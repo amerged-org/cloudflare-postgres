@@ -6,6 +6,7 @@ import { withAdmissionMutation } from "./admission-mutations.ts";
 import { failMovesOfLostNode } from "./database-moves.ts";
 import { fenceActionsFromEnv } from "./fence-actions.ts";
 import { hintNode } from "./node-hints.ts";
+import { accountOf } from "./node-tunnel.ts";
 import { reinstallBlockers, reinstallOverridden } from "./reinstall-guard.ts";
 import { markNodeLost, NodeStateError } from "./node-state.ts";
 
@@ -314,12 +315,4 @@ export async function runNodeFencing(
 export async function runNodeFencingCron(env: Env, now: number) {
   const failures = await runNodeFencing(env, now, fenceActionsFromEnv(env));
   if (failures.length > 0) throw new Error(failures[0]);
-}
-
-function accountOf(endpoint: string): string | null {
-  try {
-    return /^([0-9a-f]{32})\./.exec(new URL(endpoint).host)?.[1] ?? null;
-  } catch {
-    return null;
-  }
 }

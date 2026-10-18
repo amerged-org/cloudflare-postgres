@@ -34,7 +34,7 @@ export async function admissionSnapshotFixture() {
   // The first read creates the database's admission epoch.
   expect(await readDatabaseAdmissionSnapshot(env, id)).not.toBeNull();
   const row = (await env.DB.prepare(
-    "SELECT d.generation,d.runtime_attestation_json runtime,e.admission_revision,e.route_revision FROM databases d JOIN database_admission_epochs e ON e.database_id=d.id WHERE d.id=?",
+    "SELECT d.generation,d.runtime_json runtime,e.admission_revision,e.route_revision FROM databases d JOIN database_admission_epochs e ON e.database_id=d.id WHERE d.id=?",
   )
     .bind(id)
     .first<{

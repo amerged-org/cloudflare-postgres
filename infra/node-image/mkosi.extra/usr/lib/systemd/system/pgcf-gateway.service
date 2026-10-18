@@ -14,7 +14,6 @@ StartLimitIntervalSec=0
 Type=exec
 User=pgcf-gateway
 Group=pgcf-gateway
-Environment=PGCF_GATEWAY_MODE=local
 EnvironmentFile=/var/lib/pgcf/credentials/gateway.env
 ExecStart=/var/lib/pgcf/bin/current/pgcf-native-gateway
 Restart=always

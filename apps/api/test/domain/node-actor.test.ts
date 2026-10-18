@@ -271,9 +271,12 @@ describe("the samples of a node", () => {
   it("writes the last minute when its alarm rings, and not twice", async () => {
     const f = await fixture(0);
     const socket = await connect(f);
-    // Samples of the minute that is running, so that its alarm is still to come.
+    // Samples of the minute that is running, so that its alarm is still to come, and both of them
+    // inside it: near the end of a minute, wait until the next one is 3 s old.
     if (Date.now() % MINUTE > MINUTE - 20_000)
-      await new Promise((resolve) => setTimeout(resolve, 21_000));
+      await new Promise((resolve) =>
+        setTimeout(resolve, MINUTE - (Date.now() % MINUTE) + 3_000),
+      );
     const now = Date.now();
     for (const offset of [2_000, 1_000]) {
       socket.send(sampleMessage(now - offset));
@@ -449,6 +452,68 @@ describe("the samples of a node", () => {
         .bind(i.id)
         .first(),
     ).toEqual({ ready: 0, schedulable: 0 });
+    socket.close(1000);
+  });
+
+  it("keeps an enrolled node closed until it applied the credentials the API holds for it", async () => {
+    const i = await installed();
+    expect((await enroll(i.request)).status).toBe(200);
+    const nodeUid = (await env.DB.prepare(
+      "SELECT node_uid FROM nodes WHERE id=?",
+    )
+      .bind(i.id)
+      .first<{ node_uid: string }>())!.node_uid;
+    // The Tunnel token and the route keyring are at revision 2; the node has read none, or one.
+    await env.DB.prepare("UPDATE nodes SET credentials_revision=2 WHERE id=?")
+      .bind(i.id)
+      .run();
+    const socket = await connect({ node: i.id, nodeUid });
+    const state = () =>
+      env.DB.prepare(
+        "SELECT n.ready,n.schedulable,n.last_observed_at observed,a.status FROM nodes n JOIN node_additions a ON a.node_id=n.id WHERE n.id=?",
+      )
+        .bind(i.id)
+        .first<{
+          ready: number;
+          schedulable: number;
+          observed: string | null;
+          status: string;
+        }>();
+    const at = Date.now() - 5_000;
+    const send = async (offset: number, revision: number | null) => {
+      socket.send(
+        sampleMessage(at + offset, { credentials_revision: revision }),
+      );
+      await until(
+        async () =>
+          (await state())?.observed === new Date(at + offset).toISOString(),
+      );
+    };
+    // A node with no gateway and no Tunnel takes no database, however fresh its samples are.
+    const closed = { ready: 0, schedulable: 0, status: "audited" };
+    await send(0, null);
+    expect(await state()).toMatchObject(closed);
+    await send(1_000, 1);
+    expect(await state()).toMatchObject(closed);
+    // The sample that holds the revision opens it at once, not at the end of its minute.
+    await send(2_000, 2);
+    expect(await state()).toMatchObject({
+      ready: 1,
+      schedulable: 1,
+      status: "ready",
+    });
+    // A later revision (a rotation) does not close an open node.
+    await env.DB.prepare("UPDATE nodes SET credentials_revision=3 WHERE id=?")
+      .bind(i.id)
+      .run();
+    socket.send(sampleMessage(at + 3_000, { credentials_revision: 2 }));
+    await until(
+      async () =>
+        (await heldLink(i.id)).sample?.observed_at ===
+        new Date(at + 3_000).toISOString(),
+    );
+    await runDurableObjectAlarm(actor(i.id));
+    expect(await state()).toMatchObject({ ready: 1, schedulable: 1 });
     socket.close(1000);
   });
 

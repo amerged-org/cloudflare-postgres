@@ -312,68 +312,6 @@ export const NodeProviderAudit = z.strictObject({
   observed_at: Timestamp,
 });
 export type NodeProviderAudit = z.infer<typeof NodeProviderAudit>;
-export const NodeBootstrapStage = z.enum([
-  "prepared",
-  "rescue",
-  "talos_installed",
-  "network_protected",
-  "joined",
-]);
-export const NodeBootstrapCheckpoint = z.strictObject({
-  stage: NodeBootstrapStage,
-  reference: Reference,
-  saved_at: Timestamp,
-});
-export type NodeBootstrapCheckpoint = z.infer<typeof NodeBootstrapCheckpoint>;
-const ProofScope = {
-  operation_id: OperationId,
-  node_id: NodeId,
-  intent_hash: Hash,
-  checkpoint_reference: Reference,
-  proof_reference: Reference,
-};
-export const NodeNetworkVerification = z.strictObject({
-  ...ProofScope,
-  verified_at: Timestamp,
-});
-export type NodeNetworkVerification = z.infer<typeof NodeNetworkVerification>;
-export const NodeCapacityVerification = z
-  .strictObject({
-    ...ProofScope,
-    observed_at: Timestamp,
-    allocatable_memory_mib: z
-      .number()
-      .int()
-      .positive()
-      .max(Number.MAX_SAFE_INTEGER),
-    allocatable_cpu_millicores: z
-      .number()
-      .int()
-      .positive()
-      .max(Number.MAX_SAFE_INTEGER),
-    storage_gib_total: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-    platform_reserved_memory_mib: z
-      .number()
-      .int()
-      .nonnegative()
-      .max(Number.MAX_SAFE_INTEGER),
-    platform_reserved_cpu_millicores: z
-      .number()
-      .int()
-      .nonnegative()
-      .max(Number.MAX_SAFE_INTEGER),
-  })
-  .superRefine((proof, context) => {
-    if (
-      proof.platform_reserved_memory_mib >= proof.allocatable_memory_mib ||
-      proof.platform_reserved_cpu_millicores >= proof.allocatable_cpu_millicores
-    )
-      context.addIssue({
-        code: "custom",
-        message: "Measured platform reservations must leave actual headroom",
-      });
-  });
-export type NodeCapacityVerification = z.infer<typeof NodeCapacityVerification>;
 export const NodeAdditionStatus = z.enum([
   "reserved",
   "dispatching",
@@ -398,15 +336,6 @@ export const NodeAddition = z.strictObject({
   approval: CostedNodeApproval.nullable(),
   receipt: NodeProviderReceipt.nullable(),
   audit: NodeProviderAudit.nullable(),
-  checkpoint: NodeBootstrapCheckpoint.safeExtend({
-    revision: z.number().int().positive(),
-  }).nullable(),
-  network: NodeNetworkVerification.safeExtend({
-    revision: z.number().int().positive(),
-  }).nullable(),
-  capacity: NodeCapacityVerification.safeExtend({
-    revision: z.number().int().positive(),
-  }).nullable(),
   failure_code: z
     .enum([
       "provider_rejected",

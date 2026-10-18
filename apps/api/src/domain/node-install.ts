@@ -77,7 +77,8 @@ export async function issueNodeInstall(
      VALUES(?,?,?,?,?,?,?)
      ON CONFLICT(node_id) DO UPDATE SET image_version=excluded.image_version,token_hash=excluded.token_hash,
        progress_hash=excluded.progress_hash,allowed_sources_json=excluded.allowed_sources_json,checkpoints_json='[]',
-       progress_closed_at=NULL,issued_at=excluded.issued_at,expires_at=excluded.expires_at,refused_at=NULL,refusal=NULL
+       progress_closed_at=NULL,issued_at=excluded.issued_at,expires_at=excluded.expires_at,refused_at=NULL,refusal=NULL,
+       rescue_requested_at=NULL,restart_requested_at=NULL
      WHERE node_installs.enrolled_at IS NULL`,
   )
     .bind(
@@ -186,7 +187,7 @@ async function identityOf(
   nodeId: string,
 ): Promise<NodeEnrollmentResponse | null> {
   const row = await env.DB.prepare(
-    "SELECT id,node_uid uid,k8s_node_name hostname,region_id FROM nodes WHERE id=? AND node_uid IS NOT NULL",
+    "SELECT id,node_uid uid,hostname,region_id FROM nodes WHERE id=? AND node_uid IS NOT NULL",
   )
     .bind(nodeId)
     .first();
@@ -291,7 +292,7 @@ export async function enrollNode(
        WHERE node_id=? AND token_hash=? AND enrolled_at IS NULL AND expires_at>?`,
     ).bind(now, request.public_key, uid, request.node_id, hash, now),
     c.env.DB.prepare(
-      `INSERT INTO nodes(id,region_id,k8s_node_name,provider_instance_id,ready,schedulable,allocatable_memory_mib,
+      `INSERT INTO nodes(id,region_id,hostname,provider_instance_id,ready,schedulable,allocatable_memory_mib,
          allocatable_cpu_millicores,created_at,updated_at,node_uid,public_key,enrolled_at)
        SELECT ?,?,?,?,0,0,0,0,?,?,?,?,? WHERE changes()=1
        ON CONFLICT(id) DO UPDATE SET node_uid=excluded.node_uid,public_key=excluded.public_key,

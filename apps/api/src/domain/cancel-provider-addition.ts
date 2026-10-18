@@ -47,10 +47,7 @@ export async function cancelAlreadyCancelledProviderAddition(
         addition.provider_instance_id ||
       addition.receipt.provider_instance_id !== addition.provider_instance_id ||
       addition.receipt.request_id !== null ||
-      addition.audit.provider_instance_id !== addition.provider_instance_id ||
-      addition.checkpoint ||
-      addition.network ||
-      addition.capacity
+      addition.audit.provider_instance_id !== addition.provider_instance_id
     )
       return refuse(
         "Only an untouched audited adoption can release its installation reservation",
@@ -91,10 +88,7 @@ export async function cancelAlreadyCancelledProviderAddition(
     !addition.provider_instance_id ||
     !addition.receipt ||
     addition.receipt.provider_instance_id !== addition.provider_instance_id ||
-    addition.receipt.request_id !== addition.dispatch_request_id ||
-    addition.checkpoint ||
-    addition.network ||
-    addition.capacity
+    addition.receipt.request_id !== addition.dispatch_request_id
   )
     return refuse(
       "Only an empty paid reservation with its original receipt can record provider cancellation",

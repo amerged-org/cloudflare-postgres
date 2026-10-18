@@ -224,13 +224,13 @@ describe("enrolling a node", () => {
     });
     expect(
       await env.DB.prepare(
-        "SELECT region_id,k8s_node_name,provider_instance_id,node_uid,public_key,ready,schedulable,lost_at FROM nodes WHERE id=?",
+        "SELECT region_id,hostname,provider_instance_id,node_uid,public_key,ready,schedulable,lost_at FROM nodes WHERE id=?",
       )
         .bind(i.id)
         .first(),
     ).toEqual({
       region_id: i.f.region,
-      k8s_node_name: i.addition.intent.requested_hostname,
+      hostname: i.addition.intent.requested_hostname,
       provider_instance_id: i.instance,
       node_uid: identity.uid,
       public_key: i.publicKey,

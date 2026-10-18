@@ -65,7 +65,7 @@ export async function seedFixtureDatabase(
       now,
     ),
     env.DB.prepare(
-      `INSERT INTO nodes (id, region_id, k8s_node_name, ready, schedulable,
+      `INSERT INTO nodes (id, region_id, hostname, ready, schedulable,
        allocatable_memory_mib, allocatable_cpu_millicores, platform_reserved_memory_mib,
        storage_gib_total, created_at, updated_at, node_uid, last_observed_at, platform_reserved_cpu_millicores,
        public_key, enrolled_at)
@@ -83,7 +83,7 @@ export async function seedFixtureDatabase(
     env.DB.prepare(
       `INSERT INTO databases (id, project_id, region_id, node_id, name, size_class_id,
       desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at,
-      runtime_attestation_json)
+      runtime_json)
       VALUES (?, ?, ?, ?, 'edge-test', 'small', 'running', 'ready', 2, 2, ?, ?, ?, ?)`,
     ).bind(
       database,

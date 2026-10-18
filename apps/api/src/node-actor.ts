@@ -127,7 +127,7 @@ export class NodeActor extends DurableObject<Env> {
       new WebSocketRequestResponsePair("ping", "pong"),
     );
     ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS node_link(singleton INTEGER PRIMARY KEY CHECK(singleton=1),node_id TEXT NOT NULL,node_uid TEXT NOT NULL,sample TEXT,received_at INTEGER,minute TEXT,flushed TEXT)",
+      "CREATE TABLE IF NOT EXISTS node_link(singleton INTEGER PRIMARY KEY CHECK(singleton=1),node_id TEXT NOT NULL,node_uid TEXT NOT NULL,sample TEXT,received_at INTEGER,minute TEXT,flushed TEXT,open INTEGER NOT NULL DEFAULT 0)",
     );
   }
   override async fetch(request: Request): Promise<Response> {
@@ -167,8 +167,10 @@ export class NodeActor extends DurableObject<Env> {
         received_at: number | null;
         minute: string | null;
         flushed: string | null;
+        /** The node is open for placement: D1 holds it ready. */
+        open: number;
       }>(
-        "SELECT node_id,node_uid,sample,received_at,minute,flushed FROM node_link WHERE singleton=1",
+        "SELECT node_id,node_uid,sample,received_at,minute,flushed,open FROM node_link WHERE singleton=1",
       )
       .toArray()[0];
   }
@@ -257,12 +259,17 @@ export class NodeActor extends DurableObject<Env> {
       now,
       JSON.stringify(folded),
     );
-    // The first sample after enrollment opens the node for placement at once; the rest wait for
-    // their minute to end, and the first sample of the next minute writes it with the node's
-    // vitals as that sample has them.
-    if (previous === undefined) await this.flush(link, folded, sample, true);
-    else if (previous.minute !== folded.minute)
+    // The first sample after enrollment is written at once, and so is every sample of a node that
+    // is not open yet and has applied credentials: the one that holds the revision opens it for
+    // placement. The rest wait for their minute to end, and the first sample of the next minute
+    // writes it with the node's vitals as that sample has them.
+    if (previous !== undefined && previous.minute !== folded.minute)
       await this.flush(link, previous, sample);
+    if (
+      previous === undefined ||
+      (link.open === 0 && sample.credentials_revision !== null)
+    )
+      await this.flush(link, folded, sample);
     await this.ctx.storage.setAlarm(
       (folded.minute + 1) * MINUTE_MS + FLUSH_DELAY_MS,
     );
@@ -283,7 +290,6 @@ export class NodeActor extends DurableObject<Env> {
     link: NonNullable<ReturnType<NodeActor["link"]>>,
     minute: Minute,
     sample: NodeSample,
-    opening = false,
   ): Promise<void> {
     const db = this.env.DB,
       now = new Date().toISOString(),
@@ -341,13 +347,16 @@ export class NodeActor extends DurableObject<Env> {
             link.node_uid,
           ),
       );
-    // A lost node stays closed and not ready: samples of a fenced node change nothing about it.
+    // A lost node stays closed and not ready: samples of a fenced node change nothing about it. A
+    // node opens, once, with the sample that holds the credentials revision the API holds for it:
+    // before that it has no gateway and no Tunnel, and placement must not give it a database.
     statements.push(
       db
         .prepare(
           `UPDATE nodes SET last_observed_at=?,last_sample_json=?,allocatable_memory_mib=?,allocatable_cpu_millicores=?,
-             storage_gib_total=COALESCE(?,storage_gib_total),ready=1,
-             schedulable=CASE WHEN last_observed_at IS NULL THEN 1 ELSE schedulable END,updated_at=?
+             storage_gib_total=COALESCE(?,storage_gib_total),
+             ready=CASE WHEN ready=1 OR ?>=credentials_revision THEN 1 ELSE 0 END,
+             schedulable=CASE WHEN ready=0 AND ?>=credentials_revision THEN 1 ELSE schedulable END,updated_at=?
            WHERE id=? AND node_uid=? AND lost_at IS NULL`,
         )
         .bind(
@@ -358,31 +367,34 @@ export class NodeActor extends DurableObject<Env> {
           sample.pool === null
             ? null
             : Math.floor(sample.pool.data_total_bytes / 1024 ** 3),
+          sample.credentials_revision,
+          sample.credentials_revision,
           now,
           link.node_id,
           link.node_uid,
         ),
+      db
+        .prepare(
+          `UPDATE node_additions SET status='ready',revision=revision+1,updated_at=?
+           WHERE node_id=? AND status IN('audited','bootstrapping')
+             AND EXISTS(SELECT 1 FROM nodes WHERE id=? AND node_uid=? AND lost_at IS NULL AND ready=1)`,
+        )
+        .bind(now, link.node_id, link.node_id, link.node_uid),
+      db
+        .prepare("SELECT ready FROM nodes WHERE id=? AND node_uid=?")
+        .bind(link.node_id, link.node_uid),
     );
-    if (opening)
-      statements.push(
-        db
-          .prepare(
-            `UPDATE node_additions SET status='ready',revision=revision+1,updated_at=?
-             WHERE node_id=? AND status IN('audited','bootstrapping')
-               AND EXISTS(SELECT 1 FROM nodes WHERE id=? AND node_uid=? AND lost_at IS NULL)`,
-          )
-          .bind(now, link.node_id, link.node_id, link.node_uid),
-      );
     if (minute.minute % 60 === 0 && link.flushed !== written(minute))
       statements.push(
         db
           .prepare("DELETE FROM node_minutes WHERE node_id=? AND minute<?")
           .bind(link.node_id, minute.minute - ROLLUP_RETENTION_MINUTES),
       );
-    await db.batch(statements);
+    const results = await db.batch<{ ready: number }>(statements);
     this.ctx.storage.sql.exec(
-      "UPDATE node_link SET flushed=? WHERE singleton=1",
+      "UPDATE node_link SET flushed=?,open=? WHERE singleton=1",
       written(minute),
+      link.open === 1 || results.at(-1)?.results[0]?.ready === 1 ? 1 : 0,
     );
   }
 

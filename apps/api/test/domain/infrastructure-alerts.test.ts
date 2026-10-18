@@ -407,7 +407,7 @@ it("counts control and provider-assigned VPS for the cap notice, excluding an un
       1 + crypto.getRandomValues(new Uint32Array(1))[0]!,
     );
   await env.DB.prepare(
-    "INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,database_placement_enabled,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,provider_instance_id) VALUES(?,?,?,1,1,0,8192,2000,40,128,100,?,?,?,?)",
+    "INSERT INTO nodes(id,region_id,hostname,ready,schedulable,database_placement_enabled,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,provider_instance_id) VALUES(?,?,?,1,1,0,8192,2000,40,128,100,?,?,?,?)",
   )
     .bind(
       newNodeId(),

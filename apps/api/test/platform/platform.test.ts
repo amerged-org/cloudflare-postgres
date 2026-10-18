@@ -668,7 +668,7 @@ describe("API platform on real Workers D1", () => {
     const now = new Date().toISOString();
     await env.DB.prepare(
       `INSERT INTO nodes
-      (id, region_id, k8s_node_name, ready, schedulable, allocatable_memory_mib, allocatable_cpu_millicores, storage_gib_total, created_at, updated_at)
+      (id, region_id, hostname, ready, schedulable, allocatable_memory_mib, allocatable_cpu_millicores, storage_gib_total, created_at, updated_at)
       VALUES (?, ?, ?, 1, 0, 8192, 4000, 120, ?, ?)`,
     )
       .bind(node, region.id, `node-${crypto.randomUUID()}`, now, now)

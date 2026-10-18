@@ -59,7 +59,6 @@ it("reserves one UID-bound recovery on the same lost provider with a new install
   expect(recovered.intent.request).toEqual(f.request());
   expect(recovered.approval).toBeNull();
   expect(recovered.dispatch_request_id).toBeNull();
-  expect(recovered.checkpoint).toBeNull();
   expect(
     await reserveNodeAddition(env.DB, {
       request_key: key,

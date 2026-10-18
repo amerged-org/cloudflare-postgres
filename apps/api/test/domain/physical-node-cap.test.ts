@@ -23,7 +23,7 @@ async function setup(max = 3) {
   const ids = [newNodeId(), newNodeId()];
   for (const [i, id] of ids.entries())
     await env.DB.prepare(
-      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,database_placement_enabled,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,provider_instance_id) VALUES(?,?,?,1,1,?,8192,2000,40,128,100,?,?,?,?,?)",
+      "INSERT INTO nodes(id,region_id,hostname,ready,schedulable,database_placement_enabled,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,provider_instance_id) VALUES(?,?,?,1,1,?,8192,2000,40,128,100,?,?,?,?,?)",
     )
       .bind(
         id,

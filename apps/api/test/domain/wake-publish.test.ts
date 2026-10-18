@@ -167,7 +167,7 @@ it("a published snapshot of the wake's revision releases the waiting connection 
       "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,'database.hibernate','succeeded',?,?,?,?,?,?)",
     ).bind(sleepOperation, f.project, f.id, sleepGeneration, at, at, at),
     env.DB.prepare(
-      "UPDATE databases SET desired_state='suspended',suspension_reason='idle',generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_attestation_json=NULL WHERE id=?",
+      "UPDATE databases SET desired_state='suspended',suspension_reason='idle',generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_json=NULL WHERE id=?",
     ).bind(sleepGeneration, sleepGeneration, sleepOperation, f.id),
     env.DB.prepare(
       "UPDATE database_admission_epochs SET admission_revision=admission_revision+1,route_revision=route_revision+1 WHERE database_id=?",
@@ -224,7 +224,7 @@ it("a published snapshot of the wake's revision releases the waiting connection 
     observed_at: Date.now(),
   });
   await env.DB.prepare(
-    "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation,runtime_attestation_json=? WHERE id=?",
+    "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation,runtime_json=? WHERE id=?",
   )
     .bind(JSON.stringify(runtime), f.id)
     .run();

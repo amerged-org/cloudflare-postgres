@@ -97,6 +97,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/node/v1/installer/progress",
   "/node/v1/link",
   "/node/v1/desired",
+  "/node/v1/credentials",
   "/node/v1/observations",
   "/node/v1/volumes",
   "/node/v1/events",

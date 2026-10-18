@@ -20,6 +20,7 @@ import {
 } from "@pgcf/contracts";
 import { expect } from "vitest";
 import { createApp } from "../../src/app.ts";
+import type { Env } from "../../src/env.ts";
 import { reportStatements } from "./node-samples.ts";
 
 const fixtures: {
@@ -158,7 +159,7 @@ function nodeStatements(
 ): D1PreparedStatement[] {
   return [
     env.DB.prepare(
-      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,public_key,enrolled_at) VALUES (?,?,?,1,?,2000,?,128,100,?,?,?,?,?,?)",
+      "INSERT INTO nodes(id,region_id,hostname,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,public_key,enrolled_at) VALUES (?,?,?,1,?,2000,?,128,100,?,?,?,?,?,?)",
     ).bind(
       node,
       region,
@@ -327,11 +328,12 @@ export async function rawRequest(
   path: string,
   init: RequestInit = {},
   own?: ExecutionContext,
+  bindings: Partial<Env> = {},
 ): Promise<Response> {
   const context = own ?? createExecutionContext();
   const response = await createApp().fetch(
     new Request(new URL(path, `https://${["api", "invalid"].join(".")}`), init),
-    { ...env, DB_ENDPOINT_HOST: ["db", "invalid"].join(".") },
+    { ...env, DB_ENDPOINT_HOST: ["db", "invalid"].join("."), ...bindings },
     context,
   );
   if (!own) await waitOnExecutionContext(context);
@@ -353,6 +355,8 @@ export async function nodeRequest(
     node?: string;
     uid?: string;
     context?: ExecutionContext;
+    /** Bindings and variables the Worker has in this request besides the test's own. */
+    bindings?: Partial<Env>;
   } = {},
 ): Promise<Response> {
   const method = init.method ?? "GET",
@@ -374,6 +378,7 @@ export async function nodeRequest(
       ...(body === undefined ? {} : { body }),
     },
     init.context,
+    init.bindings,
   );
 }
 

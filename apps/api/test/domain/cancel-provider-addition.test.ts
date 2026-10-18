@@ -751,7 +751,7 @@ it("the cancellation CAS protects a Node already registered under the exact targ
     async () => {
       const now = new Date().toISOString();
       await env.DB.prepare(
-        "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,created_at,updated_at) VALUES(?,?,?,0,0,0,?,?)",
+        "INSERT INTO nodes(id,region_id,hostname,ready,allocatable_memory_mib,allocatable_cpu_millicores,created_at,updated_at) VALUES(?,?,?,0,0,0,?,?)",
       )
         .bind(
           f.addition.intent.node_id,

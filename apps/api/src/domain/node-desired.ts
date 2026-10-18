@@ -163,7 +163,7 @@ export async function nodeDesiredPage(
   query: NodeDesiredQuery,
 ): Promise<NodeDesiredPage> {
   const node = await env.DB.prepare(
-    "SELECT id,node_uid uid,k8s_node_name hostname,region_id,credentials_revision FROM nodes WHERE id=? AND node_uid=?",
+    "SELECT id,node_uid uid,hostname,region_id,credentials_revision FROM nodes WHERE id=? AND node_uid=?",
   )
     .bind(caller.id, caller.uid)
     .first<NodeRow>();

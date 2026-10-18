@@ -13,7 +13,7 @@ import type { Env, ApiContext } from "../env.ts";
 import { getAuth, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseForRequest, type DatabaseRow } from "./rows.ts";
-import { databaseCpuChargeSql } from "./startup-admission.ts";
+import { stoppedSleeperSql } from "./startup-admission.ts";
 import { resizeDatabase, scheduleDatabaseResize } from "./databases.ts";
 import { hintDatabases } from "./node-hints.ts";
 
@@ -121,7 +121,7 @@ export async function getDatabaseResourceProfile(c: ApiContext, id: string) {
   const authorized = await databaseForRequest(c, id);
   const database = await c.env.DB.prepare(
     `SELECT d.*, r.profile_id,r.revision profile_revision,p.rollout_revision,
-      (${databaseCpuChargeSql("d", "s")}=0) confirmed_cold
+      (${stoppedSleeperSql("d", false)}) confirmed_cold
      FROM databases d JOIN size_classes s ON s.id=d.size_class_id
      LEFT JOIN resource_profile_revisions r ON r.size_class_id=d.size_class_id
      LEFT JOIN resource_profiles p ON p.id=r.profile_id
@@ -199,7 +199,7 @@ export async function getResourceProfileRollout(c: ApiContext, id: string) {
   const row = await c.env.DB.prepare(
     `SELECT count(*) assignments,
       COALESCE(SUM(CASE WHEN r.revision=p.rollout_revision AND d.observed_generation=d.generation AND d.observed_state='ready' THEN 1 ELSE 0 END),0) applied,
-      COALESCE(SUM(CASE WHEN r.revision=p.rollout_revision AND d.observed_generation=d.generation AND ${databaseCpuChargeSql("d", "s")}=0 THEN 1 ELSE 0 END),0) deferred
+      COALESCE(SUM(CASE WHEN r.revision=p.rollout_revision AND d.observed_generation=d.generation AND ${stoppedSleeperSql("d", false)} THEN 1 ELSE 0 END),0) deferred
      FROM databases d JOIN projects project ON project.id=d.project_id AND project.deleted_at IS NULL
      JOIN size_classes s ON s.id=d.size_class_id
      JOIN resource_profile_revisions r ON r.size_class_id=d.size_class_id JOIN resource_profiles p ON p.id=r.profile_id

@@ -58,9 +58,7 @@ it("a v4 snapshot refuses stale runtime generation after an unrelated role chang
 });
 
 async function replaceRuntime(id: string, runtime: unknown) {
-  await env.DB.prepare(
-    "UPDATE databases SET runtime_attestation_json=? WHERE id=?",
-  )
+  await env.DB.prepare("UPDATE databases SET runtime_json=? WHERE id=?")
     .bind(JSON.stringify(runtime), id)
     .run();
 }
@@ -138,7 +136,7 @@ it("a capable idle sleeper takes guarded authoritative cold preparation and retu
       "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,'database.hibernate','succeeded',?,?,?,?,?,?)",
     ).bind(sleepOperation, f.project, f.id, sleepGeneration, at, at, at),
     env.DB.prepare(
-      "UPDATE databases SET desired_state='suspended',suspension_reason='idle',generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_attestation_json=NULL WHERE id=?",
+      "UPDATE databases SET desired_state='suspended',suspension_reason='idle',generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_json=NULL WHERE id=?",
     ).bind(sleepGeneration, sleepGeneration, sleepOperation, f.id),
     env.DB.prepare(
       "UPDATE database_admission_epochs SET admission_revision=admission_revision+1,route_revision=route_revision+1 WHERE database_id=?",
@@ -294,9 +292,7 @@ it("a runtime document the contract does not know closes admission instead of be
   const f = await admissionSnapshotFixture();
   await refused(f.id, { ...f.runtime, instance: "not-a-unit" });
   await refused(f.id, { ...f.runtime, pod_uid: crypto.randomUUID() });
-  await env.DB.prepare(
-    "UPDATE databases SET runtime_attestation_json=NULL WHERE id=?",
-  )
+  await env.DB.prepare("UPDATE databases SET runtime_json=NULL WHERE id=?")
     .bind(f.id)
     .run();
   expect(
@@ -317,7 +313,7 @@ it("wakeable is true only for an idle suspension with a power operation, a node 
       "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,'database.hibernate','succeeded',?,?,?,?,?,?)",
     ).bind(sleepOperation, f.project, f.id, sleepGeneration, at, at, at),
     env.DB.prepare(
-      "UPDATE databases SET desired_state='suspended',suspension_reason='idle',generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_attestation_json=NULL WHERE id=?",
+      "UPDATE databases SET desired_state='suspended',suspension_reason='idle',generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_json=NULL WHERE id=?",
     ).bind(sleepGeneration, sleepGeneration, sleepOperation, f.id),
   ]);
   expect(await wakeable()).toBe(true);

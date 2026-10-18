@@ -1164,10 +1164,10 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       testEnv.DB.prepare(
         `INSERT INTO databases (id, project_id, region_id, node_id, name, size_class_id,
         desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at,
-        runtime_attestation_json)
+        runtime_json)
         SELECT ?, project_id, region_id, node_id, 'second', size_class_id, desired_state, observed_state,
         generation, observed_generation, replace(archive_path, id, ?), created_at, updated_at,
-        json_set(runtime_attestation_json, '$.database_id', ?)
+        json_set(runtime_json, '$.database_id', ?)
         FROM databases WHERE id = ?`,
       ).bind(other, other, other, database),
       testEnv.DB.prepare(
@@ -1327,10 +1327,10 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       testEnv.DB.prepare(
         `INSERT INTO databases (id, project_id, region_id, node_id, name, size_class_id,
         desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at,
-        runtime_attestation_json)
+        runtime_json)
         SELECT ?, project_id, region_id, node_id, 'second', size_class_id, desired_state, observed_state,
         generation, observed_generation, replace(archive_path, id, ?), created_at, updated_at,
-        json_set(runtime_attestation_json, '$.database_id', ?)
+        json_set(runtime_json, '$.database_id', ?)
         FROM databases WHERE id = ?`,
       ).bind(other, other, other, database),
       testEnv.DB.prepare(
@@ -1422,9 +1422,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
 
   it("signs the admission's verified target into a v6 route to its node", async () => {
     const instance = crypto.randomUUID();
-    await testEnv.DB.prepare(
-      "UPDATE databases SET runtime_attestation_json=? WHERE id=?",
-    )
+    await testEnv.DB.prepare("UPDATE databases SET runtime_json=? WHERE id=?")
       .bind(
         JSON.stringify({
           database_id: database,

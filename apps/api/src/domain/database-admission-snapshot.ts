@@ -3,7 +3,7 @@ import { DatabaseId, DatabaseRuntime } from "@pgcf/contracts";
 import type { Env } from "../env.ts";
 import { databaseActor } from "./database-actor-sync.ts";
 import { DatabaseAdmissionSnapshot } from "./admission-state.ts";
-import { DatabasePresence } from "../database-actor.ts";
+import { DatabasePresence, GATEWAY_COLUMNS } from "../database-actor.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { notifyAdmissionRevisions } from "./admission-mutations.ts";
 
@@ -26,7 +26,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
   DatabaseId.parse(id);
   const readRow = () =>
     env.DB.prepare(
-      `SELECT d.*,p.deleted_at project_deleted_at,n.ready node_ready,n.lost_at,r.gateway_url,r.gateway_binding,
+      `SELECT d.*,p.deleted_at project_deleted_at,n.ready node_ready,n.lost_at,${GATEWAY_COLUMNS("r", "n")},
     ae.database_id epoch_database_id,CASE WHEN p.updated_at>d.updated_at THEN p.updated_at ELSE d.updated_at END presence_updated_at,
     ae.admission_revision,ae.route_revision,ae.mutation_id,ae.completed_mutation_id,
     (SELECT json_group_array(json_object('name',rr.name,'owner',rr.owner,'revision',rr.password_revision,'valid_until',rr.valid_until)) FROM roles rr WHERE rr.database_id=d.id AND rr.deleted_at IS NULL) roles_json
@@ -65,9 +65,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
   let runtime: DatabaseAdmissionSnapshot["runtime"] = null;
   try {
     const parsed = DatabaseRuntime.safeParse(
-      row.runtime_attestation_json
-        ? JSON.parse(row.runtime_attestation_json)
-        : null,
+      row.runtime_json ? JSON.parse(row.runtime_json) : null,
     );
     if (
       parsed.success &&

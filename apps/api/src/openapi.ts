@@ -50,6 +50,7 @@ const nodeRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "POST /node/v1/installer/progress": [400, 401, 409, 500],
   "GET /node/v1/link": [401, 403, 500],
   "GET /node/v1/desired": [400, 401, 403, 404, 409, 500],
+  "GET /node/v1/credentials": [401, 403, 500],
   "GET /node/v1/archive-credentials/{id}": [400, 401, 403, 404, 500],
   "POST /node/v1/observations": [400, 401, 403, 500],
   "POST /node/v1/volumes": [400, 401, 403, 500],

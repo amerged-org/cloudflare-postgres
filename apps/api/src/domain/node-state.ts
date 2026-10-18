@@ -60,9 +60,6 @@ interface AdditionRow {
   approval_json: string | null;
   receipt_json: string | null;
   audit_json: string | null;
-  checkpoint_json: string | null;
-  network_json: string | null;
-  capacity_json: string | null;
   failure_code: NodeAddition["failure_code"];
   created_at: string;
   updated_at: string;
@@ -126,9 +123,6 @@ async function view(row: AdditionRow): Promise<NodeAddition> {
     approval: json(row.approval_json),
     receipt: json(row.receipt_json),
     audit: json(row.audit_json),
-    checkpoint: json(row.checkpoint_json),
-    network: json(row.network_json),
-    capacity: json(row.capacity_json),
     failure_code: row.failure_code,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -946,6 +940,21 @@ export async function recordNodeAudit(
     canonical(audit),
   ]);
 }
+/** The installer was sent to the audited server: from here its progress and the node's enrollment say. */
+export async function markNodeBootstrapping(
+  db: D1Database,
+  operationId: string,
+  expectedRevision: number,
+): Promise<NodeAddition> {
+  const addition = await readNodeAddition(db, operationId);
+  revision(addition, expectedRevision);
+  if (addition.status !== "audited")
+    throw new NodeStateError(
+      "conflict",
+      "Only an audited server starts its installation",
+    );
+  return changed(db, addition, "status='bootstrapping'", []);
+}
 export async function markNodeAdditionFailed(
   db: D1Database,
   operationId: string,
@@ -981,10 +990,7 @@ export async function cancelAuditedNodeAdoption(
       addition.provider_instance_id ||
     addition.receipt.provider_instance_id !== addition.provider_instance_id ||
     addition.receipt.request_id !== null ||
-    addition.audit.provider_instance_id !== addition.provider_instance_id ||
-    addition.checkpoint ||
-    addition.network ||
-    addition.capacity
+    addition.audit.provider_instance_id !== addition.provider_instance_id
   )
     throw new NodeStateError(
       "conflict",
@@ -998,7 +1004,7 @@ export async function cancelAuditedNodeAdoption(
     `AND status='audited' AND slot_held=1 AND node_id=? AND region_id=? AND intent_hash=? AND intent_json=?
       AND dispatch_request_id IS NULL AND requested_instance_id=? AND provider_instance_id=?
       AND receipt_json=? AND audit_json=? AND approval_json IS ?
-      AND checkpoint_json IS NULL AND network_json IS NULL AND capacity_json IS NULL
+      AND NOT EXISTS(SELECT 1 FROM node_installs i WHERE i.node_id=node_additions.node_id AND i.rescue_requested_at IS NOT NULL)
       AND EXISTS(SELECT 1 FROM regions r WHERE r.id=node_additions.region_id AND r.provider='contabo' AND r.provider_region=?)
       AND NOT EXISTS(SELECT 1 FROM node_provider_mutations m WHERE m.operation_id=node_additions.operation_id)
       AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.id=node_additions.node_id OR n.provider_instance_id=node_additions.provider_instance_id)
@@ -1042,10 +1048,7 @@ export async function cancelProviderCancelledNodeAddition(
     !addition.dispatch_request_id ||
     !addition.receipt ||
     addition.receipt.provider_instance_id !== addition.provider_instance_id ||
-    addition.receipt.request_id !== addition.dispatch_request_id ||
-    addition.checkpoint ||
-    addition.network ||
-    addition.capacity
+    addition.receipt.request_id !== addition.dispatch_request_id
   )
     throw new NodeStateError(
       "conflict",
@@ -1059,7 +1062,7 @@ export async function cancelProviderCancelledNodeAddition(
     `AND status=? AND slot_held=1 AND node_id=? AND region_id=? AND intent_hash=?
       AND dispatch_request_id=? AND provider_instance_id=? AND receipt_json=?
       AND audit_json IS ? AND approval_json IS ?
-      AND checkpoint_json IS NULL AND network_json IS NULL AND capacity_json IS NULL
+      AND NOT EXISTS(SELECT 1 FROM node_installs i WHERE i.node_id=node_additions.node_id AND i.rescue_requested_at IS NOT NULL)
       AND EXISTS(SELECT 1 FROM regions r WHERE r.id=node_additions.region_id
         AND r.provider='contabo' AND r.provider_region=?)
       AND NOT EXISTS(SELECT 1 FROM nodes n
@@ -1090,8 +1093,7 @@ export async function cancelUnattemptedNodeAddition(
   if (
     !["reserved", "failed"].includes(addition.status) ||
     addition.dispatch_request_id !== null ||
-    addition.provider_instance_id !== null ||
-    addition.checkpoint !== null
+    addition.provider_instance_id !== null
   )
     throw new NodeStateError(
       "conflict",
@@ -1102,6 +1104,6 @@ export async function cancelUnattemptedNodeAddition(
     addition,
     "status='cancelled',slot_held=0",
     [],
-    "AND dispatch_request_id IS NULL AND provider_instance_id IS NULL AND checkpoint_json IS NULL",
+    "AND dispatch_request_id IS NULL AND provider_instance_id IS NULL",
   );
 }

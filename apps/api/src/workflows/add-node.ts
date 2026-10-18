@@ -22,6 +22,7 @@ import {
   NodeStateError,
   assertNodeRecoveryAuthority,
 } from "../domain/node-state.ts";
+import { driveNodeInstall } from "../domain/node-installer.ts";
 import { placePendingDatabases } from "../domain/node-capacity.ts";
 import { hintDatabases } from "../domain/node-hints.ts";
 
@@ -274,9 +275,17 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
         );
       }
       addition = await readNodeAddition(this.env.DB, id);
-      // The audited server waits for the node installer, which this release does not have.
+      // An audited server is sent the installer, and an installing one is watched until it
+      // enrolls; its first sample with credentials opens it, which `ready` above ends.
       if (["audited", "bootstrapping"].includes(addition.status))
-        return { operation_id: id, status: addition.status };
+        await step.do(
+          `install-${cycle}`,
+          { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" },
+          async () => {
+            await driveNodeInstall(this.env, id);
+            return { operation_id: id };
+          },
+        );
       await step.sleep(
         `waiting-${cycle}`,
         addition.status === "reserved" && addition.approval === null

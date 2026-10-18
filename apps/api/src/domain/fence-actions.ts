@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-import { nodeAdditionHostname } from "@pgcf/contracts/nodes";
 import type { Env } from "../env.ts";
+import { cloudflareApi } from "../providers/cloudflare.ts";
 import { contaboClient, type ContaboClient } from "../providers/contabo.ts";
+import { nodeTunnelName, TUNNEL_ID } from "./node-tunnel.ts";
 import type { FenceActions } from "./node-loss.ts";
 
 /**
@@ -10,16 +11,11 @@ import type { FenceActions } from "./node-loss.ts";
  * its instance off and reports its status. Nothing a service answers is kept or thrown on: a
  * failure is one class the caller records.
  *
- * The Tunnel is found by name, because nothing else ties it to the node: node enrollment must
- * create the Tunnel of each node under `nodeTunnelName`, the node's addition hostname. A node
- * that has no Tunnel under that name is not fenced: its Tunnel may be alive under another name,
- * so the step fails (`tunnel_unknown`) instead of counting the Tunnel as gone.
+ * The Tunnel is found by name, because nothing else ties it to the node: the credentials of each
+ * node make its Tunnel under `nodeTunnelName`, the node's addition hostname. A node that has no
+ * Tunnel under that name is not fenced: its Tunnel may be alive under another name, so the step
+ * fails (`tunnel_unknown`) instead of counting the Tunnel as gone.
  */
-export const nodeTunnelName = nodeAdditionHostname;
-
-const CLOUDFLARE_API = "https://api.cloudflare.com/client/v4";
-const TUNNEL_ID =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export interface FenceServices {
   cloudflare: { token: string; fetcher?: typeof fetch } | null;
@@ -39,27 +35,13 @@ export function fenceActions(services: FenceServices): FenceActions {
       const cloudflare = services.cloudflare;
       if (!cloudflare || cloudflare.token === "" || target.accountId === null)
         throw new Error("fence_unconfigured");
-      const fetcher = cloudflare.fetcher ?? fetch;
-      const call = async (url: string, method: "GET" | "DELETE") => {
-        const response = await fetcher(url, {
-          method,
-          redirect: "manual",
-          headers: { Authorization: `Bearer ${cloudflare.token}` },
-        });
-        const body = (await response.json().catch(() => null)) as {
-          success?: boolean;
-          result?: unknown;
-        } | null;
-        if (!response.ok || body?.success !== true)
-          throw new Error("cloudflare_api_failed");
-        return body.result;
-      };
-      const base = `${CLOUDFLARE_API}/accounts/${target.accountId}/cfd_tunnel`,
+      const call = cloudflareApi(cloudflare.token, cloudflare.fetcher);
+      const base = `/accounts/${target.accountId}/cfd_tunnel`,
         name = nodeTunnelName(target.nodeId);
       // Deleted Tunnels are listed too: a Tunnel an earlier run deleted is gone, not unknown.
       const listed = await call(
-        `${base}?name=${encodeURIComponent(name)}&per_page=100`,
         "GET",
+        `${base}?name=${encodeURIComponent(name)}&per_page=100`,
       );
       if (!Array.isArray(listed)) throw new Error("cloudflare_api_failed");
       let found = 0;
@@ -74,8 +56,8 @@ export function fenceActions(services: FenceServices): FenceActions {
         if (typeof tunnel.id !== "string" || !TUNNEL_ID.test(tunnel.id))
           throw new Error("cloudflare_api_failed");
         // A Tunnel with a connected connector cannot be deleted.
-        await call(`${base}/${tunnel.id}/connections`, "DELETE");
-        await call(`${base}/${tunnel.id}`, "DELETE");
+        await call("DELETE", `${base}/${tunnel.id}/connections`);
+        await call("DELETE", `${base}/${tunnel.id}`);
       }
       if (found === 0) throw new Error("tunnel_unknown");
     },

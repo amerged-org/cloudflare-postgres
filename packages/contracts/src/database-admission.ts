@@ -2,7 +2,11 @@
 import { z } from "zod";
 import { DatabaseId, NodeId, OperationId, RegionId } from "./ids.ts";
 
-/** The existing DatabaseActor RPC response; Rust Edge consumes its generated schema. */
+/**
+ * The existing DatabaseActor RPC response; Rust Edge consumes its generated schema. The gateway is
+ * the one of the node that serves the database (its own hostname, else the region's), because only
+ * that gateway verifies the route.
+ */
 export const DatabaseRegionRoute = z.strictObject({
   id: RegionId,
   gateway_url: z.url({ protocol: /^https?$/ }).max(2048),

@@ -294,7 +294,7 @@ export const Node = z
     lost_at: Timestamp.nullable().optional(),
     lost_reason: z.string().max(TEXT_MAX_LENGTH).nullable().optional(),
     region_id: RegionId,
-    k8s_node_name: z.string().min(1).max(253),
+    hostname: z.string().min(1).max(253),
     provider_instance_id: z.string().min(1).max(128).nullable(),
     provider_product: z.string().min(1).max(128).nullable(),
     monthly_price: z

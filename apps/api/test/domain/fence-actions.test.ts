@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { expect, it } from "vitest";
-import {
-  fenceActions,
-  nodeTunnelName,
-} from "../../src/domain/fence-actions.ts";
+import { fenceActions } from "../../src/domain/fence-actions.ts";
+import { nodeTunnelName } from "../../src/domain/node-tunnel.ts";
 import { nodeAdditionHostname } from "@pgcf/contracts/nodes";
 import type { FenceTarget } from "../../src/domain/node-loss.ts";
 import type { Instance } from "../../src/providers/contabo.ts";

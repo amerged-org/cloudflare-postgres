@@ -54,7 +54,7 @@ async function publish(
     ...previous,
     id: addition.intent.node_id,
     region_id: addition.intent.request.region_id,
-    k8s_node_name: addition.intent.requested_hostname,
+    hostname: addition.intent.requested_hostname,
     provider_instance_id: provider,
     node_uid: uid,
     ready: 1,
@@ -131,7 +131,6 @@ it("recovers completed same-provider history and chains a later loss without rew
     request_key: crypto.randomUUID(),
     request: recoverOriginal,
   });
-  expect(reserved.checkpoint).toBeNull();
   expect(reserved.intent.node_id).not.toBe(original.intent.node_id);
   expect(reserved.intent.operation_id).not.toBe(original.intent.operation_id);
   expect(reserved.intent.requested_hostname).not.toBe(
@@ -184,7 +183,6 @@ it("recovers completed same-provider history and chains a later loss without rew
     request: recoverReplacement,
   });
   expect(chained.intent.node_id).not.toBe(replacement.intent.node_id);
-  expect(chained.checkpoint).toBeNull();
   const bound = await recordNodeReceipt(
     env.DB,
     chained.intent.operation_id,

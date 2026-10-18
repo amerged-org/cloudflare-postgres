@@ -3,7 +3,7 @@ flowchart TD
     n_05cae6515ea2["Cancelled: return"]
     n_f6c7e8a30e85["Ready: place pending databases and<br/>hint their nodes"]
     n_a67701fc2401["As eligible: claim order dispatch<br/>and resolve provider identity"]
-    n_d893dc3cbbc2["Audited or bootstrapping: return<br/>until the node installer exists"]
+    n_d893dc3cbbc2["Audited or bootstrapping: send the<br/>installer once, then watch the<br/>install until the node enrolls"]
     n_8092c49190cf["Wait; re-read D1 next cycle (never<br/>trust cached outputs as authority)"]
     n_83212f141b4e["After 288 cycles:<br/>waiting_for_operator"]
     n_98d16e133cfc -->|"cancelled"| n_05cae6515ea2
@@ -12,3 +12,4 @@ flowchart TD
     n_a67701fc2401 -->|"audited or bootstrapping"| n_d893dc3cbbc2
     n_a67701fc2401 -->|"provider work pending"| n_8092c49190cf
     n_8092c49190cf -->|"cycle budget exhausted"| n_83212f141b4e
+    n_d893dc3cbbc2 -->|"install under way"| n_8092c49190cf

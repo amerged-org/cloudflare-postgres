@@ -8,7 +8,7 @@ flowchart TD
     n_05cae6515ea2["Cancelled: return"]
     n_f6c7e8a30e85["Ready: place pending databases and<br/>hint their nodes"]
     n_a67701fc2401["As eligible: claim order dispatch<br/>and resolve provider identity"]
-    n_d893dc3cbbc2["Audited or bootstrapping: return<br/>until the node installer exists"]
+    n_d893dc3cbbc2["Audited or bootstrapping: send the<br/>installer once, then watch the<br/>install until the node enrolls"]
     n_8092c49190cf["Wait; re-read D1 next cycle (never<br/>trust cached outputs as authority)"]
     n_83212f141b4e["After 288 cycles:<br/>waiting_for_operator"]
     n_98d16e133cfc -->|"cancelled"| n_05cae6515ea2
@@ -17,15 +17,16 @@ flowchart TD
     n_a67701fc2401 -->|"audited or bootstrapping"| n_d893dc3cbbc2
     n_a67701fc2401 -->|"provider work pending"| n_8092c49190cf
     n_8092c49190cf -->|"cycle budget exhausted"| n_83212f141b4e
+    n_d893dc3cbbc2 -->|"install under way"| n_8092c49190cf
 ```
 
 ## Sources
 
 - [apps/api/src/domain/node-capacity.ts · placePendingDatabases:37](../../../apps/api/src/domain/node-capacity.ts#L37)
-- [apps/api/src/domain/node-state.ts · claimNodeDispatch:770](../../../apps/api/src/domain/node-state.ts#L770)
-- [apps/api/src/domain/node-state.ts · recordNodeAudit:908](../../../apps/api/src/domain/node-state.ts#L908)
-- [apps/api/src/workflows/add-node.ts · dispatchNodeOrder:68](../../../apps/api/src/workflows/add-node.ts#L68)
-- [apps/api/src/workflows/add-node.ts · reconcileNodeProvider:111](../../../apps/api/src/workflows/add-node.ts#L111)
-- [apps/api/src/workflows/add-node.ts · AddNode:212](../../../apps/api/src/workflows/add-node.ts#L212)
+- [apps/api/src/domain/node-installer.ts · driveNodeInstall:252](../../../apps/api/src/domain/node-installer.ts#L252)
+- [apps/api/src/domain/node-state.ts · claimNodeDispatch:764](../../../apps/api/src/domain/node-state.ts#L764)
+- [apps/api/src/workflows/add-node.ts · dispatchNodeOrder:69](../../../apps/api/src/workflows/add-node.ts#L69)
+- [apps/api/src/workflows/add-node.ts · reconcileNodeProvider:112](../../../apps/api/src/workflows/add-node.ts#L112)
+- [apps/api/src/workflows/add-node.ts · AddNode:213](../../../apps/api/src/workflows/add-node.ts#L213)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

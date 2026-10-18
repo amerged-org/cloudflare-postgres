@@ -103,8 +103,15 @@ function roleAdmitted(
   );
 }
 export type { DatabaseAdmission } from "@pgcf/contracts";
+/**
+ * The gateway the Edge dials for a database (plan 5.3, 5.8): routes are signed with the key of one
+ * node and only its gateway verifies them, so the node's own gateway, a public hostname with no
+ * service binding, and only for a node that has none, the region's.
+ */
+export const GATEWAY_COLUMNS = (region: string, node: string) =>
+  `CASE WHEN ${node}.gateway_url IS NOT NULL THEN ${node}.gateway_url ELSE ${region}.gateway_url END gateway_url,CASE WHEN ${node}.gateway_url IS NOT NULL THEN NULL ELSE ${region}.gateway_binding END gateway_binding`;
 export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.storage_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
-  d.runtime_attestation_json,COALESCE(e.route_revision,1) route_revision,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at,
+  d.runtime_json,COALESCE(e.route_revision,1) route_revision,r.name role_name,g.id,${GATEWAY_COLUMNS("g", "n")},n.id node_id,n.lost_at,
   CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL) THEN 0 ELSE 1 END admission_blocked
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
   LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
@@ -123,7 +130,7 @@ interface AdmissionRow {
   observed_state: string;
   database_deleted_at: string | null;
   project_deleted_at: string | null;
-  runtime_attestation_json: string | null;
+  runtime_json: string | null;
   role_name: string | null;
   id: string;
   gateway_url: string;
@@ -156,10 +163,8 @@ function verifiedTarget(
   row: AdmissionRow,
   databaseId: string,
 ): NodeDatabaseTarget | undefined {
-  if (row.runtime_attestation_json === null) return undefined;
-  const runtime = DatabaseRuntime.safeParse(
-    JSON.parse(row.runtime_attestation_json),
-  );
+  if (row.runtime_json === null) return undefined;
+  const runtime = DatabaseRuntime.safeParse(JSON.parse(row.runtime_json));
   return runtime.success &&
     runtime.data.database_id === databaseId &&
     runtime.data.node_id === row.node_id &&

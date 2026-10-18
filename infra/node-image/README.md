@@ -215,8 +215,10 @@ restart never stops a database, because the databases are independent units.
 ## Installing a node
 
 [installer/](installer) holds the pull installer (plan 9.2): `cloud-config.yaml`, which carries
-`install.sh` and its parameters as base64, and [userdata.ts](installer/userdata.ts), which renders
-it, validates every parameter and refuses anything at or above Contabo's 32 KiB userData limit. The
+`install.sh` and its parameters as base64. The API renders it
+([node-installer.ts](../../packages/contracts/src/node-installer.ts) in the contracts package, from
+the generated module of these two files), validates every parameter and refuses anything at or above
+Contabo's 32 KiB userData limit. The
 script checks its tools, locks the rescue system's root password, checks the hardware (memory, MAC,
 IPv4 address and gateway, exactly one disk of the expected size), downloads the zstd image into
 RAM, verifies the compressed and raw sha256 and sizes before touching the disk, writes the disk,

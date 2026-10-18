@@ -202,7 +202,7 @@ describe("node CPU measurement compatibility", () => {
     const node = {
       id: newNodeId(),
       region_id: "eu-test",
-      k8s_node_name: "test-node",
+      hostname: "test-node",
       provider_instance_id: null,
       provider_product: null,
       monthly_price: null,

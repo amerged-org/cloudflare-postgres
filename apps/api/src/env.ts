@@ -13,8 +13,14 @@ export type Env = Cloudflare.Env & {
   /** The parent R2 key that signs the temporary credentials of the nodes (ULTRA plan 7.3). */
   R2_PARENT_ACCESS_KEY_ID?: string;
   R2_PARENT_SECRET_ACCESS_KEY?: string;
-  /** Deletes the Tunnel of a node declared lost (ULTRA plan 9.4). */
+  /** Makes the Tunnel and the DNS records of a node and deletes the Tunnel of a node declared lost (ULTRA plan 5.8, 9.4). */
   CLOUDFLARE_API_TOKEN?: string;
+  /** The API's origin, which a node's installer enrolls at, and the resolvers it configures (a JSON array). */
+  NODE_API_ORIGIN?: string;
+  NODE_DNS_SERVERS?: string;
+  /** The DNS zone that holds the hostnames of the nodes' gateways and shells, and its domain. */
+  NODE_GATEWAY_ZONE_ID?: string;
+  NODE_GATEWAY_DOMAIN?: string;
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
   DATABASE_ACTOR_LOCATION_HINT?: string;
   INFRASTRUCTURE_ALERT_WEBHOOK?: Fetcher;

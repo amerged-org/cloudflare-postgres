@@ -11,6 +11,7 @@ import {
   readDatabasePresence,
   syncDatabaseActor,
 } from "../../src/domain/database-actor-sync.ts";
+import { DATABASE_ADMISSION_QUERY } from "../../src/database-actor.ts";
 import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
 import { cleanupFixtures, fixture, report } from "./fixtures.ts";
 
@@ -280,6 +281,52 @@ it("a seeded unknown role and a valid role are both answered from the snapshot w
     target: { revision: 1, route_revision: 1 },
   });
   expect(count()).toBe(0);
+});
+
+it("sends a connection to the gateway of the node that serves the database, and to the region's only when the node has none", async () => {
+  const f = await ready();
+  expect(await sync(f.id)).toBe(true);
+  const regional = `https://${["gateway", "invalid"].join(".")}`,
+    own = `https://pgcf-node-${"a".repeat(20)}.nodes.example.org`;
+  await env.DB.prepare(
+    "UPDATE regions SET gateway_binding='REGIONAL' WHERE id=?",
+  )
+    .bind(f.region)
+    .run();
+  const gateway = async () => {
+    const row = (await env.DB.prepare(DATABASE_ADMISSION_QUERY)
+      .bind("app", f.id)
+      .first<{ gateway_url: string; gateway_binding: string | null }>())!;
+    expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+    const admitted = await actor(f.id).admit(f.id, "app");
+    expect(admitted.ok).toBe(true);
+    // The snapshot and the query of the actor's cold path name the same gateway.
+    const route = (
+      admitted as {
+        region: { gateway_url: string; gateway_binding: string | null };
+      }
+    ).region;
+    expect({
+      gateway_url: route.gateway_url,
+      gateway_binding: route.gateway_binding,
+    }).toEqual({
+      gateway_url: row.gateway_url,
+      gateway_binding: row.gateway_binding,
+    });
+    return route;
+  };
+  expect(await gateway()).toMatchObject({
+    gateway_url: regional,
+    gateway_binding: "REGIONAL",
+  });
+  await env.DB.prepare("UPDATE nodes SET gateway_url=? WHERE id=?")
+    .bind(own, f.node)
+    .run();
+  // A node's own gateway is a public hostname: the region's service binding is not its.
+  expect(await gateway()).toMatchObject({
+    gateway_url: own,
+    gateway_binding: null,
+  });
 });
 
 it("stale positive snapshots never authorize deleted roles, databases or projects", async () => {

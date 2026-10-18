@@ -112,7 +112,7 @@ it(
         });
       statements.push(
         env.DB.prepare(
-          `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,pg_major,desired_state,observed_state,observed_power,generation,observed_generation,storage_generation,archive_path,runtime_attestation_json,created_at,updated_at)
+          `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,pg_major,desired_state,observed_state,observed_power,generation,observed_generation,storage_generation,archive_path,runtime_json,created_at,updated_at)
         SELECT ?,project_id,region_id,node_id,?,size_class_id,pg_major,'running','ready','awake',generation,generation-1,storage_generation,?,?,?,? FROM databases WHERE id=?`,
         ).bind(
           id,

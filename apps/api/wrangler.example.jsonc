@@ -28,6 +28,11 @@
   // Optional authenticated alert receiver; direct Resend also supports API-configured sender/recipient.
   // "services": [{ "binding": "INFRASTRUCTURE_ALERT_WEBHOOK", "service": "your-alert-receiver", "entrypoint": "InfrastructureAlertsService" }],
   "vars": {
+    // Adding a node needs NODE_API_ORIGIN (this Worker's https origin, which the installer enrolls
+    // at), NODE_DNS_SERVERS (a JSON array of one to three resolver addresses the installed node
+    // uses) and, for the node's Tunnel and its hostnames, NODE_GATEWAY_DOMAIN and
+    // NODE_GATEWAY_ZONE_ID (see the secrets below). A node whose region has no release assigned
+    // waits for one.
     // Alternatively set INFRASTRUCTURE_ALERT_WEBHOOK_URL to the receiver's HTTPS endpoint.
     // Import INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN as a private Worker secret.
     "DATABASE_CONNECTION_LIMIT_PER_MINUTE": "12000",
@@ -74,7 +79,9 @@
   "triggers": { "crons": ["* * * * *"] },
   // Optional private secrets: INFRASTRUCTURE_BACKUP_CF_TOKEN (D1 export), RESEND_API_KEY (email),
   // R2_PARENT_ACCESS_KEY_ID and R2_PARENT_SECRET_ACCESS_KEY (the parent key that signs the nodes' temporary
-  // R2 credentials) and CLOUDFLARE_API_TOKEN (deletes the Tunnel of a node declared lost).
+  // R2 credentials) and CLOUDFLARE_API_TOKEN (edits the Tunnels and the DNS records of the nodes' gateways and
+  // deletes the Tunnel of a node declared lost). Their hostnames are made under NODE_GATEWAY_DOMAIN, a domain
+  // of the DNS zone NODE_GATEWAY_ZONE_ID; set both as variables.
   // Enable backups and select actual D1 identity/R2 region through the management API.
   "secrets": {
     "required": [

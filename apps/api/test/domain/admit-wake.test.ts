@@ -46,7 +46,7 @@ async function sleeper(reason: "idle" | "manual" = "idle") {
       at,
     ),
     env.DB.prepare(
-      "UPDATE databases SET desired_state='suspended',suspension_reason=?,generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_attestation_json=NULL WHERE id=?",
+      "UPDATE databases SET desired_state='suspended',suspension_reason=?,generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_json=NULL WHERE id=?",
     ).bind(reason, sleepGeneration, sleepGeneration, sleepOperation, f.id),
     env.DB.prepare(
       "UPDATE database_admission_epochs SET admission_revision=admission_revision+1,route_revision=route_revision+1 WHERE database_id=?",

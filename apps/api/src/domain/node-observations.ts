@@ -406,9 +406,9 @@ async function applyObservation(
   const runtimeChanged =
     wasReady &&
     (observation.state !== "ready" ||
-      !row.runtime_attestation_json ||
-      (JSON.parse(row.runtime_attestation_json) as { instance?: string })
-        .instance !== observation.instance?.toLowerCase());
+      !row.runtime_json ||
+      (JSON.parse(row.runtime_json) as { instance?: string }).instance !==
+        observation.instance?.toLowerCase());
   const execute = async (mutation?: AdmissionMutation) => {
     const guard = mutation?.guard(row.id),
       statements = new Statements(db, row, now, reportedAt, generation);
@@ -417,7 +417,7 @@ async function applyObservation(
         .prepare(
           `UPDATE databases SET observed_state=?,observed_power=?,
              observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,
-             runtime_attestation_json=CASE WHEN ?='ready' THEN ? ELSE NULL END,
+             runtime_json=CASE WHEN ?='ready' THEN ? ELSE NULL END,
              proven_sleep_json=CASE WHEN ?='asleep' THEN ? ELSE proven_sleep_json END,
              status_message=?,archiving_health=?,archiving_health_since=?,
              backup_observed_at=?,backup_health=?,backup_last_completed_at=?,updated_at=?
@@ -643,7 +643,7 @@ async function idleSleep(
       statements.list.push(
         env.DB.prepare(
           `UPDATE databases SET observed_state='provisioning',observed_power='hibernated',observed_generation=generation,
-             runtime_attestation_json=NULL,proven_sleep_json=?,status_message=?,archiving_health=?,archiving_health_since=?,
+             runtime_json=NULL,proven_sleep_json=?,status_message=?,archiving_health=?,archiving_health_since=?,
              backup_observed_at=?,backup_health=?,backup_last_completed_at=?
            WHERE id=? AND node_id=? AND generation=? AND updated_at=? AND power_operation=? AND desired_state='suspended'`,
         ).bind(

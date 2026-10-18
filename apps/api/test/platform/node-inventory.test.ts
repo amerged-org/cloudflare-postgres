@@ -131,7 +131,7 @@ it("keeps the enriched node list bounded and cursor ordered", async () => {
     sibling = newNodeId();
   await heard(f.node, {});
   await env.DB.prepare(
-    "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,platform_reserved_memory_mib,created_at,updated_at,node_uid) VALUES(?,?,?,1,8192,4000,128,?,?,?)",
+    "INSERT INTO nodes(id,region_id,hostname,ready,allocatable_memory_mib,allocatable_cpu_millicores,platform_reserved_memory_mib,created_at,updated_at,node_uid) VALUES(?,?,?,1,8192,4000,128,?,?,?)",
   )
     .bind(
       sibling,

@@ -246,7 +246,7 @@ it("refuses a move that cannot start and says why", async () => {
   const foreignNode = "nod_" + "b".repeat(20),
     now = new Date().toISOString();
   await env.DB.prepare(
-    "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,created_at,updated_at) VALUES (?,?,?,1,8192,2000,30,128,?,?)",
+    "INSERT INTO nodes(id,region_id,hostname,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,created_at,updated_at) VALUES (?,?,?,1,8192,2000,30,128,?,?)",
   )
     .bind(foreignNode, f.foreign, "foreign-node", now, now)
     .run();
@@ -426,7 +426,7 @@ it("starts as one order to the source and changes nothing else", async () => {
     const id = "nod_" + "c".repeat(20),
       now = new Date().toISOString();
     await env.DB.prepare(
-      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,created_at,updated_at) VALUES (?,?,?,1,8192,2000,30,128,?,?)",
+      "INSERT INTO nodes(id,region_id,hostname,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,created_at,updated_at) VALUES (?,?,?,1,8192,2000,30,128,?,?)",
     )
       .bind(id, f.region, "third-node", now, now)
       .run();

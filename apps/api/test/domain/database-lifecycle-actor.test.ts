@@ -156,7 +156,7 @@ async function commitReady(
     observed_at: Date.now(),
   });
   await env.DB.prepare(
-    "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation,runtime_attestation_json=? WHERE id=?",
+    "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation,runtime_json=? WHERE id=?",
   )
     .bind(JSON.stringify(runtime), f.id)
     .run();

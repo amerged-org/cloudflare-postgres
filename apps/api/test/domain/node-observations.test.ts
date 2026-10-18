@@ -67,7 +67,7 @@ describe("a database the node reports ready", () => {
       status_message: null,
     });
     expect(
-      JSON.parse((await row(db.id))!.runtime_attestation_json as string),
+      JSON.parse((await row(db.id))!.runtime_json as string),
     ).toMatchObject({
       database_id: db.id,
       node_id: f.node,
@@ -94,8 +94,7 @@ describe("a database the node reports ready", () => {
     ).toEqual(["accept"]);
     // The route names the unit in lower case.
     expect(
-      JSON.parse((await row(db.id))!.runtime_attestation_json as string)
-        .instance,
+      JSON.parse((await row(db.id))!.runtime_json as string).instance,
     ).toBe(instance.toLowerCase());
   });
 
@@ -151,7 +150,7 @@ describe("a database the node reports ready", () => {
       ).toEqual(["conflict"]);
     expect(await row(db.id)).toMatchObject({
       observed_state: "pending",
-      runtime_attestation_json: null,
+      runtime_json: null,
     });
     expect((await status(db.operation))!.status).not.toBe("succeeded");
     expect(await verdicts(await report(f, db.id, 1))).toEqual(["accept"]);
@@ -243,7 +242,7 @@ describe("a database the node is still building or cannot run", () => {
     expect(await row(db.id)).toMatchObject({
       observed_state: "provisioning",
       observed_power: "awake",
-      runtime_attestation_json: null,
+      runtime_json: null,
     });
   });
 });
@@ -335,7 +334,7 @@ describe("a database the node put to sleep", () => {
       observed_state: "provisioning",
       observed_power: "hibernated",
       observed_generation: 2,
-      runtime_attestation_json: null,
+      runtime_json: null,
     });
     expect(
       JSON.parse((await row(db.id))!.proven_sleep_json as string),

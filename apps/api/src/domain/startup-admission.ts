@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-import { SIDECAR } from "@pgcf/contracts";
-
 const identifier = (value: string) => {
   if (!/^[a-z][a-z0-9_]*$/.test(value))
     throw new Error("invalid_startup_sql_alias");
@@ -9,9 +7,10 @@ const identifier = (value: string) => {
 
 /** A database whose owned runtime stop is confirmed: the one predicate behind every "cold" decision. */
 export function stoppedSleeperSql(
-  database: string,
+  databaseAlias: string,
   acceptingStopInCurrentBatch: boolean,
 ): string {
+  const database = identifier(databaseAlias);
   // The observation batch records its lifecycle fact before completing this exact owned stop.
   // Both commit together; ordinary admission always requires the completed operation.
   const completed =
@@ -28,17 +27,4 @@ export function stoppedSleeperSql(
       AND ((${database}.suspension_reason='manual' AND cold_operation.kind='database.suspend')
         OR (${database}.suspension_reason='idle' AND cold_operation.kind='database.hibernate')))
 `;
-}
-
-/** A configured scheduling share consumes CPU until the owned runtime is confirmed stopped. */
-export function databaseCpuChargeSql(
-  databaseAlias = "d",
-  sizeAlias = "s",
-  acceptingStopInCurrentBatch = false,
-): string {
-  const database = identifier(databaseAlias),
-    size = identifier(sizeAlias);
-  const sleeping = stoppedSleeperSql(database, acceptingStopInCurrentBatch);
-  return `(CASE WHEN (${sleeping}) THEN 0
-    ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores} END)`;
 }

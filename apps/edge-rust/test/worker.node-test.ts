@@ -180,7 +180,7 @@ test(
             "INSERT INTO projects(id,name,created_at,updated_at) VALUES(?,'edge-rust',?,?)",
           ).bind(project, now, now),
           DB.prepare(
-            `INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,platform_reserved_memory_mib,storage_gib_total,created_at,updated_at,node_uid,last_observed_at,platform_reserved_cpu_millicores) VALUES(?,?,?,1,1,4096,2000,128,20,?,?,?,?,100)`,
+            `INSERT INTO nodes(id,region_id,hostname,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,platform_reserved_memory_mib,storage_gib_total,created_at,updated_at,node_uid,last_observed_at,platform_reserved_cpu_millicores) VALUES(?,?,?,1,1,4096,2000,128,20,?,?,?,?,100)`,
           ).bind(
             node,
             region,
@@ -191,7 +191,7 @@ test(
             now,
           ),
           DB.prepare(
-            `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,observed_generation,archive_path,runtime_attestation_json,created_at,updated_at) VALUES(?,?,?,?,'edge-rust','small','running','ready',2,2,?,?,?,?)`,
+            `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,observed_generation,archive_path,runtime_json,created_at,updated_at) VALUES(?,?,?,?,'edge-rust','small','running','ready',2,2,?,?,?,?)`,
           ).bind(
             database,
             project,

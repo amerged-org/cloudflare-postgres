@@ -371,6 +371,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Read the node's desired page",
     "node",
   ),
+  "GET /node/v1/credentials": route(
+    "getNodeCredentials",
+    "Read the node's route keyring and the token of its Tunnel",
+    "node",
+  ),
   "GET /node/v1/archive-credentials/{id}": route(
     "getNodeArchiveCredential",
     "Read a temporary R2 credential the node's desired page names",

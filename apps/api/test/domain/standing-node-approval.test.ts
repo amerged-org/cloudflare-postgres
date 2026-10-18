@@ -169,7 +169,7 @@ it("rechecks fresh regional membership before the first purchase and resumes the
     );
   const spare = newNodeId();
   await env.DB.prepare(
-    "INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) SELECT ?,region_id,?,1,1,8192,4000,60,128,100,last_observed_at,created_at,updated_at,? FROM nodes WHERE id=?",
+    "INSERT INTO nodes(id,region_id,hostname,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) SELECT ?,region_id,?,1,1,8192,4000,60,128,100,last_observed_at,created_at,updated_at,? FROM nodes WHERE id=?",
   )
     .bind(spare, `spare-${crypto.randomUUID()}`, crypto.randomUUID(), f.node)
     .run();

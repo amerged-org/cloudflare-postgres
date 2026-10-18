@@ -16,7 +16,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { NodeEnrollmentSeed } from "../../../packages/contracts/src/node-link.ts";
-import { installerParameters, renderUserData, userDataLimit, type InstallerParameters } from "./userdata.ts";
+import {
+  INSTALLER_CLOUD_CONFIG,
+  INSTALLER_SCRIPT,
+} from "../../../packages/contracts/src/node-installer-files.generated.ts";
+import {
+  installerParameters,
+  installerUserData,
+  renderUserData,
+  userDataLimit,
+  type InstallerParameters,
+} from "../../../packages/contracts/src/node-installer.ts";
 
 const template = readFileSync(new URL("cloud-config.yaml", import.meta.url), "utf8");
 const script = readFileSync(new URL("install.sh", import.meta.url), "utf8");
@@ -62,6 +72,12 @@ function decodedFile(userData: string, path: string): string {
   assert.ok(encoded, `${path} is in the userData`);
   return Buffer.from(encoded, "base64").toString("utf8");
 }
+
+test("the API renders the files the image ships with, byte for byte", () => {
+  assert.equal(INSTALLER_SCRIPT, script);
+  assert.equal(INSTALLER_CLOUD_CONFIG, template);
+  assert.equal(installerUserData(longest), renderUserData(template, script, longest));
+});
 
 test("the rendered installer stays below Contabo's 32 KiB userData limit", () => {
   const userData = renderUserData(template, script, longest);

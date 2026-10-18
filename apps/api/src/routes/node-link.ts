@@ -7,6 +7,7 @@ import {
   InstallerProgress,
   NODE_API_PATHS,
   INSTALLER_PROGRESS_PATH,
+  NodeCredentials,
   NodeDesiredPage,
   NodeDesiredQuery,
   NodeEnrollmentRequest,
@@ -23,6 +24,7 @@ import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import { archiveCredentialResponse } from "../domain/archive-credentials.ts";
 import { callingNode, nodeAuthentication } from "../domain/node-auth.ts";
+import { nodeCredentials } from "../domain/node-credentials.ts";
 import { desiredResponse } from "../domain/node-desired.ts";
 import { enrollNode, recordInstallerProgress } from "../domain/node-install.ts";
 import { nodeEvents, nodeUsage, nodeVolumes } from "../domain/node-intake.ts";
@@ -140,6 +142,19 @@ export function registerNodeLink(app: ApiApp): void {
     },
     async (c) =>
       desiredResponse(c, callingNode(c), NodeDesiredQuery.parse(c.req.query())),
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: NODE_API_PATHS.credentials,
+      tags,
+      security: node,
+      description:
+        "Reads what the node's gateway and its Tunnel need: the route keyring derived for this node and the token of its Tunnel, which is made, with its hostnames, at the first read. The secrets are in the body only and the response is never cached. The node reads it when its desired page names a newer revision than the one it applied.",
+      responses: nodeResponses(NodeCredentials),
+    },
+    async (c) => nodeCredentials(c, callingNode(c)),
   );
   register(
     app,
