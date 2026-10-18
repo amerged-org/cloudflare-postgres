@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { REFUSAL_BYTES, refusalCode } from "@pgcf/contracts/edge-policy";
+import {
+  ACCESS_CLIENT_ID_HEADER,
+  ACCESS_CLIENT_SECRET_HEADER,
+  ACCESS_SECRETS_INCOMPLETE,
+  REFUSAL_BYTES,
+  accessTokenState,
+  refusalCode,
+} from "@pgcf/contracts/edge-policy";
 import { ROUTE_TOKEN_HEADER } from "@pgcf/contracts/route-token";
 import type { Env } from "./env.ts";
 
@@ -41,6 +48,42 @@ export class GatewayRefusal extends Error {
   }
 }
 
+/**
+ * A gateway the Edge is not configured to reach: nothing was sent. `code` names the problem and
+ * never carries a value.
+ */
+export class GatewayConfigError extends Error {
+  readonly code: string;
+  constructor(code: string) {
+    super("invalid gateway configuration");
+    this.code = code;
+  }
+}
+
+/**
+ * The headers that present the Edge's Access service token to a gateway on the public network.
+ * None for a gateway on a service binding, which does not go through Access, and none without the
+ * token's secrets; one secret alone is a configuration error.
+ */
+export function accessHeaders(
+  region: GatewayRegion,
+  env: Env,
+): Record<string, string> {
+  if (region.gateway_binding !== null) return {};
+  const { ACCESS_CLIENT_ID: id, ACCESS_CLIENT_SECRET: secret } = env;
+  switch (accessTokenState(id, secret)) {
+    case "send":
+      return {
+        [ACCESS_CLIENT_ID_HEADER]: id!,
+        [ACCESS_CLIENT_SECRET_HEADER]: secret!,
+      };
+    case "incomplete":
+      throw new GatewayConfigError(ACCESS_SECRETS_INCOMPLETE);
+    default:
+      return {};
+  }
+}
+
 /** The transport seam, selected by the live edge-to-region transport spike. */
 export async function connectGateway(
   region: GatewayRegion,
@@ -57,7 +100,11 @@ export async function connectGateway(
   )
     throw new Error("invalid gateway configuration");
   const request = new Request(url, {
-    headers: { Upgrade: "websocket", [ROUTE_TOKEN_HEADER]: token },
+    headers: {
+      Upgrade: "websocket",
+      [ROUTE_TOKEN_HEADER]: token,
+      ...accessHeaders(region, env),
+    },
     redirect: "manual",
     signal,
   });

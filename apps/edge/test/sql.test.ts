@@ -569,3 +569,142 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     expect(await forwarded()).toHaveLength(2);
   });
 });
+
+describe("HTTP SQL behind Cloudflare Access", () => {
+  // Sentinels for the Access service token: they must reach the gateway and nothing else.
+  const accessId = `sentinel-id-${crypto.randomUUID()}.access`;
+  const accessSecret = `sentinel-secret-${crypto.randomUUID()}`;
+  const both = {
+    ACCESS_CLIENT_ID: accessId,
+    ACCESS_CLIENT_SECRET: accessSecret,
+  };
+  /** A gateway on the public network: without a service binding, so Access guards it. */
+  function open(mode?: string): DatabaseWakeAdmission & { ok: true } {
+    const admission = awake(mode);
+    return {
+      ...admission,
+      region: { ...admission.region, gateway_binding: null },
+    };
+  }
+  const accessHeaders = (request: Forwarded) =>
+    Object.keys(request.headers).filter((name) => name.startsWith("cf-access"));
+  const lastLog = () => JSON.parse(logs.mock.calls.at(-1)![0] as string);
+  /** Everything the Edge wrote or answered, as one string. */
+  async function leaks(response: Response): Promise<string> {
+    return JSON.stringify([...logs.mock.calls, await response.clone().text()]);
+  }
+
+  it("presents the service token to a public gateway, never what the caller sends", async () => {
+    const response = await post(
+      admitting(open(), both),
+      { query: "select 1" },
+      {
+        ...neonHeaders(),
+        "CF-Access-Client-Id": "caller-id",
+        "CF-Access-Client-Secret": "caller-secret",
+      },
+    );
+    expect(response.status).toBe(200);
+    const [request] = await forwarded();
+    expect(request!.headers["cf-access-client-id"]).toBe(accessId);
+    expect(request!.headers["cf-access-client-secret"]).toBe(accessSecret);
+    expect(request!.token).toBeTruthy();
+    const text = await leaks(response);
+    expect(text).not.toContain(accessId);
+    expect(text).not.toContain(accessSecret);
+  });
+
+  it("presents nothing without the secrets, whatever the caller sends, and nothing over a service binding", async () => {
+    const caller = {
+      ...neonHeaders(),
+      "CF-Access-Client-Id": "caller-id",
+      "CF-Access-Client-Secret": "caller-secret",
+    };
+    expect(
+      (await post(admitting(open()), { query: "select 1" }, caller)).status,
+    ).toBe(200);
+    expect(
+      (await post(admitting(awake(), both), { query: "select 1" }, caller))
+        .status,
+    ).toBe(200);
+    // Only one secret is no error where Access is not in the way.
+    expect(
+      (
+        await post(
+          admitting(awake(), { ACCESS_CLIENT_ID: accessId }),
+          { query: "select 1" },
+          caller,
+        )
+      ).status,
+    ).toBe(200);
+    const requests = await forwarded();
+    expect(requests).toHaveLength(3);
+    for (const request of requests) expect(accessHeaders(request)).toEqual([]);
+  });
+
+  it("refuses before sending anything when only one of the two secrets is set", async () => {
+    for (const one of [
+      { ACCESS_CLIENT_ID: accessId },
+      { ACCESS_CLIENT_SECRET: accessSecret },
+      { ACCESS_CLIENT_ID: accessId, ACCESS_CLIENT_SECRET: "" },
+    ]) {
+      const response = await post(admitting(open(), one), {
+        query: "insert",
+      });
+      // Not an unknown outcome (08007): the request was never sent.
+      expect(await refusal(response.clone())).toBe("08006");
+      expect(await forwarded()).toHaveLength(0);
+      expect(lastLog()).toMatchObject({
+        event: "sql_admission",
+        outcome: "08006",
+        config_error: "access_secrets_incomplete",
+      });
+      expect(lastLog().gateway_status).toBeUndefined();
+      const text = await leaks(response);
+      expect(text).not.toContain(accessId);
+      expect(text).not.toContain(accessSecret);
+    }
+  });
+
+  it("refuses before sending anything when a secret cannot be a header value", async () => {
+    const response = await post(
+      admitting(open(), {
+        ...both,
+        ACCESS_CLIENT_SECRET: `${accessSecret}\nbroken`,
+      }),
+      { query: "insert" },
+    );
+    expect(await refusal(response.clone())).toBe("08006");
+    expect(await forwarded()).toHaveLength(0);
+    const text = await leaks(response);
+    expect(text).not.toContain(accessId);
+    expect(text).not.toContain(accessSecret);
+  });
+
+  it("logs the status of an Access refusal, and a redirect to its login, as an unknown outcome", async () => {
+    for (const [mode, status] of [
+      ["status-401", 401],
+      ["status-403", 403],
+      ["status-530", 530],
+      ["access-login", 302],
+    ] as const) {
+      await testEnv.GATEWAY.fetch(`${gatewayOrigin}/reset`);
+      const response = await post(admitting(open(mode), both), {
+        query: "insert",
+      });
+      expect(await refusal(response.clone())).toBe("08007");
+      expect(lastLog()).toMatchObject({
+        outcome: "08007",
+        gateway_status: status,
+      });
+      expect(lastLog().gateway_error).toBeUndefined();
+      expect(lastLog().config_error).toBeUndefined();
+      // One request; the redirect to the login page was not followed.
+      expect(await forwarded()).toHaveLength(1);
+      const text = await leaks(response);
+      expect(text).not.toContain(accessId);
+      expect(text).not.toContain(accessSecret);
+      expect(text).not.toContain("free text");
+    }
+  });
+});

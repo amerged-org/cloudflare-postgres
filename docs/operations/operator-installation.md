@@ -57,6 +57,18 @@ is refused with `53300` "connection admission unavailable"), and `DATABASE_ACTOR
 which must equal the API Worker's value; the hint places only DatabaseActor objects created after
 it is set.
 
+Two optional Worker secrets, `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET`, are the Cloudflare
+Access service token that the Edge presents (headers `CF-Access-Client-Id` and
+`CF-Access-Client-Secret`) to a gateway on a public hostname, once Access guards it; the Access
+application's policy for the gateway hostnames must use the Service Auth action for this token.
+Set them as secrets (`wrangler secret put` or the API), never as variables. Set both or neither:
+without them the Edge sends nothing and an installation without Access works as before, and one
+alone refuses every connection and HTTP query to a public gateway with `08006` before anything is
+sent, and logs `config_error: "access_secrets_incomplete"` (never a value). A gateway on a service
+binding does not go through Access and never receives the token. An Access refusal (401, 403, or
+a redirect to the login page, which the Edge does not follow) shows in the log as the
+`gateway_status` of the refused connection.
+
 The Rust/Wasm replacement lives in `apps/edge-rust`. The common CI workflow builds it; it is not
 deployed. Build the selected source once using the Rust toolchain and `rustEdge` tools from
 `infra/platform/versions.lock.json`. Verify the pinned tool archives and exact members before

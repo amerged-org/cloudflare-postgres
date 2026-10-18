@@ -23,6 +23,21 @@ export default {
       text_frames: 0,
     };
     connections.push(connection);
+    // What Cloudflare answers for a request that Access or the Tunnel does not let through: a bare
+    // status with free text, or the redirect of a browser to the Access login page.
+    const refusal = /^status-(\d{3})$/.exec(url.searchParams.get("mode") ?? "");
+    if (refusal)
+      return new Response("Refused: free text the Edge must not log", {
+        status: Number(refusal[1]),
+      });
+    if (url.searchParams.get("mode") === "access-login")
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location:
+            "https://team.cloudflareaccess.com/cdn-cgi/access/login/gateway",
+        },
+      });
     if (url.pathname === "/sql") {
       // HTTP SQL: records the forwarded request and answers as the gateway would.
       connection.method = request.method;

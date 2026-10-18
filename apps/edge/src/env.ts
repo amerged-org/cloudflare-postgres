@@ -24,6 +24,12 @@ export interface Env {
   readonly BINDING_CONNECTION_RATE_LIMITER: RateLimit;
   readonly DATABASE_CONNECTION_RATE_LIMITER: RateLimit;
   readonly ROUTE_MASTER_KEYS: string;
+  /**
+   * The Cloudflare Access service token that the Edge presents to a gateway on the public network:
+   * both secrets or neither. A gateway on a service binding does not go through Access.
+   */
+  readonly ACCESS_CLIENT_ID?: string;
+  readonly ACCESS_CLIENT_SECRET?: string;
   /** Where the API creates DatabaseActor objects, e.g. "weur"; the Edge passes the same hint. */
   readonly DATABASE_ACTOR_LOCATION_HINT?: string;
   readonly [binding: string]: unknown;

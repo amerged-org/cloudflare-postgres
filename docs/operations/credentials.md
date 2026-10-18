@@ -27,6 +27,10 @@ only after the gateways accept it. Existing routing tokens
 expire within their configured short window. Verify a fresh connection before retiring the old
 key. Do not change an agent key as a side effect of a redeploy.
 
+For the Edge's Access service token (`ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET`), rotate the
+token in Zero Trust with a grace period, set the new secret on the Edge, check a fresh connection
+and an HTTP query, then revoke the old one.
+
 For `CREDENTIAL_KEYS`, adding a new active key ID does not make old ciphertext disposable. Retain
 all key IDs referenced by database roles, deleted-source archives and older D1 exports. Back up
 the complete keyring before changing it. Re-encryption and automatic rotation
