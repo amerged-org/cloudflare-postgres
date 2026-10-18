@@ -523,18 +523,22 @@ export const DatabaseIdleTime = z
   .meta({ id: "DatabaseIdleTime" });
 export type DatabaseIdleTime = z.infer<typeof DatabaseIdleTime>;
 
+/** A node reads only its own region's archives, so a restore stays in the source's region. */
+const RestoreRegion = RegionId.describe(
+  "The source's region, which is also the default. Another region is refused with 409 `region_unavailable`.",
+).optional();
 export const DatabaseRestore = z
   .discriminatedUnion("mode", [
     z.strictObject({
       mode: z.literal("full"),
       name: DatabaseName,
-      region_id: RegionId.optional(),
+      region_id: RestoreRegion,
     }),
     z.strictObject({
       mode: z.literal("pitr"),
       name: DatabaseName,
       target_time: Timestamp,
-      region_id: RegionId.optional(),
+      region_id: RestoreRegion,
     }),
   ])
   .meta({ id: "DatabaseRestore" });

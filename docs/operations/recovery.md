@@ -22,9 +22,8 @@ recovers the same customer EU1.
 2. Submit `POST /v1/databases/{source-id}/restore` with a persistent `Idempotency-Key` and either
    `{"mode":"full","name":"recovered"}` or
    `{"mode":"pitr","name":"recovered","target_time":"<UTC timestamp>"}`.
-   Optional `region_id` selects a target region; omission keeps the source region. For example,
-   `{"mode":"full","name":"recovered","region_id":"<target-region-id>"}` restores into healthy
-   capacity in that region after the source-read credentials below have been installed.
+   The target is in the source's region: a node reads only its own region's archives, so another
+   `region_id` is refused with 409 `region_unavailable`.
 3. Save the returned target ID and operation ID. Repeating the same request and key returns the
    same target; a transport failure does not justify issuing a new key or replaying SQL writes.
 4. Poll the operation. The source stays unchanged. The target uses new storage and its own
@@ -47,34 +46,6 @@ to simulate expiration.
 The v1 catalog is limited to 16 pages, 16,000 objects, 64 backup metadata files and 64 KiB per
 metadata file. A newer WAL timeline needs a completed base backup on that timeline. Unsupported,
 missing or ambiguous coverage is refused rather than creating an empty database.
-
-### Cross-region source access
-
-Complete the target region's node installation and capacity admission first. Before requesting
-restore, create the target/source relationship through the authenticated PGCF API described in
-[the credential runbook](credentials.md#cross-region-restore-source-credentials). It binds the
-source region ID to the exact registered bucket, HTTPS endpoint and supplied bucket-scoped
-Object Read Only S3 credential. Cloudflare stores encrypted custody and publishes the source-read
-map only to the authenticated target region. Provider IAM read-only permission needs a separate
-live check; accepting a credential is not proof of that permission.
-
-The target's write credential, archive identity and temporary administration HMAC remain tied to
-the target region. Same-region restore uses its ordinary regional credential and needs no
-cross-region relationship.
-
-Use the relationship's expected revision and a stable idempotency key for source-key rotation.
-Unfinished referencing restores block rotation; successful restored targets receive a new
-desired generation through the existing reconcile path. A missing or drifted entry of the
-authoritative desired map fails closed for that source.
-
-Cross-region acceptance requires a real Dev run: verify the source commit markers over the normal
-Cloudflare SQL endpoint, promotion, nonsuperuser application access, removal of temporary
-administration and a new target backup/WAL archive. Record duration and the last restored commit
-in the ULTRA plan; configuration or local checks alone do not establish acceptance. Preserve source
-data, archives and physical identities until an explicitly authorized loss drill or cleanup.
-A healthy cross-region restore proves archive portability and target recovery; it does not prove
-an actual server-loss or outage recovery duration. That separate gate needs an authorized real
-failure, the actual restored transaction boundary and measured recovery time.
 
 ## Lost node
 
@@ -106,9 +77,7 @@ Restore secret values without replacing the retained agent identity. Recover Pos
 R2 into separate targets. Validate SQL and routing before opening traffic.
 
 Restoring a daily D1 export into a scratch D1 database is open as go-live gate G6 of the ULTRA
-plan; the daily artifacts have so far only been read back. A cross-region restore into a later
-region installs its scoped source-read credential map only after that region is Ready; its
-credentials must not alter the source archive.
+plan; the daily artifacts have so far only been read back.
 
 ## Integrator migration
 

@@ -6,7 +6,6 @@ import {
   fixture,
   cleanupFixtures,
   desiredPage,
-  grantCredential,
   nodeKeyPair,
   refusal,
   request,
@@ -22,7 +21,7 @@ import type { Env } from "../../src/env.ts";
 import { cleanupRetainedArchives } from "../../src/domain/retained-archives.ts";
 import { keyring } from "../../src/crypto/keyring.ts";
 import type { RoleRow } from "../../src/domain/rows.ts";
-import { archiveDestinationPath, newNodeId } from "@pgcf/contracts";
+import { newNodeId } from "@pgcf/contracts";
 import { placePendingDatabases } from "../../src/domain/node-capacity.ts";
 import { withAdmissionMutation } from "../../src/domain/admission-mutations.ts";
 import { addNode } from "./fixtures.ts";
@@ -210,13 +209,13 @@ it("restores with the resources of its source", async () => {
     storage_gib: 12,
   });
 });
-it("restores a source catalog into a separate target region without changing source placement or credentials", async () => {
+it("refuses a restore into another region, whose nodes cannot read the source's archive, and writes nothing", async () => {
   const f = await archived(),
     targetNode = newNodeId(),
     targetKey = await nodeKeyPair(),
-    targetUid = crypto.randomUUID(),
     now = new Date().toISOString(),
     bucket = "pgcf-api-us-test";
+  // The other region has a bucket and a node that reports and could take the database.
   await env.DB.batch([
     env.DB.prepare(
       "UPDATE regions SET backup_bucket=?,backup_endpoint_url=? WHERE id=?",
@@ -230,7 +229,7 @@ it("restores a source catalog into a separate target region without changing sou
       now,
       now,
       now,
-      targetUid,
+      crypto.randomUUID(),
       targetKey.publicKey,
       now,
     ),
@@ -242,108 +241,44 @@ it("restores a source catalog into a separate target region without changing sou
       [f.foreign]: { binding: "ARCHIVE_US", bucket },
     }),
   };
-  const source = await env.DB.prepare("SELECT * FROM databases WHERE id=?")
-    .bind(f.id)
-    .first();
-  const body = {
-      mode: "full",
-      name: "cross-region-restored",
-      region_id: f.foreign,
-    },
-    path = `/v1/databases/${f.id}/restore`;
-  const response = await overridden(
-    path,
-    f.integrator,
-    body,
-    mapping,
-    "cross-region-restore",
-  );
-  expect(response.status).toBe(202);
-  const result = await response.json<{
-    target_database: { id: string; region_id: string };
-    operation: { id: string };
-  }>();
-  expect(result.target_database.region_id).toBe(f.foreign);
-  const target = await env.DB.prepare(
-    "SELECT region_id,node_id,archive_path,storage_generation FROM databases WHERE id=?",
-  )
-    .bind(result.target_database.id)
-    .first();
-  expect(target).toEqual({
-    region_id: f.foreign,
-    node_id: targetNode,
-    archive_path: archiveDestinationPath(
-      bucket,
-      f.foreign,
-      result.target_database.id,
-      2,
-      result.operation.id,
+  const count = async () =>
+    (await env.DB.prepare("SELECT COUNT(*) n FROM databases").first<number>(
+      "n",
+    ))!;
+  const databases = await count(),
+    source = await env.DB.prepare("SELECT * FROM databases WHERE id=?")
+      .bind(f.id)
+      .first();
+  // A node reads only archives of its own region, so the restore could never build there.
+  expect(
+    await refusal(
+      await overridden(
+        `/v1/databases/${f.id}/restore`,
+        f.integrator,
+        { mode: "full", name: "cross-region-restored", region_id: f.foreign },
+        mapping,
+        "cross-region-restore",
+      ),
     ),
-    storage_generation: 2,
-  });
+  ).toMatchObject({ status: 409, reason: "region_unavailable" });
+  expect(await count()).toBe(databases);
   expect(
     await env.DB.prepare("SELECT * FROM databases WHERE id=?")
       .bind(f.id)
       .first(),
   ).toEqual(source);
-  const replay = await overridden(
-    path,
-    f.integrator,
-    body,
-    mapping,
-    "cross-region-restore",
-  );
-  expect(await replay.json()).toEqual(result);
+  // The source's own region stays the place to restore into.
   expect(
     (
       await overridden(
-        path,
+        `/v1/databases/${f.id}/restore`,
         f.integrator,
-        { ...body, region_id: f.region },
+        { mode: "full", name: "same-region-restored", region_id: f.region },
         mapping,
-        "cross-region-restore",
+        "same-region-restore",
       )
     ).status,
-  ).toBe(409);
-  // The node of the target region reads the restore from the source's archive.
-  await grantCredential(result.target_database.id, {
-    path: (source as { archive_path: string }).archive_path,
-    access: "read_only",
-  });
-  const targetPage = await desiredPage({
-    region: f.foreign,
-    admin: f.admin,
-    node: targetNode,
-    nodeUid: targetUid,
-    nodeKey: targetKey.privateKey,
-  });
-  expect(
-    targetPage.databases.find((d) => d.id === result.target_database.id)
-      ?.origin,
-  ).toMatchObject({
-    kind: "restore",
-    source: {
-      database_id: f.id,
-      path: (source as { archive_path: string }).archive_path,
-    },
-  });
-  // The source's own node never sees the target.
-  expect(
-    (await desiredPage(f)).databases.some(
-      (d) => d.id === result.target_database.id,
-    ),
-  ).toBe(false);
-  expect(
-    (
-      await overridden(
-        path,
-        f.integrator,
-        { ...body, name: "missing-target", region_id: "missing-test" },
-        mapping,
-        "missing-target-region",
-      )
-    ).status,
-  ).toBe(409);
+  ).toBe(202);
 });
 
 it("restores into one separate target on replay with credentials encrypted for its ID", async () => {
@@ -401,17 +336,23 @@ it("restores into one separate target on replay with credentials encrypted for i
     });
   expect(await decrypt(target!)).toBe(await decrypt(source!));
   expect(target!.password_ciphertext).not.toBe(source!.password_ciphertext);
-  await grantCredential(result.target_database.id, {
-    path: (await env.DB.prepare("SELECT archive_path FROM databases WHERE id=?")
-      .bind(f.id)
-      .first<string>("archive_path"))!,
-    access: "read_only",
-  });
+  // The target's page issues the node a credential that reads the source's archive.
   expect(
     (await desiredPage(f)).databases.find(
       (d) => d.id === result.target_database.id,
     )?.origin,
-  ).toMatchObject({ kind: "restore", source: { database_id: f.id } });
+  ).toMatchObject({
+    kind: "restore",
+    source: {
+      database_id: f.id,
+      path: (await env.DB.prepare(
+        "SELECT archive_path FROM databases WHERE id=?",
+      )
+        .bind(f.id)
+        .first<string>("archive_path"))!,
+      credential: { id: expect.stringMatching(/^crd_[a-z0-9]{20}$/) },
+    },
+  });
   // The node restored the database and reports it ready; that ends the restore.
   expect(await verdicts(await report(f, result.target_database.id, 1))).toEqual(
     ["accept"],

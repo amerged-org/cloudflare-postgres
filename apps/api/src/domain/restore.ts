@@ -122,29 +122,27 @@ export async function restoreDatabase(
           "The deleted source archive is outside recovery retention",
           { reason: "archive_expired" },
         );
-      const targetRegionId = body.region_id ?? source.region_id;
-      const [sourceRegion, region, size] = await Promise.all([
+      // A node reads archives of its own region only (ULTRA plan 7.3), so a restore into another
+      // region could never build: the target is in the source's region.
+      if ((body.region_id ?? source.region_id) !== source.region_id)
+        throw new ApiError(
+          "conflict",
+          "A restore goes into the source's own region",
+          { reason: "region_unavailable" },
+        );
+      const [region, size] = await Promise.all([
         c.env.DB.prepare(
           "SELECT id,backup_bucket,backup_endpoint_url FROM regions WHERE id=?",
         )
           .bind(source.region_id)
           .first<RegionRow>(),
-        c.env.DB.prepare(
-          "SELECT id,backup_bucket,backup_endpoint_url FROM regions WHERE id=?",
-        )
-          .bind(targetRegionId)
-          .first<RegionRow>(),
         c.env.DB.prepare("SELECT * FROM size_classes WHERE id=? AND enabled=1")
           .bind(source.size_class_id)
           .first<SizeRow>(),
       ]);
-      if (!sourceRegion || !size)
+      if (!region || !size)
         throw new ApiError("conflict", "Source region or size is unavailable", {
           reason: "source_unavailable",
-        });
-      if (!region)
-        throw new ApiError("conflict", "Restore target region is unavailable", {
-          reason: "region_unavailable",
         });
       // The target keeps what the source runs with: its size class and its own resources.
       const own = ownResources(source),
@@ -152,15 +150,10 @@ export async function restoreDatabase(
       assertResourcesAllowed(
         effective,
         own,
-        await regionBounds(c.env.DB, targetRegionId),
+        await regionBounds(c.env.DB, region.id),
       );
-      const selected = regionArchive(c.env, sourceRegion),
-        prefix = validatedArchivePrefix(
-          source,
-          sourceRegion,
-          selected.bucketName,
-        );
-      regionArchive(c.env, region);
+      const selected = regionArchive(c.env, region),
+        prefix = validatedArchivePrefix(source, region, selected.bucketName);
       const backup = await restoreBackup(
         selected.bucket,
         prefix,
@@ -200,7 +193,7 @@ export async function restoreDatabase(
       );
       const decidedAt = Date.now(),
         node = choosePlacement(
-          await placementNodes(c.env.DB, targetRegionId, decidedAt),
+          await placementNodes(c.env.DB, region.id, decidedAt),
           effective,
           decidedAt,
         );
@@ -246,7 +239,7 @@ export async function restoreDatabase(
         databaseInsertStatement(c.env.DB, {
           body: {
             project_id: source.project_id,
-            region_id: targetRegionId,
+            region_id: region.id,
             size_class_id: source.size_class_id,
             sleep_after_seconds: source.sleep_after_seconds ?? null,
             name: body.name,

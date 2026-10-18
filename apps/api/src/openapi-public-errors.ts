@@ -88,12 +88,6 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/resource-profiles/{id}/revisions/{revision}": [400, 401, 404, 500],
   "GET /v1/databases/{id}/resource-profile": [400, 401, 404, 500],
   "PUT /v1/databases/{id}/resource-profile": [400, 401, 404, 409, 500, 503],
-  "GET /v1/regions/{target}/archive-sources/{source}": [
-    400, 401, 403, 404, 500,
-  ],
-  "PUT /v1/regions/{target}/archive-sources/{source}": [
-    400, 401, 403, 404, 409, 500,
-  ],
   "GET /v1/regions/{id}/capacity-policy": [400, 401, 403, 404, 500],
   "PUT /v1/regions/{id}/capacity-policy": [400, 401, 403, 404, 409, 500],
   // A dry-run decision for an absent policy/region is 200/action=unconfigured.
@@ -135,7 +129,6 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "PUT /v1/resource-profiles/{id}/rollout",
   "PUT /v1/resource-profiles/{id}",
   "PUT /v1/databases/{id}/resource-profile",
-  "PUT /v1/regions/{target}/archive-sources/{source}",
 ]);
 
 /** withIdempotency refuses an omitted key on these routes (400) before submitting durable work, and

@@ -183,6 +183,9 @@ CREATE TABLE archive_credentials (
 );
 CREATE INDEX archive_credentials_scope_idx ON archive_credentials(node_id, archive_path, access, issued_at DESC);
 CREATE INDEX archive_credentials_expiry_idx ON archive_credentials(expires_at, id);
+-- A node holds no bucket-wide key, and a restore stays in its source's region, whose nodes read
+-- the source through the credentials above; the stored read keys of other regions' archives go.
+DROP TABLE region_archive_sources;
 
 -- When the Worker last applied the recovery window to a database's current archive.
 CREATE TABLE backup_retention_runs (

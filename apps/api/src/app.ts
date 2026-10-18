@@ -20,7 +20,6 @@ import { registerOperationalHealth } from "./routes/health.ts";
 import { registerRegionConfiguration } from "./routes/region-configuration.ts";
 import { registerFleetReleases } from "./routes/fleet-releases.ts";
 import { registerResourceProfiles } from "./routes/resource-profiles.ts";
-import { registerRegionArchiveSources } from "./routes/region-archive-sources.ts";
 import { registerNodeLink } from "./routes/node-link.ts";
 import { nodeLookup } from "./domain/node-auth.ts";
 import { registerNodes } from "./routes/nodes.ts";
@@ -67,7 +66,6 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/databases/:id/resource-profile",
   "/v1/regions",
   "/v1/regions/:id/configuration",
-  "/v1/regions/:target/archive-sources/:source",
   "/v1/fleet/releases/:id",
   "/v1/regions/:id/release",
   "/v1/nodes/:id/release",
@@ -358,7 +356,6 @@ export function createApp(): ApiApp {
   registerRegionConfiguration(app);
   registerFleetReleases(app);
   registerResourceProfiles(app);
-  registerRegionArchiveSources(app);
   registerApiDocuments(app);
   app.notFound((c) => apiError(c, "not_found", "Route not found"));
   return app;

@@ -1,29 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Real local D1/Actor policy boundaries; controlled metadata is not Dev runtime acceptance.
 import { env } from "cloudflare:workers";
-import {
-  DatabaseWithOperation,
-  newNodeId,
-  newOperationId,
-} from "@pgcf/contracts";
+import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import {
   AdmissionMutation,
   withAdmissionMutation,
 } from "../../src/domain/admission-mutations.ts";
 import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
-import {
-  fixture,
-  cleanupFixtures,
-  nodeKeyPair,
-  report,
-  request,
-} from "./fixtures.ts";
-import { reports } from "./node-samples.ts";
-afterEach(async () => {
-  await env.DB.prepare("DELETE FROM region_archive_sources").run();
-  await cleanupFixtures();
-});
+import { fixture, cleanupFixtures, report, request } from "./fixtures.ts";
+afterEach(cleanupFixtures);
 const actor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
 async function ready() {
@@ -49,118 +35,6 @@ async function epoch(id: string) {
 async function trigger(sql: string) {
   await env.DB.exec(sql.replace(/\n\s*/g, " "));
 }
-
-it("archive-source custody rotation fences only established referencing restore targets", async () => {
-  const f = await ready(),
-    at = new Date().toISOString(),
-    node = newNodeId(),
-    key = await nodeKeyPair(),
-    foreignNode = {
-      node,
-      nodeUid: crypto.randomUUID(),
-      nodeKey: key.privateKey,
-    };
-  await env.DB.prepare(
-    "INSERT INTO nodes(id,region_id,k8s_node_name,node_uid,public_key,enrolled_at,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,?,1,4096,2000,30,128,100,?,?,?)",
-  )
-    .bind(
-      node,
-      f.foreign,
-      `archive-target-${node.slice(4)}`,
-      foreignNode.nodeUid,
-      key.publicKey,
-      at,
-      at,
-      at,
-      at,
-    )
-    .run();
-  await reports(node);
-  const createTarget = async (name: string) => {
-    const response = await request("/v1/databases", f.integrator, "POST", {
-      project_id: f.project,
-      region_id: f.foreign,
-      name,
-      size_class_id: f.size,
-    });
-    expect(response.status).toBe(202);
-    return DatabaseWithOperation.parse(await response.json()).database.id;
-  };
-  const target = await createTarget("referencing_restore"),
-    other = await createTarget("unrelated_target"),
-    op = newOperationId();
-  const source = await env.DB.prepare(
-    "SELECT archive_path,storage_generation FROM databases WHERE id=?",
-  )
-    .bind(f.id)
-    .first<{ archive_path: string; storage_generation: number }>();
-  await env.DB.batch([
-    env.DB.prepare(
-      "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,'database.restore','succeeded',?,?,1,?,?,?)",
-    ).bind(op, f.project, target, at, at, at),
-    env.DB.prepare(
-      "UPDATE databases SET storage_generation=2,archive_path=?,observed_state='ready',observed_generation=generation WHERE id=?",
-    ).bind(
-      `s3://${env.ARCHIVE_BUCKET_NAME}/${f.foreign}/${target}/g2-${op}`,
-      target,
-    ),
-    env.DB.prepare(
-      "INSERT INTO database_restores(target_database_id,operation_id,source_database_id,source_archive_path,source_storage_generation,backup_id,verified_at,created_at) VALUES(?,?,?,?,?,'20261013T100000',?,?)",
-    ).bind(
-      target,
-      op,
-      f.id,
-      source!.archive_path,
-      source!.storage_generation,
-      at,
-      at,
-    ),
-  ]);
-  expect((await report(foreignNode, other, 1)).status).toBe(200);
-  await publishDatabaseAdmission(env, target);
-  await publishDatabaseAdmission(env, other);
-  const before = (await epoch(target))!,
-    otherBefore = await epoch(other);
-  await trigger(
-    `CREATE TRIGGER archive_reference_fence BEFORE UPDATE OF generation ON databases WHEN NEW.id='${target}' AND NOT EXISTS(SELECT 1 FROM database_admission_epochs e WHERE e.database_id=NEW.id AND e.mutation_id IS NOT NULL AND e.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'archive reference write lacks admission fence'); END`,
-  );
-  try {
-    const registered = await env.DB.prepare(
-      "SELECT backup_bucket,backup_endpoint_url FROM regions WHERE id=?",
-    )
-      .bind(f.region)
-      .first<{ backup_bucket: string; backup_endpoint_url: string }>();
-    expect(
-      (
-        await request(
-          `/v1/regions/${f.foreign}/archive-sources/${f.region}`,
-          f.admin,
-          "PUT",
-          {
-            expected_revision: 0,
-            bucket: registered!.backup_bucket,
-            endpoint_url: registered!.backup_endpoint_url,
-            credentials: {
-              access_key_id: crypto.randomUUID(),
-              secret_access_key: crypto.randomUUID(),
-            },
-          },
-        )
-      ).status,
-    ).toBe(200);
-    expect((await epoch(target))?.route_revision).toBe(
-      before.route_revision + 1,
-    );
-    expect(await epoch(other)).toEqual(otherBefore);
-    expect(await actor(target).admit(target, "app")).toEqual({
-      ok: false,
-      sqlstate: "57P03",
-    });
-    expect((await actor(other).admit(other, "app")).ok).toBe(true);
-  } finally {
-    await env.DB.exec("DROP TRIGGER archive_reference_fence");
-  }
-});
 
 it("selective region membership closes only affected Actors while unrelated admission stays open", async () => {
   const f = await ready(),

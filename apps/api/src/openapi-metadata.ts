@@ -311,16 +311,6 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Assign a resource profile to a database",
     "project",
   ),
-  "GET /v1/regions/{target}/archive-sources/{source}": route(
-    "getRegionArchiveSource",
-    "Read a regional archive source binding",
-    "admin",
-  ),
-  "PUT /v1/regions/{target}/archive-sources/{source}": route(
-    "setRegionArchiveSource",
-    "Configure a source archive for regional restores",
-    "admin",
-  ),
   "GET /v1/regions/{id}/capacity-policy": route(
     "getRegionCapacityPolicy",
     "Read regional capacity and purchase policy",
