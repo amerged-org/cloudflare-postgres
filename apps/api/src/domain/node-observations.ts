@@ -789,7 +789,10 @@ async function failedWake(
   return failed.meta.changes;
 }
 
-/** `POST /node/v1/observations` (plan 5.3): what a node reports of its databases and its orders. */
+/**
+ * `POST /node/v1/observations` (plan 5.3): what a node reports of its databases and its orders,
+ * and the events of its own log.
+ */
 export async function nodeObservations(
   c: ApiContext,
   node: NodeCaller,
@@ -819,5 +822,20 @@ export async function nodeObservations(
     orders += await failedWake(c.env, node, result);
   // The results of the other orders, the moves they unlock and the recovery points of the databases.
   orders += await applyLifecycleObservations(c.env, node.id, report);
+  // The node's own log lines (plan 9.9): one line of Workers Logs each, kept nowhere else. A log
+  // key is never replaced by a field of the same name. A report the API applied but whose answer the
+  // node never got is sent again, so a line can appear twice: a query that counts events counts
+  // identical lines once.
+  for (const { event, at, database_id, fields } of report.events ?? [])
+    console.log(
+      JSON.stringify({
+        ...fields,
+        event: "node_event",
+        node_id: node.id,
+        node_event: event,
+        at,
+        ...(database_id === undefined ? {} : { database_id }),
+      }),
+    );
   return c.json({ databases, orders });
 }

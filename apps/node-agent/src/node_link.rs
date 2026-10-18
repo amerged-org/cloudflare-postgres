@@ -115,15 +115,24 @@ fn public_key_canonical(key: &Value) -> bool {
 }
 
 /// `NodeObservationReport`: each database and each order once; a failed order, and only a failed
-/// order, names its reason; and the rules of every database's observation.
+/// order, names its reason; the rules of every database's observation; and the fields of an event
+/// stay within their bound.
 fn observation_rules(report: &Value) -> bool {
     let (databases, orders) = (array(&report["databases"]), array(&report["orders"]));
+    let fields_max = constant("NODE_REPORT_EVENT_FIELDS_MAX")
+        .as_u64()
+        .expect("generated bound");
     unique(databases, |db| db["id"].as_str())
         && unique(orders, |order| order["operation"].as_str())
         && databases.iter().all(database_observation_rules)
         && orders
             .iter()
             .all(|order| (order["status"] == "failed") == order.get("reason").is_some())
+        && array(&report["events"]).iter().all(|event| {
+            event["fields"]
+                .as_object()
+                .is_none_or(|fields| fields.len() as u64 <= fields_max)
+        })
 }
 
 /// `NodeDatabaseObservation`: a ready database names its unit's instance and has a DONE base

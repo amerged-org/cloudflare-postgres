@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
     host,
-    policy::{Failure, GatewayRegion, refusal_code},
+    policy::{Access, Failure, GatewayRegion, access, refusal_code},
     runtime::Shared,
 };
 use futures_util::future::{Either, select};
@@ -49,6 +49,37 @@ impl Sender {
                     .dyn_into::<web_sys::Response>()
                     .map_err(|_| ())
             }
+        }
+    }
+}
+
+/// Presents the Edge's Access service token to a gateway on the public network. A gateway on a
+/// service binding does not go through Access. One secret alone refuses the request before
+/// anything is sent; the log names the problem, never a value.
+pub fn present_access(
+    headers: &web_sys::Headers,
+    region: &GatewayRegion,
+    env: &Env,
+    timings: &Shared,
+) -> Result<(), Failure> {
+    if region.gateway_binding.is_some() {
+        return Ok(());
+    }
+    let secret = |name: &str| env.secret(name).ok().map(|value| value.to_string());
+    let (id, secret) = (secret("ACCESS_CLIENT_ID"), secret("ACCESS_CLIENT_SECRET"));
+    match access(id.as_deref(), secret.as_deref()) {
+        Access::Absent => Ok(()),
+        Access::Incomplete => {
+            timings.borrow_mut().config_error = Some(wire("accessSecretsIncomplete"));
+            Err(Failure::gateway())
+        }
+        Access::Send { id, secret } => {
+            headers
+                .set(wire("accessClientIdHeader"), id)
+                .map_err(|_| Failure::gateway())?;
+            headers
+                .set(wire("accessClientSecretHeader"), secret)
+                .map_err(|_| Failure::gateway())
         }
     }
 }
@@ -107,6 +138,7 @@ pub async fn connect(
     headers
         .set(wire("routeHeader"), token)
         .map_err(|_| Failure::gateway())?;
+    present_access(&headers, region, env, timings)?;
     let init = RequestInit::new();
     init.set_headers(&headers);
     init.set_redirect(RequestRedirect::Manual);

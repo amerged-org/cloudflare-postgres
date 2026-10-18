@@ -640,6 +640,56 @@ describe("what a node reports", () => {
     ).toBe(true);
   });
 
+  it("carries at most 64 events whose names are snake_case and whose fields are numbers or short tokens", () => {
+    const accepted = (events: unknown) =>
+      NodeObservationReport.safeParse({
+        observed_at: now,
+        databases: [],
+        orders: [],
+        events,
+      }).success;
+    const event = {
+      at: now,
+      event: "wake",
+      database_id: id,
+      fields: { step_start: 61, outcome: "started", total_ms: 70.5 },
+    };
+    // A report with nothing to tell carries no events.
+    expect(
+      NodeObservationReport.safeParse({
+        observed_at: now,
+        databases: [],
+        orders: [],
+      }).success,
+    ).toBe(true);
+    expect(accepted([event])).toBe(true);
+    expect(accepted([{ ...event, database_id: undefined, fields: {} }])).toBe(
+      true,
+    );
+    expect(accepted(Array.from({ length: 64 }, () => event))).toBe(true);
+    expect(accepted(Array.from({ length: 65 }, () => event))).toBe(false);
+    const fields = (count: number) =>
+      Object.fromEntries(Array.from({ length: count }, (_, i) => [`f${i}`, i]));
+    expect(accepted([{ ...event, fields: fields(16) }])).toBe(true);
+    expect(accepted([{ ...event, fields: fields(17) }])).toBe(false);
+    for (const broken of [
+      { event: "Wake" },
+      { event: "a".repeat(49) },
+      { at: "2026-10-17T12:00:00Z" },
+      { database_id: "not-an-id" },
+      { fields: undefined },
+      { fields: { Step: 1 } },
+      { fields: { outcome: "has a space" } },
+      { fields: { outcome: "/etc/passwd" } },
+      { fields: { outcome: "a".repeat(65) } },
+      { fields: { ok: true } },
+      { fields: { ok: { nested: 1 } } },
+      { fields: { ok: Number.POSITIVE_INFINITY } },
+      { extra: 1 },
+    ])
+      expect(accepted([{ ...event, ...broken }])).toBe(false);
+  });
+
   it("samples memory, CPU, the pool, the volumes and the archive within their bounds", () => {
     const sample = {
       observed_at: now,

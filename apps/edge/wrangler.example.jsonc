@@ -63,5 +63,9 @@
   },
   "secrets": {
     "required": ["ROUTE_MASTER_KEYS"],
+    // Optional, and only as secrets (`wrangler secret put` or the API), never as vars:
+    // ACCESS_CLIENT_ID and ACCESS_CLIENT_SECRET, the Cloudflare Access service token that the Edge
+    // presents to a gateway on a public hostname. Set both or neither: one alone refuses the
+    // connection (08006). A gateway on a service binding does not go through Access.
   },
 }

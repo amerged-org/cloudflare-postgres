@@ -13,6 +13,29 @@ export const DECOY_SALT_DOMAIN = "pgcf.edge.decoy-scram-salt/v1\n";
 export const REFUSAL_BYTES = 512;
 
 /**
+ * The request headers of a Cloudflare Access service token, which the Edge presents to a gateway
+ * on the public network.
+ */
+export const ACCESS_CLIENT_ID_HEADER = "CF-Access-Client-Id";
+export const ACCESS_CLIENT_SECRET_HEADER = "CF-Access-Client-Secret";
+/** The `config_error` an Edge logs when it has one of the token's two secrets and not the other. */
+export const ACCESS_SECRETS_INCOMPLETE = "access_secrets_incomplete";
+
+/**
+ * What an Edge does with its two Access secrets: `send` both when both are set, `none` when
+ * neither is (an installation without Access), and `incomplete` for one alone, which is a
+ * configuration error that refuses the connection. An empty value is not set.
+ */
+export function accessTokenState(
+  id: unknown,
+  secret: unknown,
+): "send" | "none" | "incomplete" {
+  const set = (value: unknown) => typeof value === "string" && value !== "";
+  if (set(id) && set(secret)) return "send";
+  return set(id) || set(secret) ? "incomplete" : "none";
+}
+
+/**
  * The error code of a gateway's refusal, `{"error": "<snake_case>"}`; nothing else of its answer
  * is kept, so no free text reaches a log. A body that is not exactly that has no code.
  */

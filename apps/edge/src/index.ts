@@ -13,7 +13,11 @@ import {
 } from "./admission.ts";
 import type { Env } from "./env.ts";
 import { decoyResponse } from "./decoy.ts";
-import { connectGateway, GatewayRefusal } from "./gateway.ts";
+import {
+  connectGateway,
+  GatewayConfigError,
+  GatewayRefusal,
+} from "./gateway.ts";
 
 /** Milliseconds of each admission stage that ran, logged with the admission. */
 interface Timings extends AdmissionTimings {
@@ -21,6 +25,8 @@ interface Timings extends AdmissionTimings {
   /** A gateway that refused the upgrade: its status and its error code (`{"error": …}`). */
   gateway_status?: number;
   gateway_error?: string;
+  /** A configuration that kept the Edge from reaching the gateway: its name, never a value. */
+  config_error?: string;
   /** When the gateway stage began, for the handler to read; never logged. */
   gateway_started?: number;
 }
@@ -123,6 +129,8 @@ export default {
       if (error instanceof GatewayRefusal) {
         timings.gateway_status = error.status;
         if (error.code !== undefined) timings.gateway_error = error.code;
+      } else if (error instanceof GatewayConfigError) {
+        timings.config_error = error.code;
       }
       const failure =
         error instanceof AdmissionFailure

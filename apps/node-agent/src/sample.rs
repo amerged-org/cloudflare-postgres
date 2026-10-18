@@ -42,6 +42,13 @@ pub fn cpu_times(stat: &str, ticks_per_second: u64) -> Option<CpuTimes> {
     })
 }
 
+/// The whole seconds since boot of `/proc/uptime`, whose first field is the uptime. `None` for a
+/// text that is not `/proc/uptime`.
+pub fn uptime_seconds(uptime: &str) -> Option<u64> {
+    let seconds: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then_some(seconds as u64)
+}
+
 /// The busy CPU in millicores since the previous reading: the share of the clock ticks that were
 /// not idle, times the cores. Without a previous reading the whole time since boot is averaged.
 pub fn busy_millicores(previous: Option<CpuTimes>, now: CpuTimes) -> u64 {
@@ -114,6 +121,15 @@ mod tests {
     use super::*;
 
     const STAT: &str = "cpu  4705 150 1120 16250 520 10 55 20 0 0\ncpu0 1175 37 280 4062 130 2 14 5 0 0\ncpu1 1176 38 280 4063 130 3 14 5 0 0\ncpu2 1177 37 280 4062 130 2 13 5 0 0\ncpu3 1177 38 280 4063 130 3 14 5 0 0\nintr 12345 0 0\nctxt 999\nbtime 1\n";
+
+    #[test]
+    fn the_uptime_is_the_whole_seconds_since_boot_of_proc_uptime() {
+        assert_eq!(uptime_seconds("1234.56 4321.00\n"), Some(1234));
+        assert_eq!(uptime_seconds("0.99 0.00\n"), Some(0));
+        for broken in ["", "up 12", "-3.0 1.0", "NaN 1", "inf 1"] {
+            assert_eq!(uptime_seconds(broken), None, "{broken:?}");
+        }
+    }
 
     #[test]
     fn the_times_of_proc_stat_are_busy_and_total_ticks_over_the_cores() {

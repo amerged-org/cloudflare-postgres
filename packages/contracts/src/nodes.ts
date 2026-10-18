@@ -72,8 +72,19 @@ export const NodeAdditionRequest = z.discriminatedUnion("mode", [
   }),
 ]);
 export type NodeAdditionRequest = z.infer<typeof NodeAdditionRequest>;
+/**
+ * The labels of a node's two public hostnames. Cloudflare Access guards each family with a
+ * wildcard (`pgcf-node-*.<domain>`, `pgcf-shell-*.<domain>`), and the documentation does not say
+ * which of two overlapping wildcard applications wins, so neither prefix may start with the other.
+ */
+export const NODE_GATEWAY_LABEL_PREFIX = "pgcf-node-";
+export const NODE_SHELL_LABEL_PREFIX = "pgcf-shell-";
 export function nodeAdditionHostname(id: string): string {
-  return `pgcf-node-${NodeId.parse(id).slice(4)}`;
+  return `${NODE_GATEWAY_LABEL_PREFIX}${NodeId.parse(id).slice(4)}`;
+}
+/** The label of the node's shell hostname, which exists only while the Worker's `NODE_SHELL_HOSTNAME` is `true`. */
+export function nodeShellHostname(id: string): string {
+  return `${NODE_SHELL_LABEL_PREFIX}${NodeId.parse(id).slice(4)}`;
 }
 export const NodeAdditionIntent = z
   .strictObject({

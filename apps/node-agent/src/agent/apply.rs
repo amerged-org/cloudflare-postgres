@@ -978,15 +978,22 @@ mod tests {
         .await;
         assert_eq!(rig.machine.limits(&id).unwrap().cpu_millicores, 500);
         assert_eq!(rig.machine.volumes()[0].1, 2 << 30);
-        assert_eq!(
-            rig.core
+        // The admission learns of the resize after the state is kept, through its own channel.
+        let started = std::time::Instant::now();
+        let awake_memory_mib = loop {
+            let awake = rig
+                .core
                 .admission
                 .snapshot()
                 .await
                 .unwrap()
-                .awake_memory_mib,
-            512
-        );
+                .awake_memory_mib;
+            if awake == 512 || started.elapsed() > std::time::Duration::from_secs(30) {
+                break awake;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(awake_memory_mib, 512);
         assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
         let mut ticket = Rig::ticket(&rig.entry_for(&db));
         ticket.operation = "op_xxxxxxxxxxxxxxxxxxxx".into();

@@ -96,6 +96,16 @@
       },
       { "text": "﻿{\"error\":\"route_refused\"}", "expected": null }
     ],
+    "access": [
+      { "id": null, "secret": null, "expected": "none" },
+      { "id": "", "secret": "", "expected": "none" },
+      { "id": "id-vector", "secret": "secret-vector", "expected": "send" },
+      { "id": "id-vector", "secret": null, "expected": "incomplete" },
+      { "id": null, "secret": "secret-vector", "expected": "incomplete" },
+      { "id": "id-vector", "secret": "", "expected": "incomplete" },
+      { "id": "", "secret": "secret-vector", "expected": "incomplete" },
+      { "id": 1, "secret": "secret-vector", "expected": "incomplete" }
+    ],
     "sql": {
       "connections": [
         {

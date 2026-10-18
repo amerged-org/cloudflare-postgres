@@ -35,7 +35,12 @@ import {
   type AdmissionTimings,
 } from "./admission.ts";
 import type { Env } from "./env.ts";
-import { readRefusal, type GatewayRegion } from "./gateway.ts";
+import {
+  accessHeaders,
+  GatewayConfigError,
+  readRefusal,
+  type GatewayRegion,
+} from "./gateway.ts";
 
 /** Milliseconds of each stage that ran, logged with the request. */
 interface Timings extends AdmissionTimings {
@@ -48,6 +53,8 @@ interface Timings extends AdmissionTimings {
   gateway_status?: number;
   /** The error code of a gateway's refusal (`{"error": …}`), when it sent one. */
   gateway_error?: string;
+  /** A configuration that kept the Edge from reaching the gateway: its name, never a value. */
+  config_error?: string;
 }
 
 function json(body: unknown, status: number): Response {
@@ -121,21 +128,29 @@ async function forward(
       throw new SqlFailure("08006", "gateway connection failed");
     send = (request) => (binding as Fetcher).fetch(request);
   }
+  // Built before the send: a request that cannot be built was never sent, so it is no unknown
+  // outcome.
+  let gatewayRequest: Request;
+  try {
+    gatewayRequest = new Request(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        [ROUTE_TOKEN_HEADER]: token,
+        ...accessHeaders(region, env),
+      },
+      body,
+      redirect: "manual",
+      signal,
+    });
+  } catch (error) {
+    if (error instanceof GatewayConfigError) timings.config_error = error.code;
+    throw new SqlFailure("08006", "gateway connection failed");
+  }
   const started = Date.now();
   let response: Response;
   try {
-    response = await send(
-      new Request(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          [ROUTE_TOKEN_HEADER]: token,
-        },
-        body,
-        redirect: "manual",
-        signal,
-      }),
-    );
+    response = await send(gatewayRequest);
   } catch {
     throw unknownOutcome();
   } finally {

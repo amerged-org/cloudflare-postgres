@@ -5,6 +5,7 @@ import {
   ACCOUNT,
   DOMAIN,
   GATEWAY,
+  LEGACY_SHELL,
   NAME,
   NODE,
   SHELL,
@@ -118,6 +119,48 @@ it("removes the shell's ingress rule and DNS record of a node on the next call o
   ).toEqual([]);
   expect(published(api)).toEqual([CNAME(GATEWAY)]);
 });
+
+it("keeps the shell out of the wildcard that guards the gateways: its hostname is not made from the gateway's", () => {
+  expect(GATEWAY.startsWith("pgcf-node-")).toBe(true);
+  expect(SHELL.startsWith("pgcf-shell-")).toBe(true);
+  expect(SHELL.startsWith("pgcf-node-")).toBe(false);
+  expect(LEGACY_SHELL.startsWith("pgcf-node-")).toBe(true);
+});
+
+it.each([false, true])(
+  "deletes the DNS record of the shell's former hostname, whether the shell is on (%s) or not, and writes no ingress rule for it",
+  async (shell) => {
+    const api = cloudflare({
+      tunnels: [{ id: TUNNEL, name: NAME }],
+      records: [
+        { id: "rec0", ...CNAME(GATEWAY) },
+        { id: "rec1", ...CNAME(LEGACY_SHELL) },
+      ],
+    });
+    await ensureNodeTunnel(services(api.fetcher, shell), NODE);
+    // The Tunnel's configuration is replaced whole, so the former rule goes with it.
+    const hostnames = (
+      api.configurations.get(TUNNEL) as {
+        config: { ingress: { hostname?: string }[] };
+      }
+    ).config.ingress.flatMap((rule) => rule.hostname ?? []);
+    expect(hostnames).toEqual(shell ? [GATEWAY, SHELL] : [GATEWAY]);
+    expect(published(api)).toEqual(
+      shell ? [CNAME(GATEWAY), CNAME(SHELL)] : [CNAME(GATEWAY)],
+    );
+    // A second call finds nothing of the former name and changes no record.
+    const calls = api.calls.length;
+    await ensureNodeTunnel(services(api.fetcher, shell), NODE);
+    expect(
+      api.calls
+        .slice(calls)
+        .filter((c) => c.method === "POST" || c.method === "DELETE"),
+    ).toEqual([]);
+    expect(
+      api.calls.slice(calls).filter((c) => c.url.includes("/dns_records/")),
+    ).toEqual([]);
+  },
+);
 
 it("finds the Tunnel it made before, creates nothing again and corrects a record that points elsewhere", async () => {
   const api = cloudflare({

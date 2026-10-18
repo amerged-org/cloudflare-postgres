@@ -23,6 +23,7 @@ mod linux {
         machine::{Node, restore_runtime},
         notify::notify,
         release,
+        sample::uptime_seconds,
         service::{Intervals, Service, ServiceConfig, gateway_owner},
         storage,
         timing::emit_event,
@@ -95,7 +96,11 @@ mod linux {
             service = start(node, &layout) => service?,
             () = &mut stop => return Ok(()),
         };
-        emit_event(json!({"event": "agent_started"}));
+        // The seconds since boot tell a node that restarted from an agent that did.
+        let uptime = std::fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|text| uptime_seconds(&text));
+        emit_event(json!({"event": "agent_started", "uptime_s": uptime}));
         tokio::select! {
             () = &mut stop => {}
             // A release that changes this binary was installed (plan 9.3): exit, and systemd
