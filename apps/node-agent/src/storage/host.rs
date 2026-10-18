@@ -146,6 +146,16 @@ pub fn mount_table() -> io::Result<String> {
     std::fs::read_to_string("/proc/self/mountinfo")
 }
 
+/// The minor number of the block device at `path`, which `/dev/mapper` makes a link to.
+pub fn block_minor(path: &str) -> io::Result<u32> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.file_type().is_block_device() {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    Ok(libc::minor(metadata.rdev()))
+}
+
 /// ext4's count of errors on a mounted device-mapper device (`/sys/fs/ext4/dm-<minor>`).
 pub fn ext4_errors(minor: u32) -> io::Result<u64> {
     std::fs::read_to_string(format!("/sys/fs/ext4/dm-{minor}/errors_count"))?

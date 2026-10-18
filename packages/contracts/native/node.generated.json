@@ -1567,7 +1567,17 @@
                         "minimum": 0,
                         "maximum": 600000
                       },
-                      "queue_wait": {
+                      "volume_check": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
+                      "repair_check": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
+                      "mount": {
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 600000
@@ -1577,7 +1587,17 @@
                         "minimum": 0,
                         "maximum": 600000
                       },
-                      "mount": {
+                      "config": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
+                      "archive": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
+                      "queue_wait": {
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 600000

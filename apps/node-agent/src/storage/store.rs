@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `Storage`: the pool, the volumes and their recovery, on this node. Every operation reads what
 //! lvm2, `dmsetup` and the kernel report now and decides from that; nothing but the latest pool
-//! sample is kept in memory, so an agent restart loses nothing.
+//! sample and the last volume list is kept in memory, so an agent restart loses nothing. Only a
+//! wake's two questions (`exists`, `needs_repair`) answer from the list, and only for a volume it
+//! shows as there and not suspect; any other volume is read from lvm2 again.
 use super::{
     CommandRunner, Config, Error, NoRoom, Output, Policy, PoolSample, ReserveAction, SystemRunner,
-    VolumeId,
+    VOLUME_LIST_MAX_AGE, VolumeId,
     commands::{self, FS_TAG, RESERVE_FREED_TAG, SUSPECT_TAG},
     host,
     ids::dm_name,
+    listing::Listing,
     lvm::{self, GroupStep, LogicalVolume, PoolStep},
     mountinfo::{self, Mount},
     pool::{self, parse_pool, parse_thin_mapped},
@@ -15,16 +18,23 @@ use super::{
 };
 use std::{
     fs,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     slice,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Instant,
 };
 
 /// A volume is a whole number of extents; the volume group is made with lvm2's 4 MiB.
 const EXTENT_BYTES: u64 = 4 << 20;
+
+/// What the kernel says of a volume's device without a process: its minor number, and ext4's
+/// error count on that minor.
+struct Kernel {
+    minor: fn(&str) -> io::Result<u32>,
+    ext4_errors: fn(u32) -> io::Result<u64>,
+}
 
 pub struct Storage<R = SystemRunner> {
     runner: R,
@@ -32,6 +42,8 @@ pub struct Storage<R = SystemRunner> {
     latest: Mutex<Option<PoolSample>>,
     /// Serializes everything that changes the group, the pool or a volume.
     changes: Mutex<()>,
+    listing: Listing,
+    kernel: Kernel,
 }
 
 fn check_size(size_bytes: u64) -> Result<(), Error> {
@@ -48,6 +60,11 @@ impl<R: CommandRunner> Storage<R> {
             config,
             latest: Mutex::new(None),
             changes: Mutex::new(()),
+            listing: Listing::new(VOLUME_LIST_MAX_AGE),
+            kernel: Kernel {
+                minor: host::block_minor,
+                ext4_errors: host::ext4_errors,
+            },
         }
     }
     pub fn config(&self) -> &Config {
@@ -63,7 +80,12 @@ impl<R: CommandRunner> Storage<R> {
         self.changes.lock().unwrap_or_else(PoisonError::into_inner)
     }
     fn run(&self, command: Vec<String>) -> Result<Output, Error> {
-        let output = self.runner.run(&command)?;
+        let output = self.runner.run(&command);
+        // Whatever it answered: a command that failed may have changed some of what it was told.
+        if commands::changes_volumes(&command) {
+            self.listing.changed();
+        }
+        let output = output?;
         if output.code != 0 {
             return Err(Error::Command {
                 program: command[0].clone(),
@@ -73,8 +95,14 @@ impl<R: CommandRunner> Storage<R> {
         }
         Ok(output)
     }
-    fn read_lvs(&self) -> Result<Vec<LogicalVolume>, Error> {
-        lvm::parse_lvs(&self.run(commands::lvs(&self.config))?.stdout)
+    /// The volumes now, from lvm2. The reading is kept for a wake's questions.
+    fn read_lvs(&self) -> Result<Arc<Vec<LogicalVolume>>, Error> {
+        let read = self.listing.begin();
+        let lvs = Arc::new(lvm::parse_lvs(
+            &self.run(commands::lvs(&self.config))?.stdout,
+        )?);
+        self.listing.keep(read, &lvs);
+        Ok(lvs)
     }
     fn read_group(&self) -> Result<lvm::VolumeGroup, Error> {
         lvm::parse_vgs(&self.run(commands::vgs())?.stdout)?
@@ -284,8 +312,22 @@ impl<R: CommandRunner> Storage<R> {
         })
     }
 
-    /// Whether the database's volume of this generation exists on the node.
+    /// What the recent list and the kernel say of the volume, without a process: whether it is
+    /// tagged as suspect, and the minor number of its device. `None` when the list is old or
+    /// changed, does not show the volume as this database's, or the kernel has no device for it.
+    fn listed(&self, id: &VolumeId) -> Option<(bool, u32)> {
+        let lvs = self.listing.recent()?;
+        let suspect = self.volume(&lvs, id).ok()?.has_tag(SUSPECT_TAG);
+        let minor = (self.kernel.minor)(&commands::device(&self.config, id)).ok()?;
+        Some((suspect, minor))
+    }
+
+    /// Whether the database's volume of this generation exists on the node. A yes can come from
+    /// the recent list; a no, and any doubt, is read from lvm2.
     pub fn exists(&self, id: &VolumeId) -> Result<bool, Error> {
+        if self.listed(id).is_some() {
+            return Ok(true);
+        }
         match self.volume(&self.read_lvs()?, id) {
             Ok(_) => Ok(true),
             Err(Error::Missing) => Ok(false),
@@ -294,8 +336,15 @@ impl<R: CommandRunner> Storage<R> {
     }
 
     /// Whether the volume must be repaired (`recover_volume`) before its database starts again:
-    /// the one question a wake asks about a volume, without reading every volume's space.
+    /// the one question a wake asks about a volume, without reading every volume's space. A
+    /// volume the recent list shows as not suspect, and whose filesystem is mounted, is decided
+    /// by ext4's error count alone; the tag, and any doubt, is read from lvm2.
     pub fn needs_repair(&self, id: &VolumeId) -> Result<bool, Error> {
+        if let Some((false, minor)) = self.listed(id)
+            && let Ok(errors) = (self.kernel.ext4_errors)(minor)
+        {
+            return Ok(errors > 0);
+        }
         if self.volume(&self.read_lvs()?, id)?.has_tag(SUSPECT_TAG) {
             return Ok(true);
         }
@@ -686,6 +735,159 @@ mod tests {
         storage.runner.0.store(true, Ordering::Relaxed);
         assert!(matches!(storage.poll_pool(), Err(Error::Command { .. })));
         assert_eq!(storage.room(&policy), Err(NoRoom::Unobserved));
+    }
+
+    const LVS: &str = include_str!("fixtures/lvs-volumes.json");
+    const LISTED: &str = "a1b2c3d4e5f6g7h8i9j0";
+
+    /// Answers `lvs` with a recorded report and every other command with success, and keeps
+    /// the programs it was asked to run.
+    struct Listed(String, Mutex<Vec<String>>);
+
+    impl Listed {
+        fn new(lvs: &str) -> Self {
+            Self(lvs.into(), Mutex::default())
+        }
+        fn ran(&self, program: &str) -> usize {
+            let ran = self.1.lock().unwrap();
+            ran.iter().filter(|ran| *ran == program).count()
+        }
+    }
+    impl CommandRunner for Listed {
+        fn run(&self, command: &[String]) -> io::Result<Output> {
+            self.1.lock().unwrap().push(command[0].clone());
+            Ok(Output {
+                code: 0,
+                stdout: if command[0] == "lvs" {
+                    self.0.clone()
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// A storage whose kernel has every volume's device at minor 7 with `errors` errors on it.
+    fn storage_with(lvs: &str, errors: fn(u32) -> io::Result<u64>) -> Storage<Listed> {
+        let mut storage = Storage::new(Listed::new(lvs), Config::default());
+        storage.kernel = Kernel {
+            minor: |_| Ok(7),
+            ext4_errors: errors,
+        };
+        storage
+    }
+    fn clean_storage() -> Storage<Listed> {
+        storage_with(LVS, |_| Ok(0))
+    }
+    fn listed_volume() -> VolumeId {
+        VolumeId::new(LISTED, 1).unwrap()
+    }
+
+    #[test]
+    fn a_wake_reads_the_volume_list_once_and_then_asks_the_kernel() {
+        let storage = clean_storage();
+        let id = listed_volume();
+        for _ in 0..3 {
+            assert!(storage.exists(&id).unwrap());
+            assert!(!storage.needs_repair(&id).unwrap());
+        }
+        assert_eq!(storage.runner.ran("lvs"), 1);
+    }
+
+    #[test]
+    fn the_kernels_error_count_decides_a_listed_volume_without_lvm2() {
+        let storage = storage_with(LVS, |minor| Ok(u64::from(minor)));
+        let id = listed_volume();
+        assert!(storage.exists(&id).unwrap());
+        assert!(storage.needs_repair(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), 1);
+    }
+
+    /// Only a yes comes from the list: a volume it does not show may have been made since.
+    #[test]
+    fn a_volume_the_list_does_not_show_is_read_from_lvm2_every_time() {
+        let storage = clean_storage();
+        let missing = VolumeId::new("z1b2c3d4e5f6g7h8i9j0", 1).unwrap();
+        for read in 1..=3 {
+            assert!(!storage.exists(&missing).unwrap());
+            assert!(matches!(
+                storage.needs_repair(&missing),
+                Err(Error::Missing)
+            ));
+            assert_eq!(storage.runner.ran("lvs"), 2 * read);
+        }
+        // Another volume's generation is another volume.
+        let other = VolumeId::new(LISTED, 2).unwrap();
+        assert!(!storage.exists(&other).unwrap());
+    }
+
+    /// The tag is read from lvm2 before a wake is refused for it.
+    #[test]
+    fn a_volume_the_list_shows_as_suspect_is_read_again_before_it_is_refused() {
+        let suspect = LVS.replace(
+            "pgcf.db.a1b2c3d4e5f6g7h8i9j0,pgcf.fs,pgcf.gen.1",
+            "pgcf.db.a1b2c3d4e5f6g7h8i9j0,pgcf.fs,pgcf.gen.1,pgcf.suspect",
+        );
+        let storage = storage_with(&suspect, |_| Ok(0));
+        let id = listed_volume();
+        assert!(storage.needs_repair(&id).unwrap());
+        assert!(storage.needs_repair(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), 2);
+        // That it exists is no question of the tag.
+        assert!(storage.exists(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), 2);
+    }
+
+    #[test]
+    fn a_device_or_filesystem_the_kernel_does_not_show_falls_back_to_lvm2() {
+        let id = listed_volume();
+        let mut storage = clean_storage();
+        storage.kernel.minor = |_| Err(io::Error::from(io::ErrorKind::NotFound));
+        assert!(storage.exists(&id).unwrap());
+        assert!(!storage.needs_repair(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), 2);
+        // Not mounted: ext4 has no entry for the device. The volume is not mounted, so it is
+        // not damaged.
+        let storage = storage_with(LVS, |_| Err(io::Error::from(io::ErrorKind::NotFound)));
+        assert!(storage.exists(&id).unwrap());
+        assert!(!storage.needs_repair(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), 2);
+    }
+
+    #[test]
+    fn a_list_older_than_its_bound_is_read_again() {
+        let mut storage = clean_storage();
+        storage.listing = Listing::new(Duration::ZERO);
+        let id = listed_volume();
+        assert!(storage.exists(&id).unwrap());
+        assert!(!storage.needs_repair(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), 2);
+    }
+
+    #[test]
+    fn a_command_that_changes_a_volume_drops_the_list() {
+        let storage = clean_storage();
+        let id = listed_volume();
+        assert!(storage.exists(&id).unwrap());
+        assert!(storage.exists(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), 1);
+        storage
+            .remove_volume(
+                &id,
+                Removal::DatabaseDeleted {
+                    storage_generation: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(storage.runner.ran("lvremove"), 1);
+        // The removal read the list itself, and the command that followed made it old.
+        let read = storage.runner.ran("lvs");
+        assert!(storage.exists(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), read + 1);
+        // A command that only reads leaves the list.
+        assert!(storage.exists(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), read + 1);
     }
 
     #[test]

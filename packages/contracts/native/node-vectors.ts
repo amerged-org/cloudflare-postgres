@@ -281,7 +281,18 @@ const wake = {
   generation: 5,
   operation,
   outcome: "started",
-  phases_ms: { admission: 1, pg_control: 2, start: 61, release: 1 },
+  phases_ms: {
+    admission: 9,
+    volume_check: 1,
+    repair_check: 1,
+    mount: 1,
+    pg_control: 2,
+    config: 1,
+    archive: 1,
+    queue_wait: 1,
+    start: 61,
+    release: 1,
+  },
 };
 const usageRow = {
   database: id,

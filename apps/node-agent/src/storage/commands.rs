@@ -25,6 +25,15 @@ pub const RESERVE_FREED_TAG: &str = "pgcf.reserve0";
 /// stays until the volume is repaired, so a restart of the agent or of the node keeps it.
 pub const SUSPECT_TAG: &str = "pgcf.suspect";
 
+/// Whether the command may change what `lvs` reports: every lvm2 command does but its reports.
+pub fn changes_volumes(command: &[String]) -> bool {
+    let program = command.first().map_or("", String::as_str);
+    ["lv", "vg", "pv"]
+        .iter()
+        .any(|family| program.starts_with(family))
+        && !["lvs", "vgs", "pvs"].contains(&program)
+}
+
 fn report(program: &str, fields: &str, target: Option<&str>) -> Vec<String> {
     let mut words = vec![program.to_string()];
     words.extend(REPORT.iter().map(|word| word.to_string()));
@@ -310,6 +319,44 @@ mod tests {
             line(trim(&config, &id())),
             "fstrim /var/lib/pgcf/db/a1b2c3d4e5f6g7h8i9j0"
         );
+    }
+
+    /// The list of volumes is dropped after exactly these: every command of the storage is here.
+    #[test]
+    fn only_lvm2_commands_but_its_reports_may_change_a_volume() {
+        let (config, id) = (Config::default(), id());
+        let ids = std::slice::from_ref(&id);
+        for command in [
+            pvcreate(&config),
+            vgcreate(&config),
+            activate(&config),
+            pool_create(&config, 125 << 30),
+            error_when_full(&config),
+            volume_create(&config, &id, 1 << 30),
+            volumes_add_tag(&config, ids, SUSPECT_TAG),
+            volume_delete_tag(&config, &id, SUSPECT_TAG),
+            volume_extend(&config, &id, 2 << 30),
+            volume_remove(&config, &id),
+        ] {
+            assert!(changes_volumes(&command), "{command:?}");
+        }
+        for command in [
+            vgs(),
+            pvs(),
+            lvs(&config),
+            dm_status_pool(),
+            dm_table_pool(),
+            dm_status_thin(),
+            mkfs(&config, &id),
+            resize_fs(&config, &id),
+            fsck(&config, &id),
+            replay_journal(&config, &id),
+            reserve(&config, &id, 0),
+            trim(&config, &id),
+            vec![],
+        ] {
+            assert!(!changes_volumes(&command), "{command:?}");
+        }
     }
 
     #[test]
