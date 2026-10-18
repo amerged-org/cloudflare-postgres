@@ -2,7 +2,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env.ts";
 import { cronErrorCode } from "./domain/cron-health.ts";
-import { runCronWatchdog } from "./domain/infrastructure-alerts.ts";
 
 export const CRON_WATCHDOG_INTERVAL_MS = 60_000;
 
@@ -22,6 +21,9 @@ export class CronWatchdog extends DurableObject<Env> {
     // Scheduled first, so a failing or slow evaluation can never end the chain.
     await this.ctx.storage.setAlarm(Date.now() + CRON_WATCHDOG_INTERVAL_MS);
     try {
+      // The alert domain loads with the first alarm, not with the object.
+      const { runCronWatchdog } =
+        await import("./domain/infrastructure-alerts.ts");
       await runCronWatchdog(this.env);
     } catch (error) {
       console.error(

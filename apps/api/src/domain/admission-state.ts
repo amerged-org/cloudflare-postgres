@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
-  DatabaseId,
   DatabaseRegionRoute,
   DatabaseRuntime,
-  NodeId,
-  RoleName,
-  Timestamp,
-} from "@pgcf/contracts";
+} from "@pgcf/contracts/database-admission";
+import { DatabaseId, NodeId, RoleName } from "@pgcf/contracts/ids";
+import { Timestamp } from "@pgcf/contracts/timestamp";
 import { z } from "zod";
 
 const Revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);

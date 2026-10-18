@@ -7,6 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./ids": "./src/ids.ts",
+    "./timestamp": "./src/timestamp.ts",
     "./database-admission": "./src/database-admission.ts",
     "./edge-policy": "./src/edge-policy.ts",
     "./edge-sql": "./src/edge-sql.ts",
