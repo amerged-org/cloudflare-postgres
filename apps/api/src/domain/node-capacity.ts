@@ -135,7 +135,7 @@ export async function placePendingDatabases(
  * The next capacity step of a region (ULTRA plan 9.7). Waiting databases are placed where they fit
  * first. A node is added only when no node fits the waiting database, or the smallest size class
  * when none waits, and every node that should report does: nodes that went quiet are not a reason
- * to buy.
+ * to buy, and neither is a node whose placement an open maintenance cycle holds closed.
  */
 export async function runNodeCapacity(
   env: Env,
@@ -224,6 +224,18 @@ export async function runNodeCapacity(
     nodes = await placementNodes(env.DB, regionId, now);
   if (choosePlacement(nodes, need, now) !== null)
     return { ...result, action: waiting ? "placement_pending" : "idle" };
+  // A closure that an open maintenance order holds ends with the cycle, and the node stays: the
+  // shortage it causes is not a reason to buy.
+  if (
+    await env.DB.prepare(
+      `SELECT 1 FROM lifecycle_orders o JOIN nodes n ON n.id=o.node_id
+      WHERE n.region_id=? AND n.lost_at IS NULL AND o.type='maintenance' AND o.closed_at IS NULL
+        AND o.placement_closed_at=n.database_placement_closed_at LIMIT 1`,
+    )
+      .bind(regionId)
+      .first()
+  )
+    return { ...result, action: "maintenance" };
   if (
     nodes.some(
       (node) =>

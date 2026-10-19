@@ -349,9 +349,18 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   name=version…`, and cloudflared's `.deb` as a file whose sha256 it checked: the image changes the
   `nftables` conffile. The image's apt sources name its own snapshot and the PGDG archive; the
   agent writes the release's snapshot into the `URIs:` of `/etc/apt/sources.list.d/trixie.sources`.
-  The node reboots if a kernel image, `libc6`, `systemd`, `libsystemd0` or `udev` changed. After
-  the packages, or after the boot, it runs `pgcf-agent check` of the installed release and answers
-  the order.
+  Then it purges the installed packages the lock does not name, with `dpkg --purge`, so that the
+  node has the lock's packages and no others and its hello says the release's digest. Never a kernel
+  image (Debian keeps the previous one for the boot menu, and the digest leaves idle ones out),
+  never a package that `dpkg-query` marks essential or protected (Debian marks `login`, `libgcc-s1`
+  and `systemd-sysv` protected), never a name that is not a package name, and nothing at all for a
+  lock that names no kernel image. Dpkg refuses a package that an installed package depends on; the
+  cycle then fails with `packages_not_installed`.
+  The node reboots if a kernel image, `libc6`, `systemd`, `libsystemd0` or `udev` changed, right
+  after the install and before any purge: the agent runs the cycle again for the open order once it
+  is up, finds nothing to install, purges, and a refused purge then fails the order on the new
+  kernel. After the purge, or after the boot, it runs `pgcf-agent check` of the installed release
+  and answers the order.
 
 ## Security
 
@@ -385,6 +394,15 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
 - **Journal.** [journald](mkosi.extra/usr/lib/systemd/journald.conf.d/pgcf.conf) keeps at most
   1 GiB, at least 2 GiB free and 14 days on the 8 GiB root, and syncs to disk every 15 s instead of
   every five minutes, so that the minutes before a freeze are in the journal after the reboot.
+  After every reboot the agent posts the last 1,000 lines of the previous boot from `pgcf-agent`,
+  `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, PID 1 and the kernel (`journalctl
+  --boot=-1`, never the units of the databases or of the backup jobs, and an event line of the agent
+  only as far as the observation report carries it), which the API keeps for 30 days, one report
+  per boot, and an administrator reads at `GET /v1/nodes/{id}/diagnostics`. On request
+  (`POST /v1/nodes/{id}/diagnostics`) the agent also reads the journal or the kernel's lines, the
+  boots, the failed units, the socket units, the listeners, the pressure figures or the thin pool,
+  each a fixed command without a shell, and posts the result (plan 9.9,
+  [recovery.md](../../docs/operations/recovery.md)).
 
 ## Installing a node
 

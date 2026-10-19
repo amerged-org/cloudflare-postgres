@@ -10,7 +10,7 @@ use super::{
     upload_log::UploadLog,
 };
 use crate::credentials::{Credential, Credentials};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     io,
@@ -389,8 +389,7 @@ async fn read_line(stream: &mut UnixStream) -> Option<Vec<u8>> {
     tokio::time::timeout(READ_BOUND, read).await.ok().flatten()
 }
 
-/// A line of the agent's log about a failed job. The command's stderr is cut short and holds no
-/// part of the credential.
+/// Writes the line of the agent's log about a failed job.
 pub(crate) fn log_failed_job(
     event: &str,
     database_id: &str,
@@ -398,12 +397,30 @@ pub(crate) fn log_failed_job(
     outcome: &Outcome,
     credential: &Credential,
 ) {
+    crate::timing::emit_event(failed_job_line(
+        event,
+        database_id,
+        name,
+        outcome,
+        credential,
+    ));
+}
+
+/// The line of the agent's log about a failed job. The command's stderr is cut short and holds no
+/// part of the credential.
+pub(crate) fn failed_job_line(
+    event: &str,
+    database_id: &str,
+    name: &str,
+    outcome: &Outcome,
+    credential: &Credential,
+) -> Value {
     let stderr = credential.scrub(&outcome.stderr);
     let start = stderr.len().saturating_sub(LOGGED_STDERR);
     let start = (start..=stderr.len())
         .find(|at| stderr.is_char_boundary(*at))
         .unwrap_or(stderr.len());
-    crate::timing::emit_event(json!({
+    json!({
         "event": event,
         "database_id": database_id,
         "file": name,
@@ -411,7 +428,7 @@ pub(crate) fn log_failed_job(
         "elapsed_ms": outcome.elapsed.as_millis() as u64,
         "stderr": &stderr[start..],
         "at_ms": unix_seconds() * 1000,
-    }));
+    })
 }
 
 #[cfg(test)]

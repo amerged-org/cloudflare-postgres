@@ -129,6 +129,8 @@ pub(crate) fn timing() -> Timing {
         watch: Duration::from_millis(100),
         recovery_retry: Duration::from_millis(100),
         recovery_retry_maximum: Duration::from_millis(400),
+        report_retry: Duration::from_millis(10),
+        report_retry_maximum: Duration::from_millis(40),
         settle: Duration::from_secs(10),
     }
 }
@@ -312,6 +314,7 @@ impl Rig {
             policy: page["policy"].clone(),
             credentials_revision: 1,
             orders,
+            diagnostics: Vec::new(),
             databases,
             complete: true,
         }

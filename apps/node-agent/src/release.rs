@@ -3,7 +3,7 @@
 //! enrollment token is bound to, and the release whose binaries run (plan 8, 9.1). The image's
 //! builder writes the first as `IMAGE_VERSION` of `os-release`, and the second is the directory
 //! `/var/lib/pgcf/bin/current` links to.
-use crate::node_link::{constant, schema_valid};
+use crate::node_link::schema_valid;
 use serde_json::json;
 use std::path::Path;
 
@@ -25,19 +25,12 @@ pub fn this_image_version() -> Option<String> {
     image_version(&std::fs::read_to_string("/etc/os-release").ok()?)
 }
 
-/// The release the `current` link names: the name of the directory it points at, if the hello of
-/// the link accepts it as a release identifier.
+/// The release the `current` link names: the name of the directory it points at, if it is a
+/// release identifier of the contract (the hello of the link names it).
 pub fn release_id(current: &Path) -> Option<String> {
     let target = std::fs::read_link(current).ok()?;
     let name = target.file_name()?.to_str()?;
-    schema_valid(
-        "AgentLinkMessage",
-        &json!({
-            "type": "hello", "protocol": constant("NODE_PROTOCOL_VERSION"),
-            "agent_version": "0", "release_id": name,
-        }),
-    )
-    .then(|| name.to_string())
+    schema_valid("FleetReleaseId", &json!(name)).then(|| name.to_string())
 }
 
 #[cfg(test)]

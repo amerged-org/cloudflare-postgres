@@ -260,6 +260,63 @@ describe("the agent's gateway channel", () => {
   });
 });
 
+describe("the stages of a connection that waited for a wake", () => {
+  const stages = {
+    type: "conn_stages",
+    database,
+    outcome: "client_closed",
+    held_outcome: "released",
+    upgrade_ms: 3,
+    startup_ms: 12,
+    dial_ms: 1,
+    first_backend_ms: 7,
+    wake_wait_ms: 640,
+    session_ms: 1800,
+  };
+  const valid = (value: object) => GatewayMessage.safeParse(value).success;
+
+  it("are numbers and fixed tokens, and the reason of a refusal is one of the wake's", () => {
+    expect(valid(stages)).toBe(true);
+    // A connection that ended early has only the marks it reached.
+    expect(
+      valid({
+        type: "conn_stages",
+        database,
+        outcome: "wake_refused",
+        held_outcome: "refused",
+        wake_reason: "no_headroom",
+        session_ms: 9,
+      }),
+    ).toBe(true);
+    expect(
+      valid({ type: "conn_stages", database, outcome: "upgrade_failed" }),
+    ).toBe(true);
+  });
+
+  it("carry nothing else: no text, no unknown key, no fraction, no negative or unsafe number", () => {
+    for (const broken of [
+      { wake_reason: "busy" },
+      { outcome: "Client closed" },
+      { outcome: "" },
+      { outcome: "a".repeat(49) },
+      { held_outcome: "released!" },
+      { startup_ms: -1 },
+      { startup_ms: 1.5 },
+      { startup_ms: "12" },
+      { startup_ms: null },
+      { wake_wait_ms: Number.MAX_SAFE_INTEGER + 1 },
+      { wake_path: "cold" },
+      { agent_ms: { start: 80 } },
+      { database: "A".repeat(20) },
+      { database: undefined },
+      { outcome: undefined },
+    ])
+      expect(valid({ ...stages, ...broken }), JSON.stringify(broken)).toBe(
+        false,
+      );
+  });
+});
+
 describe("the gateway's activity report", () => {
   const at = "2026-10-17T12:00:00.000Z",
     since = "2026-10-17T11:00:00.000Z";

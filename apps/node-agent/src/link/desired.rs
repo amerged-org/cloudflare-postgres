@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The desired page of the node (plan 5.3, 5.6): its databases, release, policy and orders.
 use super::request::Api;
-use crate::{Error, node_link::desired_page_valid};
+use crate::{Error, diagnostics::probe::Request, node_link::desired_page_valid};
 use pgcf_native_protocol::valid_pattern;
 use serde::Deserialize;
 use serde_json::Value;
@@ -68,6 +68,9 @@ pub struct Desired {
     pub credentials_revision: u64,
     /// Every open order. The orders of two pages of one pull are merged by operation.
     pub orders: Vec<Order>,
+    /// The probes an administrator asked for that Cloudflare has no result of (SEC-09), merged by
+    /// identifier like the orders.
+    pub diagnostics: Vec<Request>,
     /// `NodeDesiredDatabase` entries, each once.
     pub databases: Vec<Value>,
     /// Every database of the node (a full pull) or only the ones asked for. A database that a full
@@ -81,6 +84,7 @@ impl std::fmt::Debug for Desired {
         f.debug_struct("Desired")
             .field("credentials_revision", &self.credentials_revision)
             .field("orders", &self.orders)
+            .field("diagnostics", &self.diagnostics.len())
             .field("databases", &self.databases.len())
             .field("complete", &self.complete)
             .finish()
@@ -97,6 +101,11 @@ impl Desired {
                 .all(|held| held.operation() != order.operation())
             {
                 self.orders.push(order);
+            }
+        }
+        for request in later.diagnostics {
+            if self.diagnostics.iter().all(|held| held.id != request.id) {
+                self.diagnostics.push(request);
             }
         }
         self.release = later.release;
@@ -135,6 +144,10 @@ async fn page(api: &Api, target: &str) -> Result<(Desired, Option<String>), Erro
             .as_u64()
             .ok_or("desired credentials revision invalid")?,
         orders: serde_json::from_value(page["orders"].clone())?,
+        diagnostics: match page.get("diagnostics") {
+            Some(requests) => serde_json::from_value(requests.clone())?,
+            None => Vec::new(),
+        },
         databases: page["databases"].as_array().cloned().unwrap_or_default(),
         complete: false,
     };
@@ -193,9 +206,12 @@ async fn full(api: &Api) -> Result<Desired, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::{
-        request::tests::enrolled,
-        test_server::{Cloud, database, database_id, vector},
+    use crate::{
+        diagnostics::probe::Probe,
+        link::{
+            request::tests::enrolled,
+            test_server::{Cloud, database, database_id, vector},
+        },
     };
     use serde_json::json;
 
@@ -259,6 +275,51 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn the_probes_of_the_pages_are_pulled_once_each_and_a_page_without_any_has_none() {
+        let cloud = Cloud::start().await;
+        let (api, _) = enrolled(&cloud).await;
+        cloud.with(|inner| inner.databases = (0..450).map(|i| database(&database_id(i))).collect());
+        assert!(pull(&api, None).await.unwrap().diagnostics.is_empty());
+        let request = |id: &str, probe: &str| json!({"id": id, "probe": probe, "boot": -1, "since_seconds": 600, "lines": 50});
+        cloud.with(|inner| {
+            inner.diagnostics = vec![
+                request("5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81", "kernel"),
+                request("6c2a1d3f-8e45-4b9c-af72-1d4e3b5a7c92", "pool"),
+            ];
+        });
+        // Every one of the three pages lists both, and the pull has each once, in the page's order.
+        let desired = pull(&api, None).await.unwrap();
+        assert_eq!(
+            desired.diagnostics,
+            vec![
+                Request {
+                    id: "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81".into(),
+                    probe: Probe::Kernel,
+                    boot: -1,
+                    since_seconds: 600,
+                    lines: 50,
+                },
+                Request {
+                    id: "6c2a1d3f-8e45-4b9c-af72-1d4e3b5a7c92".into(),
+                    probe: Probe::Pool,
+                    boot: -1,
+                    since_seconds: 600,
+                    lines: 50,
+                },
+            ]
+        );
+        assert_eq!(get_targets(&cloud).len(), 6);
+        // A request the contract does not have makes the page invalid, not a command to run.
+        cloud.with(|inner| inner.diagnostics[0]["probe"] = "shell".into());
+        assert_eq!(
+            pull(&api, None).await.unwrap_err().to_string(),
+            "Cloudflare desired page invalid"
+        );
+        cloud.with(|inner| inner.diagnostics[0]["command"] = "id".into());
+        assert!(pull(&api, None).await.is_err());
     }
 
     /// The largest database entry the contract allows: 100 roles with every attribute, each a

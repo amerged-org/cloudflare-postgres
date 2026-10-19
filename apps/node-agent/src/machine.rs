@@ -5,12 +5,17 @@
 //! PostgreSQL in a test on any machine; `Node` is the node itself, and the tests' `Local` stands
 //! in for systemd and LVM only.
 use crate::{
+    diagnostics::probe,
     layout::Layout,
     link::NodeIdentity,
     storage::{self, Inventory, NoRoom, PoolSample, Removal, VolumeId},
     units::{self, Started, UnitState, limits::Limits},
+    update,
 };
-use std::{collections::BTreeMap, future::Future, io, num::NonZeroU32, path::PathBuf};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap, future::Future, io, num::NonZeroU32, path::PathBuf, process::Output,
+};
 
 /// What a boot loses, restored when the agent starts and before any page comes (plan 5.6 job 4,
 /// the image's `README.md`): the CPU quota of every stopped unit is lifted, because a quota can
@@ -30,6 +35,24 @@ pub async fn restore_runtime<M: Machine>(machine: &M) {
             }
         }
     }
+}
+
+/// What the hello reports of the node's operating system (`NodeOs`, SEC-03): this boot, the running
+/// kernel, and the digest of the installed packages (`update::packages_digest`). The agent reads it
+/// when it starts and again after a maintenance cycle that did not reboot, not with every sample.
+pub async fn os_report<M: Machine>(machine: &M) -> Result<Value, crate::Error> {
+    let boot = machine
+        .boot()
+        .ok_or("the boot and the kernel cannot be read")?;
+    let installed =
+        update::without_idle_kernels(machine.installed_packages().await?, &boot.kernel_release);
+    let booted_at_ms = i64::try_from(boot.booted_at)?.saturating_mul(1000);
+    Ok(json!({
+        "boot_id": boot.id,
+        "booted_at": crate::archive::facts::timestamp(booted_at_ms),
+        "kernel_release": boot.kernel_release,
+        "packages_sha256": update::packages_digest(&installed),
+    }))
 }
 
 /// The gateway's environment file (`EnvironmentFile=` of `pgcf-gateway.service`): the node's
@@ -233,6 +256,10 @@ pub trait Machine: Send + Sync + 'static {
         versions: &[String],
         files: &[PathBuf],
     ) -> impl Future<Output = io::Result<()>> + Send;
+    /// Purges these packages (`update::purgeable`) with dpkg, which refuses one that an installed
+    /// package depends on. A package that is essential or protected is left alone. The names have been checked
+    /// as package names: they are words of a command line.
+    fn purge_packages(&self, names: &[String]) -> impl Future<Output = io::Result<()>> + Send;
     /// Reboots the node. The databases are asleep with their proofs when this is called.
     fn reboot(&self) -> impl Future<Output = io::Result<()>> + Send;
     /// The health check (`pgcf-agent check`, plan 5.6 job 10) of the release that is installed:
@@ -240,10 +267,49 @@ pub trait Machine: Send + Sync + 'static {
     fn health_check(&self) -> impl Future<Output = io::Result<()>> + Send;
 
     // ---- the kernel's facts
+    /// This boot and the running kernel.
+    fn boot(&self) -> Option<Boot>;
+    /// The journal of the boot before this one as `journalctl` prints it with `--output=json`, one
+    /// object a line (`diagnostics::boot_report::previous_boot_arguments`), or `None` when the journal
+    /// holds no earlier boot.
+    fn previous_boot_journal(&self) -> impl Future<Output = io::Result<Option<String>>> + Send;
+    /// Runs a command of a probe on request (`diagnostics::probe`, SEC-09) to its end: a program of
+    /// the system with the arguments the agent built, no shell, `LC_ALL=C`, nothing on its stdin.
+    fn diagnostic(&self, argv: &probe::Argv) -> impl Future<Output = io::Result<Output>> + Send;
+    /// The text of a file of `/proc` that the pressure probe reads.
+    fn proc_file(&self, file: probe::ProcFile) -> io::Result<String>;
     /// `MemTotal` and `MemAvailable` now.
     fn memory(&self) -> Option<Memory>;
     /// The CPU times since boot, summed over the cores.
     fn cpu(&self) -> Option<CpuTimes>;
+}
+
+/// This boot of the node and the kernel it runs (SEC-03).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Boot {
+    /// `/proc/sys/kernel/random/boot_id`: a new one with every boot.
+    pub id: String,
+    /// `btime` of `/proc/stat`: the boot, in seconds since the epoch.
+    pub booted_at: u64,
+    /// `uname -r`, which `/proc/sys/kernel/osrelease` holds.
+    pub kernel_release: String,
+}
+impl Boot {
+    /// The boot of the texts of the three files, whose contents end in a newline. `None` if one
+    /// is not what its file holds, or the kernel's release does not fit the contract.
+    pub fn parse(boot_id: &str, stat: &str, osrelease: &str) -> Option<Self> {
+        let (id, kernel_release) = (boot_id.trim(), osrelease.trim());
+        let fits = (1..=64).contains(&kernel_release.len())
+            && kernel_release.bytes().all(|byte| byte.is_ascii_graphic());
+        if id.is_empty() || !fits {
+            return None;
+        }
+        Some(Self {
+            id: id.into(),
+            booted_at: crate::sample::boot_time(stat)?,
+            kernel_release: kernel_release.into(),
+        })
+    }
 }
 
 /// `MemTotal` and `MemAvailable` of `/proc/meminfo`.
@@ -276,6 +342,106 @@ mod tests {
             uid: "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c".into(),
             hostname: "eu1".into(),
             region_id: "eu-dev".into(),
+        }
+    }
+
+    #[test]
+    fn a_boot_is_the_kernels_boot_id_the_boot_time_and_the_release_of_the_running_kernel() {
+        let stat = "cpu  4705 150 1120 16250 520 10 55 20 0 0\nctxt 999\nbtime 1792318800\nprocesses 4242\n";
+        assert_eq!(
+            Boot::parse(
+                "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90\n",
+                stat,
+                "6.12.111+deb13-amd64\n"
+            ),
+            Some(Boot {
+                id: "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90".into(),
+                booted_at: 1_792_318_800,
+                kernel_release: "6.12.111+deb13-amd64".into(),
+            })
+        );
+        let (id, kernel) = ("2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90\n", "6.12.111\n");
+        for broken in [
+            Boot::parse("\n", stat, kernel),
+            Boot::parse(id, "ctxt 1\n", kernel),
+            Boot::parse(id, stat, "\n"),
+            Boot::parse(id, stat, &"k".repeat(65)),
+            Boot::parse(id, stat, "6.12 amd64\n"),
+        ] {
+            assert_eq!(broken, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_os_report_names_the_boot_the_kernel_and_the_installed_packages() {
+        use crate::{machine::local::Local, node_link::contract_valid, update::packages_digest};
+        let Some(machine) = Local::new("os-report") else {
+            return;
+        };
+        machine.set_packages(&[("bash", "5.2"), ("libc6", "2.41-1")]);
+        let hello = |os: &serde_json::Value| json!({"type": "hello", "protocol": 1, "agent_version": "0.1.0", "release_id": null, "os": os});
+        let first = os_report(&machine).await.unwrap();
+        assert!(
+            contract_valid("AgentLinkMessage", &hello(&first)),
+            "{first}"
+        );
+        assert_eq!(
+            first["packages_sha256"],
+            packages_digest(&machine.installed_packages().await.unwrap())
+        );
+        // A reboot is another boot ID, and a kernel installed before it is the kernel after it.
+        // The previous kernel stays installed, and of the kernels the running one counts alone.
+        machine.set_packages(&[
+            ("bash", "5.2"),
+            ("linux-image-6.12.111+deb13-amd64", "6.12.111-1"),
+            ("linux-image-6.12.113+deb13-amd64", "6.12.113-1"),
+        ]);
+        machine.reboot().await.unwrap();
+        let second = os_report(&machine).await.unwrap();
+        assert!(
+            contract_valid("AgentLinkMessage", &hello(&second)),
+            "{second}"
+        );
+        assert_ne!(second["boot_id"], first["boot_id"]);
+        assert_eq!(second["kernel_release"], "6.12.113+deb13-amd64");
+        assert_ne!(first["kernel_release"], second["kernel_release"]);
+        assert_eq!(
+            second["packages_sha256"],
+            packages_digest(&BTreeMap::from([
+                ("bash".to_string(), "5.2".to_string()),
+                (
+                    "linux-image-6.12.113+deb13-amd64".to_string(),
+                    "6.12.113-1".to_string()
+                ),
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_boot_starts_the_highest_kernel_version_not_the_last_name() {
+        use crate::machine::local::Local;
+        let Some(machine) = Local::new("os-kernel-order") else {
+            return;
+        };
+        // 6.12.99 sorts after 6.12.113 as text, and 6.9 after 6.12: GRUB orders by version.
+        for (images, newest) in [
+            (
+                ["6.12.99-amd64", "6.12.113+deb13-amd64"],
+                "6.12.113+deb13-amd64",
+            ),
+            (["6.9.12-amd64", "6.12.1-amd64"], "6.12.1-amd64"),
+        ] {
+            let packages: Vec<(String, &str)> = images
+                .iter()
+                .map(|abi| (format!("linux-image-{abi}"), "1"))
+                .collect();
+            let packages: Vec<(&str, &str)> = packages
+                .iter()
+                .map(|(name, v)| (name.as_str(), *v))
+                .collect();
+            machine.set_packages(&packages);
+            machine.reboot().await.unwrap();
+            assert_eq!(machine.boot().unwrap().kernel_release, newest);
         }
     }
 

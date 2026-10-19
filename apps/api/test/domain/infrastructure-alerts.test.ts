@@ -11,6 +11,7 @@ import {
   configureNodeRegionPolicy,
   reserveNodeAddition,
 } from "../../src/domain/node-state.ts";
+import { regionalRamWindowSql } from "../../src/domain/memory-capacity.ts";
 import { recordNodeMemoryObservation } from "./memory-fixture.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
@@ -398,6 +399,27 @@ it("retries an unknown callback with its identical durable event and never rearm
   expect(InfraAlert.parse(JSON.parse(bodies[2]!)).event_id).not.toBe(
     InfraAlert.parse(JSON.parse(bodies[0]!)).event_id,
   );
+});
+
+it("leaves a node out of the regional RAM window while placement is closed on it, as a maintenance cycle closes it", async () => {
+  const f = await setup();
+  await sample(f, 75);
+  const window = () =>
+    env.DB.prepare(regionalRamWindowSql("?")).bind(f.region).first();
+  expect(await window()).not.toBeNull();
+  // The cycle closes placement without disabling it.
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_closed_at=? WHERE id=?",
+  )
+    .bind(new Date().toISOString(), f.node)
+    .run();
+  expect(await window()).toBeNull();
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_closed_at=NULL WHERE id=?",
+  )
+    .bind(f.node)
+    .run();
+  expect(await window()).not.toBeNull();
 });
 
 it("counts control and provider-assigned VPS for the cap notice, excluding an unpaid reservation and duplicate associations", async () => {

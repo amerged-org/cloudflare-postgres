@@ -38,7 +38,7 @@ pub const DB_ROOT: &str = "/var/lib/pgcf/db";
 const SLICE: &str = "pgcf.slice";
 
 /// The prefix of a database's unit; the instance is the database ID.
-const UNIT_PREFIX: &str = "pgcf-pg@";
+pub const UNIT_PREFIX: &str = "pgcf-pg@";
 const UNIT_SUFFIX: &str = ".service";
 
 /// The unit of a database.

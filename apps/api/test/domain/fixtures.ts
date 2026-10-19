@@ -620,6 +620,18 @@ const pinned = (name: string) => ({
   sha256: "a".repeat(64),
   size_bytes: 4096,
 });
+/** What a node that runs the fixtures' releases reports of its operating system. */
+export const RELEASE_OS = {
+  kernel_release: "6.12.113+deb13-amd64",
+  packages_sha256: "d".repeat(64),
+};
+/** The boot and operating system in a node's hello: those of the fixtures' releases unless changed. */
+export const nodeOs = (change: Record<string, unknown> = {}) => ({
+  boot_id: crypto.randomUUID(),
+  booted_at: "2026-10-18T08:00:00.000Z",
+  ...RELEASE_OS,
+  ...change,
+});
 /** The spec of a release: a node image, its four binaries and the package lock. */
 export const releaseSpec = (version = "1.2.0") => ({
   version: 2,
@@ -641,6 +653,7 @@ export const releaseSpec = (version = "1.2.0") => ({
     image_version: version,
     debian_snapshot: "20261015T000000Z",
     package_lock: pinned("packages.lock.json"),
+    ...RELEASE_OS,
   },
 });
 /**
@@ -691,6 +704,7 @@ export async function stageRelease(
     os: {
       debian_snapshot: "20261015T000000Z",
       package_lock: digests["packages.lock.json"],
+      ...RELEASE_OS,
     },
   };
 }

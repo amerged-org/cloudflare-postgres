@@ -173,6 +173,122 @@ it("drops the releases of the Talos spec and the per-node release tables", () =>
   ).toEqual([]);
 });
 
+it("gives a node the columns of its hello and drops the releases that state no OS facts", () => {
+  populate();
+  for (const name of migrations.filter((v) => v >= "0063" && v < "0072"))
+    apply(name);
+  run(
+    "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES('old','{}',?,?)",
+    "b".repeat(64),
+    NOW,
+  );
+  run(
+    "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES('eu-test','old',1,?)",
+    NOW,
+  );
+  apply("0072_node_os.sql");
+  const count = (table: string) =>
+    db.prepare(`SELECT count(*) n FROM ${table}`).get();
+  expect(count("fleet_releases")).toEqual({ n: 0 });
+  expect(count("fleet_region_releases")).toEqual({ n: 0 });
+  // The node keeps its row, with nothing reported yet.
+  expect(
+    db
+      .prepare(
+        "SELECT os_boot_id,os_booted_at,os_kernel_release,os_packages_sha256 FROM nodes WHERE id=?",
+      )
+      .get(node),
+  ).toEqual({
+    os_boot_id: null,
+    os_booted_at: null,
+    os_kernel_release: null,
+    os_packages_sha256: null,
+  });
+  const report = (column: string, value: string) =>
+    run(`UPDATE nodes SET ${column}=? WHERE id=?`, value, node);
+  report("os_boot_id", crypto.randomUUID());
+  report("os_booted_at", NOW);
+  report("os_kernel_release", "6.12.113+deb13-amd64");
+  report("os_packages_sha256", "a".repeat(64));
+  for (const [column, value] of [
+    ["os_boot_id", "boot"],
+    ["os_booted_at", "yesterday"],
+    ["os_kernel_release", "k".repeat(65)],
+    ["os_packages_sha256", "A".repeat(64)],
+  ] as const)
+    expect(() => report(column, value), column).toThrow(/CHECK/);
+});
+
+it("keeps a boot report per node, bounded, and widens the alert kinds with the unexpected reboot", () => {
+  populate();
+  for (const name of migrations.filter((v) => v >= "0063" && v < "0073"))
+    apply(name);
+  const report = (
+    previous: string | null,
+    expected: number | null,
+    change: Record<string, string | number | null> = {},
+  ) => {
+    const row = {
+      id: crypto.randomUUID(),
+      node_id: node,
+      kind: "boot",
+      boot_id: crypto.randomUUID(),
+      previous_boot_id: previous,
+      received_at: NOW,
+      expected_reboot: expected,
+      body: "{}",
+      ...change,
+    };
+    run(
+      `INSERT INTO node_diagnostics(id,node_id,kind,boot_id,previous_boot_id,received_at,expected_reboot,body)
+       VALUES(?,?,?,?,?,?,?,?)`,
+      ...Object.values(row),
+    );
+  };
+  // The episode that was there stays, and the new kind joins it.
+  const episodes = db.prepare("SELECT * FROM infrastructure_alerts").all();
+  apply("0073_node_diagnostics.sql");
+  expect(db.prepare("SELECT * FROM infrastructure_alerts").all()).toEqual(
+    episodes,
+  );
+  run(
+    `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)
+     VALUES('eu-test','node_unexpected_reboot',1,?,'{}')`,
+    crypto.randomUUID(),
+  );
+  expect(() =>
+    run(
+      `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)
+       VALUES('eu-test','node_rebooted',1,?,'{}')`,
+      crypto.randomUUID(),
+    ),
+  ).toThrow(/CHECK/);
+  // A reboot is expected, unexpected, or not claimed because no earlier boot was known.
+  const previous = crypto.randomUUID();
+  report(previous, 1);
+  report(previous, 0);
+  report(null, null);
+  for (const broken of [
+    () => report(previous, null),
+    () => report(null, 0),
+    () => report(previous, 2),
+    () => report(previous, 1, { kind: "journal" }),
+    () => report(previous, 1, { boot_id: "boot" }),
+    () => report(previous, 1, { received_at: "yesterday" }),
+    () => report(previous, 1, { body: "not json" }),
+    () => report(previous, 1, { body: "[" + "0,".repeat(600_000) + "0]" }),
+  ])
+    expect(broken).toThrow(/CHECK/);
+  expect(() =>
+    report(previous, 1, { node_id: `nod_${"z".repeat(20)}` }),
+  ).toThrow(/FOREIGN KEY/);
+  // The reports go with their node.
+  run("DELETE FROM nodes WHERE id=?", node);
+  expect(db.prepare("SELECT count(*) n FROM node_diagnostics").get()).toEqual({
+    n: 0,
+  });
+});
+
 it("widens the alert kinds with the refused enrollment and keeps the episodes", () => {
   populate();
   apply("0063_node_link.sql");

@@ -59,6 +59,10 @@ pub struct Timing {
     /// The wait before the first retry of a recovery, and the longest wait.
     pub recovery_retry: Duration,
     pub recovery_retry_maximum: Duration,
+    /// The wait before the first repeat of the boot report that Cloudflare could not take, and the
+    /// longest wait.
+    pub report_retry: Duration,
+    pub report_retry_maximum: Duration,
     /// How long a starting agent waits for its decisions on the databases of the first page before
     /// it serves the gateway, whose sessions end on a database the table does not show running.
     pub settle: Duration,
@@ -72,6 +76,8 @@ impl Default for Timing {
             watch: Duration::from_secs(1),
             recovery_retry: Duration::from_secs(1),
             recovery_retry_maximum: Duration::from_secs(30),
+            report_retry: Duration::from_secs(2),
+            report_retry_maximum: Duration::from_secs(60),
             settle: Duration::from_secs(10),
         }
     }

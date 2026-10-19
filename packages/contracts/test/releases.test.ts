@@ -8,6 +8,7 @@ import {
   FleetReleaseSpec,
   RELEASE_FILES,
   fleetReleaseSpec,
+  packagesSha256,
   releaseFileUrl,
   releaseObjectKey,
 } from "../src/releases.ts";
@@ -38,6 +39,8 @@ function spec() {
       image_version: "1.2.0",
       debian_snapshot: "20261015T000000Z",
       package_lock: pinned("packages.lock.json"),
+      packages_sha256: "d".repeat(64),
+      kernel_release: "6.12.113+deb13-amd64",
     },
   };
 }
@@ -64,6 +67,22 @@ it("one release is one node image, four binaries and the package lock, nothing e
     (value: ReturnType<typeof spec>) => ({
       ...value,
       os: { ...value.os, package_lock: { ...pinned("lock"), sha256: "x" } },
+    }),
+    (value: ReturnType<typeof spec>) => ({
+      ...value,
+      os: { ...value.os, packages_sha256: undefined },
+    }),
+    (value: ReturnType<typeof spec>) => ({
+      ...value,
+      os: { ...value.os, kernel_release: undefined },
+    }),
+    (value: ReturnType<typeof spec>) => ({
+      ...value,
+      os: { ...value.os, kernel_release: "6.12.113 amd64" },
+    }),
+    (value: ReturnType<typeof spec>) => ({
+      ...value,
+      os: { ...value.os, kernel_release: "k".repeat(65) },
     }),
   ])
     expect(FleetReleaseSpec.safeParse(change(spec())).success).toBe(false);
@@ -95,20 +114,46 @@ it("an image is always the compressed one, and a raw disk is whole sectors", () 
   expect(FleetReleaseSpec.safeParse(odd).success).toBe(false);
 });
 
-it("the page's release is the spec's binaries and operating system under the release id", () => {
+it("the page's release is the spec's binaries and the operating system a node installs, under the release id", () => {
   const release = FleetRelease.parse({
     id: "release-1-2-0",
     spec: spec(),
     spec_sha256: "c".repeat(64),
     approved_at: "2026-10-18T10:00:00.000Z",
   });
-  expect(
-    NodeRelease.safeParse({
-      id: release.id,
-      binaries: release.spec.binaries,
-      os: release.spec.os,
-    }).success,
-  ).toBe(true);
+  // What the node is expected to report back is the API's to compare and is not on the page: an
+  // agent of an older build refuses a page that carries more than it knows.
+  const { packages_sha256, kernel_release, ...installed } = release.spec.os;
+  expect([packages_sha256, kernel_release]).toEqual([
+    "d".repeat(64),
+    "6.12.113+deb13-amd64",
+  ]);
+  const page = { id: release.id, binaries: release.spec.binaries };
+  expect(NodeRelease.safeParse({ ...page, os: installed }).success).toBe(true);
+  expect(NodeRelease.safeParse({ ...page, os: release.spec.os }).success).toBe(
+    false,
+  );
+});
+
+it("a package set has one digest: sha256 over its sorted lines name=version", async () => {
+  // The lines are sorted as whole lines, bytewise: "libc6-dev=" sorts before "libc6=" because
+  // "-" is below "=", where sorting the names would put "libc6" first.
+  const packages = [
+    ["linux-image-amd64", "6.12.113-1"],
+    ["libc6", "2.41-1"],
+    ["bsdutils", "1:2.41.5-0+deb13u1"],
+    ["linux-image-6.12.113+deb13-amd64", "6.12.113-1"],
+    ["libc6-dev", "2.41-1"],
+    ["bash", "5.2"],
+  ].map(([name, version]) => ({ name: name!, version: version! }));
+  const digest =
+    "462f968f28c0d5a21b9cc9e4eaa820b91bdf64ec67a812b5acad20336bdef3d7";
+  expect(await packagesSha256(packages)).toBe(digest);
+  expect(await packagesSha256([...packages].reverse())).toBe(digest);
+  expect(await packagesSha256(packages.slice(1))).not.toBe(digest);
+  await expect(
+    packagesSha256([{ name: "bash", version: "5.2\n" }]),
+  ).rejects.toThrow();
 });
 
 it("a node is converged only on the release it reports, and a lost node says so", () => {
@@ -153,6 +198,8 @@ function registration() {
     os: {
       debian_snapshot: "20261016T000000Z",
       package_lock: digest("5", 90_000),
+      packages_sha256: "6".repeat(64),
+      kernel_release: "6.12.113+deb13-amd64",
     },
   };
 }
@@ -192,6 +239,14 @@ it("a release is registered by its digests and sizes alone, never by a URL", () 
       },
     }),
     (value: ReturnType<typeof registration>) => ({ ...value, version: 2 }),
+    (value: ReturnType<typeof registration>) => ({
+      ...value,
+      os: { ...value.os, packages_sha256: undefined },
+    }),
+    (value: ReturnType<typeof registration>) => ({
+      ...value,
+      os: { ...value.os, kernel_release: undefined },
+    }),
   ])
     expect(
       FleetReleaseRegistration.safeParse(change(registration())).success,
@@ -239,6 +294,11 @@ it("a release's files are stored under one prefix and served at one path, and th
   expect(spec.os.package_lock.url).toBe(
     "https://api.example.org:8443/node/v1/releases/sha-0123456789ab/packages.lock.json",
   );
+  // What a node that runs the lock reports back is registered with the release and immutable.
+  expect(spec.os).toMatchObject({
+    packages_sha256: "6".repeat(64),
+    kernel_release: "6.12.113+deb13-amd64",
+  });
   expect(() =>
     fleetReleaseSpec("http://api.example.org", "v1", registration()),
   ).toThrow();

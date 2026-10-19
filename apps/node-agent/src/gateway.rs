@@ -3,19 +3,21 @@
 //! stream socket that the agent serves and the gateway connects to, one JSON line per message.
 //!
 //! The agent sends the whole writer table first and then every change of it, the results of the
-//! wakes the gateway queued, and its quiesce, close, status and activity requests. A connection
-//! that ends, or a line that is not valid, ends the channel; the gateway then admits nothing new
+//! wakes the gateway queued, and its quiesce, close, status and activity requests. The gateway
+//! sends the stage marks of the connections it held for a wake, which the agent logs as events.
+//! A connection that ends, or a line that is not valid, ends the channel; the gateway then admits nothing new
 //! until it connects again and receives the table, and the sessions it has keep their writer.
 //! There is one gateway, and one connection at a time: the gateway that restarts connects again
 //! once its old connection has closed.
 use crate::Error;
 use pgcf_native_protocol::{
     agent::{
-        ActivityReport, ControlAction, Database, FromGateway, MAX_LINE_BYTES, SessionStatus,
-        ToGateway, decode_from_gateway, encode, timestamp_ms,
+        ActivityReport, ConnStages, ControlAction, Database, FromGateway, MAX_LINE_BYTES,
+        SessionStatus, ToGateway, decode_from_gateway, encode, timestamp_ms,
     },
     wake::{WakeRequest, WakeResult},
 };
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
@@ -203,7 +205,9 @@ impl Feed {
                 busy_connections,
                 pending_dials,
             }),
-            FromGateway::Wake { .. } | FromGateway::Activity { .. } => None,
+            FromGateway::Wake { .. }
+            | FromGateway::Activity { .. }
+            | FromGateway::ConnStages(_) => None,
         }
     }
     /// The gateway's measurements of `database`. `None` when no gateway answers.
@@ -214,7 +218,9 @@ impl Feed {
         };
         match self.ask(request).await? {
             FromGateway::Activity { report, .. } => Activity::of(&report),
-            FromGateway::Wake { .. } | FromGateway::Status { .. } => None,
+            FromGateway::Wake { .. } | FromGateway::Status { .. } | FromGateway::ConnStages(_) => {
+                None
+            }
         }
     }
 
@@ -289,6 +295,9 @@ impl Feed {
                         FromGateway::Status { id, .. } | FromGateway::Activity { id, .. } => {
                             self.answered(id, message);
                         }
+                        FromGateway::ConnStages(stages) => {
+                            crate::timing::emit_event(stages_line(&stages));
+                        }
                     }
                 }
                 change = changes.recv() => match change {
@@ -309,6 +318,38 @@ impl Feed {
             }
         }
     }
+}
+
+/// The log line (plan 9.9) of the stage marks of a connection that was held for a wake: how it
+/// ended, how its wait ended, and the milliseconds of the marks it reached. The gateway's marks
+/// are numbers and fixed tokens, so the line is all of them. The observation report carries it to
+/// Cloudflare, where `wake_wait_ms` (then `dial_ms` and `first_backend_ms`) is the wait a client
+/// sees for a cold wake, beside the agent's own steps in the `wake` event.
+fn stages_line(stages: &ConnStages) -> Value {
+    let mut line = json!({
+        "event": "conn_stages", "database_id": stages.database, "outcome": stages.outcome,
+    });
+    for (key, token) in [
+        ("held_outcome", &stages.held_outcome),
+        ("wake_reason", &stages.wake_reason),
+    ] {
+        if let Some(token) = token {
+            line[key] = token.as_str().into();
+        }
+    }
+    for (key, mark) in [
+        ("upgrade_ms", stages.upgrade_ms),
+        ("startup_ms", stages.startup_ms),
+        ("dial_ms", stages.dial_ms),
+        ("first_backend_ms", stages.first_backend_ms),
+        ("wake_wait_ms", stages.wake_wait_ms),
+        ("session_ms", stages.session_ms),
+    ] {
+        if let Some(ms) = mark {
+            line[key] = ms.into();
+        }
+    }
+    line
 }
 
 /// One line of at most `MAX_LINE_BYTES`, without its newline; `None` when the stream ended or the
@@ -367,10 +408,10 @@ pub fn bind(path: &Path, mode: u32, owner: Option<(u32, u32)>) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testpg;
+    use crate::{node_link::contract_valid, testpg};
     use pgcf_native_protocol::agent::{Mode, Writer, decode_to_gateway};
     use pgcf_native_protocol::wake::Outcome;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
@@ -552,6 +593,80 @@ mod tests {
         };
         rig.feed.wake_result(result.clone());
         assert_eq!(gateway.next().await, ToGateway::WakeResult { result });
+    }
+
+    /// The marks of a connection that was held, as the gateway sends them.
+    fn held_marks() -> ConnStages {
+        ConnStages {
+            database: A.into(),
+            outcome: "client_closed".into(),
+            held_outcome: Some("released".into()),
+            wake_reason: Some("no_headroom".into()),
+            upgrade_ms: Some(3),
+            startup_ms: Some(12),
+            dial_ms: Some(1),
+            first_backend_ms: Some(7),
+            wake_wait_ms: Some(640),
+            session_ms: Some(1800),
+        }
+    }
+
+    #[test]
+    fn the_marks_of_a_held_connection_become_an_event_of_numbers_and_tokens_the_contract_accepts() {
+        let line = stages_line(&held_marks());
+        assert_eq!(
+            line,
+            json!({
+                "event": "conn_stages", "database_id": A, "outcome": "client_closed",
+                "held_outcome": "released", "wake_reason": "no_headroom", "upgrade_ms": 3,
+                "startup_ms": 12, "dial_ms": 1, "first_backend_ms": 7, "wake_wait_ms": 640,
+                "session_ms": 1800,
+            })
+        );
+        // Nothing of the line is dropped on its way into the report, and Cloudflare takes it.
+        let at = "2026-10-18T10:11:12.345Z";
+        let event = crate::events::sanitize(&line, at).unwrap();
+        assert_eq!(event["database_id"], A);
+        assert_eq!(event["fields"].as_object().unwrap().len(), 9);
+        assert_eq!(event["fields"]["startup_ms"], 12);
+        assert!(contract_valid(
+            "NodeObservationReport",
+            &json!({"observed_at": at, "databases": [], "orders": [], "events": [event]})
+        ));
+        // A mark the connection did not reach is not in the line.
+        let early = ConnStages {
+            database: A.into(),
+            outcome: "upgrade_failed".into(),
+            ..ConnStages::default()
+        };
+        assert_eq!(
+            stages_line(&early),
+            json!({"event": "conn_stages", "database_id": A, "outcome": "upgrade_failed"})
+        );
+    }
+
+    #[tokio::test]
+    async fn the_marks_of_a_held_connection_are_taken_without_an_answer_and_the_channel_goes_on() {
+        let rig = rig(None);
+        let mut gateway = Gateway::connect(&rig.socket).await;
+        gateway.next().await;
+        let line = encode(&FromGateway::ConnStages(held_marks()));
+        gateway
+            .send(std::str::from_utf8(&line).unwrap().trim_end())
+            .await;
+        // The same channel still answers: the marks ended nothing.
+        let feed = rig.feed.clone();
+        let asked = tokio::spawn(async move { feed.control(A, 3, ControlAction::Status).await });
+        let ToGateway::Control { id, .. } = gateway.next().await else {
+            panic!("a control request");
+        };
+        gateway
+            .send(&format!(
+                r#"{{"type":"status","id":{id},"database":"{A}","status":"idle","connections":0,"busy_connections":0,"pending_dials":0}}"#
+            ))
+            .await;
+        assert!(asked.await.unwrap().is_some());
+        assert!(rig.feed.connected());
     }
 
     #[tokio::test]

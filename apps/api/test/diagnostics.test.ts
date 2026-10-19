@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { ErrorBody } from "@pgcf/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../src/api-error.ts";
-import { createApp } from "../src/app.ts";
+import { createApp, DIAGNOSTIC_ROUTES } from "../src/app.ts";
 
 const diagnosticHeader = "X-PGCF-Diagnostic-Id";
 const uuid =
@@ -85,6 +85,23 @@ describe("failed request diagnostics in the Workers runtime", () => {
     expect(logged.route).toBe("/v1/databases/:id/roles/:name/connection-uri");
     expect(logged.status).toBe(400);
     expect(JSON.stringify(log.mock.calls)).not.toContain(canary);
+  });
+
+  it("labels a refused node report by its route, not as unmatched", async () => {
+    const log = logger();
+    const response = await createApp().fetch(
+      request("/node/v1/diagnostics", { method: "POST" }),
+      env,
+    );
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(event(log).route).toBe("/node/v1/diagnostics");
+  });
+
+  it("labels every route the API serves, so that only attacker paths are unmatched", () => {
+    const unlabelled = createApp()
+      .routes.map((route) => route.path)
+      .filter((path) => !path.includes("*") && !DIAGNOSTIC_ROUTES.has(path));
+    expect([...new Set(unlabelled)]).toEqual([]);
   });
 
   it("logs internal failures without exception messages or stacks", async () => {

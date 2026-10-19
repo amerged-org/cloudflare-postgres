@@ -87,6 +87,8 @@ const spec = (id: string) => ({
       sha256: hex("4"),
       size_bytes: MIB,
     },
+    packages_sha256: hex("6"),
+    kernel_release: "6.12.113+deb13-amd64",
   },
 });
 async function release(region: string) {

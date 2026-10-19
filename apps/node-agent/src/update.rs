@@ -209,6 +209,12 @@ pub struct Plan {
     pub reboot: bool,
 }
 
+/// A kernel image (`linux-image-<abi>`), which is not the meta package `linux-image-amd64`.
+fn is_kernel_image(name: &str) -> bool {
+    name.strip_prefix("linux-image-")
+        .is_some_and(|abi| abi.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// A package whose change takes a reboot: the kernel, and the libraries every process of the node
 /// has mapped.
 fn needs_reboot(name: &str) -> bool {
@@ -231,6 +237,63 @@ pub fn plan(lock: &Lock, installed: &BTreeMap<String, String>) -> Plan {
     }
 }
 
+/// Whether `name` is a Debian package name as the image's lock states one
+/// (`infra/node-image/lock.ts`): at least two characters of lower-case letters, digits, `+`, `-`
+/// and `.`, the first a letter or a digit. Such a name is neither an option nor a pattern when it
+/// is a word of a command line.
+pub fn is_package_name(name: &str) -> bool {
+    name.len() >= 2
+        && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.')
+        })
+}
+
+/// The installed packages that the lock does not name, which the cycle purges so that the node has
+/// the lock's packages and no others (the digest of its hello then equals the release's). Never a
+/// kernel image: Debian keeps the previous kernel for the boot menu, the digest leaves idle ones
+/// out, and the running one cannot go. Never a name that is not a package name. A lock that names
+/// no kernel image is not the lock of an image, which always boots one: it purges nothing.
+pub fn purgeable(lock: &Lock, installed: &BTreeMap<String, String>) -> Vec<String> {
+    let named = |name: &str| {
+        lock.packages
+            .iter()
+            .chain(&lock.extra)
+            .any(|p| p.name == name)
+    };
+    if !lock
+        .packages
+        .iter()
+        .any(|package| is_kernel_image(&package.name))
+    {
+        return Vec::new();
+    }
+    installed
+        .keys()
+        .filter(|name| !named(name) && !is_kernel_image(name) && is_package_name(name))
+        .cloned()
+        .collect()
+}
+
+/// `names` without the packages that `dpkg-query -W -f '${Package}\t${Essential}\t${Protected}\n'`
+/// says are essential or protected: dpkg refuses to remove them (Debian marks `login`, `libgcc-s1`
+/// and `systemd-sysv` protected without making them essential), and removing one would end the
+/// node.
+pub fn without_protected(names: Vec<String>, dpkg: &str) -> Vec<String> {
+    let refused: std::collections::BTreeSet<&str> = dpkg
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?;
+            fields.any(|field| field.trim() == "yes").then_some(name)
+        })
+        .collect();
+    names
+        .into_iter()
+        .filter(|name| !refused.contains(name.as_str()))
+        .collect()
+}
+
 /// The installed packages and their versions, from `dpkg-query -W -f '${db:Status-Abbrev}\t${Package}\t${Version}\n'`.
 pub fn installed_packages(output: &str) -> BTreeMap<String, String> {
     output
@@ -241,6 +304,36 @@ pub fn installed_packages(output: &str) -> BTreeMap<String, String> {
             (status.trim() == "ii").then(|| (name.to_string(), version.to_string()))
         })
         .collect()
+}
+
+/// The packages that count for the node's digest (`packages_sha256` of the contract): of the kernel
+/// images (`linux-image-<abi>`) only the running one's. Debian keeps the previous kernel after an
+/// update, for the boot menu, while the release's lock holds the one kernel it installs.
+pub fn without_idle_kernels(
+    mut installed: BTreeMap<String, String>,
+    kernel_release: &str,
+) -> BTreeMap<String, String> {
+    installed.retain(|name, _| match name.strip_prefix("linux-image-") {
+        Some(abi) if is_kernel_image(name) => abi == kernel_release,
+        _ => true,
+    });
+    installed
+}
+
+/// The digest of a set of installed packages, as the contract states it (`packagesSha256`): sha256
+/// over the lines `name=version\n`, sorted as whole lines, bytewise, in lowercase hex.
+pub fn packages_digest(installed: &BTreeMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut lines: Vec<String> = installed
+        .iter()
+        .map(|(name, version)| format!("{name}={version}\n"))
+        .collect();
+    lines.sort();
+    let mut digest = Sha256::new();
+    for line in &lines {
+        digest.update(line.as_bytes());
+    }
+    hex(&digest.finalize())
 }
 
 /// The image's apt sources (deb822) with the snapshot of the release: the `URIs:` of the Debian
@@ -357,12 +450,139 @@ mod tests {
     }
 
     #[test]
+    fn what_the_lock_does_not_name_is_purged_but_no_kernel_image_and_no_name_apt_could_take_as_an_option()
+     {
+        let node = installed(&[
+            ("bash", "5.2"),
+            ("postgresql-18", "18.7-1"),
+            ("cloudflared", "2026.10.1"),
+            ("linux-image-6.12.99-amd64", "6.12.99-1"),
+            // The previous kernel stays for the boot menu, and a running one is never removed.
+            ("linux-image-6.12.88-amd64", "6.12.88-1"),
+            ("libdropped1", "1.0"),
+            ("libdropped++2", "1.0"),
+            ("-rf", "1"),
+            ("X", "1"),
+            ("Upper", "1"),
+        ]);
+        assert_eq!(purgeable(&lock(), &node), ["libdropped++2", "libdropped1"]);
+        // The node has what the lock names and nothing else: nothing to purge.
+        assert_eq!(
+            purgeable(&lock(), &plan_installed(&lock())),
+            [] as [&str; 0]
+        );
+        // A lock without a kernel image is not the lock of an image, which boots one: it purges
+        // nothing, however little it names.
+        let kernelless = Lock {
+            packages: lock()
+                .packages
+                .into_iter()
+                .filter(|package| package.name == "bash")
+                .collect(),
+            extra: vec![],
+        };
+        assert_eq!(purgeable(&kernelless, &node), [] as [&str; 0]);
+        assert_eq!(
+            purgeable(
+                &Lock {
+                    packages: vec![],
+                    extra: vec![]
+                },
+                &node
+            ),
+            [] as [&str; 0]
+        );
+    }
+
+    /// The packages a node that runs `lock` has.
+    fn plan_installed(lock: &Lock) -> BTreeMap<String, String> {
+        lock.packages
+            .iter()
+            .chain(&lock.extra)
+            .map(|package| (package.name.clone(), package.version.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn dpkg_says_which_packages_are_essential_or_protected_and_those_are_never_purged() {
+        let names: Vec<String> = ["libdropped1", "bash", "netbase", "login", "libgcc-s1"]
+            .map(String::from)
+            .into();
+        // `dpkg-query -W -f '${Package}\t${Essential}\t${Protected}\n'`: a field is empty or "no"
+        // for most packages. Debian marks `login` and `libgcc-s1` protected, not essential.
+        let output =
+            "libdropped1\t\t\nbash\tyes\tno\nnetbase\tno\t\nlogin\tno\tyes\nlibgcc-s1\t\tyes\n";
+        assert_eq!(without_protected(names, output), ["libdropped1", "netbase"]);
+    }
+
+    #[test]
     fn dpkg_lists_the_packages_that_are_installed_and_no_others() {
         let output =
             "ii \tbash\t5.2\nrc \told\t1.0\nii \tlibc6\t2.41-1\nhi \theld\t2\nbroken line\n";
         assert_eq!(
             installed_packages(output),
             installed(&[("bash", "5.2"), ("libc6", "2.41-1")])
+        );
+    }
+
+    #[test]
+    fn the_installed_packages_have_the_digest_the_contract_computes() {
+        use crate::link::test_server::package_vectors;
+        for vector in package_vectors() {
+            let (name, dpkg) = (&vector["name"], vector["dpkg"].as_str().unwrap());
+            let stated: BTreeMap<String, String> = vector["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|package| {
+                    (
+                        package["name"].as_str().unwrap().to_string(),
+                        package["version"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            let kernel = vector["kernel_release"].as_str().unwrap();
+            // A package dpkg lists as removed with its configuration kept ('rc') is not installed.
+            let installed = installed_packages(dpkg);
+            assert!(!installed.contains_key("oldpkg"), "{name}");
+            let counted = without_idle_kernels(installed, kernel);
+            assert_eq!(counted, stated, "{name}");
+            assert_eq!(
+                packages_digest(&counted),
+                vector["sha256"].as_str().unwrap(),
+                "{name}"
+            );
+        }
+        // One package more, one version more: another set.
+        let digest = packages_digest(&installed(&[("bash", "5.2")]));
+        let more = installed(&[("bash", "5.2"), ("libc6", "2.41-1")]);
+        assert_ne!(packages_digest(&more), digest);
+        assert_ne!(packages_digest(&installed(&[("bash", "5.3")])), digest);
+    }
+
+    #[test]
+    fn of_the_kernel_images_only_the_running_one_counts_for_the_digest() {
+        let node = installed(&[
+            ("bash", "5.2"),
+            ("linux-image-6.12.111+deb13-amd64", "6.12.111-1"),
+            ("linux-image-6.12.113+deb13-amd64", "6.12.113-1"),
+            ("linux-image-amd64", "6.12.113-1"),
+            ("linux-libc-dev", "6.12.113-1"),
+        ]);
+        // After the reboot into the new kernel the previous one is idle; before it, the new one is.
+        assert_eq!(
+            without_idle_kernels(node.clone(), "6.12.113+deb13-amd64"),
+            installed(&[
+                ("bash", "5.2"),
+                ("linux-image-6.12.113+deb13-amd64", "6.12.113-1"),
+                ("linux-image-amd64", "6.12.113-1"),
+                ("linux-libc-dev", "6.12.113-1"),
+            ])
+        );
+        assert_eq!(
+            without_idle_kernels(node, "6.12.111+deb13-amd64").len(),
+            4,
+            "the meta package and the other packages stay"
         );
     }
 

@@ -6,10 +6,11 @@
  *
  * The gateway channel is one stream of JSON lines. The agent sends its whole table first and then
  * every change of it, the results of the wakes the gateway queued, and its quiesce, close, status
- * and activity requests; the gateway sends the wakes of held connections and its answers. A
- * database's writer is its PostgreSQL unit: the socket it listens on, the database's own uid and
- * the unit's main PID, which the gateway compares with the kernel's peer credentials of every
- * connection, and the unit's invocation ID, which the route names.
+ * and activity requests; the gateway sends the wakes of held connections, its answers and the
+ * stage marks of the connections that were held. A database's writer is its PostgreSQL unit: the
+ * socket it listens on, the database's own uid and the unit's main PID, which the gateway compares
+ * with the kernel's peer credentials of every connection, and the unit's invocation ID, which the
+ * route names.
  *
  * The archive socket serves `pgcf-archive %p` (archive_command) and `pgcf-wal-fetch %f %p`
  * (restore_command): one request line and one answer line. The agent knows the database by the
@@ -400,6 +401,9 @@ export type GatewayLocalActivityReport = z.infer<
   typeof GatewayLocalActivityReport
 >;
 
+/** A fixed class of the gateway's log: lowercase words, no text. */
+const StageToken = z.string().regex(/^[a-z0-9_]{1,48}$/);
+
 /** From the gateway to the agent. */
 export const GatewayMessage = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("wake"), wake: WakeRequest }),
@@ -421,6 +425,30 @@ export const GatewayMessage = z.discriminatedUnion("type", [
     id: Count,
     database: DatabaseId,
     report: GatewayLocalActivityReport,
+  }),
+  /**
+   * The stage marks of one connection that waited for its database's wake: the gateway's
+   * `conn_stages` line, sent when the connection ends, for the connections held for a wake only.
+   * The agent logs it as the event `conn_stages` (plan 9.9), so the wait a client sees for a cold
+   * wake (`wake_wait_ms`, then `dial_ms` and `first_backend_ms`) reaches Cloudflare beside the
+   * agent's own steps. It holds numbers and fixed tokens, never text, an address or a role. A mark
+   * the connection did not reach is absent.
+   */
+  z.strictObject({
+    type: z.literal("conn_stages"),
+    database: DatabaseId,
+    /** How the connection ended: a fixed class of the gateway's log. */
+    outcome: StageToken,
+    /** How the wait for the wake ended: `released`, `refused`, `client_closed` and the like. */
+    held_outcome: StageToken.optional(),
+    /** The reason of the agent's refusal, when it refused the wake. */
+    wake_reason: z.enum(WAKE_REASONS).optional(),
+    upgrade_ms: Count.optional(),
+    startup_ms: Count.optional(),
+    dial_ms: Count.optional(),
+    first_backend_ms: Count.optional(),
+    wake_wait_ms: Count.optional(),
+    session_ms: Count.optional(),
   }),
 ]);
 export type GatewayMessage = z.infer<typeof GatewayMessage>;

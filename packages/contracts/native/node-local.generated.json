@@ -356,6 +356,66 @@
         "name": "unknown-type",
         "line": "{\"type\":\"release\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\"}",
         "valid": false
+      },
+      {
+        "name": "conn-stages",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"client_closed\",\"held_outcome\":\"released\",\"upgrade_ms\":3,\"startup_ms\":12,\"dial_ms\":1,\"first_backend_ms\":7,\"wake_wait_ms\":640,\"session_ms\":1800}",
+        "valid": true
+      },
+      {
+        "name": "conn-stages-refused",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"wake_refused\",\"held_outcome\":\"refused\",\"wake_reason\":\"no_headroom\",\"upgrade_ms\":2,\"session_ms\":9}",
+        "valid": true
+      },
+      {
+        "name": "conn-stages-early-end",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"upgrade_failed\"}",
+        "valid": true
+      },
+      {
+        "name": "conn-stages-unknown-reason",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"client_closed\",\"held_outcome\":\"released\",\"upgrade_ms\":3,\"startup_ms\":12,\"dial_ms\":1,\"first_backend_ms\":7,\"wake_wait_ms\":640,\"session_ms\":1800,\"wake_reason\":\"busy\"}",
+        "valid": false
+      },
+      {
+        "name": "conn-stages-outcome-text",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"client closed\",\"held_outcome\":\"released\",\"upgrade_ms\":3,\"startup_ms\":12,\"dial_ms\":1,\"first_backend_ms\":7,\"wake_wait_ms\":640,\"session_ms\":1800}",
+        "valid": false
+      },
+      {
+        "name": "conn-stages-negative",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"client_closed\",\"held_outcome\":\"released\",\"upgrade_ms\":3,\"startup_ms\":-1,\"dial_ms\":1,\"first_backend_ms\":7,\"wake_wait_ms\":640,\"session_ms\":1800}",
+        "valid": false
+      },
+      {
+        "name": "conn-stages-fraction",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"client_closed\",\"held_outcome\":\"released\",\"upgrade_ms\":3,\"startup_ms\":1.5,\"dial_ms\":1,\"first_backend_ms\":7,\"wake_wait_ms\":640,\"session_ms\":1800}",
+        "valid": false
+      },
+      {
+        "name": "conn-stages-above-2-53",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"client_closed\",\"held_outcome\":\"released\",\"upgrade_ms\":3,\"startup_ms\":12,\"dial_ms\":1,\"first_backend_ms\":7,\"wake_wait_ms\":9007199254740992,\"session_ms\":1800}",
+        "valid": false
+      },
+      {
+        "name": "conn-stages-null-mark",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"client_closed\",\"held_outcome\":\"released\",\"upgrade_ms\":3,\"startup_ms\":12,\"dial_ms\":null,\"first_backend_ms\":7,\"wake_wait_ms\":640,\"session_ms\":1800}",
+        "valid": false
+      },
+      {
+        "name": "conn-stages-wake-path",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"client_closed\",\"held_outcome\":\"released\",\"upgrade_ms\":3,\"startup_ms\":12,\"dial_ms\":1,\"first_backend_ms\":7,\"wake_wait_ms\":640,\"session_ms\":1800,\"wake_path\":\"cold\"}",
+        "valid": false
+      },
+      {
+        "name": "conn-stages-agent-steps",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"outcome\":\"client_closed\",\"held_outcome\":\"released\",\"upgrade_ms\":3,\"startup_ms\":12,\"dial_ms\":1,\"first_backend_ms\":7,\"wake_wait_ms\":640,\"session_ms\":1800,\"agent_ms\":{\"start\":80}}",
+        "valid": false
+      },
+      {
+        "name": "conn-stages-no-outcome",
+        "line": "{\"type\":\"conn_stages\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"session_ms\":9}",
+        "valid": false
       }
     ]
   },

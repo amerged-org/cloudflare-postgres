@@ -44,12 +44,22 @@ const DIAGNOSTIC_METHODS = new Set([
   "DELETE",
   "OPTIONS",
 ]);
-const DIAGNOSTIC_ROUTES = new Set([
+export const DIAGNOSTIC_ROUTES = new Set([
   "/v1/costs",
   "/v1/operational-health",
   "/v1/nodes/:id/mark-lost",
   "/v1/nodes/:id/loss",
   "/v1/nodes/:id/reinstall-override",
+  "/v1/nodes/:id/maintenance",
+  "/v1/nodes/:id/maintenance/:operation",
+  "/v1/nodes/:id/diagnostics",
+  "/v1/nodes/:id/diagnostics/:diagnostic_id",
+  "/v1/nodes/:id/database-placement",
+  "/v1/nodes/:id",
+  "/v1/regions/:id",
+  "/v1/fleet/releases",
+  "/v1/infrastructure-backups",
+  "/v1/infrastructure-backups/config",
   "/v1/databases/:id/move",
   "/v1/databases/:id/moves",
   "/v1/costs/node-facts",
@@ -105,6 +115,9 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/node/v1/volumes",
   "/node/v1/events",
   "/node/v1/usage",
+  "/node/v1/diagnostics",
+  "/node/v1/archive-credentials/:id",
+  "/node/v1/openapi.json",
 ]);
 
 export function apiError(

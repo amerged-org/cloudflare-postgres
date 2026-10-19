@@ -64,6 +64,61 @@ Node-loss and node-addition endpoints require an admin API key.
    and [9.4](../architecture/cloudflare-convergence-and-serverless-plan.md#94-node-loss-and-recovery)),
    which is built in Stage 3. Until then, recover databases by restore.
 
+## Looking at a node
+
+A node has no shell and opens no port, so an administrator asks its agent to read one thing and
+send it back over the link. The probes only read: each is a fixed command (no shell) or a read of
+fixed files, built by the agent, and a request names the probe and three integers, never a
+command, a path or a unit. They need an admin API key; any other key is told 404.
+
+Do not ask a node whose agent is older than the build with probes (SEC-09). It refuses a desired
+page that carries a request, and takes no order from a full pull (maintenance, move, fence, a
+release, the one that would update it) until the request expires, ten minutes later.
+
+1. `POST /v1/nodes/{id}/diagnostics` with `{"probe":"<name>"}` and, for `journal` and `kernel`,
+   `"boot"` (0 this boot, -1 the one before; default 0), `"since_seconds"` (60 to 86400; default
+   3600; `journal` only) and `"lines"` (1 to 2000; default 200). It answers `202` with a
+   `diagnostic_id`, records your key, and tells the node to pull its desired page, which lists
+   the request.
+2. `GET /v1/nodes/{id}/diagnostics/{diagnostic_id}` is `requested` until the node's result
+   arrives, `received` with the result in `body`, and `expired` after ten minutes without one.
+   A node answers within two pulls of its page; a node that is stale, fenced or off answers
+   nothing, and the request expires. A reboot has its own record: the boot report, listed at
+   `GET /v1/nodes/{id}/diagnostics` and read with its journal lines at the `diagnostic_id` path above.
+
+| Probe          | What the agent runs                                                                                                                                                          | What it shows                                                            |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `journal`      | `journalctl --no-pager --output=json --boot=<boot> --since=-<s>s --lines=<n>` for `pgcf-agent`, `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, PID 1 and the kernel | the entries of the boot report, for this boot or the one before          |
+| `kernel`       | `journalctl --no-pager --output=json -k --boot=<boot> --lines=<n>`                                                                                                           | the kernel's lines (out of memory kills, I/O errors, thin pool warnings) |
+| `boots`        | `journalctl --list-boots --no-pager`                                                                                                                                         | the boots the journal holds, and so whether a reboot happened            |
+| `failed_units` | `systemctl --failed --no-legend --plain`                                                                                                                                     | the units that failed                                                    |
+| `sockets`      | `systemctl list-sockets --all --no-legend --plain`                                                                                                                           | the socket units                                                         |
+| `listeners`    | `ss --listening --numeric --tcp --udp --unix --no-header`                                                                                                                    | what listens                                                             |
+| `pressure`     | `/proc/pressure/{cpu,memory,io}`, `/proc/meminfo`, `/proc/loadavg` and the total CPU line of `/proc/stat`                                                                    | stalls, memory and load                                                  |
+| `pool`         | `lvs --reportformat json -o lv_name,lv_attr,data_percent,metadata_percent pgcf/pgcf_thinpool`                                                                                | the thin pool's data and metadata fill                                   |
+
+`journal` and `kernel` answer with `entries`, every other probe with `text`. `status` is `failed`
+when a command ended with a status other than 0, did not end in 30 seconds, or a file could not
+be read; `text` then holds the status and what the command printed, but of `journal` and `kernel`
+only the status and stderr, never the lines they printed before they failed (a node that has not
+rebooted answers `journal` or `kernel` with `boot` -1 as failed: `No journal boot entry found`;
+a damaged journal file fails them with `Failed to iterate through journal`).
+
+- **Loopback only.** `listeners` shows TCP listeners on loopback only (the gateway and
+  cloudflared's metrics) and Unix sockets. A TCP or UDP socket on another address is an incident.
+  `/run/ssh-unix-local/socket` must not be listed there, nor `sshd-unix-local` or `sshd-vsock` in
+  `sockets`: the image masks the ssh generator that would bind sshd to them.
+- **Limits.** A result is at most 1 MiB; the oldest entries, or the end of a text (marked
+  `[truncated]`), go first. The lines of a database's unit (`pgcf-pg@…`) or of a backup job
+  (`pgcf-job-…`), and the lines PID 1 writes about them, are never sent; in a text, every line
+  that names one is left out. A kernel line that names a database's cgroup, such as an out of
+  memory kill, is kept: it holds the database's identifier and nothing of its data. A node's page
+  lists at most eight open requests at a time, the oldest first; later ones wait behind them and
+  may expire unanswered. The agent runs each once and keeps the identifiers of the last 64.
+- **Audit.** The row of the request (`node_diagnostic_requests`) holds the key that asked and
+  the time; the agent logs `probe_answered` with the probe's name. Requests and results are kept
+  for 30 days, and deleted by the next request for a probe after that.
+
 ## Control plane
 
 Keep a D1 export, the deployment source, private Worker binding configuration, Worker secret
@@ -110,3 +165,44 @@ Thin physical allocation metrics stay null until a real measurement exists; neit
 quota nor zero stands in for an unknown measurement. The node agent's full-pool and full-volume
 recovery ([plan 4.3](../architecture/cloudflare-convergence-and-serverless-plan.md#43-disk-thin-lvm))
 is built in Stage 3.
+
+## Node maintenance cycle
+
+The cycle installs the packages that a release pins (a newer Debian snapshot, a kernel update) on
+one node and reboots it if needed (plan 9.3). Run it one node at a time, in an announced window,
+with the owner's go for a reboot. The endpoints require an admin API key.
+
+1. Register the release (`PUT /v1/fleet/releases/{id}`) and assign it to the node's region
+   (`PUT /v1/regions/{id}/release`). Wait until `GET /v1/nodes/{id}/release` says `converged`:
+   the node installs the packages with the agent of the release, and the route refuses a node
+   that runs another release with 409.
+2. Verify the node's UID, then submit `POST /v1/nodes/{id}/maintenance` with a persistent
+   `Idempotency-Key` and `{"expected_node_uid":"<verified UID>"}`. It answers 202 with the
+   operation and a `Location`. Placement on the node is closed, and the node holds new wakes
+   with `57P03`, puts every awake database to sleep with the proof, installs the packages of the
+   lock and reboots if the kernel or core libraries changed. It purges the installed packages the
+   lock no longer names (never a kernel image, an essential or protected package) when nothing
+   needs a reboot, or, after a reboot, in the cycle it runs for the open order once it is up; then
+   it runs its check and reports. Repeating the request while the cycle is open returns the same
+   operation. Until the cycle ends the capacity cron buys no node in the region at all, whatever
+   the shortage: `GET /v1/regions/{id}/capacity-decision` says `maintenance`. A `failed` cycle
+   leaves placement closed and the cron buys again, as it does for any closed node.
+3. Poll `GET /v1/nodes/{id}/maintenance/{operation}`. `open` becomes `done` or `failed`; a
+   `failed` cycle names the class of the failure in `result_reason` (such as `power_busy` or
+   `power_archive` for a database that did not sleep with the proof, `release_missing`,
+   `lock_not_read`, `packages_not_read`, `packages_not_installed`, `reboot_failed` or
+   `check_failed`; `packages_not_installed` also names a purge that dpkg refused).
+4. `done` reopens placement, if this cycle closed it (`placement_closed_at` is not null). A
+   placement that an operator closed before or during the cycle stays closed: open it with
+   `PUT /v1/nodes/{id}/database-placement`. Either way the API hints the node when it records
+   the result, and the node serves wakes again as soon as it has pulled its page; if the hint is
+   lost, at its next full pull, within 60 s.
+5. After `failed`, placement stays closed and the node serves wakes again; its databases are
+   asleep. Read the node's events and logs, fix the cause, and submit the request again with a
+   new key: the new cycle takes over the closure the failed one left, so that its `done`
+   reopens placement.
+
+A lost or fenced node is refused with 409. A node that loses its link in the middle of the cycle
+keeps the order open until its agent answers after the reboot; staleness alone never declares it
+lost (plan 9.4). Debian keeps the previous kernel; a bad kernel is recovered from the boot menu
+over VNC or with a one-shot GRUB entry (plan 9.3).

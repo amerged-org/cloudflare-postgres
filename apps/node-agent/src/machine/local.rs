@@ -3,8 +3,9 @@
 //! starts them and signalled as systemd signals them, in directories that stand for the thin
 //! volumes. Only systemd, LVM and the users are stood in for; their own behaviour is proved in the
 //! lab (`units::lab`, `storage::lab_tests`) and on a node.
-use super::{Account, CpuTimes, Machine, Memory, initdb_arguments};
+use super::{Account, Boot, CpuTimes, Machine, Memory, initdb_arguments};
 use crate::{
+    diagnostics::probe,
     layout::Layout,
     link::NodeIdentity,
     storage::{
@@ -23,7 +24,7 @@ use std::{
     fs, io,
     num::NonZeroU32,
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
@@ -54,6 +55,10 @@ struct State {
     volume_error: Option<storage::Error>,
     /// `start` fails once.
     start_fails: bool,
+    /// `reboot` fails once, and the node keeps running.
+    reboot_fails: bool,
+    /// `purge_packages` fails once, as dpkg does for a package that others depend on.
+    purge_fails: bool,
     /// How long the next start takes before the postmaster begins.
     start_delay: Option<Duration>,
     /// LVM, or systemd, cannot be read: what they hold is not known.
@@ -69,6 +74,19 @@ struct State {
     credentials: Vec<(String, String, u64, bool)>,
     /// The Debian packages of the node, as dpkg would list them.
     packages: BTreeMap<String, String>,
+    /// How often the node booted since the test began, and the kernel it runs: a boot starts the
+    /// installed kernel image of the highest version.
+    boots: u64,
+    kernel_release: String,
+    /// The thin pool is gone: `lvs` cannot find it.
+    pool_lost: bool,
+    /// A journal file is damaged: `journalctl` prints the entries it read, then fails.
+    journal_damaged: bool,
+}
+
+/// The kernel's boot ID of the node's `boots`th boot.
+fn boot_id(boots: u64) -> String {
+    format!("00000000-0000-4000-8000-{boots:012x}")
 }
 
 pub struct Local {
@@ -103,6 +121,7 @@ impl Local {
             gid,
             state: Mutex::new(State {
                 available_bytes: 8 << 30,
+                kernel_release: "6.12.111+deb13-amd64".into(),
                 ..State::default()
             }),
         })
@@ -119,6 +138,14 @@ impl Local {
     }
     pub fn clear_calls(&self) {
         self.state().calls.clear();
+    }
+    /// The thin pool is gone, as on a node whose volume group lost it.
+    pub fn lose_pool(&self) {
+        self.state().pool_lost = true;
+    }
+    /// A journal file of the node was damaged by a crash.
+    pub fn damage_journal(&self) {
+        self.state().journal_damaged = true;
     }
     /// The Debian packages the node has.
     pub fn set_packages(&self, packages: &[(&str, &str)]) {
@@ -194,6 +221,12 @@ impl Local {
     }
     pub fn fail_next_start(&self) {
         self.state().start_fails = true;
+    }
+    pub fn fail_next_reboot(&self) {
+        self.state().reboot_fails = true;
+    }
+    pub fn fail_next_purge(&self) {
+        self.state().purge_fails = true;
     }
     pub fn set_volumes_unreadable(&self, unreadable: bool) {
         self.state().volumes_unreadable = unreadable;
@@ -718,7 +751,8 @@ impl Machine for Local {
     }
 
     /// Apt's effect on the package list: the versions named are installed. A package file is only
-    /// recorded.
+    /// recorded: the lock of a release lists the package of each file among its packages too, so
+    /// the versions already name it.
     async fn install_packages(
         &self,
         snapshot: &str,
@@ -743,8 +777,46 @@ impl Machine for Local {
         Ok(())
     }
 
+    /// Dpkg's effect on the package list: the packages named are gone.
+    async fn purge_packages(&self, names: &[String]) -> io::Result<()> {
+        let mut state = self.state();
+        state.calls.push(format!("purge {}", names.join(" ")));
+        if std::mem::take(&mut state.purge_fails) {
+            return Err(io::Error::other(
+                "dpkg --purge ended with exit status: 1: dependency problems - not removing",
+            ));
+        }
+        for name in names {
+            state.packages.remove(name);
+        }
+        Ok(())
+    }
+
     async fn reboot(&self) -> io::Result<()> {
-        self.state().calls.push("reboot".into());
+        let mut state = self.state();
+        state.calls.push("reboot".into());
+        if std::mem::take(&mut state.reboot_fails) {
+            return Err(io::Error::other(
+                "systemctl reboot ended with exit status: 1",
+            ));
+        }
+        state.boots += 1;
+        // GRUB boots the highest version, which is not the last name: 6.12.99 is below 6.12.113.
+        let numbers = |abi: &str| -> Vec<u64> {
+            abi.split(|c: char| !c.is_ascii_digit())
+                .filter_map(|number| number.parse().ok())
+                .collect()
+        };
+        let newest = state
+            .packages
+            .keys()
+            .filter_map(|name| name.strip_prefix("linux-image-"))
+            .filter(|abi| abi.starts_with(|c: char| c.is_ascii_digit()))
+            .max_by_key(|abi| numbers(abi))
+            .map(String::from);
+        if let Some(abi) = newest {
+            state.kernel_release = abi;
+        }
         Ok(())
     }
 
@@ -758,6 +830,100 @@ impl Machine for Local {
             .map_err(|error| io::Error::other(error.to_string()))
     }
 
+    /// What `journalctl` printed on a node that rebooted, captured from a real one; a node that has
+    /// not rebooted has no earlier boot.
+    async fn previous_boot_journal(&self) -> io::Result<Option<String>> {
+        let boots = self.state().boots;
+        // The capture's lines name the boot they are from, as journald prints its ID (32 hex
+        // digits): they are made the lines of the boot before this one.
+        Ok((boots > 0).then(|| {
+            include_str!("../diagnostics/previous-boot.jsonl").replace(
+                "11111111111141118111111111111111",
+                &boot_id(boots - 1).replace('-', ""),
+            )
+        }))
+    }
+
+    /// What the tools printed on a systemd 257 lab on Debian trixie (`diagnostics/probe/`): the
+    /// outputs of the commands the probes build, as their exit status and streams.
+    async fn diagnostic(&self, argv: &probe::Argv) -> io::Result<Output> {
+        use std::os::unix::process::ExitStatusExt;
+        // journalctl's line when reading the journal fails after it printed entries (systemd's
+        // "Failed to iterate through journal: %m" with EBADMSG). The lab's journalctl read files
+        // with random damage and ended with status 0, so this line is from the source, not a capture.
+        const DAMAGED_JOURNAL: &str = "Failed to iterate through journal: Bad message\n";
+        let exited = |code: i32, stdout: &str, stderr: &str| Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        let mut state = self.state();
+        state.calls.push(format!(
+            "diagnostic {} {}",
+            argv.program,
+            argv.arguments.join(" ")
+        ));
+        let has = |word: &str| argv.arguments.iter().any(|argument| argument == word);
+        Ok(match argv.program {
+            "journalctl" if has("--list-boots") => {
+                exited(0, include_str!("../diagnostics/probe/boots.txt"), "")
+            }
+            // A node that has not rebooted has no boot before this one.
+            "journalctl" if has("--boot=-1") && state.boots == 0 => exited(
+                1,
+                "",
+                "No journal boot entry found for the specified boot (-1).\n",
+            ),
+            "journalctl" if state.journal_damaged && has("-k") => exited(
+                1,
+                include_str!("../diagnostics/probe/kernel.jsonl"),
+                DAMAGED_JOURNAL,
+            ),
+            "journalctl" if state.journal_damaged => exited(
+                1,
+                include_str!("../diagnostics/probe/journal.jsonl"),
+                DAMAGED_JOURNAL,
+            ),
+            "journalctl" if has("-k") => {
+                exited(0, include_str!("../diagnostics/probe/kernel.jsonl"), "")
+            }
+            "journalctl" => exited(0, include_str!("../diagnostics/probe/journal.jsonl"), ""),
+            "systemctl" if has("--failed") => {
+                exited(0, include_str!("../diagnostics/probe/failed-units.txt"), "")
+            }
+            "systemctl" if has("list-sockets") => {
+                exited(0, include_str!("../diagnostics/probe/sockets.txt"), "")
+            }
+            "ss" => exited(0, include_str!("../diagnostics/probe/listeners.txt"), ""),
+            "lvs" if state.pool_lost => {
+                exited(5, include_str!("../diagnostics/probe/pool-missing.txt"), "")
+            }
+            "lvs" => exited(0, include_str!("../diagnostics/probe/pool-report.txt"), ""),
+            _ => return Err(io::Error::from(io::ErrorKind::NotFound)),
+        })
+    }
+
+    fn proc_file(&self, file: probe::ProcFile) -> io::Result<String> {
+        use probe::ProcFile::*;
+        Ok(match file {
+            PressureCpu => include_str!("../diagnostics/probe/proc-pressure-cpu.txt"),
+            PressureMemory => include_str!("../diagnostics/probe/proc-pressure-memory.txt"),
+            PressureIo => include_str!("../diagnostics/probe/proc-pressure-io.txt"),
+            Meminfo => include_str!("../diagnostics/probe/proc-meminfo.txt"),
+            Loadavg => include_str!("../diagnostics/probe/proc-loadavg.txt"),
+            Stat => include_str!("../diagnostics/probe/proc-stat.txt"),
+        }
+        .to_string())
+    }
+
+    fn boot(&self) -> Option<Boot> {
+        let state = self.state();
+        Some(Boot {
+            id: boot_id(state.boots),
+            booted_at: 1_792_318_800 + state.boots * 600,
+            kernel_release: state.kernel_release.clone(),
+        })
+    }
     fn memory(&self) -> Option<Memory> {
         Some(Memory {
             total_bytes: 12 << 30,

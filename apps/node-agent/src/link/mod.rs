@@ -20,6 +20,7 @@ pub(crate) mod test_server;
 
 pub use desired::{Desired, Order};
 pub use events::LinkEvent;
+pub(crate) use identity::transient;
 pub use identity::{NodeIdentity, Paths};
 pub use outbox::Flushed;
 pub use request::{Fenced, Transport};
@@ -108,6 +109,8 @@ pub struct LinkConfig {
     pub agent_version: String,
     /// The release the agent runs, for the hello of the link.
     pub release_id: Option<String>,
+    /// The boot and operating system of the node (`NodeOs`), for the hello of the link.
+    pub os: Value,
     pub timing: Timing,
 }
 
@@ -121,6 +124,8 @@ struct Inner {
     outbox: Arc<outbox::Outbox>,
     events: Arc<Events>,
     samples: watch::Sender<Option<String>>,
+    /// The hello every new connection of the link starts with.
+    hello: watch::Sender<Value>,
     tasks: Vec<JoinHandle<()>>,
 }
 impl Drop for Inner {
@@ -164,6 +169,7 @@ impl Link {
             "protocol": constant("NODE_PROTOCOL_VERSION"),
             "agent_version": config.agent_version,
             "release_id": config.release_id,
+            "os": config.os,
         });
         if !schema_valid("AgentLinkMessage", &hello) {
             return Err("native link hello invalid".into());
@@ -173,12 +179,13 @@ impl Link {
             config.paths.link().join("usage-outbox.json"),
         ));
         let (samples, latest) = watch::channel(None);
+        let (hello, greeting) = watch::channel(hello);
         let tasks = vec![
             tokio::spawn(socket::run(
                 api.clone(),
                 events.clone(),
                 latest,
-                hello.to_string(),
+                greeting,
                 config.timing.clone(),
             )),
             tokio::spawn(deliver(
@@ -192,6 +199,7 @@ impl Link {
             outbox,
             events: events.clone(),
             samples,
+            hello,
             tasks,
         };
         Ok((
@@ -200,6 +208,25 @@ impl Link {
             },
             LinkEvents { events },
         ))
+    }
+
+    /// Changes the boot and operating system the hello reports, when the packages changed in a
+    /// maintenance cycle that did not reboot. The link says hello again on a new connection; the
+    /// same `os` changes nothing. Nothing is taken that the contract refuses.
+    pub fn set_os(&self, os: &Value) -> Result<(), Error> {
+        let mut hello = self.inner.hello.borrow().clone();
+        hello["os"] = os.clone();
+        if !schema_valid("AgentLinkMessage", &hello) {
+            return Err("native link hello invalid".into());
+        }
+        self.inner.hello.send_if_modified(|current| {
+            let changed = *current != hello;
+            if changed {
+                *current = hello;
+            }
+            changed
+        });
+        Ok(())
     }
 
     pub fn node(&self) -> &NodeIdentity {
@@ -246,6 +273,16 @@ impl Link {
     pub async fn post_observation(&self, report: &Value) -> Result<(), Error> {
         self.post("observations", "NodeObservationReport", report)
             .await
+    }
+
+    /// Posts the journal of the previous boot (`NodeBootReport`), once after a reboot.
+    pub async fn post_diagnostics(&self, report: &Value) -> Result<(), Error> {
+        self.post("diagnostics", "NodeBootReport", report).await
+    }
+
+    /// Posts the result of a probe an administrator asked for (`NodeProbeResult`), once.
+    pub async fn post_probe(&self, result: &Value) -> Result<(), Error> {
+        self.post("diagnostics", "NodeProbeResult", result).await
     }
 
     /// Posts every thin volume of the node (`NodeVolumeReport`), sampled every 60 s.
@@ -348,12 +385,17 @@ mod tests {
                 image_version: "25".into(),
                 agent_version: "0.1.0".into(),
                 release_id: Some("release-25".into()),
+                os: os(),
                 timing: quick(),
             },
             Transport::new(cloud.roots()).unwrap(),
         )
         .await
         .unwrap()
+    }
+    /// The boot and operating system of the contract's example hello.
+    fn os() -> Value {
+        vector("AgentLinkMessage", "hello")["os"].clone()
     }
     async fn next(events: &mut LinkEvents) -> Option<LinkEvent> {
         tokio::time::timeout(Duration::from_secs(10), events.next())
@@ -440,6 +482,31 @@ mod tests {
         assert!(link.post_samples(&json!({"memory":1})).await.is_err());
         assert!(link.archive_credential("../credentials").await.is_err());
         assert_eq!(cloud.requests().len(), before);
+    }
+
+    #[tokio::test]
+    async fn the_hello_names_the_boot_and_the_os_and_a_changed_os_is_said_on_a_new_link() {
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let (link, mut events) = start(&cloud, &base).await;
+        assert_eq!(next(&mut events).await, Some(LinkEvent::Desired(None)));
+        let hellos = || cloud.with(|inner| inner.hellos.clone());
+        assert_eq!(hellos(), [vector("AgentLinkMessage", "hello")]);
+        // The packages changed in a maintenance cycle: the next hello says so, on a new link.
+        let mut installed = os();
+        installed["packages_sha256"] = "b".repeat(64).into();
+        link.set_os(&installed).unwrap();
+        assert_eq!(next(&mut events).await, Some(LinkEvent::Desired(None)));
+        eventually(|| hellos().len() == 2).await;
+        assert_eq!(hellos()[1]["os"], installed);
+        assert_eq!(hellos()[1]["release_id"], "release-25");
+        // The same os opens no new link, and an os the contract refuses is not taken.
+        link.set_os(&installed).unwrap();
+        assert!(link.set_os(&json!({"boot_id": "boot"})).is_err());
+        assert!(link.set_os(&Value::Null).is_err());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(hellos().len(), 2);
     }
 
     #[tokio::test]

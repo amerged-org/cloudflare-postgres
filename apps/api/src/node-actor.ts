@@ -204,14 +204,31 @@ export class NodeActor extends DurableObject<Env> {
     }
     if (parsed.data.type === "hello") {
       socket.serializeAttachment({ hello: true } satisfies Attachment);
+      const { os } = parsed.data;
+      // A new boot ends the one before with the newest sample the actor holds: D1 has only the
+      // sample its minute's row was written with, up to a minute older.
+      const held =
+        link.sample === null
+          ? null
+          : (JSON.parse(link.sample) as NodeSample).observed_at;
       await this.env.DB.prepare(
-        "UPDATE nodes SET agent_version=?,reported_release_id=?,updated_at=? WHERE id=? AND node_uid=?",
+        `UPDATE nodes SET agent_version=?,reported_release_id=?,
+         os_previous_observed_at=CASE WHEN os_boot_id IS ? THEN os_previous_observed_at
+           ELSE COALESCE(MAX(last_observed_at,?),?,last_observed_at) END,
+         os_boot_id=?,os_booted_at=?,os_kernel_release=?,os_packages_sha256=?,updated_at=? WHERE id=? AND node_uid=?`,
       )
         .bind(
           parsed.data.agent_version,
           parsed.data.release_id === null
             ? null
             : FleetReleaseId.parse(parsed.data.release_id),
+          os.boot_id,
+          held,
+          held,
+          os.boot_id,
+          os.booted_at,
+          os.kernel_release,
+          os.packages_sha256,
           new Date().toISOString(),
           link.node_id,
           link.node_uid,

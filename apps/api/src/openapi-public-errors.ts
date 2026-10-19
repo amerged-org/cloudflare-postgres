@@ -56,9 +56,16 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
 
   // setNodeDatabasePlacement's failed identity CAS is 409 even for a missing/lost node.
   "PUT /v1/nodes/{id}/database-placement": [400, 401, 403, 409, 500],
+  // Only an administrator reads a report: any other key is told 404, as for a resource it does not own.
+  "GET /v1/nodes/{id}/diagnostics": [400, 401, 404, 500],
+  "POST /v1/nodes/{id}/diagnostics": [400, 401, 404, 500],
+  "GET /v1/nodes/{id}/diagnostics/{diagnostic_id}": [400, 401, 404, 500],
   "POST /v1/nodes/{id}/mark-lost": [400, 401, 403, 404, 409, 500],
   "GET /v1/nodes/{id}/loss": [400, 401, 403, 404, 500],
   "POST /v1/nodes/{id}/reinstall-override": [400, 401, 403, 404, 409, 500],
+  // 409: the physical identity, a lost or fenced node, or a node that has not converged on its release.
+  "POST /v1/nodes/{id}/maintenance": [400, 401, 403, 404, 409, 500],
+  "GET /v1/nodes/{id}/maintenance/{operation}": [400, 401, 403, 404, 500],
   "POST /v1/databases/{id}/move": [400, 401, 403, 404, 409, 500],
   "GET /v1/databases/{id}/moves": [400, 401, 403, 404, 500],
   // reserveNodeAddition's slot refusal is NodeStateError.capacity_unavailable -> 503.
@@ -122,6 +129,7 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "DELETE /v1/databases/{id}/roles/{name}",
   "POST /v1/costs/node-facts",
   "POST /v1/nodes/additions",
+  "POST /v1/nodes/{id}/maintenance",
   "PUT /v1/regions/{id}/configuration",
   "PUT /v1/fleet/releases/{id}",
   "PUT /v1/regions/{id}/release",
@@ -136,6 +144,7 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
  */
 export const requiredIdempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/nodes/additions",
+  "POST /v1/nodes/{id}/maintenance",
   "POST /v1/databases",
   "PATCH /v1/databases/{id}",
   "PUT /v1/databases/{id}/idle-time",
@@ -196,5 +205,9 @@ export const locationResponses: Readonly<
   "POST /v1/nodes/additions": {
     "202":
       "Node addition operation resource path, also returned on a completed idempotency replay.",
+  },
+  "POST /v1/nodes/{id}/maintenance": {
+    "202":
+      "Maintenance cycle resource path, also returned on a completed idempotency replay.",
   },
 };

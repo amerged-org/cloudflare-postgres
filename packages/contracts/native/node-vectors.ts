@@ -6,6 +6,7 @@ import type { z } from "zod";
 import * as link from "../src/node-link.ts";
 import * as local from "../src/node-local.ts";
 import { bytesToBase64url } from "../src/encoding.ts";
+import { FleetReleaseId, packagesSha256 } from "../src/releases.ts";
 
 const id = `d${"b".repeat(19)}`,
   other = `e${"b".repeat(19)}`,
@@ -198,6 +199,8 @@ const fenced = {
   databases: [],
   next: null,
 };
+// A page with nothing on it but what its own rules are about.
+const bare = { ...page, orders: [], databases: [], next: null };
 const withDatabase = (change: object) => ({
   ...page,
   orders: [],
@@ -321,6 +324,73 @@ const archiveCredential = {
   expires_at: credential.expires_at,
 };
 
+const hello = {
+  type: "hello",
+  protocol: 1,
+  agent_version: "0.1.0",
+  release_id: "release-25",
+  os: {
+    boot_id: "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+    booted_at: now,
+    kernel_release: "6.12.111+deb13-amd64",
+    packages_sha256: "a".repeat(64),
+  },
+};
+
+const journalEntry = {
+  at: now,
+  unit: "pgcf-agent.service",
+  identifier: "pgcf-agent",
+  transport: "stdout",
+  priority: 6,
+  message: '{"event":"agent_started","uptime_s":12}',
+};
+const bootReport = {
+  boot_id: hello.os.boot_id,
+  previous_boot_id: "9a7c1d2e-4b3f-4a65-8e10-6c5d4b3a2f10",
+  kernel_release: hello.os.kernel_release,
+  entries: [
+    journalEntry,
+    {
+      at: now,
+      unit: null,
+      identifier: null,
+      transport: "kernel",
+      priority: 3,
+      message: "Out of memory: Killed process 4242 (postgres)",
+    },
+    {
+      at: now,
+      unit: "init.scope",
+      identifier: "systemd",
+      transport: "journal",
+      priority: 6,
+      message: "Stopping pgcf-agent.service - PGCF node agent...",
+    },
+  ],
+};
+const probeRequest = {
+  id: "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81",
+  probe: "journal",
+  boot: -1,
+  since_seconds: 3600,
+  lines: 200,
+};
+const probeResult = {
+  kind: "probe",
+  diagnostic_id: probeRequest.id,
+  probe: "journal",
+  status: "ok",
+  entries: [journalEntry],
+  text: "",
+};
+const textResult = {
+  ...probeResult,
+  probe: "listeners",
+  entries: [],
+  text: "tcp   LISTEN 0      4096   127.0.0.1:8443     0.0.0.0:*\n",
+};
+
 type Case = [name: string, value: unknown, valid: boolean, refinement?: true];
 /** The schemas the node agent reads or writes, by the name the JSON Schemas carry. */
 export const nodeSchemas = {
@@ -335,11 +405,14 @@ export const nodeSchemas = {
   NodeSample: link.NodeSample,
   NodeVolumeReport: link.NodeVolumeReport,
   NodeEventReport: link.NodeEventReport,
+  NodeBootReport: link.NodeBootReport,
+  NodeProbeResult: link.NodeProbeResult,
   NodeUsageReport: link.NodeUsageReport,
   NodeFencedResponse: link.NodeFencedResponse,
   AgentLinkMessage: link.AgentLinkMessage,
   ServerLinkMessage: link.ServerLinkMessage,
   InstallerProgress: link.InstallerProgress,
+  FleetReleaseId,
 } as const satisfies Record<string, z.ZodType>;
 
 const cases: Record<keyof typeof nodeSchemas, Case[]> = {
@@ -545,6 +618,43 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       { ...fenced, orders: [...fenced.orders, page.orders[2]] },
       false,
       true,
+    ],
+    [
+      "with-diagnostics",
+      {
+        ...bare,
+        diagnostics: [
+          probeRequest,
+          { ...probeRequest, id: eventId("d"), probe: "pool" },
+        ],
+      },
+      true,
+    ],
+    [
+      "nine-diagnostics",
+      {
+        ...bare,
+        diagnostics: Array.from({ length: 9 }, (_, i) => ({
+          ...probeRequest,
+          id: eventId(String(i)),
+        })),
+      },
+      false,
+    ],
+    [
+      "diagnostic-with-a-command",
+      { ...bare, diagnostics: [{ ...probeRequest, command: "ss -p" }] },
+      false,
+    ],
+    [
+      "diagnostic-of-an-unknown-probe",
+      { ...bare, diagnostics: [{ ...probeRequest, probe: "shell" }] },
+      false,
+    ],
+    [
+      "diagnostic-lines-over-2000",
+      { ...bare, diagnostics: [{ ...probeRequest, lines: 2001 }] },
+      false,
     ],
     ["credentials-revision-zero", { ...page, credentials_revision: 0 }, false],
     [
@@ -1246,6 +1356,79 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
     ["pool-hit", { events: [{ ...wake, outcome: "hit" }] }, false],
   ],
+  NodeBootReport: [
+    ["report", bootReport, true],
+    [
+      "no-earlier-boot-and-no-journal",
+      { ...bootReport, previous_boot_id: null, entries: [] },
+      true,
+    ],
+    [
+      "message-of-2048-bytes",
+      {
+        ...bootReport,
+        entries: [{ ...journalEntry, message: "\u00e9".repeat(1024) }],
+      },
+      true,
+    ],
+    [
+      "message-of-2050-bytes",
+      {
+        ...bootReport,
+        entries: [{ ...journalEntry, message: "\u00e9".repeat(1025) }],
+      },
+      false,
+      true,
+    ],
+    [
+      "priority-above-debug",
+      { ...bootReport, entries: [{ ...journalEntry, priority: 8 }] },
+      false,
+    ],
+    [
+      "unit-not-a-name",
+      { ...bootReport, entries: [{ ...journalEntry, unit: "" }] },
+      false,
+    ],
+    [
+      "entry-with-a-field-of-the-journal",
+      { ...bootReport, entries: [{ ...journalEntry, _PID: "104" }] },
+      false,
+    ],
+    ["boot-id-not-a-uuid", { ...bootReport, boot_id: "boot" }, false],
+    [
+      "no-previous-boot-id",
+      { ...bootReport, previous_boot_id: undefined },
+      false,
+    ],
+  ],
+  NodeProbeResult: [
+    ["journal", probeResult, true],
+    ["text", textResult, true],
+    [
+      "failed",
+      { ...textResult, status: "failed", text: "exit status: 5\n" },
+      true,
+    ],
+    ["no-kind", { ...probeResult, kind: undefined }, false],
+    ["boot-report", bootReport, false],
+    ["unknown-probe", { ...probeResult, probe: "shell" }, false],
+    ["unknown-status", { ...probeResult, status: "partial" }, false],
+    [
+      "entry-with-a-field-of-the-journal",
+      { ...probeResult, entries: [{ ...journalEntry, _PID: "104" }] },
+      false,
+    ],
+    [
+      "message-of-2050-bytes",
+      {
+        ...probeResult,
+        entries: [{ ...journalEntry, message: "\u00e9".repeat(1025) }],
+      },
+      false,
+      true,
+    ],
+  ],
   NodeUsageReport: [
     ["usage", { rows: [usageRow] }, true],
     [
@@ -1307,20 +1490,13 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ["detail", { error: "node_fenced", detail: "lost" }, false],
   ],
   AgentLinkMessage: [
-    [
-      "hello",
-      {
-        type: "hello",
-        protocol: 1,
-        agent_version: "0.1.0",
-        release_id: "release-25",
-      },
-      true,
-    ],
+    ["hello", hello, true],
     ["sample", { type: "sample", sample }, true],
+    ["other-protocol", { ...hello, protocol: 2, release_id: null }, false],
+    ["hello-without-os", { ...hello, os: undefined }, false],
     [
-      "other-protocol",
-      { type: "hello", protocol: 2, agent_version: "0.1.0", release_id: null },
+      "boot-id-not-a-uuid",
+      { ...hello, os: { ...hello.os, boot_id: "boot" } },
       false,
     ],
   ],
@@ -1335,6 +1511,11 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ["checkpoint", { checkpoint: "image_verified", detail: "" }, true],
     ["failed-step", { checkpoint: "failed", detail: "tools" }, true],
     ["unknown-checkpoint", { checkpoint: "booted", detail: "" }, false],
+  ],
+  FleetReleaseId: [
+    ["release", "release-25", true],
+    ["upper-case", "Release-25", false],
+    ["path", "../release", false],
   ],
 };
 
@@ -1353,6 +1534,49 @@ export function nodeSchemaVectors() {
       return { schema, name, valid, refinement: refinement ?? false, value };
     }),
   );
+}
+
+/**
+ * The digest of an installed package set (`packagesSha256`) beside the `dpkg-query` output the
+ * node reads the set from: the same digest on both sides. dpkg lists by name; the digest sorts
+ * whole lines, which orders `libc6-dev=` before `libc6=`. An `rc` line is a package that was
+ * removed with its configuration kept, not an installed one. Debian keeps the previous kernel
+ * after an update: of the kernel images the node counts only the running one, which the lock
+ * holds alone.
+ */
+export async function packageVectors() {
+  const installed = [
+    ["bash", "5.2"],
+    ["bsdutils", "1:2.41.5-0+deb13u1"],
+    ["libc6", "2.41-1"],
+    ["libc6-dev", "2.41-1"],
+    ["linux-image-6.12.113+deb13-amd64", "6.12.113-1"],
+    ["linux-image-amd64", "6.12.113-1"],
+  ].map(([name, version]) => ({ name: name!, version: version! }));
+  // dpkg-query lists the packages by name: `<status>\t<name>\t<version>`, the status abbreviated
+  // to two letters and a space.
+  const dpkg = (extra: [status: string, name: string, version: string]) =>
+    [...installed.map(({ name, version }) => ["ii ", name, version]), extra]
+      .sort((a, b) => (a[1]! < b[1]! ? -1 : 1))
+      .map(([status, name, version]) => `${status}\t${name}\t${version}\n`)
+      .join("");
+  const sha256 = await packagesSha256(installed);
+  return [
+    {
+      name: "removed-package",
+      kernel_release: "6.12.113+deb13-amd64",
+      dpkg: dpkg(["rc ", "oldpkg", "1.0-1"]),
+      packages: installed,
+      sha256,
+    },
+    {
+      name: "previous-kernel-kept",
+      kernel_release: "6.12.113+deb13-amd64",
+      dpkg: dpkg(["ii ", "linux-image-6.12.111+deb13-amd64", "6.12.111-1"]),
+      packages: installed,
+      sha256,
+    },
+  ];
 }
 
 /** A fixed Ed25519 seed; never a node's key. */
@@ -1726,6 +1950,18 @@ export function gatewayChannelVectors() {
     database: id,
     report: value,
   });
+  const stages = {
+    type: "conn_stages",
+    database: id,
+    outcome: "client_closed",
+    held_outcome: "released",
+    upgrade_ms: 3,
+    startup_ms: 12,
+    dial_ms: 1,
+    first_backend_ms: 7,
+    wake_wait_ms: 640,
+    session_ms: 1800,
+  };
   const gateway: [string, unknown, boolean][] = [
     ["wake", { type: "wake", wake: request }, true],
     [
@@ -1833,6 +2069,46 @@ export function gatewayChannelVectors() {
       false,
     ],
     ["unknown-type", { type: "release", database: id }, false],
+    ["conn-stages", stages, true],
+    [
+      "conn-stages-refused",
+      {
+        type: "conn_stages",
+        database: id,
+        outcome: "wake_refused",
+        held_outcome: "refused",
+        wake_reason: "no_headroom",
+        upgrade_ms: 2,
+        session_ms: 9,
+      },
+      true,
+    ],
+    [
+      "conn-stages-early-end",
+      { type: "conn_stages", database: id, outcome: "upgrade_failed" },
+      true,
+    ],
+    ["conn-stages-unknown-reason", { ...stages, wake_reason: "busy" }, false],
+    [
+      "conn-stages-outcome-text",
+      { ...stages, outcome: "client closed" },
+      false,
+    ],
+    ["conn-stages-negative", { ...stages, startup_ms: -1 }, false],
+    ["conn-stages-fraction", { ...stages, startup_ms: 1.5 }, false],
+    [
+      "conn-stages-above-2-53",
+      { ...stages, wake_wait_ms: 9_007_199_254_740_992 },
+      false,
+    ],
+    ["conn-stages-null-mark", { ...stages, dial_ms: null }, false],
+    ["conn-stages-wake-path", { ...stages, wake_path: "cold" }, false],
+    ["conn-stages-agent-steps", { ...stages, agent_ms: { start: 80 } }, false],
+    [
+      "conn-stages-no-outcome",
+      { type: "conn_stages", database: id, session_ms: 9 },
+      false,
+    ],
   ];
   const check = (
     schema: typeof local.AgentMessage | typeof local.GatewayMessage,

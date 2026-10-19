@@ -19,6 +19,7 @@ import type { NodeCaller } from "./node-auth.ts";
 import { ensureArchiveCredentials } from "./archive-credentials.ts";
 import { moveTargets } from "./database-moves.ts";
 import { openNodeOrders } from "./lifecycle-orders.ts";
+import { openDiagnosticRequests } from "./node-diagnostics.ts";
 
 interface NodeRow {
   id: string;
@@ -104,10 +105,12 @@ async function pageRelease(
     .first<{ id: string; spec_json: string }>();
   if (row === null) return null;
   const spec = FleetReleaseSpec.parse(JSON.parse(row.spec_json));
+  // The kernel and the packages a node is expected to report stay with the API, which compares
+  // them: an agent of an older build refuses a page that carries more than it knows.
   return NodeRelease.parse({
     id: row.id,
     binaries: spec.binaries,
-    os: spec.os,
+    os: NodeRelease.shape.os.strip().parse(spec.os),
   });
 }
 
@@ -155,7 +158,8 @@ async function databaseRoles(
 /**
  * One page of the databases a node serves, with its release, policy and open orders (plan 5.3).
  * A database is on the page once its archive credential is issued. A fenced node's page holds the
- * fence and the retired storage generations and nothing else.
+ * fence and the retired storage generations and nothing else. The probes an administrator asked
+ * the node for and the node has not answered are on the first page of a full pull (SEC-09).
  */
 export async function nodeDesiredPage(
   env: Env,
@@ -316,12 +320,19 @@ export async function nodeDesiredPage(
       ...(origin ? { origin } : {}),
     });
   }
+  // A pull of named databases is a wake's, and a later page repeats the first: the probes wait for
+  // the first page of a full pull, which a request for one is followed by at once.
+  const diagnostics =
+    query.ids === undefined && query.after === undefined
+      ? await openDiagnosticRequests(env.DB, node.id, now)
+      : [];
   return NodeDesiredPage.parse({
     node: identity,
     release: await pageRelease(env, node.region_id),
     policy,
     credentials_revision: node.credentials_revision,
     orders,
+    ...(diagnostics.length > 0 ? { diagnostics } : {}),
     databases,
     next: result.results.length > query.limit ? rows.at(-1)!.id : null,
   });

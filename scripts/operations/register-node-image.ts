@@ -23,6 +23,9 @@
 //   PGCF_API_URL               the management API's origin, https://...
 //   PGCF_API_KEY               an administrator API key
 //
+// The registration also states what a node that runs the lock reports in its hello (SEC-03): the
+// kernel the lock holds and the digest of its packages, which the API compares with each node's.
+//
 // The API refuses the registration unless every file is in the bucket at the registered size with
 // the sha256 R2 verified at upload, so each file is sent with `x-amz-checksum-sha256`. A file that
 // is already there with the same content and that sha256 is not sent again; one stored without the
@@ -42,6 +45,7 @@ import {
   RELEASE_BINARY_FILES,
   RELEASE_IMAGE_FILE,
   RELEASE_LOCK_FILE,
+  packagesSha256,
   releaseObjectKey,
   type FleetPinnedFile,
   type FleetReleaseSpec,
@@ -129,6 +133,49 @@ export interface Manifest {
   uploads: Upload[];
 }
 
+/**
+ * What a node that runs the lock reports in its hello (SEC-03): the digest of the lock's packages,
+ * `packages` and `extra` together (the extra ones are in the image too), and the kernel they hold,
+ * the one `linux-image-<abi>` package that is no meta package. The API compares both with the node's.
+ */
+export async function lockOs(
+  text: string,
+): Promise<{ packages_sha256: string; kernel_release: string }> {
+  const malformed = () =>
+    new Error("the package lock is not what node-image.ts writes");
+  let lock: Record<string, unknown>;
+  try {
+    lock = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw malformed();
+  }
+  const packages = new Map<string, string>();
+  for (const list of [lock.packages, lock.extra]) {
+    if (!Array.isArray(list)) throw malformed();
+    for (const entry of list as Record<string, unknown>[]) {
+      const { name, version } = entry ?? {};
+      if (typeof name !== "string" || typeof version !== "string")
+        throw malformed();
+      if (packages.get(name) !== undefined && packages.get(name) !== version)
+        throw new Error(`${name} is locked in two versions`);
+      packages.set(name, version);
+    }
+  }
+  const kernels = [...packages.keys()].filter((name) =>
+    /^linux-image-[0-9]/.test(name),
+  );
+  if (kernels.length !== 1)
+    throw new Error(
+      `the package lock must hold exactly one kernel image, it holds ${kernels.length}`,
+    );
+  return {
+    packages_sha256: await packagesSha256(
+      [...packages].map(([name, version]) => ({ name, version })),
+    ),
+    kernel_release: kernels[0]!.slice("linux-image-".length),
+  };
+}
+
 const defaultLock = join(
   import.meta.dirname,
   "../../infra/node-image/packages.lock.json",
@@ -181,9 +228,11 @@ export async function releaseManifest(options: {
     throw new Error(
       "the compressed image is not the one the build summary describes",
     );
-  const lock = await add(RELEASE_LOCK_FILE, options.lockPath ?? defaultLock);
+  const lockPath = options.lockPath ?? defaultLock;
+  const lock = await add(RELEASE_LOCK_FILE, lockPath);
   if (lock.sha256 !== summary.lock_sha256)
     throw new Error("the package lock is not the one the image was built from");
+  const lockFacts = await lockOs(await readFile(lockPath, "utf8"));
   const binaries = {} as Record<
     (typeof RELEASE_BINARY_FILES)[number],
     typeof image
@@ -205,7 +254,11 @@ export async function releaseManifest(options: {
         raw_bytes: summary.raw.size,
       },
       binaries,
-      os: { debian_snapshot: summary.debian_snapshot, package_lock: lock },
+      os: {
+        debian_snapshot: summary.debian_snapshot,
+        package_lock: lock,
+        ...lockFacts,
+      },
     }),
     uploads,
   };
@@ -418,6 +471,8 @@ const registeredPins = (spec: FleetReleaseSpec): FleetReleaseRegistration => ({
   os: {
     debian_snapshot: spec.os.debian_snapshot,
     package_lock: pin(spec.os.package_lock),
+    packages_sha256: spec.os.packages_sha256,
+    kernel_release: spec.os.kernel_release,
   },
 });
 
@@ -511,6 +566,9 @@ async function main(
     ...(values.lock ? { lockPath: resolve(values.lock) } : {}),
   });
   console.log(`release ${manifest.version}`);
+  console.log(
+    `  kernel ${manifest.registration.os.kernel_release}  packages sha256 ${manifest.registration.os.packages_sha256}`,
+  );
   for (const { key, digest } of manifest.uploads)
     console.log(
       `  ${key}  ${digest.size_bytes} bytes  sha256 ${digest.sha256}`,

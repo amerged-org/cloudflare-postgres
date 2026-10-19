@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The node itself: `Storage` on LVM, `Units` over systemd's D-Bus, the users in `/etc/passwd`
 //! and `initdb` as the database's user.
-use super::{Account, CpuTimes, Machine, Memory, gateway_environment, initdb_arguments};
+use super::{Account, Boot, CpuTimes, Machine, Memory, gateway_environment, initdb_arguments};
 use crate::{
+    diagnostics::probe,
     layout::Layout,
     link::NodeIdentity,
     storage::{
@@ -483,6 +484,49 @@ impl Machine for Node {
         apt(install).await
     }
 
+    async fn purge_packages(&self, names: &[String]) -> io::Result<()> {
+        if let Some(name) = names
+            .iter()
+            .find(|name| !crate::update::is_package_name(name))
+        {
+            return Err(io::Error::other(format!("{name:?} is not a package name")));
+        }
+        let output = tokio::process::Command::new("dpkg-query")
+            .args(["-W", "-f", "${Package}\t${Essential}\t${Protected}\n"])
+            .args(names)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(io::Error::other("dpkg-query failed"));
+        }
+        let names = crate::update::without_protected(
+            names.to_vec(),
+            &String::from_utf8_lossy(&output.stdout),
+        );
+        if names.is_empty() {
+            return Ok(());
+        }
+        let output = tokio::process::Command::new("dpkg")
+            .arg("--purge")
+            .args(&names)
+            .env("LC_ALL", "C")
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "dpkg --purge ended with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
     async fn reboot(&self) -> io::Result<()> {
         run("systemctl", &["reboot"]).await
     }
@@ -507,6 +551,40 @@ impl Machine for Node {
                 String::from_utf8_lossy(&output.stderr).trim()
             )))
         }
+    }
+
+    async fn previous_boot_journal(&self) -> io::Result<Option<String>> {
+        let output = tokio::process::Command::new("journalctl")
+            .args(crate::diagnostics::boot_report::previous_boot_arguments())
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        crate::diagnostics::boot_report::previous_boot(&output)
+    }
+
+    async fn diagnostic(&self, argv: &probe::Argv) -> io::Result<std::process::Output> {
+        tokio::process::Command::new(argv.program)
+            .args(&argv.arguments)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+    }
+
+    fn proc_file(&self, file: probe::ProcFile) -> io::Result<String> {
+        std::fs::read_to_string(file.path())
+    }
+
+    fn boot(&self) -> Option<Boot> {
+        let read = |path| std::fs::read_to_string(path).ok();
+        Boot::parse(
+            &read("/proc/sys/kernel/random/boot_id")?,
+            &read("/proc/stat")?,
+            &read("/proc/sys/kernel/osrelease")?,
+        )
     }
 
     fn memory(&self) -> Option<Memory> {

@@ -265,7 +265,7 @@ async fn enrollment(
 }
 
 /// Whether asking again can help: the network, or an API that is unavailable or limiting.
-fn transient(error: &Error) -> bool {
+pub(crate) fn transient(error: &Error) -> bool {
     error.is::<reqwest::Error>()
         || error
             .downcast_ref::<Refusal>()
