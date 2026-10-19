@@ -811,6 +811,9 @@ impl Machine for Local {
     /// outputs of the commands the probes build, as their exit status and streams.
     async fn diagnostic(&self, argv: &probe::Argv) -> io::Result<Output> {
         use std::os::unix::process::ExitStatusExt;
+        // journalctl's line when reading the journal fails after it printed entries (systemd's
+        // "Failed to iterate through journal: %m" with EBADMSG). The lab's journalctl read files
+        // with random damage and ended with status 0, so this line is from the source, not a capture.
         const DAMAGED_JOURNAL: &str = "Failed to iterate through journal: Bad message\n";
         let exited = |code: i32, stdout: &str, stderr: &str| Output {
             status: std::process::ExitStatus::from_raw(code << 8),
