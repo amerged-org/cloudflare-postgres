@@ -41,6 +41,10 @@
     // its Tunnel; any other value, or none (the default), gives none and removes the one a node has.
     // Keep it off until Cloudflare Access guards the shell (scripts/operations/setup-access.ts
     // --shell): otherwise anyone who can run cloudflared reaches it.
+    // NODE_SSH_USER_CA_PUBLIC_KEY: the public key of the CA the operator signs shell certificates
+    // with, exactly one "ssh-ed25519 AAAA..." line without a comment. Nodes get it only while
+    // NODE_SHELL_HOSTNAME is "true" and remove it when it goes; without a valid key nobody logs in.
+    // The private key stays with the operator and is never set on any Worker.
     // Alternatively set INFRASTRUCTURE_ALERT_WEBHOOK_URL to the receiver's HTTPS endpoint.
     // Import INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN as a private Worker secret.
     "DATABASE_CONNECTION_LIMIT_PER_MINUTE": "12000",

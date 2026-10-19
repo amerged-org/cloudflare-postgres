@@ -24,6 +24,9 @@ afterEach(async () => {
 });
 
 const CREDENTIALS = "/node/v1/credentials";
+/** A key pair made for these tests; its private half was deleted. */
+const SHELL_CA =
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp";
 const configured = {
   CLOUDFLARE_API_TOKEN: TOKEN,
   NODE_GATEWAY_DOMAIN: DOMAIN,
@@ -95,6 +98,45 @@ it("makes the shell hostname of a node only while NODE_SHELL_HOSTNAME is exactly
   await ask("yes");
   expect(hostnames()).toEqual([gateway]);
   expect(await gatewayOf(f.node)).toBe(`https://${gateway}/pg`);
+});
+
+it("carries the CA key of the operator shell only while NODE_SHELL_HOSTNAME is true and the key is exactly one valid ssh-ed25519 line", async () => {
+  const f = await fixture(0);
+  await accountRegion(f.region);
+  vi.stubGlobal("fetch", cloudflare().fetcher);
+  const ask = async (
+    shell: string | undefined,
+    key: string | undefined,
+  ): Promise<string | undefined> => {
+    const response = await nodeRequest(f, CREDENTIALS, {
+      bindings: {
+        ...configured,
+        NODE_SHELL_HOSTNAME: shell,
+        NODE_SSH_USER_CA_PUBLIC_KEY: key,
+      },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, unknown>;
+    NodeCredentials.parse(body);
+    return body.shell_ca_public_key as string | undefined;
+  };
+  expect(await ask("true", SHELL_CA)).toBe(SHELL_CA);
+  // The key is not enough, and the hostname is not enough.
+  expect(await ask(undefined, SHELL_CA)).toBeUndefined();
+  expect(await ask("false", SHELL_CA)).toBeUndefined();
+  expect(await ask("yes", SHELL_CA)).toBeUndefined();
+  expect(await ask("true", undefined)).toBeUndefined();
+  // A variable that is not exactly one valid key gives no key, and so no login.
+  for (const broken of [
+    "",
+    `${SHELL_CA} operator@example.org`,
+    `${SHELL_CA}\n`,
+    `${SHELL_CA}\n${SHELL_CA}`,
+    `command="true" ${SHELL_CA}`,
+    SHELL_CA.replace("ssh-ed25519", "ssh-rsa"),
+    SHELL_CA.slice(0, -2),
+  ])
+    expect(await ask("true", broken)).toBeUndefined();
 });
 
 it("answers a node whose Tunnel cannot be made with a failure, and writes no gateway", async () => {

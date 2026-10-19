@@ -230,7 +230,7 @@ offers the previous kernel through the `.old` links. A one-shot boot of the prev
 | `pgcf-agent.service` | root | `pgcf-agent run`, `Type=notify`; host mount namespace (see below); creates `/run/pgcf/agent` |
 | `pgcf-gateway.service` | `pgcf-gateway` | `pgcf-native-gateway` in local mode on loopback; starts once `/var/lib/pgcf/credentials/gateway.env` exists |
 | `pgcf-cloudflared.service` | `pgcf-cloudflared` | The Tunnel; starts once `/var/lib/pgcf/credentials/tunnel-token.cred` exists |
-| `ssh.service` | root | Loopback only, user certificates only (no CA ships, so no login until a CA key is written; nothing writes one yet); host keys are created at first boot |
+| `ssh.service` | root | Loopback only, user certificates only (no CA ships, so no login until the agent writes the operator's CA key, which it does only while the shell is on); host keys are created at first boot |
 
 A preset allowlist ([10-pgcf.preset](mkosi.extra/usr/lib/systemd/system-preset/10-pgcf.preset))
 enables exactly these plus networkd, timesyncd, getty and LVM monitoring. Everything else a package
@@ -306,6 +306,10 @@ restart never stops a database, because the databases are independent units.
 both behind Cloudflare Access (`scripts/operations/setup-access.ts`, the operator installation
 runbook). The shell hostname, `pgcf-shell-<id>.<domain>`, is off until its Access application
 exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
+A change of that variable reaches a running node as a new credentials revision, so the node reads
+its credentials again within one pull and cloudflared keeps running: the Tunnel's ingress is
+remote configuration, and the agent restarts the gateway and cloudflared only when the Tunnel
+token or the route keyring changed.
 
 ## What the image expects from the agent
 
@@ -373,15 +377,34 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   gateway and cloudflared's metrics listen on loopback only; PostgreSQL listens on no address.
 - **Operator shell.** [10-pgcf.conf](mkosi.extra/etc/ssh/sshd_config.d/10-pgcf.conf) makes sshd take
   one thing: a user certificate for root, signed by the CA in `/etc/ssh/pgcf_user_ca.pub` and
-  carrying the principal `pgcf-break-glass` (`/etc/ssh/principals/root`). The image ships no CA key,
-  so no login is possible until a CA's public key is written there; the installer does not write
-  one yet (plan 11.2). There are no passwords, no `authorized_keys`, two tries, a 20 s grace time,
-  two sessions and no forwarding of any kind; the log level is `VERBOSE`, and per-source penalties
-  stay at their default. sshd refuses every public key when `RevokedKeys` names a missing file, so
-  the image ships an empty key revocation list (`/etc/ssh/pgcf_revoked.krl`, the header only;
-  `ssh-keygen -k -u -f` adds to it).
-  A client offers only the certificate's key (`IdentitiesOnly=yes`), because two tries end after
-  the key and its certificate.
+  carrying the principal `pgcf-break-glass` (`/etc/ssh/principals/root`). There are no passwords, no
+  `authorized_keys`, two tries, a 20 s grace time, two sessions and no forwarding of any kind; the
+  log level is `VERBOSE`, which puts the certificate's key id and the CA's fingerprint in the
+  journal (`ssh.service`, which the boot report and the `journal` probe read), and per-source
+  penalties stay at their default. `units.test.ts` pins these values and that no other drop-in,
+  principals file or key is in the image.
+
+  The image ships no CA key, so no login is possible until a CA's public key is in the file. The
+  operator holds the CA (an Ed25519 key pair whose private half is on no Worker and in no
+  repository); its public key is the API Worker's variable `NODE_SSH_USER_CA_PUBLIC_KEY`, and the
+  node's credentials carry it (`shell_ca_public_key`) only while `NODE_SHELL_HOSTNAME` is `"true"`
+  and the variable is exactly one valid `ssh-ed25519` line. On every read of its credentials the
+  agent makes the file match: it writes it atomically (a temporary file in `/etc/ssh`, mode 0644,
+  owned by the agent's user, root, fsynced and renamed, with the directory fsynced) when the key is
+  there and differs, and removes it when the field is absent, and it logs `shell_ca_written` or
+  `shell_ca_removed`, never the key. It does this before it touches the gateway's credentials, so a
+  shell that was turned off is closed whatever else fails, and a failure to write the file is
+  retried with the next page. sshd needs no reload: it opens `TrustedUserCAKeys` for every
+  certificate it checks and `sshd -t` does not need the file, so the file appearing makes the next
+  login possible and its removal makes the next one fail (the boot test proves both without a
+  reload). The operator's side is `scripts/operations/node-shell.ts`: a throwaway key signed for 15
+  minutes, through `cloudflared access ssh` (docs/operations/operator-installation.md, "Using the
+  shell").
+
+  sshd refuses every public key when `RevokedKeys` names a missing file, so the image ships an empty
+  key revocation list (`/etc/ssh/pgcf_revoked.krl`, the header only; `ssh-keygen -k -u -f` adds to
+  it). A client offers only the certificate's key (`IdentitiesOnly=yes`), because two tries end
+  after the key and its certificate.
 - **No ssh socket.** With sshd installed, systemd 257's `systemd-ssh-generator` binds it to the Unix
   socket `/run/ssh-unix-local/socket` (mode 0666, which a database's user reaches, because its unit
   allows `AF_UNIX`) and to vsock. The image masks the generator (a link to `/dev/null` in
@@ -395,7 +418,7 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   1 GiB, at least 2 GiB free and 14 days on the 8 GiB root, and syncs to disk every 15 s instead of
   every five minutes, so that the minutes before a freeze are in the journal after the reboot.
   After every reboot the agent posts the last 1,000 lines of the previous boot from `pgcf-agent`,
-  `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, PID 1 and the kernel (`journalctl
+  `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, `ssh`, PID 1 and the kernel (`journalctl
   --boot=-1`, never the units of the databases or of the backup jobs, and an event line of the agent
   only as far as the observation report carries it), which the API keeps for 30 days, one report
   per boot, and an administrator reads at `GET /v1/nodes/{id}/diagnostics`. On request

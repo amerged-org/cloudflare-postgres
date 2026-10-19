@@ -25,12 +25,15 @@ use std::{
 
 /// The matches of the journal the agent reads (SEC-05, SEC-09). The matches before the first `+`
 /// are alternatives of one field (units), and each `+` starts another group of alternatives, so
-/// the lines are those of the four units, of PID 1 and of the kernel.
-const JOURNAL_MATCHES: [&str; 8] = [
+/// the lines are those of the five units, of PID 1 and of the kernel. `ssh.service` is the
+/// operator shell's sshd (plan 8), whose log level is VERBOSE: its lines carry the certificate's
+/// key id and the CA's fingerprint, which is how a login is audited from outside the node.
+const JOURNAL_MATCHES: [&str; 9] = [
     "_SYSTEMD_UNIT=pgcf-agent.service",
     "_SYSTEMD_UNIT=pgcf-gateway.service",
     "_SYSTEMD_UNIT=pgcf-cloudflared.service",
     "_SYSTEMD_UNIT=systemd-networkd.service",
+    "_SYSTEMD_UNIT=ssh.service",
     "+",
     "_PID=1",
     "+",
@@ -376,15 +379,15 @@ mod tests {
     }
 
     #[test]
-    fn the_command_is_the_journal_of_the_previous_boot_of_the_nodes_own_units_pid_1_and_the_kernel()
-    {
+    fn the_command_is_the_journal_of_the_previous_boot_of_the_nodes_own_units_the_shell_pid_1_and_the_kernel()
+     {
         assert_eq!(
             previous_boot_arguments().join(" "),
             concat!(
                 "--no-pager --output=json --boot=-1 --lines=1000 ",
                 "_SYSTEMD_UNIT=pgcf-agent.service _SYSTEMD_UNIT=pgcf-gateway.service ",
                 "_SYSTEMD_UNIT=pgcf-cloudflared.service _SYSTEMD_UNIT=systemd-networkd.service ",
-                "+ _PID=1 + _TRANSPORT=kernel"
+                "_SYSTEMD_UNIT=ssh.service + _PID=1 + _TRANSPORT=kernel"
             )
         );
     }

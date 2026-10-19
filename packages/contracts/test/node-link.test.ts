@@ -31,6 +31,7 @@ import {
   type NodeKey,
   nodePublicKey,
   nodeRequestClaims,
+  nodeShellCaPublicKey,
   observationVerdict,
   signNodeRequest,
   verifyNodeRequest,
@@ -1238,6 +1239,40 @@ describe("credentials and the node's policy", () => {
       expect(
         NodeDesiredPage.safeParse({ ...page, credentials_revision }).success,
       ).toBe(false);
+  });
+
+  it("takes the operator shell's CA key as one ssh-ed25519 line and nothing else, and no key as no shell", () => {
+    const key =
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp";
+    expect(
+      NodeCredentials.safeParse({ ...credentials, shell_ca_public_key: key })
+        .success,
+    ).toBe(true);
+    expect(nodeShellCaPublicKey(key)).toBe(key);
+    for (const broken of [
+      undefined,
+      "",
+      `${key} comment`,
+      `${key}\n`,
+      `${key}\n${key}`,
+      ` ${key}`,
+      `cert-authority ${key}`,
+      `command="true" ${key}`,
+      key.replace("ssh-ed25519", "ssh-rsa"),
+      key.replace("ssh-ed25519", "sk-ssh-ed25519@openssh.com"),
+      key.slice(0, -1),
+      `${key}A`,
+      key.replace("AAAAC3NzaC1lZDI1NTE5", "AAAAB3NzaC1yc2EAAAADAQAB"),
+    ]) {
+      expect(nodeShellCaPublicKey(broken)).toBeNull();
+      if (broken !== undefined)
+        expect(
+          NodeCredentials.safeParse({
+            ...credentials,
+            shell_ca_public_key: broken,
+          }).success,
+        ).toBe(false);
+    }
   });
 
   it("carries the memory of each backup job and the write limits of a 256 MiB database", () => {

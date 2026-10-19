@@ -314,6 +314,17 @@ const usageRow = {
   connections: 3,
   connection_ms: 5000,
 };
+/** A key pair made for these vectors; its private half was deleted. */
+const shellCa =
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp";
+const credentials = {
+  revision: 3,
+  tunnel_token: "eyJ".padEnd(120, "A"),
+  route_keyring: {
+    active: "k1",
+    keys: { k1: bytesToBase64url(new Uint8Array(32).fill(9)) },
+  },
+};
 const archiveCredential = {
   id: credential.id,
   path: path(id, 1),
@@ -548,18 +559,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
   ],
   NodeCredentials: [
-    [
-      "credentials",
-      {
-        revision: 3,
-        tunnel_token: "eyJ".padEnd(120, "A"),
-        route_keyring: {
-          active: "k1",
-          keys: { k1: bytesToBase64url(new Uint8Array(32).fill(9)) },
-        },
-      },
-      true,
-    ],
+    ["credentials", credentials, true],
     [
       "no-revision",
       {
@@ -583,6 +583,24 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       },
       false,
     ],
+    ["shell-ca", { ...credentials, shell_ca_public_key: shellCa }, true],
+    ...(
+      [
+        ["shell-ca-with-comment", `${shellCa} operator@example.org`],
+        ["shell-ca-with-options", `command="/bin/true" ${shellCa}`],
+        ["shell-ca-two-lines", `${shellCa}\n${shellCa}`],
+        ["shell-ca-trailing-newline", `${shellCa}\n`],
+        ["shell-ca-leading-space", ` ${shellCa}`],
+        ["shell-ca-other-type", shellCa.replace("ssh-ed25519", "ssh-rsa")],
+        ["shell-ca-truncated", shellCa.slice(0, -1)],
+        ["shell-ca-empty", ""],
+      ] satisfies [string, string][]
+    ).map(([name, key]): Case => [
+      name,
+      { ...credentials, shell_ca_public_key: key },
+      false,
+    ]),
+    ["shell-ca-null", { ...credentials, shell_ca_public_key: null }, false],
   ],
   ArchiveCredential: [
     ["read-write", archiveCredential, true],

@@ -82,6 +82,25 @@ pub struct ServiceConfig {
     pub gateway: Option<(u32, u32)>,
 }
 
+/// The credentials the agent applied: their revision, and a digest of what the gateway and the
+/// Tunnel run on (the route keyring and the Tunnel token), kept instead of the secrets themselves.
+#[derive(Clone)]
+struct AppliedCredentials {
+    revision: u64,
+    secrets: [u8; 32],
+}
+
+/// The digest of the secrets of `NodeCredentials` that the gateway and the Tunnel run on. The
+/// revision and the shell's key are not among them: a change of those restarts nothing.
+fn gateway_secrets(credentials: &Value) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let secrets = json!({
+        "tunnel_token": credentials["tunnel_token"],
+        "route_keyring": credentials["route_keyring"],
+    });
+    Sha256::digest(secrets.to_string().as_bytes()).into()
+}
+
 pub struct Service<M: Machine> {
     core: Arc<Core<M>>,
     link: Link,
@@ -89,8 +108,8 @@ pub struct Service<M: Machine> {
     intervals: Intervals,
     /// The archive credentials read, by identifier.
     delivered: Mutex<HashSet<String>>,
-    /// The revision of the node's credentials the agent applied.
-    credentials_revision: Mutex<Option<u64>>,
+    /// The credentials the agent applied, if it has applied any since it started.
+    credentials: Mutex<Option<AppliedCredentials>>,
     cpu: Mutex<Option<CpuTimes>>,
     tasks: Mutex<JoinSet<()>>,
     /// The release of the newest page (plan 9.3).
@@ -184,7 +203,7 @@ impl<M: Machine> Service<M> {
             machine: machine.clone(),
             intervals: config.intervals,
             delivered: Mutex::new(HashSet::new()),
-            credentials_revision: Mutex::new(None),
+            credentials: Mutex::new(None),
             cpu: Mutex::new(None),
             tasks: Mutex::new(JoinSet::new()),
             release: Mutex::new(None),
@@ -341,13 +360,19 @@ impl<M: Machine> Service<M> {
     }
 
     /// The Tunnel token and the route keyring, when the page names a newer revision than the one
-    /// applied: the gateway and the Tunnel start with them (plan 8).
+    /// applied: the gateway and the Tunnel start with them (plan 8). The revision also rises when
+    /// only the operator shell's state changed; the gateway and the Tunnel restart for a change of
+    /// their own secrets alone, because a restart ends every client connection of the node.
     async fn apply_credentials(&self, page: &Page) {
-        let applied = *self
-            .credentials_revision
+        let applied = self
+            .credentials
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if applied.is_some_and(|applied| applied >= page.credentials_revision) {
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if applied
+            .as_ref()
+            .is_some_and(|applied| applied.revision >= page.credentials_revision)
+        {
             return;
         }
         let credentials = match self.link.credentials().await {
@@ -360,16 +385,21 @@ impl<M: Machine> Service<M> {
             }
         };
         let revision = credentials["revision"].as_u64().unwrap_or(0);
+        let secrets = gateway_secrets(&credentials);
+        let restart = applied
+            .as_ref()
+            .is_some_and(|applied| applied.secrets != secrets);
         match self
             .machine
-            .apply_credentials(self.link.node(), &credentials, applied.is_some())
+            .apply_credentials(self.link.node(), &credentials, restart)
             .await
         {
             Ok(()) => {
                 *self
-                    .credentials_revision
+                    .credentials
                     .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(revision);
+                    .unwrap_or_else(PoisonError::into_inner) =
+                    Some(AppliedCredentials { revision, secrets });
             }
             Err(error) => crate::timing::emit_event(json!({
                 "event": "credentials_not_applied",
@@ -761,10 +791,12 @@ impl<M: Machine> Service<M> {
             volumes_mounted: mounted,
             archive: self.core.archive_summary(),
             awake: &awake,
-            credentials_revision: *self
-                .credentials_revision
+            credentials_revision: self
+                .credentials
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner),
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .map(|applied| applied.revision),
         });
         if let Err(error) = self.link.post_samples(&sample).await {
             crate::timing::emit_event(json!({
@@ -871,6 +903,9 @@ mod tests {
         wake::Outcome,
     };
 
+    const SHELL_CA: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp";
+
     fn quick() -> Intervals {
         Intervals {
             sample: Duration::from_millis(300),
@@ -881,6 +916,51 @@ mod tests {
             batch: Duration::from_millis(50),
         }
     }
+    #[test]
+    fn a_change_of_the_shell_or_the_revision_alone_does_not_restart_the_gateway_and_a_change_of_its_secrets_does()
+     {
+        let credentials = |revision: u64, token: &str, key: &str, shell: Option<&str>| {
+            let mut credentials = json!({
+                "revision": revision,
+                "tunnel_token": token,
+                "route_keyring": {"active": "k1", "keys": {"k1": key}},
+            });
+            if let Some(shell) = shell {
+                credentials["shell_ca_public_key"] = shell.into();
+            }
+            credentials
+        };
+        let base = gateway_secrets(&credentials(3, "token-a", "key-a", None));
+        // The revision and the shell's key are not secrets of the gateway or the Tunnel.
+        assert_eq!(
+            base,
+            gateway_secrets(&credentials(4, "token-a", "key-a", None))
+        );
+        assert_eq!(
+            base,
+            gateway_secrets(&credentials(
+                5,
+                "token-a",
+                "key-a",
+                Some("ssh-ed25519 AAAA")
+            ))
+        );
+        // The Tunnel's token and any key of the route keyring are.
+        assert_ne!(
+            base,
+            gateway_secrets(&credentials(3, "token-b", "key-a", None))
+        );
+        assert_ne!(
+            base,
+            gateway_secrets(&credentials(3, "token-a", "key-b", None))
+        );
+        let rotated = json!({
+            "revision": 3, "tunnel_token": "token-a",
+            "route_keyring": {"active": "k2", "keys": {"k1": "key-a", "k2": "key-b"}},
+        });
+        assert_ne!(base, gateway_secrets(&rotated));
+    }
+
     fn observed(cloud: &crate::link::test_server::Cloud, id: &str, state: &str) -> bool {
         cloud
             .acknowledged("/node/v1/observations")
@@ -971,6 +1051,48 @@ mod tests {
             )]
         );
         assert_eq!(machine.slice_memory_mib(), Some(9913));
+        // The operator shell is turned on: the revision rises and the credentials carry the CA's
+        // key, and the gateway and the Tunnel are not restarted. A new Tunnel token restarts them.
+        let applied = |revision: u64, restart: bool| {
+            (
+                "eu-dev".to_string(),
+                crate::link::test_server::NODE_ID.to_string(),
+                revision,
+                restart,
+            )
+        };
+        let mut credentials = crate::link::test_server::vector("NodeCredentials", "credentials");
+        credentials["revision"] = 4.into();
+        credentials["shell_ca_public_key"] = SHELL_CA.into();
+        cloud.with(|inner| inner.credentials = Some(credentials.clone()));
+        cloud.push(serde_json::json!({"type": "desired", "ids": [id]}));
+        eventually(30, "the credentials of the shell", || {
+            machine.credentials_applied().len() == 2
+        })
+        .await;
+        assert_eq!(machine.credentials_applied()[1], applied(4, false));
+        credentials["revision"] = 5.into();
+        credentials["tunnel_token"] = "eyJ".repeat(40).into();
+        cloud.with(|inner| inner.credentials = Some(credentials.clone()));
+        cloud.push(serde_json::json!({"type": "desired", "ids": [id]}));
+        eventually(30, "the credentials of a new Tunnel token", || {
+            machine.credentials_applied().len() == 3
+        })
+        .await;
+        assert_eq!(machine.credentials_applied()[2], applied(5, true));
+        // The shell turned off again: a revision and no key, and again nothing restarts.
+        credentials["revision"] = 6.into();
+        credentials
+            .as_object_mut()
+            .unwrap()
+            .remove("shell_ca_public_key");
+        cloud.with(|inner| inner.credentials = Some(credentials.clone()));
+        cloud.push(serde_json::json!({"type": "desired", "ids": [id]}));
+        eventually(30, "the credentials without the shell", || {
+            machine.credentials_applied().len() == 4
+        })
+        .await;
+        assert_eq!(machine.credentials_applied()[3], applied(6, false));
         // The database is served, and the meter says for how long.
         eventually(30, "the usage of the served database", || {
             cloud
