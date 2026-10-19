@@ -13,8 +13,9 @@
 //!   start; `stop` lifts it, and so does `set_cpu_quota(.., None)`, which the agent also calls for
 //!   every stopped unit when it starts.
 //! - A database's Linux user and uid are `users`.
-//! - What a start took, off the path of a wake: systemd's exec time of the postmaster and the
-//!   journal's times of PostgreSQL's three start messages (`timeline`, `journal`).
+//! - What a start took, off the path of a wake: systemd's fork of the main process and its handoff
+//!   to the postmaster, and the journal's times of PostgreSQL's three start messages (`timeline`,
+//!   `journal`).
 //!
 //! - The memory ceiling of `pgcf.slice`, which holds every database, is the operator's awake-database
 //!   budget (`set_slice_memory`): the kernel's backstop under either memory rule. The image's slice
@@ -228,9 +229,14 @@ pub struct Started {
 /// What systemd and the journal recorded of one start (`Units::timeline`), in microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Timeline {
-    /// The agent's `StartUnit` to the exec of the postmaster.
-    pub job_to_exec_us: Option<u64>,
-    /// The exec to the three messages of PostgreSQL's start.
+    /// The agent's `StartUnit` to systemd's creation of the main process, which is systemd-executor
+    /// until it executes postgres.
+    pub job_to_fork_us: Option<u64>,
+    /// The fork to the handoff: the executor's setup of the unit's sandbox (namespaces, mounts,
+    /// seccomp filter, user), which is systemd's time, not PostgreSQL's.
+    pub fork_to_handoff_us: Option<u64>,
+    /// The handoff, when the executor was about to execute postgres, to the three messages of
+    /// PostgreSQL's start.
     pub startup: Option<journal::Startup>,
 }
 
@@ -411,26 +417,32 @@ impl Units {
     }
 
     /// What systemd and the journal recorded of the start that gave `started`: the time from the
-    /// agent's request to the exec of the postmaster, and from the exec to the three messages of
-    /// PostgreSQL's start. Empty where the unit started again since, so that its exec time and its
-    /// journal are another invocation's. A journal that cannot be read leaves the second part out.
+    /// agent's request to the fork of the main process, from the fork to the handoff (the
+    /// executor's sandbox), and from the handoff to the three messages of PostgreSQL's start.
+    /// Empty where the unit started again since, so that its times and its journal are another
+    /// invocation's. A journal that cannot be read leaves the last part out.
     pub async fn timeline(&self, database: &str, started: &Started) -> Result<Timeline, Error> {
         let unit_name = Self::unit_of(database)?;
         let state = self.state(database).await?;
-        let exec_us = self
-            .service_proxy(&unit_name)
-            .await?
-            .exec_main_start_timestamp_monotonic()
-            .await?;
-        if exec_us == 0 || state.invocation_id.as_deref() != Some(started.invocation_id.as_str()) {
+        let service = self.service_proxy(&unit_name).await?;
+        let (fork_us, handoff_us) = tokio::join!(
+            service.exec_main_start_timestamp_monotonic(),
+            service.exec_main_handoff_timestamp_monotonic(),
+        );
+        let (fork_us, handoff_us) = (fork_us?, handoff_us?);
+        if fork_us == 0
+            || handoff_us == 0
+            || state.invocation_id.as_deref() != Some(started.invocation_id.as_str())
+        {
             return Ok(Timeline::default());
         }
         let journal = journal::read(&started.invocation_id).await.ok();
         Ok(Timeline {
-            job_to_exec_us: started
+            job_to_fork_us: started
                 .requested_us
-                .and_then(|requested| exec_us.checked_sub(requested)),
-            startup: journal.and_then(|journal| journal::startup(&journal, exec_us)),
+                .and_then(|requested| fork_us.checked_sub(requested)),
+            fork_to_handoff_us: handoff_us.checked_sub(fork_us),
+            startup: journal.and_then(|journal| journal::startup(&journal, handoff_us)),
         })
     }
 

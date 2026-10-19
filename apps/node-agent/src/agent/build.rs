@@ -462,7 +462,7 @@ impl<M: Machine> Core<M> {
             .await
             .map_err(|_| build_failed!())?;
         self.ensure_archive(db, entry);
-        let (started, _) = self
+        let (started, ..) = self
             .start_unit(
                 db,
                 entry,

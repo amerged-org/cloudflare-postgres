@@ -4,12 +4,12 @@
 //! the journal's monotonic timestamps leave this module: a message is matched, never kept.
 use std::io;
 
-/// The gaps between the exec of the postmaster and the three messages of its start, in
+/// The gaps between the handoff to the postmaster and the three messages of its start, in
 /// microseconds of the journal's receive times.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Startup {
-    /// The exec to `starting PostgreSQL`.
-    pub exec_to_starting_us: u64,
+    /// The handoff, when systemd-executor was about to execute postgres, to `starting PostgreSQL`.
+    pub handoff_to_starting_us: u64,
     /// `starting PostgreSQL` to `database system was shut down at`.
     pub starting_to_shut_down_us: u64,
     /// `database system was shut down at` to `database system is ready to accept connections`.
@@ -24,10 +24,11 @@ const MARKS: [&str; 3] = [
 ];
 
 /// The three gaps of the start in `journal`, the lines of `journalctl -o json` for one invocation,
-/// when the postmaster was exec'd at `exec_us` (`ExecMainStartTimestampMonotonic`). `None` when a
-/// message is missing, as after a crash, which writes no `shut down at` line, or when the
-/// messages are not in this order after the exec.
-pub fn startup(journal: &str, exec_us: u64) -> Option<Startup> {
+/// when systemd handed the unit over to the postmaster at `handoff_us`
+/// (`ExecMainHandoffTimestampMonotonic`: the executor's sandbox is set up, the execve is next).
+/// `None` when a message is missing, as after a crash, which writes no `shut down at` line, or
+/// when the messages are not in this order after the handoff.
+pub fn startup(journal: &str, handoff_us: u64) -> Option<Startup> {
     let mut marks = [None; 3];
     for line in journal.lines() {
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -49,7 +50,7 @@ pub fn startup(journal: &str, exec_us: u64) -> Option<Startup> {
     }
     let [starting, shut_down, ready] = marks;
     Some(Startup {
-        exec_to_starting_us: starting?.checked_sub(exec_us)?,
+        handoff_to_starting_us: starting?.checked_sub(handoff_us)?,
         starting_to_shut_down_us: shut_down?.checked_sub(starting?)?,
         shut_down_to_ready_us: ready?.checked_sub(shut_down?)?,
     })
@@ -84,22 +85,23 @@ mod tests {
 
     /// A start of PostgreSQL 18.6 as the node's unit runs it, in the lab: `journalctl -o json
     /// --output-fields=MESSAGE,__MONOTONIC_TIMESTAMP _SYSTEMD_INVOCATION_ID=<id>`. The unit's
-    /// `ExecMainStartTimestampMonotonic` was 450657119863.
+    /// `ExecMainHandoffTimestampMonotonic` was 453497890723 (its `ExecMainStartTimestampMonotonic`,
+    /// the fork of systemd-executor, 453497856837).
     const CLEAN: &str = include_str!("fixtures/journal-clean-start.jsonl");
-    const CLEAN_EXEC_US: u64 = 450_657_119_863;
-    /// The start after the postmaster was killed with SIGKILL, same lab (exec at 450659221819):
-    /// crash recovery, which writes no `shut down at` line.
+    const CLEAN_HANDOFF_US: u64 = 453_497_890_723;
+    /// The start after the postmaster was killed with SIGKILL, same lab (handoff at
+    /// 453500022333): crash recovery, which writes no `shut down at` line.
     const CRASH: &str = include_str!("fixtures/journal-crash-recovery.jsonl");
-    const CRASH_EXEC_US: u64 = 450_659_221_819;
+    const CRASH_HANDOFF_US: u64 = 453_500_022_333;
 
     #[test]
-    fn the_gaps_of_a_start_are_the_journals_times_between_the_exec_and_the_three_messages() {
+    fn the_gaps_of_a_start_are_the_journals_times_between_the_handoff_and_the_three_messages() {
         assert_eq!(
-            startup(CLEAN, CLEAN_EXEC_US),
+            startup(CLEAN, CLEAN_HANDOFF_US),
             Some(Startup {
-                exec_to_starting_us: 49_844,
-                starting_to_shut_down_us: 1_724,
-                shut_down_to_ready_us: 1_486,
+                handoff_to_starting_us: 12_840,
+                starting_to_shut_down_us: 1_605,
+                shut_down_to_ready_us: 1_522,
             })
         );
     }
@@ -107,7 +109,7 @@ mod tests {
     #[test]
     fn a_start_with_a_message_missing_has_no_gaps() {
         // Crash recovery says it was interrupted, not shut down.
-        assert_eq!(startup(CRASH, CRASH_EXEC_US), None);
+        assert_eq!(startup(CRASH, CRASH_HANDOFF_US), None);
         for message in [
             "starting PostgreSQL",
             "database system was shut down at",
@@ -119,13 +121,13 @@ mod tests {
                 .flat_map(|line| [line, "\n"])
                 .collect();
             assert_eq!(without.lines().count(), 3, "{message}");
-            assert_eq!(startup(&without, CLEAN_EXEC_US), None, "{message}");
+            assert_eq!(startup(&without, CLEAN_HANDOFF_US), None, "{message}");
         }
-        assert_eq!(startup("", CLEAN_EXEC_US), None);
+        assert_eq!(startup("", CLEAN_HANDOFF_US), None);
     }
 
     #[test]
-    fn lines_that_are_no_text_message_or_come_before_the_exec_are_not_marks() {
+    fn lines_that_are_no_text_message_or_come_before_the_handoff_are_not_marks() {
         // A message the journal prints as bytes, a line that is no JSON and one without a time.
         let noise = [
             r#"{"MESSAGE":[115,116,97,114],"__MONOTONIC_TIMESTAMP":"1"}"#,
@@ -134,10 +136,10 @@ mod tests {
         ];
         let journal = format!("{}\n{CLEAN}", noise.join("\n"));
         assert_eq!(
-            startup(&journal, CLEAN_EXEC_US),
-            startup(CLEAN, CLEAN_EXEC_US)
+            startup(&journal, CLEAN_HANDOFF_US),
+            startup(CLEAN, CLEAN_HANDOFF_US)
         );
-        // An exec after the first message is another invocation's: no gaps, not a wrapped number.
-        assert_eq!(startup(CLEAN, CLEAN_EXEC_US + 60_000), None);
+        // A handoff after the first message is another invocation's: no gaps, not a wrapped number.
+        assert_eq!(startup(CLEAN, CLEAN_HANDOFF_US + 60_000), None);
     }
 }

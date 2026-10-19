@@ -289,11 +289,11 @@ async fn a_database_unit_starts_serves_changes_its_limits_and_stops() {
 
 #[tokio::test]
 #[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
-async fn a_start_has_a_timeline_of_systemds_exec_and_the_three_messages_of_the_journal() {
+async fn a_start_has_a_timeline_of_the_fork_the_handoff_and_the_journals_three_messages() {
     if !lab() {
         return;
     }
-    let database = Database::new(6);
+    let database = Database::new(7);
     let id = database.id.as_str();
     let units = Units::connect(DB_ROOT).await.unwrap();
     let asked = super::monotonic_micros().unwrap();
@@ -301,8 +301,9 @@ async fn a_start_has_a_timeline_of_systemds_exec_and_the_three_messages_of_the_j
     let requested = started.requested_us.expect("the clock is read on Linux");
     assert!(requested >= asked && requested - asked < 1_000_000);
 
-    // The exec follows the request within a moment, and journald has the postmaster's three
-    // messages shortly after the start; the agent reads them seconds later.
+    // The fork follows the request within a moment, the handoff (the executor's sandbox done, the
+    // execve next) the fork, and journald has the postmaster's three messages shortly after the
+    // start; the agent reads them seconds later.
     let mut timeline = units.timeline(id, &started).await.unwrap();
     for _ in 0..100 {
         if timeline.startup.is_some() {
@@ -311,19 +312,27 @@ async fn a_start_has_a_timeline_of_systemds_exec_and_the_three_messages_of_the_j
         tokio::time::sleep(Duration::from_millis(50)).await;
         timeline = units.timeline(id, &started).await.unwrap();
     }
-    let job_to_exec = timeline.job_to_exec_us.expect("the exec after the request");
-    assert!(job_to_exec < 5_000_000, "{timeline:?}");
-    let startup = timeline.startup.expect("the three messages of the start");
+    // Each gap is a subtraction that gives none when the times are out of order: the request, the
+    // fork, the handoff and `starting PostgreSQL` follow each other in that order.
+    let job_to_fork = timeline.job_to_fork_us.expect("the fork after the request");
+    let fork_to_handoff = timeline
+        .fork_to_handoff_us
+        .expect("the handoff after the fork");
+    assert!(job_to_fork < 5_000_000, "{timeline:?}");
+    assert!(fork_to_handoff < 5_000_000, "{timeline:?}");
+    let startup = timeline
+        .startup
+        .expect("the three messages of the start, the first after the handoff");
     for gap in [
-        startup.exec_to_starting_us,
+        startup.handoff_to_starting_us,
         startup.starting_to_shut_down_us,
         startup.shut_down_to_ready_us,
     ] {
         assert!(gap < 10_000_000, "{timeline:?}");
     }
 
-    // The unit started again: the exec time and the journal are the new invocation's, not this
-    // start's.
+    // The unit started again: the fork and handoff times and the journal are the new invocation's,
+    // not this start's.
     within(units.stop(id)).await.unwrap();
     let again = within(units.start(id)).await.unwrap();
     assert_ne!(again.invocation_id, started.invocation_id);
