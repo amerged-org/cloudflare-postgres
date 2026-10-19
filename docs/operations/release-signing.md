@@ -153,10 +153,16 @@ key still does not protect is under "What is and is not protected".
     edited in D1 or registered before the API checked can never be installed. An unverifiable row
     leaves the addition `audited` with `install_blocker: release_unverified` (`GET
     /v1/nodes/additions/{id}`); no installer is rendered, and the next pass (30 s) asks again, so
-    assigning a signed release is enough, while the workflow runs: AddNode makes 288 passes (about
-    2.4 h) and then ends. After that only the capacity step of a region with a node policy (every
-    minute) or the approval of a purchase starts it again; for an adoption or a recovery in a region
-    without a policy, cancel the addition and request it again. The installer in the rescue system
+    assigning a signed release is enough. AddNode makes 288 passes (about 2.4 h) and then ends, but
+    the capacity step of the minute cron starts it again: every addition belongs to a region with a
+    node policy (a request for a region without one is refused with 409 "Region capacity policy has not
+    been configured", and a policy is only ever changed, never deleted), and each minute that step starts the workflow of the
+    region's oldest addition that is neither `ready` nor `cancelled`, so an ended AddNode carries on
+    within about a minute and asks again; nothing has to be requested or cancelled. An audited
+    recovery has its server bound already (`provider_instance_id` is set) and the cancel route refuses
+    it with 409, so cancelling is no way out for it either. If a region holds
+    more than one such addition, the older one is started first and the others follow when it is
+    `ready` or `cancelled`. The installer in the rescue system
     then checks the four image facts it is given, as it always did: its userData is rendered by the
     Worker from the verified spec and carries the installer script itself, so a second verifier inside
     the rescue system would sit where whoever can alter the userData could also alter it.
@@ -273,9 +279,13 @@ a push to `main` unsigned for long and never installs a release nobody could ver
    signer, the job is red; deploy the signer and re-run the failed jobs of that run (the job downloads the
    build's artifact by id and does not build again).
 3. Deploy the API of the merge commit with its migrations, the migrations and the Worker one after the
-   other without a pause (the reason is in step 5 of "Setting it up"). They remove the releases of the
-   older format and their region assignments (the nodes keep what they run, and an agent that cannot
-   read the new page gets none, because no release is assigned).
+   other without a pause. The reason in step 5 of "Setting it up" (the Worker that runs before the
+   deploy accepts a registration without checking its signature) holds for the first transition only:
+   a later version is replaced by a Worker that already verifies, which refuses a registration signed
+   for the new manifest, so there is no id to take in between, and the pause only keeps the nodes
+   without an assigned release for longer. The migrations remove the releases of the older format and
+   their region assignments (the nodes keep what they run, and an agent that cannot read the new page
+   gets none, because no release is assigned).
 4. Download the two artifacts of that run, check out the commit that was built, register the release
    (`register-node-image.ts`, `--signature`) and assign it to the region from revision 0
    ([infra/node-image/README.md](../../infra/node-image/README.md)). The API refuses a release signed for

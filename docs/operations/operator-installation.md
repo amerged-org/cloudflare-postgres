@@ -103,9 +103,10 @@ because a new paid resource needs the owner's explicit, costed go. Put the firew
   that accepts (a rule that drops is fine); the instance is not listed yet, or listed with a status
   other than `ok`, and stays so (`error_processing`). Fix the cause; AddNode asks again on every
   cycle and starts the install when the firewall is confirmed. It makes 288 cycles (about 2.4 h) and
-  then ends; after that only the capacity step of a region with a node policy (every minute) or the
-  approval of a purchase starts it again, and for an adoption or a recovery in a region without a
-  policy the addition is cancelled and requested again.
+  then ends; the capacity step of the minute cron starts it again within about a minute, because
+  every addition belongs to a region with a node policy and that step starts the region's oldest
+  addition that is neither `ready` nor `cancelled`. Nothing has to be requested or cancelled, and an
+  audited recovery cannot be cancelled anyway (its server is bound already).
 - Before it issues the tokens, AddNode verifies the signature of the region's release against the
   manifest rebuilt from the stored spec (the image's digests included) with the release public key of
   the API Worker. A row that does not verify (edited in D1, or registered by a path that did not
