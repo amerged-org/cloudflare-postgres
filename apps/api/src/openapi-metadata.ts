@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 export type DocumentationAuth =
-  "none" | "api" | "project" | "admin" | "node" | "installer";
+  "none" | "api" | "project" | "admin" | "admin_read" | "node" | "installer";
 export interface RouteMetadata {
   operationId: string;
   summary: string;
@@ -31,11 +31,16 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     [500],
   ),
   "POST /v1/api-keys": route("createApiKey", "Create an API key", "admin"),
-  "GET /v1/api-keys": route("listApiKeys", "List API keys", "admin"),
+  "GET /v1/api-keys": route("listApiKeys", "List API keys", "admin_read"),
   "DELETE /v1/api-keys/{id}": route(
     "revokeApiKey",
     "Revoke an API key",
     "admin",
+  ),
+  "GET /v1/audit-events": route(
+    "listAuditEvents",
+    "List the audit log of the administrator keys",
+    "admin_read",
   ),
   "POST /v1/projects": route("createProject", "Create a project", "admin"),
   "GET /v1/projects": route("listProjects", "List accessible projects", "api"),
@@ -64,13 +69,13 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/regions/{id}": route(
     "getRegion",
     "Read regional inventory",
-    "admin",
+    "admin_read",
   ),
-  "GET /v1/nodes": route("listNodes", "List registered nodes", "admin"),
+  "GET /v1/nodes": route("listNodes", "List registered nodes", "admin_read"),
   "GET /v1/nodes/{id}": route(
     "getNode",
     "Read registered node inventory and physical identity",
-    "admin",
+    "admin_read",
   ),
   "POST /v1/databases": route("createDatabase", "Create a database", "project"),
   "GET /v1/databases": route(
@@ -169,7 +174,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/costs": route(
     "getInfrastructureCosts",
     "Read measured infrastructure costs",
-    "admin",
+    "admin_read",
   ),
   "POST /v1/costs/node-facts": route(
     "refreshNodeCostFacts",
@@ -184,7 +189,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/nodes/{id}/diagnostics": route(
     "listNodeDiagnostics",
     "List the boot reports of a node",
-    "admin",
+    "admin_read",
   ),
   "POST /v1/nodes/{id}/diagnostics": route(
     "requestNodeProbe",
@@ -194,7 +199,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/nodes/{id}/diagnostics/{diagnostic_id}": route(
     "getNodeDiagnostic",
     "Read a boot report or the result of a probe",
-    "admin",
+    "admin_read",
   ),
   "POST /v1/nodes/{id}/mark-lost": route(
     "markNodeLost",
@@ -204,7 +209,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/nodes/{id}/loss": route(
     "getNodeLoss",
     "Read the fencing and the recovery points of a lost node",
-    "admin",
+    "admin_read",
   ),
   "POST /v1/nodes/{id}/maintenance": route(
     "startNodeMaintenance",
@@ -214,7 +219,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/nodes/{id}/maintenance/{operation}": route(
     "getNodeMaintenance",
     "Read a maintenance cycle of a node",
-    "admin",
+    "admin_read",
   ),
   "POST /v1/nodes/{id}/reinstall-override": route(
     "overrideNodeReinstallGuard",
@@ -229,7 +234,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/databases/{id}/moves": route(
     "listDatabaseMoves",
     "List the moves of a database",
-    "admin",
+    "admin_read",
   ),
   "POST /v1/nodes/additions": route(
     "proposeNodeAddition",
@@ -239,12 +244,12 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/nodes/additions": route(
     "listNodeAdditions",
     "List node addition operations",
-    "admin",
+    "admin_read",
   ),
   "GET /v1/nodes/additions/{id}": route(
     "getNodeAddition",
     "Read a node addition operation",
-    "admin",
+    "admin_read",
   ),
   "POST /v1/nodes/additions/{id}/approve": route(
     "approveNodeAddition",
@@ -259,7 +264,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/regions/{id}/configuration": route(
     "getRegionConfiguration",
     "Read regional PostgreSQL and storage configuration",
-    "admin",
+    "admin_read",
   ),
   "PUT /v1/regions/{id}/configuration": route(
     "setRegionConfiguration",
@@ -274,12 +279,12 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/fleet/releases/{id}": route(
     "getFleetRelease",
     "Read an immutable fleet release",
-    "admin",
+    "admin_read",
   ),
   "GET /v1/fleet/releases": route(
     "listFleetReleases",
     "List approved immutable fleet releases",
-    "admin",
+    "admin_read",
   ),
   "PUT /v1/regions/{id}/release": route(
     "assignRegionFleetRelease",
@@ -289,17 +294,17 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/regions/{id}/release": route(
     "getRegionFleetRelease",
     "Read regional fleet release assignment",
-    "admin",
+    "admin_read",
   ),
   "GET /v1/nodes/{id}/release": route(
     "getNodeFleetRelease",
     "Read how a node stands against its region's release",
-    "admin",
+    "admin_read",
   ),
   "GET /v1/resource-profiles/{id}/rollout": route(
     "getResourceProfileRollout",
     "Read central resource profile rollout state",
-    "admin",
+    "admin_read",
   ),
   "PUT /v1/resource-profiles/{id}/rollout": route(
     "setResourceProfileRollout",
@@ -334,7 +339,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/regions/{id}/capacity-policy": route(
     "getRegionCapacityPolicy",
     "Read regional capacity and purchase policy",
-    "admin",
+    "admin_read",
   ),
   "PUT /v1/regions/{id}/capacity-policy": route(
     "setRegionCapacityPolicy",
@@ -344,12 +349,12 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/regions/{id}/capacity-decision": route(
     "getRegionCapacityDecision",
     "Read current regional placement and expansion decisions",
-    "admin",
+    "admin_read",
   ),
   "GET /v1/infrastructure-backups/config": route(
     "getInfrastructureBackupConfig",
     "Read infrastructure backup and alert delivery settings",
-    "admin",
+    "admin_read",
   ),
   "PUT /v1/infrastructure-backups/config": route(
     "setInfrastructureBackupConfig",
@@ -359,17 +364,17 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/infrastructure-backups": route(
     "getInfrastructureBackupStatus",
     "Read infrastructure backup receipts and freshness",
-    "admin",
+    "admin_read",
   ),
   "GET /v1/operational-health": route(
     "getOperationalHealth",
     "Read measured operational health and alert episodes",
-    "admin",
+    "admin_read",
   ),
   "GET /v1/regions/{id}/node-policy": route(
     "getRegionNodePolicy",
     "Read the rules a region's nodes decide by when they act alone",
-    "admin",
+    "admin_read",
   ),
   "PUT /v1/regions/{id}/node-policy": route(
     "setRegionNodePolicy",

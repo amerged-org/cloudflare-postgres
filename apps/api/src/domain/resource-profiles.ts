@@ -10,7 +10,7 @@ import {
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { Env, ApiContext } from "../env.ts";
-import { getAuth, requireScope } from "../middleware/auth.ts";
+import { getAuth, requireAdminRead, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseForRequest, type DatabaseRow } from "./rows.ts";
 import { stoppedSleeperSql } from "./startup-admission.ts";
@@ -189,7 +189,7 @@ export async function assignDatabaseResourceProfile(
 
 /** Rollout status is derived from assignments and actual current-generation observations. */
 export async function getResourceProfileRollout(c: ApiContext, id: string) {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const profile = await c.env.DB.prepare(
     "SELECT revision,rollout_revision FROM resource_profiles WHERE id=?",
   )

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
+  isAdminScope,
   NODE_PROBE_EXPIRY_SECONDS,
   NODE_PROBE_REQUESTS_MAX,
   NodeBootReport,
@@ -224,20 +225,20 @@ const summary = (row: DiagnosticRow): NodeDiagnosticSummary =>
   });
 
 /**
- * Only an administrator reads a node's reports and asks it for probes; anyone else is told the
- * node is not there, as an integrator is for every resource that is not its own.
+ * Only an administrator reads a node's reports and asks it for probes; anyone else is told the node
+ * is not there, as an integrator is for every resource that is not its own. A read-only `admin_read`
+ * key never gets past `getAuth` on the POST that asks, so no scope is told apart here.
  */
 async function administeredNode(
   c: ApiContext,
   nodeId: string,
 ): Promise<AuthPrincipal> {
   const auth = await getAuth(c);
-  const found =
-    auth.scope === "admin"
-      ? await c.env.DB.prepare("SELECT 1 found FROM nodes WHERE id=?")
-          .bind(nodeId)
-          .first()
-      : null;
+  const found = isAdminScope(auth.scope)
+    ? await c.env.DB.prepare("SELECT 1 found FROM nodes WHERE id=?")
+        .bind(nodeId)
+        .first()
+    : null;
   if (found === null) throw new ApiError("not_found", "Node not found");
   return auth;
 }

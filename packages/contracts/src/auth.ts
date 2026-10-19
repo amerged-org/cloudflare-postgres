@@ -3,9 +3,22 @@ import { z } from "zod";
 import { base64urlToBytes, bytesToHex, newSecret } from "./encoding.ts";
 import { ID_ALPHABET, randomString } from "./ids.ts";
 
-export const API_KEY_SCOPES = ["admin", "integrator"] as const;
-export const ApiKeyScope = z.enum(API_KEY_SCOPES).meta({ id: "ApiKeyScope" });
+/**
+ * `admin` changes anything; `admin_read` reads what an administrator reads and can change nothing;
+ * `integrator` is bound to one project.
+ */
+export const API_KEY_SCOPES = ["admin", "admin_read", "integrator"] as const;
+export const ApiKeyScope = z.enum(API_KEY_SCOPES).meta({
+  id: "ApiKeyScope",
+  description:
+    "admin: every administrator operation. admin_read: the administrator's reads only; a request that is not a GET is refused with 403 whatever its route. integrator: bound to one project.",
+});
 export type ApiKeyScope = z.infer<typeof ApiKeyScope>;
+/** The scopes of the operator's keys, which the audit log records. */
+export const AdminScope = z.enum(["admin", "admin_read"]);
+export type AdminScope = z.infer<typeof AdminScope>;
+export const isAdminScope = (scope: ApiKeyScope): scope is AdminScope =>
+  scope !== "integrator";
 
 export const API_KEY_LOOKUP_ID_LENGTH = 12;
 export const SECRET_LENGTH = 43;
