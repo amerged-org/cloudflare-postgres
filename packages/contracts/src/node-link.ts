@@ -1453,7 +1453,8 @@ const utf8Bytes = (text: string) => new TextEncoder().encode(text).byteLength;
  * program said it, through which transport (`journal`, `stdout`, `kernel`, `syslog`, `audit`), at
  * which syslog priority (0 emergency to 7 debug), and the text. `unit` is null for the kernel's
  * lines. The agent never reports a line of a database's unit or of a backup job, whose output
- * can hold the tenant's SQL.
+ * can hold the tenant's SQL, and it reports an event line of its own log with the fields an
+ * observation event may carry.
  */
 export const NodeJournalEntry = z.strictObject({
   at: Timestamp,
@@ -1474,7 +1475,8 @@ export const NodeJournalEntry = z.strictObject({
 export type NodeJournalEntry = z.infer<typeof NodeJournalEntry>;
 /**
  * POST /node/v1/diagnostics: sent once after a boot, when the boot ID differs from the one the
- * agent stored when it last reported. `kernel_release` is the kernel of `boot_id`. `previous_boot_id`
+ * agent stored when it last reported; the API keeps one report per boot ID of a node, and answers
+ * a second send of it with the stored report's `id` and `expected_reboot`. `kernel_release` is the kernel of `boot_id`. `previous_boot_id`
  * is the stored ID, null when the agent had stored none (it was just installed or updated), and
  * `entries` are the tail of the previous boot's journal from the agent, the gateway, cloudflared,
  * networkd, PID 1 and the kernel, oldest first; they are empty when the node has no journal of the

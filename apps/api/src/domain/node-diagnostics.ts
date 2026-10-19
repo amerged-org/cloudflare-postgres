@@ -18,15 +18,16 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 interface NodeRow {
   last_observed_at: string | null;
   os_boot_id: string | null;
-  os_booted_at: string | null;
+  os_previous_observed_at: string | null;
 }
 
 /**
  * Whether a maintenance order of the node was open when its last sample of the previous boot
- * arrived, or closed after it: an order the node's own reboot belongs to. The node's newest sample
- * is that sample unless this boot has already said hello and sampled, and then the previous
- * boot's last sample is older than the boot itself. An order made after that sample, while the
- * node was down, is not the reason for the reboot, and a node that never sampled has no order.
+ * arrived, or closed after it: an order the node's own reboot belongs to. Until this boot's hello
+ * is stored, the node's newest sample is that sample. The hello keeps it when it stores the new
+ * boot (`os_previous_observed_at`), because from then on the newest sample can be this boot's. An
+ * order made after it, while the node was down, is not the reason for the reboot, and a node that
+ * never sampled has no order.
  */
 async function rebootWasAsked(
   db: D1Database,
@@ -35,18 +36,15 @@ async function rebootWasAsked(
 ): Promise<boolean> {
   const node = await db
     .prepare(
-      "SELECT last_observed_at,os_boot_id,os_booted_at FROM nodes WHERE id=?",
+      "SELECT last_observed_at,os_boot_id,os_previous_observed_at FROM nodes WHERE id=?",
     )
     .bind(nodeId)
     .first<NodeRow>();
-  const sampled = node?.last_observed_at ?? null;
-  if (sampled === null) return false;
   const at =
-    node!.os_boot_id === bootId &&
-    node!.os_booted_at !== null &&
-    node!.os_booted_at < sampled
-      ? node!.os_booted_at
-      : sampled;
+    node?.os_boot_id === bootId
+      ? node.os_previous_observed_at
+      : (node?.last_observed_at ?? null);
+  if (at === null) return false;
   const open = await db
     .prepare(
       `SELECT 1 found FROM lifecycle_orders WHERE node_id=? AND type='maintenance' AND created_at<=?
@@ -59,9 +57,10 @@ async function rebootWasAsked(
 
 /**
  * `POST /node/v1/diagnostics`: the journal tail of the boot before this one, sent by the agent
- * when its boot ID changed. The report is stored whole. An unexpected reboot (no maintenance order
- * asked for it) is what the `node_unexpected_reboot` alert reads; a report of an agent that knew no
- * earlier boot claims no reboot at all.
+ * when its boot ID changed. The report is stored whole, once for a boot: the agent sends it again
+ * when the answer was lost, and that send is answered with the stored report's id and verdict. An
+ * unexpected reboot (no maintenance order asked for it) is what the `node_unexpected_reboot` alert
+ * reads; a report of an agent that knew no earlier boot claims no reboot at all.
  */
 export async function nodeBootReport(
   c: ApiContext,
@@ -71,18 +70,17 @@ export async function nodeBootReport(
   const parsed = NodeBootReport.safeParse(raw);
   if (!parsed.success)
     throw new ApiError("invalid_request", "Invalid boot report");
-  const report = parsed.data,
-    id = crypto.randomUUID();
+  const report = parsed.data;
   const expected =
     report.previous_boot_id === null
       ? null
       : await rebootWasAsked(c.env.DB, node.id, report.boot_id);
   await c.env.DB.prepare(
     `INSERT INTO node_diagnostics(id,node_id,kind,boot_id,previous_boot_id,received_at,expected_reboot,body)
-     VALUES(?,?,'boot',?,?,?,?,?)`,
+     VALUES(?,?,'boot',?,?,?,?,?) ON CONFLICT(node_id,boot_id) DO NOTHING`,
   )
     .bind(
-      id,
+      crypto.randomUUID(),
       node.id,
       report.boot_id,
       report.previous_boot_id,
@@ -91,7 +89,16 @@ export async function nodeBootReport(
       JSON.stringify(report),
     )
     .run();
-  return c.json({ id, expected_reboot: expected });
+  const stored = await c.env.DB.prepare(
+    "SELECT id,expected_reboot FROM node_diagnostics WHERE node_id=? AND boot_id=?",
+  )
+    .bind(node.id, report.boot_id)
+    .first<{ id: string; expected_reboot: number | null }>();
+  return c.json({
+    id: stored!.id,
+    expected_reboot:
+      stored!.expected_reboot === null ? null : stored!.expected_reboot === 1,
+  });
 }
 
 /** Deletes the reports older than 30 days. The minute cron calls it. */

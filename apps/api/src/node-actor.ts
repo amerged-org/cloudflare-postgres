@@ -206,14 +206,16 @@ export class NodeActor extends DurableObject<Env> {
       socket.serializeAttachment({ hello: true } satisfies Attachment);
       const { os } = parsed.data;
       await this.env.DB.prepare(
-        `UPDATE nodes SET agent_version=?,reported_release_id=?,os_boot_id=?,os_booted_at=?,os_kernel_release=?,
-         os_packages_sha256=?,updated_at=? WHERE id=? AND node_uid=?`,
+        `UPDATE nodes SET agent_version=?,reported_release_id=?,
+         os_previous_observed_at=CASE WHEN os_boot_id IS ? THEN os_previous_observed_at ELSE last_observed_at END,
+         os_boot_id=?,os_booted_at=?,os_kernel_release=?,os_packages_sha256=?,updated_at=? WHERE id=? AND node_uid=?`,
       )
         .bind(
           parsed.data.agent_version,
           parsed.data.release_id === null
             ? null
             : FleetReleaseId.parse(parsed.data.release_id),
+          os.boot_id,
           os.boot_id,
           os.booted_at,
           os.kernel_release,

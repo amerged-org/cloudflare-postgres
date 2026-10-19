@@ -144,7 +144,7 @@ export function registerNodes(app: ApiApp): void {
       tags: ["Nodes"],
       summary: "Read a node's boot report",
       description:
-        "One report with the tail of the previous boot's journal: at most 1,000 lines of the agent, the gateway, cloudflared, networkd, PID 1 and the kernel, oldest first, each with its time, unit, program, transport, syslog priority and text (at most 2,048 bytes). Lines of the databases' units and of backup jobs are never reported. Administrator keys only: any other key is told 404.",
+        "One report with the tail of the previous boot's journal: at most 1,000 lines of the agent, the gateway, cloudflared, networkd, PID 1 and the kernel, oldest first, each with its time, unit, program, transport, syslog priority and text (at most 2,048 bytes). An event line of the agent keeps only the fields an observation event may carry; lines of the databases' units and of backup jobs are never reported. Administrator keys only: any other key is told 404.",
       request: {
         params: z.object({ id: NodeId, diagnostic_id: z.uuid() }),
       },

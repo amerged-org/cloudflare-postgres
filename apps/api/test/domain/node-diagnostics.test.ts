@@ -9,7 +9,15 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 import { runCron } from "../../src/cron.ts";
 import { infrastructureAlertStatus } from "../../src/domain/infrastructure-alerts.ts";
-import { cleanupFixtures, fixture, nodeRequest, request } from "./fixtures.ts";
+import {
+  cleanupFixtures,
+  fixture,
+  nodeOs,
+  nodeRequest,
+  nodeSample,
+  request,
+} from "./fixtures.ts";
+import { nextMessage, openLink } from "./node-fixtures.ts";
 
 afterEach(cleanupFixtures);
 
@@ -55,6 +63,41 @@ const maintenance = (f: F, created: string, closed: string | null = null) =>
       closed === null ? null : "done",
     )
     .run();
+/**
+ * The node's agent, started at `bootedAt` on the boot `BOOT`: its hello says so over the link, and
+ * its first sample, a minute old, is stored. The link stays open for the caller to close.
+ */
+async function started(f: F, bootedAt: string) {
+  const socket = await openLink(f, false);
+  const welcome = nextMessage(socket);
+  socket.send(
+    JSON.stringify({
+      type: "hello",
+      protocol: 1,
+      agent_version: "0.1.0",
+      release_id: null,
+      os: nodeOs({ boot_id: BOOT, booted_at: bootedAt }),
+    }),
+  );
+  await welcome;
+  const observed = ago(MINUTE);
+  socket.send(
+    JSON.stringify({
+      type: "sample",
+      sample: nodeSample(Date.parse(observed)),
+    }),
+  );
+  for (let i = 0; i < 400; i++) {
+    const row = await env.DB.prepare(
+      "SELECT last_observed_at FROM nodes WHERE id=?",
+    )
+      .bind(f.node)
+      .first<{ last_observed_at: string }>();
+    if (row!.last_observed_at === observed) return socket;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("sample_not_stored");
+}
 const stored = (f: F) =>
   env.DB.prepare(
     "SELECT kind,boot_id,previous_boot_id,expected_reboot,body FROM node_diagnostics WHERE node_id=? ORDER BY received_at,id",
@@ -127,7 +170,10 @@ describe("a boot report whose reboot nobody asked for", () => {
     expect((await reboot(f)).expected_reboot).toBe(false);
     await sampled(f, ago(2 * MINUTE));
     await maintenance(f, ago(30 * MINUTE), ago(10 * MINUTE));
-    expect((await reboot(f)).expected_reboot).toBe(false);
+    expect(
+      (await reboot(f, report({ boot_id: crypto.randomUUID() })))
+        .expected_reboot,
+    ).toBe(false);
   });
 
   it("is not raised for a maintenance order that was open at the node's last sample", async () => {
@@ -156,15 +202,24 @@ describe("a boot report whose reboot nobody asked for", () => {
 
   it("reads the sample of the previous boot, not the first sample of this one", async () => {
     const f = await fixture();
-    // The boot began 3 minutes ago and its first sample is 1 minute old; the order ended 2 minutes
-    // ago, after the last sample of the previous boot and before the first of this one.
-    await env.DB.prepare(
-      "UPDATE nodes SET last_observed_at=?,os_boot_id=?,os_booted_at=? WHERE id=?",
-    )
-      .bind(ago(MINUTE), BOOT, ago(3 * MINUTE), f.node)
-      .run();
+    // The previous boot's last sample is 4 minutes old; the boot began 3 minutes ago and its first
+    // sample is 1 minute old; the order ended 2 minutes ago, between the two samples.
+    await sampled(f, ago(4 * MINUTE));
     await maintenance(f, ago(30 * MINUTE), ago(2 * MINUTE));
+    const socket = await started(f, ago(3 * MINUTE));
     expect((await reboot(f)).expected_reboot).toBe(true);
+    socket.close(1000);
+  });
+
+  it("is not blamed on an order made while the node was down, also when this boot has said hello and sampled, or its agent restarted", async () => {
+    const f = await fixture();
+    await sampled(f, ago(10 * MINUTE));
+    await maintenance(f, ago(5 * MINUTE));
+    (await started(f, ago(3 * MINUTE))).close(1000);
+    // The agent starts again within the boot and says hello again, and its report goes out then.
+    const socket = await started(f, ago(3 * MINUTE));
+    expect((await reboot(f)).expected_reboot).toBe(false);
+    socket.close(1000);
   });
 
   it("claims no reboot of a node whose agent knew no earlier boot", async () => {
@@ -189,6 +244,21 @@ describe("a boot report whose reboot nobody asked for", () => {
       .bind(ago(25 * 60 * MINUTE), f.node)
       .run();
     expect((await episode(f))?.active).toBe(false);
+  });
+
+  it("is stored once for a boot, and a report sent again is answered with the stored one", async () => {
+    const f = await fixture();
+    await sampled(f, ago(2 * MINUTE));
+    const first = await reboot(f);
+    expect(first.expected_reboot).toBe(false);
+    // The answer was lost, and the agent sends the report again when an order is open.
+    await maintenance(f, ago(30 * MINUTE));
+    expect(await reboot(f)).toEqual(first);
+    expect(await stored(f)).toHaveLength(1);
+    // Another node's report of the same boot ID is its own.
+    const other = await fixture();
+    expect((await reboot(other)).id).not.toBe(first.id);
+    expect(await stored(other)).toHaveLength(1);
   });
 
   it("is refused when it breaks the contract, whatever the size of its body", async () => {
@@ -343,7 +413,10 @@ describe("the diagnostics of a node", () => {
 
   it("are deleted by the minute cron after 30 days", async () => {
     const f = await fixture();
-    const old = await reboot(f),
+    const old = await reboot(
+        f,
+        report({ boot_id: PREVIOUS, previous_boot_id: BOOT }),
+      ),
       recent = await reboot(f);
     await env.DB.prepare("UPDATE node_diagnostics SET received_at=? WHERE id=?")
       .bind(ago(30 * 24 * 60 * MINUTE + MINUTE), old.id)
