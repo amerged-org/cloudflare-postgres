@@ -336,6 +336,201 @@ it("an awake admission writes nothing durable and parses its snapshot once", asy
   expect(await durable()).toEqual(before);
 });
 
+/** Every SQL text the Durable Objects of this isolate run through `SqlStorage.exec` from now on. */
+const sqlTexts = (id: string) =>
+  runInDurableObject(actor(id), (_instance, state) =>
+    vi.spyOn(Object.getPrototypeOf(state.storage.sql), "exec"),
+  );
+const texts = (exec: { mock: { calls: unknown[][] } }) =>
+  exec.mock.calls.map(([query]) => String(query));
+/** The actor_admit lines of one database that a console.log spy has seen so far. */
+const admitLines = (log: { mock: { calls: unknown[][] } }, id: string) =>
+  log.mock.calls
+    .map(([line]) => (typeof line === "string" ? line : ""))
+    .filter((line) => line.includes('"actor_admit"'))
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((line) => line.database_id === id);
+
+it("an admission runs no statement SQLite counts as a write", async () => {
+  // SQLite counts CREATE TABLE IF NOT EXISTS as a write even when the table exists, and workerd
+  // holds the answer of an Actor that wrote until the write has committed.
+  const write = /^\s*(CREATE|INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER)\b/i;
+  const awake = await admissionSnapshotFixture();
+  expect(await publishDatabaseAdmission(env, awake.id)).toBe(true);
+  expect((await actor(awake.id).admitWake(awake.id, "app")).ok).toBe(true);
+  const exec = await sqlTexts(awake.id);
+  for (let attempt = 0; attempt < 3; attempt++)
+    expect((await actor(awake.id).admitWake(awake.id, "app")).ok).toBe(true);
+  // The spy sees the reads too: a pass cannot be an Actor that ran nothing.
+  expect(texts(exec)).not.toEqual([]);
+  expect(texts(exec).filter((text) => write.test(text))).toEqual([]);
+
+  const f = await sleeper();
+  const held = await holdClaims(f.id);
+  const issued = await actor(f.id).admitWake(f.id, "reader");
+  if (!issued.ok || !("wake" in issued)) throw new Error("no wake ticket");
+  exec.mockClear();
+  for (let attempt = 0; attempt < 3; attempt++)
+    expect(await actor(f.id).admitWake(f.id, "reader")).toMatchObject({
+      ok: true,
+      wake: issued.wake,
+    });
+  expect(texts(exec)).not.toEqual([]);
+  expect(texts(exec).filter((text) => write.test(text))).toEqual([]);
+  held.open();
+  await expect
+    .poll(() => ticket(f.id), { interval: 5, timeout: 3000 })
+    .toEqual([
+      {
+        operation: issued.wake.operation,
+        generation: issued.wake.generation,
+        state: "claimed",
+      },
+    ]);
+});
+
+it("an Actor that holds no snapshot or ticket yet answers without creating their tables", async () => {
+  const id = newDatabaseId();
+  await actor(id).seed({
+    database_id: id,
+    revision: 1,
+    updated_at: new Date().toISOString(),
+    roles: ["app"],
+    deleted: false,
+  });
+  const tables = () =>
+    runInDurableObject(actor(id), (_instance, state) =>
+      state.storage.sql
+        .exec<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' ORDER BY name",
+        )
+        .toArray()
+        .map(({ name }) => name),
+    );
+  expect(await tables()).toEqual(["database_presence", "database_wake"]);
+  // No snapshot to answer from: D1 knows no such database.
+  expect(
+    await actor(id).admitWake(id, "app", { deadline: Date.now() + 1000 }),
+  ).toEqual({ ok: false, sqlstate: "3D000" });
+  expect(await actor(id).pendingTicket()).toBeNull();
+  expect(await tables()).toEqual(["database_presence", "database_wake"]);
+});
+
+it("an admission logs one actor_admit line with the path it took", async () => {
+  const log = vi.spyOn(console, "log");
+  const awake = await admissionSnapshotFixture();
+  expect(await publishDatabaseAdmission(env, awake.id)).toBe(true);
+  const waiterId = crypto.randomUUID();
+  await actor(awake.id).admitWake(awake.id, "app", { waiterId });
+  await actor(awake.id).admitWake(awake.id, "app");
+  await actor(awake.id).admitWake(awake.id, "missing");
+  const sleeping = await sleeper();
+  const held = await holdClaims(sleeping.id);
+  await actor(sleeping.id).admitWake(sleeping.id, "reader");
+  await actor(sleeping.id).admitWake(sleeping.id, "reader");
+  // A snapshot persisted before the wakeable field existed takes ensureAwake.
+  const legacy = await sleeper();
+  await runInDurableObject(actor(legacy.id), (instance, state) => {
+    const stored = state.storage.sql
+      .exec<{ snapshot: string }>(
+        "SELECT snapshot FROM database_snapshot WHERE singleton=1",
+      )
+      .toArray()[0]!;
+    const snapshot = JSON.parse(stored.snapshot) as Record<string, unknown>;
+    delete snapshot.wakeable;
+    state.storage.sql.exec(
+      "UPDATE database_snapshot SET snapshot=? WHERE singleton=1",
+      JSON.stringify(snapshot),
+    );
+    Reflect.set(instance, "ensureAwake", async () => ({
+      ok: false,
+      sqlstate: "08006",
+    }));
+  });
+  await actor(legacy.id).admitWake(legacy.id, "reader");
+
+  const lines = [
+    ...admitLines(log, awake.id),
+    ...admitLines(log, sleeping.id),
+    ...admitLines(log, legacy.id),
+  ];
+  expect(
+    admitLines(log, awake.id).map(({ waiter_id, path, reused }) => [
+      waiter_id,
+      path,
+      reused,
+    ]),
+  ).toEqual([
+    [waiterId, "snapshot", null],
+    [null, "snapshot", null],
+    [null, "refused", null],
+  ]);
+  expect(
+    admitLines(log, sleeping.id).map(({ path, reused }) => [path, reused]),
+  ).toEqual([
+    ["ticket", false],
+    ["ticket", true],
+  ]);
+  expect(admitLines(log, legacy.id).map(({ path }) => path)).toEqual([
+    "ensure_awake",
+  ]);
+  // Nothing but these fields: no role, password or token.
+  for (const line of lines)
+    expect(Object.keys(line)).toEqual([
+      "event",
+      "database_id",
+      "waiter_id",
+      "path",
+      "reused",
+      "instance_age_ms",
+      "isolate_actors",
+      "at_ms",
+    ]);
+  held.open();
+  await expect
+    .poll(async () => (await ticket(sleeping.id))[0]?.state, {
+      interval: 5,
+      timeout: 3000,
+    })
+    .toBe("claimed");
+});
+
+it("an actor_admit line says how long its instance has existed and how many Actors the isolate built", async () => {
+  // Another call may build the instance first: a node report publishes the snapshot before any
+  // connect. So the line carries the instance's age, which is 0 only when this call built it.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const log = vi.spyOn(console, "log");
+    const published = await admissionSnapshotFixture();
+    expect(await publishDatabaseAdmission(env, published.id)).toBe(true);
+    vi.advanceTimersByTime(5000);
+    await actor(published.id).admitWake(published.id, "app");
+    const [warm] = admitLines(log, published.id);
+    expect(warm).toMatchObject({ path: "snapshot", instance_age_ms: 5000 });
+
+    // An id nothing has called: this very admission builds its Actor, one more in the isolate.
+    const cold = newDatabaseId();
+    await actor(cold).admitWake(cold, "app");
+    vi.advanceTimersByTime(7);
+    await actor(cold).admitWake(cold, "app");
+    const [first, second] = admitLines(log, cold);
+    expect(first).toMatchObject({ instance_age_ms: 0 });
+    expect(second).toMatchObject({ instance_age_ms: 7 });
+    expect(first!.isolate_actors).toBe((warm!.isolate_actors as number) + 1);
+    expect(second!.isolate_actors).toBe(first!.isolate_actors);
+
+    // Admitting on the first database again builds nothing.
+    await actor(published.id).admitWake(published.id, "app");
+    const [, again] = admitLines(log, published.id);
+    expect(again).toMatchObject({
+      instance_age_ms: 5007,
+      isolate_actors: first!.isolate_actors,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("a manual suspension is not wakeable and answers 57P03", async () => {
   const f = await sleeper("manual");
   expect(await actor(f.id).admitWake(f.id, "app")).toEqual({

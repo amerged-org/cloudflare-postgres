@@ -53,6 +53,15 @@ const withAccess = {
 } as Env;
 const live: { socket: WebSocket; ctx: ExecutionContext }[] = [];
 let logs: ReturnType<typeof vi.spyOn>;
+/**
+ * Every line but the actor_admit one. The real DatabaseActor runs in this isolate and logs one for
+ * each admission, which lands in the same spy; any other line still counts.
+ */
+const edgeLogs = () =>
+  logs.mock.calls.filter(
+    ([line]: unknown[]) =>
+      !(typeof line === "string" && line.includes('"actor_admit"')),
+  );
 let database: string;
 /** The node the fixture database runs on, with the key it signs its reports with. */
 let enrolled: { id: string; uid: string; key: NodeKey };
@@ -619,7 +628,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     // The admission: both limiters, one Actor call, one log line.
     expect(limit).toHaveBeenCalledTimes(2);
     expect(admitWake).toHaveBeenCalledTimes(1);
-    expect(logs.mock.calls).toHaveLength(1);
+    expect(edgeLogs()).toHaveLength(1);
     const frames = Array.from({ length: 200 }, (_, index) =>
       Uint8Array.of(0x51, 0, 0, 0, 5, index, 0),
     );
@@ -634,7 +643,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(get).toHaveBeenCalledTimes(1);
     expect(admitWake).toHaveBeenCalledTimes(1);
     expect(cancelWakeWaiter).not.toHaveBeenCalled();
-    expect(logs.mock.calls).toHaveLength(1);
+    expect(edgeLogs()).toHaveLength(1);
   });
 
   it("rejects missing and duplicate admission hints before any gateway call", async () => {
@@ -966,7 +975,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       Array.from({ length: 1_000 }, () => open({ ip })),
     );
     expect(await stats()).toHaveLength(1_000);
-    expect(logs.mock.calls).toHaveLength(1_000);
+    expect(edgeLogs()).toHaveLength(1_000);
     // The real limiter has its own wall-clock window; rate denial is checked separately.
     const beforeAdvance = idleUpgradeDiagnostics(idle);
     const timersBeforeAdvance = vi.getTimerCount();
@@ -1030,7 +1039,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     await waitOnExecutionContext(connection.ctx);
     expect(await errorCode(connection)).toBe("08006");
     expect(await stats()).toHaveLength(0);
-    expect(logs.mock.calls).toHaveLength(1);
+    expect(edgeLogs()).toHaveLength(1);
   });
 
   it("closes a late gateway upgrade after admission cancellation", async () => {
@@ -2073,7 +2082,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const observations = await stats();
     expect(observations).toHaveLength(1);
     expect(observations[0]!.bytes).toHaveLength(0);
-    expect(logs.mock.calls).toHaveLength(1);
+    expect(edgeLogs()).toHaveLength(1);
   });
 
   it("bounds a pending gateway upgrade without sending bytes or reconnecting", async () => {
@@ -2091,7 +2100,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     await waitOnExecutionContext(connection.ctx);
     expect(await stats()).toHaveLength(1);
     expect((await stats())[0]!.bytes).toHaveLength(0);
-    expect(logs.mock.calls).toHaveLength(1);
+    expect(edgeLogs()).toHaveLength(1);
   });
 
   it("routes the global fetch fallback to a real test gateway Worker", async () => {
@@ -2127,8 +2136,8 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       .toBe(payload.length);
     connection.socket.close(3001, "test completion");
     await expect.poll(async () => (await stats())[0]?.closes).toEqual([3001]);
-    expect(logs.mock.calls).toHaveLength(1);
-    const log = JSON.parse(logs.mock.calls[0]![0] as string);
+    expect(edgeLogs()).toHaveLength(1);
+    const log = JSON.parse(edgeLogs()[0]![0] as string);
     expect(log.event).toBe("conn_admission");
     expect(log.database_id).toBe(database);
     expect(log.user).toBe("app");
