@@ -2916,13 +2916,22 @@ mod tests {
             host_calls(&machine).len() == 2
         })
         .await;
+        // The link says hello on a task of its own, while the restart fails on the agent's: the
+        // first agent is stopped only when Cloudflare has heard its hello. A link that is stopped
+        // in the middle of its upgrade says none, and the hello of the new agent would then be
+        // the first one, not the second.
+        eventually(30, "the hello of the first agent", || {
+            !said_host_files(&cloud).is_empty()
+        })
+        .await;
         // The agent restarts (any restart of it will do): the unit still runs the old definition,
         // and the hello of the new process does not say that the files are held.
         first.stop();
         drop(first);
+        let said = said_host_files(&cloud).len();
         let second = serve(&machine, &cloud, &base).await;
         eventually(30, "the hello of the new agent", || {
-            said_host_files(&cloud).len() >= 2
+            said_host_files(&cloud).len() > said
         })
         .await;
         assert!(!said_host_files(&cloud).contains(&wanted));
