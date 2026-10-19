@@ -31,10 +31,12 @@ import {
   type NodeKey,
   nodePublicKey,
   nodeRequestClaims,
+  nodeShellCaPublicKey,
   observationVerdict,
   signNodeRequest,
   verifyNodeRequest,
 } from "../src/node-link.ts";
+import { WAKE_STALE } from "../src/node-local.ts";
 
 async function keyPair() {
   return (await crypto.subtle.generateKey("Ed25519", true, [
@@ -918,6 +920,14 @@ describe("what a node reports", () => {
             outcome: "refused",
             reason: "no_room",
           },
+          ...WAKE_STALE.map((stale, index) => ({
+            ...wake,
+            id: eventId(String(index)),
+            outcome: "refused",
+            reason: "desired_stale",
+            stale,
+            phases_ms: { admission: 1 },
+          })),
           {
             ...admission,
             id: eventId("d"),
@@ -954,6 +964,10 @@ describe("what a node reports", () => {
       { ...admission, decision: "admitted", reason: undefined },
       { ...wake, outcome: "refused" },
       { ...wake, reason: "no_room" },
+      // Only a stale ticket says how it is stale.
+      { ...wake, stale: "route" },
+      { ...wake, outcome: "refused", reason: "no_room", stale: "route" },
+      { ...wake, outcome: "refused", reason: "desired_stale", stale: "clock" },
       { ...wake, outcome: "hit" },
       { ...wake, phases_ms: { boot: 1 } },
     ])
@@ -1238,6 +1252,43 @@ describe("credentials and the node's policy", () => {
       expect(
         NodeDesiredPage.safeParse({ ...page, credentials_revision }).success,
       ).toBe(false);
+  });
+
+  it("takes the operator shell's CA key as one ssh-ed25519 line and nothing else, and no key as no shell", () => {
+    const key =
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp";
+    expect(
+      NodeCredentials.safeParse({ ...credentials, shell_ca_public_key: key })
+        .success,
+    ).toBe(true);
+    expect(nodeShellCaPublicKey(key)).toBe(key);
+    for (const broken of [
+      undefined,
+      "",
+      `${key} comment`,
+      `${key}\n`,
+      `${key}\n${key}`,
+      ` ${key}`,
+      `cert-authority ${key}`,
+      `command="true" ${key}`,
+      key.replace("ssh-ed25519", "ssh-rsa"),
+      key.replace("ssh-ed25519", "sk-ssh-ed25519@openssh.com"),
+      key.slice(0, -1),
+      `${key}A`,
+      key.replace("AAAAC3NzaC1lZDI1NTE5", "AAAAB3NzaC1yc2EAAAADAQAB"),
+      // The 32-byte length of the key is 0x20: the character after it holds two bits that are zero
+      // and the top four bits of the key, so it is one of A to P and never a Q.
+      key.replace("AAAAIDNc", "AAAAIQNc"),
+    ]) {
+      expect(nodeShellCaPublicKey(broken)).toBeNull();
+      if (broken !== undefined)
+        expect(
+          NodeCredentials.safeParse({
+            ...credentials,
+            shell_ca_public_key: broken,
+          }).success,
+        ).toBe(false);
+    }
   });
 
   it("carries the memory of each backup job and the write limits of a 256 MiB database", () => {

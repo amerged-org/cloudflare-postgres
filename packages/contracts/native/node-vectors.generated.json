@@ -207,6 +207,171 @@
       }
     },
     {
+      "schema": "NodeCredentials",
+      "name": "shell-ca",
+      "valid": true,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-with-comment",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp operator@example.org"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-with-options",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "command=\"/bin/true\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-two-lines",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-trailing-newline",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp\n"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-leading-space",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": " ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-other-type",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-truncated",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8b"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-length-byte",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIQNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-empty",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": ""
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-null",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": null
+      }
+    },
+    {
       "schema": "ArchiveCredential",
       "name": "read-write",
       "valid": true,
@@ -9115,6 +9280,18 @@
             "reason": "no_room"
           },
           {
+            "type": "wake",
+            "id": "11111111-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "outcome": "refused",
+            "phases_ms": { "admission": 1 },
+            "reason": "desired_stale",
+            "stale": "route"
+          },
+          {
             "type": "admission",
             "id": "ffffffff-1111-4111-8111-111111111111",
             "at": "2026-10-17T12:00:00.000Z",
@@ -9286,6 +9463,107 @@
             "operation": "op_cccccccccccccccccccc",
             "outcome": "started",
             "phases_ms": { "boot": 1 }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeEventReport",
+      "name": "unknown-stale",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "events": [
+          {
+            "type": "wake",
+            "id": "bbbbbbbb-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "outcome": "refused",
+            "phases_ms": {
+              "admission": 9,
+              "volume_check": 1,
+              "repair_check": 1,
+              "mount": 1,
+              "pg_control": 2,
+              "config": 1,
+              "archive": 1,
+              "queue_wait": 1,
+              "start": 61,
+              "roles": 2,
+              "release": 3
+            },
+            "reason": "desired_stale",
+            "stale": "clock"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeEventReport",
+      "name": "stale-of-a-started-wake",
+      "valid": false,
+      "refinement": true,
+      "value": {
+        "events": [
+          {
+            "type": "wake",
+            "id": "bbbbbbbb-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "outcome": "started",
+            "phases_ms": {
+              "admission": 9,
+              "volume_check": 1,
+              "repair_check": 1,
+              "mount": 1,
+              "pg_control": 2,
+              "config": 1,
+              "archive": 1,
+              "queue_wait": 1,
+              "start": 61,
+              "roles": 2,
+              "release": 3
+            },
+            "stale": "route"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeEventReport",
+      "name": "stale-with-another-reason",
+      "valid": false,
+      "refinement": true,
+      "value": {
+        "events": [
+          {
+            "type": "wake",
+            "id": "bbbbbbbb-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "outcome": "refused",
+            "phases_ms": {
+              "admission": 9,
+              "volume_check": 1,
+              "repair_check": 1,
+              "mount": 1,
+              "pg_control": 2,
+              "config": 1,
+              "archive": 1,
+              "queue_wait": 1,
+              "start": 61,
+              "roles": 2,
+              "release": 3
+            },
+            "reason": "no_room",
+            "stale": "route"
           }
         ]
       }
@@ -10400,6 +10678,46 @@
         { "name": "linux-image-amd64", "version": "6.12.113-1" }
       ],
       "sha256": "462f968f28c0d5a21b9cc9e4eaa820b91bdf64ec67a812b5acad20336bdef3d7"
+    }
+  ],
+  "releases": [
+    {
+      "name": "distinct-digests",
+      "release": {
+        "id": "sha-0123456789ab",
+        "binaries": {
+          "pgcf-agent": {
+            "url": "https://releases.example/pgcf-agent",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "size_bytes": 11000000
+          },
+          "pgcf-native-gateway": {
+            "url": "https://releases.example/pgcf-native-gateway",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "size_bytes": 12000000
+          },
+          "pgcf-archive": {
+            "url": "https://releases.example/pgcf-archive",
+            "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "size_bytes": 5000000
+          },
+          "pgcf-wal-fetch": {
+            "url": "https://releases.example/pgcf-wal-fetch",
+            "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+            "size_bytes": 5100000
+          }
+        },
+        "os": {
+          "image_version": "sha-0123456789ab",
+          "debian_snapshot": "20261016T000000Z",
+          "package_lock": {
+            "url": "https://releases.example/packages.lock.json",
+            "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "size_bytes": 90000
+          }
+        }
+      },
+      "manifest": "pgcf-release-manifest/v1\nrelease=sha-0123456789ab\nbinary.pgcf-agent=1111111111111111111111111111111111111111111111111111111111111111:11000000\nbinary.pgcf-native-gateway=2222222222222222222222222222222222222222222222222222222222222222:12000000\nbinary.pgcf-archive=3333333333333333333333333333333333333333333333333333333333333333:5000000\nbinary.pgcf-wal-fetch=4444444444444444444444444444444444444444444444444444444444444444:5100000\nos.debian_snapshot=20261016T000000Z\nos.package_lock=5555555555555555555555555555555555555555555555555555555555555555:90000\n"
     }
   ]
 }

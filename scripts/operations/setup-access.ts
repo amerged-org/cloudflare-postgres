@@ -5,7 +5,8 @@
 //
 //   node scripts/operations/setup-access.ts [plan|apply] --account ID --domain DOMAIN --service-token NAME
 //        [--edge-worker NAME] [--rotate-service-token] [--grace 1h] [--refresh-service-token]
-//        [--shell --operator-email EMAIL ...] [--verify [--verify-hostname HOST]]
+//        [--shell --operator-email EMAIL ... [--shell-service-token NAME [--shell-token-file FILE]]]
+//        [--verify [--verify-hostname HOST]]
 //   node scripts/operations/setup-access.ts [plan|apply] --account ID --remove
 //
 //   plan (default)  prints what would change and writes nothing. apply writes.
@@ -32,7 +33,20 @@
 //                   shell is an Access self-hosted application, which is what the native client
 //                   (`cloudflared access ssh`) needs; the SSH application type is the browser-rendered
 //                   terminal, which is not what an operator at a shell uses.
-//   --remove        deletes both applications (their policies go with them). The token stays.
+//   --shell-service-token  also lets one service token, made for the shells alone, through the
+//                   shell application with a Service Auth policy of its own and a session of 15
+//                   minutes: it is what `node-shell.ts` presents, so an operator's shell needs no
+//                   login. It is a different token from the Edge's: the Edge's is never allowed
+//                   on the shells and this one never on the gateways. Without the flag the policy
+//                   is deleted again. The token lasts 720h.
+//   --shell-token-file  where the new shell token's client id and secret go, as two lines of an
+//                   environment file (PGCF_SHELL_ACCESS_CLIENT_ID and
+//                   PGCF_SHELL_ACCESS_CLIENT_SECRET), written with mode 0600 into an existing
+//                   directory that group and others cannot enter, and never over a file that is
+//                   there. Cloudflare shows the secret once, so a token is created only with this
+//                   flag, and a token that exists needs none: if its secret is lost, delete the
+//                   token in the dashboard and run again.
+//   --remove        deletes both applications (their policies go with them). The tokens stay.
 //   --verify        sends an unauthenticated GET to https://pgcf-node-probe.DOMAIN/ (or
 //                   --verify-hostname) and fails unless Cloudflare refuses it with 401 or 403. The
 //                   hostname must resolve: use a node's gateway hostname where the zone has no
@@ -46,6 +60,9 @@
 //   PGCF_CLOUDFLARE_API_TOKEN  an account API token with Access: Apps and Policies Write, Access:
 //                              Service Tokens Write, Access: Organizations, Identity Providers, and
 //                              Groups Read (for --shell) and Workers Scripts Write (for --edge-worker)
+import { constants } from "node:fs";
+import { lstat, open, rm, stat } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import {
   NODE_GATEWAY_LABEL_PREFIX,
@@ -56,14 +73,23 @@ export const GATEWAY_APPLICATION = "pgcf node gateways";
 export const SHELL_APPLICATION = "pgcf node shells";
 export const GATEWAY_POLICY = "edge service token";
 export const SHELL_POLICY = "operators";
+export const SHELL_TOKEN_POLICY = "shell service token";
+/** The names of the two lines `--shell-token-file` holds and `node-shell.ts` reads by default. */
+export const SHELL_TOKEN_VARIABLES = {
+  id: "PGCF_SHELL_ACCESS_CLIENT_ID",
+  secret: "PGCF_SHELL_ACCESS_CLIENT_SECRET",
+} as const;
 export const EDGE_SECRETS = {
   id: "ACCESS_CLIENT_ID",
   secret: "ACCESS_CLIENT_SECRET",
 } as const;
 const TOKEN_DURATION = "8760h";
 const EXPIRY_WARNING_DAYS = 30;
+const SHELL_TOKEN_DURATION = "720h";
 const GATEWAY_SESSION = "24h";
 const SHELL_SESSION = "1h";
+/** The session of the shell token's policy: as long as the certificate `node-shell.ts` signs. */
+const SHELL_TOKEN_SESSION = "15m";
 const API = "https://api.cloudflare.com/client/v4";
 
 export const gatewayPattern = (domain: string) =>
@@ -103,6 +129,9 @@ export type Options =
       graceSeconds: number;
       /** The operators of the shells; undefined leaves the shells alone. */
       operators: string[] | undefined;
+      /** The service token of the shells; undefined has none, and removes the policy of one. */
+      shellServiceToken: string | undefined;
+      shellTokenFile: string | undefined;
       verify: boolean;
       verifyHostname: string | undefined;
     };
@@ -128,7 +157,8 @@ const sameDuration = (a: unknown, b: string) => {
 
 const USAGE =
   "usage: setup-access.ts [plan|apply] --account ID --domain DOMAIN --service-token NAME [--edge-worker NAME] " +
-  "[--rotate-service-token] [--grace 1h] [--refresh-service-token] [--shell --operator-email EMAIL ...] [--verify [--verify-hostname HOST]]\n" +
+  "[--rotate-service-token] [--grace 1h] [--refresh-service-token] [--shell --operator-email EMAIL ... [--shell-service-token NAME [--shell-token-file FILE]]] " +
+  "[--verify [--verify-hostname HOST]]\n" +
   "       setup-access.ts [plan|apply] --account ID --remove";
 
 export function parseOptions(argv: string[]): Options {
@@ -145,6 +175,8 @@ export function parseOptions(argv: string[]): Options {
       grace: { type: "string" },
       shell: { type: "boolean", default: false },
       "operator-email": { type: "string", multiple: true },
+      "shell-service-token": { type: "string" },
+      "shell-token-file": { type: "string" },
       remove: { type: "boolean", default: false },
       verify: { type: "boolean", default: false },
       "verify-hostname": { type: "string" },
@@ -187,6 +219,18 @@ export function parseOptions(argv: string[]): Options {
   for (const email of emails)
     if (!EMAIL.test(email))
       throw new Error("--operator-email must be an email address");
+  const shellToken = values["shell-service-token"],
+    shellTokenFile = values["shell-token-file"];
+  if (shellToken !== undefined) {
+    if (!values.shell)
+      throw new Error("--shell-service-token needs --shell and its operators");
+    if (!shellToken || shellToken === values["service-token"])
+      throw new Error(
+        "--shell-service-token must name a token of its own, not the Edge's --service-token: one token on both applications would let the Edge onto the shells",
+      );
+  }
+  if (shellTokenFile !== undefined && shellToken === undefined)
+    throw new Error("--shell-token-file needs --shell-service-token");
   const verifyHostname = values["verify-hostname"];
   if (verifyHostname !== undefined) {
     if (!values.verify) throw new Error("--verify-hostname needs --verify");
@@ -207,6 +251,9 @@ export function parseOptions(argv: string[]): Options {
     refresh: values["refresh-service-token"],
     graceSeconds,
     operators: values.shell ? [...new Set(emails)].sort() : undefined,
+    shellServiceToken: shellToken,
+    shellTokenFile:
+      shellTokenFile === undefined ? undefined : resolve(shellTokenFile),
     verify: values.verify,
     verifyHostname,
   };
@@ -272,14 +319,18 @@ interface PolicySpec {
   decision: "non_identity" | "allow";
   include: Json[];
   require: Json[];
+  /** The policy's own session; without one the application's applies. */
+  session?: string;
 }
-const policyBody = (policy: PolicySpec) => ({
+/** An application's policies are numbered in the order of its spec: Cloudflare wants each number once. */
+const policyBody = (policy: PolicySpec, precedence: number) => ({
   name: policy.name,
   decision: policy.decision,
   include: policy.include,
   exclude: [],
   require: policy.require,
-  precedence: 1,
+  precedence,
+  ...(policy.session === undefined ? {} : { session_duration: policy.session }),
   approval_required: false,
   purpose_justification_required: false,
   isolation_required: false,
@@ -291,7 +342,8 @@ interface ApplicationSpec {
   session: string;
   /** A request that a Service Auth policy refuses gets 401, whatever the organization's default is. */
   serviceAuth401: boolean;
-  policy: PolicySpec;
+  /** Every policy the application has; any other is deleted. */
+  policies: PolicySpec[];
 }
 const applicationBody = (spec: ApplicationSpec) => ({
   name: spec.name,
@@ -355,9 +407,20 @@ function ruleSet(rules: unknown): string[] {
     })
     .sort();
 }
-function policyDrift(policy: Json, spec: PolicySpec): string[] {
+function policyDrift(
+  policy: Json,
+  spec: PolicySpec,
+  precedence: number,
+): string[] {
   const drift: string[] = [];
   if (policy.decision !== spec.decision) drift.push("decision");
+  if (typeof policy.precedence === "number" && policy.precedence !== precedence)
+    drift.push("precedence");
+  if (
+    spec.session !== undefined &&
+    !sameDuration(policy.session_duration, spec.session)
+  )
+    drift.push("session_duration");
   if (ruleSet(policy.include).join() !== ruleSet(spec.include).join())
     drift.push("include");
   if (ruleSet(policy.exclude).length > 0) drift.push("exclude");
@@ -379,6 +442,8 @@ export interface Dependencies {
   fetch: Fetch;
   log: (line: string) => void;
   now: () => Date;
+  /** Where the shell token's secret goes; the file writer below unless a test replaces it. */
+  writeSecret?: (path: string, content: string) => Promise<void>;
 }
 export interface Verification {
   ok: boolean;
@@ -494,7 +559,7 @@ export async function run(
     return { changes };
   }
 
-  // The shell's policy is read first: it can refuse a run, and nothing is written yet.
+  // The shell's policies are read first: they can refuse a run, and nothing is written yet.
   let operatorPolicy: PolicySpec | undefined;
   if (options.operators !== undefined) {
     const providers = await list(
@@ -514,18 +579,26 @@ export async function run(
       require: pin === undefined ? [] : [{ login_method: { id: pin.id } }],
     };
   }
+  // What can refuse the run is read before the first write: the shell token's too.
+  const shellToken =
+    options.shellServiceToken === undefined
+      ? undefined
+      : await readShellToken(context, options, deps);
   const tokenId = await ensureServiceToken(context, options, deps.now());
+  const shellTokenId = await shellToken?.();
   await ensureApplication(context, {
     name: GATEWAY_APPLICATION,
     domain: gatewayPattern(options.domain),
     session: GATEWAY_SESSION,
     serviceAuth401: true,
-    policy: {
-      name: GATEWAY_POLICY,
-      decision: "non_identity",
-      include: [{ service_token: { token_id: tokenId } }],
-      require: [],
-    },
+    policies: [
+      {
+        name: GATEWAY_POLICY,
+        decision: "non_identity",
+        include: [{ service_token: { token_id: tokenId } }],
+        require: [],
+      },
+    ],
   });
   if (operatorPolicy !== undefined)
     await ensureApplication(context, {
@@ -533,7 +606,20 @@ export async function run(
       domain: shellPattern(options.domain),
       session: SHELL_SESSION,
       serviceAuth401: false,
-      policy: operatorPolicy,
+      policies: [
+        operatorPolicy,
+        ...(shellTokenId === undefined
+          ? []
+          : [
+              {
+                name: SHELL_TOKEN_POLICY,
+                decision: "non_identity" as const,
+                include: [{ service_token: { token_id: shellTokenId } }],
+                require: [],
+                session: SHELL_TOKEN_SESSION,
+              },
+            ]),
+      ],
     });
   context.say(summary());
   if (!options.verify) return { changes };
@@ -711,7 +797,7 @@ async function ensureServiceToken(
   return id;
 }
 
-/** One application and its one policy. Anything else on the application is put back or deleted. */
+/** One application and its policies. Anything else on the application is put back or deleted. */
 async function ensureApplication(
   context: Context,
   spec: ApplicationSpec,
@@ -735,10 +821,10 @@ async function ensureApplication(
   // Read after the update, and never before the application exists (a plan has no id to read).
   const policies =
     id === undefined ? [] : await list(call, `${appsPath}/${id}/policies`);
-  const ours = policies.find((policy) => policy.name === spec.policy.name);
-  // Nothing else may stand beside it: another policy would be another way in.
+  const names = new Set(spec.policies.map((policy) => policy.name));
+  // Nothing else may stand beside them: another policy would be another way in.
   for (const policy of policies) {
-    if (policy === ours) continue;
+    if (names.has(text(policy.name) ?? "")) continue;
     if (policy.reusable === true)
       throw new Error(
         `the reusable policy "${String(policy.name)}" is attached to "${spec.name}"; detach it in the dashboard`,
@@ -747,23 +833,178 @@ async function ensureApplication(
       call("DELETE", `${appsPath}/${id}/policies/${String(policy.id)}`),
     );
   }
-  if (ours === undefined)
-    await act(`create the policy "${spec.policy.name}"`, () =>
-      call("POST", `${appsPath}/${id}/policies`, policyBody(spec.policy)),
-    );
-  else {
-    const drift = policyDrift(ours, spec.policy);
-    if (drift.length > 0)
-      await act(
-        `put the policy "${spec.policy.name}" back (${drift.join(", ")})`,
-        () =>
-          call(
-            "PUT",
-            `${appsPath}/${id}/policies/${String(ours.id)}`,
-            policyBody(spec.policy),
-          ),
+  for (const [index, wanted] of spec.policies.entries()) {
+    const precedence = index + 1;
+    const ours = policies.find((policy) => policy.name === wanted.name);
+    if (ours === undefined)
+      await act(`create the policy "${wanted.name}"`, () =>
+        call(
+          "POST",
+          `${appsPath}/${id}/policies`,
+          policyBody(wanted, precedence),
+        ),
       );
+    else {
+      const drift = policyDrift(ours, wanted, precedence);
+      if (drift.length > 0)
+        await act(
+          `put the policy "${wanted.name}" back (${drift.join(", ")})`,
+          () =>
+            call(
+              "PUT",
+              `${appsPath}/${id}/policies/${String(ours.id)}`,
+              policyBody(wanted, precedence),
+            ),
+        );
+    }
   }
+}
+
+// ---------- The shell's service token ----------
+
+/**
+ * Where a secret may be written: a path that is not there yet, in a directory that exists, that
+ * the caller owns and that group and others cannot enter.
+ */
+export async function checkSecretFileDestination(path: string): Promise<void> {
+  const directory = await stat(dirname(path)).catch(() => undefined);
+  if (directory === undefined || !directory.isDirectory())
+    throw new Error("--shell-token-file: its directory must exist");
+  if ((directory.mode & 0o077) !== 0)
+    throw new Error(
+      "--shell-token-file: its directory is open to group or others; use one only you can enter (chmod 700)",
+    );
+  if (process.getuid !== undefined && directory.uid !== process.getuid())
+    throw new Error("--shell-token-file: its directory is not yours");
+  if ((await lstat(path).catch(() => undefined)) !== undefined)
+    throw new Error(
+      "--shell-token-file: the file exists already; it is never overwritten",
+    );
+}
+
+/** The two lines of the shell token's file: an environment file, which holds no other text. */
+export function shellTokenFileContent(id: string, secret: string): string {
+  const plain = /^[A-Za-z0-9._-]{1,256}$/;
+  if (!plain.test(id) || !plain.test(secret))
+    throw new Error(
+      "Cloudflare answered with client credentials of a shape this script does not write",
+    );
+  return `${SHELL_TOKEN_VARIABLES.id}=${id}\n${SHELL_TOKEN_VARIABLES.secret}=${secret}\n`;
+}
+
+/** A new file with mode 0600 that never replaces one, closed before it returns. */
+export async function writeSecretFile(
+  path: string,
+  content: string,
+): Promise<void> {
+  const file = await open(
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+    0o600,
+  );
+  try {
+    await file.chmod(0o600);
+    await file.writeFile(content);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+}
+
+/**
+ * The service token of the shells, a token of its own: the Edge's is never allowed on the shells
+ * and this one never on the gateways. This reads what can refuse the run, and returns what writes:
+ * Cloudflare shows the secret once, so a missing token is made only when `--shell-token-file` says
+ * where the secret goes, and it is deleted again when the file cannot be written. A token that
+ * exists is used as it is, with its expiry shown; one that is disabled or has expired is refused.
+ * Nothing but the file ever holds the client id or the secret.
+ */
+async function readShellToken(
+  { call, accountPath, say, act, findByName }: Context,
+  options: Extract<Options, { remove: false }>,
+  deps: Dependencies,
+): Promise<() => Promise<string>> {
+  const name = options.shellServiceToken!;
+  const token = await findByName(
+    "service tokens",
+    `${accountPath}/access/service_tokens?name=${encodeURIComponent(name)}&per_page=1000`,
+    name,
+  );
+  if (token === undefined) {
+    const file = options.shellTokenFile;
+    if (file === undefined)
+      throw new Error(
+        `refusing to create the service token "${name}" without --shell-token-file: Cloudflare shows its secret once, and a secret nobody receives is worse than none`,
+      );
+    await checkSecretFileDestination(file);
+    return async () => {
+      say(`service token "${name}": missing`);
+      const id = await act(
+        `create it (duration ${SHELL_TOKEN_DURATION}) and write its client id and secret to ${file} (mode 0600)`,
+        async () => {
+          const made = await call(
+            "POST",
+            `${accountPath}/access/service_tokens`,
+            { name, duration: SHELL_TOKEN_DURATION },
+          );
+          const id = isObject(made) ? text(made.id) : undefined;
+          if (id === undefined)
+            throw new Error("Cloudflare answered without the service token");
+          try {
+            const clientId = isObject(made) ? text(made.client_id) : undefined;
+            const secret = isObject(made)
+              ? text(made.client_secret)
+              : undefined;
+            if (!clientId || !secret)
+              throw new Error(
+                "Cloudflare answered without the client credentials",
+              );
+            await (deps.writeSecret ?? writeSecretFile)(
+              file,
+              shellTokenFileContent(clientId, secret),
+            );
+          } catch (error) {
+            // A token whose secret nobody holds is deleted again, and so is a file that was begun.
+            const reason = error instanceof Error ? error.message : "failed";
+            await rm(file, { force: true }).catch(() => undefined);
+            const undone = await call(
+              "DELETE",
+              `${accountPath}/access/service_tokens/${id}`,
+            ).then(
+              () => "the token was deleted again",
+              () => `delete the service token "${name}" in the dashboard`,
+            );
+            throw new Error(
+              `the secret of the shell token could not be written (${reason}); ${undone}`,
+            );
+          }
+          say(
+            `  the client id and secret are in ${file}; load them with: set -a; . ${file}; set +a`,
+          );
+          return id;
+        },
+      );
+      return id ?? NEW_TOKEN;
+    };
+  }
+  const id = text(token.id);
+  if (id === undefined)
+    throw new Error("Cloudflare answered a service token without an id");
+  if (token.enabled === false)
+    throw new Error(
+      `the service token "${name}" is disabled; enable it in the dashboard, or delete it to have a new one made`,
+    );
+  const expires = text(token.expires_at);
+  if (expires !== undefined && Date.parse(expires) <= deps.now().getTime())
+    throw new Error(
+      `the service token "${name}" expired on ${expires}; delete it in the dashboard and run again with --shell-token-file to have a new one made`,
+    );
+  return async () => {
+    say(
+      `service token "${name}": exists${expires ? `, expires ${expires}` : ""}${options.shellTokenFile === undefined ? "" : "; its secret is not shown again, so --shell-token-file is not used"}`,
+    );
+    return id;
+  };
 }
 
 // ---------- The command ----------

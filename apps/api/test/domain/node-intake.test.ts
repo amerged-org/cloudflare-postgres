@@ -372,6 +372,46 @@ describe("the events of a node", () => {
     expect(await minutes(f.node)).toEqual([]);
   });
 
+  it("log how a refused wake's ticket is stale", async () => {
+    const f = await fixture(0);
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(String(line));
+    });
+    const wake = {
+      type: "wake",
+      id: crypto.randomUUID(),
+      at: new Date().toISOString(),
+      database: newDatabaseId(),
+      generation: 3,
+      operation: newOperationId(),
+      outcome: "refused",
+      reason: "desired_stale",
+      stale: "route",
+      phases_ms: {},
+    };
+    expect((await post(f, "/node/v1/events", { events: [wake] })).status).toBe(
+      200,
+    );
+    expect(
+      lines
+        .map((line) => JSON.parse(line))
+        .find((line) => line.event === "node_wake"),
+    ).toMatchObject({
+      outcome: "refused",
+      reason: "desired_stale",
+      stale: "route",
+    });
+    // A ticket that is not stale cannot say how it is.
+    expect(
+      (
+        await post(f, "/node/v1/events", {
+          events: [{ ...wake, id: crypto.randomUUID(), reason: "no_room" }],
+        })
+      ).status,
+    ).toBe(400);
+  });
+
   it("are refused when they are invalid or from the future", async () => {
     const f = await fixture();
     expect((await post(f, "/node/v1/events", { events: [] })).status).toBe(400);

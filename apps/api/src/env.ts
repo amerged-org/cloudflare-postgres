@@ -28,6 +28,13 @@ export type Env = Cloudflare.Env & {
    * ULTRA plan 8): without Access the hostname is reachable by anyone who can run cloudflared.
    */
   NODE_SHELL_HOSTNAME?: string;
+  /**
+   * The public key of the CA that signs the operator shell's user certificates: exactly one
+   * `ssh-ed25519 AAAA...` line, without comment or options. The operator holds the private key;
+   * the Worker never sees it. Nodes get this key only while NODE_SHELL_HOSTNAME is "true", and
+   * not at all when the line is not valid, so a mistake leaves the shell without a login.
+   */
+  NODE_SSH_USER_CA_PUBLIC_KEY?: string;
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
   DATABASE_ACTOR_LOCATION_HINT?: string;
   INFRASTRUCTURE_ALERT_WEBHOOK?: Fetcher;

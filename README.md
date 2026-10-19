@@ -2,18 +2,21 @@
 
 Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare account** and **your
 Contabo VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
-Each VPS is a self-contained Debian node: real, unmodified PostgreSQL runs as one sandboxed
-systemd service per database on its own thin LVM volume, next to one Rust node agent. There is
-no Kubernetes and no control server. That node runtime is being built per the ULTRA plan. The
-deployment is EU only, with the customer node **EU1**, a Contabo Cloud VPS with **6 vCPU and
-12 GB RAM**. Server loss is recovered from R2.
+Each VPS is a self-contained Debian node installed from one image: real, unmodified PostgreSQL
+runs as one sandboxed systemd service per database on its own thin LVM volume, next to one Rust
+node agent. There is no Kubernetes and no control server. The deployment is EU only, with the
+customer node **EU1**, a Contabo Cloud VPS with **6 vCPU and 12 GB RAM**, which Cloudflare
+installed from the node image. Server loss is recovered from R2.
 
 - Create, resize, suspend, restore and delete databases through a versioned API.
 - Connect through Cloudflare: PostgreSQL over WebSocket. The VPS expose no database port.
 - Databases sleep when idle and wake on the next connection.
 - Continuous backups to R2 with point-in-time recovery.
 - Usage and infrastructure-cost metrics per database. You put your own pricing on top.
-- Capacity placement and Contabo purchases are implemented and stay off until the operator enables them; node installation is being rebuilt as a pull installer ([plan 9.2](docs/architecture/cloudflare-convergence-and-serverless-plan.md#92-installing-a-node-on-contabo-no-relay-no-ssh)).
+- Cloudflare installs a node from the image through the Contabo rescue system, with no inbound port
+  and no SSH ([plan 9.2](docs/architecture/cloudflare-convergence-and-serverless-plan.md#92-installing-a-node-on-contabo-no-relay-no-ssh)).
+  Capacity placement and Contabo purchases are implemented; purchases stay off until the operator
+  enables them.
 
 Integrators keep their adapters and any tooling that moves their existing databases in their own
 repositories; the [integrator handover](docs/operations/integrator-handover.md) describes the API,
@@ -28,28 +31,34 @@ what is [not in v1](docs/architecture/cloudflare-convergence-and-serverless-plan
 The first integrator creates its new databases on PGCF once that path is complete. This README
 states what runs where; it does not repeat measurements.
 
-| Part                                             | State                                                                                                                    |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| API Worker, DatabaseActor, NodeActor, Workflows  | TypeScript on Cloudflare; the node link (NodeActor, `/node/v1`) is built in Stage 3 and not deployed; the rest remains TypeScript |
-| Edge Worker                                      | TypeScript (`apps/edge`) is deployed; the Rust/Wasm target (`apps/edge-rust`) is built by CI and not deployed            |
-| Gateway                                          | Rust (`apps/native-gateway`): beside the node agent, on its table and the databases' Unix sockets; not deployed          |
-| Node runtime                                     | Not running: the Kubernetes runtime was retired on 2026-10-17; the node agent and the node image are built in Stage 3    |
+| Part                                            | State                                                                                                                                       |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| API Worker, DatabaseActor, NodeActor, Workflows | TypeScript on Cloudflare, deployed; each node links to its NodeActor over `/node/v1`                                                        |
+| Edge Worker                                     | TypeScript (`apps/edge`) is deployed; the Rust/Wasm target (`apps/edge-rust`) is built and tested by CI and not deployed                     |
+| Gateway                                         | Rust (`apps/native-gateway`) on every node beside the agent, reached through the node's Tunnel behind Cloudflare Access; runs on EU1        |
+| Node runtime                                    | The Debian image, the Rust node agent, the PostgreSQL units and the thin LVM volumes ([node image](infra/node-image/README.md), [agent](apps/node-agent/README.md)); EU1 runs it |
+| Release signer                                  | TypeScript Worker (`apps/release-signer`): signs a release's manifest for CI, whose key is a Cloudflare secret; deployed, key provisioned 2026-10-19         |
 
-The actual-RAM expansion threshold and automatic-purchase switch are operator settings exposed
-through the authenticated management API. Expansion requires ten fresh aligned consecutive
-minutes from every eligible customer node, each retaining its own Node UID. Existing capacity
-remains eligible during rollout under hard RAM, CPU, storage and full PostgreSQL/Barman
-startup-peak guards; there is no 81% placement cutoff. Missing observations remain unknown. Fresh
-installations do not purchase automatically or send notifications, and this installation keeps
-purchases and autoscale off. An optional `max_nodes` limit can be removed with `null`; no fixed
-three-node ceiling is required. Monetary and lifetime order-count ceilings are optional under
-explicit operator authority.
+Placement follows the
+[ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#48-placement-in-cloudflare):
+a node takes new databases until its active RAM or its CPU load reaches 80 %, each measured as the
+highest 30-minute average of the last seven days, and among the nodes that qualify the fullest
+wins. A node whose thin pool placement has closed (data at 80 %, metadata at 50 % or the sold
+storage at four times its data) takes none. Each start is admitted by the node itself, from its own
+free RAM and pool. No lease expiry, stale sample or missing observation stops a running database:
+besides its own idle sleep and the node's early sleep, only explicit orders (suspend, delete, move,
+maintenance) do. A database that no node can host is accepted and waits as "Waiting for verified regional
+capacity". Missing observations remain unknown. A node is added only when no node fits and the
+operator has enabled it: purchases and autoscale are operator settings of the authenticated
+management API, fresh installations do not purchase automatically or send notifications, and this
+installation keeps purchases and autoscale off. An optional `max_nodes` limit can be removed with
+`null`; no fixed node ceiling is required. Monetary and lifetime order-count ceilings are optional
+under explicit operator authority.
 
 ## Architecture
 
-The diagram shows the target of the
-[ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#51-big-picture);
-the node side is built in Stage 3.
+The diagram shows the runtime of the
+[ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#51-big-picture).
 
 ```mermaid
 flowchart LR
@@ -69,7 +78,7 @@ flowchart LR
     R2[("R2<br/>backups, WAL and images")]
   end
 
-  subgraph Node["Contabo VPS: Debian node (target)"]
+  subgraph Node["Contabo VPS: Debian node"]
     CFD["cloudflared<br/>outbound Tunnel"]
     GW["Gateway<br/>local mode, loopback"]
     Agent["Node agent<br/>(Rust)"]
@@ -103,7 +112,7 @@ Connecting to a sleeping database follows the
 | API Worker            | Cloudflare | `/v1` API, D1 state, Durable Objects, Workflows, usage rollups                                              |
 | Edge Worker           | Cloudflare | Database endpoint: Actor admission, wake, signed route, native forwarding                                   |
 | Gateway + cloudflared | VPS        | Native Rust gateway: entry from Cloudflare; startup validation before PostgreSQL dial, stream counters      |
-| Node agent            | VPS        | Rust, built in Stage 3: admission, volumes, systemd units, backups and recovery; the only actor on the node |
+| Node agent            | VPS        | Rust: admission, volumes, systemd units, backups and recovery; the only actor on the node                   |
 
 The approved client endpoint is `GET /v2?database=<id>&user=<role>` on the single database hostname.
 Configure the Neon serverless driver's `Pool`/`Client` WebSocket mode with its default
@@ -114,18 +123,21 @@ database generation and admission route revision, the node and the invocation ID
 serves it (v6; a sleeping database gets the v5 wake ticket), sealed with a key derived for that
 node, and returns the unopened upstream WebSocket for native forwarding. Admission failures return a small failure-only
 `101` WebSocket carrying a PostgreSQL SQLSTATE error before any gateway upgrade or PostgreSQL dial.
-Dev uses a VPC HTTP service with native forwarding; VPC TCP raw streams were unsuitable, and a
-signed Tunnel route is the fallback.
+The Edge dials the gateway of the node that serves the database at that node's own Tunnel
+hostname, which Cloudflare Access guards: the Edge presents its service token, and a request
+without it is refused at Cloudflare. A region may name a service binding instead, which does not
+pass through Access. `POST /sql` serves the Neon driver's HTTP query mode on the same hostname.
 
 The gateway checks the actual PostgreSQL StartupMessage database and user against the signed
-route before opening PostgreSQL. It owns SSL/GSS preludes, CancelRequest, startup parsing and the
-startup deadline, negotiates verified TLS to PostgreSQL, and measures stream bytes and connection
-events. A client that pipelines its password in the message of its StartupMessage (the Neon
-driver's default) is asked for it with AuthenticationCleartextPassword over the encrypted
-WebSocket; the gateway then logs in to PostgreSQL with SCRAM-SHA-256 on the node, trusts
-PostgreSQL only after its server signature, and never logs or stores the password. Any other
-client, such as the CLI, authenticates with SCRAM end to end with PostgreSQL. Uncertain writes are
-never replayed.
+route before it dials PostgreSQL, which listens on a Unix socket only: it answers SSL and GSS
+requests with `N`, because the WebSocket is the encryption. It owns the preludes, CancelRequest,
+startup parsing and the startup deadline, checks that the socket's peer is the database's unit,
+and measures stream bytes and connection events. A client that pipelines its password in the
+message of its StartupMessage (the Neon driver's default) is asked for it with
+AuthenticationCleartextPassword over the encrypted WebSocket; the gateway then logs in to
+PostgreSQL with SCRAM-SHA-256 on the node, trusts PostgreSQL only after its server signature, and
+never logs or stores the password. Any other client, such as the CLI, authenticates with SCRAM end
+to end with PostgreSQL. Uncertain writes are never replayed.
 
 ### PostgreSQL tools
 
@@ -137,11 +149,12 @@ node packages/cli/dist/main.js connect --endpoint wss://db.example.com --databas
 
 Use the printed loopback port in psql or migration tools, with `host=127.0.0.1`, your database
 and user, and `sslmode=disable`. Enter the password in the PostgreSQL tool. The local hop is
-plaintext; the public hop uses verified WSS and the gateway verifies PostgreSQL TLS. The CLI
-adapts only the SASL mechanism offer to plain SCRAM for libpq compatibility; channel binding
-requiring direct PostgreSQL TLS is unsupported. It never retries SQL. Limits are 16 local
-connections, 1 MiB per WebSocket message and a bounded 10-second FIN grace (at most 20 seconds
-during upstream startup). The packaged CLI includes the first-party and bundled-library licenses.
+plaintext; the public hop uses verified WSS, and the gateway reaches PostgreSQL over a Unix socket
+on the node. The CLI adapts only the SASL mechanism offer to plain SCRAM for libpq compatibility;
+channel binding requiring direct PostgreSQL TLS is unsupported. It never retries SQL. Limits are 16
+local connections, 1 MiB per WebSocket message and a bounded 10-second FIN grace (at most 20
+seconds during upstream startup). The packaged CLI includes the first-party and bundled-library
+licenses.
 
 ## Self-hosting requirements
 
@@ -157,11 +170,12 @@ Public-release installation polish follows separately; see [not in v1](docs/arch
 The management API reference is generated at `/v1/openapi.json` from the shared contracts.
 Node operations are published at `/node/v1/openapi.json`. Each document contains only its
 interface and referenced schemas.
-Their `info.version` is the request-serving Worker's version ID; `info.x-worker-version` also
-includes its tag and timestamp. Configure the `CF_VERSION_METADATA` version metadata binding
-shown in the example Worker configuration. If it is missing, reference requests return an
-explicit internal error rather than a made-up version. Operator runbooks
-cover [installation](docs/operations/operator-installation.md), [recovery](docs/operations/recovery.md)
+Their `info.version` is the API contract version, which changes with the contract and not with a
+Worker release; `info.x-worker-version` holds the request-serving Worker's version ID, tag and
+timestamp. Configure the `CF_VERSION_METADATA` version metadata binding shown in the example
+Worker configuration. If it is missing, reference requests return an explicit internal error
+rather than a made-up version. Operator runbooks cover
+[installation](docs/operations/operator-installation.md), [recovery](docs/operations/recovery.md)
 and [credential changes](docs/operations/credentials.md).
 
 The small TypeScript management client uses these same request and response contracts:
@@ -187,14 +201,15 @@ Warnings are disabled by default. Use authenticated
 `PUT /v1/regions/{region_id}/capacity-policy` to set `ram_warning_threshold_ppm` to the desired
 parts-per-million RAM threshold (for example, `800000` means 80%). Set it to `null` to disable
 RAM warnings. A cap notice additionally requires both a finite `max_nodes` and
-`cap_warning_enabled: true`; set the flag to `false` to disable it. RAM warnings use the same
-fresh, complete ten-minute regional measurements as capacity decisions.
+`cap_warning_enabled: true`; set the flag to `false` to disable it. The regional RAM warning needs
+a complete regional RAM window of ten fresh one-minute samples from every node; no node reports
+one yet, so it stays unknown and never fires. The per-node warnings below do not depend on it.
 
 Per-node warnings use the same route and scale: `node_ram_warning_threshold_ppm`,
 `node_cpu_warning_threshold_ppm` and `node_storage_warning_threshold_ppm` each take an integer
 from `1` to `1000000` parts per million (`900000` means 90%). `null` disables a warning; omitting
 a field keeps its stored value. A warning fires when any single node reaches its threshold,
-including a control node closed to database placement:
+including a node closed to database placement:
 
 - RAM is the 30-minute average of the node's active RAM, (MemTotal - MemAvailable) / MemTotal,
   over its samples, and CPU the 30-minute average of its CPU load, busy time over all its cores;
@@ -208,17 +223,21 @@ while a listed node still exceeds; otherwise the crossing replaces the episode w
 The episode clears only after every listed node is fresh and below the threshold, or lost; a
 missing measurement keeps it.
 
-Fixed-rule alarms need no threshold and are evaluated for every region: a stale or lost node, a
-failing or stale daily infrastructure backup, a running database whose WAL archive is failing
+Fixed-rule alarms need no threshold and are evaluated for every region: a stale node, or a lost
+node that still has a database placed on it (`regional_node_stale`), a failing or stale daily
+infrastructure backup, a running database whose WAL archive is failing
 (`database_archive_failing`), an awake database with no completed base backup within 36 hours of
-awake time (`database_base_backup_stale`; hibernated databases are excluded), and a thin pool
-without room or without a sample (`thin_storage_blocked`), a node that keeps refusing wakes for awake
+awake time (`database_base_backup_stale`; sleeping databases are excluded), a thin pool without
+room or without a sample (`thin_storage_blocked`), a node that keeps refusing wakes for awake
 capacity (`regional_node_capacity_refusals`), a thin pool that placement has closed
-(`regional_node_pool_closed`: data at 80 %, metadata at 50 % or the logical cap) and a database volume at 80 % or 90 % of its space or
-inodes (`database_volume_warning`, `database_volume_critical`). Each
-minute-cron step runs in its own failure boundary, and the `CronWatchdog` Durable Object (binding
-`CRON_WATCHDOG`) judges the cron's heartbeat from its own alarm, independently of the cron trigger,
-raising `control_cron_stalled` and `control_cron_step_failing`. Every event carries a short runbook `action`; the
+(`regional_node_pool_closed`: data at 80 %, metadata at 50 % or the sold storage at four times its
+data), a database volume at 80 % or 90 % of its space or inodes (`database_volume_warning`,
+`database_volume_critical`), an enrollment token that was presented again or too late
+(`node_enrollment_refused`) and a node that rebooted without a maintenance order
+(`node_unexpected_reboot`). Each minute-cron step runs in its own failure boundary, and the
+`CronWatchdog` Durable Object (binding `CRON_WATCHDOG`) judges the cron's heartbeat from its own
+alarm, independently of the cron trigger, raising `control_cron_stalled` and
+`control_cron_step_failing`. Every event carries a short runbook `action`; the
 [alert runbook](docs/operations/infrastructure-backups.md#alert-kinds-and-runbook-actions)
 lists each kind's rule and action.
 
@@ -267,16 +286,22 @@ Unit tests do not replace the live acceptance recorded in the ULTRA plan.
   status and the go-live path.
 - [Integrator handover](docs/operations/integrator-handover.md): the model, lifecycle API, client
   behaviour, limits, metering and recovery for an integrator that creates databases on PGCF.
+- Operator runbooks in [docs/operations](docs/operations): [installation](docs/operations/operator-installation.md),
+  [recovery](docs/operations/recovery.md), [credential changes](docs/operations/credentials.md),
+  [infrastructure backups and alerts](docs/operations/infrastructure-backups.md) and the
+  [native external probe](docs/operations/native-external-probe.md), the independent TCP/25 check
+  that Cloudflare Workers cannot perform, including provenance verification and cleanup.
+- Builder notes: the [node image](infra/node-image/README.md) (build, release registration, units,
+  security), the [node agent](apps/node-agent/README.md), the
+  [gateway](apps/native-gateway/README.md) and the [archive clients](apps/pgcf-archive/README.md).
 - [Source-backed diagrams](docs/architecture/mermaider/README.md): declared Cloudflare resources,
-  CI dependencies and current core D1 tables.
+  CI dependencies, core D1 tables and the AddNode workflow.
 - [AGENTS.md](AGENTS.md): contributor and coding-agent brief.
 - [THIRD_PARTY.md](THIRD_PARTY.md): upstream components and licenses.
-- [infra/](infra/README.md): the pinned Rust, Edge build and CI toolchain lock.
-- [Native external probe](docs/operations/native-external-probe.md): the independent TCP/25 check
-  that Cloudflare Workers cannot perform, including provenance verification and cleanup.
+- [infra/](infra/README.md): the pinned Rust, Edge build and CI toolchain lock, and the node image.
 
 ## License
 
 Original code and documentation: [Apache License 2.0](LICENSE). Third-party components keep their
-own licenses. This is an independent project, not affiliated with Cloudflare, Contabo, Neon,
-Supabase or CloudNativePG.
+own licenses. This is an independent project, not affiliated with Cloudflare, Contabo, Neon or
+Supabase.

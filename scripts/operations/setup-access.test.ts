@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { newNodeId } from "../../packages/contracts/src/ids.ts";
@@ -14,6 +25,8 @@ import {
   GATEWAY_POLICY,
   SHELL_APPLICATION,
   SHELL_POLICY,
+  SHELL_TOKEN_POLICY,
+  SHELL_TOKEN_VARIABLES,
   cloudflareApiToken,
   durationSeconds,
   gatewayPattern,
@@ -892,4 +905,264 @@ test("--verify probes a hostname of the gateways' family after the run and repor
   const quiet = cloudflare();
   await go(quiet, argv("--edge-worker", WORKER));
   assert.ok(quiet.calls.every((call) => !call.path.includes("probe")));
+});
+
+// ---------- The shell's own service token ----------
+
+const SHELL_TOKEN = "pgcf-shell-token-test";
+const shellApp = (api: ReturnType<typeof cloudflare>) =>
+  api.state.apps.find((app) => app.name === SHELL_APPLICATION)!;
+const tokenNamed = (api: ReturnType<typeof cloudflare>, name: string) =>
+  api.state.tokens.find((token) => token.name === name)!;
+const OPERATOR = ["--operator-email", "ops@example.org"];
+/** A directory only its owner can enter, which the token file needs, removed after the test. */
+async function privateDirectory(t: {
+  after: (cleanup: () => Promise<void>) => void;
+}) {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-access-test-"));
+  await chmod(directory, 0o700);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  return directory;
+}
+const withShellToken = (file: string, ...extra: string[]) =>
+  argv(
+    "--edge-worker",
+    WORKER,
+    "--shell",
+    ...OPERATOR,
+    "--shell-service-token",
+    SHELL_TOKEN,
+    "--shell-token-file",
+    file,
+    ...extra,
+  );
+
+test("the shell token needs the shell, differs from the Edge's, and its file needs the token", () => {
+  assert.throws(
+    () => parseOptions(argv("--shell-service-token", SHELL_TOKEN)),
+    /needs --shell/,
+  );
+  assert.throws(
+    () =>
+      parseOptions(
+        argv("--shell", ...OPERATOR, "--shell-service-token", TOKEN_NAME),
+      ),
+    /token of its own/,
+  );
+  assert.throws(
+    () =>
+      parseOptions(argv("--shell", ...OPERATOR, "--shell-token-file", "x.env")),
+    /needs --shell-service-token/,
+  );
+  const options = parseOptions(
+    argv(
+      "--shell",
+      ...OPERATOR,
+      "--shell-service-token",
+      SHELL_TOKEN,
+      "--shell-token-file",
+      "token.env",
+    ),
+  );
+  assert.ok(!options.remove);
+  assert.equal(options.shellServiceToken, SHELL_TOKEN);
+  assert.ok(options.shellTokenFile?.startsWith("/"));
+});
+
+test("the shell token is a token of its own: the Edge's is never on the shells and this one never on the gateways", async (t) => {
+  const api = cloudflare();
+  const file = join(await privateDirectory(t), "shell-token.env");
+  const done = await go(api, withShellToken(file));
+  // The Edge token, the shell token, both applications, three policies.
+  assert.equal(done.changes, 7);
+  const edge = tokenNamed(api, TOKEN_NAME),
+    shellToken = tokenNamed(api, SHELL_TOKEN);
+  assert.notEqual(edge.id, shellToken.id);
+  assert.equal(shellToken.duration, "720h");
+  const gateway = policiesOf(api, gatewayApp(api));
+  assert.equal(gateway.length, 1);
+  assert.deepEqual(gateway[0]!.include, [
+    { service_token: { token_id: edge.id } },
+  ]);
+  const [operators, serviceAuth, ...others] = policiesOf(api, shellApp(api));
+  assert.deepEqual(others, []);
+  assert.equal(operators!.name, SHELL_POLICY);
+  assert.equal(operators!.decision, "allow");
+  assert.equal(operators!.precedence, 1);
+  assert.equal(serviceAuth!.name, SHELL_TOKEN_POLICY);
+  assert.equal(serviceAuth!.decision, "non_identity");
+  assert.deepEqual(serviceAuth!.include, [
+    { service_token: { token_id: shellToken.id } },
+  ]);
+  assert.deepEqual(serviceAuth!.require, []);
+  assert.deepEqual(serviceAuth!.exclude, []);
+  assert.equal(serviceAuth!.session_duration, "15m");
+  assert.equal(serviceAuth!.precedence, 2);
+  // Neither token is anywhere on the other family's application.
+  const text = (policies: Json[]) => JSON.stringify(policies);
+  assert.ok(!text(policiesOf(api, shellApp(api))).includes(String(edge.id)));
+  assert.ok(!text(gateway).includes(String(shellToken.id)));
+  assert.ok(!text(policiesOf(api, shellApp(api))).includes(String(edge.id)));
+  // The shell token's secret is in the file and nowhere else: not on the Edge Worker, not in a line.
+  const lines = (await readFile(file, "utf8")).split("\n");
+  assert.equal(lines.length, 3);
+  assert.ok(lines[0]!.startsWith(`${SHELL_TOKEN_VARIABLES.id}=`));
+  assert.ok(lines[1]!.startsWith(`${SHELL_TOKEN_VARIABLES.secret}=`));
+  assert.equal((await stat(file)).mode & 0o777, 0o600);
+  const [shellId, shellSecret] = [lines[0]!, lines[1]!].map((line) =>
+    line.slice(line.indexOf("=") + 1),
+  );
+  const held = api.state.secrets.get(WORKER)!;
+  assert.deepEqual(
+    [...held.keys()].sort(),
+    [EDGE_SECRETS.id, EDGE_SECRETS.secret].sort(),
+  );
+  assert.ok(
+    ![...held.values()].some(
+      (value) => value === shellId || value === shellSecret,
+    ),
+  );
+  assertNoSecrets(api, done.lines.join("\n"));
+  assert.ok(done.lines.some((line) => line.includes(file)));
+  // Idempotent, and the second run needs no file: the secret is shown once and is not asked for again.
+  const before = api.calls.length;
+  const again = await go(
+    api,
+    argv("--shell", ...OPERATOR, "--shell-service-token", SHELL_TOKEN),
+  );
+  assert.equal(again.changes, 0);
+  assert.deepEqual(
+    api.calls.slice(before).filter((call) => call.method !== "GET"),
+    [],
+  );
+  // Without the flag the policy of the token is deleted: the list of ways in is the whole list.
+  const without = await go(api, argv("--shell", ...OPERATOR));
+  assert.equal(without.changes, 1);
+  assert.deepEqual(
+    policiesOf(api, shellApp(api)).map((policy) => policy.name),
+    [SHELL_POLICY],
+  );
+  assert.equal(api.state.tokens.length, 2);
+});
+
+test("a hand edit of the shell token's policy is put back, its number and its session included", async (t) => {
+  const api = cloudflare();
+  const file = join(await privateDirectory(t), "shell-token.env");
+  await go(api, withShellToken(file));
+  const serviceAuth = policiesOf(api, shellApp(api))[1]!;
+  serviceAuth.session_duration = "24h";
+  serviceAuth.precedence = 7;
+  serviceAuth.include = [{ everyone: {} }];
+  const again = await go(
+    api,
+    argv("--shell", ...OPERATOR, "--shell-service-token", SHELL_TOKEN),
+  );
+  assert.equal(again.changes, 1);
+  const fixed = policiesOf(api, shellApp(api))[1]!;
+  assert.equal(fixed.session_duration, "15m");
+  assert.equal(fixed.precedence, 2);
+  assert.deepEqual(fixed.include, [
+    { service_token: { token_id: tokenNamed(api, SHELL_TOKEN).id } },
+  ]);
+});
+
+test("a shell token is made only where its secret goes, and what can refuse is read before the first write", async (t) => {
+  const directory = await privateDirectory(t);
+  const api = cloudflare();
+  const first = (file: string) => withShellToken(file);
+  // No file: refused before the Edge token is made as well.
+  await assert.rejects(
+    go(
+      api,
+      argv(
+        "--edge-worker",
+        WORKER,
+        "--shell",
+        ...OPERATOR,
+        "--shell-service-token",
+        SHELL_TOKEN,
+      ),
+    ),
+    /without --shell-token-file/,
+  );
+  // A file that is there, a directory that does not exist, and one that others can enter.
+  const present = join(directory, "present.env");
+  await writeFile(present, "keep");
+  await assert.rejects(go(api, first(present)), /exists already/);
+  assert.equal(await readFile(present, "utf8"), "keep");
+  await assert.rejects(
+    go(api, first(join(directory, "missing", "token.env"))),
+    /directory must exist/,
+  );
+  const open = join(directory, "open");
+  await mkdir(open, { mode: 0o755 });
+  await chmod(open, 0o755);
+  await assert.rejects(
+    go(api, first(join(open, "token.env"))),
+    /open to group or others/,
+  );
+  assert.deepEqual(api.writes(), []);
+  assert.deepEqual(api.state.tokens, []);
+  // A plan writes no file and makes no token, and says where the secret would go.
+  const planned = join(directory, "planned.env");
+  const plan = await go(api, ["plan", ...withShellToken(planned).slice(1)]);
+  assert.equal(plan.changes, 7);
+  assert.deepEqual(api.writes(), []);
+  await assert.rejects(readFile(planned), /ENOENT/);
+  assert.ok(plan.lines.some((line) => line.includes(planned)));
+});
+
+test("a shell token whose secret cannot be written is deleted again, and a disabled or expired one is refused", async (t) => {
+  const directory = await privateDirectory(t);
+  const api = cloudflare();
+  const file = join(directory, "shell-token.env");
+  const failing = await run(parseOptions(withShellToken(file)), {
+    token: API_TOKEN,
+    fetch: api.fetch,
+    log: () => undefined,
+    now: () => NOW,
+    writeSecret: async (path, content) => {
+      await writeFile(path, content.slice(0, 5));
+      throw new Error("disk full");
+    },
+  }).then(
+    () => assert.fail("it must fail"),
+    (error: Error) => error,
+  );
+  assert.match(
+    failing.message,
+    /could not be written \(disk full\).*deleted again/,
+  );
+  assertNoSecrets(api, failing.message);
+  assert.deepEqual(
+    api.state.tokens.map((token) => token.name),
+    [TOKEN_NAME],
+  );
+  await assert.rejects(readFile(file), /ENOENT/);
+  // The same run with a working writer goes through, the Edge token being there already.
+  await go(api, withShellToken(file));
+  const shellToken = tokenNamed(api, SHELL_TOKEN);
+  const args = argv(
+    "--shell",
+    ...OPERATOR,
+    "--shell-service-token",
+    SHELL_TOKEN,
+  );
+  shellToken.enabled = false;
+  await assert.rejects(go(api, args), /disabled/);
+  shellToken.enabled = true;
+  shellToken.expires_at = "2026-10-18T11:59:59Z";
+  await assert.rejects(go(api, args), /expired on 2026-10-18T11:59:59Z/);
+  shellToken.expires_at = "2027-10-18T12:00:00Z";
+  assert.equal((await go(api, args)).changes, 0);
+});
+
+test("--remove keeps both service tokens", async (t) => {
+  const api = cloudflare();
+  const file = join(await privateDirectory(t), "shell-token.env");
+  await go(api, withShellToken(file));
+  const removed = await go(api, ["apply", "--account", ACCOUNT, "--remove"]);
+  assert.equal(removed.changes, 2);
+  assert.deepEqual(api.state.apps, []);
+  assert.equal(api.state.tokens.length, 2);
 });

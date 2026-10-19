@@ -6,7 +6,11 @@ import type { z } from "zod";
 import * as link from "../src/node-link.ts";
 import * as local from "../src/node-local.ts";
 import { bytesToBase64url } from "../src/encoding.ts";
-import { FleetReleaseId, packagesSha256 } from "../src/releases.ts";
+import {
+  FleetReleaseId,
+  packagesSha256,
+  signedReleaseManifest,
+} from "../src/releases.ts";
 
 const id = `d${"b".repeat(19)}`,
   other = `e${"b".repeat(19)}`,
@@ -314,6 +318,17 @@ const usageRow = {
   connections: 3,
   connection_ms: 5000,
 };
+/** A key pair made for these vectors; its private half was deleted. */
+const shellCa =
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp";
+const credentials = {
+  revision: 3,
+  tunnel_token: "eyJ".padEnd(120, "A"),
+  route_keyring: {
+    active: "k1",
+    keys: { k1: bytesToBase64url(new Uint8Array(32).fill(9)) },
+  },
+};
 const archiveCredential = {
   id: credential.id,
   path: path(id, 1),
@@ -548,18 +563,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
   ],
   NodeCredentials: [
-    [
-      "credentials",
-      {
-        revision: 3,
-        tunnel_token: "eyJ".padEnd(120, "A"),
-        route_keyring: {
-          active: "k1",
-          keys: { k1: bytesToBase64url(new Uint8Array(32).fill(9)) },
-        },
-      },
-      true,
-    ],
+    ["credentials", credentials, true],
     [
       "no-revision",
       {
@@ -583,6 +587,25 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       },
       false,
     ],
+    ["shell-ca", { ...credentials, shell_ca_public_key: shellCa }, true],
+    ...(
+      [
+        ["shell-ca-with-comment", `${shellCa} operator@example.org`],
+        ["shell-ca-with-options", `command="/bin/true" ${shellCa}`],
+        ["shell-ca-two-lines", `${shellCa}\n${shellCa}`],
+        ["shell-ca-trailing-newline", `${shellCa}\n`],
+        ["shell-ca-leading-space", ` ${shellCa}`],
+        ["shell-ca-other-type", shellCa.replace("ssh-ed25519", "ssh-rsa")],
+        ["shell-ca-truncated", shellCa.slice(0, -1)],
+        ["shell-ca-length-byte", shellCa.replace("AAAAIDNc", "AAAAIQNc")],
+        ["shell-ca-empty", ""],
+      ] satisfies [string, string][]
+    ).map(([name, key]): Case => [
+      name,
+      { ...credentials, shell_ca_public_key: key },
+      false,
+    ]),
+    ["shell-ca-null", { ...credentials, shell_ca_public_key: null }, false],
   ],
   ArchiveCredential: [
     ["read-write", archiveCredential, true],
@@ -1286,6 +1309,14 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
             phases_ms: { admission: 1 },
           },
           {
+            ...wake,
+            id: eventId("1"),
+            outcome: "refused",
+            reason: "desired_stale",
+            stale: "route",
+            phases_ms: { admission: 1 },
+          },
+          {
             ...admission,
             id: eventId("f"),
             reason: "no_room",
@@ -1311,6 +1342,36 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     ["unknown-phase", { events: [{ ...wake, phases_ms: { boot: 1 } }] }, false],
+    [
+      "unknown-stale",
+      {
+        events: [
+          {
+            ...wake,
+            outcome: "refused",
+            reason: "desired_stale",
+            stale: "clock",
+          },
+        ],
+      },
+      false,
+    ],
+    [
+      "stale-of-a-started-wake",
+      { events: [{ ...wake, stale: "route" }] },
+      false,
+      true,
+    ],
+    [
+      "stale-with-another-reason",
+      {
+        events: [
+          { ...wake, outcome: "refused", reason: "no_room", stale: "route" },
+        ],
+      },
+      false,
+      true,
+    ],
     [
       "refused-without-reason",
       { events: [{ ...admission, reason: undefined }] },
@@ -1576,6 +1637,42 @@ export async function packageVectors() {
       dpkg: dpkg(["ii ", "linux-image-6.12.111+deb13-amd64", "6.12.111-1"]),
       packages: installed,
       sha256,
+    },
+  ];
+}
+
+/**
+ * A release as the page of a node names it and the text the release key signs for it
+ * (`signedReleaseManifest`), which the agent builds from the page alone. Every digest differs, so
+ * a manifest with two of them swapped is another one. It carries no signature and no key: the
+ * agent's tests make a throwaway key and sign the text.
+ */
+export function releaseVectors() {
+  const pin = (name: string, digit: string, size: number) => ({
+    url: `https://releases.example/${name}`,
+    sha256: digit.repeat(64),
+    size_bytes: size,
+  });
+  const release = {
+    id: "sha-0123456789ab",
+    binaries: {
+      "pgcf-agent": pin("pgcf-agent", "1", 11_000_000),
+      "pgcf-native-gateway": pin("pgcf-native-gateway", "2", 12_000_000),
+      "pgcf-archive": pin("pgcf-archive", "3", 5_000_000),
+      "pgcf-wal-fetch": pin("pgcf-wal-fetch", "4", 5_100_000),
+    },
+    os: {
+      image_version: "sha-0123456789ab",
+      debian_snapshot: "20261016T000000Z",
+      package_lock: pin("packages.lock.json", "5", 90_000),
+    },
+  };
+  link.NodeRelease.parse(release);
+  return [
+    {
+      name: "distinct-digests",
+      release,
+      manifest: signedReleaseManifest(release),
     },
   ];
 }

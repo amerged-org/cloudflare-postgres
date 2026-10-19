@@ -2,6 +2,7 @@
 import {
   FleetReleaseVersion,
   RELEASE_IMAGE_FILE,
+  RELEASE_SIGNATURE_FILE,
   ReleaseFileName,
   releaseObjectKey,
   type ReleaseFile,
@@ -107,14 +108,37 @@ async function registeredFile(
 }
 
 /**
- * A binary or the package lock. An agent reads these without a credential: they are open
- * artifacts, and the desired page, which it reads signed, pins each by size and sha256.
+ * The signature of a registered release, as its stored spec holds it (hex text). It is no object
+ * of the bucket: the registration states it and the API only keeps it. A node checks it against
+ * the key compiled into its agent before it installs anything of the release.
+ */
+async function releaseSignature(
+  c: ApiContext,
+  version: string,
+): Promise<Response> {
+  const id = FleetReleaseVersion.safeParse(version);
+  const row = id.success
+    ? await c.env.DB.prepare(
+        "SELECT json_extract(spec_json,'$.signature') signature FROM fleet_releases WHERE id=?",
+      )
+        .bind(id.data)
+        .first<{ signature: string | null }>()
+    : null;
+  if (row?.signature == null) throw notFound();
+  return c.text(row.signature, 200);
+}
+
+/**
+ * A binary, the package lock or the signature. An agent reads these without a credential: they
+ * are open artifacts, and the desired page, which it reads signed, pins each file by size and
+ * sha256; the signature proves itself.
  */
 export async function serveReleaseFile(
   c: ApiContext,
   version: string,
   name: string,
 ): Promise<Response> {
+  if (name === RELEASE_SIGNATURE_FILE) return releaseSignature(c, version);
   const file = await registeredFile(c, version, name);
   if (file === RELEASE_IMAGE_FILE) throw notFound();
   return deliver(c, version, file);

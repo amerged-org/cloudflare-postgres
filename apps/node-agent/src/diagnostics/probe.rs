@@ -417,7 +417,7 @@ mod tests {
     const ID: &str = "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81";
     const MATCHES: &str = "_SYSTEMD_UNIT=pgcf-agent.service _SYSTEMD_UNIT=pgcf-gateway.service \
         _SYSTEMD_UNIT=pgcf-cloudflared.service _SYSTEMD_UNIT=systemd-networkd.service \
-        + _PID=1 + _TRANSPORT=kernel";
+        _SYSTEMD_UNIT=ssh.service + _PID=1 + _TRANSPORT=kernel";
 
     fn request(probe: Probe, boot: i64, since_seconds: u64, lines: u64) -> Request {
         Request {

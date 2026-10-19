@@ -4,8 +4,8 @@ One Debian 13 ("trixie") disk image for every PGCF node: EU1, US1 and every late
 image release, so OS patches, PostgreSQL upgrades and agent releases are identical everywhere
 ([ULTRA plan](../../docs/architecture/cloudflare-convergence-and-serverless-plan.md) 5.4, 9.1,
 9.6). Nodes differ only in configuration that the installer and the agent write: network, hostname,
-enrollment seed, keys and credentials. These are the image's builder notes (plan Appendix C); the
-agent's own notes are in `apps/node-agent/README.md`.
+enrollment seed, keys and credentials. These are the image's builder notes; the agent's own notes
+are in [apps/node-agent/README.md](../../apps/node-agent/README.md).
 
 ## Pinned inputs
 
@@ -102,20 +102,27 @@ characters (CI uses `sha-<12 hex digits of the commit>`).
 Every push to `main` of this repository (not of a fork) whose `node-image` job passed keeps the
 release files for 7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`: `pgcf-node.raw.zst`,
 `pgcf-node.json`, `packages.lock.json`, the four binaries and a `SHA256SUMS` of these seven files.
-The uncompressed image (about 1.7 GB) is not part of it, and no credential is. The release is named
+The uncompressed image (about 1.7 GB) is not part of it, and no credential is. The job `sign-release`
+(which holds no key and runs only when `check` and `node-image` both passed: it has the signer Worker sign
+that release with the identity token of its run) keeps the signature as the artifact `pgcf-node-signature-<commit sha>-<run attempt>`, one file,
+`release.sig`: [release-signing.md](../../docs/operations/release-signing.md). The release is named
 `sha-<first 12 hex digits of the commit>`. The artifact belongs to the commit that built it, so the
-package lock comes from the artifact, not from the checkout. Only the `push` run carries it: a
-manually dispatched run of the same commit (the external probe, for one) uploads nothing, which is why
-the lookup below filters on `--event push`.
+package lock comes from the artifact, not from the checkout, and the registration runs from a checkout
+of exactly that commit: it checks the signature with the release key of its checkout
+(`apps/node-agent/release-signing.pub`), which must be the key the build's agent carries. Only the
+`push` run carries the artifacts: a manually dispatched run of the same commit (the external probe, for
+one) uploads nothing, which is why the lookup below filters on `--event push`.
 
 ```sh
 git fetch origin main && sha=$(git rev-parse origin/main)   # or any commit on main whose CI run passed
+git switch --detach "$sha"                                   # the registration needs this commit's release key
 run=$(gh run list --workflow ci.yml --branch main --event push --commit "$sha" --status success --json databaseId --jq '.[0].databaseId')
 # --pattern extracts each artifact into a directory named after it; a re-run adds one per attempt.
-gh run download "$run" --pattern "pgcf-node-release-$sha-*" --dir .local/node-release
+gh run download "$run" --pattern "pgcf-node-release-$sha-*" --pattern "pgcf-node-signature-$sha-*" --dir .local/node-release
 release=$(ls -d .local/node-release/pgcf-node-release-"$sha"-* | tail -n 1)
+signature=$(ls -d .local/node-release/pgcf-node-signature-"$sha"-* | tail -n 1)
 (cd "$release" && sha256sum --check SHA256SUMS)   # shasum -a 256 -c SHA256SUMS on macOS
-node scripts/operations/register-node-image.ts --image-dir "$release" --binaries "$release" --lock "$release/packages.lock.json"
+node scripts/operations/register-node-image.ts --image-dir "$release" --binaries "$release" --lock "$release/packages.lock.json" --signature "$signature/release.sig"
 ```
 
 The artifact expires after 7 days. Register within that time, or re-run all jobs of that CI run to
@@ -125,7 +132,10 @@ overwritten, so register one attempt and keep using it.
 ### Or build it locally
 
 When there is no artifact (it expired, or the release comes from a commit that is not on `main`),
-build the release yourself with the local Docker builder:
+build the release yourself with the local Docker builder. A local build is **not signed**: CI holds no
+key, the signer Worker holds it, and the Worker signs only for the job `sign-release` of a push to
+`main` (`.github/workflows/ci.yml`). The nodes refuse a release that is not signed, so the registration
+refuses it too: use this path for the lab and for `--dry-run`, and register only what CI built.
 
 ```sh
 # 1. The four binaries, built for linux/amd64 with the pinned Rust toolchain (CI does this too):
@@ -134,8 +144,8 @@ mkdir -p .local/node-image/binaries
 for binary in pgcf-agent pgcf-native-gateway pgcf-archive pgcf-wal-fetch; do install -m 0755 "target/release/$binary" .local/node-image/binaries/; done
 # 2. The image, with the local Docker builder (see Building above):
 node infra/node-image/node-image.ts build --binaries .local/node-image/binaries --release sha-0123456789ab
-# 3. Upload the six files and register the release:
-node scripts/operations/register-node-image.ts --image-dir .local/node-image/out --binaries .local/node-image/binaries
+# 3. Check the files (a registration needs the signature that only CI makes):
+node scripts/operations/register-node-image.ts --image-dir .local/node-image/out --binaries .local/node-image/binaries --dry-run
 ```
 
 Step 1 builds on Linux; on another host build in a linux/amd64 container with the same toolchain.
@@ -152,13 +162,19 @@ their values:
 | `PGCF_R2_ACCESS_KEY_ID`, `PGCF_R2_SECRET_ACCESS_KEY` | an R2 API token with object read and write on that bucket |
 | `PGCF_API_URL`, `PGCF_API_KEY` | the management API's origin and an administrator key |
 
-`--dry-run` reads the files, prints the manifest and stops before any network call.
+`--dry-run` reads the files, prints the manifest and stops before any network call; it reports whether
+the release is signed and whether its signature verifies, and refuses for neither.
+`--signature FILE` names the signature (default `<image-dir>/release.sig`), and `--release-key FILE`
+the public key it must verify with (default `apps/node-agent/release-signing.pub`, the key of the
+agents built from this checkout).
 
 What the script does, and what the API checks:
 
 - It refuses a build whose compressed image, package lock or any of the four binaries is not the
   one `pgcf-node.json` describes (so binaries rebuilt since the image was built are refused: build
   the image again), and a release name that is no version.
+- It reads the signature and checks it against the release key before it uploads a byte: a release
+  without a signature, or with one that does not verify, is refused, because every node would refuse it.
 - It uploads `pgcf-node.raw.zst`, `packages.lock.json` and the four binaries to
   `node-images/<version>/` with `x-amz-checksum-sha256`, so R2 itself verifies each digest. A file
   that is already there with the same content (size, md5 and the sha256 R2 reports for it) is
@@ -166,8 +182,10 @@ What the script does, and what the API checks:
   holds no sha256 for, because another tool stored it, is sent again with the checksum: the API
   refuses a file without it. One with another content stops the run, because a registered release
   is never overwritten.
-- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file. The API refuses
-  the registration unless the bucket holds every file at that size with that sha256, and it names
+- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file and the signature.
+  The API refuses a registration without a well-formed signature (64 bytes in hex; it holds no key,
+  so it stores and shows the signature and cannot check it). It refuses the registration
+  unless the bucket holds every file at that size with that sha256, and it names
   every URL of the stored, immutable spec itself, as `/node/v1/releases/<version>/<file>` on its
   own origin (`NODE_API_ORIGIN`). Nothing in the registration is a URL or a credential. The script
   prints the release id and spec sha256 of the answer, and fails if the stored spec is another
@@ -230,7 +248,7 @@ offers the previous kernel through the `.old` links. A one-shot boot of the prev
 | `pgcf-agent.service` | root | `pgcf-agent run`, `Type=notify`; a mount namespace of its own, `PrivateMounts=yes` (see [The agent unit](#the-agent-unit)); creates `/run/pgcf/agent` |
 | `pgcf-gateway.service` | `pgcf-gateway` | `pgcf-native-gateway` in local mode on loopback; starts once `/var/lib/pgcf/credentials/gateway.env` exists |
 | `pgcf-cloudflared.service` | `pgcf-cloudflared` | The Tunnel; starts once `/var/lib/pgcf/credentials/tunnel-token.cred` exists |
-| `ssh.service` | root | Loopback only, user certificates only (no CA ships, so no login until a CA key is written; nothing writes one yet); host keys are created at first boot |
+| `ssh.service` | root | Loopback only, user certificates only (no CA ships, so no login until the agent writes the operator's CA key, which it does only while the shell is on); host keys are created at first boot |
 
 A preset allowlist ([10-pgcf.preset](mkosi.extra/usr/lib/systemd/system-preset/10-pgcf.preset))
 enables exactly these plus networkd, timesyncd, getty and LVM monitoring. Everything else a package
@@ -397,6 +415,10 @@ before inside the namespace; the database units and the backup jobs mount their 
 both behind Cloudflare Access (`scripts/operations/setup-access.ts`, the operator installation
 runbook). The shell hostname, `pgcf-shell-<id>.<domain>`, is off until its Access application
 exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
+A change of that variable reaches a running node as a new credentials revision, so the node reads
+its credentials again within one pull and cloudflared keeps running: the Tunnel's ingress is
+remote configuration, and the agent restarts the gateway and cloudflared only when the Tunnel
+token or the route keyring changed.
 
 ## What the image expects from the agent
 
@@ -495,15 +517,34 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   gateway and cloudflared's metrics listen on loopback only; PostgreSQL listens on no address.
 - **Operator shell.** [10-pgcf.conf](mkosi.extra/etc/ssh/sshd_config.d/10-pgcf.conf) makes sshd take
   one thing: a user certificate for root, signed by the CA in `/etc/ssh/pgcf_user_ca.pub` and
-  carrying the principal `pgcf-break-glass` (`/etc/ssh/principals/root`). The image ships no CA key,
-  so no login is possible until a CA's public key is written there; the installer does not write
-  one yet (plan 11.2). There are no passwords, no `authorized_keys`, two tries, a 20 s grace time,
-  two sessions and no forwarding of any kind; the log level is `VERBOSE`, and per-source penalties
-  stay at their default. sshd refuses every public key when `RevokedKeys` names a missing file, so
-  the image ships an empty key revocation list (`/etc/ssh/pgcf_revoked.krl`, the header only;
-  `ssh-keygen -k -u -f` adds to it).
-  A client offers only the certificate's key (`IdentitiesOnly=yes`), because two tries end after
-  the key and its certificate.
+  carrying the principal `pgcf-break-glass` (`/etc/ssh/principals/root`). There are no passwords, no
+  `authorized_keys`, two tries, a 20 s grace time, two sessions and no forwarding of any kind; the
+  log level is `VERBOSE`, which puts the certificate's key id and the CA's fingerprint in the
+  journal (`ssh.service`, which the boot report and the `journal` probe read), and per-source
+  penalties stay at their default. `units.test.ts` pins these values and that no other drop-in,
+  principals file or key is in the image.
+
+  The image ships no CA key, so no login is possible until a CA's public key is in the file. The
+  operator holds the CA (an Ed25519 key pair whose private half is on no Worker and in no
+  repository); its public key is the API Worker's variable `NODE_SSH_USER_CA_PUBLIC_KEY`, and the
+  node's credentials carry it (`shell_ca_public_key`) only while `NODE_SHELL_HOSTNAME` is `"true"`
+  and the variable is exactly one valid `ssh-ed25519` line. On every read of its credentials the
+  agent makes the file match: it writes it atomically (a temporary file in `/etc/ssh`, mode 0644,
+  owned by the agent's user, root, fsynced and renamed, with the directory fsynced) when the key is
+  there and differs, and removes it when the field is absent, and it logs `shell_ca_written` or
+  `shell_ca_removed`, never the key. It does this before it touches the gateway's credentials, so a
+  shell that was turned off is closed whatever else fails, and a failure to write the file is
+  retried with the next page. sshd needs no reload: it opens `TrustedUserCAKeys` for every
+  certificate it checks and `sshd -t` does not need the file, so the file appearing makes the next
+  login possible and its removal makes the next one fail (the boot test proves both without a
+  reload). The operator's side is `scripts/operations/node-shell.ts`: a throwaway key signed for 15
+  minutes, through `cloudflared access ssh` (docs/operations/operator-installation.md, "Using the
+  shell").
+
+  sshd refuses every public key when `RevokedKeys` names a missing file, so the image ships an empty
+  key revocation list (`/etc/ssh/pgcf_revoked.krl`, the header only; `ssh-keygen -k -u -f` adds to
+  it). A client offers only the certificate's key (`IdentitiesOnly=yes`), because two tries end
+  after the key and its certificate.
 - **No ssh socket.** With sshd installed, systemd 257's `systemd-ssh-generator` binds it to the Unix
   socket `/run/ssh-unix-local/socket` (mode 0666, which a database's user reaches, because its unit
   allows `AF_UNIX`) and to vsock. The image masks the generator (a link to `/dev/null` in
@@ -517,7 +558,7 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   1 GiB, at least 2 GiB free and 14 days on the 8 GiB root, and syncs to disk every 15 s instead of
   every five minutes, so that the minutes before a freeze are in the journal after the reboot.
   After every reboot the agent posts the last 1,000 lines of the previous boot from `pgcf-agent`,
-  `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, PID 1 and the kernel (`journalctl
+  `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, `ssh`, PID 1 and the kernel (`journalctl
   --boot=-1`, never the units of the databases or of the backup jobs, and an event line of the agent
   only as far as the observation report carries it), which the API keeps for 30 days, one report
   per boot, and an administrator reads at `GET /v1/nodes/{id}/diagnostics`. On request
@@ -574,9 +615,9 @@ database.
 The API side renders the userData from the registered release and serves the image and the progress route (`POST` of
 `{"checkpoint", "detail"}` with the Bearer token). It refuses the token once `rebooting` or `failed`
 has arrived, so a second run in rescue, for example after a reboot that leads back into rescue,
-stops at `started` before it touches the disk. Stage 1 left rescue through the API's
-`actions/restart`; whether the script's own reboot leaves rescue is recorded at the first install
-(Stage 4). If enrollment does not follow `rebooting`, AddNode restarts the instance through the API.
+stops at `started` before it touches the disk. If enrollment does not follow `rebooting`, AddNode
+restarts the instance through the API. EU1's live install enrolled the node 28.0 s after the
+`rebooting` checkpoint (plan 11.1).
 
 ## Boot test
 

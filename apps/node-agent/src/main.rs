@@ -27,6 +27,7 @@ mod linux {
         service::{Intervals, Service, ServiceConfig, gateway_owner},
         storage,
         timing::emit_event,
+        update,
     };
     use serde_json::json;
     use std::{sync::Arc, time::Duration};
@@ -73,6 +74,7 @@ mod linux {
                 intervals: Intervals::default(),
                 timing: Timing::default(),
                 gateway: Some(gateway),
+                release_key: update::RELEASE_KEY,
             },
         )
         .await

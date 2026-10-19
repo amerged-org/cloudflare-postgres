@@ -413,7 +413,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   ),
   "GET /node/v1/credentials": route(
     "getNodeCredentials",
-    "Read the node's route keyring and the token of its Tunnel",
+    "Read the node's route keyring, the token of its Tunnel and, while the operator shell is on, its CA public key",
     "node",
   ),
   "GET /node/v1/archive-credentials/{id}": route(

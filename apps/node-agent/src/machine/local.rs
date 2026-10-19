@@ -69,6 +69,12 @@ struct State {
     start_delay: Option<Duration>,
     /// LVM, or systemd, cannot be read: what they hold is not known.
     volumes_unreadable: bool,
+    /// The next this many questions of `has_volume`, or of `unit`, fail as an unreadable LVM or
+    /// systemd does, and the questions asked: what a reconciliation that retries costs.
+    volume_reads_fail: u32,
+    unit_reads_fail: u32,
+    volume_reads: u64,
+    unit_reads: u64,
     /// Every volume must be repaired before its database starts again.
     needs_repair: bool,
     units_unreadable: bool,
@@ -249,6 +255,19 @@ impl Local {
     pub fn set_units_unreadable(&self, unreadable: bool) {
         self.state().units_unreadable = unreadable;
     }
+    /// LVM cannot be read for the next `count` questions, and can be after them.
+    pub fn fail_next_volume_reads(&self, count: u32) {
+        self.state().volume_reads_fail = count;
+    }
+    /// systemd cannot be read for the next `count` questions, and can be after them.
+    pub fn fail_next_unit_reads(&self, count: u32) {
+        self.state().unit_reads_fail = count;
+    }
+    /// How often `has_volume` was asked, and how often `unit` was.
+    pub fn reads(&self) -> (u64, u64) {
+        let state = self.state();
+        (state.volume_reads, state.unit_reads)
+    }
     /// A unit that exists and is stopped, as one is after a stop or a boot.
     pub fn add_stopped_unit(&self, database: &str) {
         self.state().units.insert(
@@ -366,8 +385,10 @@ impl Machine for Local {
         Ok(())
     }
     async fn has_volume(&self, id: &VolumeId) -> Result<bool, storage::Error> {
-        let state = self.state();
-        if state.volumes_unreadable {
+        let mut state = self.state();
+        state.volume_reads += 1;
+        if state.volumes_unreadable || state.volume_reads_fail > 0 {
+            state.volume_reads_fail = state.volume_reads_fail.saturating_sub(1);
             return Err(storage::Error::Unexpected("lvs"));
         }
         Ok(state.volumes.contains_key(id))
@@ -600,7 +621,9 @@ impl Machine for Local {
 
     async fn unit(&self, database: &str) -> Result<UnitState, units::Error> {
         let mut state = self.state();
-        if state.units_unreadable {
+        state.unit_reads += 1;
+        if state.units_unreadable || state.unit_reads_fail > 0 {
+            state.unit_reads_fail = state.unit_reads_fail.saturating_sub(1);
             return Err(units::Error::NotReady("bus"));
         }
         let memory_max = state.limits.get(database).and_then(|limits| {

@@ -7,7 +7,9 @@ import {
 } from "@pgcf/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
+import type { Env } from "../../src/env.ts";
 import { fenceOperation } from "../../src/domain/node-desired.ts";
+import { shellCredentialsRevision } from "../../src/domain/node-shell.ts";
 import {
   assignRelease,
   cleanupFixtures,
@@ -23,6 +25,10 @@ import {
 } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
+
+/** A key pair made for these tests; its private half was deleted. */
+const SHELL_CA =
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp";
 
 type F = Awaited<ReturnType<typeof fixture>>;
 async function pull(f: F, query = "") {
@@ -66,6 +72,100 @@ describe("the desired page of a node", () => {
       databases: [],
       next: null,
     });
+  });
+
+  it("raises the credentials revision once for every change of the operator shell's state, which is how a running node learns it", async () => {
+    const f = await fixture();
+    await setNodePolicy(f);
+    const other = SHELL_CA.replace("AAAAIDNc", "AAAAIDNd");
+    const revision = async (bindings: Partial<Env>) => {
+      const response = await nodeRequest(f, "/node/v1/desired", { bindings });
+      expect(response.status).toBe(200);
+      return NodeDesiredPage.parse(await response.json()).credentials_revision;
+    };
+    const on = { NODE_SHELL_HOSTNAME: "true" };
+    // Off is what a node starts with: no change, no new revision.
+    expect(await revision({})).toBe(1);
+    expect(await revision({ NODE_SSH_USER_CA_PUBLIC_KEY: SHELL_CA })).toBe(1);
+    // On with a key, then the same again: one new revision.
+    const key = { ...on, NODE_SSH_USER_CA_PUBLIC_KEY: SHELL_CA };
+    expect(await revision(key)).toBe(2);
+    expect(await revision(key)).toBe(2);
+    // Another key, one that is not valid (the hostname stays, the key goes), and off again.
+    expect(await revision({ ...on, NODE_SSH_USER_CA_PUBLIC_KEY: other })).toBe(
+      3,
+    );
+    expect(
+      await revision({ ...on, NODE_SSH_USER_CA_PUBLIC_KEY: `${other} x` }),
+    ).toBe(4);
+    expect(await revision({ ...on })).toBe(4);
+    expect(await revision({})).toBe(5);
+    expect(await revision({})).toBe(5);
+    expect(
+      await env.DB.prepare(
+        "SELECT credentials_revision r FROM nodes WHERE id=?",
+      )
+        .bind(f.node)
+        .first<number>("r"),
+    ).toBe(5);
+  });
+
+  it("names the revision at which D1 holds its own state even when the row moved since the node was read", async () => {
+    const f = await fixture();
+    await setNodePolicy(f);
+    const row = {
+      id: f.node,
+      uid: "",
+      credentials_revision: 1,
+      shell_state: "off",
+    };
+    row.uid = (await env.DB.prepare("SELECT node_uid u FROM nodes WHERE id=?")
+      .bind(f.node)
+      .first<string>("u"))!;
+    const other = SHELL_CA.replace("AAAAIDNc", "AAAAIDNd");
+    // Another Worker version wrote its state, a key this one does not have, after this one read.
+    await env.DB.prepare(
+      "UPDATE nodes SET credentials_revision=2,shell_state=? WHERE id=?",
+    )
+      .bind(`on ${other}`, f.node)
+      .run();
+    const mine: Env = {
+      ...env,
+      NODE_SHELL_HOSTNAME: "true",
+      NODE_SSH_USER_CA_PUBLIC_KEY: SHELL_CA,
+    };
+    // The revision 2 names the other key: this version's key needs a revision of its own.
+    expect(await shellCredentialsRevision(mine, row)).toBe(3);
+    const held = () =>
+      env.DB.prepare(
+        "SELECT credentials_revision r,shell_state s FROM nodes WHERE id=?",
+      )
+        .bind(f.node)
+        .first<{ r: number; s: string }>();
+    expect(await held()).toEqual({ r: 3, s: `on ${SHELL_CA}` });
+    // A read that finds D1 already holding its state takes that revision and raises nothing.
+    expect(await shellCredentialsRevision(mine, row)).toBe(3);
+    expect(await held()).toEqual({ r: 3, s: `on ${SHELL_CA}` });
+  });
+
+  it("leaves the credentials revision of a fenced node alone", async () => {
+    const f = await fixture();
+    await setNodePolicy(f);
+    await env.DB.prepare(
+      "UPDATE nodes SET lost_at=?,lost_reason='test' WHERE id=?",
+    )
+      .bind(new Date().toISOString(), f.node)
+      .run();
+    const response = await nodeRequest(f, "/node/v1/desired", {
+      bindings: {
+        NODE_SHELL_HOSTNAME: "true",
+        NODE_SSH_USER_CA_PUBLIC_KEY: SHELL_CA,
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(
+      NodeDesiredPage.parse(await response.json()).credentials_revision,
+    ).toBe(1);
   });
 
   it("names a database with the credential it issues, its class resources, roles and archive", async () => {

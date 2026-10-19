@@ -23,6 +23,9 @@ pub struct Layout {
     pub archive_command: String,
     /// The `restore_command` client of the image (plan 7.8).
     pub fetch_command: String,
+    /// The file of the CA public key that sshd trusts for the operator shell (plan 8): it exists
+    /// only while Cloudflare's credentials carry the key, and sshd refuses every login without it.
+    pub ssh_user_ca: PathBuf,
 }
 
 impl Default for Layout {
@@ -36,6 +39,7 @@ impl Default for Layout {
             systemd_executor: PathBuf::from("/usr/lib/systemd/systemd-executor"),
             archive_command: "/usr/libexec/pgcf/pgcf-archive".into(),
             fetch_command: crate::archive::recovery::WAL_FETCH_COMMAND.into(),
+            ssh_user_ca: PathBuf::from("/etc/ssh/pgcf_user_ca.pub"),
         }
     }
 }

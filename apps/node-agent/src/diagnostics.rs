@@ -8,8 +8,9 @@ pub mod boot_report;
 pub mod probe;
 
 /// The class of `error` as a short snake-case code: its kind (`postgres_28p01`, `http_connect`,
-/// `io_connection_refused`, `deadline_exceeded`), or a fixed phrase the agent wrote itself
-/// (`cluster_uid_changed`), or `other`.
+/// `io_connection_refused`, `io_too_many_open_files`, `deadline_exceeded`), the program that
+/// failed and how (`lvs_exit_5`), the bus's own error name (`bus_limits_exceeded`), or a fixed
+/// phrase the agent wrote itself (`cluster_uid_changed`), or `other`.
 pub fn error_code(error: &Error) -> String {
     if error
         .downcast_ref::<tokio::time::error::Elapsed>()
@@ -24,7 +25,13 @@ pub fn error_code(error: &Error) -> String {
         return http_code(error).into();
     }
     if let Some(error) = error.downcast_ref::<std::io::Error>() {
-        return format!("io_{}", snake(&format!("{:?}", error.kind())));
+        return io_code(error);
+    }
+    if let Some(error) = error.downcast_ref::<crate::storage::Error>() {
+        return storage_code(error);
+    }
+    if let Some(error) = error.downcast_ref::<crate::units::Error>() {
+        return units_code(error);
     }
     if let Some(error) = error.downcast_ref::<serde_json::Error>() {
         return match error.classify() {
@@ -36,6 +43,75 @@ pub fn error_code(error: &Error) -> String {
         .into();
     }
     phrase(&error.to_string()).unwrap_or_else(|| "other".into())
+}
+
+/// An I/O failure by its kind: running out of descriptors (`EMFILE`) is `too_many_open_files`.
+fn io_code(error: &std::io::Error) -> String {
+    format!("io_{}", snake(&format!("{:?}", error.kind())))
+}
+
+/// A storage failure: the I/O error, the program that ended with a failure and its exit code (what
+/// it wrote is not kept), or the kind of failure. A program is named as its executable's name.
+fn storage_code(error: &crate::storage::Error) -> String {
+    use crate::storage::Error;
+    match error {
+        Error::Io(error) => io_code(error),
+        Error::Command { program, code, .. } => {
+            let program: String = program
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .take(16)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            match u32::try_from(*code) {
+                Ok(code) => format!("{program}_exit_{code}"),
+                // No exit code: a signal ended it.
+                Err(_) => format!("{program}_signalled"),
+            }
+        }
+        other => format!("storage_{}", variant(other)),
+    }
+}
+
+/// A call on a unit that failed: the bus's error name where it answered with one, the result of a
+/// job, why PostgreSQL was not ready, or the kind of failure.
+fn units_code(error: &crate::units::Error) -> String {
+    use crate::units::Error;
+    match error {
+        Error::Bus(zbus::Error::MethodError(name, ..)) => {
+            format!(
+                "bus_{}",
+                snake(name.as_str().rsplit('.').next().unwrap_or_default())
+            )
+        }
+        Error::Job { result, .. } => format!("job_{}", slug(result)),
+        Error::NotReady(reason) => format!("not_ready_{}", slug(reason)),
+        other => format!("units_{}", variant(other)),
+    }
+}
+
+/// The variant of a derived `Debug`, as snake case: `NeedsRepair` is `needs_repair`.
+fn variant(error: &impl std::fmt::Debug) -> String {
+    let text = format!("{error:?}");
+    snake(
+        text.split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .unwrap_or_default(),
+    )
+}
+
+/// Lower-case letters and digits, any other character an underscore.
+fn slug(text: &str) -> String {
+    text.chars()
+        .take(24)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// A database error's SQLSTATE (five characters, never free text), or where a connection failed.
@@ -148,6 +224,84 @@ mod tests {
             code(serde_json::from_str::<u8>("\"x\"").unwrap_err()),
             "json_data"
         );
+    }
+
+    #[test]
+    fn storage_and_unit_failures_are_named_by_what_failed_never_by_their_text() {
+        use crate::{storage, units};
+        let refused = |name: &str| {
+            let call = zbus::message::Message::method_call("/org/pgcf/probe", "Ping")
+                .unwrap()
+                .build(&())
+                .unwrap();
+            let reply = zbus::message::Message::error(&call.header(), name.to_string())
+                .unwrap()
+                .build(&())
+                .unwrap();
+            zbus::Error::MethodError(name.try_into().unwrap(), None, reply)
+        };
+        let named = [
+            // A process out of descriptors, as 245 databases read at once may leave it.
+            (
+                code(storage::Error::Io(std::io::Error::from_raw_os_error(
+                    libc::EMFILE,
+                ))),
+                "io_too_many_open_files",
+            ),
+            (
+                code(storage::Error::Io(std::io::Error::other("10.0.0.7"))),
+                "io_other",
+            ),
+            // The program and how it ended, never its words: lvm2 says which lock it waits for.
+            (
+                code(storage::Error::Command {
+                    program: "lvs".into(),
+                    code: 5,
+                    stderr: "Unable to acquire lock on /run/lock/lvm/V_pgcf 10.0.0.7".into(),
+                }),
+                "lvs_exit_5",
+            ),
+            (
+                code(storage::Error::Command {
+                    program: "lvs".into(),
+                    code: -1,
+                    stderr: String::new(),
+                }),
+                "lvs_signalled",
+            ),
+            (
+                code(storage::Error::Unexpected("lvs")),
+                "storage_unexpected",
+            ),
+            (code(storage::Error::NeedsRepair), "storage_needs_repair"),
+            // The bus's own error name is the class of a refused call: the limit on pending replies
+            // is another failure than a unit that is not there.
+            (
+                code(units::Error::Bus(refused(
+                    "org.freedesktop.DBus.Error.LimitsExceeded",
+                ))),
+                "bus_limits_exceeded",
+            ),
+            (
+                code(units::Error::Job {
+                    unit: "pgcf-pg@db.service".into(),
+                    result: "timeout".into(),
+                }),
+                "job_timeout",
+            ),
+            (
+                code(units::Error::NotReady("unit_not_active")),
+                "not_ready_unit_not_active",
+            ),
+            (
+                code(units::Error::InvalidDatabase),
+                "units_invalid_database",
+            ),
+        ];
+        for (class, wanted) in named {
+            assert_eq!(class, wanted);
+            assert!(clean(&class), "{class}");
+        }
     }
 
     #[tokio::test]

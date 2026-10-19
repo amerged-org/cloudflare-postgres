@@ -32,8 +32,9 @@ runtime and delivery stages. No live acceptance gate is closed by these diagrams
 
 The AddNode diagram is an overview of `AddNode.run` and its referenced helpers,
 not a mechanically inferred state machine. It includes the asynchronous wait
-cycle and the uncertain provider readback, and it ends where the node installer
-of Stage 3 takes over. Helper bodies and the orchestrator are bound by declaration
+cycle, the uncertain provider readback and the install of the node (firewall
+check, pull installer and the wait for the node's enrollment). Helper bodies and
+the orchestrator are bound by declaration
 hashes. A changed declaration requires review before its evidence hash is renewed.
 A fresh output fingerprint by itself never renews that review.
 

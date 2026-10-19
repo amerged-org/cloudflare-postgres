@@ -113,39 +113,16 @@ proof in the ULTRA plan; targeted tests alone are not live backup acceptance.
 
 While the provider's export job runs, the control database stops answering requests. Cloudflare
 documents the unavailability and states no duration. The exporter sends no D1 request of its own
-meanwhile. No running database needs D1 to keep writing. A wake that arrives during the window
-needs D1.
-
-Measured on the retired Kubernetes runtime from the usage samples of the six runs that reached or
-passed the export. The regional agent posted one sample every 15 s per emitting database; a gap in `usage_samples.observed_at` of
-source `agent` inside a run (`SELECT DISTINCT observed_at FROM usage_samples WHERE source='agent'
-AND observed_at BETWEEN <created_at> AND <completed_at> ORDER BY observed_at`, spacings above 25 s)
-is the time its posts did not complete:
-
-| Run | D1 plaintext | Sample gap | Last stored sample before it, after run creation |
-| --- | --- | --- | --- |
-| 2026-10-12, attempt 3 | 396 MB | none (one spacing of 20.9 s) | not visible |
-| 2026-10-13 | 413 MB | 00:00:48 to 00:01:56 (68 s) | 20 s |
-| 2026-10-14, attempt 1 | not read back | 00:04:04 to 00:05:13 (69 s) | 126 s |
-| 2026-10-14, attempt 2 | not read back | none | not visible |
-| 2026-10-14, attempt 3 | not read back | 00:35:00 to 00:36:12 (72 s) | 121 s |
-| 2026-10-15 | 468 MB | 00:02:21 to 00:02:58 (37 s) | 70 s |
-
-The gap runs from the last sample that was stored to the first one stored afterwards, so the stall
-itself is up to 30 s shorter than the gap: in three runs it lasted at least 37 s, and in the fourth
-between 7 and 37 s. It does not follow the database size, and in
-two runs no stall is visible at all. The gateway's samples show the same gap as one longer interval.
-
-Unknown:
-
-- Why two runs show no stall, and what the 20 to 126 s before the window are (initialization,
-  image manifest reads and the provider's job start are the code's steps there; none is timed).
-- The effect on a wake during the window: no wake arrived in any nightly window.
-- Whether a request during the window waits or is rejected: the code tolerates both.
-
-The raw samples this relies on are being reduced (pruned once their hourly rollup is final, none
-from idle databases), so read the derivation while they exist. Go-live gate G6 also needs a night
-with an awake database under writes and one wake during the export that shows no failed wake.
+meanwhile, and no running database needs D1 to keep writing. **How long D1 stops is not
+established.** ULTRA plan 9.10 states about 4 s, tagged as measured on EU1, which the plan's legend
+defines as the retired Kubernetes runtime; the plan does not say how it was taken. The earlier
+sampling of that runtime (usage posts of the regional agent, one per 15 s) showed gaps of 37 to 72 s
+in four of six nightly runs, a stall of at least 37 s in three of them and none in two, and so
+contradicts it. Nothing on the node runtime has measured the length yet, and gate G6 does not ask
+for it: record the stall of a nightly run in the plan when one is measured. A wake admits from the
+DatabaseActor's own state and commits its claim to D1 after the answer, so it is not expected to
+wait for the export. That is not yet observed: go-live gate G6 needs a night with an awake database
+under writes and one wake during the export that shows no failed wake.
 
 ## Optional email or webhook delivery
 
@@ -162,12 +139,12 @@ Per-node threshold warnings use the same delivery. Set `node_ram_warning_thresho
 million (`850000` means 85%); `null` disables one. The cron checks every node of a
 policy region each minute:
 
-- RAM uses the node's own fresh ten-minute window.
-- CPU averages reported CPU usage over the same ten minutes against node CPU capacity.
-  Only reporters that send the optional CPU sample fields supply it (the node agent,
-  Stage 3); otherwise CPU stays unknown and sends nothing.
-- Storage uses the fresh LVM sample: thin-pool data or metadata fill, otherwise
-  volume-group allocation.
+- RAM is the 30-minute average of the node's active RAM, (MemTotal - MemAvailable) / MemTotal,
+  over its own samples.
+- CPU is the 30-minute average of the node's CPU load, busy time over all its cores.
+  RAM and CPU need samples that span at least ten minutes and a newest sample at most 180 s old;
+  otherwise they stay unknown and send nothing.
+- Storage is the fuller of the thin pool's data and metadata in the node's newest sample.
 
 The email subject is `PGCF infrastructure: <kind> (<region>)` and its body is the
 event JSON, including `node_ids`, `threshold_ppm` and the highest `utilization_ppm`.
@@ -197,7 +174,7 @@ same event ID while it stays active; a cleared episode sends nothing.
 
 | Kind | Fires when | Rule | Action |
 | --- | --- | --- | --- |
-| `regional_ram_warning` | regional ten-minute RAM utilization reaches the threshold | `ram_warning_threshold_ppm`, off by default | Read `GET /v1/regions/{id}/capacity-decision`; add a node or reduce awake databases |
+| `regional_ram_warning` | regional ten-minute RAM utilization reaches the threshold | `ram_warning_threshold_ppm`, off by default; it needs a regional RAM window of ten fresh one-minute samples from every node, which no node reports yet, so it stays unknown | Read `GET /v1/regions/{id}/capacity-decision`; add a node or reduce awake databases |
 | `regional_node_cap_reached` | allocated nodes reached `max_nodes` | `cap_warning_enabled` with a finite `max_nodes` | Raise `max_nodes` in the capacity policy or free a slot |
 | `regional_node_ram_warning` | a node's 30-minute average of active RAM, (MemTotal - MemAvailable) / MemTotal, reaches the threshold | `node_ram_warning_threshold_ppm`; judged from at least ten minutes of samples | Reduce awake databases on the listed node or add capacity |
 | `regional_node_cpu_warning` | a node's 30-minute average CPU load, busy time over all its cores, reaches the threshold | `node_cpu_warning_threshold_ppm`; judged from at least ten minutes of samples | Reduce awake databases on the listed node or add capacity |
@@ -227,18 +204,21 @@ Rules of the database and Thin storage kinds:
 - **Base backup.** The 36 h count starts at the latest of the last completed base backup,
   the database's placement (`created`) and its last wake (`woke`, written by every resume
   and wake). A `ready` event is not a wake: any generation bump, such as a role change or a
-  resize, writes one. The daily 03:00 UTC backup skips a sleeping database, so a database
-  that slept through it is not reported until it has been awake 36 h without a backup. The
-  agent's backup report must be fresh (at most 180 s old) and `ok` with a completion time,
-  or `failing`; a sleeping database and an unknown report are excluded.
-- **Thin storage.** From the node's fresh physical sample (at most 120 s old),
-  `thin_pool_no_room` means no database starts on the node: its free data is under the
-  profile's `data_reserve_bytes` or its free metadata under `metadata_reserve_bytes`. The pool
-  does not grow; `regional_node_storage_warning` reports it filling before that.
-  `thin_pool_unobserved` means a node with a bound thin volume has no physical sample of its
-  pool at most 120 s old, so neither the room rule nor this alert sees the pool fill. Running
-  databases are never stopped for storage; a pool that does fill fails the write and
-  PostgreSQL stops without acknowledging it.
+  resize, writes one. The node takes a base backup when a database is created and after a
+  restore, before an idle sleep when one is due (none on the current timeline, or the newest is
+  older than 24 h) and, for an always-warm database, once the newest is older than 24 h; it never
+  wakes a sleeping database for a backup, so a database that slept through its due time is not
+  reported until it has been awake 36 h without a backup. The agent's backup report must be fresh
+  (at most 180 s old) and `ok` with a completion time, or `failing`; a sleeping database and an
+  unknown report are excluded.
+- **Thin storage.** From the node's newest pool sample (at most 180 s old), `thin_pool_no_room`
+  means the node's own room rule says no room: free data under the region node policy's
+  `reserve_bytes` or metadata at or above its `metadata_no_room_percent`, so no database starts, is
+  created or is restored there. The pool does not grow; `regional_node_storage_warning` reports it
+  filling before that. `thin_pool_unobserved` means a node that holds a database has no pool sample
+  at most 180 s old, so neither the room rule nor this alert sees the pool fill. Running databases
+  are never stopped for storage; a pool that does fill fails the write and PostgreSQL stops without
+  acknowledging it ([recovery](recovery.md#thin-storage-admission-and-recovery)).
 - **Subjects.** An episode lists at most 64 databases (longest-standing first) or nodes,
   16 for Thin storage (by ID). A subject that fails and is not listed yet replaces the
   episode with a new event that lists the current subjects (this also holds for
@@ -322,7 +302,8 @@ Keep all referenced `CREDENTIAL_KEYS.keys[kid]` versions in protected offline
 custody, separate from R2 and D1. A D1 export contains encrypted role custody;
 it cannot recover those credentials if the matching master key versions were lost.
 Never upload a plaintext keyring alongside these objects. Disabling capture or
-changing the active key does not retire keys needed by existing archives.
+changing the active key does not retire keys needed by existing archives. The
+[restore drill](#restore-drill) opens an artifact with the complete keyring.
 
 The `PGCFINF1` envelope contains: eight-byte magic, four-byte big-endian JSON AAD
 length, UTF-8 authenticated JSON identity, 12-byte nonce, AES-GCM ciphertext, and a
@@ -335,3 +316,151 @@ SHA-256/length from the API receipt and GCM/AAD/plaintext hash before writing or
 restoring recovered SQL. Never restore an unverified or partial object.
 Use the existing [recovery runbook](recovery.md) for controlled D1 restoration;
 restoration changes live state and requires explicit operator authorization.
+
+## Restore drill
+
+An artifact is a backup only once it has been opened. The drill decrypts one artifact with the
+offline keyring and imports it into a new, empty scratch D1 database. It reads one R2 object and
+writes only that scratch database; the control database is never touched. Run it for the first
+complete artifact (go-live gate G6 of the
+[ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md)), after any change of
+the keyring or of the envelope code, and before relying on the backup in a recovery.
+
+The tool is `scripts/operations/restore-infrastructure-backup.ts` (Node, no packages beyond the
+repository's). It does not share code with the Worker: it reads the layout documented under
+[offline recovery custody](#offline-recovery-custody), so a restore needs nothing of the Worker.
+It uses wrangler for Cloudflare (`apps/api/node_modules/.bin/wrangler` after `pnpm install`, or any
+wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` set to an account token that can read the archive bucket and edit D1.
+
+1. **Receipt (optional, recommended).** `GET /v1/infrastructure-backups` returns only the latest
+   run, so save the answer on the day of the artifact you will open. Send the administrator key
+   without putting it on a command line:
+
+   ```sh
+   printf 'header = "Authorization: Bearer %s"\n' "$PGCF_API_KEY" \
+     | curl --fail --silent --show-error --config - \
+         "$PGCF_API_URL/v1/infrastructure-backups" > receipt.json
+   ```
+
+   Without a receipt (the control database may be the thing that was lost) the artifact still
+   authenticates its own identity and plaintext hash; the tool then prints `receipt: not given`.
+
+2. **Download the object.** The key is `latest.artifacts[0].object_key` of the receipt, in the
+   archive bucket of the configured `d1_region_id`. The EU archive bucket is in the EU
+   jurisdiction (the `jurisdiction` of its `r2_buckets` entry in the Worker configuration), and
+   wrangler looks a bucket up in the default jurisdiction unless told otherwise, so name it:
+
+   ```sh
+   wrangler r2 object get "<ARCHIVE_BUCKET>/<object_key>" --file d1-control.pgcfenc --remote --jurisdiction eu
+   ```
+
+   Leave `--jurisdiction` out only for a bucket the configuration lists without one.
+
+3. **Create the scratch database**, from an empty directory so that wrangler reads and changes no
+   configuration:
+
+   ```sh
+   (cd "$(mktemp -d)" && wrangler d1 create pgcf-restore-drill --jurisdiction eu)
+   ```
+
+4. **Load the keyring.** It is the complete `CREDENTIAL_KEYS` JSON from offline custody
+   (`{"active":"<id>","keys":{"<id>":"<base64url, 32 bytes>"}}`). Put it in an environment
+   variable without echoing it; the tool takes the variable's name, never its value, and uses the
+   key version the artifact names, whichever version is active:
+
+   ```sh
+   read -rs PGCF_RESTORE_KEYS && export PGCF_RESTORE_KEYS
+   ```
+
+5. **Import.**
+
+   ```sh
+   node scripts/operations/restore-infrastructure-backup.ts import \
+     --input d1-control.pgcfenc --keys-env PGCF_RESTORE_KEYS --receipt receipt.json \
+     --database pgcf-restore-drill --wrangler apps/api/node_modules/.bin/wrangler
+   ```
+
+   The tool first reads the artifact's header, then:
+   - resolves `--database` by its exact name to one D1 database ID, and refuses a name that
+     matches none or several, the database the artifact was exported from (the AAD names it), and
+     any database that already holds a schema object (a table, index, trigger or view);
+   - decrypts into a `0600` file in a `0700` temporary directory, authenticating the GCM tag, the
+     AAD and the plaintext hash and length, and holds the artifact to the receipt (run, key
+     version, hashes, sizes, object key) when one is given; a flipped or missing byte, a truncated
+     file or another key stops it with nothing written;
+   - writes every `CREATE TABLE` statement ahead of the rest, byte for byte (see below), and runs
+     `wrangler d1 execute <database ID> --remote --yes --file` from that directory, which holds no
+     wrangler configuration, so a configured binding cannot redirect the import;
+   - removes the directory, and counts the tables of the scratch database (tables only; the
+     indexes, triggers and views the dump also creates are not in that number).
+
+   It prints the artifact's day, region and key version, the plaintext and encrypted byte counts
+   and SHA-256, the scratch database's ID, and the counts. It never prints SQL, the keyring, the
+   control database's ID or wrangler's own text about the import, which can quote a statement; if
+   an import fails, it reports wrangler's exit code. wrangler's output says that a failed import
+   returns the database to its original state; check with step 6's queries before reusing it, or
+   create a new scratch database. To read wrangler's message, write the verified SQL with
+   `decrypt --input FILE --output FILE --keys-env NAME` (mode `0600`, never over an existing
+   file), run the import by hand, and delete the file afterwards.
+
+   Ctrl-C, `kill` and a closed terminal (SIGINT, SIGTERM, SIGHUP) stop wrangler, remove the
+   decrypted SQL and end the run with exit code 130, 143 or 129. A run killed with SIGKILL, or by a
+   power cut, cannot clean up: delete `$TMPDIR/pgcf-restore-*` (for `import`) or `<output>.partial`
+   (for `decrypt`) by hand.
+
+   **Unverified until the first drill:** that D1 runs the imported file as one transaction. The
+   reordered file only imports in one transaction, because the dump's `PRAGMA
+   defer_foreign_keys=TRUE` lasts for one transaction and the rows of a table can precede its
+   parent's rows. If the drill fails with `FOREIGN KEY constraint failed`, the data statements
+   need an order by foreign key as well; record that in the plan instead of working around it
+   by hand.
+
+6. **Check the scratch database** against the live one. `d1_migrations` and `regions` must match;
+   the other counts may have moved since the export began. Name the database by the ID the tool
+   printed on its `importing into` line, and run wrangler from an empty directory as in step 3,
+   so that a wrangler configuration cannot redirect the query to another database:
+
+   ```sh
+   (cd "$(mktemp -d)" && wrangler d1 execute <scratch-database-id> --remote --command "PRAGMA foreign_key_check")
+   (cd "$(mktemp -d)" && wrangler d1 execute <scratch-database-id> --remote --command \
+     "SELECT (SELECT count(*) FROM d1_migrations) AS migrations, (SELECT count(*) FROM regions) AS regions, (SELECT count(*) FROM nodes) AS nodes, (SELECT count(*) FROM databases) AS databases")
+   ```
+
+7. **Clean up.** Delete the scratch database by the same ID, from an empty directory (a name is
+   looked up in a wrangler configuration first, and this step cannot be undone), then
+   `rm d1-control.pgcfenc receipt.json` and `unset PGCF_RESTORE_KEYS`. `--skip-confirmation`
+   removes the only prompt, which shows no more than the ID, so first read what the ID names and
+   delete only if `d1 info` answers `pgcf-restore-drill`:
+
+   ```sh
+   (cd "$(mktemp -d)" && wrangler d1 info <scratch-database-id>)
+   (cd "$(mktemp -d)" && wrangler d1 delete <scratch-database-id> --skip-confirmation)
+   ```
+
+8. **Record** in the ULTRA plan only: the artifact's day, its plaintext and encrypted byte counts
+   and SHA-256, the table count and the results of step 6. Not the IDs the tool prints (the run,
+   the artifact, the scratch database), not the control database's ID, and nothing else of the
+   content.
+
+**Why the tool reorders the SQL.** D1's export lists each table's rows right after its
+`CREATE TABLE`, and the tables in the order they were created. A migration that rebuilt a table
+puts it after the tables that reference it: in this repository's migrations `regions` comes after
+`nodes`, `databases` and others. SQLite refuses the first row of a table whose referenced table
+does not exist yet (`no such table: main.regions`), even under `PRAGMA defer_foreign_keys`, which
+defers constraint violations only. The local export of the repository's migrations (wrangler's
+local D1) fails to import this way; with every `CREATE TABLE` first it imports as one
+transaction, and a second export holds the same statements as the first. The drill is where the
+provider's own export and the provider's import are first tried (see the unverified premise
+under step 5). The same holds for a restore of the control database: do not import a decrypted
+file by hand; use `import`.
+
+| The tool says | Meaning |
+| --- | --- |
+| `authentication failed` | The file was changed or cut, or the key is not the one that wrote it. Check the key version the artifact names and the keyring in custody. |
+| `not a complete PGCFINF1 envelope` | The download is truncated, empty or not an artifact of this layout. Download it again. |
+| `the keyring has no usable key version` | The keyring lacks the version the artifact names. Find the custody copy that holds it. |
+| `differs from the API's receipt` | The artifact is not the one the receipt describes, or it was replaced in R2. Treat it as unverified. |
+| `is the database this artifact was exported from` | The name resolves to the control database. Create a new scratch database. |
+| `already has N schema objects` | The target is not empty. Create a new scratch database. |
+
