@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   RELEASE_FILES,
+  RELEASE_SIGNATURE_FILE,
   releaseFileUrl,
   type ReleaseFile,
 } from "@pgcf/contracts/releases";
@@ -15,6 +16,7 @@ import {
   rawRequest,
   refusal,
   request,
+  signatureOf,
   stageRelease,
 } from "./fixtures.ts";
 import {
@@ -46,8 +48,10 @@ async function registered() {
       )
     ).status,
   ).toBe(200);
-  const path = (file: ReleaseFile, release = version) =>
-    new URL(releaseFileUrl(API_ORIGIN, release, file)).pathname;
+  const path = (
+    file: ReleaseFile | typeof RELEASE_SIGNATURE_FILE,
+    release = version,
+  ) => new URL(releaseFileUrl(API_ORIGIN, release, file)).pathname;
   const body = (file: ReleaseFile, release = version) =>
     new TextEncoder().encode(`${release}/${file}`);
   return { f, version, path, body };
@@ -77,6 +81,22 @@ describe("the files every node reads", () => {
       String(r.body("pgcf-agent").byteLength),
     );
     expect(response.headers.get("ETag")).toMatch(/^"[0-9a-f]+"$/);
+  });
+
+  it("serves the signature of a registered release from its stored spec, to anyone, as the agent reads it without a credential", async () => {
+    const r = await registered();
+    const response = await get(r.path("release.sig"));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toMatch(/^text\/plain/);
+    expect(await response.text()).toBe(await signatureOf(r.version));
+    // Another release has its own, and a version that was never registered has none.
+    const other = await registered();
+    expect(await (await get(other.path("release.sig"))).text()).toBe(
+      await signatureOf(other.version),
+    );
+    expect(
+      (await get(r.path("release.sig", "release-files-unknown"))).status,
+    ).toBe(404);
   });
 
   it("knows only the files of a registered release", async () => {

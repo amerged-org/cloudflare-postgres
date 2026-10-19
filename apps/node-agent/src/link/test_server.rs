@@ -53,6 +53,10 @@ pub fn vector(schema: &str, name: &str) -> Value {
 pub fn package_vectors() -> Vec<Value> {
     VECTORS["packages"].as_array().unwrap().clone()
 }
+/// The contract's examples of a release as the page names it, with the text its signature covers.
+pub fn release_vectors() -> Vec<Value> {
+    VECTORS["releases"].as_array().unwrap().clone()
+}
 /// A desired database of the contract's example page, under another identifier.
 pub fn database(id: &str) -> Value {
     let page = vector("NodeDesiredPage", "full-page");

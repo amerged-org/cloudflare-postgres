@@ -6,6 +6,8 @@ import { NodeId, RegionId } from "./ids.ts";
 
 const Sha256 = z.string().regex(/^[0-9a-f]{64}$/);
 const Positive = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
+/** An Ed25519 signature of a release manifest: 64 bytes as 128 lowercase hex digits. */
+export const ReleaseSignature = z.string().regex(/^[0-9a-f]{128}$/);
 export const FleetReleaseId = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,95}$/);
 /** The pattern carries the scheme into the JSON Schema, which drops the URL check. */
 const Https = HttpsUrl.regex(/^https:\/\//);
@@ -99,6 +101,13 @@ export const FleetReleaseSpec = z.strictObject({
   image: FleetNodeImage,
   binaries: FleetReleaseBinaries,
   os: FleetReleaseOs,
+  /**
+   * The release key's signature of the release's manifest (`signedReleaseManifest`), made in CI.
+   * The API stores it and cannot check it: a node does, with the key compiled into its agent,
+   * before it installs anything of the release. It is not on the node's page; a node reads it at
+   * `RELEASE_SIGNATURE_FILE` beside the binaries.
+   */
+  signature: ReleaseSignature,
 });
 export type FleetReleaseSpec = z.infer<typeof FleetReleaseSpec>;
 
@@ -130,7 +139,7 @@ export const releaseObjectKey = (version: string, file: ReleaseFile): string =>
 export const releaseFileUrl = (
   origin: string,
   version: string,
-  file: ReleaseFile,
+  file: ReleaseFile | typeof RELEASE_SIGNATURE_FILE,
 ): string => `${apiOrigin(origin)}${RELEASE_FILE_PATH}/${version}/${file}`;
 function apiOrigin(origin: string): string {
   const url = new URL(origin);
@@ -144,6 +153,69 @@ function apiOrigin(origin: string): string {
   )
     throw new Error("The API origin is an https origin and nothing else");
   return url.origin;
+}
+
+/**
+ * The first line of every signed manifest. It names what is signed and its format, so that a
+ * signature made for any other purpose, or for another version of this format, never verifies as
+ * a release's.
+ */
+export const RELEASE_MANIFEST_DOMAIN = "pgcf-release-manifest/v1\n";
+/**
+ * The file name under which the API answers with a release's signature, beside the binaries. It
+ * is no uploaded file (`RELEASE_FILES`): the API serves the signature of the stored spec.
+ */
+export const RELEASE_SIGNATURE_FILE = "release.sig";
+/**
+ * Why a node refuses to install a release, as its `release_refused` event names the class: no
+ * signature was served for it, or the one served is not the release key's signature of the
+ * release's manifest.
+ */
+export const RELEASE_REFUSALS = [
+  "release_signature_missing",
+  "release_signature_invalid",
+] as const;
+
+const SignedDigest = z.object({ sha256: Sha256, size_bytes: Positive });
+const SignedRelease = z.object({
+  id: FleetReleaseId,
+  binaries: z.object(
+    Object.fromEntries(
+      RELEASE_BINARY_FILES.map((file) => [file, SignedDigest]),
+    ) as Record<(typeof RELEASE_BINARY_FILES)[number], typeof SignedDigest>,
+  ),
+  os: z.object({
+    debian_snapshot: z.string().regex(/^[0-9]{8}T[0-9]{6}Z$/),
+    package_lock: SignedDigest,
+  }),
+});
+/**
+ * What the release key signs for a release (plan 9.3): the domain line and then one `name=value`
+ * line each, in this order and no other, every line ended by a line feed: the release id; the
+ * sha256 and size of each of the four binaries a node runs; the Debian snapshot its packages come
+ * from; the sha256 and size of the package lock, which in turn pins every package and every
+ * download (cloudflared) a maintenance cycle installs. A digest is `<sha256>:<size>`. The image
+ * is the installer's and not the agent's, and the kernel and the package digest a node reports
+ * are derived from the lock, so they are not in it. Every value is checked against its pattern,
+ * which holds no line feed: no two releases have the same manifest. The page of a node carries
+ * every fact in it (`NodeRelease`), which is how the agent builds the same text.
+ */
+export function signedReleaseManifest(
+  release: z.input<typeof SignedRelease>,
+): string {
+  const { id, binaries, os } = SignedRelease.parse(release);
+  const pin = ({ sha256, size_bytes }: z.infer<typeof SignedDigest>) =>
+    `${sha256}:${size_bytes}`;
+  return [
+    RELEASE_MANIFEST_DOMAIN.slice(0, -1),
+    `release=${id}`,
+    ...RELEASE_BINARY_FILES.map(
+      (file) => `binary.${file}=${pin(binaries[file])}`,
+    ),
+    `os.debian_snapshot=${os.debian_snapshot}`,
+    `os.package_lock=${pin(os.package_lock)}`,
+    "",
+  ].join("\n");
 }
 
 const Digest = z.strictObject({ sha256: Sha256, size_bytes: Positive });
@@ -169,6 +241,7 @@ export const FleetReleaseRegistration = z.strictObject({
     packages_sha256: FleetReleaseOs.shape.packages_sha256,
     kernel_release: FleetReleaseOs.shape.kernel_release,
   }),
+  signature: ReleaseSignature,
 });
 export type FleetReleaseRegistration = z.infer<typeof FleetReleaseRegistration>;
 /** The version of a registered release: a release id that is also a valid image version. */
@@ -206,6 +279,7 @@ export function fleetReleaseSpec(
       packages_sha256: registration.os.packages_sha256,
       kernel_release: registration.os.kernel_release,
     },
+    signature: registration.signature,
   });
 }
 

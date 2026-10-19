@@ -321,8 +321,23 @@ jobs:
           for binary in pgcf-agent pgcf-native-gateway pgcf-archive pgcf-wal-fetch; do
             cp "$PGCF_NODE_IMAGE_WORK/binaries/$binary" "$release/"
           done
+      # The nodes refuse a release that the release key did not sign. Only a push to main holds the key
+      # (the secret RELEASE_SIGNING_KEY): the step fails with a message that says what to do while the
+      # secret is missing, and a pull request, which has no secret, signs nothing.
+      - name: Sign the release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.fork
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          release="$PGCF_NODE_IMAGE_WORK/release"
+          node scripts/operations/sign-release.ts sign --image-dir "$release" --binaries "$release" \
+            --lock "$release/packages.lock.json"
+      - name: Sum the release files and dry-run their registration
+        run: |
+          release="$PGCF_NODE_IMAGE_WORK/release"
           (cd "$release" && sha256sum * > SHA256SUMS)
-          # The registration script's own dry run: it refuses a file that is missing or is not the one the build describes.
+          # The registration script's own dry run: it refuses a file that is missing or is not the one the build describes,
+          # and says whether the signature is there and verifies with the key of this checkout.
           node scripts/operations/register-node-image.ts --image-dir "$release" --binaries "$release" \
             --lock "$release/packages.lock.json" --dry-run
       - name: Keep the release files for the operator

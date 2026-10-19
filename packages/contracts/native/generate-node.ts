@@ -12,6 +12,7 @@ import {
   RESERVED_ROLE_PREFIXES,
 } from "../src/ids.ts";
 import { MAINTENANCE_ROLE } from "../src/maintenance.ts";
+import { RELEASE_REFUSALS, RELEASE_SIGNATURE_FILE } from "../src/releases.ts";
 import {
   archiveVectors,
   gatewayChannelVectors,
@@ -20,6 +21,7 @@ import {
   nodeSchemaVectors,
   packageVectors,
   refusalVectors,
+  releaseVectors,
 } from "./node-vectors.ts";
 
 const files = {
@@ -72,12 +74,15 @@ const files = {
       NODE_DATABASE_STATES: link.NODE_DATABASE_STATES,
       NODE_DATABASE_ERRORS: link.NODE_DATABASE_ERRORS,
       INSTALLER_CHECKPOINTS: link.INSTALLER_CHECKPOINTS,
+      RELEASE_REFUSALS,
+      RELEASE_SIGNATURE_FILE,
     },
   },
   "node-vectors.generated.json": {
     schemas: nodeSchemaVectors(),
     requests: await nodeRequestVectors(),
     packages: await packageVectors(),
+    releases: releaseVectors(),
   },
   "node-local.generated.json": {
     version: 1,

@@ -190,6 +190,9 @@ with the owner's go for a reboot. The endpoints require an admin API key.
 3. Poll `GET /v1/nodes/{id}/maintenance/{operation}`. `open` becomes `done` or `failed`; a
    `failed` cycle names the class of the failure in `result_reason` (such as `power_busy` or
    `power_archive` for a database that did not sleep with the proof, `release_missing`,
+   `release_signature_missing` or `release_signature_invalid` for a release the node does not trust
+   (its agent checks the release key's signature before it reads the lock, and reports the event
+   `release_refused`; [release-signing.md](release-signing.md)), `signature_not_read`,
    `lock_not_read`, `packages_not_read`, `packages_not_installed`, `reboot_failed` or
    `check_failed`; `packages_not_installed` also names a purge that dpkg refused).
 4. `done` reopens placement, if this cycle closed it (`placement_closed_at` is not null). A

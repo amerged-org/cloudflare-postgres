@@ -46,8 +46,10 @@ rustls-pki-types 1.15.1, tokio-postgres 0.7.18 and libc 0.2.190 (`MIT OR Apache-
 0.23.45 and tokio-rustls 0.26.6 (`Apache-2.0 OR ISC OR MIT` and `MIT OR Apache-2.0`), jsonschema
 0.58.6 and zbus 5.19.0 (MIT; zbus drives the database units over systemd's D-Bus API), and
 webpki-roots 1.0.9 (`CDLA-Permissive-2.0`). The agent signs the node's requests with its Ed25519
-key through ring and speaks the link's TLS WebSocket to Cloudflare through tokio-rustls and
-tokio-tungstenite. Its tests also use rcgen 0.14.10 (`MIT OR Apache-2.0`). rustls-pki-types is used
+key through ring, checks the Ed25519 signature of each release against the release key through
+the same crate (`ring::signature::ED25519`; no crate was added for release signing, and the
+script that makes and checks the key uses Node's own `node:crypto`), and speaks the link's TLS
+WebSocket to Cloudflare through tokio-rustls and tokio-tungstenite. Its tests also use rcgen 0.14.10 (`MIT OR Apache-2.0`). rustls-pki-types is used
 directly for PEM parsing; the unmaintained rustls-pemfile wrapper is not used. The gateway's SCRAM
 client uses hmac and zeroize directly, with sha2, and takes its random nonces from ring.
 

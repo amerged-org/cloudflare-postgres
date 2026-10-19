@@ -8,9 +8,11 @@ import test from "node:test";
 import {
   FleetReleaseRegistration,
   fleetReleaseSpec,
+  signedReleaseManifest,
 } from "../../packages/contracts/src/releases.ts";
 import {
   apiCredentials,
+  checkSignature,
   digestFile,
   existingObject,
   lockOs,
@@ -22,6 +24,11 @@ import {
   uploadObject,
   type Manifest,
 } from "./register-node-image.ts";
+import {
+  generateKeyPair,
+  readReleaseKey,
+  signText,
+} from "./release-signing.ts";
 
 const sha = (text: string, algorithm = "sha256") =>
   createHash(algorithm).update(text).digest("hex");
@@ -156,8 +163,11 @@ test("the manifest registers the digests of the files the build produced, under 
   try {
     const manifest = await releaseManifest(b.options);
     assert.equal(manifest.version, "sha-0123456789ab");
-    // Exactly what the API accepts: no URLs, no version, nothing the Worker names itself.
-    const registration = FleetReleaseRegistration.parse(manifest.registration);
+    // Exactly what the API accepts, but for the signature: no URLs, no version, nothing the
+    // Worker names itself.
+    const registration = FleetReleaseRegistration.omit({
+      signature: true,
+    }).parse(manifest.registration);
     assert.deepEqual(registration.image, {
       sha256: sha(b.files.zst),
       size_bytes: Buffer.byteLength(b.files.zst),
@@ -532,14 +542,14 @@ test("an upload is one signed PUT of the file with the sha256 R2 verifies, and i
   }
 });
 
+const SIGNATURE = "5".repeat(128);
 // What `PUT /v1/fleet/releases/{version}` answers: the whole stored release, its spec named by the Worker.
 const stored = (manifest: Manifest, id = manifest.version) => ({
   id,
-  spec: fleetReleaseSpec(
-    "https://api.example.org",
-    manifest.version,
-    manifest.registration,
-  ),
+  spec: fleetReleaseSpec("https://api.example.org", manifest.version, {
+    ...manifest.registration,
+    signature: SIGNATURE,
+  }),
   spec_sha256: "a".repeat(64),
   approved_at: "2026-10-16T12:00:00.000Z",
 });
@@ -552,6 +562,7 @@ test("the registration is one admin PUT of the manifest to the version, and the 
     const release = await registerRelease(
       { apiUrl: "https://api.example.org/", apiKey: "pgcf_sk_secret" },
       manifest,
+      SIGNATURE,
       async (url, init) => {
         seen.push({ url: String(url), init: init! });
         return Response.json(stored(manifest));
@@ -568,14 +579,17 @@ test("the registration is one admin PUT of the manifest to the version, and the 
       new Headers(seen[0]!.init.headers).get("authorization"),
       "Bearer pgcf_sk_secret",
     );
-    assert.deepEqual(
-      JSON.parse(String(seen[0]!.init.body)),
-      manifest.registration,
-    );
+    // The registration is the digests and the signature CI made of them, which the API stores.
+    assert.deepEqual(JSON.parse(String(seen[0]!.init.body)), {
+      ...manifest.registration,
+      signature: SIGNATURE,
+    });
+    assert.equal(release.spec.signature, SIGNATURE);
     await assert.rejects(
       registerRelease(
         { apiUrl: "https://api.example.org", apiKey: "pgcf_sk_secret" },
         manifest,
+        SIGNATURE,
         async () =>
           Response.json(
             {
@@ -602,27 +616,113 @@ test("the registration is one admin PUT of the manifest to the version, and the 
     const answer = (body: unknown) => async () => Response.json(body);
     const api = { apiUrl: "https://api.example.org", apiKey: "k" };
     await assert.rejects(
-      registerRelease(api, manifest, answer(stored(manifest, "other"))),
+      registerRelease(
+        api,
+        manifest,
+        SIGNATURE,
+        answer(stored(manifest, "other")),
+      ),
       /stored the release as "other"/,
     );
     const changed = stored(manifest);
     changed.spec.binaries["pgcf-agent"].sha256 = sha("another agent");
     await assert.rejects(
-      registerRelease(api, manifest, answer(changed)),
+      registerRelease(api, manifest, SIGNATURE, answer(changed)),
+      /pins differ/,
+    );
+    // The signature the API stored is the one registered: a node would refuse another.
+    const resigned = stored(manifest);
+    resigned.spec.signature = "6".repeat(128);
+    await assert.rejects(
+      registerRelease(api, manifest, SIGNATURE, answer(resigned)),
       /pins differ/,
     );
     await assert.rejects(
-      registerRelease(api, manifest, answer({ id: manifest.version })),
+      registerRelease(
+        api,
+        manifest,
+        SIGNATURE,
+        answer({ id: manifest.version }),
+      ),
       { name: "ZodError" },
     );
     await assert.rejects(
       registerRelease(
         { apiUrl: "http://api.example.org", apiKey: "k" },
         manifest,
+        SIGNATURE,
         async () => new Response(),
       ),
       /https/,
     );
+  } finally {
+    await rm(b.root, { recursive: true, force: true });
+  }
+});
+
+test("the signature CI wrote beside the files is read and checked against the key the nodes trust, before anything is uploaded", async () => {
+  const b = await build();
+  try {
+    const manifest = await releaseManifest(b.options);
+    const key = generateKeyPair();
+    const keyPath = join(b.root, "release-signing.pub");
+    const signaturePath = join(b.options.imageDir, "release.sig");
+    await writeFile(keyPath, `${key.publicKey}\n`);
+    const options = { signaturePath, keyPath };
+    // CI has not signed this build (a pull request, or a dry run of a build by hand).
+    assert.equal(await checkSignature(manifest, options), undefined);
+    // CI signs what the registration states: the id and every digest a node installs.
+    const text = signedReleaseManifest({
+      id: manifest.version,
+      ...manifest.registration,
+    });
+    const signature = signText(key.privateKey, text);
+    await writeFile(signaturePath, `${signature}\n`);
+    assert.deepEqual(await checkSignature(manifest, options), {
+      signature,
+      verified: true,
+    });
+    // A signature of another release, of other binaries or by another key does not verify: the
+    // nodes would refuse the release, so the registration refuses it first.
+    const elsewhere = signText(
+      key.privateKey,
+      signedReleaseManifest({
+        id: "sha-ffffffffffff",
+        ...manifest.registration,
+      }),
+    );
+    await writeFile(signaturePath, elsewhere);
+    assert.equal((await checkSignature(manifest, options))?.verified, false);
+    await writeFile(signaturePath, signature);
+    await writeFile(keyPath, `${generateKeyPair().publicKey}\n`);
+    assert.equal((await checkSignature(manifest, options))?.verified, false);
+    // The checked-in key is the default one: it is the key of the agent in this checkout, which
+    // no signature made here verifies with.
+    const { RELEASE_KEY_FILE } = await import("./release-signing.ts");
+    assert.equal(
+      (
+        await checkSignature(manifest, {
+          signaturePath,
+          keyPath: RELEASE_KEY_FILE,
+        })
+      )?.verified,
+      false,
+    );
+    assert.match(await readReleaseKey(RELEASE_KEY_FILE), /^[0-9a-f]{64}$/);
+    // A file that is no signature is an error, not a missing one.
+    for (const bad of [
+      "",
+      "\n",
+      "abc",
+      `${signature}00`,
+      signature.toUpperCase(),
+    ]) {
+      await writeFile(signaturePath, bad);
+      await assert.rejects(
+        checkSignature(manifest, options),
+        /not a signature/,
+      );
+    }
   } finally {
     await rm(b.root, { recursive: true, force: true });
   }

@@ -90,6 +90,7 @@ const spec = (id: string) => ({
     packages_sha256: hex("6"),
     kernel_release: "6.12.113+deb13-amd64",
   },
+  signature: "e".repeat(128),
 });
 async function release(region: string) {
   const id = `installer-test-${crypto.randomUUID().slice(0, 8)}`;

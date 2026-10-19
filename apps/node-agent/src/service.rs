@@ -80,6 +80,9 @@ pub struct ServiceConfig {
     pub timing: Timing,
     /// The gateway's user and group, who alone may reach the agent's channel.
     pub gateway: Option<(u32, u32)>,
+    /// The key that signs releases (`update::RELEASE_KEY`, which the agent's build holds). A test
+    /// signs its releases with a key of its own; the binary has no other source for it.
+    pub release_key: [u8; 32],
 }
 
 pub struct Service<M: Machine> {
@@ -95,6 +98,10 @@ pub struct Service<M: Machine> {
     tasks: Mutex<JoinSet<()>>,
     /// The release of the newest page (plan 9.3).
     release: Mutex<Option<update::Release>>,
+    /// The key a release must be signed with, and the verdict on the release last checked: a
+    /// release is trusted only when this says so (`verified`).
+    release_key: [u8; 32],
+    verdict: Mutex<Option<(update::Release, Result<(), update::ReleaseRefusal>)>>,
     /// The probes an administrator asked for that the agent has answered or is running (SEC-09).
     probes: probe::Answered,
     /// A release is being installed.
@@ -188,6 +195,8 @@ impl<M: Machine> Service<M> {
             cpu: Mutex::new(None),
             tasks: Mutex::new(JoinSet::new()),
             release: Mutex::new(None),
+            release_key: config.release_key,
+            verdict: Mutex::new(None),
             probes: probe::Answered::load(layout.agent().join("probes-done")),
             updating: AtomicBool::new(false),
             restart: Notify::new(),
@@ -462,10 +471,72 @@ impl<M: Machine> Service<M> {
         });
     }
 
+    /// Whether the release key signed `release` (plan 8, 9.3): nothing of a release is downloaded,
+    /// staged or installed, and no package of its lock is planned, before this says so. The signature
+    /// is the file the API serves beside the binaries. The verdict on the release last checked is
+    /// kept, so that the signature is read once however many pages name the release. The error
+    /// names the class: a refusal of the contract (`RELEASE_REFUSALS`), reported once as the event
+    /// `release_refused`, or `signature_not_read` when the API could not be asked, which is not
+    /// kept and is tried again.
+    async fn verified(&self, release: &update::Release) -> Result<(), &'static str> {
+        if let Some((checked, verdict)) =
+            &*self.verdict.lock().unwrap_or_else(PoisonError::into_inner)
+            && checked == release
+        {
+            return verdict.map_err(update::ReleaseRefusal::code);
+        }
+        let verdict = match self.read_signature(release).await {
+            Ok(Some(signature)) => update::verify(&self.release_key, release, &signature),
+            Ok(None) => Err(update::ReleaseRefusal::SignatureMissing),
+            Err(error) => {
+                crate::timing::emit_event(json!({
+                    "event": "release_not_installed", "release": release.id,
+                    "class": crate::diagnostics::error_code(&error),
+                }));
+                return Err("signature_not_read");
+            }
+        };
+        if let Err(refusal) = verdict {
+            crate::timing::emit_event(json!({
+                "event": "release_refused", "release": release.id, "class": refusal.code(),
+            }));
+        }
+        *self.verdict.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((release.clone(), verdict));
+        verdict.map_err(update::ReleaseRefusal::code)
+    }
+
+    /// The signature the API serves for the release: `None` if it serves none (404, or no place to
+    /// ask for it).
+    async fn read_signature(&self, release: &update::Release) -> Result<Option<Vec<u8>>, Error> {
+        let Some(url) = release.signature_url() else {
+            return Ok(None);
+        };
+        match self
+            .link
+            .fetch_bytes(&url, update::SIGNATURE_MAX_BYTES)
+            .await
+        {
+            Ok(signature) => Ok(Some(signature)),
+            Err(error)
+                if error
+                    .downcast_ref::<crate::api::Refusal>()
+                    .is_some_and(|refusal| refusal.status == 404) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Installs the release's binaries, and restarts what runs one that changed: the gateway
     /// (its sessions reconnect) and then the agent, which exits and is started by systemd from the
-    /// new link. The databases keep running: they are units of their own.
+    /// new link. The databases keep running: they are units of their own. A release that the key
+    /// did not sign is not touched: the node keeps what it runs.
     async fn install(&self, release: &update::Release, bin: &std::path::Path) {
+        if self.verified(release).await.is_err() {
+            return;
+        }
         let link = self.link.clone();
         let switched = update::install_binaries(bin, release, |pinned, path| {
             let link = link.clone();
@@ -581,6 +652,8 @@ impl<M: Machine> Service<M> {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or("release_missing")?;
+        // The lock names what apt installs as root: the key must have signed the release first.
+        self.verified(&release).await?;
         let work = self.machine.layout().agent().join("packages");
         let outcome = self.install_packages(&release, &work).await;
         let _ = std::fs::remove_dir_all(&work);
@@ -926,6 +999,7 @@ mod tests {
                 intervals: quick(),
                 timing: timing(),
                 gateway: None,
+                release_key: test_release_key(),
             },
         )
         .await
@@ -1071,6 +1145,7 @@ mod tests {
             intervals: quick(),
             timing: timing(),
             gateway: None,
+            release_key: test_release_key(),
         };
         let db = new_entry_json();
         let id = db["id"].as_str().unwrap().to_string();
@@ -1144,8 +1219,43 @@ mod tests {
         let _ = std::fs::remove_file(bin.join("current"));
         std::os::unix::fs::symlink(bin.join(id), bin.join("current")).unwrap();
     }
+    /// A key pair for the signatures of a test; nothing of the private half is kept.
+    fn throwaway_key() -> ring::signature::Ed25519KeyPair {
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    }
+    /// The release key of the tests: made once for the test process, which the agents of the
+    /// tests are built with (`ServiceConfig::release_key`) and which signs the releases of
+    /// `release_of`.
+    fn test_key() -> &'static ring::signature::Ed25519KeyPair {
+        static KEY: std::sync::LazyLock<ring::signature::Ed25519KeyPair> =
+            std::sync::LazyLock::new(throwaway_key);
+        &KEY
+    }
+    fn test_release_key() -> [u8; 32] {
+        use ring::signature::KeyPair;
+        test_key().public_key().as_ref().try_into().unwrap()
+    }
+    /// The URL path under which the double serves the signature of `release` (a page's release).
+    fn signature_path(cloud: &Cloud, release: &Value) -> String {
+        let url = update::Release::parse(release)
+            .unwrap()
+            .signature_url()
+            .unwrap();
+        url.strip_prefix(&cloud.url("")).unwrap().to_string()
+    }
+    /// Serves the signature that `key` makes of the release, where the agent reads it.
+    fn sign_release(cloud: &Cloud, release: &Value, key: &ring::signature::Ed25519KeyPair) {
+        let manifest = update::Release::parse(release).unwrap().manifest();
+        cloud.serve_file(
+            &signature_path(cloud, release),
+            update::hex(key.sign(&manifest).as_ref()),
+        );
+    }
     /// The release `id` as the page names it: its binaries served by the double, and the package
-    /// lock, which is `lock` (served too).
+    /// lock, which is `lock` (served too), and its signature by the key of the tests.
     fn release_of(cloud: &Cloud, id: &str, files: &[(&str, &[u8])], lock: &[u8]) -> Value {
         let pin = |name: &str, bytes: &[u8]| {
             let url = cloud.serve_file(&format!("/files/{id}/{name}"), bytes.to_vec());
@@ -1155,11 +1265,13 @@ mod tests {
             .iter()
             .map(|(name, bytes)| (name.to_string(), pin(name, bytes)))
             .collect();
-        json!({
+        let release = json!({
             "id": id, "binaries": binaries,
             "os": {"image_version": "25", "debian_snapshot": "20261016T000000Z",
                    "package_lock": pin("packages.lock.json", lock)}
-        })
+        });
+        sign_release(cloud, &release, test_key());
+        release
     }
     const NAMES: [&str; 4] = [
         "pgcf-agent",
@@ -1201,6 +1313,7 @@ mod tests {
                 intervals: quick(),
                 timing: timing(),
                 gateway: None,
+                release_key: test_release_key(),
             },
         )
         .await
@@ -1402,6 +1515,138 @@ mod tests {
                 .calls()
                 .iter()
                 .all(|call| !call.contains("cloudflared")),
+            "{:?}",
+            machine.calls()
+        );
+        service.stop();
+    }
+
+    /// The node reported refusing the release with this class (the event `release_refused`).
+    fn refused(release: &str, class: &str) -> bool {
+        crate::events::seen().iter().any(|event| {
+            event["event"] == "release_refused"
+                && event["fields"]["release"] == release
+                && event["fields"]["class"] == class
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_release_the_key_did_not_sign_is_refused_with_its_class_and_nothing_of_it_is_downloaded()
+     {
+        let Some((machine, _fixture, _root)) =
+            site("update-unsigned", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        runs(&machine, "r0", &same(b"old"));
+        let cloud = Cloud::start().await;
+        let mut files = same(b"old");
+        files[0].1 = b"new agent";
+        files[1].1 = b"new gateway";
+        // The API serves no signature for the first release.
+        let unsigned = release_of(&cloud, "r1-unsigned", &files, b"{}");
+        cloud.with(|inner| {
+            inner.files.remove(&signature_path(&cloud, &unsigned));
+            inner.release = Some(unsigned);
+        });
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(30, "the release to be refused as unsigned", || {
+            refused("r1-unsigned", "release_signature_missing")
+        })
+        .await;
+
+        // A signature of another key is no better: a new page names the second release.
+        let forged = release_of(&cloud, "r2-forged", &files, b"{}");
+        sign_release(&cloud, &forged, &throwaway_key());
+        cloud.with(|inner| inner.release = Some(forged));
+        cloud.push(json!({"type": "desired"}));
+        eventually(30, "the release to be refused as forged", || {
+            refused("r2-forged", "release_signature_invalid")
+        })
+        .await;
+
+        // Nothing of either was downloaded or staged, and the node still runs what it ran.
+        let bin = machine.layout().state.join("bin");
+        for id in ["r1-unsigned", "r2-forged"] {
+            assert!(
+                cloud.requests().iter().all(|seen| !seen
+                    .path()
+                    .starts_with(&format!("/files/{id}/pgcf-"))
+                    && !seen.path().starts_with(&format!("/files/{id}/packages"))),
+                "{id}"
+            );
+            assert!(!bin.join(id).exists(), "{id}");
+        }
+        assert_eq!(crate::update::current_release(&bin).as_deref(), Some("r0"));
+        assert!(
+            machine.calls().iter().all(|call| !call.contains("restart")),
+            "{:?}",
+            machine.calls()
+        );
+
+        // A release that the key signed is installed on the same node: a refusal is not a stop.
+        let signed = release_of(&cloud, "r3-signed", &files, b"{}");
+        cloud.with(|inner| inner.release = Some(signed));
+        cloud.push(json!({"type": "desired"}));
+        eventually(30, "the signed release to be installed", || {
+            crate::update::current_release(&bin).as_deref() == Some("r3-signed")
+        })
+        .await;
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_maintenance_order_of_a_release_the_key_did_not_sign_installs_nothing_and_fails_with_the_class()
+     {
+        let Some((machine, _fixture, _root)) = site("maintenance-unsigned", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1", &same(b"bin"));
+        machine.set_packages(&[("bash", "5.1")]);
+        let cloud = Cloud::start().await;
+        let lock = json!({"packages": [
+            {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
+        ], "extra": []})
+        .to_string();
+        // The page names the release the node runs, so no install is tried, and its lock would
+        // put packages on the node as root: the signature is another key's.
+        let release = release_of(&cloud, "r1", &same(b"bin"), lock.as_bytes());
+        sign_release(&cloud, &release, &throwaway_key());
+        let operation = "op_mmmmmmmmmmmmmmmmmmmm";
+        cloud.with(|inner| {
+            inner.release = Some(release);
+            inner.orders = vec![json!({"type": "maintenance", "operation": operation})];
+        });
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(60, "the order to fail as unsigned", || {
+            cloud
+                .acknowledged("/node/v1/observations")
+                .iter()
+                .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                .any(|order| {
+                    order["operation"] == operation
+                        && order["status"] == "failed"
+                        && order["reason"] == "release_signature_invalid"
+                })
+        })
+        .await;
+        assert!(refused("r1", "release_signature_invalid"));
+        assert!(
+            cloud
+                .requests()
+                .iter()
+                .all(|seen| !seen.path().ends_with("packages.lock.json")),
+            "the lock is not even read"
+        );
+        assert!(
+            machine
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("install") && !call.starts_with("purge")),
             "{:?}",
             machine.calls()
         );
@@ -1909,6 +2154,7 @@ mod tests {
                 intervals: quick(),
                 timing: timing(),
                 gateway: None,
+                release_key: test_release_key(),
             },
         )
         .await
