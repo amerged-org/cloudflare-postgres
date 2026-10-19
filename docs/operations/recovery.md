@@ -131,8 +131,11 @@ foreign keys, and verify region/node/credential identity before switching Worker
 Restore secret values without replacing the retained agent identity. Recover PostgreSQL through
 R2 into separate targets. Validate SQL and routing before opening traffic.
 
-Restoring a daily D1 export into a scratch D1 database is open as go-live gate G6 of the ULTRA
-plan; the daily artifacts have so far only been read back.
+Open a daily D1 artifact with the
+[restore drill](infrastructure-backups.md#restore-drill): `scripts/operations/restore-infrastructure-backup.ts`
+verifies and decrypts it with the offline keyring and imports it into a new, empty D1 database.
+Use the same command for the separate D1 database this section calls for; switching the Worker
+bindings stays a separate step that needs the operator's explicit authorization.
 
 ## Integrator migration
 

@@ -322,7 +322,8 @@ Keep all referenced `CREDENTIAL_KEYS.keys[kid]` versions in protected offline
 custody, separate from R2 and D1. A D1 export contains encrypted role custody;
 it cannot recover those credentials if the matching master key versions were lost.
 Never upload a plaintext keyring alongside these objects. Disabling capture or
-changing the active key does not retire keys needed by existing archives.
+changing the active key does not retire keys needed by existing archives. The
+[restore drill](#restore-drill) opens an artifact with the complete keyring.
 
 The `PGCFINF1` envelope contains: eight-byte magic, four-byte big-endian JSON AAD
 length, UTF-8 authenticated JSON identity, 12-byte nonce, AES-GCM ciphertext, and a
@@ -335,3 +336,119 @@ SHA-256/length from the API receipt and GCM/AAD/plaintext hash before writing or
 restoring recovered SQL. Never restore an unverified or partial object.
 Use the existing [recovery runbook](recovery.md) for controlled D1 restoration;
 restoration changes live state and requires explicit operator authorization.
+
+## Restore drill
+
+An artifact is a backup only once it has been opened. The drill decrypts one artifact with the
+offline keyring and imports it into a new, empty scratch D1 database. It reads one R2 object and
+writes only that scratch database; the control database is never touched. Run it for the first
+complete artifact (go-live gate G6 of the
+[ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md)), after any change of
+the keyring or of the envelope code, and before relying on the backup in a recovery.
+
+The tool is `scripts/operations/restore-infrastructure-backup.ts` (Node, no packages beyond the
+repository's). It does not share code with the Worker: it reads the layout documented under
+[offline recovery custody](#offline-recovery-custody), so a restore needs nothing of the Worker.
+It uses wrangler for Cloudflare (`apps/api/node_modules/.bin/wrangler` after `pnpm install`, or any
+wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` set to an account token that can read the archive bucket and edit D1.
+
+1. **Receipt (optional, recommended).** `GET /v1/infrastructure-backups` returns only the latest
+   run, so save the answer on the day of the artifact you will open. Send the administrator key
+   without putting it on a command line:
+
+   ```sh
+   printf 'header = "Authorization: Bearer %s"\n' "$PGCF_API_KEY" \
+     | curl --fail --silent --show-error --config - \
+         "$PGCF_API_URL/v1/infrastructure-backups" > receipt.json
+   ```
+
+   Without a receipt (the control database may be the thing that was lost) the artifact still
+   authenticates its own identity and plaintext hash; the tool then prints `receipt: not given`.
+
+2. **Download the object.** The key is `latest.artifacts[0].object_key` of the receipt, in the
+   archive bucket of the configured `d1_region_id`:
+
+   ```sh
+   wrangler r2 object get "<ARCHIVE_BUCKET>/<object_key>" --file d1-control.pgcfenc --remote
+   ```
+
+3. **Create the scratch database**, from an empty directory so that wrangler reads and changes no
+   configuration:
+
+   ```sh
+   (cd "$(mktemp -d)" && wrangler d1 create pgcf-restore-drill --jurisdiction eu)
+   ```
+
+4. **Load the keyring.** It is the complete `CREDENTIAL_KEYS` JSON from offline custody
+   (`{"active":"<id>","keys":{"<id>":"<base64url, 32 bytes>"}}`). Put it in an environment
+   variable without echoing it; the tool takes the variable's name, never its value, and uses the
+   key version the artifact names, whichever version is active:
+
+   ```sh
+   read -rs PGCF_RESTORE_KEYS && export PGCF_RESTORE_KEYS
+   ```
+
+5. **Import.**
+
+   ```sh
+   node scripts/operations/restore-infrastructure-backup.ts import \
+     --input d1-control.pgcfenc --keys-env PGCF_RESTORE_KEYS --receipt receipt.json \
+     --database pgcf-restore-drill --wrangler apps/api/node_modules/.bin/wrangler
+   ```
+
+   The tool first reads the artifact's header, then:
+   - resolves `--database` by its exact name to one D1 database ID, and refuses a name that
+     matches none or several, the database the artifact was exported from (the AAD names it), and
+     any database that already has tables;
+   - decrypts into a `0600` file in a `0700` temporary directory, authenticating the GCM tag, the
+     AAD and the plaintext hash and length, and holds the artifact to the receipt (run, key
+     version, hashes, sizes, object key) when one is given; a flipped or missing byte, a truncated
+     file or another key stops it with nothing written;
+   - writes every `CREATE TABLE` statement ahead of the rest, byte for byte (see below), and runs
+     `wrangler d1 execute <database ID> --remote --yes --file` from that directory, which holds no
+     wrangler configuration, so a configured binding cannot redirect the import;
+   - removes the directory, and counts the tables of the scratch database.
+
+   It prints identities, sizes, hashes and counts. It never prints SQL, the keyring or
+   wrangler's own text about the import, which can quote a statement; if an import fails, it
+   reports wrangler's exit code and the scratch database is unchanged (D1 imports are atomic).
+   To read wrangler's message, write the verified SQL with `decrypt --input FILE --output FILE
+   --keys-env NAME` (mode `0600`, never over an existing file), run the import by hand, and delete
+   the file afterwards.
+
+6. **Check the scratch database** against the live one. `d1_migrations` and `regions` must match;
+   the other counts may have moved since the export began.
+
+   ```sh
+   wrangler d1 execute pgcf-restore-drill --remote --command "PRAGMA foreign_key_check"
+   wrangler d1 execute pgcf-restore-drill --remote --command \
+     "SELECT (SELECT count(*) FROM d1_migrations) AS migrations, (SELECT count(*) FROM regions) AS regions, (SELECT count(*) FROM nodes) AS nodes, (SELECT count(*) FROM databases) AS databases"
+   ```
+
+7. **Clean up.** `wrangler d1 delete pgcf-restore-drill`, `rm d1-control.pgcfenc receipt.json`,
+   `unset PGCF_RESTORE_KEYS`.
+
+8. **Record** the artifact's day, its plaintext and encrypted byte counts, the tool's output lines,
+   the table count and the check results in the ULTRA plan. Nothing else of the content.
+
+**Why the tool reorders the SQL.** D1's export lists each table's rows right after its
+`CREATE TABLE`, and the tables in the order they were created. A migration that rebuilt a table
+puts it after the tables that reference it: in this repository's migrations `regions` comes after
+`nodes`, `databases` and others. SQLite refuses the first row of a table whose referenced table
+does not exist yet (`no such table: main.regions`), even under `PRAGMA defer_foreign_keys`, which
+defers constraint violations only. The local export of the repository's migrations (wrangler's
+local D1, SQLite 3.53) fails to import this way; with every `CREATE TABLE` first it imports
+completely, and a second export holds the same statements as the first. The drill is where the
+provider's own export is first tried. The same holds for a restore of the control database: do not
+import a decrypted file by hand; use `import`.
+
+| The tool says | Meaning |
+| --- | --- |
+| `authentication failed` | The file was changed or cut, or the key is not the one that wrote it. Check the key version the artifact names and the keyring in custody. |
+| `not a complete PGCFINF1 envelope` | The download is truncated, empty or not an artifact of this layout. Download it again. |
+| `the keyring has no usable key version` | The keyring lacks the version the artifact names. Find the custody copy that holds it. |
+| `differs from the API's receipt` | The artifact is not the one the receipt describes, or it was replaced in R2. Treat it as unverified. |
+| `is the database this artifact was exported from` | The name resolves to the control database. Create a new scratch database. |
+| `already has N tables` | The target is not empty. Create a new scratch database. |
+
