@@ -89,7 +89,8 @@ every flow updates in small steps.
 sockets, and tests give it another root. The rest are named where they are used: `credentials/`,
 `enrollment/seed.json` and `node-key.pk8` in `link/identity.rs` and `link/file.rs` (and
 `machine/node.rs`, which writes the gateway's environment and the Tunnel token there), `usage.json`
-in `agent/mod.rs`, `bin/current` in `update.rs`, `boot-id` in `diagnostics/boot_report.rs` and
+in `agent/mod.rs`, `bin/current` in `update.rs`, `main.rs` and `machine/node.rs` (and in the image's
+`pgcf-agent.service` and `pgcf-gateway.service`), `boot-id` in `diagnostics/boot_report.rs` and
 `probes-done` in `service.rs`.
 
 ## PostgreSQL configuration

@@ -63,9 +63,9 @@ A database lives on one node of one region, chosen at creation (`region_id`). Th
 it to another node of the region under the same ID (`POST /v1/databases/{id}/move`, admin): the
 source proves the sleep, your connections get `57P03` while the move runs, and a move that fails
 leaves the database where it was. The target may be the database's own node (a move from one
-volume to another); a move to another node needs a second node in the region, and there is one
-today. Automatic rebalancing comes after go-live. The hostname is the same for every region; the Edge
-finds the region from the database's record.
+volume to another); a move to another node needs a second node in the region, and a region has
+only one node until the owner approves EU2 (plan 1.11). Automatic rebalancing comes after go-live.
+The hostname is the same for every region; the Edge finds the region from the database's record.
 
 The installation serves one region: EU. Its region ID is `eu-dev` (the Worker and region IDs carry
 the name `dev`). `GET /v1/regions` with your key lists `{id, provider_region}` of the regions that
@@ -422,15 +422,16 @@ retried at once.
 - A running database takes new memory and CPU limits as live limits on its unit, without ending its
   sessions; PostgreSQL's own settings follow the new memory at its next start, and storage grows
   online. A hibernated database changes immediately and starts on the new class at its next wake:
-its memory and CPU are admitted by its node then, while its storage growth must fit the node's
-logical cap now (see below).
+its memory and CPU are admitted by its node then, while its storage growth must fit the node now
+(see below).
 - The target class must be enabled and within the region's memory maximum. A running database that
   grows must fit the node now, else `503 capacity_exhausted` ("Current node has insufficient
-  memory, CPU or storage"): its active RAM would reach 80 % with the extra memory, its CPU would
-  exceed the node's cores, or its storage would take the node's sold storage past four times its
-  pool. A smaller or equal size needs no room. A hibernated database waits for its next wake only
-  for memory and CPU; growth of its storage is sold from now on and is refused with the same
-  `503` when it would pass the logical cap.
+  memory, CPU or storage"): the node has no observation from the last 180 s, its active RAM would
+  reach 80 % with the extra memory, its CPU would exceed the node's cores, or, for extra storage,
+  the node reports no thin pool or no room in it, or its sold storage would pass four times its
+  pool. A smaller or equal size needs no room. A hibernated database waits for its next wake only for
+  memory and CPU; growth of its storage is sold from now on and is refused with the same `503` on
+  the same storage test.
 - Storage may only grow; shrinking is `400` ("Storage shrink is not supported"). Growth through the
   API is **not yet verified live**.
 - The operator can roll a new revision of a resource profile out to every database assigned to
@@ -940,8 +941,9 @@ any price.
 
 Alerts are infrastructure alerts for the **operator**. You do not receive them: they go to the
 operator's alert webhook, which was configured on 2026-10-19. Four active episodes were delivered
-that day and the receiver acknowledged them (plan 11.2); go-live gate G5 still lacks the named
-recipient's confirmation and a runbook action for every kind of alert. The operator reads their state in
+that day and the receiver acknowledged them (plan 11.2); go-live gate G5 is met on the receiver
+side, and every kind of alert carries its runbook action. The plan keeps the gate open until the
+owner confirms the recipient. The operator reads the alerts' state in
 `GET /v1/operational-health?scope=regions`.
 
 One episode exists per region and kind. A new episode gets a new `event_id`, is delivered at least
