@@ -148,8 +148,11 @@ pub fn volume_extend(config: &Config, id: &VolumeId, size_bytes: u64) -> Vec<Str
 pub fn volume_remove(config: &Config, id: &VolumeId) -> Vec<String> {
     words(["lvremove", "--quiet", "--yes", &volume_path(config, id)])
 }
+/// `--noflush`: without it the kernel first commits the pool's metadata if a transaction is open,
+/// so the 5 s poll would force a commit whenever it finds one. With it the status shows the last
+/// committed transaction ID, which the agent does not read, and the block counts it does read.
 pub fn dm_status_pool() -> Vec<String> {
-    words(["dmsetup", "status", "--target", "thin-pool"])
+    words(["dmsetup", "status", "--noflush", "--target", "thin-pool"])
 }
 pub fn dm_table_pool() -> Vec<String> {
     words(["dmsetup", "table", "--target", "thin-pool"])
@@ -361,7 +364,10 @@ mod tests {
 
     #[test]
     fn the_pool_and_thin_status_are_read_with_dmsetup() {
-        assert_eq!(line(dm_status_pool()), "dmsetup status --target thin-pool");
+        assert_eq!(
+            line(dm_status_pool()),
+            "dmsetup status --noflush --target thin-pool"
+        );
         assert_eq!(line(dm_table_pool()), "dmsetup table --target thin-pool");
         assert_eq!(line(dm_status_thin()), "dmsetup status --target thin");
         assert_eq!(dm_name("pgcf", "pgcf_thinpool"), "pgcf-pgcf_thinpool");

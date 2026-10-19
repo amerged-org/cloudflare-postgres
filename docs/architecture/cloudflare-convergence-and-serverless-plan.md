@@ -1945,7 +1945,7 @@ Worst case for 256 MiB (*estimate*): 32 + 25 × (2 + 4) + 16 + 15 ≈ 215 MiB.
   - `mkfs.ext4 -J size=8 -i 65536 -m 1 -E lazy_itable_init=0,lazy_journal_init=0`;
   - mounted 0700 `nosuid,nodev,noexec,noatime`, without `discard`, with `fstrim` after each clean sleep.
 - **Full-volume recovery:** `tune2fs -m 0` once, and back to `-m 1` after the next resize or when use drops.
-- **Sampling:** commands use `--reportformat json`. Pool status every 5 s (`dmsetup status`, or the read-only `devicemapper` crate). Per-LV `data_percent`, and `df` space and inodes, every 60 s.
+- **Sampling:** commands use `--reportformat json`. Pool status every 5 s (`dmsetup status --noflush`, so that the poll forces no commit of the pool's metadata, or the read-only `devicemapper` crate). Per-LV `data_percent`, and `df` space and inodes, every 60 s.
 
 **Barman jobs:**
 - Started with `systemd-run --uid=pgcf-<id> --slice=<backup slice> -p MemoryMax=<per job> -p InaccessiblePaths=<other databases, agent state>`, with `MemoryMax` 128M for a WAL upload, 192M for a WAL fetch and 256M for a base backup or restore (7.5).
