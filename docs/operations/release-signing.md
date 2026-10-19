@@ -84,9 +84,9 @@ that node boots their image, whose agent trusts their key. That is an open decis
   node checks each digest of its release against the signed text. So a leaked token, or any code that
   runs in the signing job, can have a signature made for digests of its own as the release of that
   commit, and the signature can be used by whoever holds an administrator key and write access to the
-  bucket, the very threat the key exists for. Only the owner registering the real build first (the
-  API's 409 goes to whoever registers first, and the run's artifacts stay downloadable for 7 days) keeps
-  such a release from being installable. Trusting the digests is trusting the workflow file on `main`,
+  bucket, the very threat the key exists for. Only the owner registering the real build first (the first
+  registration of a release id stands, the API answers 409 to any later, different one, and the run's
+  artifacts stay downloadable for 7 days) keeps such a release from being installable. Trusting the digests is trusting the workflow file on `main`,
   which is the next point.
 - **Who asks.** The job `sign-release` of `.github/workflows/ci.yml`. It `needs: [check, node-image]`,
   so a commit whose tests failed (`check` runs `cargo test`, which includes the agent's verification
@@ -289,10 +289,14 @@ holder of the key can also sign a transition release that carries their own key.
     `ci.yml` on `main`, the pinned actions it uses, and the locked dependencies that `node-image` (which
     builds the bytes that are signed) and `sign-release` run. Whoever can push to `main`, change
     `ci.yml` there, or get code into one of those dependencies can have digests of their choosing signed.
-    A token that leaks, or is taken by any code in that job, can have **any** digests signed as
-    `sha-<its own commit>` until its `exp` plus a minute of skew (a few minutes after it was issued);
-    only the owner registering the real build first, which the API's 409 enforces for the second
-    registrar, stops that release from being installable.
+    A token that leaks can have **any** digests signed as `sha-<its own commit>` until its `exp` plus a
+    minute of skew (a few minutes after it was issued). Code that runs in the job does not need to take
+    a token: it takes the credential that mints them (`ACTIONS_ID_TOKEN_REQUEST_URL` and
+    `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, named under "Who asks") and can keep minting fresh tokens, each
+    bound to `sha-<its own commit>`, for as long as that credential is valid, which is at least until the
+    job ends (`timeout-minutes: 30`). In both cases only the owner registering the real build first,
+    which the API's 409 enforces for the second, different registration, stops that release from being
+    installable.
   - *Workers edit access to the Cloudflare account.* Whoever can deploy a version of the signer Worker
     (an account member, or any API token with Workers Scripts: Edit) can deploy code that returns
     `env.RELEASE_SIGNING_KEY` and keeps the key permanently, or that signs anything. Redeploying the real

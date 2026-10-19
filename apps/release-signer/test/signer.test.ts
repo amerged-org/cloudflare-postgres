@@ -159,8 +159,8 @@ describe("what it signs", () => {
     // no state in which "once" could be counted, so the same token also gets a valid signature of
     // DIFFERENT digests under the same release id: it ties the id to the commit and cannot know
     // whether the digests are the build of that commit. What makes one content the release is where
-    // it is registered: the API's 409 goes to whoever registers a release id first, and the nodes
-    // check every digest against the signed text.
+    // it is registered: the first registration of a release id stands and the API answers 409 to a
+    // later, different one, and the nodes check every digest against the signed text.
     const h = harness();
     const first = await (await h.post()).text();
     const second = await (await h.post()).text();
