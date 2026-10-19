@@ -142,7 +142,7 @@ const page = {
     backup: {
       wal_uploads: 2,
       base_backups: 1,
-      memory_mib: { wal_upload: 128, wal_fetch: 192, base_backup: 256 },
+      memory_mib: { wal_upload: 128, wal_fetch: 128, base_backup: 256 },
     },
     io: { write_bytes_per_second: 16_000_000, write_iops: 1000 },
   },

@@ -337,7 +337,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -611,7 +611,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -666,7 +666,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -799,7 +799,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -854,7 +854,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -909,7 +909,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -965,7 +965,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -1563,7 +1563,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -1870,7 +1870,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -2176,7 +2176,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           }
@@ -2748,7 +2748,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -2827,7 +2827,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -3135,7 +3135,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -3259,7 +3259,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -3383,7 +3383,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -3502,7 +3502,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -3814,7 +3814,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -4121,7 +4121,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -4245,7 +4245,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -4369,7 +4369,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -4493,7 +4493,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -4630,7 +4630,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -4767,7 +4767,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -4900,7 +4900,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -5033,7 +5033,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -5167,7 +5167,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -5293,7 +5293,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -5425,7 +5425,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -5569,7 +5569,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -5686,7 +5686,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -5809,7 +5809,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -5929,7 +5929,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -6044,7 +6044,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -6167,7 +6167,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -6290,7 +6290,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -6413,7 +6413,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -6537,7 +6537,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -6670,7 +6670,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -6794,7 +6794,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -6962,7 +6962,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -7261,7 +7261,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },
@@ -7555,7 +7555,7 @@
             "base_backups": 1,
             "memory_mib": {
               "wal_upload": 128,
-              "wal_fetch": 192,
+              "wal_fetch": 128,
               "base_backup": 256
             }
           },

@@ -7,7 +7,7 @@
 //!   for a connection, tells it whose archive a request concerns. `ok` to an archive request
 //!   follows the object in R2 and the entry in the upload log; the agent never deletes in R2.
 //! - `job`: the barman-cloud command lines, the transient `systemd-run` unit around each (the
-//!   database's user, `pgcf-backup.slice`, its volume alone, one credential), and the limits.
+//!   database's user, `pgcfbackup.slice`, its volume alone, one credential), and the limits.
 //! - `recovery`: the settings and files that make a restored volume recover through the socket.
 //! - `restore`: the executor of a restore, a point-in-time restore and a move target. It runs
 //!   the steps of plan 7.8 and 9.5 over the pieces above and asks the modules that own units and
