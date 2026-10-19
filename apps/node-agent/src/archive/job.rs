@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The barman-cloud jobs of a database (plan 7.4-7.8): each runs as the database's own Linux user
-//! in `pgcf-backup.slice`, as a transient unit the agent starts with `systemd-run`. The unit has
+//! in `pgcfbackup.slice`, as a transient unit the agent starts with `systemd-run`. The unit has
 //! network access and a memory limit of its own; it sees its database's volume and nothing else of
 //! the node's state, and it holds the one credential scoped to its database's archive prefix.
 use crate::credentials::{Access, Credential, Scope};
@@ -16,8 +16,10 @@ use tokio::{
     time::Instant,
 };
 
-/// The slice of all backup jobs (`infra/node-image`): CPU and IO weight 20, `MemoryMax=512M`.
-pub const BACKUP_SLICE: &str = "pgcf-backup.slice";
+/// The slice of all backup jobs (`infra/node-image`): CPU and IO weight 20, `MemoryMax=512M`. It has
+/// no dash, because systemd nests `pgcf-backup.slice` inside `pgcf.slice`, under the databases'
+/// memory ceiling; a name the image has no unit for gets a slice without these limits.
+pub const BACKUP_SLICE: &str = "pgcfbackup.slice";
 /// Barman's server name for every database; the archive prefix already makes it unique.
 pub const SERVER_NAME: &str = "database";
 /// What the agent hides from a job: every other database's volume and the agent's own state.
@@ -665,15 +667,19 @@ mod tests {
     }
     const DEST: &str = "s3://pgcf-eu/eu-dev/abcdefghijklmnopqrst/g1-op_aaaaaaaaaaaaaaaaaaaa";
     const ENDPOINT: &str = "https://account.r2.cloudflarestorage.com";
+    /// The memory the busiest mix of jobs holds at once: the WAL calls of the larger kind and the
+    /// big jobs (plan 4.5).
+    fn busiest_mib(limits: &Limits) -> u64 {
+        limits.wal_jobs as u64 * limits.wal_upload_mib.max(limits.wal_fetch_mib)
+            + limits.big_jobs as u64 * limits.base_backup_mib
+    }
 
     #[test]
     fn the_limits_fill_the_backup_budget_of_the_plan_and_no_more() {
         let limits = Limits::default();
         assert_eq!((limits.wal_jobs, limits.big_jobs), (2, 1));
         // Plan 4.5: two WAL calls and one base backup or restore in 512 MiB.
-        let busiest = limits.wal_jobs as u64 * limits.wal_upload_mib.max(limits.wal_fetch_mib)
-            + limits.big_jobs as u64 * limits.base_backup_mib;
-        assert_eq!(busiest, 512);
+        assert_eq!(busiest_mib(&limits), 512);
         assert_eq!(Kind::WalArchive.memory_mib(&limits), 128);
         assert_eq!(Kind::WalFetch.memory_mib(&limits), 128);
         for kind in [Kind::BaseBackup, Kind::Restore, Kind::BackupList] {
@@ -814,6 +820,55 @@ mod tests {
     }
 
     #[test]
+    fn a_job_runs_in_the_backup_slice_the_node_image_ships_with_the_limits_the_jobs_fill() {
+        let db = database();
+        let wal = Job::wal_archive(
+            &store('a'),
+            &db,
+            "000000010000000000000003",
+            Duration::from_secs(60),
+        );
+        let arguments = systemd_run_arguments(
+            "unit",
+            &db,
+            &wal,
+            128,
+            Path::new("/e"),
+            Path::new("/usr/bin"),
+        );
+        let slice = arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--slice="))
+            .expect("a job names its slice");
+        // The image's units are the source of the name. systemd starts a job in a slice it has no
+        // unit file for in a slice it creates on the spot, without the image's limits.
+        let units = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../infra/node-image/mkosi.extra/usr/lib/systemd/system");
+        let mut shipped: Vec<String> = std::fs::read_dir(&units)
+            .expect("the node image's units")
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".slice"))
+            .collect();
+        shipped.sort();
+        assert!(
+            shipped.iter().any(|name| name == slice),
+            "a backup job is started in {slice}; the node image ships {shipped:?}"
+        );
+        // The slice holds the jobs to the budget they are sized for (plan 4.5), which is not the
+        // databases' slice with its share of the RAM.
+        let unit = std::fs::read_to_string(units.join(slice)).unwrap();
+        let memory_max = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("MemoryMax="))
+            .expect("the backup slice limits memory");
+        assert_eq!(
+            memory_max,
+            format!("{}M", busiest_mib(&Limits::default())),
+            "{slice}"
+        );
+    }
+
+    #[test]
     fn a_unit_runs_as_the_database_in_the_backup_slice_and_sees_only_its_volume() {
         let db = database();
         let store = store('a');
@@ -838,7 +893,7 @@ mod tests {
             "--unit=pgcf-job-wal-archive-abcdefghijklmnopqrst-7",
             "--uid=pgcf-abcdefghijklmnopqrst",
             "--gid=pgcf-abcdefghijklmnopqrst",
-            "--slice=pgcf-backup.slice",
+            &format!("--slice={BACKUP_SLICE}"),
             "-p",
             "MemoryMax=128M",
             "-p",

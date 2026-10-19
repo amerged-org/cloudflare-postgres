@@ -301,9 +301,12 @@ database_directory_not_listable() {
 }
 
 # systemd nests a slice whose name has a dash inside the slice before the dash. A backup job must
-# not run under the databases' slice and its memory ceiling.
+# not run under the databases' slice and its memory ceiling. A slice name without a unit file in
+# the image is not refused: systemd creates the slice on the spot, with no limits. The agent's name
+# for the slice (apps/node-agent/src/archive/job.rs) is held to the image's unit by that crate's
+# tests; the limit read here holds this name to the unit as well.
 backup_slice_top_level() {
-	local cgroup
+	local cgroup memory
 	cgroup=$(systemd-run --quiet --pipe --wait --collect --slice=pgcfbackup.slice cat /proc/self/cgroup) || return 1
 	case $cgroup in
 	0::/pgcfbackup.slice/*) ;;
@@ -312,6 +315,11 @@ backup_slice_top_level() {
 		false
 		;;
 	esac
+	memory=$(systemctl show --property=MemoryMax --value pgcfbackup.slice) || return 1
+	[ "$memory" = 536870912 ] || {
+		echo "pgcfbackup.slice MemoryMax = $memory"
+		false
+	}
 }
 
 check no_failed_units no_failed_units
