@@ -54,7 +54,10 @@ key still does not protect is under "What is and is not protected".
   `packages/contracts/src/releases.ts`; the agent builds the same text of its desired page (which
   carries the image's four facts and never its URL: a node does not fetch the image), and a shared
   vector keeps the two equal. The kernel and the digests of packages and host files that a node
-  reports are derived from the lock and the list and are not in it.
+  reports are derived from the lock and the list and are not in it. The API checks the digest of the
+  host files against the list at registration; the kernel and the digest of the packages, which the
+  registration script derives from the lock, are taken as registered, and only the `os_converged`
+  report reads them, so the first registration of a release id decides what that report compares with.
 - **The signer** takes `POST /sign` and nothing else (every other path is 404, every other method 405).
   The caller sends the manifest's fields, which `ReleaseManifestFields` in the contracts defines, as
   JSON, with a GitHub Actions OIDC identity token as the bearer credential. The signer checks the
@@ -150,10 +153,13 @@ key still does not protect is under "What is and is not protected".
     edited in D1 or registered before the API checked can never be installed. An unverifiable row
     leaves the addition `audited` with `install_blocker: release_unverified` (`GET
     /v1/nodes/additions/{id}`); no installer is rendered, and the next pass (30 s) asks again, so
-    assigning a signed release is enough. The installer in the rescue system then checks the four image
-    facts it is given, as it always did: its userData is rendered by the Worker from the verified spec
-    and carries the installer script itself, so a second verifier inside the rescue system would sit
-    where whoever can alter the userData could also alter it.
+    assigning a signed release is enough, while the workflow runs: AddNode makes 288 passes (about
+    2.4 h) and then ends. After that only the capacity step of a region with a node policy (every
+    minute) or the approval of a purchase starts it again; for an adoption or a recovery in a region
+    without a policy, cancel the addition and request it again. The installer in the rescue system
+    then checks the four image facts it is given, as it always did: its userData is rendered by the
+    Worker from the verified spec and carries the installer script itself, so a second verifier inside
+    the rescue system would sit where whoever can alter the userData could also alter it.
   A node's desired page carries the image's four facts (`release.image`, never its URL) so that the
   agent can build the same text.
 - **The node.** Before it downloads, stages or installs anything of a release, and before a maintenance
@@ -234,7 +240,10 @@ no step prints one.
    they were signed as the current manifest version (`0077` without a signature, `0079` before the host
    files, `0080` before the image) and the region assignments that name them; the nodes keep what they
    run. From this deploy the API verifies every registration and every installer it renders with the
-   key of this commit.
+   key of this commit. Run the migrations and the Worker's deploy one after the other without a pause:
+   until the Worker is deployed, the one that still runs accepts a registration of the older format
+   without checking its signature, and an administrator who registers one for the id of the new release
+   in between takes the id; the real registration does not succeed until that row is deleted from D1.
 
 6. **Download the artifacts and register.** A run of `main` keeps two artifacts for 7 days: the release
    files (`pgcf-node-release-<sha>-<attempt>`) and the signature (`pgcf-node-signature-<sha>-<attempt>`).
@@ -254,15 +263,19 @@ signer accepts (`ReleaseManifestFields`, the signer builds the text itself), the
 its page, the text the API rebuilds from a spec, and the page the API serves. The order that never leaves
 a push to `main` unsigned for long and never installs a release nobody could verify is:
 
-1. Deploy the signer from the commit (`cd apps/release-signer && npx wrangler deploy`). Until `main`
-   carries the new CI, a push to `main` is signed by a signer that expects the new fields and is refused
+1. Deploy the signer from a checkout of the branch tip that is about to be merged (`cd
+   apps/release-signer && npx wrangler deploy`). The signer bundles the manifest's contract
+   (`ReleaseManifestFields`), so the checkout has to hold the new one even where the signer's own files
+   did not change; a checkout of the merge commit does as well. Until `main` carries the new CI, a
+   push to `main` is signed by a signer that expects the new fields and is refused
    (`manifest_invalid`), so do the next two steps without a pause.
 2. Merge. The job `sign-release` signs the new manifest. If the merge came before the deploy of the
    signer, the job is red; deploy the signer and re-run the failed jobs of that run (the job downloads the
    build's artifact by id and does not build again).
-3. Deploy the API of the merge commit with its migrations. They remove the releases of the older format
-   and their region assignments (the nodes keep what they run, and an agent that cannot read the new page
-   gets none, because no release is assigned).
+3. Deploy the API of the merge commit with its migrations, the migrations and the Worker one after the
+   other without a pause (the reason is in step 5 of "Setting it up"). They remove the releases of the
+   older format and their region assignments (the nodes keep what they run, and an agent that cannot
+   read the new page gets none, because no release is assigned).
 4. Download the two artifacts of that run, check out the commit that was built, register the release
    (`register-node-image.ts`, `--signature`) and assign it to the region from revision 0
    ([infra/node-image/README.md](../../infra/node-image/README.md)). The API refuses a release signed for

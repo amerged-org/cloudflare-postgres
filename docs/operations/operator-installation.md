@@ -102,13 +102,17 @@ because a new paid resource needs the owner's explicit, costed go. Put the firew
   is unset or wrong, or the provider cannot be read; the firewall is not `active`; it has a rule
   that accepts (a rule that drops is fine); the instance is not listed yet, or listed with a status
   other than `ok`, and stays so (`error_processing`). Fix the cause; AddNode asks again on every
-  cycle and starts the install when the firewall is confirmed.
+  cycle and starts the install when the firewall is confirmed. It makes 288 cycles (about 2.4 h) and
+  then ends; after that only the capacity step of a region with a node policy (every minute) or the
+  approval of a purchase starts it again, and for an adoption or a recovery in a region without a
+  policy the addition is cancelled and requested again.
 - Before it issues the tokens, AddNode verifies the signature of the region's release against the
   manifest rebuilt from the stored spec (the image's digests included) with the release public key of
   the API Worker. A row that does not verify (edited in D1, or registered by a path that did not
   check it) leaves the addition `audited` with `install_blocker` `release_unverified`; no tokens are
   issued and no rescue is requested. Register a release signed by the signer and assign it to the
-  region ([release-signing.md](release-signing.md)); the next cycle goes on.
+  region ([release-signing.md](release-signing.md)); the next cycle goes on, within the 288 cycles
+  above.
 - To verify an install, try a TCP connect to port 22 of the instance's public IPv4 address from
   outside during the rescue and after the reboot. Both must time out.
 
