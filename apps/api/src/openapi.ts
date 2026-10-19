@@ -58,7 +58,7 @@ const nodeRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "POST /node/v1/volumes": [400, 401, 403, 500],
   "POST /node/v1/events": [400, 401, 403, 500],
   "POST /node/v1/usage": [400, 401, 403, 500],
-  "POST /node/v1/diagnostics": [400, 401, 403, 500],
+  "POST /node/v1/diagnostics": [400, 401, 403, 404, 500],
 };
 const errors: Record<number, string> = {
   400: "Invalid request",

@@ -20,6 +20,7 @@ import {
 import { RegionRouteKeyring, RolePassword } from "./auth.ts";
 import { base64urlToBytes, bytesToBase64url, bytesToHex } from "./encoding.ts";
 import {
+  ApiKeyId,
   DATABASE_ID_PATTERN,
   DatabaseId,
   NodeId,
@@ -852,6 +853,71 @@ export const NodeOrder = z.discriminatedUnion("type", [
 ]);
 export type NodeOrder = z.infer<typeof NodeOrder>;
 
+// ---------- Probes on request (POST /v1/nodes/{id}/diagnostics) ----------
+
+/**
+ * What an administrator may ask a node to read (SEC-09). The node has no shell, and the agent is
+ * the only thing that can look at it: each probe is a fixed command or a read of fixed files that
+ * the agent builds itself, and a request names the probe and three integers, never a command, a
+ * path or a unit. `journal`: the lines of the agent, the gateway, cloudflared, networkd, PID 1 and
+ * the kernel, as the boot report has them; `kernel`: the kernel's lines; `boots`: the boots the
+ * journal holds; `failed_units`: `systemctl --failed`; `sockets`: the socket units; `listeners`:
+ * the listening TCP, UDP and Unix sockets; `pressure`: the kernel's pressure, memory and load
+ * figures; `pool`: the thin pool's fill. `boot` is 0 for this boot and -1 for the one before,
+ * `since_seconds` and `lines` bound the journal's reading. A probe that does not read the journal
+ * ignores them.
+ */
+export const NODE_PROBES = [
+  "journal",
+  "kernel",
+  "boots",
+  "failed_units",
+  "sockets",
+  "listeners",
+  "pressure",
+  "pool",
+] as const;
+export const NodeProbe = z.enum(NODE_PROBES);
+export type NodeProbe = z.infer<typeof NodeProbe>;
+export const NODE_PROBE_BOOTS = [0, -1] as const;
+export const NODE_PROBE_SINCE_SECONDS_MIN = 60;
+export const NODE_PROBE_SINCE_SECONDS_MAX = 86_400;
+export const NODE_PROBE_LINES_MAX = 2000;
+/** A desired page lists at most this many open requests, the oldest first. */
+export const NODE_PROBE_REQUESTS_MAX = 8;
+/** A request that no result answered is expired after this long, and leaves the desired page. */
+export const NODE_PROBE_EXPIRY_SECONDS = 600;
+/** The JSON body of a result: the agent cuts its output until it fits. */
+export const NODE_PROBE_RESULT_MAX_BYTES = 1024 * 1024;
+const ProbeBoot = z.union([z.literal(0), z.literal(-1)]);
+const ProbeSinceSeconds = z
+  .number()
+  .int()
+  .min(NODE_PROBE_SINCE_SECONDS_MIN)
+  .max(NODE_PROBE_SINCE_SECONDS_MAX);
+const ProbeLines = z.number().int().min(1).max(NODE_PROBE_LINES_MAX);
+
+/** `POST /v1/nodes/{id}/diagnostics`: what to read. The values left out are these defaults. */
+export const NodeProbeRequest = z.strictObject({
+  probe: NodeProbe,
+  boot: ProbeBoot.default(0),
+  since_seconds: ProbeSinceSeconds.default(3600),
+  lines: ProbeLines.default(200),
+});
+export type NodeProbeRequest = z.infer<typeof NodeProbeRequest>;
+export const NodeProbeAccepted = z.strictObject({ diagnostic_id: z.uuid() });
+export type NodeProbeAccepted = z.infer<typeof NodeProbeAccepted>;
+
+/** A request on the desired page: open, not expired, and not yet answered. */
+export const NodeDiagnosticRequest = z.strictObject({
+  id: z.uuid(),
+  probe: NodeProbe,
+  boot: ProbeBoot,
+  since_seconds: ProbeSinceSeconds,
+  lines: ProbeLines,
+});
+export type NodeDiagnosticRequest = z.infer<typeof NodeDiagnosticRequest>;
+
 /**
  * One page of the node's desired state. A database the pages do not name is never stopped or
  * deleted for that; only an order or a desired state does that. The page of a fenced node (it
@@ -872,6 +938,17 @@ export const NodeDesiredPage = z
     credentials_revision: Positive,
     /** Every open order, on every page. */
     orders: z.array(NodeOrder).max(NODE_ORDER_LIMIT),
+    /**
+     * The probes an administrator asked for that the node has not answered, at most
+     * `NODE_PROBE_REQUESTS_MAX`, oldest first; left out when there are none. They are on the first
+     * page of a full pull only, not on a pull of named databases (which a wake's pull is, and
+     * which stays as fast as it was) or on a later page. The agent runs each once and posts the
+     * result to `/node/v1/diagnostics`. A fenced node's page has none.
+     */
+    diagnostics: z
+      .array(NodeDiagnosticRequest)
+      .max(NODE_PROBE_REQUESTS_MAX)
+      .optional(),
     databases: z.array(NodeDesiredDatabase).max(NODE_DESIRED_PAGE_LIMIT_MAX),
     next: DatabaseId.nullable(),
   })
@@ -1515,6 +1592,58 @@ export const NodeDiagnostic = NodeDiagnosticSummary.extend({
   report: NodeBootReport,
 });
 export type NodeDiagnostic = z.infer<typeof NodeDiagnostic>;
+
+/**
+ * POST /node/v1/diagnostics with `kind` "probe": the answer to one request on the desired page.
+ * `status` is "failed" when the command ended with a status other than 0 or could not be run, and
+ * `text` then holds that status and what the command printed. `journal` and `kernel` answer with
+ * `entries`, reduced as a boot report's are (at most `lines`, oldest first, and none of a
+ * database's unit or of a backup job); every other probe answers with `text`, with the lines that
+ * name a database's unit or a backup job left out. The side a probe does not answer with is
+ * empty. The body is at most 1 MiB: the agent drops the oldest entries, or the end of the text,
+ * until it fits.
+ */
+export const NodeProbeResult = z
+  .strictObject({
+    kind: z.literal("probe"),
+    diagnostic_id: z.uuid(),
+    probe: NodeProbe,
+    status: z.enum(["ok", "failed"]),
+    entries: z.array(NodeJournalEntry).max(NODE_PROBE_LINES_MAX),
+    text: z.string(),
+  })
+  .refine(
+    (result) =>
+      utf8Bytes(JSON.stringify(result)) <= NODE_PROBE_RESULT_MAX_BYTES,
+    { message: "A probe result is at most 1 MiB" },
+  );
+export type NodeProbeResult = z.infer<typeof NodeProbeResult>;
+
+export const NODE_PROBE_STATUSES = [
+  "requested",
+  "received",
+  "expired",
+] as const;
+/**
+ * What the API says of a request: `requested` until a result arrives, `received` once it has
+ * (`body` is the result), and `expired` when `NODE_PROBE_EXPIRY_SECONDS` passed without one.
+ * `requested_by` is the key that asked.
+ */
+export const NodeProbeDiagnostic = z.strictObject({
+  id: z.uuid(),
+  node_id: NodeId,
+  kind: z.literal("probe"),
+  probe: NodeProbe,
+  boot: ProbeBoot,
+  since_seconds: ProbeSinceSeconds,
+  lines: ProbeLines,
+  requested_by: ApiKeyId,
+  requested_at: Timestamp,
+  status: z.enum(NODE_PROBE_STATUSES),
+  received_at: Timestamp.nullable(),
+  body: NodeProbeResult.nullable(),
+});
+export type NodeProbeDiagnostic = z.infer<typeof NodeProbeDiagnostic>;
 
 // ---------- Link messages (GET /node/v1/link WebSocket) ----------
 

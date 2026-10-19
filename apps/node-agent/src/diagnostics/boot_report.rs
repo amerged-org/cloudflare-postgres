@@ -23,14 +23,10 @@ use std::{
     process::Output,
 };
 
-/// The arguments of `journalctl`, run with no shell. The matches before the first `+` are
-/// alternatives of one field (units), and each `+` starts another group of alternatives, so the
-/// lines are those of the four units, of PID 1 and of the kernel; `--lines` keeps the newest 1,000.
-pub const JOURNAL_ARGUMENTS: [&str; 12] = [
-    "--no-pager",
-    "--output=json",
-    "--boot=-1",
-    "--lines=1000",
+/// The matches of the journal the agent reads (SEC-05, SEC-09). The matches before the first `+`
+/// are alternatives of one field (units), and each `+` starts another group of alternatives, so
+/// the lines are those of the four units, of PID 1 and of the kernel.
+const JOURNAL_MATCHES: [&str; 8] = [
     "_SYSTEMD_UNIT=pgcf-agent.service",
     "_SYSTEMD_UNIT=pgcf-gateway.service",
     "_SYSTEMD_UNIT=pgcf-cloudflared.service",
@@ -40,6 +36,27 @@ pub const JOURNAL_ARGUMENTS: [&str; 12] = [
     "+",
     "_TRANSPORT=kernel",
 ];
+
+/// The arguments of `journalctl`, run with no shell, for the newest `lines` lines of `boot` (0 is
+/// this boot, -1 the one before) that match `JOURNAL_MATCHES`, and, where `since_seconds` is
+/// given, not older than that. Only integers the caller has checked are put into the words.
+pub fn journal_arguments(boot: i64, since_seconds: Option<u64>, lines: u64) -> Vec<String> {
+    let mut arguments = vec![
+        "--no-pager".to_string(),
+        "--output=json".to_string(),
+        format!("--boot={boot}"),
+    ];
+    arguments.extend(since_seconds.map(|seconds| format!("--since=-{seconds}s")));
+    arguments.push(format!("--lines={lines}"));
+    arguments.extend(JOURNAL_MATCHES.map(String::from));
+    arguments
+}
+
+/// The arguments for the journal of the previous boot that the boot report is made of: the newest
+/// 1,000 lines.
+pub fn previous_boot_arguments() -> Vec<String> {
+    journal_arguments(-1, None, bound("NODE_BOOT_REPORT_ENTRIES_MAX") as u64)
+}
 
 /// What `journalctl` printed for the previous boot: its lines, or `None` when the journal holds no
 /// earlier boot, which it answers with status 1 and a line on stderr and nothing on stdout. A
@@ -67,7 +84,7 @@ pub fn boot_report_due(stored: Option<&str>, current: &str) -> bool {
 
 /// The unit names whose lines can hold a tenant's SQL: a database's unit and a backup job. PID 1
 /// writes a job's whole command line, an address and a role included, into the lines about it.
-const TENANT_UNITS: [&str; 2] = [units::UNIT_PREFIX, job::UNIT_PREFIX];
+pub(super) const TENANT_UNITS: [&str; 2] = [units::UNIT_PREFIX, job::UNIT_PREFIX];
 
 /// The unit of the agent, whose event lines go through `events::sanitize` on their way here.
 const AGENT_UNIT: &str = "pgcf-agent.service";
@@ -178,35 +195,46 @@ fn entry(line: &str) -> Option<Value> {
 /// The entries of `NodeBootReport` that the lines of `journal` make, in their order: at most the
 /// newest 1,000.
 pub fn sanitize(journal: &str) -> Vec<Value> {
+    sanitize_newest(journal, bound("NODE_BOOT_REPORT_ENTRIES_MAX"))
+}
+
+/// The same, at most the newest `max`.
+pub fn sanitize_newest(journal: &str, max: usize) -> Vec<Value> {
     let entries: Vec<Value> = journal.lines().filter_map(entry).collect();
-    let excess = entries
-        .len()
-        .saturating_sub(bound("NODE_BOOT_REPORT_ENTRIES_MAX"));
+    let excess = entries.len().saturating_sub(max);
     entries.into_iter().skip(excess).collect()
 }
 
-/// The report of this boot: the entries, without their oldest while the body is above its cap.
-pub fn report(boot: &Boot, previous: Option<&str>, entries: Vec<Value>) -> Value {
-    let build = |entries: &[Value]| {
-        json!({
-            "boot_id": boot.id,
-            "previous_boot_id": previous,
-            "kernel_release": boot.kernel_release,
-            "entries": entries,
-        })
-    };
+/// What `build` makes of `entries` without their oldest, as many as it takes for the body to be at
+/// most `cap` bytes.
+pub fn newest_within(cap: usize, build: impl Fn(&[Value]) -> Value, entries: &[Value]) -> Value {
     let size = |value: &Value| value.to_string().len();
     // Each entry costs its own text and a comma, and the first one has no comma.
     let sizes: Vec<usize> = entries.iter().map(|entry| size(entry) + 1).collect();
     let mut total =
         size(&build(&[])) + sizes.iter().sum::<usize>() - usize::from(!sizes.is_empty());
-    let cap = bound("NODE_BOOT_REPORT_MAX_BYTES");
     let mut dropped = 0;
     while total > cap && dropped < sizes.len() {
         total -= sizes[dropped];
         dropped += 1;
     }
     build(&entries[dropped..])
+}
+
+/// The report of this boot: the entries, without their oldest while the body is above its cap.
+pub fn report(boot: &Boot, previous: Option<&str>, entries: Vec<Value>) -> Value {
+    newest_within(
+        bound("NODE_BOOT_REPORT_MAX_BYTES"),
+        |entries| {
+            json!({
+                "boot_id": boot.id,
+                "previous_boot_id": previous,
+                "kernel_release": boot.kernel_release,
+                "entries": entries,
+            })
+        },
+        &entries,
+    )
 }
 
 /// Where the agent keeps the boot it last reported.
@@ -296,7 +324,7 @@ mod tests {
     fn the_command_is_the_journal_of_the_previous_boot_of_the_nodes_own_units_pid_1_and_the_kernel()
     {
         assert_eq!(
-            JOURNAL_ARGUMENTS.join(" "),
+            previous_boot_arguments().join(" "),
             concat!(
                 "--no-pager --output=json --boot=-1 --lines=1000 ",
                 "_SYSTEMD_UNIT=pgcf-agent.service _SYSTEMD_UNIT=pgcf-gateway.service ",

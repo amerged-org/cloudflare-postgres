@@ -199,6 +199,8 @@ const fenced = {
   databases: [],
   next: null,
 };
+// A page with nothing on it but what its own rules are about.
+const bare = { ...page, orders: [], databases: [], next: null };
 const withDatabase = (change: object) => ({
   ...page,
   orders: [],
@@ -356,6 +358,27 @@ const bootReport = {
     },
   ],
 };
+const probeRequest = {
+  id: "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81",
+  probe: "journal",
+  boot: -1,
+  since_seconds: 3600,
+  lines: 200,
+};
+const probeResult = {
+  kind: "probe",
+  diagnostic_id: probeRequest.id,
+  probe: "journal",
+  status: "ok",
+  entries: [journalEntry],
+  text: "",
+};
+const textResult = {
+  ...probeResult,
+  probe: "listeners",
+  entries: [],
+  text: "tcp   LISTEN 0      4096   127.0.0.1:8443     0.0.0.0:*\n",
+};
 
 type Case = [name: string, value: unknown, valid: boolean, refinement?: true];
 /** The schemas the node agent reads or writes, by the name the JSON Schemas carry. */
@@ -372,6 +395,7 @@ export const nodeSchemas = {
   NodeVolumeReport: link.NodeVolumeReport,
   NodeEventReport: link.NodeEventReport,
   NodeBootReport: link.NodeBootReport,
+  NodeProbeResult: link.NodeProbeResult,
   NodeUsageReport: link.NodeUsageReport,
   NodeFencedResponse: link.NodeFencedResponse,
   AgentLinkMessage: link.AgentLinkMessage,
@@ -583,6 +607,43 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       { ...fenced, orders: [...fenced.orders, page.orders[2]] },
       false,
       true,
+    ],
+    [
+      "with-diagnostics",
+      {
+        ...bare,
+        diagnostics: [
+          probeRequest,
+          { ...probeRequest, id: eventId("d"), probe: "pool" },
+        ],
+      },
+      true,
+    ],
+    [
+      "nine-diagnostics",
+      {
+        ...bare,
+        diagnostics: Array.from({ length: 9 }, (_, i) => ({
+          ...probeRequest,
+          id: eventId(String(i)),
+        })),
+      },
+      false,
+    ],
+    [
+      "diagnostic-with-a-command",
+      { ...bare, diagnostics: [{ ...probeRequest, command: "ss -p" }] },
+      false,
+    ],
+    [
+      "diagnostic-of-an-unknown-probe",
+      { ...bare, diagnostics: [{ ...probeRequest, probe: "shell" }] },
+      false,
+    ],
+    [
+      "diagnostic-lines-over-2000",
+      { ...bare, diagnostics: [{ ...probeRequest, lines: 2001 }] },
+      false,
     ],
     ["credentials-revision-zero", { ...page, credentials_revision: 0 }, false],
     [
@@ -1328,6 +1389,33 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       "no-previous-boot-id",
       { ...bootReport, previous_boot_id: undefined },
       false,
+    ],
+  ],
+  NodeProbeResult: [
+    ["journal", probeResult, true],
+    ["text", textResult, true],
+    [
+      "failed",
+      { ...textResult, status: "failed", text: "exit status: 5\n" },
+      true,
+    ],
+    ["no-kind", { ...probeResult, kind: undefined }, false],
+    ["boot-report", bootReport, false],
+    ["unknown-probe", { ...probeResult, probe: "shell" }, false],
+    ["unknown-status", { ...probeResult, status: "partial" }, false],
+    [
+      "entry-with-a-field-of-the-journal",
+      { ...probeResult, entries: [{ ...journalEntry, _PID: "104" }] },
+      false,
+    ],
+    [
+      "message-of-2050-bytes",
+      {
+        ...probeResult,
+        entries: [{ ...journalEntry, message: "\u00e9".repeat(1025) }],
+      },
+      false,
+      true,
     ],
   ],
   NodeUsageReport: [

@@ -111,6 +111,11 @@ pub struct Inner {
     pub fenced: bool,
     pub databases: Vec<Value>,
     pub orders: Vec<Value>,
+    /// The probes of an administrator that every page lists (`NodeDiagnosticRequest`). They stay on
+    /// the page after they are answered, as a page pulled while the answer was on its way lists them.
+    pub diagnostics: Vec<Value>,
+    /// The next this many results of probes are answered 503, whatever else is posted meanwhile.
+    pub probe_failures: usize,
     /// The node uid the desired pages name; the enrolled node's own unless a test changes it.
     pub page_uid: String,
     /// The pages never advance their cursor.
@@ -181,6 +186,8 @@ impl Cloud {
             fenced: false,
             databases: vec![],
             orders: vec![],
+            diagnostics: vec![],
+            probe_failures: 0,
             page_uid: NODE_UID.into(),
             stuck: false,
             silent_welcome: false,
@@ -466,7 +473,11 @@ fn desired(inner: &Inner, query: &[(String, String)]) -> Value {
     } else {
         inner.release.clone().unwrap_or(example["release"].clone())
     };
-    json!({"node":node,"release":release,"policy":example["policy"],"credentials_revision":3,"orders":inner.orders,"databases":rows,"next":next})
+    let mut page = json!({"node":node,"release":release,"policy":example["policy"],"credentials_revision":3,"orders":inner.orders,"databases":rows,"next":next});
+    if !inner.diagnostics.is_empty() && !inner.fenced {
+        page["diagnostics"] = inner.diagnostics.clone().into();
+    }
+    page
 }
 
 fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer {
@@ -507,7 +518,11 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
     } else if is("usage") {
         post("NodeUsageReport")
     } else if is("diagnostics") {
-        post("NodeBootReport")
+        post(if body["kind"] == "probe" {
+            "NodeProbeResult"
+        } else {
+            "NodeBootReport"
+        })
     } else {
         answer(404, error("not_found"))
     }
@@ -561,7 +576,13 @@ async fn serve(
                 None => Err("not_enrolled"),
             })
         };
-        let failure = if request.method == "POST" {
+        let probe = request.method == "POST"
+            && request.target == constant("NODE_API_PATHS")["diagnostics"].as_str().unwrap()
+            && body["kind"] == "probe";
+        let failure = if probe && inner.probe_failures > 0 {
+            inner.probe_failures -= 1;
+            Some(Failure::Status(503))
+        } else if request.method == "POST" {
             inner.failures.pop_front()
         } else {
             None

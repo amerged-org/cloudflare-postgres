@@ -21,6 +21,8 @@ import {
   NodeEventReport,
   NodeFencedResponse,
   NodeObservationReport,
+  NodeProbeRequest,
+  NodeProbeResult,
   NodeSample,
   NodeUsageReport,
   NodeVolumeReport,
@@ -1303,5 +1305,78 @@ describe("the report of the previous boot", () => {
       NodeBootReport.safeParse(report(Array.from({ length: 1000 }, () => full)))
         .success,
     ).toBe(false);
+  });
+});
+
+describe("a probe on request", () => {
+  const asked = { probe: "journal", boot: -1, since_seconds: 60, lines: 2000 };
+
+  it("takes the defaults for the numbers left out and the ends of the ranges", () => {
+    expect(NodeProbeRequest.parse({ probe: "boots" })).toEqual({
+      probe: "boots",
+      boot: 0,
+      since_seconds: 3600,
+      lines: 200,
+    });
+    expect(NodeProbeRequest.parse(asked)).toEqual(asked);
+    expect(
+      NodeProbeRequest.parse({ ...asked, since_seconds: 86_400 }),
+    ).toBeDefined();
+  });
+
+  it("refuses a number out of range, an unknown probe and any field of a command", () => {
+    for (const broken of [
+      { ...asked, boot: 1 },
+      { ...asked, boot: -2 },
+      { ...asked, since_seconds: 59 },
+      { ...asked, since_seconds: 86_401 },
+      { ...asked, lines: 0 },
+      { ...asked, lines: 2001 },
+      { ...asked, lines: 1.5 },
+      { ...asked, probe: "shell" },
+      { ...asked, command: "ss" },
+      { ...asked, path: "/proc/1/environ" },
+    ])
+      expect(NodeProbeRequest.safeParse(broken).success).toBe(false);
+  });
+
+  it("is listed eight at most on the desired page, and a page without any is a page", () => {
+    const request = (n: number) => ({
+      id: `5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b8${n}`,
+      probe: "pool",
+      boot: 0,
+      since_seconds: 3600,
+      lines: 200,
+    });
+    const listed = (count: number) =>
+      NodeDesiredPage.safeParse({
+        ...page,
+        diagnostics: Array.from({ length: count }, (_, n) => request(n)),
+      }).success;
+    expect(NodeDesiredPage.safeParse(page).success).toBe(true);
+    expect(listed(8)).toBe(true);
+    expect(listed(9)).toBe(false);
+  });
+
+  it("answers with its own probe and at most 1 MiB, whatever the side that carries the output", () => {
+    const result = (change: object) => ({
+      kind: "probe",
+      diagnostic_id: "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81",
+      probe: "listeners",
+      status: "ok",
+      entries: [],
+      text: "",
+      ...change,
+    });
+    const room = 1024 * 1024 - JSON.stringify(result({})).length;
+    expect(
+      NodeProbeResult.safeParse(result({ text: "a".repeat(room) })).success,
+    ).toBe(true);
+    expect(
+      NodeProbeResult.safeParse(result({ text: "a".repeat(room + 1) })).success,
+    ).toBe(false);
+    expect(NodeProbeResult.safeParse(result({ kind: "boot" })).success).toBe(
+      false,
+    );
   });
 });

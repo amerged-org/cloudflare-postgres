@@ -17,6 +17,7 @@ import {
   NodeFencedResponse,
   NodeObservationReport,
   NodePolicy,
+  NodeProbeResult,
   NodeUsageReport,
   NodeVolumeReport,
   RegionId,
@@ -27,7 +28,7 @@ import { archiveCredentialResponse } from "../domain/archive-credentials.ts";
 import { callingNode, nodeAuthentication } from "../domain/node-auth.ts";
 import { nodeCredentials } from "../domain/node-credentials.ts";
 import { desiredResponse } from "../domain/node-desired.ts";
-import { nodeBootReport } from "../domain/node-diagnostics.ts";
+import { nodeDiagnosticUpload } from "../domain/node-diagnostics.ts";
 import { enrollNode, recordInstallerProgress } from "../domain/node-install.ts";
 import { nodeEvents, nodeUsage, nodeVolumes } from "../domain/node-intake.ts";
 import { nodeObservations } from "../domain/node-observations.ts";
@@ -252,16 +253,19 @@ export function registerNodeLink(app: ApiApp): void {
       tags,
       security: node,
       description:
-        "The tail of the previous boot's journal, sent once after a reboot. It carries at most 1,000 lines of the agent, the gateway, cloudflared, networkd, PID 1 and the kernel, and is at most 1 MiB. expected_reboot is true when a maintenance order of the node was open when its last sample of the previous boot arrived, or closed after it; when it is false the minute cron raises node_unexpected_reboot; it is null when the agent knew no earlier boot.",
-      request: { body: body(NodeBootReport) },
+        "Either the tail of the previous boot's journal, sent once after a reboot, or, with kind probe, the answer to a probe an administrator asked the node for. The boot report carries at most 1,000 lines of the agent, the gateway, cloudflared, networkd, PID 1 and the kernel, and is at most 1 MiB. expected_reboot is true when a maintenance order of the node was open when its last sample of the previous boot arrived, or closed after it; when it is false the minute cron raises node_unexpected_reboot; it is null when the agent knew no earlier boot. A probe result is at most 1 MiB and answers one request of the node's desired page, once: a request that is not the node's is not found, and a second answer changes nothing. It is answered with the request's id alone.",
+      request: { body: body(z.union([NodeBootReport, NodeProbeResult])) },
       responses: nodeResponses(
-        z.strictObject({
-          id: z.uuid(),
-          expected_reboot: z.boolean().nullable(),
-        }),
+        z.union([
+          z.strictObject({
+            id: z.uuid(),
+            expected_reboot: z.boolean().nullable(),
+          }),
+          z.strictObject({ id: z.uuid() }),
+        ]),
       ),
     },
-    async (c) => nodeBootReport(c, callingNode(c), await c.req.json()),
+    async (c) => nodeDiagnosticUpload(c, callingNode(c), await c.req.json()),
   );
   const security = [{ bearerAuth: [] }];
   register(

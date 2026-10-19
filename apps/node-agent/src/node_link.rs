@@ -94,7 +94,8 @@ pub fn contract_valid(name: &str, value: &Value) -> bool {
                 let events = array(&value["events"]);
                 events.iter().all(event_rules) && unique(events, |event| event["id"].as_str())
             }
-            "NodeBootReport" => boot_report_rules(value),
+            "NodeBootReport" => journal_rules(value, "NODE_BOOT_REPORT_MAX_BYTES"),
+            "NodeProbeResult" => journal_rules(value, "NODE_PROBE_RESULT_MAX_BYTES"),
             _ => true,
         }
 }
@@ -250,16 +251,15 @@ fn event_rules(event: &Value) -> bool {
     }
 }
 
-/// `NodeBootReport`: a message is at most 2,048 bytes, which a JSON Schema counts in characters,
-/// and the body at most 1 MiB.
-fn boot_report_rules(report: &Value) -> bool {
+/// `NodeBootReport` and `NodeProbeResult`: a message is at most 2,048 bytes, which a JSON Schema
+/// counts in characters, and the body at most `body_max` bytes.
+fn journal_rules(report: &Value, body_max: &str) -> bool {
     let bound = |name: &str| constant(name).as_u64().expect("generated bound");
     array(&report["entries"]).iter().all(|entry| {
         entry["message"].as_str().is_some_and(|message| {
             message.len() as u64 <= bound("NODE_BOOT_REPORT_MESSAGE_MAX_BYTES")
         })
-    }) && serde_json::to_vec(report)
-        .is_ok_and(|body| body.len() as u64 <= bound("NODE_BOOT_REPORT_MAX_BYTES"))
+    }) && serde_json::to_vec(report).is_ok_and(|body| body.len() as u64 <= bound(body_max))
 }
 
 /// A usage row alone, as a report of one row: what Cloudflare would accept of it. One invalid row

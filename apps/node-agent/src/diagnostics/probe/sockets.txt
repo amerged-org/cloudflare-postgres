@@ -1,0 +1,17 @@
+127.0.0.1:8443                      pgcf-gateway.socket             pgcf-gateway.service
+audit 1                             systemd-journald-audit.socket   systemd-journald.service
+route 1361                          systemd-networkd.socket         systemd-networkd.service
+/run/dbus/system_bus_socket         dbus.socket                     dbus.service
+/run/dmeventd-client                dm-event.socket                 dm-event.service
+/run/dmeventd-server                dm-event.socket                 dm-event.service
+/run/initctl                        systemd-initctl.socket          systemd-initctl.service
+/run/lvm/lvmpolld.socket            lvm2-lvmpolld.socket            lvm2-lvmpolld.service
+/run/systemd/io.systemd.Credentials systemd-creds.socket            -
+/run/systemd/io.systemd.Hostname    systemd-hostnamed.socket        systemd-hostnamed.service
+/run/systemd/io.systemd.PCRExtend   systemd-pcrextend.socket        -
+/run/systemd/io.systemd.PCRLock     systemd-pcrlock.socket          -
+/run/systemd/io.systemd.sysext      systemd-sysext.socket           -
+/run/systemd/journal/dev-log        systemd-journald-dev-log.socket systemd-journald.service
+/run/systemd/journal/socket         systemd-journald.socket         systemd-journald.service
+/run/systemd/journal/stdout         systemd-journald.socket         systemd-journald.service
+/run/systemd/journal/syslog         syslog.socket                   syslog.service

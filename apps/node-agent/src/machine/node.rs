@@ -3,6 +3,7 @@
 //! and `initdb` as the database's user.
 use super::{Account, Boot, CpuTimes, Machine, Memory, gateway_environment, initdb_arguments};
 use crate::{
+    diagnostics::probe,
     layout::Layout,
     link::NodeIdentity,
     storage::{
@@ -509,13 +510,27 @@ impl Machine for Node {
 
     async fn previous_boot_journal(&self) -> io::Result<Option<String>> {
         let output = tokio::process::Command::new("journalctl")
-            .args(crate::diagnostics::boot_report::JOURNAL_ARGUMENTS)
+            .args(crate::diagnostics::boot_report::previous_boot_arguments())
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .output()
             .await?;
         crate::diagnostics::boot_report::previous_boot(&output)
+    }
+
+    async fn diagnostic(&self, argv: &probe::Argv) -> io::Result<std::process::Output> {
+        tokio::process::Command::new(argv.program)
+            .args(&argv.arguments)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+    }
+
+    fn proc_file(&self, file: probe::ProcFile) -> io::Result<String> {
+        std::fs::read_to_string(file.path())
     }
 
     fn boot(&self) -> Option<Boot> {

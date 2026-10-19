@@ -607,6 +607,47 @@
             ]
           }
         },
+        "diagnostics": {
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "probe": {
+                "type": "string",
+                "enum": [
+                  "journal",
+                  "kernel",
+                  "boots",
+                  "failed_units",
+                  "sockets",
+                  "listeners",
+                  "pressure",
+                  "pool"
+                ]
+              },
+              "boot": {
+                "anyOf": [
+                  { "type": "number", "const": 0 },
+                  { "type": "number", "const": -1 }
+                ]
+              },
+              "since_seconds": {
+                "type": "integer",
+                "minimum": 60,
+                "maximum": 86400
+              },
+              "lines": { "type": "integer", "minimum": 1, "maximum": 2000 }
+            },
+            "required": ["id", "probe", "boot", "since_seconds", "lines"],
+            "additionalProperties": false
+          }
+        },
         "databases": {
           "maxItems": 200,
           "type": "array",
@@ -1716,6 +1757,83 @@
         }
       }
     },
+    "NodeProbeResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string", "const": "probe" },
+        "diagnostic_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "probe": {
+          "type": "string",
+          "enum": [
+            "journal",
+            "kernel",
+            "boots",
+            "failed_units",
+            "sockets",
+            "listeners",
+            "pressure",
+            "pool"
+          ]
+        },
+        "status": { "type": "string", "enum": ["ok", "failed"] },
+        "entries": {
+          "maxItems": 2000,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "at": { "$ref": "#/$defs/Timestamp" },
+              "unit": {
+                "anyOf": [
+                  { "type": "string", "minLength": 1, "maxLength": 255 },
+                  { "type": "null" }
+                ]
+              },
+              "identifier": {
+                "anyOf": [
+                  { "type": "string", "minLength": 1, "maxLength": 255 },
+                  { "type": "null" }
+                ]
+              },
+              "transport": { "type": "string", "pattern": "^[a-z]{1,16}$" },
+              "priority": { "type": "integer", "minimum": 0, "maximum": 7 },
+              "message": { "type": "string", "maxLength": 2048 }
+            },
+            "required": [
+              "at",
+              "unit",
+              "identifier",
+              "transport",
+              "priority",
+              "message"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "text": { "type": "string" }
+      },
+      "required": [
+        "kind",
+        "diagnostic_id",
+        "probe",
+        "status",
+        "entries",
+        "text"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
     "NodeUsageReport": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
@@ -2143,6 +2261,22 @@
     "NODE_BOOT_REPORT_ENTRIES_MAX": 1000,
     "NODE_BOOT_REPORT_MESSAGE_MAX_BYTES": 2048,
     "NODE_BOOT_REPORT_MAX_BYTES": 1048576,
+    "NODE_PROBES": [
+      "journal",
+      "kernel",
+      "boots",
+      "failed_units",
+      "sockets",
+      "listeners",
+      "pressure",
+      "pool"
+    ],
+    "NODE_PROBE_BOOTS": [0, -1],
+    "NODE_PROBE_SINCE_SECONDS_MIN": 60,
+    "NODE_PROBE_SINCE_SECONDS_MAX": 86400,
+    "NODE_PROBE_LINES_MAX": 2000,
+    "NODE_PROBE_REQUESTS_MAX": 8,
+    "NODE_PROBE_RESULT_MAX_BYTES": 1048576,
     "NODE_REQUEST_TOKEN_PREFIX": "pgcf_nr1",
     "NODE_REQUEST_SIGNATURE_DOMAIN": "pgcf-node-request/v1\n",
     "NODE_REQUEST_MAX_LIFETIME_SECONDS": 60,

@@ -5,6 +5,7 @@
 //! lab (`units::lab`, `storage::lab_tests`) and on a node.
 use super::{Account, Boot, CpuTimes, Machine, Memory, initdb_arguments};
 use crate::{
+    diagnostics::probe,
     layout::Layout,
     link::NodeIdentity,
     storage::{
@@ -23,7 +24,7 @@ use std::{
     fs, io,
     num::NonZeroU32,
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
@@ -73,6 +74,8 @@ struct State {
     /// installed kernel image of the highest version.
     boots: u64,
     kernel_release: String,
+    /// The thin pool is gone: `lvs` cannot find it.
+    pool_lost: bool,
 }
 
 pub struct Local {
@@ -124,6 +127,10 @@ impl Local {
     }
     pub fn clear_calls(&self) {
         self.state().calls.clear();
+    }
+    /// The thin pool is gone, as on a node whose volume group lost it.
+    pub fn lose_pool(&self) {
+        self.state().pool_lost = true;
     }
     /// The Debian packages the node has.
     pub fn set_packages(&self, packages: &[(&str, &str)]) {
@@ -792,6 +799,64 @@ impl Machine for Local {
     async fn previous_boot_journal(&self) -> io::Result<Option<String>> {
         Ok((self.state().boots > 0)
             .then(|| include_str!("../diagnostics/previous-boot.jsonl").to_string()))
+    }
+
+    /// What the tools printed on a systemd 257 lab on Debian trixie (`diagnostics/probe/`): the
+    /// outputs of the commands the probes build, as their exit status and streams.
+    async fn diagnostic(&self, argv: &probe::Argv) -> io::Result<Output> {
+        use std::os::unix::process::ExitStatusExt;
+        let exited = |code: i32, stdout: &str, stderr: &str| Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        let mut state = self.state();
+        state.calls.push(format!(
+            "diagnostic {} {}",
+            argv.program,
+            argv.arguments.join(" ")
+        ));
+        let has = |word: &str| argv.arguments.iter().any(|argument| argument == word);
+        Ok(match argv.program {
+            "journalctl" if has("--list-boots") => {
+                exited(0, include_str!("../diagnostics/probe/boots.txt"), "")
+            }
+            // A node that has not rebooted has no boot before this one.
+            "journalctl" if has("--boot=-1") && state.boots == 0 => exited(
+                1,
+                "",
+                "No journal boot entry found for the specified boot (-1).\n",
+            ),
+            "journalctl" if has("-k") => {
+                exited(0, include_str!("../diagnostics/probe/kernel.jsonl"), "")
+            }
+            "journalctl" => exited(0, include_str!("../diagnostics/probe/journal.jsonl"), ""),
+            "systemctl" if has("--failed") => {
+                exited(0, include_str!("../diagnostics/probe/failed-units.txt"), "")
+            }
+            "systemctl" if has("list-sockets") => {
+                exited(0, include_str!("../diagnostics/probe/sockets.txt"), "")
+            }
+            "ss" => exited(0, include_str!("../diagnostics/probe/listeners.txt"), ""),
+            "lvs" if state.pool_lost => {
+                exited(5, include_str!("../diagnostics/probe/pool-missing.txt"), "")
+            }
+            "lvs" => exited(0, include_str!("../diagnostics/probe/pool-report.txt"), ""),
+            _ => return Err(io::Error::from(io::ErrorKind::NotFound)),
+        })
+    }
+
+    fn proc_file(&self, file: probe::ProcFile) -> io::Result<String> {
+        use probe::ProcFile::*;
+        Ok(match file {
+            PressureCpu => include_str!("../diagnostics/probe/proc-pressure-cpu.txt"),
+            PressureMemory => include_str!("../diagnostics/probe/proc-pressure-memory.txt"),
+            PressureIo => include_str!("../diagnostics/probe/proc-pressure-io.txt"),
+            Meminfo => include_str!("../diagnostics/probe/proc-meminfo.txt"),
+            Loadavg => include_str!("../diagnostics/probe/proc-loadavg.txt"),
+            Stat => include_str!("../diagnostics/probe/proc-stat.txt"),
+        }
+        .to_string())
     }
 
     fn boot(&self) -> Option<Boot> {

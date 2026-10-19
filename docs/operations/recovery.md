@@ -64,6 +64,54 @@ Node-loss and node-addition endpoints require an admin API key.
    and [9.4](../architecture/cloudflare-convergence-and-serverless-plan.md#94-node-loss-and-recovery)),
    which is built in Stage 3. Until then, recover databases by restore.
 
+## Looking at a node
+
+A node has no shell and opens no port, so an administrator asks its agent to read one thing and
+send it back over the link. The probes only read: each is a fixed command (no shell) or a read of
+fixed files, built by the agent, and a request names the probe and three integers, never a
+command, a path or a unit. They need an admin API key; any other key is told 404.
+
+1. `POST /v1/nodes/{id}/diagnostics` with `{"probe":"<name>"}` and, for `journal` and `kernel`,
+   `"boot"` (0 this boot, -1 the one before; default 0), `"since_seconds"` (60 to 86400; default
+   3600; `journal` only) and `"lines"` (1 to 2000; default 200). It answers `202` with a
+   `diagnostic_id`, records your key, and tells the node to pull its desired page, which lists
+   the request.
+2. `GET /v1/nodes/{id}/diagnostics/{diagnostic_id}` is `requested` until the node's result
+   arrives, `received` with the result in `body`, and `expired` after ten minutes without one.
+   A node answers within two pulls of its page; a node that is stale, fenced or off answers
+   nothing, and the request expires. A reboot has its own record: the boot report at
+   `GET /v1/nodes/{id}/diagnostics`.
+
+| Probe          | What the agent runs                                                                                                                                                          | What it shows                                                            |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `journal`      | `journalctl --no-pager --output=json --boot=<boot> --since=-<s>s --lines=<n>` for `pgcf-agent`, `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, PID 1 and the kernel | the entries of the boot report, for this boot or the one before          |
+| `kernel`       | `journalctl --no-pager --output=json -k --boot=<boot> --lines=<n>`                                                                                                           | the kernel's lines (out of memory kills, I/O errors, thin pool warnings) |
+| `boots`        | `journalctl --list-boots --no-pager`                                                                                                                                         | the boots the journal holds, and so whether a reboot happened            |
+| `failed_units` | `systemctl --failed --no-legend --plain`                                                                                                                                     | the units that failed                                                    |
+| `sockets`      | `systemctl list-sockets --all --no-legend --plain`                                                                                                                           | the socket units                                                         |
+| `listeners`    | `ss --listening --numeric --tcp --udp --unix --no-header`                                                                                                                    | what listens                                                             |
+| `pressure`     | `/proc/pressure/{cpu,memory,io}`, `/proc/meminfo`, `/proc/loadavg` and the total CPU line of `/proc/stat`                                                                    | stalls, memory and load                                                  |
+| `pool`         | `lvs --reportformat json -o lv_name,lv_attr,data_percent,metadata_percent pgcf/pgcf_thinpool`                                                                                | the thin pool's data and metadata fill                                   |
+
+`journal` and `kernel` answer with `entries`, every other probe with `text`. `status` is `failed`
+when a command ended with a status other than 0, did not end in 30 seconds, or a file could not
+be read; `text` then holds the status and what the command printed (a node that has not rebooted
+answers `journal` or `kernel` with `boot` -1 as failed: `No journal boot entry found`).
+
+- **Loopback only.** `listeners` shows TCP listeners on loopback only (the gateway and
+  cloudflared's metrics) and Unix sockets. A TCP or UDP socket on another address is an incident.
+  `/run/ssh-unix-local/socket` must not be listed there, nor `sshd-unix-local` or `sshd-vsock` in
+  `sockets`: the image masks the ssh generator that would bind sshd to them.
+- **Limits.** A result is at most 1 MiB; the oldest entries, or the end of a text (marked
+  `[truncated]`), go first. The lines of a database's unit (`pgcf-pg@…`) or of a backup job
+  (`pgcf-job-…`), and the lines PID 1 writes about them, are never sent; in a text, every line
+  that names one is left out. A kernel line that names a database's cgroup, such as an out of
+  memory kill, is kept: it holds the database's identifier and nothing of its data. At most eight
+  requests are open on a node; the agent runs each once and keeps the identifiers of the last 64.
+- **Audit.** The row of the request (`node_diagnostic_requests`) holds the key that asked and
+  the time; the agent logs `probe_answered` with the probe's name. Requests and results are kept
+  for 30 days, and deleted by the next request for a probe after that.
+
 ## Control plane
 
 Keep a D1 export, the deployment source, private Worker binding configuration, Worker secret

@@ -5,6 +5,7 @@
 //! PostgreSQL in a test on any machine; `Node` is the node itself, and the tests' `Local` stands
 //! in for systemd and LVM only.
 use crate::{
+    diagnostics::probe,
     layout::Layout,
     link::NodeIdentity,
     storage::{self, Inventory, NoRoom, PoolSample, Removal, VolumeId},
@@ -12,7 +13,9 @@ use crate::{
     update,
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, future::Future, io, num::NonZeroU32, path::PathBuf};
+use std::{
+    collections::BTreeMap, future::Future, io, num::NonZeroU32, path::PathBuf, process::Output,
+};
 
 /// What a boot loses, restored when the agent starts and before any page comes (plan 5.6 job 4,
 /// the image's `README.md`): the CPU quota of every stopped unit is lifted, because a quota can
@@ -263,9 +266,14 @@ pub trait Machine: Send + Sync + 'static {
     /// This boot and the running kernel.
     fn boot(&self) -> Option<Boot>;
     /// The journal of the boot before this one as `journalctl` prints it with `--output=json`, one
-    /// object a line (`diagnostics::boot_report::JOURNAL_ARGUMENTS`), or `None` when the journal
+    /// object a line (`diagnostics::boot_report::previous_boot_arguments`), or `None` when the journal
     /// holds no earlier boot.
     fn previous_boot_journal(&self) -> impl Future<Output = io::Result<Option<String>>> + Send;
+    /// Runs a command of a probe on request (`diagnostics::probe`, SEC-09) to its end: a program of
+    /// the system with the arguments the agent built, no shell, `LC_ALL=C`, nothing on its stdin.
+    fn diagnostic(&self, argv: &probe::Argv) -> impl Future<Output = io::Result<Output>> + Send;
+    /// The text of a file of `/proc` that the pressure probe reads.
+    fn proc_file(&self, file: probe::ProcFile) -> io::Result<String>;
     /// `MemTotal` and `MemAvailable` now.
     fn memory(&self) -> Option<Memory>;
     /// The CPU times since boot, summed over the cores.

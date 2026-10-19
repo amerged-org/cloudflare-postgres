@@ -279,6 +279,11 @@ impl Link {
         self.post("diagnostics", "NodeBootReport", report).await
     }
 
+    /// Posts the result of a probe an administrator asked for (`NodeProbeResult`), once.
+    pub async fn post_probe(&self, result: &Value) -> Result<(), Error> {
+        self.post("diagnostics", "NodeProbeResult", result).await
+    }
+
     /// Posts every thin volume of the node (`NodeVolumeReport`), sampled every 60 s.
     pub async fn post_volumes(&self, report: &Value) -> Result<(), Error> {
         self.post("volumes", "NodeVolumeReport", report).await

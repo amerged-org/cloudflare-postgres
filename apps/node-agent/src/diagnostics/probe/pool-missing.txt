@@ -1,0 +1,14 @@
+  {
+      "report": [
+          {
+              "lv": [
+              ]
+          }
+      ]
+      ,
+      "log": [
+          {"log_seq_num":"1", "log_type":"error", "log_context":"processing", "log_object_type":"lv", "log_object_name":"missing_pool", "log_object_id":"", "log_object_group":"pgcf", "log_object_group_id":"LHcj8D-vPdw-EkkM-fqG7-Vxwm-Vcc8-zywfxE", "log_message":"Failed to find logical volume \"pgcf/missing_pool\"", "log_errno":"-1", "log_ret_code":"0"},
+          {"log_seq_num":"2", "log_type":"status", "log_context":"processing", "log_object_type":"lv", "log_object_name":"missing_pool", "log_object_id":"", "log_object_group":"pgcf", "log_object_group_id":"LHcj8D-vPdw-EkkM-fqG7-Vxwm-Vcc8-zywfxE", "log_message":"failure", "log_errno":"-1", "log_ret_code":"5"},
+          {"log_seq_num":"3", "log_type":"status", "log_context":"processing", "log_object_type":"vg", "log_object_name":"pgcf", "log_object_id":"LHcj8D-vPdw-EkkM-fqG7-Vxwm-Vcc8-zywfxE", "log_object_group":"", "log_object_group_id":"", "log_message":"failure", "log_errno":"-1", "log_ret_code":"5"}
+      ]
+  }

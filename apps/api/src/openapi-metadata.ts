@@ -186,9 +186,14 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "List the boot reports of a node",
     "admin",
   ),
+  "POST /v1/nodes/{id}/diagnostics": route(
+    "requestNodeProbe",
+    "Ask a node for a read-only probe",
+    "admin",
+  ),
   "GET /v1/nodes/{id}/diagnostics/{diagnostic_id}": route(
     "getNodeDiagnostic",
-    "Read a boot report with the previous boot's journal tail",
+    "Read a boot report or the result of a probe",
     "admin",
   ),
   "POST /v1/nodes/{id}/mark-lost": route(
@@ -423,7 +428,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   ),
   "POST /node/v1/diagnostics": route(
     "reportNodeBoot",
-    "Report the tail of the previous boot's journal after a reboot",
+    "Report the previous boot's journal after a reboot, or the result of a probe",
     "node",
   ),
 };

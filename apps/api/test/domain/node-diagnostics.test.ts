@@ -4,6 +4,8 @@ import {
   INFRA_ALERT_ACTIONS,
   InfraAlert,
   NODE_BOOT_REPORT_MAX_BYTES,
+  NODE_PROBE_RESULT_MAX_BYTES,
+  NodeProbeDiagnostic,
   newOperationId,
 } from "@pgcf/contracts";
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,6 +13,7 @@ import { runCron } from "../../src/cron.ts";
 import { infrastructureAlertStatus } from "../../src/domain/infrastructure-alerts.ts";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
   nodeOs,
   nodeRequest,
@@ -431,5 +434,320 @@ describe("the diagnostics of a node", () => {
       .bind(f.node)
       .all<{ id: string }>();
     expect(left.results.map((row) => row.id)).toEqual([recent.id]);
+  });
+});
+
+const LISTENERS = "tcp   LISTEN 0      4096   127.0.0.1:8443     0.0.0.0:*\n";
+/** An administrator asks the node of `f` for a probe. */
+const ask = (f: F, body: unknown = { probe: "listeners" }, key = f.admin) =>
+  request(`/v1/nodes/${f.node}/diagnostics`, key, "POST", body);
+const asked = async (f: F, body?: unknown) => {
+  const answer = await ask(f, body);
+  expect(answer.status).toBe(202);
+  return (await answer.json<{ diagnostic_id: string }>()).diagnostic_id;
+};
+/** The result the agent posts for a request. */
+const probed = (id: string, change: Record<string, unknown> = {}) => ({
+  kind: "probe",
+  diagnostic_id: id,
+  probe: "listeners",
+  status: "ok",
+  entries: [],
+  text: LISTENERS,
+  ...change,
+});
+const reading = (f: F, id: string, key = f.admin) =>
+  request(`/v1/nodes/${f.node}/diagnostics/${id}`, key);
+const requests = (f: F) =>
+  env.DB.prepare(
+    "SELECT id,probe,boot,since_seconds,lines,requested_by_key_id,received_at,body FROM node_diagnostic_requests WHERE node_id=? ORDER BY requested_at,id",
+  )
+    .bind(f.node)
+    .all<{
+      id: string;
+      probe: string;
+      boot: number;
+      since_seconds: number;
+      lines: number;
+      requested_by_key_id: string;
+      received_at: string | null;
+      body: string | null;
+    }>()
+    .then((rows) => rows.results);
+const keyIdOf = (key: string) =>
+  env.DB.prepare("SELECT id FROM api_keys WHERE lookup_id=?")
+    .bind(key.split("_")[2])
+    .first<string>("id");
+const askedAt = (id: string, at: string) =>
+  env.DB.prepare(
+    "UPDATE node_diagnostic_requests SET requested_at=? WHERE id=?",
+  )
+    .bind(at, id)
+    .run();
+
+describe("a probe on request", () => {
+  it("is accepted from an administrator, records the key that asked, and tells the node to pull its page", async () => {
+    const f = await fixture();
+    const socket = await openLink(f);
+    const hint = nextMessage(socket);
+    const answer = await ask(f, {
+      probe: "journal",
+      boot: -1,
+      since_seconds: 120,
+      lines: 50,
+    });
+    expect(answer.status).toBe(202);
+    const { diagnostic_id } = await answer.json<{ diagnostic_id: string }>();
+    expect(JSON.parse(await hint)).toEqual({ type: "desired" });
+    expect(await requests(f)).toEqual([
+      {
+        id: diagnostic_id,
+        probe: "journal",
+        boot: -1,
+        since_seconds: 120,
+        lines: 50,
+        requested_by_key_id: await keyIdOf(f.admin),
+        received_at: null,
+        body: null,
+      },
+    ]);
+    socket.close(1000);
+  });
+
+  it("takes the defaults for the numbers left out", async () => {
+    const f = await fixture();
+    await asked(f, { probe: "boots" });
+    expect(await requests(f)).toMatchObject([
+      { probe: "boots", boot: 0, since_seconds: 3600, lines: 200 },
+    ]);
+  });
+
+  it("is refused for an unknown probe, a number out of range, or a field the contract does not have", async () => {
+    const f = await fixture();
+    const probe = "journal";
+    for (const body of [
+      {},
+      { probe: "shell" },
+      { probe: "journal; id" },
+      { probe, boot: 1 },
+      { probe, boot: -2 },
+      { probe, boot: "0" },
+      { probe, since_seconds: 59 },
+      { probe, since_seconds: 86_401 },
+      { probe, since_seconds: 60.5 },
+      { probe, lines: 0 },
+      { probe, lines: 2001 },
+      { probe, command: "ss -p" },
+      { probe, path: "/etc/shadow" },
+      { probe, unit: "pgcf-pg@aaaaaaaaaaaaaaaaaaaa.service" },
+    ]) {
+      expect((await ask(f, body)).status, JSON.stringify(body)).toBe(400);
+    }
+    // The ends of the ranges are in.
+    for (const body of [
+      { probe, boot: 0, since_seconds: 60, lines: 1 },
+      { probe, boot: -1, since_seconds: 86_400, lines: 2000 },
+    ])
+      expect((await ask(f, body)).status, JSON.stringify(body)).toBe(202);
+    expect(await requests(f)).toHaveLength(2);
+  });
+
+  it("is not made, nor read, by an integrator's key: it is not found", async () => {
+    const f = await fixture(),
+      other = await fixture();
+    const id = await asked(f);
+    for (const key of [f.integrator, f.otherKey]) {
+      expect((await ask(f, undefined, key)).status).toBe(404);
+      expect((await reading(f, id, key)).status).toBe(404);
+    }
+    expect(await requests(f)).toHaveLength(1);
+    expect((await ask(f, undefined, "pgcf_sk_bad")).status).toBe(401);
+    // A node that is not there, and a request under another node, are not found either.
+    expect(
+      (
+        await request(
+          `/v1/nodes/nod_${"z".repeat(20)}/diagnostics`,
+          f.admin,
+          "POST",
+          { probe: "boots" },
+        )
+      ).status,
+    ).toBe(404);
+    expect((await reading(other, id)).status).toBe(404);
+  });
+
+  it("is on the desired page of its node exactly once until the node answers it", async () => {
+    const f = await fixture(),
+      other = await fixture();
+    const id = await asked(f, { probe: "kernel", boot: -1, lines: 30 });
+    const request = {
+      id,
+      probe: "kernel",
+      boot: -1,
+      since_seconds: 3600,
+      lines: 30,
+    };
+    expect((await desiredPage(f)).diagnostics).toEqual([request]);
+    // Pulled again: still there once. Another node has none.
+    expect((await desiredPage(f)).diagnostics).toEqual([request]);
+    expect((await desiredPage(other)).diagnostics).toBeUndefined();
+    // A pull of named databases, which is a wake's, and a later page do not carry them.
+    for (const query of [
+      "?ids=aaaaaaaaaaaaaaaaaaaa",
+      "?after=aaaaaaaaaaaaaaaaaaaa",
+    ])
+      expect((await desiredPage(f, query)).diagnostics, query).toBeUndefined();
+    const answer = await send(f, probed(id, { probe: "kernel" }));
+    expect(answer.status).toBe(200);
+    expect((await desiredPage(f)).diagnostics).toBeUndefined();
+  });
+
+  it("is listed eight at a time, the oldest first", async () => {
+    const f = await fixture();
+    const ids: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const id = await asked(f);
+      await askedAt(id, ago(9 * MINUTE - i * 1000));
+      ids.push(id);
+    }
+    const listed = async () =>
+      (await desiredPage(f)).diagnostics?.map((request) => request.id);
+    expect(await listed()).toEqual(ids.slice(0, 8));
+    expect((await send(f, probed(ids[0]!))).status).toBe(200);
+    expect(await listed()).toEqual(ids.slice(1, 9));
+  });
+
+  it("is requested, then received with the result, as the API reads it", async () => {
+    const f = await fixture();
+    const id = await asked(f, { probe: "journal", lines: 5 });
+    const waiting = NodeProbeDiagnostic.parse(
+      await (await reading(f, id)).json(),
+    );
+    expect(waiting).toEqual({
+      id,
+      node_id: f.node,
+      kind: "probe",
+      probe: "journal",
+      boot: 0,
+      since_seconds: 3600,
+      lines: 5,
+      requested_by: await keyIdOf(f.admin),
+      requested_at: expect.any(String),
+      status: "requested",
+      received_at: null,
+      body: null,
+    });
+    const result = probed(id, {
+      probe: "journal",
+      entries: [entry],
+      text: "",
+    });
+    expect((await send(f, result)).status).toBe(200);
+    const done = NodeProbeDiagnostic.parse(await (await reading(f, id)).json());
+    expect(done).toMatchObject({ id, status: "received", body: result });
+    expect(done.received_at).toEqual(expect.any(String));
+  });
+
+  it("is expired after ten minutes without an answer, and leaves the page", async () => {
+    const f = await fixture();
+    const id = await asked(f);
+    const status = async () =>
+      (await (await reading(f, id)).json<{ status: string }>()).status;
+    await askedAt(id, ago(10 * MINUTE - 5000));
+    expect(await status()).toBe("requested");
+    expect((await desiredPage(f)).diagnostics).toHaveLength(1);
+    await askedAt(id, ago(10 * MINUTE + 1000));
+    expect(await status()).toBe("expired");
+    expect(
+      (await reading(f, id).then((r) => r.json())) as object,
+    ).toMatchObject({
+      received_at: null,
+      body: null,
+    });
+    expect((await desiredPage(f)).diagnostics).toBeUndefined();
+  });
+
+  it("keeps the answer of a probe that ran just before it expired", async () => {
+    const f = await fixture();
+    const id = await asked(f);
+    await askedAt(id, ago(10 * MINUTE + 1000));
+    expect((await send(f, probed(id))).status).toBe(200);
+    expect(
+      (await (await reading(f, id)).json<{ status: string }>()).status,
+    ).toBe("received");
+  });
+
+  it("is answered once: a second answer is accepted and the first stays", async () => {
+    const f = await fixture();
+    const id = await asked(f);
+    expect((await send(f, probed(id))).status).toBe(200);
+    expect((await send(f, probed(id, { text: "other\n" }))).status).toBe(200);
+    const [row] = await requests(f);
+    expect(JSON.parse(row!.body!).text).toBe(LISTENERS);
+  });
+
+  it("is refused a result over 1 MiB, or one that breaks the contract", async () => {
+    const f = await fixture();
+    const id = await asked(f);
+    const fits =
+      NODE_PROBE_RESULT_MAX_BYTES -
+      JSON.stringify(probed(id, { text: "" })).length;
+    expect(
+      (await send(f, probed(id, { text: "a".repeat(fits + 1) }))).status,
+    ).toBe(400);
+    expect(
+      (
+        await send(
+          f,
+          probed(id, { text: "a".repeat(NODE_PROBE_RESULT_MAX_BYTES) }),
+        )
+      ).status,
+    ).toBe(400);
+    for (const broken of [
+      { ...probed(id), extra: true },
+      probed(id, { probe: "shell" }),
+      probed(id, { status: "partial" }),
+      probed(id, { entries: Array.from({ length: 2001 }, () => entry) }),
+      probed(id, { entries: [{ ...entry, message: "\u00e9".repeat(1025) }] }),
+      probed("not-an-id"),
+    ])
+      expect(
+        (await send(f, broken)).status,
+        JSON.stringify(broken).slice(0, 80),
+      ).toBe(400);
+    expect((await requests(f))[0]!.body).toBeNull();
+    // Exactly 1 MiB is kept whole.
+    expect((await send(f, probed(id, { text: "a".repeat(fits) }))).status).toBe(
+      200,
+    );
+    const read = await (
+      await reading(f, id)
+    ).json<{ body: { text: string } }>();
+    expect(read.body.text).toHaveLength(fits);
+  });
+
+  it("is answered by its own node, with its own probe, and by none that did not ask", async () => {
+    const f = await fixture(),
+      other = await fixture();
+    const id = await asked(f);
+    expect((await send(other, probed(id))).status).toBe(404);
+    expect((await send(f, probed(crypto.randomUUID()))).status).toBe(404);
+    expect((await send(f, probed(id, { probe: "pool" }))).status).toBe(400);
+    expect((await requests(f))[0]!.body).toBeNull();
+  });
+
+  it("is deleted after 30 days, by the next request for a probe of any node", async () => {
+    const f = await fixture(),
+      other = await fixture();
+    const old = await asked(f),
+      recent = await asked(f);
+    await askedAt(old, ago(30 * 24 * 60 * MINUTE + MINUTE));
+    await askedAt(recent, ago(29 * 24 * 60 * MINUTE));
+    // The minute cron leaves them, and a request for another node's probe takes the old one.
+    await runCron(env, Date.now());
+    expect((await requests(f)).map((row) => row.id)).toEqual([old, recent]);
+    const next = await asked(other);
+    expect((await requests(f)).map((row) => row.id)).toEqual([recent]);
+    expect((await requests(other)).map((row) => row.id)).toEqual([next]);
   });
 });

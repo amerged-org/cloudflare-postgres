@@ -5,6 +5,7 @@
 use crate::Error;
 
 pub mod boot_report;
+pub mod probe;
 
 /// The class of `error` as a short snake-case code: its kind (`postgres_28p01`, `http_connect`,
 /// `io_connection_refused`, `deadline_exceeded`), or a fixed phrase the agent wrote itself
