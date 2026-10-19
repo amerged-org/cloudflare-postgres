@@ -177,7 +177,7 @@ pub fn install_link(link: &Path, target: &str) -> io::Result<()> {
     if let Some(dir) = link.parent() {
         ensure_link_directory(dir)?;
     }
-    if std::fs::read_link(link).is_ok_and(|current| current == Path::new(target)) {
+    if link_names(link, target) {
         return Ok(());
     }
     let staged = staged(link);
@@ -198,6 +198,11 @@ pub fn drop_link(link: &Path, target: &str) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Whether `link` points to `target`.
+pub fn link_names(link: &Path, target: &str) -> bool {
+    std::fs::read_link(link).is_ok_and(|current| current == Path::new(target))
 }
 
 /// The agent's start: no link survives it. A link names a volume that the agent attached in its

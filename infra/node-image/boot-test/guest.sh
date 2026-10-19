@@ -241,8 +241,9 @@ no_volume_in_pid_1_namespace() {
 	}
 }
 
-# Every filesystem ends 1 MiB before its volume, so that nothing a database writes forms a RAID or
-# ZFS signature at the end of the device, which systemd's image dissection would refuse to mount.
+# Every filesystem ends 4 MiB (one extent) before its volume, so that nothing a database writes forms
+# a RAID or ZFS signature where libblkid looks at the end of the device (the farthest is 1,580,544
+# bytes from it), which systemd's image dissection would refuse to mount.
 scratch_filesystem_gap() {
 	local id volume bytes filesystem
 	id=$(scratch_id)
@@ -250,7 +251,7 @@ scratch_filesystem_gap() {
 	bytes=$(lvs --noheadings --nosuffix --units b --options lv_size "$volume" | tr -d ' ')
 	filesystem=$(dumpe2fs -h "/dev/mapper/pgcf-db_${id}_g1" 2>/dev/null |
 		awk -F: '/^Block count:/ { count = $2 + 0 } /^Block size:/ { size = $2 + 0 } END { print count * size }')
-	[ -n "$bytes" ] && [ "$filesystem" -gt 0 ] && [ $((filesystem + 1048576)) -le "$bytes" ] || {
+	[ -n "$bytes" ] && [ "$filesystem" -gt 0 ] && [ $((filesystem + 4194304)) -le "$bytes" ] || {
 		echo "filesystem $filesystem of a volume of $bytes"
 		return 1
 	}
@@ -429,6 +430,48 @@ scratch_database_runs_across_an_agent_restart() {
 	}
 }
 
+# MountImages= opens the unit's device policy to block devices (DeviceAllow), and the policy is all
+# a database's user would have against the raw volumes of the others if the unit's /dev held a node
+# for one or the user could make one. Inside the running scratch database, as its user with no
+# capability: the private /dev has no block device node (and does have the character ones, so the
+# search sees what is there), a device node cannot be made, and neither a device-mapper node by its
+# number nor the volume's own device by name can be opened.
+database_user_reaches_no_block_device() {
+	local unit=pgcf-pg@pgcfcheckscratch0000.service pid uid gid dm blocks characters volume own
+	pid=$(systemctl show --property=MainPID --value "$unit")
+	[ "${pid:-0}" -gt 0 ] || {
+		echo "the scratch database does not run"
+		return 1
+	}
+	uid=$(stat -c %u "/proc/$pid")
+	gid=$(stat -c %g "/proc/$pid")
+	blocks=$(nsenter --target "$pid" --mount -- find /dev -type b | wc -l)
+	characters=$(nsenter --target "$pid" --mount -- find /dev -type c | wc -l)
+	{ [ "$blocks" -eq 0 ] && [ "$characters" -gt 0 ]; } || {
+		echo "the unit's /dev has $blocks block and $characters character nodes"
+		return 1
+	}
+	dm=$(cat "$(ls -d /sys/block/dm-* | head -1)/dev")
+	volume=/dev/mapper/pgcf-db_pgcfcheckscratch0000_g1
+	own=/var/lib/pgcf/db/pgcfcheckscratch0000
+	# shellcheck disable=SC2016  # the commands run in the unit's shell, with its own $1, $2 and $3
+	nsenter --target "$pid" --mount -- setpriv --reuid="$uid" --regid="$gid" --clear-groups \
+		--bounding-set=-all --inh-caps=-all --no-new-privs -- sh -c '
+		touch "$3/probe" && rm "$3/probe" || exit 13
+		mknod "$3/block-node" b "${1%:*}" "${1#*:}" 2>/dev/null && exit 10
+		(: <"/dev/dm-${1#*:}") 2>/dev/null && exit 11
+		(: <"$2") 2>/dev/null && exit 12
+		exit 0' sh "$dm" "$volume" "$own"
+	case $? in
+	0) ;;
+	10) echo "the user made a block device node" && return 1 ;;
+	11) echo "the user opened a device-mapper node" && return 1 ;;
+	12) echo "the user opened the volume's device" && return 1 ;;
+	13) echo "the user cannot write its own volume: the probe proves nothing" && return 1 ;;
+	*) echo "the probe in the unit failed" && return 1 ;;
+	esac
+}
+
 # After the reboot with that database awake: the unit stopped on its own, cleanly, before the node
 # went down, and neither PostgreSQL nor ext4 had anything to recover at this start.
 scratch_database_was_stopped_cleanly() {
@@ -478,6 +521,7 @@ if [ "$phase" = 1 ]; then
 	check database_unit_device_allow database_unit_device_allow
 	check database_unit_needs_the_link database_unit_needs_the_link
 	check scratch_database_runs_across_an_agent_restart scratch_database_runs_across_an_agent_restart
+	check database_user_reaches_no_block_device database_user_reaches_no_block_device
 else
 	check scratch_database_was_stopped_cleanly scratch_database_was_stopped_cleanly
 fi

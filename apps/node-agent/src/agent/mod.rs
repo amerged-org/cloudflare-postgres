@@ -212,6 +212,25 @@ impl Db {
     }
 }
 
+/// The database as the barman jobs know it: its user, its directory (one for every generation),
+/// the device `device` of the storage generation `volume` that the job reads or writes (a restore
+/// writes the one it builds, whichever the database's link names), and its socket directory.
+pub(crate) fn job_database(
+    layout: &Layout,
+    device: &str,
+    volume: &VolumeId,
+    user: &str,
+) -> JobDatabase {
+    let id = volume.database();
+    JobDatabase {
+        id: id.to_string(),
+        user: user.to_string(),
+        volume: layout.volume(id),
+        device: device.into(),
+        socket_directory: layout.socket_directory(id),
+    }
+}
+
 pub struct Core<M: Machine> {
     pub(crate) machine: Arc<M>,
     pub(crate) admission: Admission,
@@ -365,14 +384,7 @@ impl<M: Machine> Core<M> {
     /// The database as the barman jobs know it, with the device of the storage generation
     /// `volume` that they mount, which is the generation the job reads or writes.
     pub(crate) fn job_database(&self, volume: &VolumeId, user: &str) -> JobDatabase {
-        let id = volume.database();
-        JobDatabase {
-            id: id.to_string(),
-            user: user.to_string(),
-            volume: self.layout().volume(id),
-            device: self.machine.device(volume).into(),
-            socket_directory: self.layout().socket_directory(id),
-        }
+        job_database(self.layout(), &self.machine.device(volume), volume, user)
     }
 
     /// A credential Cloudflare delivered (`ArchiveCredential`): kept for the jobs and the archive

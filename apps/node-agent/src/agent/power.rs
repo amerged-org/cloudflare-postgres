@@ -512,7 +512,8 @@ impl<M: Machine> Core<M> {
             }
             Err(_) => return refuse("volume_missing"),
         }
-        if !mounted(&self.layout().volume(&db.id)) {
+        // The agent's link says it has the volume: mounted, not suspect, and the unit may start.
+        if !self.machine.attached(&volume) {
             let began = Instant::now();
             match self
                 .machine
@@ -916,14 +917,15 @@ impl<M: Machine> Core<M> {
                 return Recovered::Retry;
             }
         }
-        if !mounted(&self.layout().volume(&db.id))
-            && self
+        if !self.machine.attached(&volume) {
+            match self
                 .machine
                 .mount_volumes(std::slice::from_ref(&volume))
                 .await
-                .is_err()
-        {
-            return Recovered::Retry;
+            {
+                Ok(failures) if failures.is_empty() => {}
+                _ => return Recovered::Retry,
+            }
         }
         if self.refresh_configuration(db, &entry).await.is_err() {
             return Recovered::Retry;
@@ -1143,18 +1145,6 @@ pub(crate) fn writer_of(started: &Started) -> Option<Writer> {
         instance: started.invocation_id.clone(),
     };
     writer.valid().then_some(writer)
-}
-
-/// Whether `path` is the root of a filesystem of its own: a mounted volume.
-pub(crate) fn mounted(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let (Ok(dir), Some(Ok(parent))) = (
-        std::fs::metadata(path),
-        path.parent().map(std::fs::metadata),
-    ) else {
-        return false;
-    };
-    dir.dev() != parent.dev()
 }
 
 pub(crate) fn register(
@@ -2069,6 +2059,56 @@ mod tests {
             sessions.busy_connections = 0;
         }
         assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+    }
+
+    /// What a wake and a recovery ask of a volume is whether the agent has it attached (its link
+    /// for the unit), not whether its directory is a mount: a volume can be mounted without its
+    /// link (the rename after the mount failed), and then every start fails its assertion for
+    /// good. The mount is asked for only when it is needed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_and_a_recovery_attach_a_volume_that_is_not_attached_and_ask_nothing_of_one_that_is()
+     {
+        let Some(rig) = Rig::new("attach").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let volume = Core::<crate::machine::local::Local>::volume_id(&entry).unwrap();
+        let mounts = |rig: &Rig| {
+            rig.machine
+                .calls()
+                .iter()
+                .filter(|call| *call == &format!("mount {}", entry.id))
+                .count()
+        };
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        rig.machine.clear_calls();
+        let woken = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(woken.outcome, WakeOutcome::Started, "{woken:?}");
+        assert_eq!(mounts(&rig), 0, "attached: nothing to mount");
+
+        // The volume is mounted and its link is gone: the wake attaches it again, and starts.
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        rig.machine.lose_link(&volume);
+        rig.machine.clear_calls();
+        let woken = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(woken.outcome, WakeOutcome::Started, "{woken:?}");
+        assert_eq!(mounts(&rig), 1);
+        assert!(rig.machine.running(&entry.id));
+
+        // A crash, and the link lost: the recovery attaches the volume and starts the unit; one
+        // whose volume is attached asks for no mount.
+        rig.machine.crash(&entry.id);
+        rig.machine.lose_link(&volume);
+        rig.machine.clear_calls();
+        rig.core.watch_pass().await;
+        assert!(matches!(rig.core.recover_once(&db).await, Recovered::Done));
+        assert_eq!(mounts(&rig), 1);
+        assert_eq!(db.phase(), Phase::Asleep, "the recovery proved its sleep");
+        rig.machine.clear_calls();
+        rig.machine.crash(&entry.id);
+        rig.core.watch_pass().await;
+        assert!(matches!(rig.core.recover_once(&db).await, Recovered::Done));
+        assert_eq!(mounts(&rig), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

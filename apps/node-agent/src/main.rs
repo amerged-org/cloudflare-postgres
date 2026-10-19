@@ -126,6 +126,11 @@ mod linux {
     }
 
     pub async fn check() -> Result<(), Error> {
+        // Before anything is made: the scratch volume is mounted in this process's namespace.
+        pgcf_node_agent::machine::refuse_init_mount_namespace(
+            std::path::Path::new("/proc/self/ns/mnt"),
+            std::path::Path::new("/proc/1/ns/mnt"),
+        )?;
         let node = Node::connect(Layout::default(), storage::Config::default()).await?;
         let account = node.scratch_account(SCRATCH).await?;
         let checked = check::run(&node, &account).await?;

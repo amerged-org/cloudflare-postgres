@@ -43,6 +43,23 @@ pub async fn restore_runtime<M: Machine>(machine: &M) {
     }
 }
 
+/// `pgcf-agent check` makes its scratch volume and mounts it as the agent mounts every volume, in
+/// the mount namespace of the process that runs it. A shell on the node has PID 1's, in which that
+/// mount would stay: every unit's executor copies that namespace and reads its table again and
+/// again, so a start would take longer for each volume mounted there (the image's README). The
+/// check is refused there; the agent runs it from its own namespace, and a shell uses `nsenter`.
+/// `own` and `init` are the two `ns/mnt` links of `/proc`.
+pub fn refuse_init_mount_namespace(own: &Path, init: &Path) -> io::Result<()> {
+    if std::fs::read_link(own)? == std::fs::read_link(init)? {
+        return Err(io::Error::other(
+            "this process has PID 1's mount namespace, in which the check would leave a volume \
+             mounted for good; run it in the agent's: nsenter --target \"$(systemctl show \
+             --property=MainPID --value pgcf-agent.service)\" --mount -- pgcf-agent check",
+        ));
+    }
+    Ok(())
+}
+
 /// What the hello reports of the node's operating system (`NodeOs`, SEC-03): this boot, the running
 /// kernel, and the digest of the installed packages (`update::packages_digest`). The agent reads it
 /// when it starts and again after a maintenance cycle that did not reboot, not with every sample.
@@ -215,6 +232,19 @@ pub trait Machine: Send + Sync + 'static {
         &self,
         id: &VolumeId,
     ) -> impl Future<Output = Result<bool, storage::Error>> + Send;
+    /// Whether the agent has the volume attached: mounted in its own mount namespace and linked
+    /// for the database's unit, which starts on it and on no other volume. Not so after the
+    /// agent restarted, until `mount_volumes` has attached it again, nor for a volume that is
+    /// suspect or being repaired, nor for one whose link is missing though it is mounted.
+    fn attached(&self, id: &VolumeId) -> bool;
+    /// The volume a running unit of `database` has mounted: what it serves, whichever volume the
+    /// agent has attached or ever has. `None` when no unit of the database runs. An error when a
+    /// unit runs and its volume cannot be told: the agent's mount table is no witness of it, as
+    /// the unit mounts the volume itself.
+    fn unit_volume(
+        &self,
+        database: &str,
+    ) -> impl Future<Output = Result<Option<VolumeId>, storage::Error>> + Send;
     /// After a boot: mounts the volume of every database in `current` that is formatted.
     fn mount_volumes(
         &self,
@@ -703,6 +733,25 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("the process {pid} of the warm-up is still running");
+    }
+
+    /// The check refuses PID 1's mount namespace and runs in any other, whose link differs.
+    #[test]
+    fn the_check_is_refused_in_the_mount_namespace_of_pid_1_and_runs_in_another() {
+        let directory = crate::testpg::directory("namespaces");
+        let link = |name: &str, target: &str| {
+            let path = directory.join(name);
+            std::os::unix::fs::symlink(target, &path).unwrap();
+            path
+        };
+        let init = link("init", "mnt:[4026531841]");
+        let shell = link("shell", "mnt:[4026531841]");
+        let agent = link("agent", "mnt:[4026532612]");
+        let refused = refuse_init_mount_namespace(&shell, &init).unwrap_err();
+        assert!(refused.to_string().contains("nsenter"), "{refused}");
+        refuse_init_mount_namespace(&agent, &init).unwrap();
+        // A namespace that cannot be read is no answer.
+        assert!(refuse_init_mount_namespace(&directory.join("missing"), &init).is_err());
     }
 
     #[test]

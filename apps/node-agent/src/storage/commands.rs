@@ -164,17 +164,38 @@ pub fn dm_status_thin() -> Vec<String> {
 pub fn device(config: &Config, id: &VolumeId) -> String {
     format!("/dev/mapper/{}", dm_name(&config.group, &id.lv_name()))
 }
-/// What a filesystem leaves unused at the end of its volume. The unit and the jobs mount a volume
-/// through systemd's image dissection, which runs libblkid's probers as root over the whole
-/// device: RAID and ZFS signatures sit in the last blocks of a device, and a filesystem that ends
-/// with the device lets a database's own data form one there, which makes the dissection refuse
-/// the mount (the database could no longer start or archive). Nothing writes to the gap, so it
-/// stays zero.
-pub const FS_END_GAP_BYTES: u64 = 1 << 20;
-/// The size `mkfs.ext4` and `resize2fs` are given for a volume of `volume_bytes`, in KiB with the
-/// suffix both tools read as such.
+/// What a filesystem leaves unused at the end of its volume: one extent of the volume group. The
+/// unit and the jobs mount a volume through systemd's image dissection, which runs libblkid's
+/// probers as root over the whole device, and a filesystem that ends with the device lets a
+/// database's own data form a RAID or ZFS signature where they look, which makes the dissection
+/// refuse the mount (the database could no longer start or archive). The farthest probe from the
+/// end is `promise_raid`'s, 3087 sectors or 1.5 MiB (`commands::tests::PROBED_FROM_THE_END`).
+/// Nothing writes to the gap, so it stays zero.
+pub const FS_END_GAP_BYTES: u64 = 4 << 20;
+/// The size, in whole KiB, that `mkfs.ext4` and `resize2fs` give the filesystem of a volume of
+/// `volume_bytes`.
+pub fn fs_target_kib(volume_bytes: u64) -> u64 {
+    volume_bytes.saturating_sub(FS_END_GAP_BYTES) / 1024
+}
+/// The same, as the argument of those tools: KiB with the suffix both read as such.
 fn fs_size(volume_bytes: u64) -> String {
-    format!("{}K", volume_bytes.saturating_sub(FS_END_GAP_BYTES) / 1024)
+    format!("{}K", fs_target_kib(volume_bytes))
+}
+/// The filesystem's superblock, which tells how big it is.
+pub fn fs_header(config: &Config, id: &VolumeId) -> Vec<String> {
+    words(["dumpe2fs", "-h", &device(config, id)])
+}
+/// The size of the filesystem in KiB from `dumpe2fs -h`: its block count times its block size.
+pub fn parse_fs_kib(header: &str) -> Option<u64> {
+    let field = |name: &str| -> Option<u64> {
+        header
+            .lines()
+            .find_map(|line| line.strip_prefix(name))?
+            .trim()
+            .parse()
+            .ok()
+    };
+    Some(field("Block count:")? * field("Block size:")? / 1024)
 }
 /// The filesystem is made with an explicit size that ends `FS_END_GAP_BYTES` before the end of
 /// the volume, never the whole device.
@@ -315,16 +336,16 @@ mod tests {
         let config = Config::default();
         let device = "/dev/mapper/pgcf-db_a1b2c3d4e5f6g7h8i9j0_g3";
         assert_eq!(super::device(&config, &id()), device);
-        // 1 GiB volume: the filesystem ends 1 MiB before it.
+        // 1 GiB volume: the filesystem ends 4 MiB before it.
         assert_eq!(
             line(mkfs(&config, &id(), 1 << 30)),
             format!(
-                "mkfs.ext4 -F -q -J size=8 -i 65536 -m 1 -E lazy_itable_init=0,lazy_journal_init=0 {device} 1047552K"
+                "mkfs.ext4 -F -q -J size=8 -i 65536 -m 1 -E lazy_itable_init=0,lazy_journal_init=0 {device} 1044480K"
             )
         );
         assert_eq!(
             line(resize_fs(&config, &id(), 2 << 30)),
-            format!("resize2fs {device} 2096128K")
+            format!("resize2fs {device} 2093056K")
         );
         assert_eq!(line(fsck(&config, &id())), format!("e2fsck -p {device}"));
         assert_eq!(
@@ -341,13 +362,39 @@ mod tests {
         );
     }
 
-    /// A database's data can be anything, so the last bytes of the device are never the
-    /// filesystem's: libblkid finds a RAID or ZFS label in the last 512 KiB, at most 1 MiB of a
-    /// device, and the filesystem ends before that for every size of volume.
+    /// What `dumpe2fs -h` of e2fsprogs 1.47.2 printed for a filesystem made as `mkfs` makes it, 60
+    /// MiB of 1 KiB blocks.
     #[test]
-    fn a_filesystem_ends_at_least_one_mib_before_its_volume() {
+    fn the_size_of_a_filesystem_is_its_block_count_times_its_block_size() {
+        let header = include_str!("fixtures/dumpe2fs-header.txt");
+        assert_eq!(parse_fs_kib(header), Some(61440));
+        assert_eq!(parse_fs_kib(""), None);
+        assert_eq!(parse_fs_kib("Block count:   12\n"), None);
+        assert_eq!(parse_fs_kib("Block count: x\nBlock size: 4096\n"), None);
+        assert_eq!(
+            line(fs_header(&Config::default(), &id())),
+            "dumpe2fs -h /dev/mapper/pgcf-db_a1b2c3d4e5f6g7h8i9j0_g3"
+        );
+        // The target is what the commands are given, for a volume of any size.
+        assert_eq!(fs_target_kib(1 << 30), 1_044_480);
+        assert_eq!(fs_size(1 << 30), "1044480K");
+    }
+
+    /// What libblkid 2.41, which systemd 257's image dissection runs over the device as root, reads
+    /// counted back from the end of a device: `promise_raid` probes sectors 63, 255, 256, 16, 399,
+    /// 591, 675, 735, 911, 974, 991, 951 and 3087, the last of them 1,580,544 bytes from the end
+    /// (the lab wrote the signature there: `blkid -p` then reports a RAID member of an ext4
+    /// device, and the dissection refuses the mount). The others are nearer: UDF's anchor is 256
+    /// blocks of 4 KiB from the end, ZFS's last label within 768 KiB, a RAID superblock within
+    /// 128 KiB.
+    const PROBED_FROM_THE_END: u64 = 3087 * 512;
+
+    /// A database's data can be anything, so the bytes libblkid reads at the end of the device are
+    /// never the filesystem's, for every size of volume.
+    #[test]
+    fn a_filesystem_ends_before_everything_libblkid_reads_at_the_end_of_its_volume() {
         let (config, id) = (Config::default(), id());
-        for extents in [1u64, 2, 3, 8, 256, 25_600] {
+        for extents in [2u64, 3, 8, 256, 25_600] {
             let volume = extents * (4 << 20);
             let size = |command: Vec<String>| -> u64 {
                 let last = command.last().unwrap();
@@ -355,6 +402,10 @@ mod tests {
             };
             for command in [mkfs(&config, &id, volume), resize_fs(&config, &id, volume)] {
                 let fs_bytes = size(command);
+                assert!(
+                    volume - fs_bytes > PROBED_FROM_THE_END,
+                    "{volume}: {fs_bytes}"
+                );
                 assert!(
                     volume - fs_bytes >= FS_END_GAP_BYTES,
                     "{volume}: {fs_bytes}"
@@ -391,6 +442,7 @@ mod tests {
             dm_status_pool(),
             dm_table_pool(),
             dm_status_thin(),
+            fs_header(&config, &id),
             mkfs(&config, &id, 1 << 30),
             resize_fs(&config, &id, 2 << 30),
             fsck(&config, &id),

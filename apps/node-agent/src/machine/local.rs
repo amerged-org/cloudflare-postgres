@@ -20,7 +20,7 @@ use crate::{
     },
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs, io,
     num::NonZeroU32,
     path::Path,
@@ -36,12 +36,18 @@ struct Unit {
     crashed: bool,
     invocations: u64,
     invocation_id: Option<String>,
+    /// The volume the unit mounted when it started, from the agent's link: what it runs on until
+    /// it stops, whatever the agent has attached since.
+    volume: Option<VolumeId>,
 }
 
 #[derive(Default)]
 struct State {
     units: HashMap<String, Unit>,
     volumes: BTreeMap<VolumeId, u64>,
+    /// The volumes the agent has mounted in its mount namespace, each with its link for the
+    /// database's unit: what the agent's restart ends. A unit that runs keeps its own mount.
+    attached: BTreeSet<VolumeId>,
     accounts: Vec<String>,
     limits: HashMap<String, Limits>,
     quotas: HashMap<String, Option<NonZeroU32>>,
@@ -252,8 +258,19 @@ impl Local {
                 crashed: false,
                 invocations: 0,
                 invocation_id: None,
+                volume: None,
             },
         );
+    }
+    /// The agent restarts: its mount namespace ends with it, and with it the mounts and the links
+    /// of every volume. The units run on, on the volumes they mounted themselves.
+    pub fn forget_mounts(&self) {
+        self.state().attached.clear();
+    }
+    /// A volume that the agent has mounted but whose link is gone (a failed rename, or a link
+    /// dropped by a pool failure that did not reach the volume's recovery).
+    pub fn lose_link(&self, id: &VolumeId) {
+        self.state().attached.remove(id);
     }
     pub fn has_account(&self, database: &str) -> bool {
         self.state().accounts.iter().any(|a| a == database)
@@ -345,6 +362,7 @@ impl Machine for Local {
         }
         fs::create_dir_all(&live)?;
         state.volumes.insert(id.clone(), size_bytes);
+        state.attached.insert(id.clone());
         Ok(())
     }
     async fn has_volume(&self, id: &VolumeId) -> Result<bool, storage::Error> {
@@ -354,18 +372,57 @@ impl Machine for Local {
         }
         Ok(state.volumes.contains_key(id))
     }
+    fn attached(&self, id: &VolumeId) -> bool {
+        self.state().attached.contains(id)
+    }
+    async fn unit_volume(&self, database: &str) -> Result<Option<VolumeId>, storage::Error> {
+        if !self.running(database) {
+            return Ok(None);
+        }
+        let state = self.state();
+        match state
+            .units
+            .get(database)
+            .and_then(|unit| unit.volume.clone())
+        {
+            Some(volume) => Ok(Some(volume)),
+            None => Err(storage::Error::Unexpected(
+                "a running unit without its volume",
+            )),
+        }
+    }
     async fn mount_volumes(
         &self,
-        _current: &[VolumeId],
+        current: &[VolumeId],
     ) -> Result<Vec<(VolumeId, storage::Error)>, storage::Error> {
-        Ok(Vec::new())
+        let mut state = self.state();
+        let mut failures = Vec::new();
+        for id in current {
+            state.calls.push(format!("mount {}", id.database()));
+            if !state.volumes.contains_key(id) {
+                continue;
+            }
+            // A database has one directory: the generation that is attached holds it.
+            if state
+                .attached
+                .iter()
+                .any(|other| other.database() == id.database() && other != id)
+            {
+                failures.push((id.clone(), storage::Error::OtherGeneration));
+                continue;
+            }
+            state.attached.insert(id.clone());
+        }
+        Ok(failures)
     }
     /// The volume is set aside beside its directory, as the unmounted logical volume is: its
     /// files are there for the generation, not for the database's directory.
     async fn unmount_volume(&self, id: &VolumeId) -> Result<(), storage::Error> {
-        self.state()
-            .calls
-            .push(format!("unmount {}", id.database()));
+        {
+            let mut state = self.state();
+            state.calls.push(format!("unmount {}", id.database()));
+            state.attached.remove(id);
+        }
         let live = self.layout.volume(id.database());
         let aside = self
             .layout
@@ -390,6 +447,7 @@ impl Machine for Local {
         let mut state = self.state();
         state.calls.push(format!("remove {}", id.database()));
         state.volumes.remove(id);
+        state.attached.remove(id);
         let others = state
             .volumes
             .keys()
@@ -440,7 +498,8 @@ impl Machine for Local {
                 formatted: true,
                 reserve_released: false,
                 suspect: false,
-                mount: Some(MountInfo {
+                fs_errors: false,
+                mount: state.attached.contains(id).then_some(MountInfo {
                     usage: FsUsage {
                         total_bytes: *size,
                         used_bytes: 100 << 20,
@@ -448,7 +507,6 @@ impl Machine for Local {
                         inodes_total: 1 << 20,
                         inodes_used: 1500,
                     },
-                    fs_errors: false,
                 }),
             })
             .collect();
@@ -610,6 +668,21 @@ impl Machine for Local {
         if self.running(database) {
             return self.wait_started(database).await;
         }
+        // The unit asserts the agent's link, and mounts the volume the link names.
+        let attached = {
+            let state = self.state();
+            state
+                .attached
+                .iter()
+                .find(|volume| volume.database() == database)
+                .cloned()
+        };
+        let Some(attached) = attached else {
+            return Err(units::Error::Job {
+                unit: units::unit_name(database),
+                result: "assert".into(),
+            });
+        };
         let volume = self.layout.volume(database);
         if !self.layout.data(database).join("PG_VERSION").exists() {
             return Err(units::Error::Job {
@@ -642,7 +715,9 @@ impl Machine for Local {
                 crashed: false,
                 invocations: 0,
                 invocation_id: None,
+                volume: None,
             });
+            unit.volume = Some(attached);
             unit.invocations += 1;
             unit.crashed = false;
             unit.child = Some(child);

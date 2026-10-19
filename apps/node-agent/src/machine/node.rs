@@ -226,6 +226,31 @@ impl Machine for Node {
         self.storage(move |storage| storage.exists(&id)).await
     }
 
+    fn attached(&self, id: &VolumeId) -> bool {
+        self.storage.attached(id)
+    }
+
+    async fn unit_volume(&self, database: &str) -> Result<Option<VolumeId>, storage::Error> {
+        let unit = self
+            .units
+            .state(database)
+            .await
+            .map_err(|_| storage::Error::Unexpected("the state of the database's unit"))?;
+        if !unit.active.awake() {
+            return Ok(None);
+        }
+        let pid = unit.main_pid.ok_or(storage::Error::Unexpected(
+            "a unit that runs without a main process",
+        ))?;
+        let database = database.to_string();
+        let volume = self
+            .storage(move |storage| storage.volume_mounted_by(pid, &database))
+            .await?;
+        volume.map(Some).ok_or(storage::Error::Unexpected(
+            "a unit that runs without its volume",
+        ))
+    }
+
     async fn mount_volumes(
         &self,
         current: &[VolumeId],
@@ -836,8 +861,29 @@ mod lab {
 
         // It starts as its user, answers the agent over the socket, takes a CPU quota that its
         // stop lifts again.
+        assert!(node.attached(&volume));
+        assert_eq!(node.unit_volume(ID).await.unwrap(), None);
         let started = node.start(ID).await.unwrap();
         assert_eq!(started.uid, account.uid);
+        // The unit has mounted the volume itself, and that mount is what tells which volume it
+        // serves, whatever the agent has mounted: the agent's namespace ending (its restart)
+        // leaves the unit, its mount and the answer as they are.
+        assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
+        sh("umount", &[&format!("/var/lib/pgcf/db/{ID}")]);
+        node.reset_device_links().await.unwrap();
+        assert!(!node.attached(&volume));
+        assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
+        // The agent's unmount of a volume that a unit holds is refused: it is mounted again.
+        assert!(
+            node.mount_volumes(std::slice::from_ref(&volume))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(node.attached(&volume));
+        let busy = node.unmount_volume(&volume).await.unwrap_err();
+        assert!(matches!(busy, storage::Error::Busy), "{busy:?}");
+        assert!(node.attached(&volume));
         node.set_cpu_quota(ID, NonZeroU32::new(250)).await.unwrap();
         assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "250ms");
         let session = postgres::agent(&socket).await.unwrap();
@@ -854,6 +900,7 @@ mod lab {
         node.stop(ID).await.unwrap();
         assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "infinity");
         assert!(!node.unit(ID).await.unwrap().active.awake());
+        assert_eq!(node.unit_volume(ID).await.unwrap(), None);
 
         // The volume grows online, is trimmed, unmounted and mounted again as after a boot.
         node.grow_volume(&volume, 2 << 30).await.unwrap();
@@ -875,6 +922,7 @@ mod lab {
             Some((2 << 30, false))
         );
         // A volume that is not attached has no link: no start on its empty directory.
+        assert!(!node.attached(&volume));
         assert!(std::fs::symlink_metadata(&link).is_err());
         let refused = node.start(ID).await.unwrap_err();
         assert!(
@@ -888,6 +936,7 @@ mod lab {
                 .is_empty()
         );
         assert!(data.join("PG_VERSION").exists());
+        assert!(node.attached(&volume));
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
             PathBuf::from(node.device(&volume))

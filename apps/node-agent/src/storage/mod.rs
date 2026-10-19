@@ -31,6 +31,7 @@ mod store;
 mod usage;
 
 pub use command::{CommandRunner, Output, SystemRunner};
+pub use commands::FS_END_GAP_BYTES;
 pub use error::Error;
 pub use ids::VolumeId;
 pub use pool::{NoRoom, Policy, PoolMode, PoolSample};

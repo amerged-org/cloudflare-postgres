@@ -110,10 +110,18 @@ impl Volume {
         if !Path::new(&node).exists() {
             run("mknod", &[&node, "b", major, minor]);
         }
-        // 1 MiB shorter than the device, as the agent makes every filesystem.
+        // Shorter than the device by the gap, as the agent makes every filesystem.
         run(
             "mkfs.ext4",
-            &["-F", "-q", &format!("/dev/mapper/{mapper}"), "130048K"],
+            &[
+                "-F",
+                "-q",
+                &format!("/dev/mapper/{mapper}"),
+                &format!(
+                    "{}K",
+                    ((128u64 << 20) - crate::storage::FS_END_GAP_BYTES) / 1024
+                ),
+            ],
         );
         Self {
             image,
@@ -769,7 +777,7 @@ async fn the_unit_and_the_agent_hold_one_filesystem_each_in_a_namespace_of_its_o
         "resize2fs",
         &[
             &database.volume.device(),
-            &format!("{}K", (bigger - (1 << 20)) / 1024),
+            &format!("{}K", (bigger - crate::storage::FS_END_GAP_BYTES) / 1024),
         ],
     );
     assert!(blocks(&database.root) > before);
@@ -903,6 +911,23 @@ async fn a_database_user_writes_its_own_volume_and_sees_the_neighbours_only_wher
     assert_eq!(field("list_volumes"), "no");
     // The system is read-only, a world-writable directory included.
     assert_eq!(field("system_write"), "no");
+    // The device policy of the unit allows the block devices that image dissection touches, and
+    // what keeps its user from them is this: a private /dev with the character nodes of any
+    // /dev and no block node, no capability to make one, and neither the device-mapper node of
+    // a volume nor the volume's own device to open, by number or by name.
+    assert_eq!(field("block_nodes"), "0");
+    assert!(
+        field("character_nodes").parse::<u32>().unwrap() > 0,
+        "{report}"
+    );
+    for attempt in [
+        "mknod_block",
+        "open_dm_node",
+        "open_own_device",
+        "open_other_device",
+    ] {
+        assert_eq!(field(attempt), "no", "{attempt}\n{report}");
+    }
     // What stays visible, as before: the device-mapper names, and a neighbour's cgroup.
     assert!(
         field("dm_names").contains(&format!("pgcflab-{}", other.id)),
@@ -946,6 +971,13 @@ echo "other_entries=$(ls -A /var/lib/pgcf/db/$other 2>/dev/null | wc -l)"
 echo "other_write=$(t touch /var/lib/pgcf/db/$other/probe.tmp)"
 echo "list_volumes=$(t ls /var/lib/pgcf/db)"
 echo "system_write=$(t touch /srv/ww/probe.tmp)"
+dm=$(cat "$(ls -d /sys/block/dm-* | head -1)/dev")
+echo "block_nodes=$(find /dev -type b 2>/dev/null | wc -l)"
+echo "character_nodes=$(find /dev -type c 2>/dev/null | wc -l)"
+echo "mknod_block=$(t mknod $mine/block-node b ${dm%:*} ${dm#*:})"
+echo "open_dm_node=$(t sh -c ": < /dev/dm-${dm#*:}")"
+echo "open_own_device=$(t sh -c ": < /dev/mapper/pgcflab-$me")"
+echo "open_other_device=$(t sh -c ": < /dev/mapper/pgcflab-$other")"
 echo "dm_names=$(cat /sys/block/dm-*/dm/name 2>/dev/null | tr '\n' ' ')"
 echo "cgroup_siblings=$(ls /sys/fs/cgroup$(dirname $cgroup) 2>/dev/null | tr '\n' ' ')"
 } > /run/pgcf/$me/probe.txt

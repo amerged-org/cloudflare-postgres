@@ -22,12 +22,17 @@ use std::{
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     slice,
-    sync::{Arc, Mutex, PoisonError},
-    time::Instant,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
 };
 
 /// A volume is a whole number of extents; the volume group is made with lvm2's 4 MiB.
 const EXTENT_BYTES: u64 = 4 << 20;
+
+/// How long `detach` looks for the superblock of a volume it has unmounted before it takes the
+/// volume to be held by a unit or a job, and how often it looks.
+const SUPERBLOCK_RELEASE_WAIT: Duration = Duration::from_millis(250);
+const SUPERBLOCK_POLL: Duration = Duration::from_millis(10);
 
 /// What the kernel says of a volume's device without a process: its minor number, and ext4's
 /// error count on that minor.
@@ -36,18 +41,12 @@ struct Kernel {
     ext4_errors: fn(u32) -> io::Result<u64>,
 }
 
-/// The hold on `Storage::changes`.
-type Changes<'a> = tokio::sync::MutexGuard<'a, ()>;
-
 pub struct Storage<R = SystemRunner> {
     runner: R,
     config: Config,
     latest: Mutex<Option<PoolSample>>,
-    /// Serializes everything that changes the group, the pool or a volume. A fair lock: whoever
-    /// asks first has it first, so that a wake that needs its own volume mounted gets in between
-    /// two volumes of the batch `mount_all` is mounting, which a lock that the batch can take
-    /// again at once would not let it.
-    changes: tokio::sync::Mutex<()>,
+    /// Serializes everything that changes the group, the pool or a volume.
+    changes: Mutex<()>,
     listing: Listing,
     kernel: Kernel,
 }
@@ -65,7 +64,7 @@ impl<R: CommandRunner> Storage<R> {
             runner,
             config,
             latest: Mutex::new(None),
-            changes: tokio::sync::Mutex::new(()),
+            changes: Mutex::new(()),
             listing: Listing::new(VOLUME_LIST_MAX_AGE),
             kernel: Kernel {
                 minor: host::block_minor,
@@ -81,10 +80,9 @@ impl<R: CommandRunner> Storage<R> {
         commands::device(&self.config, id)
     }
 
-    fn lock(&self) -> Changes<'_> {
+    fn lock(&self) -> MutexGuard<'_, ()> {
         // The lock guards no data: a panic while holding it leaves nothing half-updated in memory.
-        // Storage runs on the blocking pool (`Node::storage`), never in an async task.
-        self.changes.blocking_lock()
+        self.changes.lock().unwrap_or_else(PoisonError::into_inner)
     }
     fn run(&self, command: Vec<String>) -> Result<Output, Error> {
         let output = self.runner.run(&command);
@@ -150,6 +148,39 @@ impl<R: CommandRunner> Storage<R> {
     pub fn reset_device_links(&self) -> Result<(), Error> {
         let _guard = self.lock();
         Ok(host::reset_links(&self.config.device_links)?)
+    }
+    /// Whether the volume is attached: its link for the database's unit names its device. The link
+    /// is made last by `attach` and taken first by everything that detaches, repairs or removes
+    /// the volume, and is no more after the agent's start, so it is the one fact that says the
+    /// agent has the volume mounted and may start a unit on it.
+    pub fn attached(&self, id: &VolumeId) -> bool {
+        let (link, device) = self.link_of(id);
+        host::link_names(&link, &device)
+    }
+    /// The volume that the process `pid`, a unit's main process, has mounted at the database's
+    /// directory, from its own mount table: the unit mounts its volume itself, so this is what it
+    /// serves, and the agent's table says nothing of it. `None` when it has no mount there.
+    pub fn volume_mounted_by(&self, pid: u32, database: &str) -> Result<Option<VolumeId>, Error> {
+        let table = fs::read_to_string(format!("/proc/{pid}/mountinfo"))?;
+        self.volume_of_mount(database, &mountinfo::parse(&table)?)
+    }
+    fn volume_of_mount(&self, database: &str, mounts: &[Mount]) -> Result<Option<VolumeId>, Error> {
+        let dir = self.config.mount_root.join(database);
+        let Some(mount) = mounts.iter().rev().find(|mount| mount.mount_point == dir) else {
+            return Ok(None);
+        };
+        // The device's number says which of the database's volumes it is.
+        let lvs = self.read_lvs()?;
+        self.database_volumes(&lvs)
+            .filter(|(id, _)| id.database() == database)
+            .map(|(id, _)| id)
+            .find(|id| {
+                (self.kernel.minor)(&commands::device(&self.config, id)).ok() == Some(mount.minor)
+            })
+            .map(Some)
+            .ok_or(Error::Unexpected(
+                "a mount at the database's directory that is no volume of it",
+            ))
     }
     /// The mount of this volume's own filesystem at its directory, if any.
     fn mount_of<'a>(&self, id: &VolumeId, mounts: &'a [Mount]) -> Option<&'a Mount> {
@@ -267,7 +298,7 @@ impl<R: CommandRunner> Storage<R> {
     }
 
     /// `poll_pool` inside a change, which holds the lock.
-    fn sample_pool(&self, held: &Changes<'_>) -> Result<PoolSample, Error> {
+    fn sample_pool(&self, held: &MutexGuard<'_, ()>) -> Result<PoolSample, Error> {
         let sample = self.read_pool()?;
         if !sample.writable() {
             self.mark_suspects(held)?;
@@ -278,17 +309,19 @@ impl<R: CommandRunner> Storage<R> {
     /// While the pool takes no writes, a mounted ext4 loses metadata blocks without recording an
     /// error: only a later write notices, and PostgreSQL stops at its first failed WAL write and
     /// makes none. So the pool's state, not ext4's error count, decides which volumes may be
-    /// damaged: every volume mounted now. The tag is LVM metadata, so it outlives the agent and
-    /// the node, and it stays until `recover_volume` has repaired the volume.
-    fn mark_suspects(&self, _held: &Changes<'_>) -> Result<(), Error> {
+    /// damaged: every volume that is open now, whoever has it open. The agent's own mount table
+    /// is no witness: the agent has mounted what its namespace has since it started, and a unit
+    /// or a job mounts the volume in a namespace of its own. The tag is LVM metadata, so it
+    /// outlives the agent and the node, and it stays until `recover_volume` has repaired the
+    /// volume.
+    fn mark_suspects(&self, _held: &MutexGuard<'_, ()>) -> Result<(), Error> {
         let lvs = self.read_lvs()?;
-        let mounts = self.mounts()?;
-        let mounted: Vec<(VolumeId, bool)> = self
+        let open: Vec<(VolumeId, bool)> = self
             .database_volumes(&lvs)
-            .filter(|(id, _)| self.mount_of(id, &mounts).is_some())
+            .filter(|(_, lv)| lv.is_open())
             .map(|(id, lv)| (id, lv.has_tag(SUSPECT_TAG)))
             .collect();
-        let unmarked: Vec<VolumeId> = mounted
+        let unmarked: Vec<VolumeId> = open
             .iter()
             .filter(|(_, suspect)| !suspect)
             .map(|(id, _)| id.clone())
@@ -300,10 +333,10 @@ impl<R: CommandRunner> Storage<R> {
                 SUSPECT_TAG,
             ))?;
         }
-        // A suspect volume may not be started on, whoever asks: every volume mounted now has no
+        // A suspect volume may not be started on, whoever asks: every volume open now has no
         // link, also one a failed attempt left, which the tag no longer makes a candidate. Units
         // that run keep their own mounts and are stopped by their databases' recovery.
-        for (id, _) in &mounted {
+        for (id, _) in &open {
             self.drop_link(id)?;
         }
         Ok(())
@@ -333,10 +366,10 @@ impl<R: CommandRunner> Storage<R> {
             let mount = match self.mount_of(&id, &mounts) {
                 Some(mount) => Some(MountInfo {
                     usage: host::fs_usage(&mount.mount_point)?,
-                    fs_errors: host::ext4_errors(mount.minor)? > 0,
                 }),
                 None => None,
             };
+            let fs_errors = self.fs_errors(&id)?;
             volumes.push(VolumeInfo {
                 id,
                 size_bytes: lv.size_bytes,
@@ -344,6 +377,7 @@ impl<R: CommandRunner> Storage<R> {
                 formatted: lv.has_tag(FS_TAG),
                 reserve_released: lv.has_tag(RESERVE_FREED_TAG),
                 suspect: lv.has_tag(SUSPECT_TAG),
+                fs_errors,
                 mount,
             });
         }
@@ -355,6 +389,24 @@ impl<R: CommandRunner> Storage<R> {
                 .map(|lv| lv.size_bytes)
                 .sum(),
         })
+    }
+
+    /// Whether ext4 recorded an error on the volume's filesystem, wherever it is mounted: ext4's
+    /// entry for the device (`/sys/fs/ext4/dm-<minor>`) exists while a superblock does, in any
+    /// mount namespace, the agent's own or a unit's or a job's. A device with no filesystem
+    /// mounted has no entry and no error to count.
+    fn fs_errors(&self, id: &VolumeId) -> Result<bool, Error> {
+        let absent = |error: io::Error| match error.kind() {
+            ErrorKind::NotFound => Ok(false),
+            _ => Err(Error::from(error)),
+        };
+        match (self.kernel.minor)(&commands::device(&self.config, id)) {
+            Ok(minor) => match (self.kernel.ext4_errors)(minor) {
+                Ok(errors) => Ok(errors > 0),
+                Err(error) => absent(error),
+            },
+            Err(error) => absent(error),
+        }
     }
 
     /// What the recent list and the kernel say of the volume, without a process: whether it is
@@ -399,10 +451,7 @@ impl<R: CommandRunner> Storage<R> {
         if self.volume(&self.read_lvs()?, id)?.has_tag(SUSPECT_TAG) {
             return Ok(true);
         }
-        match self.mount_of(id, &self.mounts()?) {
-            Some(mount) => Ok(host::ext4_errors(mount.minor)? > 0),
-            None => Ok(false),
-        }
+        self.fs_errors(id)
     }
 
     /// The logical cap of plan 4.3: nominal sizes stay at or below a multiple of the pool.
@@ -556,12 +605,23 @@ impl<R: CommandRunner> Storage<R> {
         if size_bytes > current {
             self.run(commands::volume_extend(&self.config, id, size_bytes))?;
         }
-        self.run(commands::resize_fs(&self.config, id, size_bytes))?;
+        // A filesystem that already has the size, or more (a volume made before the gap existed
+        // fills it; a call that follows a crash after `resize2fs`), is left as it is: asked for
+        // less, resize2fs refuses to shrink it, for ever.
+        if self.filesystem_kib(id)? < commands::fs_target_kib(size_bytes) {
+            self.run(commands::resize_fs(&self.config, id, size_bytes))?;
+        }
         if released {
             let usage = host::fs_usage(&self.mount_dir(id))?;
             self.apply_reserve(id, usage.reserve_action(true, false), true)?;
         }
         Ok(())
+    }
+
+    /// The size of the volume's filesystem, from its superblock.
+    fn filesystem_kib(&self, id: &VolumeId) -> Result<u64, Error> {
+        let header = self.run(commands::fs_header(&self.config, id))?;
+        commands::parse_fs_kib(&header.stdout).ok_or(Error::Parse("the filesystem's header"))
     }
 
     pub fn mount_volume(&self, id: &VolumeId) -> Result<(), Error> {
@@ -571,21 +631,16 @@ impl<R: CommandRunner> Storage<R> {
         self.attach(id, suspect)
     }
 
-    /// After a boot: mounts the formatted volume of every database in `current`, as sleeping
+    /// After a boot, and after an agent's restart, which ends its mount namespace and with it every
+    /// mount it made: mounts the formatted volume of every database in `current`, as sleeping
     /// databases keep theirs mounted. `current` is the storage generation the persisted desired
     /// state names for each database: an older generation that has not been removed yet is never
     /// mounted, and the unit would start its data. A volume that does not mount is returned and
     /// the others still are. One that does not exist, or whose create stopped before its
-    /// filesystem, is the create's to finish.
-    ///
-    /// The change lock is held for one volume at a time, not for all: with a thousand volumes the
-    /// batch takes seconds (a mount is about 100 ms on a node), and a wake that needs its own
-    /// volume mounted waits for one mount, not for the batch.
+    /// filesystem, is the create's to finish. The agent serves no wake before this is done.
     pub fn mount_all(&self, current: &[VolumeId]) -> Result<Vec<(VolumeId, Error)>, Error> {
-        let lvs = {
-            let _guard = self.lock();
-            self.read_lvs()?
-        };
+        let _guard = self.lock();
+        let lvs = self.read_lvs()?;
         let mut failures = Vec::new();
         for id in current {
             let lv = match self.volume(&lvs, id) {
@@ -596,7 +651,6 @@ impl<R: CommandRunner> Storage<R> {
                     continue;
                 }
             };
-            let _guard = self.lock();
             if let Err(error) = self.attach(id, lv.has_tag(SUSPECT_TAG)) {
                 failures.push((id.clone(), error));
             }
@@ -607,6 +661,14 @@ impl<R: CommandRunner> Storage<R> {
     /// Unmounts the volume's own filesystem, after taking its link away: from the first moment no
     /// unit can be started on a volume that is going. What is on top at its directory must be that
     /// filesystem; `umount` would take whatever is on top.
+    ///
+    /// A unit or a job mounts the volume in a namespace of its own, and the agent's unmount does
+    /// not see that mount (a mount of its own is not busy because of it): the agent's mount goes
+    /// and the superblock stays. So the unmount is followed by a look at ext4's entry for the
+    /// device, which exists as long as a superblock does, in any namespace. If it stays, the
+    /// volume is held: it is mounted again, as it was, and the call is `Busy`. A holder that has
+    /// just ended leaves its namespace, and the superblock with it, a moment after (lab: 1 to 2
+    /// ms, 20 runs), which the wait covers many times over.
     fn detach(&self, id: &VolumeId) -> Result<(), Error> {
         self.drop_link(id)?;
         let mounts = self.mounts()?;
@@ -622,7 +684,27 @@ impl<R: CommandRunner> Storage<R> {
         host::unmount(&self.mount_dir(id)).map_err(|error| match error.raw_os_error() {
             Some(libc::EBUSY) => Error::Busy,
             _ => error.into(),
-        })
+        })?;
+        if self.superblock_outlives_unmount(id)? {
+            host::mount_ext4(&commands::device(&self.config, id), &self.mount_dir(id))?;
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+
+    /// Whether the device's filesystem is still alive a moment after the agent's last mount of it
+    /// went: another namespace holds it.
+    fn superblock_outlives_unmount(&self, id: &VolumeId) -> Result<bool, Error> {
+        let minor = (self.kernel.minor)(&commands::device(&self.config, id))?;
+        let ended = Instant::now() + SUPERBLOCK_RELEASE_WAIT;
+        loop {
+            match (self.kernel.ext4_errors)(minor) {
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+                Ok(_) if Instant::now() >= ended => return Ok(true),
+                Ok(_) => std::thread::sleep(SUPERBLOCK_POLL),
+            }
+        }
     }
 
     pub fn unmount_volume(&self, id: &VolumeId) -> Result<(), Error> {
@@ -763,6 +845,14 @@ impl<R: CommandRunner> Storage<R> {
     /// A pool without writes can leave the journal with committed transactions while the
     /// filesystem's `needs_recovery` flag is clear. `-p` then refuses (4); the journal is replayed
     /// by setting the flag, and `-p` runs again. Anything it still refuses needs an operator.
+    ///
+    /// Between the two `e2fsck` runs the flag is set with `debugfs -w`, which does not refuse a
+    /// filesystem that another namespace has mounted (lab: it wrote one, where `e2fsck` stopped
+    /// with 8). Nothing can mount the device then: the volume is detached first, which is refused
+    /// (`Busy`) while a unit or a job holds the filesystem; the unit cannot start without its
+    /// link, which is gone; and a job starts only from a flow of the database, which waits for the
+    /// database's lock that the recovery holds, or at the request of the database's own
+    /// processes, of which the stopped unit has none.
     pub fn recover_volume(&self, id: &VolumeId, policy: &Policy) -> Result<(), Error> {
         let guard = self.lock();
         // First of all: from here on no start may run on a volume that is being repaired, and the
@@ -956,6 +1046,76 @@ mod tests {
         assert!(storage.exists(&id).unwrap());
         assert!(!storage.needs_repair(&id).unwrap());
         assert_eq!(storage.runner.ran("lvs"), 2);
+    }
+
+    /// A unit or a job mounts the volume in a namespace of its own, so the agent's mount table
+    /// does not list a volume that has a filesystem mounted (the agent's own mounts end with its
+    /// restart): ext4's entry for the device, which exists while any namespace has the
+    /// superblock, is what tells that it recorded an error. No entry is no filesystem and no error.
+    #[test]
+    fn a_filesystem_that_the_agent_has_not_mounted_is_damaged_when_ext4_says_so() {
+        let id = listed_volume();
+        for list_is_old in [false, true] {
+            let mut storage = storage_with(LVS, |_| Ok(3));
+            if list_is_old {
+                storage.listing = Listing::new(Duration::ZERO);
+            }
+            assert!(storage.needs_repair(&id).unwrap(), "{list_is_old}");
+        }
+        let mut storage = storage_with(LVS, |_| Ok(0));
+        storage.listing = Listing::new(Duration::ZERO);
+        assert!(!storage.needs_repair(&id).unwrap());
+        let mut storage = storage_with(LVS, |_| Err(io::Error::from(io::ErrorKind::NotFound)));
+        storage.listing = Listing::new(Duration::ZERO);
+        assert!(!storage.needs_repair(&id).unwrap());
+        // Not being able to read ext4's entry is no answer, and no "clean".
+        let mut storage = storage_with(LVS, |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        storage.listing = Listing::new(Duration::ZERO);
+        assert!(storage.needs_repair(&id).is_err());
+    }
+
+    /// A unit mounts its volume itself, so which generation it serves is in its own mount table:
+    /// the device number of the mount at the database's directory names the volume.
+    #[test]
+    fn the_generation_a_unit_serves_is_the_volume_whose_device_number_it_has_mounted() {
+        let two_generations = LVS
+            .replace("db_k1l2m3n4o5p6q7r8s9t0_g12", "db_a1b2c3d4e5f6g7h8i9j0_g2")
+            .replace(
+                "pgcf.db.k1l2m3n4o5p6q7r8s9t0,pgcf.gen.12",
+                "pgcf.db.a1b2c3d4e5f6g7h8i9j0,pgcf.fs,pgcf.gen.2",
+            );
+        let mut storage = Storage::new(Listed::new(&two_generations), Config::default());
+        storage.kernel = Kernel {
+            minor: |device| match device {
+                device if device.ends_with("_g1") => Ok(7),
+                device if device.ends_with("_g2") => Ok(9),
+                _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+            },
+            ext4_errors: |_| Ok(0),
+        };
+        let mount = |minor: u32, at: &str| Mount {
+            major: 252,
+            minor,
+            mount_point: at.into(),
+            fstype: "ext4".into(),
+            source: format!("/dev/dm-{minor}"),
+        };
+        let at = format!("/var/lib/pgcf/db/{LISTED}");
+        let serves = |mounts: &[Mount]| storage.volume_of_mount(LISTED, mounts);
+        let generation = |volume: Option<VolumeId>| volume.map(|volume| volume.generation());
+        assert_eq!(generation(serves(&[mount(7, &at)]).unwrap()), Some(1));
+        assert_eq!(generation(serves(&[mount(9, &at)]).unwrap()), Some(2));
+        // The mounts of other directories say nothing, and the top mount at the directory counts.
+        let other = mount(7, "/var/lib/pgcf/db/k1l2m3n4o5p6q7r8s9t0");
+        assert_eq!(serves(std::slice::from_ref(&other)).unwrap(), None);
+        assert_eq!(
+            generation(serves(&[mount(7, &at), other, mount(9, &at)]).unwrap()),
+            Some(2)
+        );
+        // A device that is no volume of the database is no answer, and no guess.
+        assert!(serves(&[mount(11, &at)]).is_err());
     }
 
     #[test]

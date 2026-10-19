@@ -281,6 +281,9 @@ impl Rig {
         );
         let timing = self.core.timing.clone();
         drop(self);
+        // The agent's mount namespace ends with it: the volumes are mounted again by the next
+        // one, which the units that run do not wait for.
+        machine.forget_mounts();
         // The old sockets close with the old tasks.
         tokio::time::sleep(Duration::from_millis(50)).await;
         Self::boot(machine, fixture, root, running, timing).await

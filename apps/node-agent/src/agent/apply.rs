@@ -580,17 +580,16 @@ impl<M: Machine> Core<M> {
             None => None,
         };
         let entry = db.as_ref().and_then(|db| db.view().entry.clone());
-        // A node that restarted has no record of a unit that runs on: it serves the generation that
-        // is mounted.
+        // A node that restarted has no record of a unit that runs on: it serves the volume the
+        // unit itself has mounted, which the agent's own mounts (made again for the page's
+        // databases only, after a restart) do not tell.
         let retired = match entry {
             Some(entry) => Some(entry.storage_generation <= storage_generation),
-            None => self.machine.inventory().await.ok().map(|inventory| {
-                inventory.volumes.iter().any(|volume| {
-                    volume.id.database() == database
-                        && volume.mounted()
-                        && volume.id.generation() <= storage_generation
-                })
-            }),
+            None => match self.machine.unit_volume(database).await {
+                Ok(Some(volume)) => Some(volume.generation() <= storage_generation),
+                Ok(None) => Some(false),
+                Err(_) => None,
+            },
         };
         match (retired, &db) {
             (Some(true), Some(db)) => {
@@ -1453,6 +1452,69 @@ mod tests {
         );
     }
 
+    /// The unit's own mount says which generation it serves: an order for the generation before
+    /// it takes that generation's volume and leaves the unit of the next one running, though the
+    /// agent that restarted has neither a record of the database nor a mount of its volume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_leaves_the_unit_of_a_later_generation_than_a_superseded_order_names()
+    {
+        let Some(rig) = Rig::new("superseded-later").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db], vec![])).await;
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        // The database moved here from itself: the unit runs on generation 2 (the volume of
+        // generation 1 stays until the order releases it).
+        let (first, second) = (
+            crate::storage::VolumeId::new(&id, 1).unwrap(),
+            crate::storage::VolumeId::new(&id, 2).unwrap(),
+        );
+        rig.machine.stop(&id).await.unwrap();
+        rig.machine.unmount_volume(&first).await.unwrap();
+        let account = rig.machine.account(&id).unwrap();
+        let storage = rig.core.policy().storage.clone();
+        rig.machine
+            .create_volume(&second, 1 << 30, &account, &storage)
+            .await
+            .unwrap();
+        // A move restored the database's files into it: here, the first generation's directory
+        // that the double set aside stands for them.
+        let layout = rig.core.layout().clone();
+        std::fs::remove_dir_all(layout.volume(&id)).unwrap();
+        std::fs::rename(layout.volume(&format!("{id}.g1")), layout.volume(&id)).unwrap();
+        rig.machine.start(&id).await.unwrap();
+        let rig = rig.restart().await;
+        assert!(rig.machine.running(&id));
+        assert_eq!(rig.machine.unit_volume(&id).await.unwrap(), Some(second));
+        let order = Order::Superseded {
+            operation: "op_ssssssssssssssssssss".into(),
+            database: id.clone(),
+            storage_generation: 1,
+            remove_volume: true,
+        };
+        rig.core.apply(&Rig::page(vec![], vec![order])).await;
+        eventually(30, "the superseded order", || {
+            rig.core.pending_order("op_ssssssssssssssssssss").is_some()
+        })
+        .await;
+        assert!(rig.machine.running(&id), "the unit serves generation 2");
+        assert_eq!(
+            rig.core.pending_order("op_ssssssssssssssssssss").unwrap()["status"],
+            "done"
+        );
+        assert_eq!(
+            rig.machine
+                .volumes()
+                .iter()
+                .map(|(volume, _)| volume.generation())
+                .collect::<Vec<_>>(),
+            [2]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_restarted_agent_finds_what_runs_what_sleeps_and_what_crashed() {
         let Some(rig) = Rig::new("restart").await else {
@@ -1875,26 +1937,25 @@ mod tests {
             "the generation the page serves is not retired"
         );
     }
+
     /// A restore writes the generation it builds, and a move's target is the next generation of a
     /// database whose source generation is still in the way: the jobs of a generation mount the
-    /// device of that generation, whichever generation the database's link names.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_jobs_of_a_generation_mount_the_device_of_that_generation() {
-        let Some(rig) = Rig::new("job-device").await else {
-            return;
-        };
-        let id = id_of(&rig.entry_json());
-        let layout = rig.core.layout().clone();
+    /// device of that generation, whichever generation the database's link names. No node, no
+    /// PostgreSQL: a plain test.
+    #[test]
+    fn the_jobs_of_a_generation_mount_the_device_of_that_generation() {
+        let layout = crate::layout::Layout::default();
+        let id = "a1b2c3d4e5f6g7h8i9j0";
         for generation in [1, 7] {
-            let volume = crate::storage::VolumeId::new(&id, generation).unwrap();
-            let database = rig.core.job_database(&volume, "pgcf-user");
-            assert_eq!(
-                database.device,
-                std::path::PathBuf::from(format!("/dev/mapper/pgcf-db_{id}_g{generation}"))
-            );
+            let volume = crate::storage::VolumeId::new(id, generation).unwrap();
+            let device = format!("/dev/mapper/pgcf-db_{id}_g{generation}");
+            let database = crate::agent::job_database(&layout, &device, &volume, "pgcf-user");
+            assert_eq!(database.device, std::path::PathBuf::from(&device));
             // One directory for every generation: the job mounts the device at the database's path.
-            assert_eq!(database.volume, layout.volume(&id));
+            assert_eq!(database.volume, layout.volume(id));
             assert_eq!(database.id, id);
+            assert_eq!(database.user, "pgcf-user");
+            assert_eq!(database.socket_directory, layout.socket_directory(id));
         }
     }
 }

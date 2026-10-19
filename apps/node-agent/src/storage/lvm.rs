@@ -44,6 +44,12 @@ impl LogicalVolume {
     pub fn is_thin(&self) -> bool {
         self.attr.starts_with('V')
     }
+    /// Something has the volume's device open: the filesystem is mounted, in any mount namespace
+    /// (the agent's, a unit's, a job's), or a process has opened the device. It is the sixth
+    /// character of `lv_attr`, which lvm2 reads from the device-mapper open count.
+    pub fn is_open(&self) -> bool {
+        self.attr.as_bytes().get(5) == Some(&b'o')
+    }
     pub fn has_tag(&self, tag: &str) -> bool {
         self.tags.iter().any(|t| t == tag)
     }
@@ -237,6 +243,19 @@ mod tests {
     }
     fn device() -> PhysicalVolume {
         parse_pvs(PVS).unwrap().remove(0)
+    }
+
+    /// The sixth character of `lv_attr` is `o` while something has the device open, as lvm2
+    /// wrote it for a thin volume that a mount holds (lab).
+    #[test]
+    fn a_volume_is_open_when_lvm2_says_o_in_the_sixth_place_of_its_attributes() {
+        let mut volume = parse_lvs(LVS_VOLUMES).unwrap().remove(0);
+        assert_eq!(volume.attr, "Vwi-a-tz--");
+        assert!(!volume.is_open());
+        volume.attr = "Vwi-aotz--".into();
+        assert!(volume.is_open());
+        volume.attr = "Vwi".into();
+        assert!(!volume.is_open());
     }
 
     #[test]
