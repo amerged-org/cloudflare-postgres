@@ -10,6 +10,7 @@ import {
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext, Env } from "../env.ts";
+import { eachBounded } from "./bounded.ts";
 import { databaseActor } from "./database-actor-sync.ts";
 import { recoverFailedResume, recoverQuiescence } from "./lifecycle.ts";
 import { powerTransitionStatements } from "./power-transition.ts";
@@ -59,10 +60,19 @@ const LOGGED_REPORT_MS = 2000;
 const LOGGED_REPORT_DATABASES = 50;
 
 interface Row extends DatabaseRow {
+  proven_sleep_json: string | null;
+  /** 1 once a report has written the sleep's lifecycle event of the database's generation. */
+  slept: number;
   operation: string;
   restore_operation: string | null;
   restore_status: string | null;
 }
+/**
+ * Whether the sleep's event of the database's generation is written. The first report applied to a
+ * suspended database asleep at the generation writes it, in one batch with every other statement
+ * that report runs, and no other writer does.
+ */
+const SLEEP_EVENT = `EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.generation=d.generation AND e.kind IN('suspended','hibernated'))`;
 const OPERATION_OF_GENERATION = `(SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
   ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1)`;
 
@@ -339,10 +349,89 @@ function reportedColumns(
   };
 }
 
+/** The runtime of the row and of the one the report would write, but for the time of the report. */
+function sameRuntime(stored: string | null | undefined, next: string | null) {
+  if (next === null) return stored == null;
+  if (stored == null) return false;
+  const a = JSON.parse(stored) as DatabaseRuntime,
+    b = JSON.parse(next) as DatabaseRuntime;
+  return (
+    a.node_id === b.node_id &&
+    a.generation === b.generation &&
+    a.storage_generation === b.storage_generation &&
+    a.instance === b.instance
+  );
+}
+
+/**
+ * Whether D1 already holds what applying `observation` would write: every column of the update,
+ * and so every statement that follows it, which the first report of this state already ran. A
+ * node says what it said again once in each anti-entropy period (`NODE_OBSERVATION_RESEND_MS`),
+ * and most of what it says then is this: a database asleep or ready as it was. Only these two
+ * steady states are told; the rest of the states are rare and take the whole path. Role removals
+ * and refused sleeps are outcomes, never a repeat. What the report would write besides is the
+ * time of the backup observation, which `touchObserved` takes alone. A row can be in the state
+ * the node reports without any report having brought it there: a cold resize takes the next
+ * generation and observes it at once, so the statements that follow (the sleep's event, which
+ * meters the new resources, and the end of the resize) have not run. The resize may be failed
+ * meanwhile (`operation_timeout`, after 20 minutes with the node, its agent or its link down), so
+ * no open operation shows it. A suspended database's sleep is therefore held only once the event
+ * of that generation is written, which only a report writes. (A role removal needs no clause of
+ * its own: only a report that names roles ends one, and a sleep ends the ones that wait before
+ * it, while a removal asked of a suspended database is created ended.)
+ */
+function holds(
+  row: Row,
+  observation: NodeDatabaseObservation,
+  set: { state: string; power: string; runtime: string | null },
+  columns: ReturnType<typeof reportedColumns>,
+): boolean {
+  return (
+    (observation.state === "ready" || observation.state === "asleep") &&
+    observation.roles === undefined &&
+    observation.refusal === undefined &&
+    row.observed_state === set.state &&
+    row.observed_power === set.power &&
+    row.observed_generation === observation.generation &&
+    sameRuntime(row.runtime_json, set.runtime) &&
+    (observation.state !== "asleep" ||
+      (row.proven_sleep_json === JSON.stringify(observation.proven_sleep) &&
+        (row.desired_state !== "suspended" || row.slept === 1))) &&
+    row.status_message === columns.message &&
+    row.archiving_health === columns.health &&
+    row.archiving_health_since === columns.since &&
+    (row.backup_health ?? "unknown") === columns.backup_health &&
+    (row.backup_last_completed_at ?? null) === columns.backup_last_completed_at
+  );
+}
+
+/**
+ * What an unchanged observation still proves: that the node names the database and its backup now,
+ * which is the time `health.backup` and `database_base_backup_stale` judge by. One column, only
+ * forward, and not `updated_at`, which versions the row for the writers that race this one.
+ */
+async function touchObserved(
+  env: Env,
+  node: NodeCaller,
+  row: Row,
+  observation: NodeDatabaseObservation,
+  reportedAt: string,
+): Promise<void> {
+  if (observation.backup === null) return;
+  await env.DB.prepare(
+    `UPDATE databases SET backup_observed_at=?
+     WHERE id=? AND node_id=? AND (backup_observed_at IS NULL OR backup_observed_at<?)`,
+  )
+    .bind(reportedAt, row.id, node.id, reportedAt)
+    .run();
+}
+
 /**
  * Applies one accepted report of a database. Returns whether D1 took it: the update is a
  * compare-and-set on the row it was made from, so a concurrent change wins and the node is told
- * its report conflicted.
+ * its report conflicted. A report of what D1 already holds writes nothing but the time of the
+ * backup observation; it still publishes the Actor's snapshot, which is the repair of a publish
+ * that failed after the report that asked for it.
  */
 async function applyObservation(
   env: Env,
@@ -425,6 +514,13 @@ async function applyObservation(
     row.restore_status === "failed"
   )
     return false;
+  if (holds(row, observation, set, columns)) {
+    await touchObserved(env, node, row, observation, reportedAt);
+    // The repair of what an earlier report of this state left undone: its publish may have failed
+    // after the commit, and the report that was failed for it comes again to this path.
+    await answeredWithin(publishDatabaseAdmission(env, row.id), row.id);
+    return true;
+  }
   const wasReady =
     row.observed_state === "ready" &&
     row.observed_power === "awake" &&
@@ -547,6 +643,34 @@ async function applyObservation(
   });
 }
 
+/**
+ * Waits for a publish of the Actor's snapshot for `ADMISSION_PUBLISH_ANSWER_MS`. A publish is a few
+ * Actor RPCs and D1 reads. A failure within the bound fails the report, so the node sends it
+ * again; one still running after it finishes in the background and is logged if it fails.
+ */
+async function answeredWithin(
+  publishing: Promise<unknown>,
+  databaseId: string,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = await Promise.race([
+    publishing.then(() => true),
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), ADMISSION_PUBLISH_ANSWER_MS);
+    }),
+  ]).finally(() => clearTimeout(timer));
+  if (!settled)
+    void publishing.catch((error) =>
+      console.error(
+        JSON.stringify({
+          event: "admission_publish_failed",
+          database_id: databaseId,
+          error: error instanceof Error ? error.name : "error",
+        }),
+      ),
+    );
+}
+
 /** The push that releases a waiting connection and the publish of the Actor's snapshot. */
 async function afterCommit(
   env: Env,
@@ -582,27 +706,7 @@ async function afterCommit(
         publishedAt = Date.now();
         return value;
       });
-  if (publishing) {
-    // A publish is a few Actor RPCs and D1 reads. A failure within the bound fails this report,
-    // so the node sends it again; one still running after it finishes in the background.
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const settled = await Promise.race([
-      publishing.then(() => true),
-      new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => resolve(false), ADMISSION_PUBLISH_ANSWER_MS);
-      }),
-    ]).finally(() => clearTimeout(timer));
-    if (!settled)
-      void publishing.catch((error) =>
-        console.error(
-          JSON.stringify({
-            event: "admission_publish_failed",
-            database_id: row.id,
-            error: error instanceof Error ? error.name : "error",
-          }),
-        ),
-      );
-  }
+  if (publishing) await answeredWithin(publishing, row.id);
   if (
     becameReady ||
     (observation.state === "asleep" && row.observed_power !== "hibernated")
@@ -702,7 +806,7 @@ async function readRow(
   nodeId: string,
 ): Promise<Row | null> {
   return env.DB.prepare(
-    `SELECT d.*,${OPERATION_OF_GENERATION} operation,x.operation_id restore_operation,ro.status restore_status
+    `SELECT d.*,${SLEEP_EVENT} slept,${OPERATION_OF_GENERATION} operation,x.operation_id restore_operation,ro.status restore_status
      FROM databases d LEFT JOIN database_restores x ON x.target_database_id=d.id
      LEFT JOIN operations ro ON ro.id=x.operation_id AND ro.kind='database.restore'
      WHERE d.id=? AND d.node_id=?`,
@@ -880,37 +984,22 @@ async function takeObservations(
 ): Promise<Taken> {
   const { databases } = report;
   const taken: Taken = { verdicts: [], deferred: 0, slowest: 0 };
-  const state: { next: number; failure?: { cause: unknown } } = { next: 0 };
-  const worker = async () => {
-    while (
-      state.failure === undefined &&
-      state.next < databases.length &&
-      Date.now() - started < budgetMs
-    ) {
-      const index = state.next++,
-        at = Date.now();
-      try {
-        taken.verdicts[index] = await takeObservation(
-          env,
-          node,
-          report.observed_at,
-          databases[index]!,
-        );
-      } catch (cause) {
-        state.failure ??= { cause };
-        return;
-      }
+  const begun = await eachBounded(
+    databases,
+    OBSERVATION_CONCURRENCY,
+    started + budgetMs,
+    async (observation, index) => {
+      const at = Date.now();
+      taken.verdicts[index] = await takeObservation(
+        env,
+        node,
+        report.observed_at,
+        observation,
+      );
       taken.slowest = Math.max(taken.slowest, Date.now() - at);
-    }
-  };
-  await Promise.all(
-    Array.from(
-      { length: Math.min(OBSERVATION_CONCURRENCY, databases.length) },
-      worker,
-    ),
+    },
   );
-  if (state.failure) throw state.failure.cause;
-  taken.deferred = databases.length - state.next;
+  taken.deferred = databases.length - begun;
   return taken;
 }
 
@@ -944,7 +1033,10 @@ function logReport(
 
 /**
  * `POST /node/v1/observations` (plan 5.3): what a node reports of its databases and its orders,
- * and the events of its own log.
+ * and the events of its own log. A node names a database when its observation changed, and again
+ * once in each anti-entropy period (`NODE_OBSERVATION_RESEND_MS`), so a report is a delta: a
+ * database it does not name is not gone, asleep or stale, it is unchanged, and nothing here reads
+ * its absence as anything.
  */
 export async function nodeObservations(
   c: ApiContext,

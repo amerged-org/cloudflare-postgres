@@ -437,6 +437,7 @@ export const nodeSchemas = {
   ArchiveCredential: link.ArchiveCredential,
   NodeDesiredPage: link.NodeDesiredPage,
   NodeObservationReport: link.NodeObservationReport,
+  NodeObservationAnswer: link.NodeObservationAnswer,
   NodeSample: link.NodeSample,
   NodeVolumeReport: link.NodeVolumeReport,
   NodeEventReport: link.NodeEventReport,
@@ -1193,6 +1194,37 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       false,
       true,
     ],
+  ],
+  NodeObservationAnswer: [
+    [
+      "one-of-each",
+      {
+        databases: [
+          { id, verdict: "accept" },
+          { id: other, verdict: "stale" },
+          { id: source, verdict: "conflict" },
+        ],
+        orders: 2,
+      },
+      true,
+    ],
+    ["a-fenced-node", { databases: [], orders: 1 }, true],
+    [
+      "unknown-verdict",
+      { databases: [{ id, verdict: "rejected" }], orders: 0 },
+      false,
+    ],
+    [
+      "no-identifier",
+      { databases: [{ id: "not-a-database", verdict: "accept" }], orders: 0 },
+      false,
+    ],
+    [
+      "negative-orders",
+      { databases: [{ id, verdict: "accept" }], orders: -1 },
+      false,
+    ],
+    ["an-unknown-key", { databases: [], orders: 0, hint: true }, false],
   ],
   NodeSample: [
     ["sample", sample, true],

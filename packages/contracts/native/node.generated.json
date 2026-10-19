@@ -1308,6 +1308,38 @@
         "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
       }
     },
+    "NodeObservationAnswer": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "databases": {
+          "maxItems": 200,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "$ref": "#/$defs/DatabaseId" },
+              "verdict": {
+                "type": "string",
+                "enum": ["accept", "stale", "conflict"]
+              }
+            },
+            "required": ["id", "verdict"],
+            "additionalProperties": false
+          }
+        },
+        "orders": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": ["databases", "orders"],
+      "additionalProperties": false,
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
+      }
+    },
     "NodeSample": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
@@ -2392,6 +2424,7 @@
     "NODE_SAMPLE_INTERVAL_MS": 15000,
     "NODE_VOLUME_REPORT_INTERVAL_MS": 60000,
     "NODE_STALE_MS": 180000,
+    "NODE_OBSERVATION_RESEND_MS": 900000,
     "NODE_EVENT_RETRY_SECONDS": 600,
     "NODE_FENCED_PATHS": ["/node/v1/desired", "/node/v1/observations"],
     "NODE_FENCED_ERROR": "node_fenced",

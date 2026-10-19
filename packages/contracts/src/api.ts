@@ -378,7 +378,7 @@ export const DatabaseHealth = z
       status: z
         .enum(BACKUP_HEALTH_STATUSES)
         .describe(
-          "ok: the last completed base backup is at most 36 h old; stale: older; failing: the region reports failing, or the last failure is newer than the last completion; unknown: no report within 180 s, an unknown report, or no completed backup.",
+          "ok: the last completed base backup is at most 36 h old; stale: older; failing: the region reports failing, or the last failure is newer than the last completion; unknown: no report of the database within 45 min (a node names an unchanged database once in 15 min), an unknown report, or no completed backup.",
         ),
       last_base_backup_at: describedTimestamp(
         "When the last completed base backup finished; null while none is known.",

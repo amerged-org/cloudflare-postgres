@@ -125,6 +125,9 @@ pub struct Inner {
     /// The next this many observation reports that name databases are answered 503: the ones that
     /// carry events alone are not counted, as the node posts those on its own account.
     pub observation_failures: usize,
+    /// The verdict the double gives a database of an observation report, where it is not `accept`
+    /// (`ObservationVerdict`).
+    pub verdicts: std::collections::HashMap<String, &'static str>,
     /// The node uid the desired pages name; the enrolled node's own unless a test changes it.
     pub page_uid: String,
     /// The pages never advance their cursor.
@@ -202,6 +205,7 @@ impl Cloud {
             probe_failures: 0,
             boot_failures: 0,
             observation_failures: 0,
+            verdicts: std::collections::HashMap::new(),
             page_uid: NODE_UID.into(),
             stuck: false,
             silent_welcome: false,
@@ -535,7 +539,25 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
         }
         answer(200, credential)
     } else if is("observations") {
-        post("NodeObservationReport")
+        if method != "POST" || !contract_valid("NodeObservationReport", body) {
+            return answer(400, error("invalid_request"));
+        }
+        // As the API answers (`nodeObservations`): a verdict on each database of the report, in its
+        // order, and how many results of orders it took; a fenced node's databases are not read.
+        let databases: Vec<Value> = body["databases"]
+            .as_array()
+            .filter(|_| !inner.fenced)
+            .into_iter()
+            .flatten()
+            .map(|db| {
+                let id = db["id"].as_str().unwrap();
+                json!({"id": id, "verdict": inner.verdicts.get(id).copied().unwrap_or("accept")})
+            })
+            .collect();
+        answer(
+            200,
+            json!({"databases": databases, "orders": body["orders"].as_array().map_or(0, Vec::len)}),
+        )
     } else if is("volumes") {
         post("NodeVolumeReport")
     } else if is("events") {

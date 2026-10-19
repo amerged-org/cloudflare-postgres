@@ -4,7 +4,7 @@ import {
   createExecutionContext,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { DatabaseWithOperation } from "@pgcf/contracts";
+import { DatabaseWithOperation, NODE_DATABASE_STALE_MS } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import { createApp } from "../../src/app.ts";
 import {
@@ -51,9 +51,22 @@ it("keeps unavailable health unknown and reports only fresh measured backup and 
   expect(
     backupHealth({ ...backup, last_failed_at: observed_at }, now).status,
   ).toBe("failing");
+  // A database's own report is repeated once in each anti-entropy period: a report that is older
+  // than the node's 180 s is still the latest one of a database that did not change.
   expect(
     backupHealth(
       { ...backup, observed_at: new Date(now - 181000).toISOString() },
+      now,
+    ).status,
+  ).toBe("ok");
+  expect(
+    backupHealth(
+      {
+        ...backup,
+        observed_at: new Date(
+          now - NODE_DATABASE_STALE_MS - 1000,
+        ).toISOString(),
+      },
       now,
     ).status,
   ).toBe("unknown");

@@ -8,10 +8,15 @@ use crate::{
     archive::facts::{self, ArchiveState},
     events::Events,
     machine::Machine,
+    node_link::constant,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::PoisonError};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::PoisonError,
+};
 
 /// The most databases one report carries; the contract allows 200 (`NODE_DESIRED_PAGE_LIMIT_MAX`).
 /// The API takes 8 at a time (`OBSERVATION_CONCURRENCY`). A database usually costs it 0.25 to 1.1 s
@@ -25,10 +30,58 @@ use std::{collections::BTreeMap, sync::PoisonError};
 pub(crate) const DATABASES_PER_REPORT: usize = 64;
 /// The most orders one report carries (`NODE_ORDER_LIMIT`).
 const ORDERS_PER_REPORT: usize = 1000;
+/// The most databases the anti-entropy queues in one minute: one report. A node whose databases do
+/// not fit its period at this rate says them again later, the one longest unsaid first, never
+/// faster than the period; at 15 minutes it holds 960 databases.
+const RESENT_PER_MINUTE: usize = DATABASES_PER_REPORT;
+
+/// What the API stores of an observation (`applyObservation`, `archiveHealth`), which is all that
+/// Cloudflare can learn from it: the archive's last segment and the number of its files waiting
+/// are not stored, only whether the files are known and since when the archive fails. Two
+/// observations of the same stored form say the same to Cloudflare.
+fn stored(observation: &Value) -> Value {
+    let archive = &observation["archive"];
+    let mut stored = observation.clone();
+    stored["archive"] = json!({
+        "failing_since": archive["failing_since"],
+        "ready_files_known": !archive["ready_files"].is_null(),
+    });
+    stored
+}
+
+/// What the API holds of a database: the stored form of the observation it last accepted (a 200
+/// answer with the verdict `accept` for that database), and when it accepted it.
+struct Held {
+    stored: Value,
+    at_ms: i64,
+}
+
+/// Where in the anti-entropy period the identifier of a database fixes its turn, in milliseconds.
+/// The databases of a node are spread over the period by their identifiers, so that they never
+/// come in one minute, whatever moment the node began to say them.
+fn turn(database: &str, period_ms: i64) -> i64 {
+    let digest = Sha256::digest(database.as_bytes());
+    let hash = u64::from_be_bytes(digest[..8].try_into().expect("eight bytes"));
+    i64::try_from(hash % u64::try_from(period_ms).expect("a positive period")).expect("a period")
+}
+/// The period `at_ms` falls in, counted from the turn of the database.
+fn period_of(database: &str, at_ms: i64, period_ms: i64) -> i64 {
+    (at_ms - turn(database, period_ms)).div_euclid(period_ms)
+}
+/// The anti-entropy period (`NODE_OBSERVATION_RESEND_MS`).
+fn resend_period_ms() -> i64 {
+    constant("NODE_OBSERVATION_RESEND_MS")
+        .as_i64()
+        .expect("generated period")
+}
 
 pub(crate) struct Reports {
-    /// The newest observation of each database that changed since the last post.
+    /// The newest observation of each database that is not what the API holds: the ones that
+    /// changed, the ones it did not accept, and the ones the anti-entropy asks for.
     observations: BTreeMap<String, Value>,
+    /// What the API accepted of each database since the agent started. Nothing is held at the
+    /// start, so the first pull says every database once.
+    held: HashMap<String, Held>,
     /// How the orders ended, until Cloudflare answered.
     orders: BTreeMap<String, Value>,
     /// Events not yet queued for delivery.
@@ -41,6 +94,7 @@ impl Default for Reports {
     fn default() -> Self {
         Self {
             observations: BTreeMap::new(),
+            held: HashMap::new(),
             orders: BTreeMap::new(),
             events: Vec::new(),
             limit: DATABASES_PER_REPORT,
@@ -48,6 +102,50 @@ impl Default for Reports {
     }
 }
 impl Reports {
+    /// Drops the observations of what the API holds: one of the stored form of the last that it
+    /// accepted says nothing new.
+    fn forget_held(&mut self) {
+        let held = &self.held;
+        self.observations.retain(|id, observation| {
+            held.get(id)
+                .is_none_or(|held| held.stored != stored(observation))
+        });
+    }
+    /// The API accepted these databases of `report`: it holds them from `at_ms`.
+    fn accepted(&mut self, report: &Value, accepted: &[String], at_ms: i64) {
+        let accepted: HashSet<&str> = accepted.iter().map(String::as_str).collect();
+        for observation in report["databases"].as_array().into_iter().flatten() {
+            if let Some(id) = observation["id"].as_str()
+                && accepted.contains(id)
+            {
+                self.held.insert(
+                    id.to_string(),
+                    Held {
+                        stored: stored(observation),
+                        at_ms,
+                    },
+                );
+            }
+        }
+    }
+    /// The databases whose turn in the anti-entropy period has come since the API accepted them,
+    /// at most `RESENT_PER_MINUTE`, the one it accepted longest ago first. The first turn of a
+    /// database after the agent started is within one period; the next is one period later.
+    fn due(&self, now_ms: i64, period_ms: i64) -> Vec<String> {
+        let mut due: Vec<(&String, i64)> = self
+            .held
+            .iter()
+            .filter(|(id, held)| {
+                period_of(id, now_ms, period_ms) != period_of(id, held.at_ms, period_ms)
+            })
+            .map(|(id, held)| (id, held.at_ms))
+            .collect();
+        due.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+        due.into_iter()
+            .take(RESENT_PER_MINUTE)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
     /// The next batch of observations, at most `limit` of them: what is not asleep goes first (a
     /// database that became ready, failed or was deleted is what Cloudflare waits for), then the
     /// asleep ones, each group in the order of the database IDs.
@@ -195,16 +293,49 @@ impl<M: Machine> Core<M> {
         facts::node_archive(&facts)
     }
 
-    /// Queues the database's observation for Cloudflare.
+    /// Queues the database's observation for Cloudflare. What the API holds of it is not sent
+    /// again (`take_report`), except while Cloudflare waits for the database: an entry with an
+    /// origin (a build, a restore or a move target) or a move order that holds it. The API's
+    /// create, restore and move steps wait for the next report that names such a database, so
+    /// every pull says it, as it did before the anti-entropy.
     pub(crate) fn report(&self, db: &Db) {
-        let observation = self.observe(db, &db.view());
+        let (observation, awaited) = {
+            let view = db.view();
+            let awaited = view.moving.is_some()
+                || view
+                    .entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.origin.is_some());
+            (self.observe(db, &view), awaited)
+        };
         if let Some(observation) = observation {
-            self.reports
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .observations
-                .insert(db.id.clone(), observation);
+            let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
+            if awaited {
+                reports.held.remove(&db.id);
+            }
+            reports.observations.insert(db.id.clone(), observation);
+            drop(reports);
             self.changed.notify_one();
+        }
+    }
+
+    /// The anti-entropy (`NODE_OBSERVATION_RESEND_MS`): queues the observation of each database
+    /// whose turn in the period has come since the API accepted one, at most one report of them
+    /// in a minute. Called each minute; a database goes again at its own point of the period,
+    /// whatever the moment the agent started at.
+    pub(crate) fn resend_due(&self, now_ms: i64) {
+        let due = {
+            let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
+            let due = reports.due(now_ms, resend_period_ms());
+            for id in &due {
+                reports.held.remove(id);
+            }
+            due
+        };
+        for id in due {
+            if let Some(db) = self.find(&id) {
+                self.report(&db);
+            }
         }
     }
 
@@ -239,6 +370,7 @@ impl<M: Machine> Core<M> {
     /// `unsent`.
     pub(crate) fn take_report(&self, events: &Events) -> Option<Value> {
         let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
+        reports.forget_held();
         let alone = reports.observations.is_empty() && reports.orders.is_empty();
         let databases = reports.take_databases();
         let orders: Vec<String> = reports
@@ -259,12 +391,14 @@ impl<M: Machine> Core<M> {
         events.attach(&mut report, alone);
         (!alone || report.get("events").is_some()).then_some(report)
     }
-    /// The report was accepted: the next one carries a whole batch.
-    pub(crate) fn report_posted(&self) {
-        self.reports
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .posted();
+    /// Cloudflare answered the report: the next one carries a whole batch, and the databases
+    /// whose observation it accepted are held (`accepted`, the identifiers of the answer). The
+    /// others, `stale` or in `conflict`, are not: the page decides, and the node reports them
+    /// again from the next pull of it.
+    pub(crate) fn report_posted(&self, report: &Value, accepted: &[String]) {
+        let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
+        reports.posted();
+        reports.accepted(report, accepted, super::now_ms());
     }
     /// The post of a report failed with `error`: if for want of time (`too_big`), the next report
     /// is half as large.
@@ -277,12 +411,15 @@ impl<M: Machine> Core<M> {
         }
     }
     /// A report that was not accepted: what it holds is posted again, unless something newer
-    /// about the same database or order was queued since.
+    /// about the same database or order was queued since. Whether Cloudflare applied it is not
+    /// known (the answer may be what was lost), so it holds none of its databases: the newest
+    /// observation of each is posted.
     pub(crate) fn unsent(&self, events: &Events, report: &Value) {
         events.give_back(report);
         let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
         for observation in report["databases"].as_array().into_iter().flatten() {
             if let Some(id) = observation["id"].as_str() {
+                reports.held.remove(id);
                 reports
                     .observations
                     .entry(id.to_string())
@@ -345,7 +482,13 @@ impl<M: Machine> Core<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{agent::testing::Rig, node_link::contract_valid};
+    use crate::{
+        agent::{
+            Reconcile,
+            testing::{Rig, eventually},
+        },
+        node_link::contract_valid,
+    };
     use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -512,7 +655,7 @@ mod tests {
             sent(&rig.core.take_report(&events).unwrap()).len(),
             DATABASES_PER_REPORT / 2
         );
-        rig.core.report_posted();
+        rig.core.report_posted(&second, &[]);
         assert_eq!(
             sent(&rig.core.take_report(&events).unwrap()).len(),
             DATABASES_PER_REPORT
@@ -561,5 +704,295 @@ mod tests {
         assert_eq!(a.as_bytes()[14], b'4');
         assert!(matches!(a.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
         assert_ne!(a, uuid());
+    }
+
+    // ---- what the API holds, and the anti-entropy
+
+    const PERIOD: i64 = 15 * 60_000;
+    fn held_at(at_ms: i64) -> Held {
+        Held {
+            stored: json!({}),
+            at_ms,
+        }
+    }
+
+    #[test]
+    fn the_period_is_the_contracts_and_a_database_has_one_turn_in_it_that_its_identifier_fixes() {
+        assert_eq!(resend_period_ms(), PERIOD);
+        let id = crate::link::test_server::database_id(7);
+        assert_eq!(turn(&id, PERIOD), turn(&id, PERIOD));
+        assert!((0..PERIOD).contains(&turn(&id, PERIOD)));
+        // One period holds one turn: the period of a moment is the one number of the turn's count.
+        let at = 1_800_000_000_000;
+        assert_eq!(
+            period_of(&id, at + PERIOD, PERIOD),
+            period_of(&id, at, PERIOD) + 1
+        );
+        // The databases are spread over the period, not stacked on one point of it.
+        let turns: HashSet<i64> = (0..300)
+            .map(|n| turn(&crate::link::test_server::database_id(n), PERIOD) / 60_000)
+            .collect();
+        assert!(turns.len() >= 13, "{} of 15 minutes used", turns.len());
+    }
+
+    #[test]
+    fn the_anti_entropy_says_each_database_once_in_each_period_at_its_own_turn_and_never_more_than_a_report_in_a_minute()
+     {
+        let ids: Vec<String> = (0..300)
+            .map(crate::link::test_server::database_id)
+            .collect();
+        let mut reports = Reports::default();
+        // The agent starts and the API accepts every database at one moment.
+        let start = 1_800_000_000_000;
+        for id in &ids {
+            reports.held.insert(id.clone(), held_at(start));
+        }
+        let mut says: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut busiest = 0;
+        // Each minute for two periods: the databases whose turn has come.
+        for minute in 1..=2 * 15 {
+            let now = start + minute * 60_000;
+            let due = reports.due(now, PERIOD);
+            busiest = busiest.max(due.len());
+            for id in due {
+                reports.held.get_mut(&id).unwrap().at_ms = now;
+                says.entry(id).or_default().push(now);
+            }
+        }
+        // Every database was said twice, a whole period apart, and never faster.
+        assert_eq!(says.len(), 300);
+        for (id, times) in &says {
+            assert_eq!(times.len(), 2, "{id}: {times:?}");
+            assert_eq!(times[1] - times[0], PERIOD, "{id}");
+            assert!(
+                times[0] - start <= PERIOD,
+                "{id}: the first turn is within a period"
+            );
+        }
+        // They did not come in one minute: the mean is 20 a minute, and no minute had twice that.
+        assert!(busiest <= 40, "{busiest} in one minute");
+        assert!(busiest <= RESENT_PER_MINUTE);
+        // Nothing is due where nothing was accepted: the first pull says every database once.
+        assert!(
+            Reports::default()
+                .due(start + 100 * PERIOD, PERIOD)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_node_with_more_databases_than_its_period_holds_says_a_report_of_them_in_a_minute_the_longest_unsaid_first()
+     {
+        let mut reports = Reports::default();
+        let start = 1_800_000_000_000;
+        for n in 0..2000usize {
+            reports.held.insert(
+                crate::link::test_server::database_id(n),
+                held_at(start + i64::try_from(n).unwrap()),
+            );
+        }
+        // A day later every database's turn has come: the 64 accepted longest ago are queued.
+        let due = reports.due(start + 24 * 3_600_000, PERIOD);
+        assert_eq!(
+            due,
+            (0..RESENT_PER_MINUTE)
+                .map(crate::link::test_server::database_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The contract's asleep observation of database `id`.
+    fn asleep(id: &str) -> Value {
+        let mut observation =
+            crate::link::test_server::vector("NodeObservationReport", "asleep")["databases"][0]
+                .clone();
+        observation["id"] = id.into();
+        observation
+    }
+    fn failing(observation: &Value, since: &str) -> Value {
+        let mut changed = observation.clone();
+        changed["archive"]["failing_since"] = since.into();
+        changed
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn what_the_api_took_is_not_said_again_but_a_report_whose_answer_was_lost_holds_nothing()
+    {
+        let Some(rig) = Rig::new("report-held").await else {
+            return;
+        };
+        let events = Events::new(Duration::from_secs(60));
+        let id = crate::link::test_server::database_id(1);
+        let ids = [id.clone()];
+        let a = asleep(&id);
+        let b = failing(&a, "2026-10-19T10:00:00.000Z");
+        // The API takes a; a is not said again, b is.
+        rig.core.queue_observation(a.clone());
+        let first = rig.core.take_report(&events).unwrap();
+        rig.core.report_posted(&first, &ids);
+        rig.core.queue_observation(a.clone());
+        assert!(rig.core.take_report(&events).is_none());
+        rig.core.queue_observation(b.clone());
+        let second = rig.core.take_report(&events).unwrap();
+        assert_eq!(second["databases"], json!([b]));
+        // A report the API answered with `stale` or `conflict` holds nothing: b is said again.
+        rig.core.report_posted(&second, &[]);
+        rig.core.queue_observation(b.clone());
+        let third = rig.core.take_report(&events).unwrap();
+        // The answer to the third was lost; the API may hold b. The observation is back to a, the
+        // one the node last knew the API took, and it is said all the same.
+        rig.core.unsent(&events, &third);
+        rig.core.queue_observation(a.clone());
+        let fourth = rig.core.take_report(&events).unwrap();
+        assert_eq!(fourth["databases"], json!([a]));
+        // This one is answered: the API took a, and a is not said again.
+        rig.core.report_posted(&fourth, &ids);
+        rig.core.queue_observation(a.clone());
+        assert!(rig.core.take_report(&events).is_none());
+    }
+
+    /// The result of an order is not an observation and is never held: a failed resume, whose
+    /// database the API holds as it is, still goes out in a report of its own, and goes out again
+    /// when the answer to it was lost (the API ends the order once, and a result it did not take is
+    /// the only way the resume ends).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_order_result_goes_out_when_every_database_is_held_and_again_after_a_lost_answer() {
+        let Some(rig) = Rig::new("report-orders").await else {
+            return;
+        };
+        let events = Events::new(Duration::from_secs(60));
+        let id = crate::link::test_server::database_id(1);
+        let a = asleep(&id);
+        rig.core.queue_observation(a.clone());
+        let first = rig.core.take_report(&events).unwrap();
+        rig.core.report_posted(&first, std::slice::from_ref(&id));
+
+        // The API holds the database, and the node's resume of it failed.
+        rig.core.queue_observation(a.clone());
+        rig.core
+            .report_order("op_rrrrrrrrrrrrrrrrrrrr", Err("wake_failed"));
+        let second = rig.core.take_report(&events).unwrap();
+        assert_eq!(second["databases"], json!([]));
+        assert_eq!(
+            second["orders"],
+            json!([{"operation": "op_rrrrrrrrrrrrrrrrrrrr", "status": "failed", "reason": "wake_failed"}])
+        );
+        assert!(contract_valid("NodeObservationReport", &second));
+
+        // The answer was lost: the result is queued again, and nothing else is.
+        rig.core.unsent(&events, &second);
+        let third = rig.core.take_report(&events).unwrap();
+        assert_eq!(third["orders"], second["orders"]);
+        assert_eq!(third["databases"], json!([]));
+        // A report that failed with the API's 409 (the recovery of the resume changed under it) is
+        // the same: the result is not dropped by the failure.
+        rig.core.unsent(&events, &third);
+        let fourth = rig.core.take_report(&events).unwrap();
+        assert_eq!(fourth["orders"], second["orders"]);
+
+        // Answered, it is gone, and the database is still held.
+        rig.core.report_posted(&fourth, &[]);
+        rig.core.queue_observation(a);
+        assert!(rig.core.take_report(&events).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pull_of_what_the_api_holds_says_nothing_what_changed_goes_at_once_and_a_restart_says_everything_once()
+     {
+        let Some(rig) = Rig::new("report-pulls").await else {
+            return;
+        };
+        let events = Events::new(Duration::from_secs(60));
+        let mut json = rig.entry_json();
+        let id = json["id"].as_str().unwrap().to_string();
+        let path = json["archive"]["path"].as_str().unwrap().to_string();
+        let page = |json: &Value| Rig::page(vec![json.clone()], vec![]);
+        let quiet = || tokio::time::sleep(Duration::from_millis(300));
+        rig.core.apply(&page(&json)).await;
+        let db = rig.core.db(&id);
+        eventually(90, "the report of the build", || {
+            rig.core
+                .pending_observation(&id)
+                .is_some_and(|observation| observation["state"] == "ready")
+        })
+        .await;
+        // What the decision on a pull queues, it queues within this time.
+        let settled = || async {
+            eventually(30, "the decision on the entry", || {
+                db.view().reconcile == Reconcile::Idle
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        };
+        // Cloudflare waits for the build: every pull says the database, however often the API took it.
+        let built = rig.core.take_report(&events).unwrap();
+        assert_eq!(built["databases"][0]["state"], "ready");
+        rig.core.report_posted(&built, std::slice::from_ref(&id));
+        for _ in 0..2 {
+            rig.core.apply(&page(&json)).await;
+            settled().await;
+            let again = rig.core.take_report(&events).unwrap();
+            assert_eq!(again["databases"][0]["id"], id.as_str());
+            rig.core.report_posted(&again, std::slice::from_ref(&id));
+        }
+        // The page drops the origin once the API took the build: a pull of it says nothing.
+        json.as_object_mut().unwrap().remove("origin");
+        for _ in 0..3 {
+            rig.core.apply(&page(&json)).await;
+            settled().await;
+            let unexpected = rig.core.take_report(&events);
+            assert!(unexpected.is_none(), "{unexpected:?}");
+        }
+        // A move order holds the database: it is said with every pull until the order ends.
+        rig.core.set(&db, |view| {
+            view.moving = Some("op_mmmmmmmmmmmmmmmmmmmm".into())
+        });
+        let held = rig.core.take_report(&events).unwrap();
+        rig.core.report_posted(&held, std::slice::from_ref(&id));
+        rig.core.apply(&page(&json)).await;
+        settled().await;
+        let held = rig.core.take_report(&events).unwrap();
+        rig.core.report_posted(&held, std::slice::from_ref(&id));
+        rig.core.set(&db, |view| view.moving = None);
+        settled().await;
+        assert!(rig.core.take_report(&events).is_none());
+        // A change goes at once: the page moves the generation on.
+        json["generation"] = 5.into();
+        let operation = format!("op_{}", "d".repeat(20));
+        json["operation"] = operation.clone().into();
+        rig.core.apply(&page(&json)).await;
+        let changed = rig.core.take_report(&events).unwrap();
+        assert_eq!(changed["databases"][0]["generation"], 5);
+        assert_eq!(changed["databases"][0]["operation"], operation.as_str());
+        rig.core.report_posted(&changed, std::slice::from_ref(&id));
+
+        // The anti-entropy: its turn has not come, and it comes within a period.
+        let at = rig.core.reports.lock().unwrap().held[&id].at_ms;
+        rig.core.resend_due(at);
+        assert!(rig.core.take_report(&events).is_none());
+        rig.core.resend_due(at + 2 * PERIOD);
+        let resent = rig.core.take_report(&events).unwrap();
+        assert_eq!(resent["databases"][0]["id"], id.as_str());
+        assert_eq!(resent["databases"][0]["generation"], 5);
+
+        // The agent restarts and holds nothing: its first pull says every database once.
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        rig.core.apply(&page(&json)).await;
+        let db = rig.core.db(&id);
+        eventually(60, "the database to be found", || {
+            db.phase() == Phase::Ready
+        })
+        .await;
+        let first = rig
+            .core
+            .take_report(&events)
+            .expect("a restarted agent says it");
+        assert_eq!(first["databases"][0]["id"], id.as_str());
+        assert_eq!(first["databases"][0]["state"], "ready");
+        rig.core.report_posted(&first, std::slice::from_ref(&id));
+        rig.core.apply(&page(&json)).await;
+        quiet().await;
+        assert!(rig.core.take_report(&events).is_none());
     }
 }

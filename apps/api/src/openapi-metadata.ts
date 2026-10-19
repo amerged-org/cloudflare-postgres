@@ -428,7 +428,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   ),
   "POST /node/v1/observations": route(
     "reportNodeObservations",
-    "Report the state of the node's databases and the results of its orders",
+    "Report the node's databases that changed, each one again once in 15 minutes, and the results of its orders",
     "node",
   ),
   "POST /node/v1/volumes": route(

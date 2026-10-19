@@ -15,6 +15,7 @@ import {
   NodeEnrollmentResponse,
   NodeEventReport,
   NodeFencedResponse,
+  NodeObservationAnswer,
   NodeObservationReport,
   NodePolicy,
   NodeProbeResult,
@@ -59,7 +60,6 @@ const nodeResponses = (schema: z.ZodType) => ({
   ...responses(schema),
   ...fenced,
 });
-const verdicts = z.enum(["accept", "stale", "conflict"]);
 function register(
   app: ApiApp,
   route: RouteConfig,
@@ -185,14 +185,7 @@ export function registerNodeLink(app: ApiApp): void {
       tags,
       security: node,
       request: { body: body(NodeObservationReport) },
-      responses: nodeResponses(
-        z.strictObject({
-          databases: z.array(
-            z.strictObject({ id: z.string(), verdict: verdicts }),
-          ),
-          orders: z.number().int().nonnegative(),
-        }),
-      ),
+      responses: nodeResponses(NodeObservationAnswer),
     },
     async (c) => nodeObservations(c, callingNode(c), await c.req.json()),
   );
