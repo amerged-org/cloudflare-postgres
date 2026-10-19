@@ -187,7 +187,10 @@ bucket, made after the last write into it, closes any gap.
    brought back), and compare. Then delete from the new bucket the copies of what the old bucket's
    retention deleted before step 5 (written there at or before T_B, absent in the old bucket), or
    a deleted database's data outlives its recovery window. T_B was noted before the deploy of step 5,
-   so a database created after it is never touched.
+   so a database created after it is never touched. After a rollback (a second attempt) this delete
+   is allowed only when the last reverse check of the rollback found nothing missing: it also deletes
+   every key that the first attempt wrote into the new bucket before the new T_B and that the old
+   bucket lacks, the WAL that only the new bucket holds.
 9. Accept on the new bucket: wake a database, write, let it sleep (its WAL appears under the same
    prefix in the new bucket and the old bucket gets no new key), take a base backup, restore to a point
    in time, `HEAD` and `GET` a release file through `/node/v1/releases/<release>/<file>` (it reads the
@@ -201,39 +204,67 @@ bucket, made after the last write into it, closes any gap.
     retention goes on, so a pass with an earlier time copies back what the new bucket deleted
     legitimately, such as the purged archive of a deleted database, and nothing deletes it again. After
     the barrier no upload into the old bucket is in flight, so no hour of margin is needed. A pass that
-    copies a key is therefore real: check that the key's prefix is still named by a database, retained
-    archive or move row (a prefix no row names came back from a purge and is no gap; the owner deletes
-    it from the new bucket), find the node whose credential read failed (usually a parent key that
-    lacks the new bucket) and wake its databases again. Only then, and with the owner's word, delete
-    the old bucket and its scope in the old token.
+    copies a key is therefore real: check that the key's prefix is still named by a row that the
+    Worker has not purged yet. No row of `databases` or `database_moves` is ever deleted: the purge of
+    a retained archive deletes only its `retained_archives` row and the deleted database keeps its
+    `archive_path` (`deleted_at` set), and the expiry of a superseded archive only sets
+    `source_archive_deleted_at` or `target_archive_deleted_at`. So the prefix counts while a database
+    that is not deleted is on it, while a `retained_archives` row names it, while the source of a done
+    move or the staged target of a failed move is not marked deleted, and while it is the target of a
+    move in flight. A prefix that nothing of this names came back from a purge or an expiry and is no
+    gap; the owner deletes it from the new bucket. For a real gap, find the node whose credential read
+    failed (usually a parent key that lacks the new bucket) and wake its databases again. Only then,
+    and with the owner's word, delete the old bucket and its scope in the old token.
 
 If a step fails. Before step 5, nothing in production changed (a failed copy is repeated). From step 5
 on, every rollback is the same whole procedure, because nothing records whether a node switched and a
 check that no credential names the new bucket races the nodes' pulls every 60 seconds:
 
 1. Redeploy the old configuration (`ARCHIVE` and `ARCHIVE_BUCKET_NAME` name the old bucket). Until
-   step 2 ends, the retention step fails again for the rows that name the new bucket (expected).
-2. Run the rewrite with the two names swapped (every statement touches only rows that name the other
-   bucket, a database created after step 5 included) and in the same file delete every
-   `archive_credentials` row that names either bucket. The delete is not optional: a node remembers
-   the id of every credential it has read and keeps one credential per archive prefix without the
-   bucket, and the API reuses a credential row younger than a third of its seven days. After a swap
-   back the page would name the old bucket's row again, which the node believes it has, while the
-   credential it holds for that prefix is signed for the new bucket; every upload into the old bucket
-   would be refused for up to about 2.3 days. A row with a new id makes the node read the right one.
-3. Run the maintenance cycle on every node again and check, as in step 7, that each database has a
-   credential row for its path issued after step 2.
+   step 2 ends, the retention step fails again for the rows that name the new bucket (expected). The
+   Worker signs nothing for the new bucket from now on. Read `max(expires_at)` of the
+   `archive_credentials` rows that name the new bucket (X_NEW) now: step 2 deletes them, and with them
+   the only record of when the credentials signed for the new bucket die. A node that does not switch
+   keeps writing into the new bucket with one until then (steps 4 and 7).
+2. Note the time (T_R2) immediately before the file runs. Run the rewrite with the two names swapped
+   (every statement touches only rows that name the other bucket, a database created after step 5
+   included) and in the same file delete every `archive_credentials` row that names either bucket. The
+   delete is not optional: a node remembers the id of every credential it has read and keeps one
+   credential per archive prefix without the bucket, and the API reuses a credential row younger than
+   a third of its seven days. After a swap back the page would name the old bucket's row again, which
+   the node believes it has, while the credential it holds for that prefix is signed for the new
+   bucket; every upload into the old bucket would be refused for up to about 2.3 days. A row with a
+   new id makes the node read the right one. The delete leaves no row older than the file's run, so
+   every credential row for an old-bucket path that exists afterwards was issued after T_R2. A time
+   noted after the file would miss a pull between the delete and the note: it mints a row older than
+   that time, the API reuses it for about 2.3 days and step 3's check would never accept its database.
+3. Run the maintenance cycle on every node again and check, as in step 7 but against T_R2, that each
+   database has a credential row for its path issued after T_R2. Note the time the check passed
+   (T_R3).
 4. Compare the other way round: the keys the new bucket received since T_B that the old bucket lacks
    (`verify --from <new> --to <old> --since T_B`). If there are none, go on. Otherwise, with the
    owner's separate go (the token of the move has only read on the old bucket, so that nothing can
    write there), mirror them with a second token that has read on the new and read and write on the old
    bucket (a copy that only adds missing keys and never replaces one), check each copied key's prefix
-   as in step 10, compare again, and delete the token.
+   as in step 10 (against the old bucket: a purge there since step 1 may have deleted an archive whose
+   copy the new bucket still holds), compare again, and delete the token. If the go is refused while
+   keys are missing, the new bucket stays as it is, because it is the only copy of those keys, and
+   the old bucket has gaps for point-in-time recovery: say so. One comparison is not final: a node
+   whose read of the old credential failed accepts the old path all the same and keeps the
+   registration it has for the new bucket (the agent's `ensure_archive` returns false and the wake path
+   ignores that), so its databases go on writing into the new bucket until X_NEW; nothing records it,
+   and the check of step 3 only sees that a row was minted. Hence step 7.
 5. Prove archiving into the old bucket with a canary: wake a database, write, let it sleep; its WAL
-   appears under the same prefix in the old bucket and the new one gets no key. A node that still
-   refuses its uploads is restarted (`pgcf-agent` forgets what it was delivered and reads every
-   credential again).
-6. Point `PGCF_R2_BUCKET` back at the old bucket. The new bucket stays until the owner decides.
+   appears under the same prefix in the old bucket and the new one gets no key since T_R3 (not since
+   T_R2: until step 3 is done, nodes that had not switched yet still write into the new bucket). A node
+   that still refuses its uploads is restarted (`pgcf-agent` forgets what it was delivered and reads
+   every credential again).
+6. Point `PGCF_R2_BUCKET` back at the old bucket.
+7. Repeat step 4 (and its mirror when it says so) one hour and one day after step 3 and once more
+   after X_NEW, when no credential for the new bucket is alive any more. Neither the deletion of the
+   new bucket nor a new attempt (its step 8 delete takes every key of the new bucket that the old one
+   lacks and that was written before the new T_B) may happen before that last comparison shows nothing
+   missing. The new bucket stays until the owner decides: delete it, or try again from step 3.
 
 The migration of step 1 has no way back; D1 Time Travel is the last resort.
 
