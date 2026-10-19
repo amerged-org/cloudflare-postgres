@@ -525,8 +525,10 @@ export async function captureInfrastructureArtifact(
   if (!artifact || artifact.status !== "pending")
     throw new Error("infrastructure_backup_artifact_identity_changed");
   const source = async () => {
+    // "manual" hands a redirect back as a non-ok response, which is refused below; the Workers
+    // runtime does not implement "error" and threw a TypeError for every run.
     const response = await fetcher(sourceUrl, {
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.timeout(300_000),
     });
     if (!response.ok || !response.body) {

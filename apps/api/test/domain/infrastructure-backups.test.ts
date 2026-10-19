@@ -794,7 +794,10 @@ async function capturedRun() {
 /** The export as the signed URL serves it, in small uneven chunks. */
 function exportServer(...bodies: Uint8Array[]) {
   const requests: RequestInit[] = [];
-  const fetcher: typeof fetch = async (_input, init) => {
+  const fetcher: typeof fetch = async (input, init) => {
+    // The Workers runtime builds a Request from the init and rejects an option it does not
+    // implement: live, redirect "error" failed every daily run with a TypeError.
+    new Request(input, init);
     requests.push(init!);
     const bytes = bodies[Math.min(requests.length, bodies.length) - 1]!;
     let offset = 0;
@@ -826,8 +829,8 @@ it("encrypts the D1 export into its R2 object as a PGCFINF1 envelope and complet
   );
   // One read measures the export, the second one is encrypted; neither follows a redirect.
   expect(server.requests.map((init) => init.redirect)).toEqual([
-    "error",
-    "error",
+    "manual",
+    "manual",
   ]);
   const [prepared] = (await readInfrastructureBackupRun(env.DB, run)).artifacts;
   expect(prepared).toMatchObject({
@@ -892,6 +895,26 @@ it("encrypts the D1 export into its R2 object as a PGCFINF1 envelope and complet
   await env.ARCHIVE.delete(artifact.object_key);
 });
 
+it("refuses an export source that answers with a redirect instead of following it", async () => {
+  const { run, binding, artifact } = await capturedRun(),
+    fetcher: typeof fetch = async (input, init) => {
+      new Request(input, init);
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://elsewhere.example.com/control.sql" },
+      });
+    };
+  await expect(
+    captureInfrastructureArtifact(
+      binding,
+      run,
+      artifact.id,
+      "https://export.example.com/control.sql",
+      fetcher,
+    ),
+  ).rejects.toThrow("infrastructure_backup_source_refused");
+  expect(await env.ARCHIVE.head(artifact.object_key)).toBeNull();
+});
 it("stores nothing when the export changes between its two reads and never overwrites a run's object", async () => {
   const changed = await capturedRun(),
     server = exportServer(dump("first;\n"), dump("other;\n"));
