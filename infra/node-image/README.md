@@ -349,6 +349,12 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   name=version…`, and cloudflared's `.deb` as a file whose sha256 it checked: the image changes the
   `nftables` conffile. The image's apt sources name its own snapshot and the PGDG archive; the
   agent writes the release's snapshot into the `URIs:` of `/etc/apt/sources.list.d/trixie.sources`.
+  Then it purges the installed packages the lock does not name, with `dpkg --purge`, so that the
+  node has the lock's packages and no others and its hello says the release's digest. Never a kernel
+  image (Debian keeps the previous one for the boot menu, and the digest leaves idle ones out),
+  never a package that `dpkg-query` marks essential, never a name that is not a package name, and
+  nothing at all for a lock that names no kernel image. Dpkg refuses a package that an installed
+  package depends on; the cycle then fails with `packages_not_installed`.
   The node reboots if a kernel image, `libc6`, `systemd`, `libsystemd0` or `udev` changed. After
   the packages, or after the boot, it runs `pgcf-agent check` of the installed release and answers
   the order.

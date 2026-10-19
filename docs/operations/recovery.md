@@ -83,8 +83,8 @@ release, the one that would update it) until the request expires, ten minutes la
 2. `GET /v1/nodes/{id}/diagnostics/{diagnostic_id}` is `requested` until the node's result
    arrives, `received` with the result in `body`, and `expired` after ten minutes without one.
    A node answers within two pulls of its page; a node that is stale, fenced or off answers
-   nothing, and the request expires. A reboot has its own record: the boot report at
-   `GET /v1/nodes/{id}/diagnostics`.
+   nothing, and the request expires. A reboot has its own record: the boot report, listed at
+   `GET /v1/nodes/{id}/diagnostics` and read with its journal lines at the `diagnostic_id` path above.
 
 | Probe          | What the agent runs                                                                                                                                                          | What it shows                                                            |
 | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
@@ -179,13 +179,18 @@ with the owner's go for a reboot. The endpoints require an admin API key.
 2. Verify the node's UID, then submit `POST /v1/nodes/{id}/maintenance` with a persistent
    `Idempotency-Key` and `{"expected_node_uid":"<verified UID>"}`. It answers 202 with the
    operation and a `Location`. Placement on the node is closed, and the node holds new wakes
-   with `57P03`, puts every awake database to sleep with the proof, installs the packages,
-   reboots if the kernel or core libraries changed, runs its check and reports. Repeating the
-   request while the cycle is open returns the same operation.
+   with `57P03`, puts every awake database to sleep with the proof, installs the packages of the
+   lock and purges the installed packages the lock no longer names (never a kernel image or an
+   essential package), reboots if the kernel or core libraries changed, runs its check and
+   reports. Repeating the request while the cycle is open returns the same operation. Until the
+   cycle ends the capacity cron of the region buys no node for the shortage that the closed
+   placement causes: `GET /v1/regions/{id}/capacity-decision` says `maintenance`. A `failed`
+   cycle leaves placement closed and the cron buys again, as it does for any closed node.
 3. Poll `GET /v1/nodes/{id}/maintenance/{operation}`. `open` becomes `done` or `failed`; a
    `failed` cycle names the class of the failure in `result_reason` (such as `power_busy` or
    `power_archive` for a database that did not sleep with the proof, `release_missing`,
-   `lock_not_read`, `packages_not_installed`, `reboot_failed` or `check_failed`).
+   `lock_not_read`, `packages_not_read`, `packages_not_installed`, `reboot_failed` or
+   `check_failed`; `packages_not_installed` also names a purge that dpkg refused).
 4. `done` reopens placement, if this cycle closed it (`placement_closed_at` is not null). A
    placement that an operator closed before or during the cycle stays closed: open it with
    `PUT /v1/nodes/{id}/database-placement`. Either way the API hints the node when it records

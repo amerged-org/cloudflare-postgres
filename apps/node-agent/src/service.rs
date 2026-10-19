@@ -530,14 +530,27 @@ impl<M: Machine> Service<M> {
     }
 
     /// After a boot, the tail of the previous boot's journal (SEC-05). A node that stopped
-    /// answering has no shell to tell why.
+    /// answering has no shell to tell why. A report that Cloudflare could not take (the network, an
+    /// API that is unavailable or limiting) is sent again with a doubling wait: the API keeps one
+    /// report for a boot, so a report whose answer was lost is safe to send again. Any other
+    /// failure ends the attempt for this start.
     async fn report_boot(&self) {
-        if let Err(error) =
-            crate::diagnostics::boot_report::report_boot(&*self.machine, &self.link).await
-        {
+        let timing = &self.core.timing;
+        let mut wait = timing.report_retry;
+        loop {
+            let Err(error) =
+                crate::diagnostics::boot_report::report_boot(&*self.machine, &self.link).await
+            else {
+                return;
+            };
             crate::timing::emit_event(json!({
                 "event": "boot_report_not_sent", "class": crate::diagnostics::error_code(&error),
             }));
+            if !crate::link::transient(&error) {
+                return;
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(timing.report_retry_maximum);
         }
     }
 
@@ -557,7 +570,8 @@ impl<M: Machine> Service<M> {
     }
 
     /// Brings the packages to the lock of the release (plan 9.3): what the node lacks or has in
-    /// another version is installed, and `true` is returned if the node reboots for it.
+    /// another version is installed, what the lock no longer names is purged, and `true` is
+    /// returned if the node reboots for it.
     async fn cycle(&self) -> Result<bool, &'static str> {
         let release = self
             .release
@@ -593,27 +607,46 @@ impl<M: Machine> Service<M> {
             .await
             .map_err(|_| "packages_not_read")?;
         let plan = update::plan(&lock, &installed);
-        if plan.versions.is_empty() && plan.files.is_empty() {
+        let installing = !(plan.versions.is_empty() && plan.files.is_empty());
+        let mut stale = update::purgeable(&lock, &installed);
+        if !installing && stale.is_empty() {
             return Ok(false);
         }
-        let mut files = Vec::new();
-        for package in &plan.files {
-            let path = work.join(format!("{}.deb", package.name));
-            self.link
-                .fetch(
-                    &package.pinned.url,
-                    package.pinned.size_bytes,
-                    &package.pinned.sha256,
-                    &path,
-                )
+        if installing {
+            let mut files = Vec::new();
+            for package in &plan.files {
+                let path = work.join(format!("{}.deb", package.name));
+                self.link
+                    .fetch(
+                        &package.pinned.url,
+                        package.pinned.size_bytes,
+                        &package.pinned.sha256,
+                        &path,
+                    )
+                    .await
+                    .map_err(|_| "package_not_read")?;
+                files.push(path);
+            }
+            self.machine
+                .install_packages(&release.debian_snapshot, &plan.versions, &files)
                 .await
-                .map_err(|_| "package_not_read")?;
-            files.push(path);
+                .map_err(|_| "packages_not_installed")?;
+            // Apt may have replaced or removed packages: the purge follows what is installed now.
+            stale = update::purgeable(
+                &lock,
+                &self
+                    .machine
+                    .installed_packages()
+                    .await
+                    .map_err(|_| "packages_not_read")?,
+            );
         }
-        self.machine
-            .install_packages(&release.debian_snapshot, &plan.versions, &files)
-            .await
-            .map_err(|_| "packages_not_installed")?;
+        if !stale.is_empty() {
+            self.machine
+                .purge_packages(&stale)
+                .await
+                .map_err(|_| "packages_not_installed")?;
+        }
         if plan.reboot {
             self.machine.reboot().await.map_err(|_| "reboot_failed")?;
         }
@@ -1212,6 +1245,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_boot_report_that_cloudflare_refuses_is_sent_again_within_the_boot() {
+        let Some((machine, _fixture, _root)) = site("boot-journal-retry", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let first = serve(&machine, &cloud, &base).await;
+        eventually(30, "the first boot to be remembered", || {
+            machine.layout().agent().join("boot-id").exists()
+        })
+        .await;
+        first.stop();
+        drop(first);
+        // The node reboots, and Cloudflare refuses the report twice: the agent keeps asking, with
+        // no restart, until the third attempt is answered.
+        machine.reboot().await.unwrap();
+        cloud.with(|inner| inner.boot_failures = 2);
+        let second = serve(&machine, &cloud, &base).await;
+        eventually(30, "the report of the previous boot", || {
+            !cloud.acknowledged("/node/v1/diagnostics").is_empty()
+        })
+        .await;
+        assert_eq!(cloud.posted("/node/v1/diagnostics").len(), 3);
+        assert_eq!(cloud.acknowledged("/node/v1/diagnostics").len(), 1);
+        eventually(30, "the boot to be remembered", || {
+            std::fs::read_to_string(machine.layout().agent().join("boot-id"))
+                .is_ok_and(|id| id.trim() == machine.boot().unwrap().id)
+        })
+        .await;
+        second.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_probe_on_the_page_runs_once_its_result_is_posted_and_a_result_that_did_not_arrive_runs_it_again()
      {
         let Some((machine, _fixture, _root)) =
@@ -1551,6 +1619,90 @@ mod tests {
                 .all(|call| !call.starts_with("install") && call != "reboot"),
             "{calls:?}"
         );
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_release_that_drops_a_package_leaves_the_node_with_the_digest_of_its_lock() {
+        let Some((machine, _fixture, _root)) = site("maintenance-purge", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1", &same(b"bin"));
+        // The node runs lock A. Lock B changes PostgreSQL and drops `libdropped1`; the running
+        // kernel is B's too, and the kernel before it stays on the node, as Debian keeps it.
+        machine.set_packages(&[
+            ("bash", "5.2"),
+            ("libdropped1", "1.0"),
+            ("postgresql-18", "18.6-1"),
+            ("linux-image-6.12.111+deb13-amd64", "6.12.111-1"),
+            ("linux-image-6.12.88+deb13-amd64", "6.12.88-1"),
+        ]);
+        let cloud = Cloud::start().await;
+        let package = |name: &str, version: &str| json!({"name": name, "version": version, "architecture": "amd64", "url": format!("https://snapshot.example/{name}.deb"), "size": 10, "sha256": "a".repeat(64)});
+        let lock = json!({
+            "packages": [
+                package("bash", "5.2"),
+                package("postgresql-18", "18.7-1"),
+                package("linux-image-6.12.111+deb13-amd64", "6.12.111-1"),
+            ],
+            "extra": [],
+        });
+        let wanted: std::collections::BTreeMap<String, String> = lock["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["name"].as_str().unwrap().to_string(),
+                    p["version"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let release = release_of(&cloud, "r1", &same(b"bin"), lock.to_string().as_bytes());
+        let operation = "op_pppppppppppppppppppp";
+        cloud.with(|inner| {
+            inner.release = Some(release);
+            inner.orders = vec![json!({"type": "maintenance", "operation": operation})];
+        });
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(60, "the order to be reported", || {
+            cloud
+                .acknowledged("/node/v1/observations")
+                .iter()
+                .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                .any(|order| order["operation"] == operation && order["status"] == "done")
+        })
+        .await;
+        // The purge follows the install, and the check follows both. No reboot.
+        let calls = machine.calls();
+        let at = |what: &str| calls.iter().position(|call| call.starts_with(what));
+        assert!(
+            at("install").unwrap() < at("purge").unwrap()
+                && at("purge").unwrap() < at("health_check").unwrap(),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&"purge libdropped1".to_string()),
+            "{calls:?}"
+        );
+        assert!(at("reboot").is_none(), "{calls:?}");
+        // Of the kernel images only the running one counts, and the other is still installed: the
+        // digest the hello says is the lock's.
+        let installed = machine.installed_packages().await.unwrap();
+        assert!(installed.contains_key("linux-image-6.12.88+deb13-amd64"));
+        assert!(!installed.contains_key("libdropped1"));
+        let said = crate::machine::os_report(&*machine).await.unwrap();
+        assert_eq!(
+            said["packages_sha256"],
+            crate::update::packages_digest(&wanted).as_str()
+        );
+        eventually(30, "the lock's digest to be said", || {
+            cloud.with(|inner| inner.hellos.iter().any(|hello| hello["os"] == said))
+        })
+        .await;
         service.stop();
     }
 

@@ -1554,8 +1554,10 @@ export type NodeJournalEntry = z.infer<typeof NodeJournalEntry>;
  * POST /node/v1/diagnostics: sent once after a boot, when the boot ID differs from the one the
  * agent stored when it last reported; the API keeps one report per boot ID of a node, and answers
  * a second send of it with the stored report's `id` and `expected_reboot`. `kernel_release` is the kernel of `boot_id`. `previous_boot_id`
- * is the stored ID, null when the agent had stored none (it was just installed or updated), and
- * `entries` are the tail of the previous boot's journal from the agent, the gateway, cloudflared,
+ * is the boot the `entries` are from (the `_BOOT_ID` of its lines; the stored ID where the journal
+ * names none), which is not the boot the agent stored when a report of a boot between them was lost;
+ * null when the agent had stored none (it was just installed or updated). `entries` are the tail of
+ * the previous boot's journal from the agent, the gateway, cloudflared,
  * networkd, PID 1 and the kernel, oldest first; they are empty when the node has no journal of the
  * previous boot.
  */

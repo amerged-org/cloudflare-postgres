@@ -82,6 +82,11 @@ struct State {
     journal_damaged: bool,
 }
 
+/// The kernel's boot ID of the node's `boots`th boot.
+fn boot_id(boots: u64) -> String {
+    format!("00000000-0000-4000-8000-{boots:012x}")
+}
+
 pub struct Local {
     layout: Layout,
     user: String,
@@ -767,6 +772,16 @@ impl Machine for Local {
         Ok(())
     }
 
+    /// Dpkg's effect on the package list: the packages named are gone.
+    async fn purge_packages(&self, names: &[String]) -> io::Result<()> {
+        let mut state = self.state();
+        state.calls.push(format!("purge {}", names.join(" ")));
+        for name in names {
+            state.packages.remove(name);
+        }
+        Ok(())
+    }
+
     async fn reboot(&self) -> io::Result<()> {
         let mut state = self.state();
         state.calls.push("reboot".into());
@@ -808,8 +823,15 @@ impl Machine for Local {
     /// What `journalctl` printed on a node that rebooted, captured from a real one; a node that has
     /// not rebooted has no earlier boot.
     async fn previous_boot_journal(&self) -> io::Result<Option<String>> {
-        Ok((self.state().boots > 0)
-            .then(|| include_str!("../diagnostics/previous-boot.jsonl").to_string()))
+        let boots = self.state().boots;
+        // The capture's lines name the boot they are from, as journald prints its ID (32 hex
+        // digits): they are made the lines of the boot before this one.
+        Ok((boots > 0).then(|| {
+            include_str!("../diagnostics/previous-boot.jsonl").replace(
+                "11111111111141118111111111111111",
+                &boot_id(boots - 1).replace('-', ""),
+            )
+        }))
     }
 
     /// What the tools printed on a systemd 257 lab on Debian trixie (`diagnostics/probe/`): the
@@ -887,7 +909,7 @@ impl Machine for Local {
     fn boot(&self) -> Option<Boot> {
         let state = self.state();
         Some(Boot {
-            id: format!("00000000-0000-4000-8000-{:012x}", state.boots),
+            id: boot_id(state.boots),
             booted_at: 1_792_318_800 + state.boots * 600,
             kernel_release: state.kernel_release.clone(),
         })

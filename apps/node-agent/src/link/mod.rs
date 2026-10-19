@@ -20,6 +20,7 @@ pub(crate) mod test_server;
 
 pub use desired::{Desired, Order};
 pub use events::LinkEvent;
+pub(crate) use identity::transient;
 pub use identity::{NodeIdentity, Paths};
 pub use outbox::Flushed;
 pub use request::{Fenced, Transport};

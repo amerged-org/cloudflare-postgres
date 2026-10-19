@@ -237,6 +237,27 @@ pub fn report(boot: &Boot, previous: Option<&str>, entries: Vec<Value>) -> Value
     )
 }
 
+/// The ID of the boot the lines of `journal` are from, as the kernel writes it (with dashes): the
+/// `_BOOT_ID` of the first line that has one, which journald prints as 32 hex digits. `None` when
+/// no line names its boot.
+fn journal_boot(journal: &str) -> Option<String> {
+    journal.lines().find_map(|line| {
+        let line: Value = serde_json::from_str(line).ok()?;
+        let id = texts(line.get("_BOOT_ID")?).into_iter().next()?;
+        (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| {
+            let id = id.to_ascii_lowercase();
+            format!(
+                "{}-{}-{}-{}-{}",
+                &id[..8],
+                &id[8..12],
+                &id[12..16],
+                &id[16..20],
+                &id[20..]
+            )
+        })
+    })
+}
+
 /// Where the agent keeps the boot it last reported.
 fn stored_path(layout: &Layout) -> PathBuf {
     layout.agent().join("boot-id")
@@ -251,9 +272,12 @@ fn stored_boot(path: &Path) -> Option<String> {
 }
 
 /// After a boot: posts the previous boot's journal, and remembers this boot only once Cloudflare
-/// answered. A failure leaves the stored boot as it was, so that the next start tries again. A
+/// answered. A failure leaves the stored boot as it was, so that the caller tries again. A
 /// node whose journal holds no earlier boot is a first start: nothing is posted, and the boot is
 /// remembered, unless the agent reported an earlier boot, in which case the report goes without lines.
+/// The report names the boot its lines are from as `previous_boot_id`: when the report of a boot
+/// before it was lost, that is not the boot the agent stored. An agent that stored no boot claims
+/// none.
 pub async fn report_boot<M: Machine>(machine: &M, link: &Link) -> Result<(), Error> {
     let boot = machine.boot().ok_or("the boot cannot be read")?;
     let path = stored_path(machine.layout());
@@ -264,7 +288,13 @@ pub async fn report_boot<M: Machine>(machine: &M, link: &Link) -> Result<(), Err
     let journal = machine.previous_boot_journal().await?;
     if journal.is_some() || stored.is_some() {
         let entries = journal.as_deref().map(sanitize).unwrap_or_default();
-        link.post_diagnostics(&report(&boot, stored.as_deref(), entries))
+        let previous = stored.as_ref().map(|stored| {
+            journal
+                .as_deref()
+                .and_then(journal_boot)
+                .unwrap_or_else(|| stored.clone())
+        });
+        link.post_diagnostics(&report(&boot, previous.as_deref(), entries))
             .await?;
     }
     crate::link::file::create_private_directory(&machine.layout().agent())?;
@@ -318,6 +348,31 @@ mod tests {
         assert!(boot_report_due(None, CURRENT));
         assert!(boot_report_due(Some(EARLIER), CURRENT));
         assert!(!boot_report_due(Some(CURRENT), CURRENT));
+    }
+
+    #[test]
+    fn the_boot_of_a_journal_is_the_boot_id_of_its_first_line_that_names_one() {
+        let named = |id: Value| json!({"_BOOT_ID": id, "MESSAGE": "x"}).to_string();
+        let journal = [
+            "not json".to_string(),
+            json!({"MESSAGE": "no boot"}).to_string(),
+            named(json!("short")),
+            named(json!("0123456789abcdefg123456789abcdef")),
+            named(json!(["0123456789ABCDEF0123456789abcdef"])),
+            named(json!("ffffffffffff4fffbfffffffffffffff")),
+        ]
+        .join("\n");
+        assert_eq!(
+            journal_boot(&journal).as_deref(),
+            Some("01234567-89ab-cdef-0123-456789abcdef")
+        );
+        assert_eq!(journal_boot(""), None);
+        assert_eq!(journal_boot(&named(json!("short"))), None);
+        // The capture of a real node: every line is of one boot.
+        assert_eq!(
+            journal_boot(JOURNAL).as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
     }
 
     #[test]
@@ -684,6 +739,35 @@ mod tests {
                 .skip(1)
                 .all(|seen| seen.signed == Some(Ok(())))
         );
+    }
+
+    #[tokio::test]
+    async fn a_report_names_the_boot_its_lines_are_of_when_the_report_of_a_boot_before_it_was_lost()
+    {
+        let Some(machine) = Local::new("boot-report-missed") else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let link = linked(&cloud, &machine).await;
+        let first = machine.boot().unwrap().id;
+        report_boot(&machine, &link).await.unwrap();
+        // The second boot's report is refused and the agent does not start again before the third:
+        // the lines it reads are those of the second boot, and the report says so.
+        machine.reboot().await.unwrap();
+        let second = machine.boot().unwrap().id;
+        cloud.fail_next([Failure::Status(503)]);
+        assert!(report_boot(&machine, &link).await.is_err());
+        machine.reboot().await.unwrap();
+        let third = machine.boot().unwrap().id;
+        report_boot(&machine, &link).await.unwrap();
+        let [report] = &cloud.acknowledged("/node/v1/diagnostics")[..] else {
+            panic!("one report");
+        };
+        assert_eq!(report["boot_id"], third);
+        assert_eq!(report["previous_boot_id"], second);
+        assert_ne!(report["previous_boot_id"], first);
+        assert!(contract_valid("NodeBootReport", report));
+        assert_eq!(stored(&machine).as_deref(), Some(third.as_str()));
     }
 
     #[tokio::test]

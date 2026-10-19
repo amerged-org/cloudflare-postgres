@@ -116,6 +116,8 @@ pub struct Inner {
     pub diagnostics: Vec<Value>,
     /// The next this many results of probes are answered 503, whatever else is posted meanwhile.
     pub probe_failures: usize,
+    /// The same for the next this many boot reports.
+    pub boot_failures: usize,
     /// The node uid the desired pages name; the enrolled node's own unless a test changes it.
     pub page_uid: String,
     /// The pages never advance their cursor.
@@ -188,6 +190,7 @@ impl Cloud {
             orders: vec![],
             diagnostics: vec![],
             probe_failures: 0,
+            boot_failures: 0,
             page_uid: NODE_UID.into(),
             stuck: false,
             silent_welcome: false,
@@ -576,11 +579,14 @@ async fn serve(
                 None => Err("not_enrolled"),
             })
         };
-        let probe = request.method == "POST"
-            && request.target == constant("NODE_API_PATHS")["diagnostics"].as_str().unwrap()
-            && body["kind"] == "probe";
+        let diagnostic = request.method == "POST"
+            && request.target == constant("NODE_API_PATHS")["diagnostics"].as_str().unwrap();
+        let probe = diagnostic && body["kind"] == "probe";
         let failure = if probe && inner.probe_failures > 0 {
             inner.probe_failures -= 1;
+            Some(Failure::Status(503))
+        } else if diagnostic && !probe && inner.boot_failures > 0 {
+            inner.boot_failures -= 1;
             Some(Failure::Status(503))
         } else if request.method == "POST" {
             inner.failures.pop_front()

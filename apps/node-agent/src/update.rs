@@ -209,6 +209,12 @@ pub struct Plan {
     pub reboot: bool,
 }
 
+/// A kernel image (`linux-image-<abi>`), which is not the meta package `linux-image-amd64`.
+fn is_kernel_image(name: &str) -> bool {
+    name.strip_prefix("linux-image-")
+        .is_some_and(|abi| abi.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// A package whose change takes a reboot: the kernel, and the libraries every process of the node
 /// has mapped.
 fn needs_reboot(name: &str) -> bool {
@@ -231,6 +237,60 @@ pub fn plan(lock: &Lock, installed: &BTreeMap<String, String>) -> Plan {
     }
 }
 
+/// Whether `name` is a Debian package name as the image's lock states one
+/// (`infra/node-image/lock.ts`): at least two characters of lower-case letters, digits, `+`, `-`
+/// and `.`, the first a letter or a digit. Such a name is neither an option nor a pattern when it
+/// is a word of a command line.
+pub fn is_package_name(name: &str) -> bool {
+    name.len() >= 2
+        && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.')
+        })
+}
+
+/// The installed packages that the lock does not name, which the cycle purges so that the node has
+/// the lock's packages and no others (the digest of its hello then equals the release's). Never a
+/// kernel image: Debian keeps the previous kernel for the boot menu, the digest leaves idle ones
+/// out, and the running one cannot go. Never a name that is not a package name. A lock that names
+/// no kernel image is not the lock of an image, which always boots one: it purges nothing.
+pub fn purgeable(lock: &Lock, installed: &BTreeMap<String, String>) -> Vec<String> {
+    let named = |name: &str| {
+        lock.packages
+            .iter()
+            .chain(&lock.extra)
+            .any(|p| p.name == name)
+    };
+    if !lock
+        .packages
+        .iter()
+        .any(|package| is_kernel_image(&package.name))
+    {
+        return Vec::new();
+    }
+    installed
+        .keys()
+        .filter(|name| !named(name) && !is_kernel_image(name) && is_package_name(name))
+        .cloned()
+        .collect()
+}
+
+/// `names` without the packages `dpkg-query -W -f '${Package}\t${Essential}\n'` says are essential:
+/// dpkg refuses to remove them, and removing one would end the node.
+pub fn without_essential(names: Vec<String>, dpkg: &str) -> Vec<String> {
+    let essential: std::collections::BTreeSet<&str> = dpkg
+        .lines()
+        .filter_map(|line| {
+            let (name, essential) = line.split_once('\t')?;
+            (essential.trim() == "yes").then_some(name)
+        })
+        .collect();
+    names
+        .into_iter()
+        .filter(|name| !essential.contains(name.as_str()))
+        .collect()
+}
+
 /// The installed packages and their versions, from `dpkg-query -W -f '${db:Status-Abbrev}\t${Package}\t${Version}\n'`.
 pub fn installed_packages(output: &str) -> BTreeMap<String, String> {
     output
@@ -251,7 +311,7 @@ pub fn without_idle_kernels(
     kernel_release: &str,
 ) -> BTreeMap<String, String> {
     installed.retain(|name, _| match name.strip_prefix("linux-image-") {
-        Some(abi) if abi.starts_with(|c: char| c.is_ascii_digit()) => abi == kernel_release,
+        Some(abi) if is_kernel_image(name) => abi == kernel_release,
         _ => true,
     });
     installed
@@ -384,6 +444,68 @@ mod tests {
         let planned = plan(&lock(), &without);
         assert_eq!(planned.versions, ["linux-image-6.12.99-amd64=6.12.99-1"]);
         assert!(planned.reboot);
+    }
+
+    #[test]
+    fn what_the_lock_does_not_name_is_purged_but_no_kernel_image_and_no_name_apt_could_take_as_an_option()
+     {
+        let node = installed(&[
+            ("bash", "5.2"),
+            ("postgresql-18", "18.7-1"),
+            ("cloudflared", "2026.10.1"),
+            ("linux-image-6.12.99-amd64", "6.12.99-1"),
+            // The previous kernel stays for the boot menu, and a running one is never removed.
+            ("linux-image-6.12.88-amd64", "6.12.88-1"),
+            ("libdropped1", "1.0"),
+            ("libdropped++2", "1.0"),
+            ("-rf", "1"),
+            ("X", "1"),
+            ("Upper", "1"),
+        ]);
+        assert_eq!(purgeable(&lock(), &node), ["libdropped++2", "libdropped1"]);
+        // The node has what the lock names and nothing else: nothing to purge.
+        assert_eq!(
+            purgeable(&lock(), &plan_installed(&lock())),
+            [] as [&str; 0]
+        );
+        // A lock without a kernel image is not the lock of an image, which boots one: it purges
+        // nothing, however little it names.
+        let kernelless = Lock {
+            packages: lock()
+                .packages
+                .into_iter()
+                .filter(|package| package.name == "bash")
+                .collect(),
+            extra: vec![],
+        };
+        assert_eq!(purgeable(&kernelless, &node), [] as [&str; 0]);
+        assert_eq!(
+            purgeable(
+                &Lock {
+                    packages: vec![],
+                    extra: vec![]
+                },
+                &node
+            ),
+            [] as [&str; 0]
+        );
+    }
+
+    /// The packages a node that runs `lock` has.
+    fn plan_installed(lock: &Lock) -> BTreeMap<String, String> {
+        lock.packages
+            .iter()
+            .chain(&lock.extra)
+            .map(|package| (package.name.clone(), package.version.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn dpkg_says_which_packages_are_essential_and_those_are_never_purged() {
+        let names: Vec<String> = ["libdropped1", "bash", "netbase"].map(String::from).into();
+        // `dpkg-query -W -f '${Package}\t${Essential}\n'`: the field is empty for most packages.
+        let output = "libdropped1\t\nbash\tyes\nnetbase\t\n";
+        assert_eq!(without_essential(names, output), ["libdropped1", "netbase"]);
     }
 
     #[test]

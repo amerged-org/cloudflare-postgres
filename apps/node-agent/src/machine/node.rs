@@ -484,6 +484,49 @@ impl Machine for Node {
         apt(install).await
     }
 
+    async fn purge_packages(&self, names: &[String]) -> io::Result<()> {
+        if let Some(name) = names
+            .iter()
+            .find(|name| !crate::update::is_package_name(name))
+        {
+            return Err(io::Error::other(format!("{name:?} is not a package name")));
+        }
+        let output = tokio::process::Command::new("dpkg-query")
+            .args(["-W", "-f", "${Package}\t${Essential}\n"])
+            .args(names)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(io::Error::other("dpkg-query failed"));
+        }
+        let names = crate::update::without_essential(
+            names.to_vec(),
+            &String::from_utf8_lossy(&output.stdout),
+        );
+        if names.is_empty() {
+            return Ok(());
+        }
+        let output = tokio::process::Command::new("dpkg")
+            .arg("--purge")
+            .args(&names)
+            .env("LC_ALL", "C")
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "dpkg --purge ended with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
     async fn reboot(&self) -> io::Result<()> {
         run("systemctl", &["reboot"]).await
     }
