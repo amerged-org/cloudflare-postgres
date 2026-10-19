@@ -1,7 +1,8 @@
 # Manual credential changes
 
 Operational Cloudflare, R2 and PGCF credentials have no configured expiry in the current
-operator installation, except the Edge's Access service token below. Keep their scopes limited to
+operator installation, except the Edge's Access service token below and the PGCF API keys, which
+carry an optional expiry ([API keys](#api-keys)). Keep their scopes limited to
 the account, buckets and services they use.
 Routing capabilities, control messages, provider access tokens and certificates retain their
 security deadlines.
@@ -14,6 +15,46 @@ integrator keys additionally require their existing `project_id`. Save the creat
 directly in private credential custody. The full key is returned once; replay does not reissue or
 silently replace it. Verify the replacement's scoped access, update the consumer, then revoke the
 old key with `DELETE /v1/api-keys/{id}`. Keep a working administrator throughout the change.
+
+**Scopes.** An operator holds keys of two scopes. `admin` changes anything: it buys servers, starts
+rollouts and maintenance, declares nodes lost and makes keys. `admin_read` reads what an
+administrator reads (nodes, regions, health, costs, fleet, the key list and the audit log) and
+changes nothing: every request that is not a GET is refused with `403` before it runs, on every
+route, and it is recorded. Give monitoring, dashboards and anything else that only looks an
+`admin_read` key (`{"scope":"admin_read","name":"monitoring"}`); a leaked one shows the fleet and
+cannot touch it. A read-only key reads no more than an `admin` key does: the connection URI of a
+role never carries its password for either.
+
+**Expiry.** Every key may carry `expires_at` (a future time, set at creation and not changeable;
+make another key to move it). From that instant the key is refused with `401` like a revoked one.
+An `admin` or `admin_read` key made by an administrator key expires 90 days after its creation
+unless `expires_at` asks for another time, and at most 366 days ahead is accepted; an integrator key
+never expires unless it asks. The first administrator key, made with the bootstrap token, does not
+expire unless it asks: no earlier key exists to make its successor, and `POST /v1/api-keys` with the
+bootstrap token works once only, so a first key that lapsed could not be replaced through the API.
+Keys made before the audit migration (`0076`) have no expiry; replace them with keys that do, then
+revoke them. Make the successor of an administrator key before the key expires, and read
+`expires_at` in `GET /v1/api-keys`.
+
+**Audit log.** `GET /v1/audit-events` (either administrator scope; newest first, the usual `limit`
+and `cursor`) lists every request an `admin` or `admin_read` key made with a method other than
+`GET`, and every refusal of a key that carries an administrator key's identifier but a wrong
+secret, or was revoked or has expired. An event holds the key's ID and scope, the method, the
+route template (`/v1/api-keys/{id}`, never the path that was asked for), the HTTP status, the
+`X-Request-Id` and the time. It holds no body, query, key, secret or address; to tie an event to
+what it did, read the resource it names in the route (the key that asked is also kept on role
+and probe records). An event is listed for 90 days; the next change or refused administrator key
+deletes the older ones (the minute cron has no statement to spare: its tests hold it to 850).
+Not recorded: successful reads, a refused key that matches no key row or an integrator's (anyone
+could otherwise grow the log), and the one bootstrap request, which has no key to name.
+
+A change is written to the log **before** it runs, and its status is added when the answer is
+known. This order is deliberate: a change cannot be taken back, so a row written afterwards could
+be lost with the change already made. If the row cannot be written, the request is not run and
+answers `500` (log line `audit_write_failed`); the retry is safe. If only the status cannot be
+written, the answer stands and the event keeps `status: null`, which says the outcome is unknown
+(also after a Worker that stopped mid-request), never that it succeeded. A refused key is
+refused whatever the log says. Look for `null` statuses after an incident.
 
 ## Worker and routing secrets
 

@@ -285,6 +285,63 @@ describe("actual generated API references in the Workers runtime", () => {
     );
   });
 
+  it("documents the scopes of the keys, their expiry and the audit log", async () => {
+    const doc = await document("/v1/openapi.json");
+    const schemas = doc.components!.schemas as Record<
+      string,
+      {
+        enum?: string[];
+        required?: string[];
+        properties?: Record<string, { description?: string }>;
+      }
+    >;
+    expect(schemas.ApiKeyScope!.enum).toEqual([
+      "admin",
+      "admin_read",
+      "integrator",
+    ]);
+    expect(schemas.ApiKey!.required).toContain("expires_at");
+    expect(schemas.ApiKeyCreate!.properties).toHaveProperty("expires_at");
+    expect(schemas.ApiKeyCreate!.required).not.toContain("expires_at");
+    expect(schemas.ApiKeyCreate!.properties!.expires_at!.description).toContain(
+      "90 days",
+    );
+    expect(Object.keys(schemas.AuditEvent!.properties!)).toEqual([
+      "id",
+      "key_id",
+      "scope",
+      "method",
+      "route",
+      "status",
+      "request_id",
+      "created_at",
+    ]);
+    const audit = operation(doc, "/v1/audit-events", "get");
+    expect(audit.operationId).toBe("listAuditEvents");
+    expect(audit.security).toEqual([{ bearerAuth: [] }]);
+    expect(Object.keys(audit.responses).sort()).toEqual([
+      "200",
+      "400",
+      "401",
+      "403",
+      "500",
+    ]);
+    expect(audit.description).toContain("admin_read");
+    // A read-only key reads what administrators read and is refused every change.
+    expect(operation(doc, "/v1/nodes", "get").description).toContain(
+      "admin_read",
+    );
+    expect(operation(doc, "/v1/projects", "post").description).toContain(
+      "refused with 403",
+    );
+    expect(operation(doc, "/v1/databases", "post").responses).toHaveProperty(
+      "403",
+    );
+    expect((doc.info as { description?: string }).description).toContain(
+      "audit log",
+    );
+  });
+
   it("documents the role lifecycle: attributes, deletion, required keys and the operation kind", async () => {
     const doc = await document("/v1/openapi.json");
     const create = operation(doc, "/v1/databases/{id}/roles", "post");
@@ -306,10 +363,12 @@ describe("actual generated API references in the Workers runtime", () => {
     ).toBe(false);
     expect(remove.operationId).toBe("deleteDatabaseRole");
     expect(remove.security).toEqual([{ bearerAuth: [] }]);
+    // 403 is what a read-only administrator key is told for any request that is not a GET.
     expect(Object.keys(remove.responses).sort()).toEqual([
       "202",
       "400",
       "401",
+      "403",
       "404",
       "409",
       "500",

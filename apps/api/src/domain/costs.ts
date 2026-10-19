@@ -12,7 +12,7 @@ import {
 } from "@pgcf/contracts/costs";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
-import { requireScope } from "../middleware/auth.ts";
+import { requireAdminRead, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 
 interface FactRow {
@@ -237,7 +237,7 @@ export async function queryInfrastructureCosts(
   c: ApiContext,
   value: InfrastructureCostsQuery,
 ): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const query = InfrastructureCostsQuery.parse(value),
     scopeId = query.node_id ?? query.region_id!;
   const exists = query.node_id

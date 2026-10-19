@@ -2,7 +2,7 @@
 import { createRoute, z } from "@hono/zod-openapi";
 import { ErrorBody, ListQuery, listEnvelope } from "@pgcf/contracts";
 import type { ApiApp } from "../app.ts";
-import { requireScope } from "../middleware/auth.ts";
+import { requireAdminRead } from "../middleware/auth.ts";
 import { page } from "../platform/pagination.ts";
 import { CronHealth, readCronHealth } from "../domain/cron-health.ts";
 import {
@@ -72,7 +72,7 @@ export function registerOperationalHealth(app: ApiApp): void {
       },
     }),
     async (c) => {
-      await requireScope(c, "admin");
+      await requireAdminRead(c);
       const query = c.req.valid("query");
       const pagination = page(c, { limit: query.limit, cursor: query.cursor });
       const rows = await readOperationalHealth(c.env.DB, query.scope, {

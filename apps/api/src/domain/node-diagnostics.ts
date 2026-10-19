@@ -224,16 +224,18 @@ const summary = (row: DiagnosticRow): NodeDiagnosticSummary =>
   });
 
 /**
- * Only an administrator reads a node's reports and asks it for probes; anyone else is told the
- * node is not there, as an integrator is for every resource that is not its own.
+ * Only an administrator reads a node's reports and asks it for probes (asking needs the scope that
+ * changes things, `admin`; reading takes `admin_read` too); anyone else is told the node is not
+ * there, as an integrator is for every resource that is not its own.
  */
 async function administeredNode(
   c: ApiContext,
   nodeId: string,
+  asks = false,
 ): Promise<AuthPrincipal> {
   const auth = await getAuth(c);
   const found =
-    auth.scope === "admin"
+    auth.scope === "admin" || (auth.scope === "admin_read" && !asks)
       ? await c.env.DB.prepare("SELECT 1 found FROM nodes WHERE id=?")
           .bind(nodeId)
           .first()
@@ -252,7 +254,7 @@ export async function requestNodeProbe(
   c: ApiContext,
   nodeId: string,
 ): Promise<Response> {
-  const auth = await administeredNode(c, nodeId);
+  const auth = await administeredNode(c, nodeId, true);
   const request = NodeProbeRequest.parse(await c.req.json());
   const id = crypto.randomUUID(),
     now = Date.now();

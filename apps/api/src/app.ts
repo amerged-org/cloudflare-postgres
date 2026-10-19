@@ -26,6 +26,8 @@ import { nodeLookup } from "./domain/node-auth.ts";
 import { registerNodes } from "./routes/nodes.ts";
 import { registerLifecycle } from "./routes/lifecycle.ts";
 import { registerInfrastructureBackups } from "./routes/infrastructure-backups.ts";
+import { registerAuditEvents } from "./routes/audit-events.ts";
+import { recordAuditOutcome } from "./middleware/audit.ts";
 import { NodeStateError } from "./domain/node-state.ts";
 
 export type ApiApp = OpenAPIHono<ApiEnv>;
@@ -67,6 +69,7 @@ export const DIAGNOSTIC_ROUTES = new Set([
   "/v1/openapi.json",
   "/v1/api-keys",
   "/v1/api-keys/:id",
+  "/v1/audit-events",
   "/v1/projects",
   "/v1/projects/:id",
   "/v1/size-classes",
@@ -272,6 +275,7 @@ export function createApp(): ApiApp {
     c.header("X-Content-Type-Options", "nosniff");
     await next();
   });
+  app.use("*", recordAuditOutcome);
   app.onError((error, c) => {
     if (error instanceof ApiError)
       return apiError(c, error.code, error.message, error.details);
@@ -358,6 +362,7 @@ export function createApp(): ApiApp {
   registerNodeLink(app);
   registerLifecycle(app);
   registerInfrastructureBackups(app);
+  registerAuditEvents(app);
   registerOperationalHealth(app);
   registerRegionConfiguration(app);
   registerFleetReleases(app);

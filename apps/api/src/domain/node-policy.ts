@@ -2,7 +2,7 @@
 import { NodePolicy, RegionId } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
-import { requireScope } from "../middleware/auth.ts";
+import { requireAdminRead, requireScope } from "../middleware/auth.ts";
 import { hintNode } from "./node-hints.ts";
 
 /**
@@ -14,7 +14,7 @@ export async function getNodePolicy(
   c: ApiContext,
   regionId: string,
 ): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const row = await c.env.DB.prepare(
     "SELECT node_policy_json FROM node_region_policies WHERE region_id=?",
   )
