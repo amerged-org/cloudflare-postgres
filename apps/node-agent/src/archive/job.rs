@@ -713,6 +713,27 @@ mod tests {
     }
 
     #[test]
+    fn the_backup_policy_of_the_contracts_example_page_is_the_default_limits() {
+        // In operation the agent takes its limits from the node policy, so a policy that fills more
+        // than the backup slice holds (`busiest_mib`) overflows its `MemoryMax`.
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../../packages/contracts/native/node-vectors.generated.json"
+        ))
+        .unwrap();
+        let page = vectors["schemas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| {
+                v["schema"] == "NodeDesiredPage" && v["name"] == "full-page" && v["valid"] == true
+            })
+            .expect("the valid full desired page");
+        let limits = Limits::from_policy(&page["value"]["policy"]["backup"]).unwrap();
+        assert_eq!(limits, Limits::default());
+        assert_eq!(busiest_mib(&limits), 512);
+    }
+
+    #[test]
     fn the_barman_commands_are_the_ones_the_lab_ran() {
         let db = database();
         let store = store('a');
