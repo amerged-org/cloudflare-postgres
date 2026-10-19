@@ -9,7 +9,7 @@ import {
 import { ApiError } from "../api-error.ts";
 import { withAdmissionMutation } from "../domain/admission-mutations.ts";
 import type { ApiContext } from "../env.ts";
-import { getAuth, requireScope } from "../middleware/auth.ts";
+import { getAuth, requireAdminRead, requireScope } from "../middleware/auth.ts";
 import { regionAcceptsPlacementSql } from "../domain/placement.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "./pagination.ts";
@@ -92,7 +92,7 @@ export async function listRegions(c: ApiContext): Promise<Response> {
   const auth = await getAuth(c);
   const pagination = page(c);
   const cursor = pagination.where();
-  if (auth.scope !== "admin") {
+  if (auth.scope === "integrator") {
     const placed = await c.env.DB.prepare(
       `SELECT id,provider_region,created_at FROM regions WHERE ${regionAcceptsPlacementSql()} AND ${cursor.sql} ORDER BY created_at DESC, id DESC LIMIT ?`,
     )
@@ -121,7 +121,7 @@ export async function listRegions(c: ApiContext): Promise<Response> {
   return c.json(pagination.envelope(rows.results.map(regionRow)), 200);
 }
 export async function listNodes(c: ApiContext): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const pagination = page(c);
   const cursor = pagination.where();
   const rows = await c.env.DB.prepare(
@@ -152,7 +152,7 @@ async function inventoryRows(c: ApiContext, rows: Row[]) {
 }
 
 export async function getNode(c: ApiContext, id: string) {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const row = await c.env.DB.prepare("SELECT * FROM nodes WHERE id=?")
     .bind(id)
     .first<Row>();
@@ -161,7 +161,7 @@ export async function getNode(c: ApiContext, id: string) {
 }
 
 export async function getRegion(c: ApiContext, id: string) {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const row = await c.env.DB.prepare(regionSelect).bind(id).first<Row>();
   if (!row) throw new ApiError("not_found", "Region not found");
   return c.json(regionRow(row), 200);
@@ -210,7 +210,7 @@ export async function getRegionConfiguration(
   c: ApiContext,
   id: string,
 ): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   return configurationResponse(c, await regionConfigurationRow(c, id));
 }
 

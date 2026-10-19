@@ -18,7 +18,7 @@ import {
 import { nodeLossStatus } from "../domain/node-loss.ts";
 import { acknowledgeReinstallOverride } from "../domain/reinstall-guard.ts";
 import type { ApiContext } from "../env.ts";
-import { requireScope } from "../middleware/auth.ts";
+import { requireAdminRead, requireScope } from "../middleware/auth.ts";
 
 const json = (schema: z.ZodType) => ({ "application/json": { schema } });
 const errors = {
@@ -182,7 +182,7 @@ export function registerLifecycle(app: ApiApp): void {
       ),
     },
     async (c) => {
-      await requireScope(c, "admin");
+      await requireAdminRead(c);
       const id = DatabaseId.parse(c.req.param("id"));
       const exists = await c.env.DB.prepare(
         "SELECT 1 found FROM databases WHERE id=?",
@@ -207,7 +207,7 @@ export function registerLifecycle(app: ApiApp): void {
       responses: responses(NodeLossStatus),
     },
     async (c) => {
-      await requireScope(c, "admin");
+      await requireAdminRead(c);
       const status = await nodeLossStatus(
         c.env.DB,
         NodeId.parse(c.req.param("id")),

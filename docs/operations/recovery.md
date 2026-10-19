@@ -51,8 +51,9 @@ missing or ambiguous coverage is refused rather than creating an empty database.
 
 ## Lost node
 
-Node-loss and node-addition endpoints require an admin API key. A node is never declared lost from
-staleness alone, and fencing comes before any database moves (plan 7.11, 9.4).
+Node-loss and node-addition endpoints require an `admin` API key (an `admin_read` key reads them and
+changes nothing). A node is never declared lost from staleness alone, and fencing comes before any
+database moves (plan 7.11, 9.4).
 
 1. Read `/v1/operational-health?scope=nodes` and verify the actual node UID. A node whose newest
    sample is older than 180 seconds is stale: placement excludes it and `regional_node_stale`
@@ -95,7 +96,8 @@ staleness alone, and fencing comes before any database moves (plan 7.11, 9.4).
 A node has no shell and opens no port, so an administrator asks its agent to read one thing and
 send it back over the link. The probes only read: each is a fixed command (no shell) or a read of
 fixed files, built by the agent, and a request names the probe and three integers, never a
-command, a path or a unit. They need an admin API key; any other key is told 404.
+command, a path or a unit. Asking needs an `admin` API key; an `admin_read` key reads the answers; any
+other key is told 404.
 
 Do not ask a node whose agent is older than the build with probes (SEC-09). It refuses a desired
 page that carries a request, and takes no order from a full pull (maintenance, move, fence, a
@@ -209,7 +211,7 @@ is tested against lab volumes; the live test (Stage 5.5 of the ULTRA plan) has n
 
 The cycle installs the packages that a release pins (a newer Debian snapshot, a kernel update) on
 one node and reboots it if needed (plan 9.3). Run it one node at a time, in an announced window,
-with the owner's go for a reboot. The endpoints require an admin API key.
+with the owner's go for a reboot. Starting a cycle requires an `admin` API key; an `admin_read` key reads its state.
 
 1. Register the release (`PUT /v1/fleet/releases/{id}`) and assign it to the node's region
    (`PUT /v1/regions/{id}/release`). Wait until `GET /v1/nodes/{id}/release` says `converged`:

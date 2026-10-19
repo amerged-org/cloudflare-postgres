@@ -288,12 +288,12 @@ the purchase switches and the alert thresholds. The live node ceiling is removed
 and the alert webhook is the delivery destination; no direct email is configured. Purchases and
 autoscale stay off; enabling them, or any new paid resource, needs the owner's explicit, costed go.
 
-Management is API-only and requires an administrator key; an integrator's project key does not
-control infrastructure purchases. Read the policy, then PUT the intended complete policy to the same
-route. Existing fields retain their documented full-replacement semantics; omitting `max_nodes`,
-`ram_expansion_threshold_ppm`, the warning thresholds or `cap_warning_enabled` preserves the stored
-values, and an explicit `null` removes an optional value. No large sentinel count represents an
-absent limit.
+Management is API-only and requires an administrator key of scope `admin` (`admin_read` only
+reads); an integrator's project key does not control infrastructure purchases. Read the policy,
+then PUT the intended complete policy to the same route. Existing fields retain their documented
+full-replacement semantics; omitting `max_nodes`, `ram_expansion_threshold_ppm`, the warning
+thresholds or `cap_warning_enabled` preserves the stored values, and an explicit `null` removes an
+optional value. No large sentinel count represents an absent limit.
 
 | Setting                                                              | Meaning                                                                                                                                                                                                                              |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

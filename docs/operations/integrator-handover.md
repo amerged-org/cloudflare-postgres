@@ -111,7 +111,8 @@ operator which classes are placeable. The owner has not yet approved the product
 
 ### 1.4 Projects and keys
 
-There are two key scopes:
+There are three key scopes. You hold an integrator key; the table compares it with the operator's
+`admin` key:
 
 |                                                                                            | Integrator key                                                                                              | Admin key                                              |
 | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
@@ -122,6 +123,11 @@ There are two key scopes:
 | Regions                                                                                    | list `{id, provider_region}` of those that accept placement                                                 | list the full records, create, read                    |
 | Projects                                                                                   | list and read its own; delete its own once it holds no live database (this also revokes the project's keys) | create, list, delete                                   |
 | API keys, nodes, capacity policy, costs, operational health, infrastructure backups, fleet | `403`                                                                                                       | yes                                                    |
+
+The third scope, `admin_read`, is the operator's read-only administrator key, for monitoring and
+dashboards: it reads what an admin key reads, and every request that is not a GET is refused with
+`403` before it runs. You are never given one. The operator's keys leave an audit log
+(`GET /v1/audit-events`, administrator keys only); yours do not.
 
 A key is `pgcf_sk_<12 characters>_<43 characters>`, sent as `Authorization: Bearer <key>`. PGCF
 stores only an HMAC of it; the full key appears once, in the creation response. A lost response
@@ -141,18 +147,20 @@ curl -sS -X POST "$PGCF_API/v1/api-keys" -H "Authorization: Bearer $ADMIN_API_KE
   -d '{"scope":"integrator","project_id":"<project-id>","name":"<label>"}'
 ```
 
-**Rotating a key.** There is no self-service rotation and no expiry. The operator follows
-[credentials](credentials.md#api-keys): create a second integrator key for the same project, you
-deploy it, the operator revokes the first with `DELETE /v1/api-keys/{id}`. A revoked key answers
-`401` at once. Idempotency keys are scoped to the API key that used them: settle in-flight
-mutations before the switch, and do not expect a new key to replay an old key's
-`Idempotency-Key`. Key expiry, last-use display, a read-only scope and bounded admin minting are
-open work.
+**Rotating a key.** There is no self-service rotation. An integrator key never expires unless the
+operator gave it an `expires_at` when making it (the key's resource shows it; it cannot be
+changed): from that time the key answers `401` like a revoked one, so ask for the replacement
+before it. The operator follows [credentials](credentials.md#api-keys): create a second integrator
+key for the same project, you deploy it, the operator revokes the first with
+`DELETE /v1/api-keys/{id}`. A revoked key answers `401` at once. Idempotency keys are scoped to the
+API key that used them: settle in-flight mutations before the switch, and do not expect a new key
+to replay an old key's `Idempotency-Key`. Last-use display and bounded admin minting are open
+work.
 
 ## 2. Lifecycle API
 
 The machine-readable reference is `GET /v1/openapi.json` (no key needed). Its `info.version` is
-the version of the API contract (`1.2.0` for this document): it changes when the contract changes
+the version of the API contract (`1.3.0` for this document): it changes when the contract changes
 and not with a Worker release, which is named in `info.x-worker-version`. Rules a schema cannot
 state are in descriptions ([Appendix C](#appendix-c-what-the-served-openapi-document-states-in-words)).
 Its operation IDs are listed below. Examples assume:
@@ -1056,9 +1064,8 @@ the operator supplies it at handover.** Send:
   rebalancing (an operator can move a database under its ID; a restore always creates a new ID).
 - Alerts for integrators (alerts go to the operator); alert history, acknowledgement and test send.
 - Finding deleted databases: the lists exclude them, so keep the IDs you were given.
-- An event stream or webhooks, an audit log.
-- Key expiry, last-use display, key rotation as a feature, a read-only scope; an API domain with
-  rate limiting.
+- An event stream or webhooks, an audit log of integrator keys (the administrator keys have one).
+- Last-use display and key rotation as a feature; an API domain with rate limiting.
 - Infrastructure metrics history and measured CPU and RAM per database.
 - Changing a role after creation (expiry, limit, membership), user-chosen passwords, a grants API,
   per-role settings, renaming a database.

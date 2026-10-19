@@ -32,6 +32,7 @@ const scopes = [
       "An error is `{error: {code, message, request_id, details?}}`. `details.reason` is the stable cause where a code stands for several, and a `Retry-After` header advises the delay of a transient refusal.",
       "A mutation that names `Idempotency-Key` is repeated safely under the same key for 24 hours, per API key.",
       "A resource of another project is reported as `404`, never `403`.",
+      "An administrator key has scope `admin` (reads and changes) or `admin_read` (reads only: a request that is not a GET is refused with `403` before it runs, on every route). A route described as for administrator keys takes `admin_read` as well when it only reads. An API key may carry an `expires_at`, from which it is refused with `401` like a revoked one. Every request of an administrator key that is not a GET, and the refusal of a revoked or expired one presented with its real secret, is recorded in the audit log (`GET /v1/audit-events`); a change whose record cannot be written is not run.",
     ].join("\n\n"),
   ],
   [
@@ -70,15 +71,27 @@ const errors: Record<number, string> = {
   500: "Internal server error",
   503: "Capacity unavailable",
 };
-const authDescription: Record<DocumentationAuth, string> = {
-  none: "",
-  api: "Accepts an administrator or integrator API key.",
-  project:
-    "Accepts an administrator or integrator API key; a resource outside the integrator's project is reported as not found.",
-  admin: "Requires an administrator API key.",
-  node: "Requires a request signed with the node's key, rather than a management API key.",
-  installer:
-    "Requires the install's one-time progress token, rather than a management API key.",
+/** What a read-only administrator key (`admin_read`) may do: a GET, never a change. */
+const authDescription = (auth: DocumentationAuth, reads: boolean): string => {
+  const administrator = reads
+    ? "an administrator API key (scope admin, or the read-only admin_read)"
+    : "an administrator API key of scope admin (a read-only admin_read key is refused with 403)";
+  switch (auth) {
+    case "none":
+      return "";
+    case "api":
+      return `Accepts ${administrator} or an integrator API key.`;
+    case "project":
+      return `Accepts ${administrator} or an integrator API key; a resource outside the integrator's project is reported as not found.`;
+    case "admin":
+      return `Requires ${administrator}.`;
+    case "admin_read":
+      return "Requires an administrator API key: scope admin, or the read-only admin_read.";
+    case "node":
+      return "Requires a request signed with the node's key, rather than a management API key.";
+    case "installer":
+      return "Requires the install's one-time progress token, rather than a management API key.";
+  }
 };
 const responseHeaders = {
   "X-Request-Id": {
@@ -190,8 +203,8 @@ function describeOperation(key: string, operation: Operation): void {
   operation.summary ??= metadata.summary;
   const authentication =
     key === "POST /v1/api-keys"
-      ? "Requires an administrator API key, except for the one-time bootstrap bearer that creates the first administrator key. Bootstrap creation ignores Idempotency-Key."
-      : authDescription[metadata.auth];
+      ? "Requires an administrator API key of scope admin (a read-only admin_read key is refused with 403), except for the one-time bootstrap bearer that creates the first administrator key. Bootstrap creation ignores Idempotency-Key."
+      : authDescription(metadata.auth, key.startsWith("GET "));
   if (authentication)
     operation.description = [operation.description, authentication]
       .filter(Boolean)
@@ -217,8 +230,10 @@ function describeOperation(key: string, operation: Operation): void {
     for (const status of statuses)
       (operation.responses ??= {})[status] ??= {
         description:
-          status === 403 && metadata.auth !== "admin"
-            ? "Scoped execution authority is unavailable or changed"
+          status === 403 &&
+          metadata.auth !== "admin" &&
+          metadata.auth !== "admin_read"
+            ? "The key's scope does not allow the request: a read-only admin_read key on a request that is not a GET, or an integrator key on an operation of administrators"
             : (errors[status] ?? "Request refused"),
         content: {
           "application/json": {
