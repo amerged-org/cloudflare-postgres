@@ -173,7 +173,8 @@ bucket, made after the last write into it, closes any gap.
    and `target_archive_path` (the trigger `database_moves_monotonic` refuses that change: drop it
    and create it again, text for text, from migration `0065` around the statements). The credential
    rows stay: a credential is found by node, path and access, so the new paths make every page name a
-   new credential, and the old rows record when the old credentials expire.
+   new credential, and the old rows record when the old credentials expire. Note the time the file
+   ended (T_REWRITE).
 7. Run the maintenance cycle (`POST /v1/nodes/{id}/maintenance`) on every node that holds a database
    and wait until it is `done`. The node answers new wakes with `57P03`, puts every awake database to
    sleep with the proof and reopens placement; by then it has read the new credentials and accepted
@@ -201,23 +202,51 @@ bucket, made after the last write into it, closes any gap.
    backup.
 10. Repeat the copy and the check for new keys in the old bucket after an hour, a day and after the
     last credential for the old bucket has expired (`max(expires_at)` of the rows that name it, at
-    most seven days). Each pass takes as `--since` the time its previous pass printed (`chain_since`,
-    60 seconds before that pass's listing began; the first pass takes the one that step 8's copy
-    printed), never an earlier one: the old bucket gets no deletion after step 5 while the new bucket's
-    retention goes on, so a pass with an earlier time copies back what the new bucket deleted
-    legitimately, such as the purged archive of a deleted database, and nothing deletes it again. After
-    the barrier no upload into the old bucket is in flight, so no hour of margin is needed. A pass that
-    copies a key is therefore real: check that the key's prefix is still named by a row that the
-    Worker has not purged yet. No row of `databases` or `database_moves` is ever deleted: the purge of
+    most seven days). Each pass takes as `--since` the `next_since` its previous pass printed (its
+    listing start minus an hour; the first pass takes the one that step 8's copy printed), never an
+    earlier one: the old bucket gets no deletion after step 5 while the new bucket's retention goes
+    on, so a pass with an earlier time copies back what the new bucket deleted legitimately, such as
+    the purged archive of a deleted database, and nothing deletes it again. The hour of overlap is
+    needed, because uploads into the old bucket do not stop at step 7's barrier: a node whose read of
+    the new credential failed keeps its registration for the old path (`ensure_archive` finds no
+    endpoint for the new path and returns false, and the apply and wake paths ignore that), so its
+    databases archive into the old bucket until the last old credential expires, and a multipart
+    object (a base backup) carries its start time: one that began before a pass listed and ended
+    after it is older than a window that began a minute before that listing, and no later pass would
+    copy it. The hour costs nothing: the new bucket's retention deletes by name only what precedes a
+    base backup that ended at least `backup_retention_days` (a day at least) before, and a purge or an
+    expiry waits as long for a deleted database or a finished move, so the overlap copies back only a
+    key that retention deletes again, or a purged prefix that the check below finds unnamed. Run
+    after each pass also `verify --from <old> --to <new> --since <T_REWRITE> --sample-heads 0
+    --missing-file <file>`: every key the old bucket received since step 6's file ended, compared with
+    the new bucket whatever the chain skipped. In the passes of an hour and a day it finds nothing
+    missing (the new bucket's retention cannot have acted on keys that young). After the last
+    credential has expired a missing key is no gap only if no row names its prefix (below) or if it is
+    older than the `backup_retention_days` of its database's size class (the line shows `modified=`:
+    retention may have deleted it); any other is a gap, copied with `copy --since <T_REWRITE> --prefix
+    <its prefix>`, after which the check runs again. A pass that copies a key is real, not noise:
+    check that the key's prefix is still named by a row that the Worker has not purged yet. No row of `databases` or `database_moves` is ever deleted: the purge of
     a retained archive deletes only its `retained_archives` row and the deleted database keeps its
     `archive_path` (`deleted_at` set), and the expiry of a superseded archive only sets
     `source_archive_deleted_at` or `target_archive_deleted_at`. So the prefix counts while a database
     that is not deleted is on it, while a `retained_archives` row names it, while the source of a done
     move or the staged target of a failed move is not marked deleted, and while it is the target of a
-    move in flight. A prefix that nothing of this names came back from a purge or an expiry and is no
+    move in flight. As a read-only query, where `<bucket>` is the bucket whose name the rows carry (the
+    new bucket after step 6; the old one after the rollback's step 2) and `<prefix>` is
+    `<region>/<database>/g<generation>-<operation>`, a row answers when the prefix is named:
+    ```sql
+    SELECT 1 FROM databases WHERE archive_path='s3://<bucket>/<prefix>' AND deleted_at IS NULL
+    UNION ALL SELECT 1 FROM retained_archives WHERE archive_path='s3://<bucket>/<prefix>'
+    UNION ALL SELECT 1 FROM database_moves WHERE
+      (status='done' AND source_archive_path='s3://<bucket>/<prefix>' AND source_archive_deleted_at IS NULL)
+      OR (status='restoring' AND target_archive_path='s3://<bucket>/<prefix>')
+      OR (status='failed' AND target_archive_path='s3://<bucket>/<prefix>' AND target_archive_deleted_at IS NULL)
+    ```
+    A prefix that nothing of this names came back from a purge or an expiry and is no
     gap; the owner deletes it from the new bucket. For a real gap, find the node whose credential read
-    failed (usually a parent key that lacks the new bucket) and wake its databases again. Only then,
-    and with the owner's word, delete the old bucket and its scope in the old token.
+    failed (usually a parent key that lacks the new bucket) and wake its databases again. Only when
+    the last pass, after the last credential expired, ended without a failure and its check shows no
+    gap, and with the owner's word, delete the old bucket and its scope in the old token.
 
 If a step fails. Before step 5, nothing in production changed (a failed copy is repeated). From step 5
 on, every rollback is the same whole procedure, because nothing records whether a node switched and a
@@ -249,8 +278,8 @@ check that no credential names the new bucket races the nodes' pulls every 60 se
    The first pass takes `<S>` = T_B; it prints `listing_started_at` and `next_since` (its listing
    start minus an hour), which the next pass takes (step 7). It answers two questions.
    - *Missing*: keys the new bucket received that the old one lacks (a node wrote WAL, a base backup
-     or an export into the new bucket, and the upload log will not send them again). Apply the prefix
-     check of step 10 to the keys of `--missing-file`, with the old bucket in the query. A key whose
+     or an export into the new bucket, and the upload log will not send them again). Apply the
+     rollback's prefix check (below) to the keys of `--missing-file`. A key whose
      prefix a row names is a gap: mirror it. A key whose prefix no row names is no gap: the old
      bucket's Worker purged that archive since step 1, and the new bucket still holds the copy that
      step 8 or 10 made.
@@ -266,6 +295,11 @@ check that no credential names the new bucket races the nodes' pulls every 60 se
      second attempt would bring it into the new bucket, where step 8's delete keeps it because the old
      bucket holds it.
 
+   The rollback's prefix check is step 10's query with `<bucket>` = the old bucket: after step 2 every
+   row names the old bucket again. The query for the new bucket finds no row for any prefix after the
+   swap: run with it, every key would count as unnamed, so nothing would be mirrored and the cleanup
+   (b) would take the whole extras file. Fill in the old bucket's name before the first comparison.
+
    The mirror (a) and the cleanup (b) need the owner's separate go, because the token of the move
    has only read on the old bucket, so that nothing can write or delete there. Create a second token
    with read on the new and read and write on the old bucket (the permission that lets step 8's
@@ -273,21 +307,26 @@ check that no credential names the new bucket races the nodes' pulls every 60 se
    afterwards.
    (a) Mirror the missing keys of a named prefix: a copy that only adds missing keys and never
    replaces one (`copy --from <new> --to <old> --since <S> --add-only --copied-file <file>`). Check
-   each copied key's prefix as in step 10, against the old bucket: a purge there since step 1 may
+   each copied key's prefix with the rollback's prefix check: a purge there since step 1 may
    have deleted an archive whose copy the new bucket still holds, and that copy must not stay (the
    owner deletes those few keys by hand, because (b) does not take a key that the new bucket also
    holds). Run the comparison again with the same `<S>`: nothing missing, or only keys of unnamed
    prefixes.
    (b) Clean the old bucket: take the extras file and the prefix
    `<region>/<database>/g<generation>-<operation>` of each key (its first three path segments), run
-   the prefix check of step 10 for each against the old bucket (after step 2 the rows name it again),
-   and write the keys of the prefixes that no row names, and only those, into a 0600 file in a 0700
-   directory (extras of other classes, `node-images/` and `infrastructure/`, are none of this: tell the
-   owner). `prune --from <new> --to <old> --before <T_R3> --keys-file <file>` is the dry run, the same
-   with `--execute` deletes. It deletes in the old bucket only the listed keys that the new bucket
-   lacks and that were written at or before T_R3, and it refuses a list that names a key outside the
-   archive layout. A prefix that a row names stays: a database wrote into it, or the old Worker's
-   retention owns it.
+   the rollback's prefix check for each, and write the keys of the prefixes that no row names, and
+   only those, into a 0600 file in a 0700 directory (extras of other classes, `node-images/` and
+   `infrastructure/`, are none of this: tell the owner). `prune --from <new> --to <old> --before
+   <T_R2> --keys-file <file>` is the dry run, the same with `--execute` deletes. It deletes in the old
+   bucket only the listed keys that the new bucket lacks and that were written at or before T_R2, and
+   it refuses a list that names a key outside the archive layout. A prefix that a row names stays: a
+   database wrote into it, or the old Worker's retention owns it. T_R2 and not T_R3 bounds the
+   delete: every key the cleanup is meant to delete is an archive that the new bucket's Worker purged,
+   written into the old bucket before T_B, while everything the swapped-back system wrote there since
+   step 2 is newer than T_R2 and stays whatever the prefix check says; step 3's maintenance cycle
+   archives the final WAL of every database that was awake into the old bucket between T_R2 and
+   T_R3, the new bucket lacks those keys, and with T_R3 a wrongly written check would delete them
+   from the bucket that is live again.
 
    If the go is refused while keys of named prefixes are missing, the new bucket stays as it is,
    because it is the only copy of those keys, and the old bucket has gaps for point-in-time recovery:
