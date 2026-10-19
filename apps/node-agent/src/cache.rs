@@ -57,8 +57,19 @@ struct Candidate {
     modified: SystemTime,
 }
 
-/// The regular files of `directory`. A link is none: it is not followed.
+/// Whether `path` is a directory and no link to one. The data directory is the database user's,
+/// who can put a link in place of any directory of it, and the agent reads as root.
+fn is_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// The regular files of `directory`, which is none if it is a link. A link among them is none:
+/// neither is followed. The check and the listing are two calls, so a link put there between them
+/// is followed once, for the opening of files without reading them.
 fn files_in(directory: &Path) -> Vec<Candidate> {
+    if !is_directory(directory) {
+        return Vec::new();
+    }
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Vec::new();
     };
@@ -76,8 +87,11 @@ fn files_in(directory: &Path) -> Vec<Candidate> {
         .collect()
 }
 
-/// The files to read: nothing is chosen of a data directory that is not there.
+/// The files to read: nothing is chosen of a data directory that is not there or is a link.
 fn select(data: &Path) -> Vec<Candidate> {
+    if !is_directory(data) {
+        return Vec::new();
+    }
     let mut all = files_in(&data.join("global"));
     all.extend(files_in(&data.join("pg_xact")));
     all.extend(
@@ -91,14 +105,17 @@ fn select(data: &Path) -> Vec<Candidate> {
             })
             .max_by_key(|file| file.modified),
     );
-    if let Ok(databases) = std::fs::read_dir(data.join("base")) {
+    let base = data.join("base");
+    if is_directory(&base)
+        && let Ok(databases) = std::fs::read_dir(&base)
+    {
         for database in databases.take(MAX_ENTRIES).filter_map(Result::ok) {
             let user_database = database
                 .file_name()
                 .to_str()
                 .and_then(|name| name.parse::<u32>().ok())
                 .is_some_and(|oid| oid >= FIRST_USER_DATABASE);
-            if user_database && database.metadata().is_ok_and(|m| m.is_dir()) {
+            if user_database {
                 all.extend(files_in(&database.path()));
             }
         }
@@ -135,7 +152,9 @@ pub(crate) fn page_size() -> u64 {
 }
 
 /// Opens a file of the data directory to count its pages. The directory is the database user's:
-/// a link there is not followed, and a pipe or a device is not opened for reading.
+/// a link at the file is not followed (`O_NOFOLLOW` covers the last part of the path, the
+/// directories were checked when they were listed), and a pipe or a device is not opened for
+/// reading.
 fn open(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
@@ -367,6 +386,36 @@ mod tests {
         assert!(open(&linked).is_err());
         // The pipe and the link are no files of the directory in the first place.
         assert_eq!(names(&select(&data)), ["16384/20001"]);
+    }
+
+    /// The database's user can put a link where the data directory has a directory, and the agent
+    /// reads as root: the files behind it are not listed, so they are not opened.
+    #[test]
+    fn a_link_in_place_of_a_directory_is_not_followed() {
+        // Each place the reading lists, replaced by a link to a directory with what it would take.
+        for place in ["global", "pg_xact", "pg_wal", "base"] {
+            let data = data("cache-link");
+            let outside = crate::testpg::directory("cache-outside");
+            file(outside.join("000000010000000000000001"), 8192, 500);
+            fs::create_dir_all(outside.join("16384")).unwrap();
+            file(outside.join("16384/16500"), 8192, 500);
+            fs::remove_dir_all(data.join(place)).unwrap();
+            std::os::unix::fs::symlink(&outside, data.join(place)).unwrap();
+            assert_eq!(names(&select(&data)), Vec::<String>::new(), "{place}");
+        }
+        // The directory of a user database, and the data directory itself.
+        let data = data("cache-link-database");
+        let outside = crate::testpg::directory("cache-outside");
+        file(outside.join("16500"), 8192, 500);
+        fs::remove_dir_all(data.join("base/16384")).unwrap();
+        std::os::unix::fs::symlink(&outside, data.join("base/16384")).unwrap();
+        assert_eq!(names(&select(&data)), Vec::<String>::new());
+        let real = self::data("cache-link-data");
+        file(real.join("global/pg_control"), 8192, 900);
+        let linked = crate::testpg::directory("cache-linked").join("data");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        assert_eq!(names(&select(&real)), ["global/pg_control"]);
+        assert_eq!(names(&select(&linked)), Vec::<String>::new());
     }
 
     #[test]
