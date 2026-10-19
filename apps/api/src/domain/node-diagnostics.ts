@@ -33,7 +33,7 @@ interface NodeRow {
  * Whether a maintenance order of the node was open when its last sample of the previous boot
  * arrived, or closed after it: an order the node's own reboot belongs to. Until this boot's hello
  * is stored, the node's newest sample is that sample. The hello keeps it when it stores the new
- * boot (`os_previous_observed_at`), because from then on the newest sample can be this boot's. An
+ * boot (`os_previous_observed_at`): the newest sample the node's actor holds, which D1 may not have yet, because from then on the newest sample can be this boot's. An
  * order made after it, while the node was down, is not the reason for the reboot, and a node that
  * never sampled has no order.
  */

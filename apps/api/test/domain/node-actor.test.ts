@@ -380,6 +380,47 @@ describe("the samples of a node", () => {
     socket.close(1000);
   }, 60_000);
 
+  it("keeps the newest sample of a boot that ended as the end of that boot, also when its minute's alarm has not written it", async () => {
+    const f = await fixture(0);
+    const socket = await connect(f);
+    if (Date.now() % MINUTE > MINUTE - 20_000)
+      await new Promise((resolve) =>
+        setTimeout(resolve, MINUTE - (Date.now() % MINUTE) + 3_000),
+      );
+    const now = Date.now(),
+      iso = (at: number) => new Date(at).toISOString();
+    for (const offset of [2_000, 1_000]) {
+      socket.send(sampleMessage(now - offset));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    await until(
+      async () =>
+        (await heldLink(f.node)).sample?.observed_at === iso(now - 1_000),
+    );
+    const column = (name: string) =>
+      env.DB.prepare(`SELECT ${name} v FROM nodes WHERE id=?`)
+        .bind(f.node)
+        .first<string | null>("v");
+    // D1 holds the minute's first sample; the actor holds the newer one.
+    expect(await column("last_observed_at")).toBe(iso(now - 2_000));
+    socket.close(1000);
+
+    // The node boots again and says hello before the alarm: the boot that ended ended with the
+    // sample the actor holds. A hello of the same boot changes nothing.
+    const again = await connect(f, false);
+    const welcome = next(again);
+    again.send(hello(null, nodeOs({ boot_id: crypto.randomUUID() })));
+    await welcome;
+    expect(await column("os_previous_observed_at")).toBe(iso(now - 1_000));
+    again.close(1000);
+    const same = await connect(f, false);
+    const answered = next(same);
+    same.send(hello(null, nodeOs({ boot_id: (await column("os_boot_id"))! })));
+    await answered;
+    expect(await column("os_previous_observed_at")).toBe(iso(now - 1_000));
+    same.close(1000);
+  }, 60_000);
+
   describe("when a minute's first sample comes less than 5 s into the minute", () => {
     // The alarm of a minute rings 5 s after it ends, so a first sample sooner than that moves the
     // alarm on before it rings. The node's vitals must follow the sample all the same.

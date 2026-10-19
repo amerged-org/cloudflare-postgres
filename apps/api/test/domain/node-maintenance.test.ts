@@ -4,6 +4,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { NodeMaintenance } from "@pgcf/contracts/nodes";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openNodeOrders } from "../../src/domain/lifecycle-orders.ts";
+import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
+import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import {
   assignRelease,
   cleanupFixtures,
@@ -230,6 +232,42 @@ describe("the maintenance cycle of one node", () => {
     expect(reclosed).not.toBe(during.placement_closed_at);
     await answer(f, "done", during.operation);
     expect(await closedAt(f)).toBe(reclosed);
+  });
+
+  it("buys no node while a cycle holds the placement of the only node it closed, and buys again once the cycle ended", async () => {
+    const f = await converged();
+    await configureNodeRegionPolicy(env.DB, {
+      region_id: f.region,
+      max_nodes: 3,
+      purchases_enabled: false,
+    });
+    await env.DB.prepare(
+      "UPDATE node_region_policies SET autoscale_enabled=1,adopt_instance_ids=? WHERE region_id=?",
+    )
+      .bind(JSON.stringify(["4711"]), f.region)
+      .run();
+    const additions = () =>
+      env.DB.prepare("SELECT count(*) n FROM node_additions WHERE region_id=?")
+        .bind(f.region)
+        .first<number>("n");
+    const create = vi
+      .spyOn(env.ADD_NODE, "create")
+      .mockResolvedValue({} as Awaited<ReturnType<typeof env.ADD_NODE.create>>);
+    const order = await started(f);
+    // The node is online and its placement is closed for the cycle: the shortage is temporary.
+    expect((await runNodeCapacity(env, f.region)).action).toBe("maintenance");
+    expect(await additions()).toBe(0);
+    expect(create).not.toHaveBeenCalled();
+    await answer(f, "done", order.operation);
+    expect((await runNodeCapacity(env, f.region)).action).toBe("idle");
+    expect(await additions()).toBe(0);
+    // A placement that an operator closed is not the cycle's: the region buys.
+    await env.DB.prepare(
+      "UPDATE nodes SET database_placement_closed_at=? WHERE id=?",
+    )
+      .bind(new Date().toISOString(), f.node)
+      .run();
+    expect((await runNodeCapacity(env, f.region, true)).action).toBe("adopt");
   });
 
   it("refuses a node that cannot run the cycle", async () => {
