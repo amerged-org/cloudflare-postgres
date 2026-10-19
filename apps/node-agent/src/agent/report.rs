@@ -4,6 +4,7 @@
 use super::{Core, Db, Phase, View};
 use crate::{
     archive::facts::{self, ArchiveState},
+    events::Events,
     machine::Machine,
 };
 use ring::rand::{SecureRandom, SystemRandom};
@@ -179,13 +180,13 @@ impl<M: Machine> Core<M> {
         self.changed.notify_one();
     }
 
-    /// The reports waiting to be posted, at most what one request carries; `None` when nothing
-    /// waits. A report that was not accepted is given back with `unsent`.
-    pub fn take_report(&self) -> Option<Value> {
+    /// The reports waiting to be posted, at most what one request carries, with the events of
+    /// `events`; `None` when nothing waits. Events alone are a report of their own (no database,
+    /// no order) when their window is open. A report that was not accepted is given back with
+    /// `unsent`.
+    pub(crate) fn take_report(&self, events: &Events) -> Option<Value> {
         let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
-        if reports.observations.is_empty() && reports.orders.is_empty() {
-            return None;
-        }
+        let alone = reports.observations.is_empty() && reports.orders.is_empty();
         let databases: Vec<String> = reports
             .observations
             .keys()
@@ -209,14 +210,14 @@ impl<M: Machine> Core<M> {
                 .filter_map(|operation| reports.orders.remove(operation))
                 .collect::<Vec<_>>(),
         });
-        // The agent's own log lines ride along; none wait for a report of their own.
-        crate::events::attach(&mut report);
-        Some(report)
+        // The agent's own log lines ride along, or leave alone.
+        events.attach(&mut report, alone);
+        (!alone || report.get("events").is_some()).then_some(report)
     }
     /// A report that was not accepted: what it holds is posted again, unless something newer
     /// about the same database or order was queued since.
-    pub fn unsent(&self, report: &Value) {
-        crate::events::give_back(report);
+    pub(crate) fn unsent(&self, events: &Events, report: &Value) {
+        events.give_back(report);
         let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
         for observation in report["databases"].as_array().into_iter().flatten() {
             if let Some(id) = observation["id"].as_str() {
@@ -272,6 +273,7 @@ impl<M: Machine> Core<M> {
 mod tests {
     use super::*;
     use crate::{agent::testing::Rig, node_link::contract_valid};
+    use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_ready_database_names_the_unit_it_runs_and_the_report_is_what_cloudflare_accepts() {
@@ -294,6 +296,39 @@ mod tests {
             .unwrap()
             .remove("instance");
         assert!(!contract_valid("NodeObservationReport", &without));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn events_alone_are_a_report_once_per_window_and_otherwise_ride_with_what_goes() {
+        let Some(rig) = Rig::new("report-events").await else {
+            return;
+        };
+        let window = Duration::from_millis(300);
+        let events = Events::new(window);
+        let line = |name: &str| json!({"event": name, "uptime_s": 12});
+        // Nothing to say: no report.
+        assert!(rig.core.take_report(&events).is_none());
+        // An event alone is a report with no database and no order, which Cloudflare takes.
+        events.record(&line("agent_started"));
+        let alone = rig.core.take_report(&events).unwrap();
+        assert_eq!(alone["databases"], json!([]));
+        assert_eq!(alone["orders"], json!([]));
+        assert_eq!(alone["events"][0]["event"], "agent_started");
+        assert!(contract_valid("NodeObservationReport", &alone));
+        // The next one waits for the window, and a report that goes meanwhile takes it along.
+        events.record(&line("tick"));
+        assert!(rig.core.take_report(&events).is_none());
+        rig.core.report_order("op_aaaaaaaaaaaaaaaaaaaa", Ok(()));
+        let with_order = rig.core.take_report(&events).unwrap();
+        assert_eq!(with_order["orders"].as_array().unwrap().len(), 1);
+        assert_eq!(with_order["events"][0]["event"], "tick");
+        // A report that was not accepted gives its events back, and they go alone after the window.
+        rig.core.unsent(&events, &alone);
+        assert!(rig.core.take_report(&events).is_none());
+        tokio::time::sleep(window).await;
+        let again = rig.core.take_report(&events).unwrap();
+        assert_eq!(again["events"], alone["events"]);
+        assert_eq!(again["orders"], json!([]));
     }
 
     #[test]

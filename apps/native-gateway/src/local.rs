@@ -6,12 +6,13 @@
 //! PostgreSQL does (running, quiescing, sleeping or retired). A connection is dialled on the
 //! database's socket and kept only when the kernel's peer credentials are the unit's uid and main
 //! PID. The wakes of held connections go to the agent on the same channel, and the agent's
-//! release is the table entry that shows the woken unit at the ticket's generation.
+//! release is the table entry that shows the woken unit at the ticket's generation. The stage
+//! marks of the connections that were held follow them there.
 use crate::{sessions::Action, transport::Gateway};
 use pgcf_native_protocol::{
     agent::{
-        self, ActivityReport, ControlAction, Database, FromGateway, MAX_LINE_BYTES, Mode,
-        SessionStatus, ToGateway, Writer,
+        self, ActivityReport, ConnStages, ControlAction, Database, FromGateway, MAX_LINE_BYTES,
+        Mode, SessionStatus, ToGateway, Writer,
     },
     wake::POLL_HOLD_MS,
 };
@@ -23,9 +24,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedReadHalf},
-    sync::{Notify, RwLock, mpsc, watch},
+    sync::{Mutex, Notify, RwLock, mpsc, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -37,6 +38,54 @@ const RECONNECT: Duration = Duration::from_millis(200);
 const WRITE_BOUND: Duration = Duration::from_secs(10);
 /// How long a quiesce or close waits for the sessions to reach the state it asks for.
 const SETTLE_BOUND: Duration = Duration::from_secs(1);
+
+/// How many stage marks wait for the channel to the agent at most.
+const STAGE_QUEUE: usize = 64;
+
+/// The stage marks of the connections that were held for a wake, on their way to the agent. A
+/// connection that ends sends its marks with `try_send` and never waits: a mark that finds the
+/// queue full is lost. The marks do not enter the channel's queue of wakes and answers: `write`
+/// takes one only when none of those waits, so the marks delay neither.
+pub struct StageQueue {
+    sender: mpsc::Sender<ConnStages>,
+    receiver: Mutex<mpsc::Receiver<ConnStages>>,
+}
+impl Default for StageQueue {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::channel(STAGE_QUEUE);
+        Self {
+            sender,
+            receiver: Mutex::new(receiver),
+        }
+    }
+}
+impl StageQueue {
+    /// What a connection sends its marks with when it ends.
+    pub fn sender(&self) -> mpsc::Sender<ConnStages> {
+        self.sender.clone()
+    }
+    /// Writes the channel's lines to the agent for as long as it is served, each wake and answer
+    /// before any mark, and returns when `queue` is closed or a write fails.
+    async fn write(&self, mut agent: impl AsyncWrite + Unpin, mut queue: mpsc::Receiver<Vec<u8>>) {
+        let mut marks = self.receiver.lock().await;
+        loop {
+            let line = tokio::select! {
+                biased;
+                line = queue.recv() => match line {
+                    Some(line) => line,
+                    None => return,
+                },
+                Some(stages) = marks.recv() => agent::encode(&FromGateway::ConnStages(stages)),
+            };
+            if !matches!(
+                timeout(WRITE_BOUND, agent.write_all(&line)).await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
+        }
+    }
+}
 
 /// The agent's table, as the gateway last received it.
 #[derive(Default)]
@@ -219,20 +268,14 @@ async fn serve(
     stream: UnixStream,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), Failure> {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let (outgoing, mut queue) = mpsc::channel::<Vec<u8>>(256);
+    let (outgoing, queue) = mpsc::channel::<Vec<u8>>(256);
     let mut tasks = JoinSet::new();
-    tasks.spawn(async move {
-        while let Some(line) = queue.recv().await {
-            if !matches!(
-                timeout(WRITE_BOUND, writer.write_all(&line)).await,
-                Ok(Ok(()))
-            ) {
-                break;
-            }
-        }
-    });
+    {
+        let gateway = gateway.clone();
+        tasks.spawn(async move { gateway.stage_marks.write(writer, queue).await });
+    }
     {
         let (gateway, outgoing) = (gateway.clone(), outgoing.clone());
         tasks.spawn(async move {
@@ -445,6 +488,7 @@ fn activity(gateway: &Gateway, database: &str) -> Option<ActivityReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     fn writer(pid: u32) -> Writer {
         Writer {
             socket: "/run/pgcf/aaaaaaaaaaaaaaaaaaaa/.s.PGSQL.5432".into(),
@@ -463,6 +507,58 @@ mod tests {
             writer: matches!(mode, Mode::Running | Mode::Quiesce).then(|| writer(pid)),
         }
     }
+    #[tokio::test]
+    async fn a_flood_of_stage_marks_is_dropped_and_what_is_kept_follows_every_wake_and_answer() {
+        let queue = StageQueue::default();
+        let sender = queue.sender();
+        let marks = || ConnStages {
+            database: "a".repeat(20),
+            outcome: "client_closed".into(),
+            held_outcome: Some("released".into()),
+            wake_wait_ms: Some(640),
+            ..ConnStages::default()
+        };
+        // A connection that ends sends with `try_send`: beyond the bound its marks are gone.
+        let accepted = (0..STAGE_QUEUE * 4)
+            .filter(|_| sender.try_send(marks()).is_ok())
+            .count();
+        assert_eq!(accepted, STAGE_QUEUE);
+        // The marks take no room in the channel for wakes and answers, although it holds four.
+        let (outgoing, channel) = mpsc::channel::<Vec<u8>>(4);
+        for line in ["wake\n", "answer\n"] {
+            timeout(
+                Duration::from_millis(200),
+                outgoing.send(line.as_bytes().to_vec()),
+            )
+            .await
+            .expect("a wake or an answer finds room behind the marks")
+            .unwrap();
+        }
+        // The writer is idle once everything is written: the wake and the answer first, then
+        // every mark that was kept, as the protocol's lines.
+        let (agent, mut written) = tokio::io::duplex(1 << 20);
+        assert!(
+            timeout(Duration::from_millis(200), queue.write(agent, channel))
+                .await
+                .is_err()
+        );
+        let mut text = Vec::new();
+        written.read_to_end(&mut text).await.unwrap();
+        let head = b"wake\nanswer\n";
+        assert!(text.starts_with(head), "{}", String::from_utf8_lossy(&text));
+        let lines: Vec<&str> = std::str::from_utf8(&text[head.len()..])
+            .unwrap()
+            .lines()
+            .collect();
+        assert_eq!(lines.len(), STAGE_QUEUE);
+        for line in lines {
+            assert_eq!(
+                agent::decode_from_gateway(line.as_bytes()),
+                Ok(FromGateway::ConnStages(marks()))
+            );
+        }
+    }
+
     #[test]
     fn the_table_admits_running_units_and_moves_the_epochs_of_what_changed() {
         let (a, b) = ("a".repeat(20), "b".repeat(20));

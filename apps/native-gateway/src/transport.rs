@@ -11,7 +11,7 @@ use crate::{
 use futures_util::{SinkExt, StreamExt};
 use pgcf_native_protocol::{
     activity::PostgresActivity,
-    agent::{Mode, Writer},
+    agent::{ConnStages, Mode, Writer},
     constant,
     route::{Keyring, ReplayCache, Route, valid_websocket_key, verify},
     startup::{Event, StartupReader, error_response_with},
@@ -28,7 +28,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UnixStream},
-    sync::{Notify, OwnedSemaphorePermit, RwLock, watch},
+    sync::{Notify, OwnedSemaphorePermit, RwLock, mpsc, watch},
     time::timeout,
 };
 use tokio_tungstenite::{
@@ -89,6 +89,8 @@ pub struct Gateway {
     pub draining: AtomicBool,
     /// The held connections of sleeping databases and their wake tickets.
     pub wakes: Arc<WakeQueue>,
+    /// The stage marks of those connections, on their way to the agent.
+    pub stage_marks: local::StageQueue,
     /// The idle sessions of HTTP SQL.
     pub sql: crate::sql::Pool,
     pub(crate) admission: Mutex<Admission>,
@@ -104,6 +106,7 @@ impl Gateway {
             measurements: Arc::new(Mutex::new(GatewayMeasurements::new())),
             draining: AtomicBool::new(false),
             wakes: WakeQueue::new(),
+            stage_marks: local::StageQueue::default(),
             sql: crate::sql::Pool::default(),
             admission: Mutex::new(Admission::default()),
         })
@@ -314,8 +317,8 @@ fn replay_status(reason: &str) -> u16 {
     if reason == "replayed" { 403 } else { 429 }
 }
 /// Monotonic stage marks of one routed connection, logged once as `conn_stages` when it is
-/// dropped. The outcome is a fixed class; roles, addresses, tokens and payloads are never
-/// logged.
+/// dropped. A connection held for a wake also sends them to the agent (`forward`). The outcome is
+/// a fixed class; roles, addresses, tokens and payloads are never logged.
 struct Stages {
     database: String,
     outcome: &'static str,
@@ -328,6 +331,9 @@ struct Stages {
     wake_wait: Option<Duration>,
     /// The agent's result for the wake, as it arrives, read when the line is logged.
     verdict: Option<Verdict>,
+    /// Where a connection held for a wake sends its marks to the agent when it ends; none for any
+    /// other connection.
+    forward: Option<mpsc::Sender<ConnStages>>,
     received: Instant,
     accepted: Option<Instant>,
     startup: Option<Instant>,
@@ -345,6 +351,7 @@ impl Stages {
             held_outcome: None,
             wake_wait: None,
             verdict: None,
+            forward: None,
             received,
             accepted: None,
             startup: None,
@@ -353,29 +360,54 @@ impl Stages {
             first_backend: None,
         }
     }
-}
-impl Drop for Stages {
-    fn drop(&mut self) {
+    /// The marks of the connection as they stand, in milliseconds; a mark it did not reach is
+    /// absent.
+    fn marks(&self) -> ConnStages {
         let ms = |duration: Duration| duration.as_millis() as u64;
         let between = |from: Option<Instant>, to: Option<Instant>| {
             from.zip(to).map(|(from, to)| ms(to.duration_since(from)))
         };
-        let mut observation = serde_json::json!({"event":"conn_stages","database":self.database,"outcome":self.outcome,"upgrade_ms":between(Some(self.received),self.accepted),"startup_ms":between(self.accepted,self.startup),"dial_ms":self.dial.map(ms),"first_backend_ms":between(self.written,self.first_backend),"wake_path":self.wake_path,"session_ms":ms(self.received.elapsed())});
+        ConnStages {
+            database: self.database.clone(),
+            outcome: self.outcome.into(),
+            held_outcome: self.held_outcome.map(Into::into),
+            wake_reason: self
+                .verdict
+                .as_ref()
+                .and_then(Verdict::get)
+                .and_then(|result| result.reason),
+            upgrade_ms: between(Some(self.received), self.accepted),
+            startup_ms: between(self.accepted, self.startup),
+            dial_ms: self.dial.map(ms),
+            first_backend_ms: between(self.written, self.first_backend),
+            wake_wait_ms: self.wake_wait.map(ms),
+            session_ms: Some(ms(self.received.elapsed())),
+        }
+    }
+}
+impl Drop for Stages {
+    fn drop(&mut self) {
+        let marks = self.marks();
+        let mut observation = serde_json::json!({"event":"conn_stages","database":self.database,"outcome":self.outcome,"upgrade_ms":marks.upgrade_ms,"startup_ms":marks.startup_ms,"dial_ms":marks.dial_ms,"first_backend_ms":marks.first_backend_ms,"wake_path":self.wake_path,"session_ms":marks.session_ms});
         if let Some(held) = self.held_outcome {
             observation["held_outcome"] = held.into();
-            if let Some(wait) = self.wake_wait {
-                observation["wake_wait_ms"] = ms(wait).into();
+            if let Some(wait) = marks.wake_wait_ms {
+                observation["wake_wait_ms"] = wait.into();
             }
-            if let Some(result) = self.verdict.as_ref().and_then(Verdict::get) {
-                if let Some(reason) = result.reason {
-                    observation["wake_reason"] = reason.into();
-                }
-                if !result.steps_ms.is_empty() {
-                    observation["agent_ms"] = serde_json::json!(result.steps_ms);
-                }
+            if let Some(reason) = &marks.wake_reason {
+                observation["wake_reason"] = reason.as_str().into();
+            }
+            if let Some(result) = self.verdict.as_ref().and_then(Verdict::get)
+                && !result.steps_ms.is_empty()
+            {
+                observation["agent_ms"] = serde_json::json!(result.steps_ms);
             }
         }
         println!("{observation}");
+        // Never waits: a full queue loses the marks.
+        if let Some(forward) = &self.forward {
+            let _ = forward.try_send(marks);
+        }
     }
 }
 fn upgrade(head: &HttpHead) -> bool {
@@ -783,6 +815,7 @@ async fn serve_held(
         }
     };
     stages.wake_path = Some("cold");
+    stages.forward = Some(gateway.stage_marks.sender());
     let wire = WireBudget::new(gateway.memory.lease(&database));
     let stream = BudgetedStream::new(socket, head.prefix, head.end, wire.clone(), base);
     let accepted = timeout(
@@ -1567,5 +1600,70 @@ async fn forward_if_running(
             stages.outcome = "postgres_error";
             Err("PostgreSQL write failed".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DATABASE: &str = "aaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn a_connection_held_for_a_wake_sends_its_marks_when_it_ends_and_no_other_does() {
+        let (sender, mut marks) = mpsc::channel(4);
+        let received = Instant::now();
+        let later = |ms: u64| received + Duration::from_millis(ms);
+        {
+            let mut held = Stages::new(DATABASE, received);
+            held.forward = Some(sender.clone());
+            held.wake_path = Some("cold");
+            held.held_outcome = Some("released");
+            held.outcome = "client_closed";
+            held.wake_wait = Some(Duration::from_millis(640));
+            held.accepted = Some(later(3));
+            held.startup = Some(later(15));
+            held.dial = Some(Duration::from_millis(1));
+            held.written = Some(later(700));
+            held.first_backend = Some(later(707));
+            // A connection that is not held for a wake has no way to send.
+            let mut warm = Stages::new(DATABASE, received);
+            warm.wake_path = Some("warm");
+        }
+        let sent = marks
+            .try_recv()
+            .expect("the held connection sends its marks");
+        assert_eq!(
+            ConnStages {
+                session_ms: None,
+                ..sent.clone()
+            },
+            ConnStages {
+                database: DATABASE.into(),
+                outcome: "client_closed".into(),
+                held_outcome: Some("released".into()),
+                wake_reason: None,
+                upgrade_ms: Some(3),
+                startup_ms: Some(12),
+                dial_ms: Some(1),
+                first_backend_ms: Some(7),
+                wake_wait_ms: Some(640),
+                session_ms: None,
+            }
+        );
+        assert!(sent.session_ms.is_some());
+        assert!(sent.valid());
+        // The warm connection sent nothing, and the marks it did not reach are absent.
+        assert!(marks.try_recv().is_err());
+        let early = Stages::new(DATABASE, received).marks();
+        assert_eq!(
+            (
+                early.upgrade_ms,
+                early.startup_ms,
+                early.dial_ms,
+                early.first_backend_ms
+            ),
+            (None, None, None, None)
+        );
     }
 }

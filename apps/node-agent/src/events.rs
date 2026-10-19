@@ -5,23 +5,34 @@
 //! numbers or short tokens. Error text, paths, dotted-quad and colon address forms and anything
 //! else the contract refuses is dropped; what the contract accepts is the call sites' to keep
 //! clean (class codes, IDs, numbers). The next observation report carries the ring, and a report
-//! that was not accepted gives its events back.
+//! that was not accepted gives its events back. A node whose databases do not change has no
+//! observation to carry them: the ring wakes the report loop, which posts the events alone, but
+//! not more often than `ALONE_EVERY`.
 use crate::{archive::facts, node_link::constant};
 use serde_json::{Map, Value, json};
 use std::{
     collections::VecDeque,
-    sync::{Mutex, PoisonError},
+    sync::{Mutex, MutexGuard, PoisonError},
+    time::Duration,
 };
+use tokio::{sync::Notify, time::Instant};
+
+/// A report of events alone goes out at most this often. Events that wait for the window leave
+/// with it, or with the next observation report if that comes first.
+pub(crate) const ALONE_EVERY: Duration = Duration::from_secs(1);
 
 /// The events waiting for the next report, oldest first. A full ring drops its oldest event: a
 /// node that cannot report keeps its newest.
 pub(crate) struct Ring {
     events: VecDeque<Value>,
+    /// When a report of events alone last took events.
+    alone_at: Option<Instant>,
 }
 impl Ring {
     pub(crate) const fn new() -> Self {
         Self {
             events: VecDeque::new(),
+            alone_at: None,
         }
     }
 
@@ -42,6 +53,25 @@ impl Ring {
         self.trim();
     }
 
+    /// How long until the events may leave in a report of their own: `None` while there are
+    /// none, zero when they may go now.
+    fn alone_in(&self, now: Instant, every: Duration) -> Option<Duration> {
+        (!self.events.is_empty()).then(|| {
+            self.alone_at.map_or(Duration::ZERO, |at| {
+                (at + every).saturating_duration_since(now)
+            })
+        })
+    }
+
+    /// Whether the events may leave in a report of their own now; if so, the window starts.
+    fn allow_alone(&mut self, now: Instant, every: Duration) -> bool {
+        let due = self.alone_in(now, every) == Some(Duration::ZERO);
+        if due {
+            self.alone_at = Some(now);
+        }
+        due
+    }
+
     /// Moves the ring's events into the report, if there are any.
     pub(crate) fn attach(&mut self, report: &mut Value) {
         if !self.events.is_empty() {
@@ -57,25 +87,74 @@ impl Ring {
     }
 }
 
-static RING: Mutex<Ring> = Mutex::new(Ring::new());
-fn ring() -> std::sync::MutexGuard<'static, Ring> {
-    RING.lock().unwrap_or_else(PoisonError::into_inner)
+/// The ring, and what wakes the report loop when an event enters it.
+pub(crate) struct Events {
+    ring: Mutex<Ring>,
+    arrived: Notify,
+    /// How often a report of events alone may go.
+    every: Duration,
+}
+impl Events {
+    pub(crate) const fn new(every: Duration) -> Self {
+        Self {
+            ring: Mutex::new(Ring::new()),
+            arrived: Notify::const_new(),
+            every,
+        }
+    }
+    fn ring(&self) -> MutexGuard<'_, Ring> {
+        self.ring.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keeps `line`, a line of the agent's log, for the next report, as far as the contract
+    /// allows.
+    pub(crate) fn record(&self, line: &Value) {
+        let at = facts::timestamp(crate::agent::now_ms());
+        if let Some(event) = sanitize(line, &at) {
+            self.ring().push(event);
+            self.arrived.notify_one();
+        }
+    }
+
+    /// Adds the waiting events to a report that is about to be posted. A report of events alone
+    /// (`alone`) takes them only when its window is open; otherwise it is left without events.
+    pub(crate) fn attach(&self, report: &mut Value, alone: bool) {
+        let mut ring = self.ring();
+        if alone && !ring.allow_alone(Instant::now(), self.every) {
+            return;
+        }
+        ring.attach(report);
+    }
+
+    /// Returns the events of a report whose post failed.
+    pub(crate) fn give_back(&self, report: &Value) {
+        self.ring().give_back(report);
+    }
+
+    /// Resolves when events wait that a report of their own may carry now.
+    pub(crate) async fn due(&self) {
+        loop {
+            // `notify_one` keeps its permit when nobody waits, so an event that enters between the
+            // read and the wait ends the wait at once.
+            let left = self.ring().alone_in(Instant::now(), self.every);
+            match left {
+                Some(Duration::ZERO) => return,
+                Some(left) => tokio::time::sleep(left).await,
+                None => self.arrived.notified().await,
+            }
+        }
+    }
+}
+
+static EVENTS: Events = Events::new(ALONE_EVERY);
+/// The agent's own ring, which `timing::emit_event` fills.
+pub(crate) fn global() -> &'static Events {
+    &EVENTS
 }
 
 /// Keeps `line`, a line of the agent's log, for the next report, as far as the contract allows.
 pub(crate) fn record(line: &Value) {
-    let at = facts::timestamp(crate::agent::now_ms());
-    if let Some(event) = sanitize(line, &at) {
-        ring().push(event);
-    }
-}
-/// Adds the waiting events to a report that is about to be posted.
-pub(crate) fn attach(report: &mut Value) {
-    ring().attach(report);
-}
-/// Returns the events of a report whose post failed.
-pub(crate) fn give_back(report: &Value) {
-    ring().give_back(report);
+    EVENTS.record(line);
 }
 
 /// The event of a log line, or `None` for a line without a valid name. Its fields are those of
@@ -144,6 +223,7 @@ fn address(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::node_link::contract_valid;
+    use std::sync::Arc;
 
     const AT: &str = "2026-10-18T10:11:12.345Z";
     const DATABASE: &str = "abcdefghijklmnopqrst";
@@ -213,6 +293,65 @@ mod tests {
         ring.attach(&mut full);
         assert_eq!(names(&full).len() as u64, max);
         assert_eq!(names(&full).first(), Some(&("d".into(), 10)));
+    }
+
+    #[test]
+    fn events_alone_go_once_per_window_and_the_next_ones_wait_for_it() {
+        let every = Duration::from_secs(1);
+        let start = Instant::now();
+        let mut ring = Ring::new();
+        // Nothing waits: nothing is due and nothing goes.
+        assert_eq!(ring.alone_in(start, every), None);
+        assert!(!ring.allow_alone(start, every));
+        ring.push(event("a", 1));
+        assert_eq!(ring.alone_in(start, every), Some(Duration::ZERO));
+        assert!(ring.allow_alone(start, every));
+        // Events after that wait out the window since the report that took the first.
+        ring.push(event("b", 2));
+        let early = start + Duration::from_millis(400);
+        assert_eq!(
+            ring.alone_in(early, every),
+            Some(Duration::from_millis(600))
+        );
+        assert!(!ring.allow_alone(early, every));
+        assert!(ring.allow_alone(start + every, every));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_event_wakes_the_loop_that_waits_for_events_and_a_window_holds_the_next_ones() {
+        let events = Arc::new(Events::new(Duration::from_secs(1)));
+        let line = |n: u64| json!({"event": "tick", "n": n});
+        // Nothing waits: the loop sleeps for good.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), events.due())
+                .await
+                .is_err()
+        );
+        // The first event wakes a loop that is asleep.
+        let waiting = tokio::spawn({
+            let events = events.clone();
+            async move { events.due().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        events.record(&line(1));
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the event wakes the loop")
+            .unwrap();
+        // The report that takes it opens the window: the next event wakes nothing before it ends.
+        let mut report = json!({});
+        events.attach(&mut report, true);
+        assert_eq!(names(&report).len(), 1);
+        events.record(&line(2));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(900), events.due())
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_millis(200), events.due())
+            .await
+            .expect("the window ended");
     }
 
     #[test]
