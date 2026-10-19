@@ -245,8 +245,8 @@ Configure either an `INFRASTRUCTURE_ALERT_WEBHOOK` service binding or an HTTPS
 `INFRASTRUCTURE_ALERT_WEBHOOK_URL`, plus your own `INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN` secret.
 The adopter's receiving service verifies the bearer token and durably deduplicates the pair
 `event_id` and `occurred_at` (equivalently the `Idempotency-Key` together with the exact request
-body) before acknowledging it. `event_id` names the error: a version 5 UUID derived from the
-region, the kind and the subjects the event lists, so the same error has the same `event_id`
+body) before acknowledging it. `event_id` names the error: a version 8 UUID (RFC 9562) derived from the
+region, the kind and the subjects the event lists (the nodes or databases, or the failing cron steps), so the same error has the same `event_id`
 every time, also after it cleared and came back, and another set of subjects is a new error with a
 new one. A retry repeats the pair and the body; a recurrence has the same `event_id` and a new
 `occurred_at` (the start of its episode), and the receiver treats it as a new occurrence of the

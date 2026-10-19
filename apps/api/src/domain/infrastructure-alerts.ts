@@ -22,7 +22,11 @@ import {
   minuteOf,
   NODE_OBSERVATION_MAX_AGE_MS,
 } from "./placement.ts";
-import { cronErrorCode, readCronHealth } from "./cron-health.ts";
+import {
+  CRON_STEP_FAILURE_RUNS,
+  cronErrorCode,
+  readCronHealth,
+} from "./cron-health.ts";
 import { purgeNodeDiagnostics } from "./node-diagnostics.ts";
 import type { Env } from "../env.ts";
 import { regionalRamWindowSql } from "./memory-capacity.ts";
@@ -54,13 +58,15 @@ interface AlertCondition {
 const retryMs = 60_000;
 
 /**
- * The identifier of an error, so that the same error always has the same one: a UUID of version 5
- * (RFC 4122 variant) made from the first 16 bytes of the SHA-256 of a fixed domain string, the
- * region, the kind and the sorted subjects (the nodes or databases the event lists), one per line.
- * The same region, kind and subjects give the same ID again after the error cleared and came back,
- * another set of subjects is another error with its own ID, and a kind without subjects is told
- * apart by region and kind alone. The ID names the error, not the episode: with `occurred_at`,
- * the start of the episode, it names one notification.
+ * The identifier of an error, so that the same error always has the same one: a UUID of version 8
+ * (RFC 9562; a name-based UUID from SHA-256 is no version 5, which is SHA-1) and the RFC 4122
+ * variant, made from the first 16 bytes of the SHA-256 of a fixed domain string, the region, the
+ * kind and the sorted subjects, one per line. The subjects are what tells two errors of one kind
+ * apart: the nodes or databases the event lists, or for `control_cron_step_failing` the failing
+ * steps. The same region, kind and subjects give the same ID again after the error cleared and
+ * came back, another set of subjects is another error with its own ID, and a kind without
+ * subjects is told apart by region and kind alone. The ID names the error, not the episode: with
+ * `occurred_at`, the start of the episode, it names one notification.
  */
 export async function alertEventId(
   regionId: string,
@@ -76,7 +82,7 @@ export async function alertEventId(
   const bytes = new Uint8Array(
     await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input)),
   ).subarray(0, 16);
-  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[6] = (bytes[6]! & 0x0f) | 0x80;
   bytes[8] = (bytes[8]! & 0x3f) | 0x80;
   const hex = bytesToHex(bytes);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
@@ -574,7 +580,13 @@ type EventDetail = Partial<
  * unknown measurement neither starts nor clears an episode).
  */
 type Observation =
-  | { state: "active"; detail: EventDetail; subjects?: string[] }
+  | {
+      state: "active";
+      detail: EventDetail;
+      subjects?: string[];
+      /** Besides `subjects`, what makes this error another of its kind in `alertEventId`; it never re-announces an active episode. */
+      identity?: string[];
+    }
   | { state: "resolved" }
   | { state: "retain" };
 
@@ -636,7 +648,10 @@ async function reconcileEpisode(
   }
   const event = InfraAlert.parse({
     version: 1,
-    event_id: await alertEventId(regionId, kind, observation.subjects),
+    event_id: await alertEventId(regionId, kind, [
+      ...(observation.subjects ?? []),
+      ...(observation.identity ?? []),
+    ]),
     kind,
     region_id: regionId,
     occurred_at: new Date(now).toISOString(),
@@ -1240,7 +1255,17 @@ export async function runCronWatchdog(
       health.status === "stalled"
         ? { state: "retain" }
         : health.status === "failing"
-          ? { state: "active", detail }
+          ? {
+              state: "active",
+              detail,
+              // The steps that make it an error, not one that failed only once.
+              identity: health.failing_steps
+                .filter(
+                  (value) =>
+                    value.consecutive_failures >= CRON_STEP_FAILURE_RUNS,
+                )
+                .map((value) => value.step),
+            }
           : { state: "resolved" },
     ],
   ];

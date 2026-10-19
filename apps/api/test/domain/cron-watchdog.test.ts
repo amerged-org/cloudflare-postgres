@@ -189,6 +189,43 @@ it("raises a failing step only after five consecutive failed runs and names it",
   expect(cleared.get("control_cron_stalled")).toMatchObject({ active: false });
 });
 
+it("names a failing step in the event id: another step is another error, the same step the same one again", async () => {
+  const f = await fixture(),
+    now = Date.now(),
+    hook = receiver();
+  const episode = async () =>
+    (await episodes(f.region)).get("control_cron_step_failing")!;
+  const fail = async (failing: Record<string, number>, at: number) => {
+    await heartbeat(now, 30_000, failing);
+    await runCronWatchdog(hook.env, now + at, hook.fetcher);
+  };
+  // A step that failed only once is no part of the error: five failures in a row make it one.
+  await fail({ usage: 5, retained_archives: 1 }, 0);
+  const first = await episode();
+  await fail({}, 1000);
+  await fail({ health_alerts: 5 }, 2000);
+  const other = await episode();
+  await fail({}, 3000);
+  await fail({ usage: 5 }, 4000);
+  const again = await episode();
+  expect(other.event_id).not.toBe(first.event_id);
+  expect(again.event_id).toBe(first.event_id);
+  expect(again.occurred_at).not.toBe(first.occurred_at);
+  // Each episode was sent once under its own key, and the third repeats the first one's event_id.
+  const sent = hook.events
+    .filter(
+      (value) =>
+        value.event.region_id === f.region &&
+        value.event.kind === "control_cron_step_failing",
+    )
+    .map((value) => value.key);
+  expect(sent).toEqual([
+    `${first.event_id}:${first.occurred_at}`,
+    `${other.event_id}:${other.occurred_at}`,
+    `${again.event_id}:${again.occurred_at}`,
+  ]);
+});
+
 it("judges nothing before the cron has recorded a run", async () => {
   const f = await fixture(),
     hook = receiver();

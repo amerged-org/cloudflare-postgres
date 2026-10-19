@@ -124,7 +124,7 @@ describe("the volumes of a node", () => {
     expect(await stored(f.node)).toHaveLength(450);
   });
 
-  it("become a storage sample in every minute for a database that can grow and in each quarter hour for a hibernated one", async () => {
+  it("become a storage sample in every minute for a database that can grow and in the first report of each quarter hour for a hibernated one", async () => {
     const f = await fixture();
     const growing = await database(f, "growing"),
       asleep = await database(f, "asleep");
@@ -134,7 +134,7 @@ describe("the volumes of a node", () => {
       .bind(asleep)
       .run();
     const start = quarterHour();
-    // Minute 7 is no quarter-hour mark; minute 15 is the next one. The orphan has no database to bill.
+    // Minute 7 is the first report of its quarter hour, minute 15 the first of the next. The orphan has no database to bill.
     await volumes(
       f,
       [volume(growing), volume(asleep), volume(newDatabaseId())],
@@ -178,6 +178,7 @@ describe("the volumes of a node", () => {
         [growing, minute + 7],
         [growing, minute + 8],
         [growing, minute + 15],
+        [asleep, minute + 7],
         [asleep, minute + 15],
       ].sort(
         (a, b) =>
@@ -203,6 +204,49 @@ describe("the volumes of a node", () => {
     expect(payload(asleep, minute + 15).storage_used_bytes).toBe(
       300 * 1024 ** 2,
     );
+  });
+
+  it("take a hibernated database's one sample of a quarter hour from its first report, whichever minute that is", async () => {
+    const f = await fixture();
+    const growing = await database(f, "growing"),
+      asleep = await database(f, "asleep");
+    await env.DB.prepare(
+      "UPDATE databases SET observed_power='hibernated' WHERE id=?",
+    )
+      .bind(asleep)
+      .run();
+    const start = quarterHour();
+    // The clock is past the last report: a sample may not be dated after the control plane's now.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start + 20 * MINUTE);
+    // The reports of minutes 0 and 15 (the quarter-hour marks) are late, lost or never made: the
+    // quarter hour is not left without a sample, and a later report of it adds none.
+    for (const minute of [1, 2, 16, 17, 18])
+      expect(
+        (
+          await volumes(
+            f,
+            [volume(growing), volume(asleep)],
+            reportedAt(start, minute),
+          )
+        ).status,
+      ).toBe(200);
+    const rows = await env.DB.prepare(
+      "SELECT database_id,sequence FROM usage_samples WHERE source='agent' AND database_id=? ORDER BY sequence",
+    )
+      .bind(asleep)
+      .all<{ database_id: string; sequence: number }>();
+    const minute = Math.floor(start / MINUTE);
+    expect(rows.results.map((row) => row.sequence)).toEqual([
+      minute + 1,
+      minute + 16,
+    ]);
+    const awake = await env.DB.prepare(
+      "SELECT count(*) n FROM usage_samples WHERE source='agent' AND database_id=?",
+    )
+      .bind(growing)
+      .first<number>("n");
+    expect(awake).toBe(5);
   });
 
   it("let the database's health and its usage rollup see a volume that filled between two quarter hours", async () => {

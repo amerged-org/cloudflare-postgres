@@ -156,11 +156,16 @@ The existing authenticated infrastructure webhook remains supported and takes
 precedence when configured. Without a webhook or both email addresses plus the
 Resend secret, alarms remain visible through the API and no notification is sent.
 Delivery uses a five-second deadline and a minimum one-minute retry interval. The event UUID
-(`event_id`) names the error, not the delivery: it is a version 5 UUID made from the SHA-256 of a
-fixed domain string, the region, the kind and the sorted IDs of the subjects the event lists
-(nodes or databases; a kind without subjects has the ID of region and kind alone). The same
-error therefore has the same `event_id` every time, also after it cleared and came back, and
-another set of subjects is another error with another ID. A continuously active episode keeps
+(`event_id`) names the error, not the delivery: it is a version 8 UUID (RFC 9562; a name-based
+UUID from SHA-256 is no version 5, which is SHA-1) made from the first 16 bytes of the SHA-256 of
+the lines `pgcf.infrastructure-alert.v1`, the region, the kind and the sorted subjects, with the
+version and variant bits set. The subjects are the IDs of the nodes or databases the event lists
+or, for `control_cron_step_failing`, the names of the steps in `cron.failing_steps` with at least
+five consecutive failures (a step that failed once is not part of the error); every other kind
+has the ID of region and kind alone. The same error therefore has the same `event_id` every
+time, also after it cleared and came back, and another set of subjects, another failing step
+or another region is another error with another ID. The cron kinds are raised in every region,
+so one cron stall is announced once per region, each with its own ID. A continuously active episode keeps
 its UUID and payload, and a retry sends both unchanged. Recovering clears the episode; the
 same failure later reopens the same row with the same UUID, a new `occurred_at` (the start of
 the new episode) and a fresh delivery.
@@ -237,7 +242,7 @@ Rules of the database and Thin storage kinds:
   a crossing is seen at the next report and the next minute run raises it. A volume that crosses
   both 80 % and 90 % between two reports raises only the critical alert; the warning is for
   growth slower than the report interval. The stored samples, one per minute for a database
-  that can grow and one per quarter hour for a hibernated one, feed `health.disk`, `storage` and
+  that can grow and one in each quarter hour (from its first report of it) for a hibernated one, feed `health.disk`, `storage` and
   the usage rollup, not these alerts.
 - **Subjects.** An episode lists at most 64 databases (longest-standing first) or nodes,
   16 for Thin storage (by ID). A subject that fails and is not listed yet replaces the

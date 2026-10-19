@@ -93,7 +93,7 @@ export const InfraAlert = z.strictObject({
   event_id: z
     .uuid()
     .describe(
-      "Identifier of the error, not of the delivery: a version 5 UUID derived from region_id, kind and the sorted subjects (node_ids, database_ids or the nodes of thin_storage) the event lists. The same error has the same event_id every time it occurs, also after it cleared and came back; another set of subjects is another error with another event_id. A retry repeats event_id, occurred_at and the body; a recurrence has the same event_id and a new occurred_at.",
+      "Identifier of the error, not of the delivery: a version 8 UUID (RFC 9562) made from the SHA-256 of region_id, kind and the sorted subjects: node_ids, database_ids, the nodes of thin_storage or, for control_cron_step_failing, the steps of cron.failing_steps with at least 5 consecutive failures. The same error has the same event_id every time it occurs, also after it cleared and came back; another set of subjects is another error with another event_id. A retry repeats event_id, occurred_at and the body; a recurrence has the same event_id and a new occurred_at.",
     ),
   kind: InfraAlertKind,
   region_id: RegionId,
