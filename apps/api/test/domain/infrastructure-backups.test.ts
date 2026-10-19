@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import type { Env } from "../../src/env.ts";
 import {
   captureInfrastructureArtifact,
@@ -1015,4 +1015,55 @@ it("reads an earlier run that also captured an etcd snapshot as its D1 export al
   expect(
     await (await request("/v1/infrastructure-backups", f.admin)).json(),
   ).toMatchObject({ latest: { id: run, artifacts: [{ kind: "d1" }] } });
+});
+it("logs an unexpected failure of a run by its class and a detail that cannot hold a URL, a key or a path", async () => {
+  // Live, a daily run failed for days with only "execution failed" in its record: the Workflow
+  // swallowed the error that said which step it was.
+  const f = await fixture(),
+    at = Date.now();
+  await configureInfrastructureBackups(
+    enabled(),
+    config(f.region),
+    at - 3600000,
+  );
+  const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    for (const [attempt, error] of [
+      new Error("The specified bucket does not exist"),
+      new TypeError(
+        "fetch failed: https://host.example/path?X-Amz-Signature=sekret",
+      ),
+    ].entries()) {
+      const id = crypto.randomUUID();
+      await env.DB.prepare(
+        "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) VALUES(?,?,?,1,'running',?,?)",
+      )
+        .bind(
+          id,
+          new Date(at).toISOString().slice(0, 10),
+          attempt + 1,
+          new Date(at - 1000).toISOString(),
+          new Date(at + 3600000).toISOString(),
+        )
+        .run();
+      await finishInfrastructureBackup(env, id, error);
+    }
+    const lines = logs.mock.calls.map((call) => JSON.parse(String(call[0])));
+    expect(lines).toEqual([
+      expect.objectContaining({
+        event: "infrastructure_backup_failed",
+        code: "infrastructure_backup_execution_failed",
+        error_name: "Error",
+        detail: "The specified bucket does not exist",
+      }),
+      expect.objectContaining({
+        event: "infrastructure_backup_failed",
+        error_name: "TypeError",
+      }),
+    ]);
+    expect(lines[1]).not.toHaveProperty("detail");
+    expect(JSON.stringify(lines)).not.toContain("sekret");
+  } finally {
+    logs.mockRestore();
+  }
 });

@@ -638,6 +638,23 @@ export async function finishInfrastructureBackup(
       ? error.message
       : "infrastructure_backup_execution_failed";
   const at = new Date().toISOString();
+  if (error) {
+    // The record keeps only the code. Which step failed is the error's class and, when its text
+    // cannot carry a signed URL, a key or a path, the text: letters, digits and plain punctuation.
+    const name = error instanceof Error ? error.name : typeof error,
+      text = error instanceof Error ? error.message : "";
+    console.error(
+      JSON.stringify({
+        event: "infrastructure_backup_failed",
+        run_id: id,
+        code,
+        error_name: /^[A-Za-z0-9_]{1,64}$/.test(name) ? name : "other",
+        ...(/^[A-Za-z0-9 _.,:;'()-]{1,160}$/.test(text)
+          ? { detail: text }
+          : {}),
+      }),
+    );
+  }
   if (error)
     await env.DB.prepare(
       "UPDATE infrastructure_backup_artifacts SET status='failed',error_code=? WHERE run_id=? AND status!='complete'",
