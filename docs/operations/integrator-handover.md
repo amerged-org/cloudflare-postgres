@@ -237,7 +237,8 @@ password and an internal maintenance role (`pgcf_maintenance`, reserved) are wri
 placement step picks the node that is the fullest of those that stay under 80 % active RAM and 80 %
 CPU load, each as the highest 30-minute average of the last seven days, and whose thin pool is
 open (data below 80 %, metadata below 50 %, sold storage within four times its data). A database
-placed in the last 30 minutes counts at its full memory until its own average exists. The first base backup is
+placed after the node's newest sample counts at its full memory until that sample exists, and the
+newest sample's active RAM counts when it is above the average. The first base backup is
 requested at once and WAL archiving starts with the first start. The idle time
 (`effective_sleep_after_seconds`) counts from readiness.
 

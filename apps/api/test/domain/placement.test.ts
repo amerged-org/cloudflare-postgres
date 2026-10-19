@@ -56,6 +56,7 @@ function node(overrides: Partial<PlacementNode> = {}): PlacementNode {
     pool_nominal_bytes: OPEN_POOL.nominal,
     ram_peak_ppm: 0,
     cpu_peak_ppm: 0,
+    ram_now_ppm: 0,
     pending_memory_mib: 0,
     pending_storage_gib: 0,
     ...overrides,
@@ -109,7 +110,7 @@ describe("which node takes a new database", () => {
     expect(pick(nodes)).toBeNull();
   });
 
-  it("counts a database without a 30-minute average at its full memory", () => {
+  it("counts a database no sample includes yet at its full memory", () => {
     // 2,048 MiB pending are 20 % of the node: 55 % + 20 % + 2.5 % stays under 80 %, 57.5 % + 20 % + 2.5 % is 80 %.
     expect(
       pick([node({ ram_peak_ppm: 550_000, pending_memory_mib: 2048 })]),
@@ -125,6 +126,23 @@ describe("which node takes a new database", () => {
         node({ id: id("b"), ram_peak_ppm: 0, pending_memory_mib: 8000 }),
       ]),
     ).toBe(id("a"));
+  });
+
+  it("lets the newest sample stand in for an average that has not caught up with a burst of starts", () => {
+    // The average is 10 %, the newest sample shows 75 % of the node in use: a 256 MiB database (2.5 %) reaches 77.5 %, 1,024 MiB (10 %) would not fit.
+    expect(
+      pick([node({ ram_peak_ppm: 100_000, ram_now_ppm: 750_000 })]),
+    ).not.toBeNull();
+    expect(
+      pick([node({ ram_peak_ppm: 100_000, ram_now_ppm: 750_000 })], {
+        ...SMALL,
+        memory_mib: 1024,
+      }),
+    ).toBeNull();
+    // A sample below the average changes nothing.
+    expect(
+      pick([node({ ram_peak_ppm: 790_000, ram_now_ppm: 100_000 })]),
+    ).toBeNull();
   });
 
   it("ranks by peak plus pending, so a node that just took several databases counts as fuller", () => {
@@ -379,9 +397,12 @@ describe("the load of a node, read from its samples", () => {
     expect(ids).not.toContain(foreign);
   });
 
-  it("counts the databases placed in the last 30 minutes at their full memory, the class's or their own", async () => {
+  it("counts the databases placed after the node's newest sample at their full memory, the class's or their own", async () => {
     const { f, a } = await regionWith();
     await seedSamples(a, steady(NOW, 5, { ramPpm: 100_000 }));
+    const sampleAt = (await load(f.region, a)).sampled_at;
+    expect(sampleAt).not.toBeNull();
+    const after = Date.parse(sampleAt!) + 1_000;
     const place = (
       name: string,
       placedAt: number | null,
@@ -406,12 +427,21 @@ describe("the load of a node, read from its samples", () => {
       );
     await env.DB.batch([
       // The class of the fixture has 512 MiB.
-      place("recent-class", NOW - 10 * 60_000, null),
-      place("recent-own", NOW - 29 * 60_000, 1024),
-      place("old", NOW - 31 * 60_000, 2048),
+      place("after-class", after, null),
+      place("after-own", after + 5_000, 1024),
+      // The newest sample has these: their memory is in it, and in the average from then on.
+      place("before-sample", after - 600_000, 2048),
       place("never-placed-here", null, 4096),
     ]);
     expect((await load(f.region, a)).pending_memory_mib).toBe(512 + 1024);
+  });
+
+  it("reads the active RAM of the newest sample", async () => {
+    const { f, a } = await regionWith();
+    await seedSamples(a, steady(NOW, 5, { ramPpm: 250_000 }));
+    const got = await load(f.region, a);
+    expect(got.ram_now_ppm).toBeGreaterThan(240_000);
+    expect(got.ram_now_ppm).toBeLessThan(260_000);
   });
 
   it("does not count a database that is deleted", async () => {
