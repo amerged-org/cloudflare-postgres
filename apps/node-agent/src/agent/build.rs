@@ -18,7 +18,7 @@ use crate::{
     },
     credentials::Access,
     machine::{Account, Machine},
-    postgres, roles,
+    pg_control, postgres, roles,
     settings::{self, Settings},
     sleep,
     state::{self, DatabaseState},
@@ -75,6 +75,25 @@ pub(crate) fn backup_due(
     .and_then(|at| i64::try_from(at.unix_timestamp_nanos().div_euclid(1_000_000)).ok());
     timeline.is_some_and(|timeline| timeline != backup.timeline)
         || completed.is_none_or(|completed| now_ms - completed >= BACKUP_MAX_AGE_MS)
+}
+
+/// The system identifier of the cluster on a database's volume, as its `pg_control` shows it:
+/// `None` without a readable one.
+fn local_system_identifier(volume: &Path) -> Option<String> {
+    let bytes = crate::proof::read_control(volume).ok()?;
+    Some(pg_control::parse_control(&bytes).ok()?.system_identifier)
+}
+
+/// Whether a create may use an archive path that holds `backups`: it holds none, or every one is
+/// of the cluster on the volume (`local`). A backup without an identifier, or a volume without a
+/// cluster, leaves the archive refused.
+fn archive_is_free_or_own(backups: &[facts::Backup], local: Option<&str>) -> bool {
+    backups.is_empty()
+        || local.is_some_and(|local| {
+            backups
+                .iter()
+                .all(|backup| backup.system_identifier == local)
+        })
 }
 
 /// What the entry sets a database's unit and volume to.
@@ -418,8 +437,10 @@ impl<M: Machine> Core<M> {
         self.begin_state(db, entry)?;
         let (account, volume) = self.provision(entry).await?;
         let job_database = self.job_database(id, &account.name);
-        // The archive path is the database's own and must be empty: a generation never writes
-        // into an archive that holds something (barman overwrites without asking).
+        // The archive path is the database's own and must hold nothing but backups of the cluster
+        // on this volume: a generation never writes into an archive that holds something else
+        // (barman overwrites without asking). The first base backup is the last step before the
+        // state says built, so a build that stopped there finds its own backup and goes on.
         let credential = self
             .credentials
             .get(&store.scope, unix_seconds())
@@ -432,10 +453,9 @@ impl<M: Machine> Core<M> {
         if !listing.succeeded() {
             return Err("archive_unusable");
         }
-        if !facts::parse_backup_list(&listing.stdout)
-            .map_err(|_| "archive_unusable")?
-            .is_empty()
-        {
+        let backups = facts::parse_backup_list(&listing.stdout).map_err(|_| "archive_unusable")?;
+        let local = local_system_identifier(&self.layout().volume(id));
+        if !archive_is_free_or_own(&backups, local.as_deref()) {
             return Err("prefix_not_empty");
         }
         // The cluster. A data directory a crash left half made is made again: no client has been
@@ -782,6 +802,31 @@ mod tests {
         assert!(backup_due(Some(&backup("yesterday")), Some(2), now));
     }
 
+    #[test]
+    fn a_create_uses_an_archive_that_is_empty_or_holds_only_backups_of_the_cluster_on_its_volume() {
+        let backup = |system_identifier: &str| facts::Backup {
+            backup_id: "20261018T080000".into(),
+            status: "DONE".into(),
+            timeline: 1,
+            system_identifier: system_identifier.into(),
+            end_wal: None,
+            completed_at_ms: None,
+            segment_bytes: None,
+        };
+        assert!(archive_is_free_or_own(&[], None));
+        assert!(archive_is_free_or_own(&[], Some("7697773764701949975")));
+        let own = [backup("7697773764701949975"), backup("7697773764701949975")];
+        assert!(archive_is_free_or_own(&own, Some("7697773764701949975")));
+        // Another cluster's backup, one without an identifier, or no cluster on the volume.
+        let mixed = [backup("7697773764701949975"), backup("7697781764826800331")];
+        assert!(!archive_is_free_or_own(&mixed, Some("7697773764701949975")));
+        assert!(!archive_is_free_or_own(
+            &[backup("")],
+            Some("7697773764701949975")
+        ));
+        assert!(!archive_is_free_or_own(&own, None));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_database_is_created_and_ready_only_with_its_first_base_backup() {
         let Some(rig) = Rig::new("create").await else {
@@ -886,6 +931,89 @@ mod tests {
             &json!({"events": events})
         ));
         let _ = pg_control::CONTROL_FILE;
+    }
+
+    /// The node went down after the base backup was DONE and before the state file said built: the
+    /// agent comes back with the unbuilt state of the generation, the cluster on the volume and the
+    /// backup in the archive.
+    async fn after_a_crash_before_built(rig: Rig, entry: &Entry) -> (Rig, Arc<Db>) {
+        rig.core
+            .files(&entry.id)
+            .save(&DatabaseState::new(entry.storage_generation))
+            .unwrap();
+        let rig = rig.restart().await;
+        rig.deliver(&entry.archive_path, "read_write");
+        let db = rig.core.db(&entry.id);
+        assert!(rig.core.accept(&db, entry.clone()));
+        (rig, db)
+    }
+
+    fn backup_files(rig: &Rig, entry: &Entry, backup_id: &str) -> std::path::PathBuf {
+        rig.fixture.store_directory().join(format!(
+            "objects/{}/database/base/{backup_id}/backup.json",
+            entry.archive_path.strip_prefix("s3://").unwrap()
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_that_stopped_after_its_base_backup_resumes_over_the_backup_of_its_own_cluster()
+     {
+        let Some(rig) = Rig::new("create-resume").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let first = db.state().unwrap().backup.unwrap();
+        let (rig, db) = after_a_crash_before_built(rig, &entry).await;
+        assert!(!db.state().is_some_and(|state| state.built));
+        let _flow = db.lock.lock().await;
+        rig.core.build(&db, &entry).await.unwrap();
+
+        // The normal end state: built, a backup recorded, ready.
+        let state = db.state().unwrap();
+        assert!(state.built && state.record.is_none());
+        let backup = state.backup.clone().unwrap();
+        assert_eq!(backup.timeline, 1);
+        assert_eq!(rig.observation(&entry.id)["state"], "ready");
+        assert_eq!(
+            rig.observation(&entry.id)["backup"]["backup_id"],
+            backup.backup_id.as_str()
+        );
+        assert_eq!(rig.core.files(&entry.id).load().unwrap(), Some(state));
+        // The one more base backup is next to the first, which nothing deleted or overwrote.
+        assert_ne!(backup.backup_id, first.backup_id);
+        assert!(backup_files(&rig, &entry, &backup.backup_id).exists());
+        assert!(backup_files(&rig, &entry, &first.backup_id).exists());
+        assert!(rig.machine.running(&entry.id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_still_refuses_an_archive_with_a_backup_of_another_cluster_next_to_its_own() {
+        let Some(rig) = Rig::new("create-resume-foreign").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let first = db.state().unwrap().backup.unwrap();
+        let foreign = r#"{"backup_id":"20261017T225342","status":"DONE","timeline":1,"systemid":"7697773764701949975","end_wal":"000000010000000000000003","end_time_iso":"2026-10-17T22:53:45+00:00","xlog_segment_size":16777216}"#;
+        rig.fixture
+            .put_backup(&entry.archive_path, "20261017T225342", foreign, None);
+        let (rig, db) = after_a_crash_before_built(rig, &entry).await;
+        let _flow = db.lock.lock().await;
+        assert_eq!(rig.core.build(&db, &entry).await, Err("prefix_not_empty"));
+        assert_eq!(rig.observation(&entry.id)["error"], "prefix_not_empty");
+        // Nothing of the cluster or the archive was touched.
+        assert!(
+            rig.core
+                .layout()
+                .data(&entry.id)
+                .join("PG_VERSION")
+                .exists()
+        );
+        assert!(backup_files(&rig, &entry, &first.backup_id).exists());
+        assert_eq!(
+            std::fs::read_to_string(backup_files(&rig, &entry, "20261017T225342")).unwrap(),
+            foreign
+        );
+        assert!(!db.state().is_some_and(|state| state.built));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
