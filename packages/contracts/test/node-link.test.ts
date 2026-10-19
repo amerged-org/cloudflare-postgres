@@ -35,6 +35,7 @@ import {
   signNodeRequest,
   verifyNodeRequest,
 } from "../src/node-link.ts";
+import { WAKE_STALE } from "../src/node-local.ts";
 
 async function keyPair() {
   return (await crypto.subtle.generateKey("Ed25519", true, [
@@ -918,6 +919,14 @@ describe("what a node reports", () => {
             outcome: "refused",
             reason: "no_room",
           },
+          ...WAKE_STALE.map((stale, index) => ({
+            ...wake,
+            id: eventId(String(index)),
+            outcome: "refused",
+            reason: "desired_stale",
+            stale,
+            phases_ms: { admission: 1 },
+          })),
           {
             ...admission,
             id: eventId("d"),
@@ -954,6 +963,10 @@ describe("what a node reports", () => {
       { ...admission, decision: "admitted", reason: undefined },
       { ...wake, outcome: "refused" },
       { ...wake, reason: "no_room" },
+      // Only a stale ticket says how it is stale.
+      { ...wake, stale: "route" },
+      { ...wake, outcome: "refused", reason: "no_room", stale: "route" },
+      { ...wake, outcome: "refused", reason: "desired_stale", stale: "clock" },
       { ...wake, outcome: "hit" },
       { ...wake, phases_ms: { boot: 1 } },
     ])

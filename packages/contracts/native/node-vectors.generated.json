@@ -9115,6 +9115,18 @@
             "reason": "no_room"
           },
           {
+            "type": "wake",
+            "id": "11111111-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "outcome": "refused",
+            "phases_ms": { "admission": 1 },
+            "reason": "desired_stale",
+            "stale": "route"
+          },
+          {
             "type": "admission",
             "id": "ffffffff-1111-4111-8111-111111111111",
             "at": "2026-10-17T12:00:00.000Z",
@@ -9286,6 +9298,107 @@
             "operation": "op_cccccccccccccccccccc",
             "outcome": "started",
             "phases_ms": { "boot": 1 }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeEventReport",
+      "name": "unknown-stale",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "events": [
+          {
+            "type": "wake",
+            "id": "bbbbbbbb-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "outcome": "refused",
+            "phases_ms": {
+              "admission": 9,
+              "volume_check": 1,
+              "repair_check": 1,
+              "mount": 1,
+              "pg_control": 2,
+              "config": 1,
+              "archive": 1,
+              "queue_wait": 1,
+              "start": 61,
+              "roles": 2,
+              "release": 3
+            },
+            "reason": "desired_stale",
+            "stale": "clock"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeEventReport",
+      "name": "stale-of-a-started-wake",
+      "valid": false,
+      "refinement": true,
+      "value": {
+        "events": [
+          {
+            "type": "wake",
+            "id": "bbbbbbbb-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "outcome": "started",
+            "phases_ms": {
+              "admission": 9,
+              "volume_check": 1,
+              "repair_check": 1,
+              "mount": 1,
+              "pg_control": 2,
+              "config": 1,
+              "archive": 1,
+              "queue_wait": 1,
+              "start": 61,
+              "roles": 2,
+              "release": 3
+            },
+            "stale": "route"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeEventReport",
+      "name": "stale-with-another-reason",
+      "valid": false,
+      "refinement": true,
+      "value": {
+        "events": [
+          {
+            "type": "wake",
+            "id": "bbbbbbbb-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "outcome": "refused",
+            "phases_ms": {
+              "admission": 9,
+              "volume_check": 1,
+              "repair_check": 1,
+              "mount": 1,
+              "pg_control": 2,
+              "config": 1,
+              "archive": 1,
+              "queue_wait": 1,
+              "start": 61,
+              "roles": 2,
+              "release": 3
+            },
+            "reason": "no_room",
+            "stale": "route"
           }
         ]
       }
