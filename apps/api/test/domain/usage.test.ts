@@ -259,11 +259,13 @@ describe("hourly usage", () => {
   });
   it("reports pre-snapshot resources and absent measurement components as gaps", async () => {
     const f = await setup();
-    await env.DB.prepare(
-      "INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at) VALUES(?,'created',?,?,1,?)",
-    )
-      .bind(f.id, f.node, f.size, iso(epoch))
-      .run();
+    // Created and ready with no resource snapshot: awake, so the gateway should have reported.
+    for (const kind of ["created", "ready"])
+      await env.DB.prepare(
+        "INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at) VALUES(?,?,?,?,1,?)",
+      )
+        .bind(f.id, kind, f.node, f.size, iso(epoch))
+        .run();
     const row = await rollupUsageHour(
       env.DB,
       f.id,
@@ -693,6 +695,12 @@ describe("hourly usage", () => {
             occurred_at: iso(epoch),
             resource_snapshot: JSON.stringify(resources),
           },
+          {
+            id: 2,
+            kind: "ready",
+            occurred_at: iso(epoch),
+            resource_snapshot: JSON.stringify(resources),
+          },
         ],
         [],
         epoch + 27 * USAGE_HOUR_MS,
@@ -838,4 +846,127 @@ it("keeps known compute usage while thin physical allocation remains unknown", (
   expect(usage.metrics.reserved_storage_byte_seconds).toBeNull();
   expect(usage.gaps).toContain("reserved_storage_byte_seconds");
   expect(usage.gaps).not.toContain("resource_snapshot");
+});
+
+// A sleeping database emits no usage row (the node agent says nothing for an interval in which
+// nothing was awake and nothing was counted), so the rollup must ask the gateway for coverage of
+// the awake time only; asleep time with no row is a measured zero, not a gap.
+describe("traffic coverage of a database that sleeps", () => {
+  const MINUTE = 60_000,
+    id = newDatabaseId(),
+    database = { id, project_id: "prj_" + id, created_at: iso(epoch) },
+    snapshot = JSON.stringify(resources),
+    event = (kind: string, number: number, offset: number) => ({
+      id: number,
+      kind,
+      occurred_at: iso(epoch + offset),
+      resource_snapshot: snapshot,
+    }),
+    // The database is created and ready at the start, and sleeps from the tenth minute on.
+    sleeping = [
+      event("created", 1, 0),
+      event("ready", 2, 0),
+      event("hibernated", 3, 10 * MINUTE),
+    ],
+    row = (from: number, to: number, ingress = 0) => ({
+      payload: JSON.stringify({
+        source: "gateway",
+        database_id: id,
+        producer_id: "node_a",
+        sequence: epoch + from,
+        observed_at: iso(epoch + to),
+        interval_start: iso(epoch + from),
+        interval_end: iso(epoch + to),
+        expected_producers: ["node_a"],
+        ingress_bytes: ingress,
+        egress_bytes: ingress * 2,
+        connections: ingress > 0 ? 1 : 0,
+        connection_seconds: ingress > 0 ? 3 : 0,
+      }),
+    }),
+    traffic = [
+      "ingress_bytes",
+      "egress_bytes",
+      "connections",
+      "connection_seconds",
+    ],
+    now = epoch + 4 * USAGE_HOUR_MS;
+
+  it("measures zero traffic for an hour spent asleep with no rows at all", () => {
+    const usage = computeUsageHour(
+      database,
+      epoch + USAGE_HOUR_MS,
+      sleeping,
+      [],
+      now,
+    );
+    expect(usage.metrics).toMatchObject({
+      provisioned_seconds: 3600,
+      awake_seconds: 0,
+      ingress_bytes: 0,
+      egress_bytes: 0,
+      connections: 0,
+      connection_seconds: 0,
+    });
+    expect(usage.gaps).not.toContain("traffic_coverage");
+    for (const metric of traffic) expect(usage.gaps).not.toContain(metric);
+  });
+
+  it("books the rows of the awake minutes of an hour that ends asleep, with no gap for the rest", () => {
+    const usage = computeUsageHour(
+      database,
+      epoch,
+      sleeping,
+      [row(0, 5 * MINUTE, 40), row(5 * MINUTE, 10 * MINUTE, 2)],
+      now,
+    );
+    expect(usage.metrics).toMatchObject({
+      awake_seconds: 600,
+      provisioned_seconds: 3600,
+      ingress_bytes: 42,
+      egress_bytes: 84,
+      connections: 2,
+      connection_seconds: 6,
+    });
+    expect(usage.gaps).not.toContain("traffic_coverage");
+  });
+
+  it("counts traffic against a sleeping database, such as a refused wake", () => {
+    const usage = computeUsageHour(
+      database,
+      epoch + USAGE_HOUR_MS,
+      sleeping,
+      [row(USAGE_HOUR_MS + 30 * MINUTE, USAGE_HOUR_MS + 31 * MINUTE, 7)],
+      now,
+    );
+    expect(usage.metrics.ingress_bytes).toBe(7);
+    expect(usage.metrics.egress_bytes).toBe(14);
+    expect(usage.gaps).not.toContain("traffic_coverage");
+  });
+
+  it("still reports unknown traffic when awake time has no row", () => {
+    const usage = computeUsageHour(
+      database,
+      epoch,
+      sleeping,
+      [row(0, 5 * MINUTE, 40)],
+      now,
+    );
+    expect(usage.metrics.awake_seconds).toBe(600);
+    for (const metric of traffic) {
+      expect(usage.metrics[metric as keyof typeof usage.metrics]).toBeNull();
+      expect(usage.gaps).toContain(metric);
+    }
+    expect(usage.gaps).toContain("traffic_coverage");
+    // A database that was awake and never reported anything is no different.
+    const silent = computeUsageHour(
+      database,
+      epoch,
+      sleeping.slice(0, 2),
+      [],
+      now,
+    );
+    expect(silent.metrics.ingress_bytes).toBeNull();
+    expect(silent.gaps).toContain("traffic_coverage");
+  });
 });

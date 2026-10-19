@@ -922,10 +922,13 @@ millisecond resolution.
 
 **What stays unknown.** An interval is `null`, with `traffic_coverage` in `gaps`, when the gateway
 process restarted or was replaced, a counter went backwards, a report was incomplete, no reading
-arrived, or two readings are more than one UTC hour boundary apart (an agent outage of about an
-hour or more). A reading that shows
-nothing counted is a measured zero, not a gap. A day row is `null` when any of its hours is. Hours
-finalized before this attribution was deployed keep `null` traffic and are never recomputed.
+arrived, or two readings are more than one UTC hour boundary apart (an agent outage of about an hour or
+more). A reading that shows nothing counted is a measured zero, not a gap. Only awake time has to be
+covered by readings: a sleeping database emits none, so an hour or part of an hour asleep without a
+reading counts as zero traffic (and traffic counted against a sleeping database, such as a refused wake,
+is added), while awake time without a reading is the gap above. A day row is `null` when any of its
+hours is. Hours finalized before this attribution, or before the rule on sleeping time, was deployed
+keep `null` traffic and are never recomputed.
 
 **Infrastructure cost** (`GET /v1/costs`, **admin only**, hourly, at most 31 days, one node or one
 region) is per node and built from monthly amounts the owner recorded as immutable facts
