@@ -8,7 +8,7 @@ import {
   NodeMarkLost,
 } from "@pgcf/contracts/nodes";
 import { z } from "zod";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import {
   withAdmissionMutation,
   type AdmissionMutation,

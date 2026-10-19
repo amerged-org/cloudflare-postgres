@@ -11,7 +11,7 @@ import {
   newSecret,
   timingSafeEqual,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext, Env } from "../env.ts";
 
 const PROGRESS_TOKEN_PREFIX = "pgcf_pt_";

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DatabaseId, NodeId, ProjectId, RegionId } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
 import type { AdmissionMutationIntent } from "./admission-state.ts";
 import { databaseActor, readDatabasePresence } from "./database-actor-sync.ts";

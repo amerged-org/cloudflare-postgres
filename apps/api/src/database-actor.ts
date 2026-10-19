@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // This module is what a cold DatabaseActor evaluates before it answers an admission, so it imports
 // only the contract modules and the snapshot schema it needs. What writes D1 and tells the region
-// loads on first use (`d1`), after the answer: see database-actor-d1.ts.
+// loads on first use (`d1`), so the awake path never evaluates it. A wake ticket's claim starts in
+// the moment the answer is returned, and the answer leaves only after that microtask has evaluated
+// the module: database-actor-d1.ts therefore stays small.
 import { DurableObject } from "cloudflare:workers";
 import {
   ADMISSION_DEADLINE_MS,
@@ -25,7 +27,7 @@ import {
   DatabaseAdmissionSnapshot,
 } from "./domain/admission-state.ts";
 import type { LocalAdmissionActor } from "./domain/admission-mutations.ts";
-/** The D1 side of the actor: the claim, the snapshot read and the hint. It pulls in the API's domain graph. */
+/** The D1 side of the actor: the claim, the snapshot read and the hint. */
 const d1 = () => import("./database-actor-d1.ts");
 const PersistedAdmissionMutationIntent = AdmissionMutationIntent.extend({
   started_at: z.number().int().nonnegative().default(0),

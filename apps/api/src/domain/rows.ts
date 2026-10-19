@@ -7,7 +7,7 @@ import {
   type DesiredState,
   type ObservedState,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import { assertProjectAccess, getAuth } from "../middleware/auth.ts";
 import {

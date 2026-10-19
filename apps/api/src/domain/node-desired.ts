@@ -11,7 +11,7 @@ import {
   type NodeDesiredQuery,
   type NodeOrder,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import { keyring } from "../crypto/keyring.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { effectiveSleepAfterSql, type RoleRow } from "./rows.ts";

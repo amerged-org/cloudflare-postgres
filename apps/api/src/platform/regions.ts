@@ -6,7 +6,7 @@ import {
   RegionGatewayConfiguration,
   type RegionConfigurationUpdate,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import { withAdmissionMutation } from "../domain/admission-mutations.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth, requireScope } from "../middleware/auth.ts";

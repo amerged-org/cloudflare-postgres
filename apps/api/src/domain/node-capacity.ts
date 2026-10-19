@@ -23,7 +23,7 @@ import {
 import { startAddNode } from "../platform/nodes.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
 import { hintDatabases } from "./node-hints.ts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import {
   assertResourcesAllowed,
   effectiveResources,

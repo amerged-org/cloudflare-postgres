@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 const WAL = /^[0-9A-F]{24}$/;
 const BACKUP = /^[0-9]{8}T[0-9]{6}$/;
 const CATALOG_PAGE_LIMIT = 16,

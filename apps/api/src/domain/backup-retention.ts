@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { parseArchivePath } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
 import { purgeArchiveCredentials } from "./archive-credentials.ts";
 import { validatedArchivePrefix } from "./archive.ts";

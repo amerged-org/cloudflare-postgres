@@ -7,7 +7,7 @@ import {
   ERROR_HTTP_STATUS,
   parseArchivePath,
 } from "@pgcf/contracts";
-import { ApiError } from "../../src/app.ts";
+import { ApiError } from "../../src/api-error.ts";
 import type { ApiEnv } from "../../src/env.ts";
 import { Hono } from "hono";
 import { afterEach, expect, it } from "vitest";

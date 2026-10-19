@@ -2,7 +2,8 @@
 import { env } from "cloudflare:workers";
 import { ErrorBody } from "@pgcf/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, createApp } from "../src/app.ts";
+import { ApiError } from "../src/api-error.ts";
+import { createApp } from "../src/app.ts";
 
 const diagnosticHeader = "X-PGCF-Diagnostic-Id";
 const uuid =

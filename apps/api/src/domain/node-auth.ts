@@ -11,7 +11,7 @@ import {
   type NodeFencedResponse,
 } from "@pgcf/contracts";
 import type { MiddlewareHandler } from "hono";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext, ApiEnv } from "../env.ts";
 
 /** The node a signed request came from, as D1 holds it. */

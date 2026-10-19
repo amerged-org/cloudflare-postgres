@@ -6,7 +6,7 @@ import {
   releaseObjectKey,
   type ReleaseFile,
 } from "@pgcf/contracts/releases";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import { openInstall } from "./node-install.ts";
 

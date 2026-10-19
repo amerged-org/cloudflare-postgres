@@ -4,7 +4,8 @@ import {
   RETRYABLE_ERROR_REASONS,
   TIMESTAMP_PATTERN,
 } from "@pgcf/contracts";
-import { ApiError, type ApiApp } from "./app.ts";
+import { ApiError } from "./api-error.ts";
+import type { ApiApp } from "./app.ts";
 import type { Env } from "./env.ts";
 import { routeMetadata, type DocumentationAuth } from "./openapi-metadata.ts";
 import {

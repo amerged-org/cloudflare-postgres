@@ -5,7 +5,7 @@ import {
   IDEMPOTENCY_KEY_PATTERN,
 } from "@pgcf/contracts";
 import { routePath } from "hono/route";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import { requiredIdempotentPublicRoutes } from "../openapi-public-errors.ts";
 import { getAuth } from "./auth.ts";

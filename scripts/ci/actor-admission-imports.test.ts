@@ -93,7 +93,30 @@ test("the actor loads what writes D1 only by dynamic import", () => {
     ),
   );
   assert.ok(!closure("apps/api/src/database-actor.ts").files.includes(lazy));
-  assert.ok(closure(lazy).files.includes("apps/api/src/app.ts"));
+});
+
+// A ticket claim starts in a microtask while the answer is being returned, and a Durable Object
+// sends its answer only after the microtasks have drained: what the claim imports is evaluated
+// before the answer leaves (measured 2026-10-19 in local workerd, first answer of a fresh isolate:
+// 79 modules beyond the Worker's own added about 7 ms, these 8 add under 1 ms). This pins how
+// little that is.
+test("a ticket claim evaluates only a few modules beyond the Worker's own, never the router", () => {
+  const loaded = new Set(closure("apps/api/src/index.ts").files);
+  const claim = closure("apps/api/src/database-actor-d1.ts");
+  assert.deepEqual(
+    claim.files.filter((file) => !loaded.has(file)),
+    [
+      "apps/api/src/api-error.ts",
+      "apps/api/src/database-actor-d1.ts",
+      "apps/api/src/domain/admission-mutations.ts",
+      "apps/api/src/domain/database-actor-sync.ts",
+      "apps/api/src/domain/database-admission-snapshot.ts",
+      "apps/api/src/domain/node-hints.ts",
+      "apps/api/src/domain/placement.ts",
+      "apps/api/src/domain/power-transition.ts",
+    ],
+  );
+  assert.deepEqual(claim.packages, ["cloudflare:workers", "zod"]);
 });
 
 test("the Worker entry evaluates no router, cron, provider or Workflow implementation", () => {

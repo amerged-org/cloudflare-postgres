@@ -6,7 +6,7 @@ import {
   randomString,
   type ArchiveCredentialReference,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import { R2_ACTIONS, signR2Credential } from "../crypto/r2-credentials.ts";
 import type { ApiContext } from "../env.ts";
 

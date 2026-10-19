@@ -12,7 +12,7 @@ import {
   type DatabaseResources,
   type DatabaseResourcesCreate,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { DatabaseRow, SizeRow } from "./rows.ts";
 
 /** The database's own values; null takes the size class's. */
