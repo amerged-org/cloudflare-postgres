@@ -221,10 +221,49 @@ it("does not alarm a database that cannot archive and announces each database th
   expect(hook.events).toHaveLength(2);
 });
 
+it("does not announce a node marked lost that holds no database", async () => {
+  // Live, retired nodes kept a regional_node_stale episode open for days and the webhook kept
+  // announcing a region whose only running node was healthy.
+  const f = await fixture(),
+    now = Date.now(),
+    hook = receiver();
+  await env.DB.prepare(
+    "UPDATE nodes SET last_observed_at=?,lost_at=? WHERE id=?",
+  )
+    .bind(ago(now, 2 * HOUR), ago(now, HOUR), f.node)
+    .run();
+  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+  expect(hook.events).toHaveLength(0);
+  expect(await status(f, "regional_node_stale")).toBeUndefined();
+});
+
+it("announces a node marked lost while a database is placed on it and stops once it is deleted", async () => {
+  const f = await fixture(),
+    now = Date.now(),
+    hook = receiver(),
+    id = await database(f, "on-lost-node");
+  await env.DB.prepare(
+    "UPDATE nodes SET last_observed_at=?,lost_at=? WHERE id=?",
+  )
+    .bind(ago(now, 2 * HOUR), ago(now, HOUR), f.node)
+    .run();
+  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+  expect(hook.events).toHaveLength(1);
+  expect(hook.events[0]!.event.node_ids).toEqual([f.node]);
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='deleted',deleted_at=? WHERE id=?",
+  )
+    .bind(new Date(now).toISOString(), id)
+    .run();
+  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
+  expect((await status(f, "regional_node_stale"))?.active).toBe(false);
+});
+
 it("announces a node that goes stale after another was marked lost", async () => {
   const f = await fixture(),
     now = Date.now(),
     hook = receiver();
+  await database(f, "on-lost-node");
   await env.DB.prepare(
     "UPDATE nodes SET last_observed_at=?,lost_at=? WHERE id=?",
   )

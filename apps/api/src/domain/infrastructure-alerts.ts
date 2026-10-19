@@ -841,20 +841,28 @@ async function regionHealthAlerts(
   deadline: number | undefined,
 ) {
   const nodes = await env.DB.prepare(
-    "SELECT id,last_observed_at,lost_at FROM nodes WHERE region_id=? AND node_uid IS NOT NULL AND (last_observed_at IS NOT NULL OR lost_at IS NOT NULL) ORDER BY id",
+    `SELECT id,last_observed_at,lost_at,
+      EXISTS(SELECT 1 FROM databases d WHERE d.node_id=nodes.id AND d.deleted_at IS NULL) holds_databases
+     FROM nodes WHERE region_id=? AND node_uid IS NOT NULL AND (last_observed_at IS NOT NULL OR lost_at IS NOT NULL) ORDER BY id`,
   )
     .bind(regionId)
     .all<{
       id: string;
       last_observed_at: string | null;
       lost_at: string | null;
+      holds_databases: number;
     }>();
+  // A node the operator marked lost is announced while databases are still placed on it; once it
+  // holds none, it is a record and nobody has anything to do.
   const failedNodes = nodes.results
-    .filter((node) =>
-      ["stale", "lost"].includes(
-        heartbeatHealth(node.last_observed_at, node.lost_at, now).status,
-      ),
-    )
+    .filter((node) => {
+      const status = heartbeatHealth(
+        node.last_observed_at,
+        node.lost_at,
+        now,
+      ).status;
+      return status === "stale" || (status === "lost" && node.holds_databases);
+    })
     .slice(0, 64);
   // The nodes whose enrollment token was presented in vain, newest first.
   const refused = await env.DB.prepare(
