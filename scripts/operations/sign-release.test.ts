@@ -143,13 +143,15 @@ test("CI asks the signer for the signature of the manifest's facts with its iden
     assert.equal(asked.searchParams.get("api-version"), "2.0");
     assert.equal(tokenRequest!.authorization, `bearer ${OIDC_REQUEST_TOKEN}`);
     // The signer got the token as the bearer credential and the facts as JSON: the release id,
-    // every digest of the manifest and the host files with how each takes effect, and nothing of
-    // the image or the kernel.
+    // the image's four facts (the compressed and the raw sha256 and size, which the installer checks
+    // of the disk it writes), every other digest of the manifest and the host files with how each
+    // takes effect, and nothing of the kernel or what a node reports.
     assert.equal(signRequest!.method, "POST");
     assert.equal(signRequest!.authorization, `Bearer ${IDENTITY_TOKEN}`);
     assert.equal(signRequest!.contentType, "application/json");
     assert.deepEqual(JSON.parse(signRequest!.body), {
       id: manifest.version,
+      image: manifest.registration.image,
       binaries: manifest.registration.binaries,
       os: {
         debian_snapshot: manifest.registration.os.debian_snapshot,

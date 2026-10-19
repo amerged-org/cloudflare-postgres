@@ -20,7 +20,6 @@ import {
   rawRequest,
   refusal,
   request,
-  signatureOf,
   stageRelease,
 } from "./fixtures.ts";
 import {
@@ -58,7 +57,7 @@ async function registered() {
   ) => new URL(releaseFileUrl(API_ORIGIN, release, file)).pathname;
   const body = (file: ReleaseFile, release = version) =>
     new TextEncoder().encode(`${release}/${file}`);
-  return { f, version, path, body };
+  return { f, version, path, body, signature: registration.signature };
 }
 const get = (path: string, headers: HeadersInit = {}, method = "GET") =>
   rawRequest(path, { method, headers });
@@ -131,12 +130,13 @@ describe("the files every node reads", () => {
     const response = await get(r.path("release.sig"));
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toMatch(/^text\/plain/);
-    expect(await response.text()).toBe(await signatureOf(r.version));
+    expect(await response.text()).toBe(r.signature);
     // Another release has its own, and a version that was never registered has none.
     const other = await registered();
     expect(await (await get(other.path("release.sig"))).text()).toBe(
-      await signatureOf(other.version),
+      other.signature,
     );
+    expect(other.signature).not.toBe(r.signature);
     expect(
       (await get(r.path("release.sig", "release-files-unknown"))).status,
     ).toBe(404);

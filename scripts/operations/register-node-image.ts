@@ -540,7 +540,8 @@ const registeredPins = (spec: FleetReleaseSpec): FleetReleaseRegistration => ({
 
 /**
  * Registers the manifest as the release `version`, with the signature CI made of it; the API
- * checks the bucket before it records it and only stores the signature, which it cannot check.
+ * verifies the signature against the manifest of the registration's own facts and checks the bucket
+ * before it records it.
  * Its answer is the whole stored release, which must be this version with the registered digests
  * and the registered signature.
  */
@@ -706,7 +707,7 @@ async function main(
     );
   if (!checked.verified)
     throw new Error(
-      `the signature does not verify with ${keyPath}, so the nodes would refuse the release: it is not the signature of this build, or the key of this checkout is not the key of the running agents (pass --release-key for the release that rotates it)`,
+      `the signature does not verify with ${keyPath}, so the API and the nodes would refuse the release: it is not the signature of this build, or the key of this checkout is not the key of the running agents and of the API Worker (pass --release-key for the release that rotates it)`,
     );
   console.log(`  signature verifies with ${keyPath}`);
   for (const upload of manifest.uploads) {

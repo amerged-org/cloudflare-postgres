@@ -113,6 +113,12 @@ const page = {
   node,
   release: {
     id: "release-25",
+    image: {
+      sha256: "d".repeat(64),
+      size_bytes: 500_000_000,
+      raw_sha256: "e".repeat(64),
+      raw_bytes: 2_147_483_648,
+    },
     binaries: {
       "pgcf-agent": binary,
       "pgcf-native-gateway": binary,
@@ -1668,6 +1674,13 @@ export async function releaseVectors() {
   });
   const release = {
     id: "sha-0123456789ab",
+    // The image's four facts, each different from the others and from every digest below.
+    image: {
+      sha256: "c".repeat(64),
+      size_bytes: 520_000_000,
+      raw_sha256: "d".repeat(64),
+      raw_bytes: 2_147_483_648,
+    },
     binaries: {
       "pgcf-agent": pin("pgcf-agent", "1", 11_000_000),
       "pgcf-native-gateway": pin("pgcf-native-gateway", "2", 12_000_000),

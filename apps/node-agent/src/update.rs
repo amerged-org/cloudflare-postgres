@@ -12,8 +12,10 @@
 //! and checks (`verify`) before it downloads, stages or installs anything of the release. The page's
 //! digests pin the files and the signature pins the page, so an administrator who can change the
 //! API's records and the bucket's objects still cannot make a node run a file nobody signed. The
-//! manifest also lists the release's host files (`hostfiles`), each with its digest and how it
-//! takes effect; the agent writes them only after the signature held and its own rules did.
+//! manifest names the release's image too (its digests and sizes, which the agent never fetches
+//! and the API checks before it installs a node from it) and lists the release's host files
+//! (`hostfiles`), each with its digest and how it takes effect; the agent writes them only after
+//! the signature held and its own rules did.
 use crate::{
     Error,
     hostfiles::{self, HostFile},
@@ -63,7 +65,7 @@ pub const SIGNATURE_FILE: &str = "release.sig";
 pub const SIGNATURE_MAX_BYTES: usize = 256;
 
 /// The first line of the signed manifest (`RELEASE_MANIFEST_DOMAIN`).
-const MANIFEST_DOMAIN: &str = "pgcf-release-manifest/v2\n";
+const MANIFEST_DOMAIN: &str = "pgcf-release-manifest/v3\n";
 
 /// Why a node does not trust a release; the codes are the contract's `RELEASE_REFUSALS`. The
 /// refusals of a release's host files (`hostfiles::Refusal`) are no part of this: they are the
@@ -135,6 +137,26 @@ impl Pinned {
     }
 }
 
+/// The image a release installs new nodes from, by its facts (`ImageIdentity`): the sha256 and size
+/// of the compressed disk and of the raw disk. A node never fetches it; the signature covers it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub raw_sha256: String,
+    pub raw_bytes: u64,
+}
+impl Image {
+    fn parse(value: &Value) -> Option<Self> {
+        Some(Self {
+            sha256: value["sha256"].as_str()?.to_string(),
+            size_bytes: value["size_bytes"].as_u64()?,
+            raw_sha256: value["raw_sha256"].as_str()?.to_string(),
+            raw_bytes: value["raw_bytes"].as_u64()?,
+        })
+    }
+}
+
 /// The binaries a release names, each under its file name (`FleetReleaseBinaries`).
 pub const AGENT: &str = "pgcf-agent";
 pub const GATEWAY: &str = "pgcf-native-gateway";
@@ -144,6 +166,7 @@ const BINARIES: [&str; 4] = [AGENT, GATEWAY, "pgcf-archive", "pgcf-wal-fetch"];
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
     pub id: String,
+    pub image: Image,
     pub binaries: Vec<(String, Pinned)>,
     /// The Debian snapshot the packages of the image's lock come from.
     pub debian_snapshot: String,
@@ -156,6 +179,7 @@ impl Release {
     pub fn parse(release: &Value) -> Option<Self> {
         Some(Self {
             id: release["id"].as_str()?.to_string(),
+            image: Image::parse(&release["image"])?,
             binaries: BINARIES
                 .iter()
                 .map(|name| Some((name.to_string(), Pinned::parse(&release["binaries"][name])?)))
@@ -171,12 +195,23 @@ impl Release {
     }
 
     /// What the release key signs for this release (`signedReleaseManifest` of the contract): the
-    /// domain line, then the release id, the digest and size of each binary in the order of
-    /// `BINARIES`, the snapshot, the digest and size of the package lock and the host files in the
-    /// list's order, one `name=value` line each.
+    /// domain line, then the release id, the digest and size of the compressed and of the raw
+    /// image, the digest and size of each binary in the order of `BINARIES`, the snapshot, the
+    /// digest and size of the package lock and the host files in the list's order, one
+    /// `name=value` line each.
     pub fn manifest(&self) -> Vec<u8> {
         let mut text = String::from(MANIFEST_DOMAIN);
         let _ = writeln!(text, "release={}", self.id);
+        let _ = writeln!(
+            text,
+            "image.zst={}:{}",
+            self.image.sha256, self.image.size_bytes
+        );
+        let _ = writeln!(
+            text,
+            "image.raw={}:{}",
+            self.image.raw_sha256, self.image.raw_bytes
+        );
         for (name, pinned) in &self.binaries {
             let _ = writeln!(
                 text,
@@ -570,6 +605,14 @@ mod tests {
         assert_eq!(release.binaries[0].1.size_bytes, 1000);
         assert_eq!(release.debian_snapshot, "20261016T000000Z");
         assert_eq!(release.package_lock.size_bytes, 2000);
+        // The image is named by its four facts, and a page without them is no release.
+        assert_eq!(release.image.sha256, "d".repeat(64));
+        assert_eq!(release.image.size_bytes, 500_000_000);
+        assert_eq!(release.image.raw_sha256, "e".repeat(64));
+        assert_eq!(release.image.raw_bytes, 2_147_483_648);
+        let mut without = page["release"].clone();
+        without["image"] = Value::Null;
+        assert_eq!(Release::parse(&without), None);
         assert_eq!(Release::parse(&Value::Null), None);
     }
 
@@ -822,10 +865,14 @@ mod tests {
         let mut lined = signature.clone();
         lined.push(b'\n');
         assert_eq!(verify(&public(&key), &release, &lined), Ok(()));
-        // Every fact the manifest holds is covered: the release id, each binary's digest and size,
-        // the order of the binaries, the snapshot and the package lock.
-        let changes: [fn(&mut Release); 14] = [
+        // Every fact the manifest holds is covered: the release id, the image's four facts, each
+        // binary's digest and size, the order of the binaries, the snapshot and the package lock.
+        let changes: [fn(&mut Release); 18] = [
             |r| r.id = "sha-0123456789ac".into(),
+            |r| r.image.sha256 = "9".repeat(64),
+            |r| r.image.size_bytes += 1,
+            |r| r.image.raw_sha256 = "9".repeat(64),
+            |r| r.image.raw_bytes += 512,
             |r| r.binaries[0].1.sha256 = "9".repeat(64),
             |r| r.binaries[1].1.size_bytes += 1,
             |r| {
@@ -1003,6 +1050,12 @@ mod tests {
     fn release(id: &str, files: &[(&str, &[u8])]) -> Release {
         Release {
             id: id.into(),
+            image: Image {
+                sha256: "c".repeat(64),
+                size_bytes: 1,
+                raw_sha256: "d".repeat(64),
+                raw_bytes: 512,
+            },
             binaries: files
                 .iter()
                 .map(|(name, bytes)| {

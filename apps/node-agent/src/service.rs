@@ -1744,7 +1744,10 @@ mod tests {
             })
             .collect();
         let release = json!({
-            "id": id, "binaries": binaries,
+            "id": id,
+            "image": {"sha256": "c".repeat(64), "size_bytes": 1000,
+                      "raw_sha256": "d".repeat(64), "raw_bytes": 4096},
+            "binaries": binaries,
             "os": {"image_version": "25", "debian_snapshot": "20261016T000000Z",
                    "package_lock": pin("packages.lock.json", lock), "host_files": host_files}
         });

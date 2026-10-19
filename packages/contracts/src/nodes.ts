@@ -384,8 +384,16 @@ export const NodeAddition = z.strictObject({
       "verification_failed",
     ])
     .nullable(),
-  /** Why an audited server has not been sent its installer yet; the next pass asks again. Null outside `audited`. */
-  install_blocker: z.enum(["node_firewall_unconfirmed"]).nullable(),
+  /**
+   * Why an audited server has not been sent its installer yet; the next pass asks again. Null
+   * outside `audited`. `node_firewall_unconfirmed`: Contabo's firewall does not yet hold the
+   * instance behind a deny-all rule set. `release_unverified`: the release of the region is not
+   * signed by the release key (the row was edited, or registered by a path that did not check it),
+   * so no installer is rendered from its image until a signed release is assigned.
+   */
+  install_blocker: z
+    .enum(["node_firewall_unconfirmed", "release_unverified"])
+    .nullable(),
   created_at: Timestamp,
   updated_at: Timestamp,
 });

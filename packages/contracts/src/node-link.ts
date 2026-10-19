@@ -36,6 +36,7 @@ import {
   FleetReleaseBinaries,
   FleetReleaseId,
   FleetReleaseOs,
+  ImageIdentity,
   ImageVersion,
   KernelRelease,
   NodeHostFiles,
@@ -666,6 +667,11 @@ export type NodeDesiredQuery = z.infer<typeof NodeDesiredQuery>;
  */
 export const NodeRelease = z.strictObject({
   id: FleetReleaseId,
+  /**
+   * The image's identity, which a node never fetches: the release key signs it with the rest of
+   * the release (`signedReleaseManifest`), and the agent builds that text from its page alone.
+   */
+  image: ImageIdentity,
   binaries: FleetReleaseBinaries,
   /** What the node installs. What it is expected to report back stays with the API. */
   os: FleetReleaseOs.omit({

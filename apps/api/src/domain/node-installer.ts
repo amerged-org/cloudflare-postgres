@@ -15,6 +15,7 @@ import {
   type ContaboInstance,
 } from "../providers/contabo.ts";
 import { installSources, issueNodeInstall } from "./node-install.ts";
+import { releaseIsSigned } from "./release-signature.ts";
 import {
   markNodeAdditionFailed,
   markNodeBootstrapping,
@@ -59,13 +60,13 @@ const installOf = (env: Env, nodeId: string) =>
 /** The release of the region: the node image the installer writes and the version the node enrolls as. */
 async function regionRelease(env: Env, regionId: string) {
   const row = await env.DB.prepare(
-    `SELECT r.spec_json FROM fleet_region_releases f JOIN fleet_releases r ON r.id=f.release_id WHERE f.region_id=?`,
+    `SELECT r.id,r.spec_json FROM fleet_region_releases f JOIN fleet_releases r ON r.id=f.release_id WHERE f.region_id=?`,
   )
     .bind(regionId)
-    .first<{ spec_json: string }>();
+    .first<{ id: string; spec_json: string }>();
   return row === null
     ? null
-    : FleetReleaseSpec.parse(JSON.parse(row.spec_json));
+    : { id: row.id, spec: FleetReleaseSpec.parse(JSON.parse(row.spec_json)) };
 }
 
 /** The resolvers the installer configures: a JSON array of one to three addresses. */
@@ -201,8 +202,9 @@ async function startInstall(
     await markNodeBootstrapping(env.DB, operation, addition.revision);
     return;
   }
-  const spec = await regionRelease(env, addition.intent.request.region_id);
-  if (spec === null || addition.provider_instance_id === null) return;
+  const release = await regionRelease(env, addition.intent.request.region_id);
+  if (release === null || addition.provider_instance_id === null) return;
+  const { spec } = release;
   const instance = await provider.getInstance(addition.provider_instance_id, {
     requestId: crypto.randomUUID(),
     accounting: { operation_id: operation, stage: "inspection" },
@@ -217,6 +219,14 @@ async function startInstall(
     ))
   ) {
     await markNodeInstallBlocked(env.DB, addition, "node_firewall_unconfirmed");
+    return;
+  }
+  // The installer writes the image this spec names to a disk, and the agent in that image trusts
+  // whatever key it carries. The spec is checked here, in the Worker, against the release key
+  // compiled into its code, however the row got into D1: no tokens are issued and no rescue is
+  // requested for a release the key did not sign, and the next pass asks again.
+  if (!(await releaseIsSigned(release.id, spec))) {
+    await markNodeInstallBlocked(env.DB, addition, "release_unverified");
     return;
   }
   const keys = rescueKeys(env);

@@ -29,6 +29,7 @@ import {
 import { expect } from "vitest";
 import { createApp } from "../../src/app.ts";
 import type { Env } from "../../src/env.ts";
+import { signRelease } from "../release-key.ts";
 import { reportStatements } from "./node-samples.ts";
 
 /** The origin the Worker under test names in the URLs of a release and in an installer's userData. */
@@ -668,18 +669,28 @@ export const nodeOs = (change: Record<string, unknown> = {}) => ({
   ...RELEASE_OS,
   ...change,
 });
-/** A signature of the form the API stores for a version: another for each, made by no key. */
-export const signatureOf = async (version: string) => {
-  const digest = bytesToHex(
-    new Uint8Array(
-      await crypto.subtle.digest(
-        "SHA-256",
-        new TextEncoder().encode(`signature/${version}`),
-      ),
-    ),
-  );
-  return digest + digest;
-};
+/**
+ * A registration signed the way CI's signer signs a release: the manifest rebuilt from its own
+ * facts under the id, signed by the key the API verifies with in these tests (../release-key.ts).
+ */
+export async function signed(
+  version: string,
+  registration: Omit<FleetReleaseRegistration, "signature">,
+): Promise<FleetReleaseRegistration> {
+  return {
+    ...registration,
+    signature: await signRelease({ id: version, ...registration }),
+  };
+}
+/** `registration` signed again, after a test changed what it holds. */
+export function resigned(
+  version: string,
+  registration: FleetReleaseRegistration,
+): Promise<FleetReleaseRegistration> {
+  const { signature, ...unsigned } = registration;
+  void signature;
+  return signed(version, unsigned);
+}
 /** The spec of a release: a node image, its four binaries and the package lock. */
 export const releaseSpec = (version = "1.2.0") => ({
   version: 3,
@@ -748,7 +759,7 @@ export async function stageRelease(
     await env.ARCHIVE.put(key, body, { sha256: file.sha256 });
     stagedObjects.push(key);
   }
-  return {
+  return signed(version, {
     image: {
       ...digests["pgcf-node.raw.zst"],
       raw_sha256: bytesToHex(
@@ -770,8 +781,7 @@ export async function stageRelease(
       host_files: structuredClone(HOST_FILES),
       ...RELEASE_OS,
     },
-    signature: await signatureOf(version),
-  };
+  });
 }
 /** Registers a release and assigns it to the region. */
 export async function assignRelease(

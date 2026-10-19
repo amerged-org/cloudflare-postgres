@@ -94,6 +94,12 @@ const page = {
   node,
   release: {
     id: "release-25",
+    image: {
+      sha256: "d".repeat(64),
+      size_bytes: 500_000_000,
+      raw_sha256: "e".repeat(64),
+      raw_bytes: 2_147_483_648,
+    },
     binaries: Object.fromEntries(
       [
         "pgcf-agent",

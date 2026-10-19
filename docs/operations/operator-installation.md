@@ -103,6 +103,12 @@ because a new paid resource needs the owner's explicit, costed go. Put the firew
   that accepts (a rule that drops is fine); the instance is not listed yet, or listed with a status
   other than `ok`, and stays so (`error_processing`). Fix the cause; AddNode asks again on every
   cycle and starts the install when the firewall is confirmed.
+- Before it issues the tokens, AddNode verifies the signature of the region's release against the
+  manifest rebuilt from the stored spec (the image's digests included) with the release public key of
+  the API Worker. A row that does not verify (edited in D1, or registered by a path that did not
+  check it) leaves the addition `audited` with `install_blocker` `release_unverified`; no tokens are
+  issued and no rescue is requested. Register a release signed by the signer and assign it to the
+  region ([release-signing.md](release-signing.md)); the next cycle goes on.
 - To verify an install, try a TCP connect to port 22 of the instance's public IPv4 address from
   outside during the rescue and after the reboot. Both must time out.
 
@@ -384,9 +390,11 @@ made as in step 3.
 
 ### Replacing the agent by hand: a node whose agent predates host files
 
-An agent of a build before host files cannot read the page of a release that carries them, and the API refuses its hello, which
-lacks `os.host_files_sha256`, so no release can reach it: once, its binary is replaced through the
-shell. EU1 is such a node (it runs the agent of main `bb85de7d`). A node enrolled from an image that
+An agent of a build before host files cannot read the page of a release that carries them (nor,
+since manifest v3, the image's facts that every page's release carries: its generated schema is
+strict), and the API refuses its hello, which lacks `os.host_files_sha256`, so no release can reach
+it: once, its binary is replaced through the shell. EU1 is such a node (it runs the agent of main
+`bb85de7d`). A node enrolled from an image that
 holds the first agent that writes host files needs none of this, and no code supports it: Dev runs
 the newest release only. The databases keep running throughout (their units do not depend on the
 agent, and a restart of the agent never stops one).
@@ -394,8 +402,8 @@ agent, and a restart of the agent never stops one).
 1. **While the node is still linked,** check that the shell reaches it (steps 1 to 4 above;
    `node-shell.ts ... -- true` exits 0): after step 2 it is the only way in. Assign nothing to the
    region.
-2. **Deploy the API of the commit.** Migration `0079` removes the registered releases and their
-   assignments, and the API refuses the old agent's hello from then on: the node loses its link
+2. **Deploy the API of the commit.** Its migrations (`0079` host files, `0080` the signed image) remove
+   the registered releases and their assignments, and the API refuses the old agent's hello from then on: the node loses its link
    (`GET /v1/nodes/{id}` says `observation.state` `stale`; staleness alone never declares a node
    lost).
 3. **Register the release** built and signed from that commit, from a checkout of exactly that
@@ -532,7 +540,8 @@ and actual delivery are separate evidence. The alert kinds and their runbook act
    `POST .../cancel` (with the addition's `expected_revision`) cancels it.
 4. AddNode confirms the node firewall, then requests the Contabo rescue with the pull installer
    (plan 9.2). The addition is `audited` until the firewall is confirmed (`install_blocker`
-   `node_firewall_unconfirmed`), `bootstrapping` while the installer runs and the node enrolls, and
+   `node_firewall_unconfirmed`) and the region's release verifies (`release_unverified`),
+   `bootstrapping` while the installer runs and the node enrolls, and
    `ready` once the node has sampled with its credentials, which also opens it for placement.
    A node that does not enroll after the installer's reboot is restarted once through the API.
 5. A new release reaches a running node without a reboot: assign it to the region and the node pulls

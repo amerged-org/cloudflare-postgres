@@ -449,6 +449,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -921,6 +927,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -1191,6 +1203,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -1296,6 +1314,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -1450,6 +1474,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -1549,6 +1579,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -1647,6 +1683,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -1745,6 +1787,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -2062,6 +2110,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -2378,6 +2432,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -2694,6 +2754,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -3049,6 +3115,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -3367,6 +3439,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -3501,6 +3579,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -3635,6 +3719,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -3769,6 +3859,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -4081,6 +4177,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -4403,6 +4505,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -4537,6 +4645,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -4671,6 +4785,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -4805,6 +4925,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -4952,6 +5078,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -5099,6 +5231,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -5242,6 +5380,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -5385,6 +5529,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -5529,6 +5679,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -5665,6 +5821,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -5807,6 +5969,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -5961,6 +6129,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -6088,6 +6262,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -6221,6 +6401,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -6351,6 +6537,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -6476,6 +6668,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -6609,6 +6807,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -6742,6 +6946,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -6875,6 +7085,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -7009,6 +7225,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -7152,6 +7374,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -7286,6 +7514,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -7464,6 +7698,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -7773,6 +8013,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -8077,6 +8323,12 @@
         },
         "release": {
           "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
           "binaries": {
             "pgcf-agent": {
               "url": "https://releases.example/binary",
@@ -11108,6 +11360,12 @@
       "name": "distinct-digests",
       "release": {
         "id": "sha-0123456789ab",
+        "image": {
+          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "size_bytes": 520000000,
+          "raw_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "raw_bytes": 2147483648
+        },
         "binaries": {
           "pgcf-agent": {
             "url": "https://releases.example/pgcf-agent",
@@ -11195,7 +11453,7 @@
           ]
         }
       },
-      "manifest": "pgcf-release-manifest/v2\nrelease=sha-0123456789ab\nbinary.pgcf-agent=1111111111111111111111111111111111111111111111111111111111111111:11000000\nbinary.pgcf-native-gateway=2222222222222222222222222222222222222222222222222222222222222222:12000000\nbinary.pgcf-archive=3333333333333333333333333333333333333333333333333333333333333333:5000000\nbinary.pgcf-wal-fetch=4444444444444444444444444444444444444444444444444444444444444444:5100000\nos.debian_snapshot=20261016T000000Z\nos.package_lock=5555555555555555555555555555555555555555555555555555555555555555:90000\nos.host_file=/etc/ssh/sshd_config.d/10-pgcf.conf file 0644 6666666666666666666666666666666666666666666666666666666666666666:1500 restart_unit:ssh.service\nos.host_file=/etc/systemd/system/modprobe@loop.service symlink-to-dev-null - - daemon_reload\nos.host_file=/usr/lib/sysctl.d/90-pgcf.conf file 0644 7777777777777777777777777777777777777777777777777777777777777777:800 restart_unit:systemd-sysctl.service\nos.host_file=/usr/lib/systemd/system/pgcf-agent.service file 0644 8888888888888888888888888888888888888888888888888888888888888888:1100 restart_unit:pgcf-agent.service\nos.host_file=/usr/lib/systemd/system/pgcf-pg@.service file 0644 9999999999999999999999999999999999999999999999999999999999999999:4300 next_start\nos.host_file=/usr/lib/sysusers.d/pgcf.conf file 0755 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:300 sysusers\nos.host_file=/usr/lib/tmpfiles.d/pgcf.conf file 0644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:400 tmpfiles\n",
+      "manifest": "pgcf-release-manifest/v3\nrelease=sha-0123456789ab\nimage.zst=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc:520000000\nimage.raw=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:2147483648\nbinary.pgcf-agent=1111111111111111111111111111111111111111111111111111111111111111:11000000\nbinary.pgcf-native-gateway=2222222222222222222222222222222222222222222222222222222222222222:12000000\nbinary.pgcf-archive=3333333333333333333333333333333333333333333333333333333333333333:5000000\nbinary.pgcf-wal-fetch=4444444444444444444444444444444444444444444444444444444444444444:5100000\nos.debian_snapshot=20261016T000000Z\nos.package_lock=5555555555555555555555555555555555555555555555555555555555555555:90000\nos.host_file=/etc/ssh/sshd_config.d/10-pgcf.conf file 0644 6666666666666666666666666666666666666666666666666666666666666666:1500 restart_unit:ssh.service\nos.host_file=/etc/systemd/system/modprobe@loop.service symlink-to-dev-null - - daemon_reload\nos.host_file=/usr/lib/sysctl.d/90-pgcf.conf file 0644 7777777777777777777777777777777777777777777777777777777777777777:800 restart_unit:systemd-sysctl.service\nos.host_file=/usr/lib/systemd/system/pgcf-agent.service file 0644 8888888888888888888888888888888888888888888888888888888888888888:1100 restart_unit:pgcf-agent.service\nos.host_file=/usr/lib/systemd/system/pgcf-pg@.service file 0644 9999999999999999999999999999999999999999999999999999999999999999:4300 next_start\nos.host_file=/usr/lib/sysusers.d/pgcf.conf file 0755 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:300 sysusers\nos.host_file=/usr/lib/tmpfiles.d/pgcf.conf file 0644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:400 tmpfiles\n",
       "host_files_sha256": "a1daf09a59b5ee45c6b7d69aefee21e22b8fc0df2c91440112c165bb60ed1b66"
     }
   ]

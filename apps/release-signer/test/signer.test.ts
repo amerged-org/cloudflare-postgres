@@ -29,6 +29,11 @@ const digest = (letter: string, size_bytes: number) => ({
 });
 const fields = (id = RELEASE_ID) => ({
   id,
+  image: {
+    ...digest("a", 520_000_000),
+    raw_sha256: "b".repeat(64),
+    raw_bytes: 2_147_483_648,
+  },
   binaries: {
     "pgcf-agent": digest("1", 11_000_000),
     "pgcf-native-gateway": digest("2", 12_000_000),
@@ -66,8 +71,10 @@ function tweak(value: object, path: string[], to?: unknown): unknown {
 }
 /** The text the agent verifies, written out here and not built by the contract's function. */
 const MANIFEST = [
-  "pgcf-release-manifest/v2",
+  "pgcf-release-manifest/v3",
   `release=${RELEASE_ID}`,
+  `image.zst=${"a".repeat(64)}:520000000`,
+  `image.raw=${"b".repeat(64)}:2147483648`,
   `binary.pgcf-agent=${"1".repeat(64)}:11000000`,
   `binary.pgcf-native-gateway=${"2".repeat(64)}:12000000`,
   `binary.pgcf-archive=${"3".repeat(64)}:5000000`,
@@ -168,8 +175,31 @@ describe("what it signs", () => {
     expect(signedReleaseManifest(fields())).toBe(MANIFEST);
     // Not the signature of anything else: the domain line is part of what is signed.
     expect(
-      await verifies(MANIFEST.replace("pgcf-release-manifest/v2\n", "")),
+      await verifies(MANIFEST.replace("pgcf-release-manifest/v3\n", "")),
     ).toBe(false);
+    // The previous version of the format and a text without the image are signatures of others.
+    expect(
+      await verifies(
+        MANIFEST.replace(
+          "pgcf-release-manifest/v3",
+          "pgcf-release-manifest/v2",
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      await verifies(
+        MANIFEST.split("\n")
+          .filter((line) => !line.startsWith("image."))
+          .join("\n"),
+      ),
+    ).toBe(false);
+    // The image is in what is signed: another image under the same release is another signature.
+    expect(
+      await verifies(MANIFEST.replace("a".repeat(64), "9".repeat(64))),
+    ).toBe(false);
+    expect(await verifies(MANIFEST.replace("2147483648", "2147483649"))).toBe(
+      false,
+    );
     expect(
       await verifies(MANIFEST.replace("1".repeat(64), "9".repeat(64))),
     ).toBe(false);
@@ -215,6 +245,19 @@ describe("what it signs", () => {
     const h = harness();
     const bodies: unknown[] = [
       tweak(fields(), ["extra"], 1),
+      // The image's four facts and nothing else: a missing one, an extra one, a malformed one.
+      tweak(fields(), ["image"]),
+      tweak(fields(), ["image", "sha256"]),
+      tweak(fields(), ["image", "size_bytes"]),
+      tweak(fields(), ["image", "raw_sha256"]),
+      tweak(fields(), ["image", "raw_bytes"]),
+      tweak(fields(), ["image", "url"], "https://x.example/i"),
+      tweak(fields(), ["image", "format"], "raw.zst"),
+      tweak(fields(), ["image", "sha256"], "A".repeat(64)),
+      tweak(fields(), ["image", "size_bytes"], 0),
+      tweak(fields(), ["image", "raw_sha256"], `${"b".repeat(63)}\n`),
+      tweak(fields(), ["image", "raw_bytes"], 2_147_483_649),
+      tweak(fields(), ["image"], "a".repeat(64)),
       tweak(fields(), ["binaries", "pgcf-agent", "url"], "https://x.example/a"),
       tweak(fields(), ["os", "kernel_release"], "6.12.113+deb13-amd64"),
       tweak(fields(), ["os", "package_lock", "md5"], "a".repeat(32)),

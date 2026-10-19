@@ -754,6 +754,31 @@ test("the signature CI wrote beside the files is read and checked against the ke
     );
     await writeFile(signaturePath, elsewhere);
     assert.equal((await checkSignature(manifest, options))?.verified, false);
+    // The image is in what is signed: the signature of this build for an image of one's own does
+    // not verify for this build, so nothing is uploaded under it.
+    for (const change of [
+      { sha256: "f".repeat(64) },
+      { size_bytes: manifest.registration.image.size_bytes + 1 },
+      { raw_sha256: "f".repeat(64) },
+      { raw_bytes: manifest.registration.image.raw_bytes + 512 },
+    ]) {
+      await writeFile(
+        signaturePath,
+        signText(
+          key.privateKey,
+          signedReleaseManifest({
+            id: manifest.version,
+            ...manifest.registration,
+            image: { ...manifest.registration.image, ...change },
+          }),
+        ),
+      );
+      assert.equal(
+        (await checkSignature(manifest, options))?.verified,
+        false,
+        JSON.stringify(Object.keys(change)),
+      );
+    }
     await writeFile(signaturePath, signature);
     await writeFile(keyPath, `${generateKeyPair().publicKey}\n`);
     assert.equal((await checkSignature(manifest, options))?.verified, false);

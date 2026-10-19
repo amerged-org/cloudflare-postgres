@@ -2,6 +2,7 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext } from "cloudflare:test";
 import { afterEach, expect, it, vi } from "vitest";
+import { bytesToHex } from "@pgcf/contracts";
 import {
   FleetNodeReleaseStatus,
   FleetRegionReleaseStatus,
@@ -10,6 +11,7 @@ import {
   hostFilesSha256,
   releaseFileUrl,
   releaseObjectKey,
+  signedReleaseManifest,
 } from "@pgcf/contracts/releases";
 import { createApp } from "../../src/app.ts";
 import {
@@ -23,6 +25,8 @@ import {
   nodeSample,
   refusal,
   request,
+  resigned,
+  signed,
   stageRelease,
 } from "./fixtures.ts";
 import { NODE_HEADER, NODE_UID_HEADER } from "../../src/node-actor.ts";
@@ -107,9 +111,11 @@ it("approves immutable releases with idempotent replay and rejects a changed one
   const result = await first.json();
   expect(await (await f.approve(f.value, key)).json()).toEqual(result);
   expect(await (await f.approve()).json()).toEqual(result);
-  const changed = structuredClone(f.value);
-  changed.binaries["pgcf-agent"].sha256 = "e".repeat(64);
-  expect((await f.approve(changed)).status).toBe(409);
+  // Another release under the same version is signed for what it is, and still refused.
+  const { signature: _signature, ...facts } = structuredClone(f.value);
+  void _signature;
+  facts.binaries["pgcf-agent"].sha256 = "e".repeat(64);
+  expect((await f.approve(await signed(f.id, facts))).status).toBe(409);
   expect((await request(`/v1/fleet/releases/${f.id}`, f.admin)).status).toBe(
     200,
   );
@@ -183,7 +189,7 @@ it("refuses a body that is not a registration: a full spec, a URL, an unknown fi
   ).toBe(400);
 });
 
-it("registers a release only with a signature of 64 bytes in hex, which it stores and shows but cannot check", async () => {
+it("registers a release only with a signature of 64 bytes in hex, which it verifies, stores and shows", async () => {
   const f = await setup();
   const { signature, ...unsigned } = f.value;
   for (const body of [
@@ -200,8 +206,8 @@ it("registers a release only with a signature of 64 bytes in hex, which it store
       .bind(f.id)
       .first(),
   ).toBeNull();
-  // The API has no key to check it against: whatever the registration states is what it stores
-  // and every reader sees, in the release and in the list.
+  // What the registration states is what is stored and every reader sees, in the release and in
+  // the list.
   const stored = FleetRelease.parse(await (await f.approve()).json());
   expect(stored.spec.signature).toBe(signature);
   expect(
@@ -217,9 +223,75 @@ it("registers a release only with a signature of 64 bytes in hex, which it store
   expect(
     listed.data.find((release) => release.id === f.id)?.spec.signature,
   ).toBe(signature);
-  // A release is immutable with its signature: another one is another release.
-  const resigned = { ...f.value, signature: "0".repeat(128) };
-  expect((await f.approve(resigned)).status).toBe(409);
+});
+
+it("registers a release only when the release key signed this very release: any other signature is refused and nothing is stored", async () => {
+  const f = await setup();
+  const { signature, ...facts } = f.value;
+  const foreign = (await crypto.subtle.generateKey("Ed25519", true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const text = new TextEncoder().encode(
+    signedReleaseManifest({ id: f.id, ...facts }),
+  );
+  const strangers = [
+    // 128 hex digits that no key made.
+    "e".repeat(128),
+    "0".repeat(128),
+    // The right text, signed by a key that is not the release key.
+    bytesToHex(
+      new Uint8Array(
+        await crypto.subtle.sign("Ed25519", foreign.privateKey, text),
+      ),
+    ),
+    // The release key's signature of another release.
+    (await stageRelease(`${f.id}-other`)).signature,
+  ];
+  const tampered: [string, (value: typeof facts) => void][] = [
+    ["image.sha256", (v) => (v.image.sha256 = "e".repeat(64))],
+    ["image.size_bytes", (v) => (v.image.size_bytes += 1)],
+    ["image.raw_sha256", (v) => (v.image.raw_sha256 = "e".repeat(64))],
+    ["image.raw_bytes", (v) => (v.image.raw_bytes += 512)],
+    ["binary", (v) => (v.binaries["pgcf-agent"].sha256 = "e".repeat(64))],
+    ["lock", (v) => (v.os.package_lock.size_bytes += 1)],
+    ["snapshot", (v) => (v.os.debian_snapshot = "20261017T000000Z")],
+    ["host file", (v) => (v.os.host_files[1]!.apply = "next_start")],
+  ];
+  const refused: [string, unknown][] = [
+    ...strangers.map((stranger, at): [string, unknown] => [
+      `signature ${at}`,
+      { ...facts, signature: stranger },
+    ]),
+    // The release key's own signature, with a fact of the release changed after it was made: an
+    // image of an attacker's choice under a signature that was made for the real one.
+    ...tampered.map(([name, change]): [string, unknown] => {
+      const copy = structuredClone(facts);
+      change(copy);
+      return [name, { ...copy, signature }];
+    }),
+  ];
+  for (const [name, body] of refused) {
+    const response = await f.approve(body);
+    expect(response.status, name).toBe(400);
+    const error = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(error.error.code, name).toBe("invalid_request");
+    expect(error.error.message, name).toMatch(/signature/);
+  }
+  expect(
+    await env.DB.prepare("SELECT 1 FROM fleet_releases WHERE id=?")
+      .bind(f.id)
+      .first(),
+  ).toBeNull();
+  // The release under its own signature is registered, and a replay of it is the same release.
+  expect((await f.approve()).status).toBe(200);
+  expect((await f.approve()).status).toBe(200);
+  // A release is immutable: the same facts under another signature are refused, not stored.
+  expect(
+    (await f.approve({ ...f.value, signature: strangers[0] })).status,
+  ).toBe(400);
 });
 
 it("names the URLs of the spec itself: every file of the release is served by this Worker", async () => {
@@ -296,12 +368,12 @@ it("registers only what the archive bucket holds: every file, at its size, with 
   const resized = `${f.id}-b`;
   const sized = await stageRelease(resized);
   sized.binaries["pgcf-agent"].size_bytes += 1;
-  await conflict(resized, sized, "pgcf-agent");
+  await conflict(resized, await resigned(resized, sized), "pgcf-agent");
   // An object whose digest differs from the registered one.
   const forged = `${f.id}-c`;
   const digests = await stageRelease(forged);
   digests.os.package_lock.sha256 = "0".repeat(64);
-  await conflict(forged, digests, "packages.lock.json");
+  await conflict(forged, await resigned(forged, digests), "packages.lock.json");
   // An object uploaded without a sha256 that R2 verified: nothing proves its digest.
   const unverified = `${f.id}-d`;
   const registration = await stageRelease(unverified, {
@@ -328,7 +400,7 @@ it("registers only what the archive bucket holds: every file, at its size, with 
   bigger.os.host_files_sha256 = await hostFilesSha256(bigger.os.host_files);
   await conflict(
     bigHost,
-    bigger,
+    await resigned(bigHost, bigger),
     hostFileObjectKey(bigHost, GATEWAY_UNIT_SHA256),
   );
   const looseHost = `${f.id}-g`;

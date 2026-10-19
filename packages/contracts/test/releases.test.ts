@@ -143,11 +143,36 @@ it("the page's release is the spec's binaries and the operating system a node in
     "6.12.113+deb13-amd64",
     "f".repeat(64),
   ]);
-  const page = { id: release.id, binaries: release.spec.binaries };
+  // The image's identity is on the page, without the URL and the format: the agent builds the
+  // signed manifest of its page, and the manifest holds the image's four facts.
+  const { url, format, ...identity } = release.spec.image;
+  void [url, format];
+  const page = {
+    id: release.id,
+    image: identity,
+    binaries: release.spec.binaries,
+  };
   expect(NodeRelease.safeParse({ ...page, os: installed }).success).toBe(true);
   expect(NodeRelease.safeParse({ ...page, os: release.spec.os }).success).toBe(
     false,
   );
+  expect(
+    NodeRelease.safeParse({ ...page, image: undefined, os: installed }).success,
+  ).toBe(false);
+  expect(
+    NodeRelease.safeParse({
+      ...page,
+      image: release.spec.image,
+      os: installed,
+    }).success,
+  ).toBe(false);
+  expect(
+    NodeRelease.safeParse({
+      ...page,
+      image: { ...identity, raw_sha256: undefined },
+      os: installed,
+    }).success,
+  ).toBe(false);
 });
 
 it("a package set has one digest: sha256 over its sorted lines name=version", async () => {

@@ -135,6 +135,12 @@ const options = (apiBase: string, publicPath: string, extra = {}) => ({
 });
 const MANIFEST = signedReleaseManifest({
   id: "sha-0123456789ab",
+  image: {
+    sha256: "7".repeat(64),
+    size_bytes: 1000,
+    raw_sha256: "8".repeat(64),
+    raw_bytes: 2048,
+  },
   binaries: Object.fromEntries(
     ["pgcf-agent", "pgcf-native-gateway", "pgcf-archive", "pgcf-wal-fetch"].map(
       (name, index) => [

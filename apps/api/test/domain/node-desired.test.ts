@@ -5,6 +5,7 @@ import {
   NodeDesiredPage,
   newOperationId,
 } from "@pgcf/contracts";
+import { FleetRelease } from "@pgcf/contracts/releases";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
 import type { Env } from "../../src/env.ts";
@@ -496,7 +497,18 @@ describe("the release and the orders on a node's page", () => {
       "pgcf-archive",
       "pgcf-wal-fetch",
     ]);
-    // The image only installs a node; no node reads it.
+    // The image only installs a node; no node reads it. Its four facts are on the page, because
+    // the release key signs them with the rest of the release and the agent builds that text from
+    // its page, and its URL and format are not.
+    const { spec } = FleetRelease.parse(
+      await (await request(`/v1/fleet/releases/${id}`, f.admin)).json(),
+    );
+    expect(page.release!.image).toEqual({
+      sha256: spec.image.sha256,
+      size_bytes: spec.image.size_bytes,
+      raw_sha256: spec.image.raw_sha256,
+      raw_bytes: spec.image.raw_bytes,
+    });
     expect(JSON.stringify(page)).not.toContain("raw.zst");
     // The host files are on the page, to be signed over and written, and what a node is expected
     // to report back of them is not: that stays with the API, as the packages' digest does.

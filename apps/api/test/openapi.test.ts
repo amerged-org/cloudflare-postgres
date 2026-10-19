@@ -299,6 +299,23 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(file.responses["206"]!.content).not.toHaveProperty("text/plain");
   });
 
+  it("documents that the API verifies a release's signature, with the image in what is signed, and refuses one that does not verify", async () => {
+    const management = await document("/v1/openapi.json");
+    const register = operation(management, "/v1/fleet/releases/{id}", "put");
+    expect(register.description).toContain("verifies it");
+    expect(register.description).toContain("image");
+    expect(register.description).not.toContain("cannot check");
+    expect(register.description).not.toContain("holds no key");
+    expect(register.responses["400"]).toBeDefined();
+    // Why an audited server waits for its installer: the firewall, or a release nobody signed.
+    const blockers = JSON.stringify(management).match(
+      /"install_blocker":\{[^}]*\}/g,
+    );
+    expect(blockers).not.toBeNull();
+    for (const blocker of blockers!)
+      expect(blocker).toContain('"release_unverified"');
+  });
+
   it("documents the scopes of the keys, their expiry and the audit log", async () => {
     const doc = await document("/v1/openapi.json");
     const schemas = doc.components!.schemas as Record<

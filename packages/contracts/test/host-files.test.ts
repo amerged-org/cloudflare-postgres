@@ -189,10 +189,10 @@ it("a list is ascending by path with no path twice, has at least one file and at
 });
 
 it("the manifest of a release lists each host file after the lock, one line each, in path order", () => {
-  expect(RELEASE_MANIFEST_DOMAIN).toBe("pgcf-release-manifest/v2\n");
+  expect(RELEASE_MANIFEST_DOMAIN).toBe("pgcf-release-manifest/v3\n");
   const text = signedReleaseManifest(release());
   const lines = text.split("\n");
-  expect(lines[0]).toBe("pgcf-release-manifest/v2");
+  expect(lines[0]).toBe("pgcf-release-manifest/v3");
   expect(lines.slice(-5)).toEqual([
     `os.package_lock=${"5".repeat(64)}:90000`,
     "os.host_file=/etc/systemd/system/modprobe@loop.service symlink-to-dev-null - - daemon_reload",
@@ -307,7 +307,9 @@ it("a release registers its host files and the digest a node reports, and the sp
   const { packages_sha256, kernel_release, host_files_sha256, ...installed } =
     spec.os;
   void [packages_sha256, kernel_release, host_files_sha256];
-  const page = { id: "v1", binaries: spec.binaries };
+  const { url, format, ...identity } = spec.image;
+  void [url, format];
+  const page = { id: "v1", image: identity, binaries: spec.binaries };
   expect(NodeRelease.safeParse({ ...page, os: installed }).success).toBe(true);
   expect(NodeRelease.safeParse({ ...page, os: spec.os }).success).toBe(false);
   expect(
@@ -351,8 +353,11 @@ it("the page states the shape of the host files and no rule: what the contract m
   const { packages_sha256, kernel_release, host_files_sha256, ...installed } =
     spec.os;
   void [packages_sha256, kernel_release, host_files_sha256];
+  const { url, format, ...identity } = spec.image;
+  void [url, format];
   const page = (host_files: unknown) => ({
     id: "v1",
+    image: identity,
     binaries: spec.binaries,
     os: { ...installed, host_files },
   });
@@ -466,8 +471,8 @@ function registered() {
   };
 }
 function release() {
-  const { signature: _signature, image: _image, ...rest } = registered();
-  void [_signature, _image];
+  const { signature: _signature, ...rest } = registered();
+  void _signature;
   return { id: "sha-0123456789ab", ...rest };
 }
 // The digest of `list()`, computed once for the fixtures above.

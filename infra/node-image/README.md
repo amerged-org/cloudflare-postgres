@@ -177,7 +177,8 @@ What the script does, and what the API checks:
   list is not the one the summary states (`host_files_sha256`): check out the commit that was
   built (`--tree DIR` names another tree).
 - It reads the signature and checks it against the release key before it uploads a byte: a release
-  without a signature, or with one that does not verify, is refused, because every node would refuse it.
+  without a signature, or with one that does not verify (the signature covers the image's compressed
+  and raw sha256 and size too), is refused, because the API and every node would refuse it.
 - It uploads `pgcf-node.raw.zst`, `packages.lock.json` and the four binaries to
   `node-images/<version>/`, and every host file that has content to
   `node-images/<version>/host-files/<sha256>` (two files of the same bytes are one object), with
@@ -190,9 +191,11 @@ What the script does, and what the API checks:
 - It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file, the host
   files (path, mode, sha256, size and how each takes effect) with the digest a node that holds them
   reports, and the signature. The API refuses a registration without a well-formed signature (64
-  bytes in hex; it holds no key, so it stores and shows the signature and cannot check it), one
-  whose host files digest is not the list's own, and one unless the bucket holds every file and
-  every host file at that size with that sha256, and it names
+  bytes in hex), one whose signature is not the release key's signature of the registration's own
+  manifest (400: it verifies with the public key built into its code, so a signature of another
+  key, of another release or of other digests, an image's included, is refused and nothing is
+  stored), one whose host files digest is not the list's own, and one unless the bucket holds every
+  file and every host file at that size with that sha256, and it names
   every URL of the stored, immutable spec itself, as `/node/v1/releases/<version>/<file>` on its
   own origin (`NODE_API_ORIGIN`). Nothing in the registration is a URL or a credential. The script
   prints the release id and spec sha256 of the answer, and fails if the stored spec is another

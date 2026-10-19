@@ -109,9 +109,16 @@ async function pageRelease(
   const spec = FleetReleaseSpec.parse(JSON.parse(row.spec_json));
   // The kernel and the digests of the packages and the host files a node is expected to report
   // stay with the API, which compares them; the host files themselves are on the page, because
-  // the agent writes them and the release key signs them.
+  // the agent writes them and the release key signs them. So is the image's identity (never its
+  // URL, which only the installer reads): the agent builds the signed manifest from its page.
   return NodeRelease.parse({
     id: row.id,
+    image: NodeRelease.shape.image.parse({
+      sha256: spec.image.sha256,
+      size_bytes: spec.image.size_bytes,
+      raw_sha256: spec.image.raw_sha256,
+      raw_bytes: spec.image.raw_bytes,
+    }),
     binaries: spec.binaries,
     os: NodeRelease.shape.os.strip().parse(spec.os),
   });

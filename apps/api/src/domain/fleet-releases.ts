@@ -28,6 +28,7 @@ import { requireAdminRead, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
 import { hintNode } from "./node-hints.ts";
+import { releaseIsSigned } from "./release-signature.ts";
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -171,8 +172,16 @@ export async function approveFleetRelease(
       "invalid_request",
       "os.host_files_sha256 is not the digest of os.host_files",
     );
-  const spec = registeredSpec(c, id, registration),
-    specJson = canonical(spec),
+  const spec = registeredSpec(c, id, registration);
+  // The release key signed this release or nobody did: a node is installed from the image of a
+  // registered release, and an agent is updated to its binaries, so a spec whose signature is not
+  // the key's signature of its own facts is refused before the bucket or the database is read.
+  if (!(await releaseIsSigned(id, spec)))
+    throw new ApiError(
+      "invalid_request",
+      "signature is not the release key's signature of this release's manifest (its id, image, binaries, package lock, snapshot and host files)",
+    );
+  const specJson = canonical(spec),
     hash = await sha256(specJson);
   const read = async () => {
     const current = await release(c.env.DB, id);

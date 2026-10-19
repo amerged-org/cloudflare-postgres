@@ -245,17 +245,25 @@ export async function packagesSha256(
   );
 }
 
+/**
+ * What an image is, whatever carries it: the sha256 and size of the compressed disk the pull
+ * installer downloads and the sha256 and size of the raw disk it writes (whole sectors). These are
+ * the four facts the installer checks, and the four the release key signs.
+ */
+export const ImageIdentity = z.strictObject({
+  sha256: Sha256,
+  size_bytes: Positive,
+  raw_sha256: Sha256,
+  raw_bytes: Positive.refine((value) => value % 512 === 0),
+});
+export type ImageIdentity = z.infer<typeof ImageIdentity>;
 /** The disk a new node is installed from (plan 9.2); the pull installer downloads it, compressed. */
-export const FleetNodeImage = z.strictObject({
+export const FleetNodeImage = ImageIdentity.safeExtend({
   url: HttpsUrl.refine((value) => {
     const url = new URL(value);
     return !url.username && !url.password && !url.search && !url.hash;
   }),
-  sha256: Sha256,
   format: z.literal("raw.zst"),
-  size_bytes: Positive,
-  raw_sha256: Sha256,
-  raw_bytes: Positive.refine((value) => value % 512 === 0),
 });
 export type FleetNodeImage = z.infer<typeof FleetNodeImage>;
 
@@ -271,9 +279,10 @@ export const FleetReleaseSpec = z.strictObject({
   os: FleetReleaseOs,
   /**
    * The release key's signature of the release's manifest (`signedReleaseManifest`), made in CI.
-   * The API stores it and cannot check it: a node does, with the key compiled into its agent,
-   * before it installs anything of the release. It is not on the node's page; a node reads it at
-   * `RELEASE_SIGNATURE_FILE` beside the binaries.
+   * The API verifies it with the release public key, a constant of its code, when the release is
+   * registered and again before it renders an installer from the release's image; a node verifies
+   * it with the key compiled into its agent before it installs anything of the release. It is not
+   * on the node's page; a node reads it at `RELEASE_SIGNATURE_FILE` beside the binaries.
    */
   signature: ReleaseSignature,
 });
@@ -335,9 +344,10 @@ function apiOrigin(origin: string): string {
 /**
  * The first line of every signed manifest. It names what is signed and its format, so that a
  * signature made for any other purpose, or for another version of this format, never verifies as
- * a release's.
+ * a release's. v3 added the image's identity to the host files of v2; nothing signed as v1 or v2
+ * is in the field.
  */
-export const RELEASE_MANIFEST_DOMAIN = "pgcf-release-manifest/v2\n";
+export const RELEASE_MANIFEST_DOMAIN = "pgcf-release-manifest/v3\n";
 /**
  * The file name under which the API answers with a release's signature, beside the binaries. It
  * is no uploaded file (`RELEASE_FILES`): the API serves the signature of the stored spec.
@@ -371,6 +381,7 @@ const SignedDigest = z.strictObject({ sha256: Sha256, size_bytes: Positive });
  */
 export const ReleaseManifestFields = z.strictObject({
   id: FleetReleaseId,
+  image: ImageIdentity,
   binaries: z.strictObject(
     Object.fromEntries(
       RELEASE_BINARY_FILES.map((file) => [file, SignedDigest]),
@@ -398,6 +409,12 @@ export function releaseManifestFields(
   });
   return ReleaseManifestFields.parse({
     id: release.id,
+    image: {
+      sha256: release.image?.sha256,
+      size_bytes: release.image?.size_bytes,
+      raw_sha256: release.image?.raw_sha256,
+      raw_bytes: release.image?.raw_bytes,
+    },
     binaries: Object.fromEntries(
       RELEASE_BINARY_FILES.map((file) => [file, pin(release.binaries?.[file])]),
     ),
@@ -412,23 +429,27 @@ export function releaseManifestFields(
 /**
  * What the release key signs for a release (plan 9.3): the domain line and then one `name=value`
  * line each, in this order and no other, every line ended by a line feed: the release id; the
- * sha256 and size of each of the four binaries a node runs; the Debian snapshot its packages come
- * from; the sha256 and size of the package lock, which in turn pins every package and every
- * download (cloudflared) a maintenance cycle installs; and one line for each host file, in path
- * order: `os.host_file=<path> <kind> <mode> <digest> <apply>`, with `-` for the mode and digest of
- * a mask. A digest is `<sha256>:<size>`. The image is the installer's and not the agent's, and the
- * kernel and the digests of packages and host files a node reports are derived from the lock and
- * the list, so they are not in it. Every value is checked against its pattern, which holds no
- * line feed or space: no two releases have the same manifest. The page of a node carries every
- * fact in it (`NodeRelease`), which is how the agent builds the same text.
+ * sha256 and size of the compressed image (`image.zst`) and of the raw image (`image.raw`), which
+ * are the four facts the installer checks of the disk it writes; the sha256 and size of each of
+ * the four binaries a node runs; the Debian snapshot its packages come from; the sha256 and size
+ * of the package lock, which in turn pins every package and every download (cloudflared) a
+ * maintenance cycle installs; and one line for each host file, in path order:
+ * `os.host_file=<path> <kind> <mode> <digest> <apply>`, with `-` for the mode and digest of a
+ * mask. A digest is `<sha256>:<size>`. The kernel and the digests of packages and host files a
+ * node reports are derived from the lock and the list, so they are not in it. Every value is
+ * checked against its pattern, which holds no line feed or space: no two releases have the same
+ * manifest. The page of a node carries every fact in it (`NodeRelease`), which is how the agent
+ * builds the same text.
  */
 export function signedReleaseManifest(release: ReleaseManifestFields): string {
-  const { id, binaries, os } = releaseManifestFields(release);
+  const { id, image, binaries, os } = releaseManifestFields(release);
   const pin = ({ sha256, size_bytes }: z.infer<typeof SignedDigest>) =>
     `${sha256}:${size_bytes}`;
   return [
     RELEASE_MANIFEST_DOMAIN.slice(0, -1),
     `release=${id}`,
+    `image.zst=${pin(image)}`,
+    `image.raw=${pin({ sha256: image.raw_sha256, size_bytes: image.raw_bytes })}`,
     ...RELEASE_BINARY_FILES.map(
       (file) => `binary.${file}=${pin(binaries[file])}`,
     ),
@@ -437,6 +458,41 @@ export function signedReleaseManifest(release: ReleaseManifestFields): string {
     ...os.host_files.map((file) => `os.host_file=${hostFileLine(file)}`),
     "",
   ].join("\n");
+}
+
+/**
+ * Whether `signature`, as the API stores it (128 lower-case hex digits), is the Ed25519 signature
+ * that the holder of `publicKey` (64 lower-case hex digits) made of the manifest of `release`,
+ * which is rebuilt from the release's own facts (`signedReleaseManifest`). Anything that is not a
+ * key, not a signature or not a release's facts does not verify, and nothing throws. The API
+ * Worker calls this with the key the agent trusts (`release-key.generated.ts`) when a release is
+ * registered and again when a node is installed from it, so that a release nobody signed is never
+ * written to a disk.
+ */
+export async function releaseSignatureVerifies(
+  publicKey: string,
+  release: ReleaseManifestFields,
+  signature: string,
+): Promise<boolean> {
+  if (
+    !/^[0-9a-f]{64}$/.test(publicKey) ||
+    !ReleaseSignature.safeParse(signature).success
+  )
+    return false;
+  const bytes = (hex: string) =>
+    Uint8Array.from(hex.match(/../g)!, (pair) => Number.parseInt(pair, 16));
+  try {
+    return await crypto.subtle.verify(
+      "Ed25519",
+      await crypto.subtle.importKey("raw", bytes(publicKey), "Ed25519", false, [
+        "verify",
+      ]),
+      bytes(signature),
+      new TextEncoder().encode(signedReleaseManifest(release)),
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -455,10 +511,7 @@ const Digest = z.strictObject({ sha256: Sha256, size_bytes: Positive });
  * receives points at its own delivery route and nowhere else.
  */
 export const FleetReleaseRegistration = z.strictObject({
-  image: Digest.safeExtend({
-    raw_sha256: Sha256,
-    raw_bytes: Positive.refine((value) => value % 512 === 0),
-  }),
+  image: ImageIdentity,
   binaries: z.strictObject({
     "pgcf-agent": Digest,
     "pgcf-native-gateway": Digest,
