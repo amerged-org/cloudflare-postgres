@@ -1506,6 +1506,15 @@ mod tests {
 
         // Stopped, recorded, off the gateway's writers and out of admission's awake set.
         assert!(!rig.machine.running(&entry.id));
+        // The proof's clean stop was also autoprewarm's: the list of the shared buffers is in the
+        // data directory for the next start, and the proof did not mind the file.
+        assert!(
+            rig.core
+                .layout()
+                .data(&entry.id)
+                .join("autoprewarm.blocks")
+                .exists()
+        );
         let state = db.state().unwrap();
         let record = state.record.clone().unwrap();
         assert!(record.valid());
