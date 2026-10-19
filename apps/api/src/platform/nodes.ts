@@ -15,7 +15,7 @@ import {
   type AdmissionMutation,
 } from "../domain/admission-mutations.ts";
 import type { ApiContext, Env } from "../env.ts";
-import { requireScope } from "../middleware/auth.ts";
+import { requireAdminRead, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "./pagination.ts";
 import {
@@ -152,7 +152,7 @@ export async function getNodeAddition(
   c: ApiContext,
   id: string,
 ): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   return c.json(await readNodeAddition(c.env.DB, id));
 }
 export async function markLostNode(
@@ -211,14 +211,14 @@ export async function getNodeMaintenance(
   id: string,
   operation: string,
 ): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const maintenance = await readNodeMaintenance(c.env.DB, id, operation);
   if (!maintenance)
     throw new ApiError("not_found", "Maintenance operation not found");
   return c.json(maintenance);
 }
 export async function listNodeAdditions(c: ApiContext): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const pagination = page(c),
     cursor = pagination.where("created_at", "operation_id");
   const result = await c.env.DB.prepare(
@@ -270,7 +270,7 @@ export async function getCapacityPolicy(
   c: ApiContext,
   id: string,
 ): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   RegionId.parse(id);
   const row = await c.env.DB.prepare(
     "SELECT * FROM node_region_policies WHERE region_id=?",
@@ -380,7 +380,7 @@ export async function capacityDecision(
   c: ApiContext,
   id: string,
 ): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const decision = await runNodeCapacity(c.env, id, true);
   console.log(JSON.stringify({ event: "node_capacity_decision", ...decision }));
   return c.json(decision);

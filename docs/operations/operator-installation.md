@@ -255,7 +255,7 @@ The live node ceiling is removed (`max_nodes:null`) and no capacity-mail credent
 recipient are configured. Purchases and autoscale stay off; enabling them, or any new paid
 resource, needs the owner's explicit, costed go.
 
-Management is API-only and requires an administrator key; an integrator's project key does not
+Management is API-only and requires an administrator key of scope `admin` (`admin_read` only reads); an integrator's project key does not
 control infrastructure purchases. Read `GET /v1/regions/{id}/capacity-policy`, then PUT the
 intended complete policy to the same route. Existing fields retain their documented
 full-replacement semantics; omitting newly added settings or `max_nodes` preserves stored values
