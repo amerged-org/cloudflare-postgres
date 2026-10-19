@@ -130,6 +130,7 @@ pub(crate) fn timing() -> Timing {
         recovery_retry: Duration::from_millis(100),
         recovery_retry_maximum: Duration::from_millis(400),
         settle: Duration::from_secs(10),
+        detail: Duration::from_millis(100),
     }
 }
 

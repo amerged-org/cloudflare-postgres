@@ -40,6 +40,8 @@ export const WAKE_REDELIVER_MS = 3_000;
 /**
  * Phases of a wake on the node; wake results and wake events time them in ms. `admission` is the
  * whole check before the start: `volume_check` to `archive`, in the order the agent takes them.
+ * `release` is the time from the end of `start` to the writer in the gateway's table, and holds
+ * `roles`, the page's roles written before anyone logs in.
  */
 export const WAKE_PHASES = [
   "admission",
@@ -51,6 +53,7 @@ export const WAKE_PHASES = [
   "archive",
   "queue_wait",
   "start",
+  "roles",
   "release",
 ] as const;
 export type WakePhase = (typeof WAKE_PHASES)[number];

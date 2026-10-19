@@ -58,6 +58,13 @@ impl Ring {
 }
 
 static RING: Mutex<Ring> = Mutex::new(Ring::new());
+/// Every event this test process kept, which reports do not drain, for a test that waits for one.
+#[cfg(test)]
+static SEEN: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) fn seen() -> Vec<Value> {
+    SEEN.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
 fn ring() -> std::sync::MutexGuard<'static, Ring> {
     RING.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -66,6 +73,10 @@ fn ring() -> std::sync::MutexGuard<'static, Ring> {
 pub(crate) fn record(line: &Value) {
     let at = facts::timestamp(crate::agent::now_ms());
     if let Some(event) = sanitize(line, &at) {
+        #[cfg(test)]
+        SEEN.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(event.clone());
         ring().push(event);
     }
 }

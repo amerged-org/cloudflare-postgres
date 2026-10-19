@@ -167,6 +167,14 @@ fn limits(memory_mib: u64, cpu_millicores: u32) -> Limits {
     }
 }
 
+/// A start without the time the agent asked for it, which differs between two asks of one unit.
+fn same_unit(started: super::Started) -> super::Started {
+    super::Started {
+        requested_us: None,
+        ..started
+    }
+}
+
 async fn within<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(60), future)
         .await
@@ -231,7 +239,10 @@ async fn a_database_unit_starts_serves_changes_its_limits_and_stops() {
     assert!(running.contains(&state), "{running:?}");
 
     // A start of a running unit finds it running.
-    assert_eq!(within(units.start(id)).await.unwrap(), started);
+    assert_eq!(
+        same_unit(within(units.start(id)).await.unwrap()),
+        same_unit(started.clone())
+    );
 
     // Live limits, without a restart and without a reload.
     assert_eq!(cgroup_file(started.main_pid, "cpu.max"), "max 100000");
@@ -278,6 +289,61 @@ async fn a_database_unit_starts_serves_changes_its_limits_and_stops() {
 
 #[tokio::test]
 #[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
+async fn a_start_has_a_timeline_of_systemds_exec_and_the_three_messages_of_the_journal() {
+    if !lab() {
+        return;
+    }
+    let database = Database::new(6);
+    let id = database.id.as_str();
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    let asked = super::monotonic_micros().unwrap();
+    let started = within(units.start(id)).await.unwrap();
+    let requested = started.requested_us.expect("the clock is read on Linux");
+    assert!(requested >= asked && requested - asked < 1_000_000);
+
+    // The exec follows the request within a moment, and journald has the postmaster's three
+    // messages shortly after the start; the agent reads them seconds later.
+    let mut timeline = units.timeline(id, &started).await.unwrap();
+    for _ in 0..100 {
+        if timeline.startup.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        timeline = units.timeline(id, &started).await.unwrap();
+    }
+    let job_to_exec = timeline.job_to_exec_us.expect("the exec after the request");
+    assert!(job_to_exec < 5_000_000, "{timeline:?}");
+    let startup = timeline.startup.expect("the three messages of the start");
+    for gap in [
+        startup.exec_to_starting_us,
+        startup.starting_to_shut_down_us,
+        startup.shut_down_to_ready_us,
+    ] {
+        assert!(gap < 10_000_000, "{timeline:?}");
+    }
+
+    // The unit started again: the exec time and the journal are the new invocation's, not this
+    // start's.
+    within(units.stop(id)).await.unwrap();
+    let again = within(units.start(id)).await.unwrap();
+    assert_ne!(again.invocation_id, started.invocation_id);
+    assert_eq!(
+        units.timeline(id, &started).await.unwrap(),
+        super::Timeline::default()
+    );
+    // And the cgroup of the running unit counts its throttling, which the sample parses.
+    let throttle =
+        crate::sample::throttle(&fs::read_to_string(super::cpu_stat_path(id).unwrap()).unwrap());
+    assert_eq!(
+        throttle.map(|t| t.nr_throttled),
+        Some(0),
+        "no quota, no throttling"
+    );
+    within(units.stop(id)).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
 async fn a_unit_that_is_still_starting_is_waited_for() {
     if !lab() {
         return;
@@ -307,7 +373,7 @@ async fn a_unit_that_is_still_starting_is_waited_for() {
     // A start of a unit that is starting joins the start under way: both see the same unit.
     let (waited, joined) = tokio::join!(within(units.wait_started(id)), within(units.start(id)),);
     let started = waited.unwrap();
-    assert_eq!(joined.unwrap(), started);
+    assert_eq!(same_unit(joined.unwrap()), same_unit(started.clone()));
     assert_eq!(started.uid, database.uid);
     assert_eq!(
         units.state(id).await.unwrap().main_pid,

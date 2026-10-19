@@ -13,12 +13,15 @@
 //!   start; `stop` lifts it, and so does `set_cpu_quota(.., None)`, which the agent also calls for
 //!   every stopped unit when it starts.
 //! - A database's Linux user and uid are `users`.
+//! - What a start took, off the path of a wake: systemd's exec time of the postmaster and the
+//!   journal's times of PostgreSQL's three start messages (`timeline`, `journal`).
 //!
 //! - The memory ceiling of `pgcf.slice`, which holds every database, is the operator's awake-database
 //!   budget (`set_slice_memory`): the kernel's backstop under either memory rule. The image's slice
 //!   has 80 % of RAM until the agent sets it.
 //!
 //! The agent runs as root on the node; systemd answers these calls without further authorization.
+pub mod journal;
 pub mod limits;
 pub mod ready;
 pub mod users;
@@ -217,6 +220,48 @@ pub struct Started {
     pub uid: u32,
     /// The Unix socket it listens on, as its `postmaster.pid` says.
     pub socket: PathBuf,
+    /// When the agent asked systemd to start the unit, in microseconds of `CLOCK_MONOTONIC`;
+    /// `None` for a start the agent only waited for, and where the clock is not read.
+    pub requested_us: Option<u64>,
+}
+
+/// What systemd and the journal recorded of one start (`Units::timeline`), in microseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timeline {
+    /// The agent's `StartUnit` to the exec of the postmaster.
+    pub job_to_exec_us: Option<u64>,
+    /// The exec to the three messages of PostgreSQL's start.
+    pub startup: Option<journal::Startup>,
+}
+
+/// `CLOCK_MONOTONIC` in microseconds: the clock of systemd's `*TimestampMonotonic` properties and
+/// of the journal's `__MONOTONIC_TIMESTAMP`.
+#[cfg(target_os = "linux")]
+fn monotonic_micros() -> Option<u64> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes the `timespec` it is given and nothing else.
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    let seconds = u64::try_from(now.tv_sec).ok()?;
+    let nanos = u64::try_from(now.tv_nsec).ok()?;
+    (read == 0).then(|| seconds * 1_000_000 + nanos / 1_000)
+}
+#[cfg(not(target_os = "linux"))]
+fn monotonic_micros() -> Option<u64> {
+    None
+}
+
+/// The `cpu.stat` of a database's unit in the cgroup tree, where its throttling is counted;
+/// `None` for an argument that is no database ID.
+pub fn cpu_stat_path(database: &str) -> Option<PathBuf> {
+    valid_pattern("database", database).then(|| {
+        PathBuf::from(format!(
+            "/sys/fs/cgroup/{SLICE}/{}/cpu.stat",
+            unit_name(database)
+        ))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -256,8 +301,9 @@ impl Units {
         }
     }
 
-    /// Runs a start, stop or restart job and waits for its result.
-    async fn job(&self, unit: &str, kind: JobKind) -> Result<(), Error> {
+    /// Runs a start, stop or restart job and waits for its result. It gives the time the job was
+    /// asked for (`Started::requested_us`).
+    async fn job(&self, unit: &str, kind: JobKind) -> Result<Option<u64>, Error> {
         // Listening starts before the job exists: a job can end before the reply to its start
         // reaches this client. The bus filters the signals to this unit's.
         let mut removed = self
@@ -267,6 +313,7 @@ impl Units {
             .await?;
         // A start never replaces a job that is queued, and a stop does: an order to stop wins over
         // a start that is under way, whose own waiter then sees `canceled`.
+        let requested = monotonic_micros();
         let job = match kind {
             JobKind::Stop => self.manager.stop_unit(unit, "replace").await?,
             JobKind::Start => self.manager.start_unit(unit, "fail").await?,
@@ -277,7 +324,7 @@ impl Units {
                 message.body().deserialize()?;
             if path == job {
                 return match result.as_str() {
-                    "done" => Ok(()),
+                    "done" => Ok(requested),
                     _ => Err(Error::Job {
                         unit: unit.to_string(),
                         result,
@@ -301,16 +348,21 @@ impl Units {
             .await?)
     }
 
+    /// The unit's proxy on `Service`, which reads its properties on every call.
+    async fn service_proxy(&self, unit: &str) -> Result<dbus::ServiceProxy<'static>, Error> {
+        Ok(dbus::ServiceProxy::builder(&self.connection)
+            .path(unit_path(unit))?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await?)
+    }
+
     /// The state of a database's unit. systemd loads a unit when it is asked for it, so a database
     /// that never started is `inactive`, with the memory ceiling of the unit template.
     pub async fn state(&self, database: &str) -> Result<UnitState, Error> {
         let unit_name = Self::unit_of(database)?;
         let unit = self.unit_proxy(&unit_name, CacheProperties::No).await?;
-        let service = dbus::ServiceProxy::builder(&self.connection)
-            .path(unit_path(&unit_name))?
-            .cache_properties(CacheProperties::No)
-            .build()
-            .await?;
+        let service = self.service_proxy(&unit_name).await?;
         let (active, invocation, pid, uid, memory) = tokio::join!(
             unit.active_state(),
             unit.invocation_id(),
@@ -339,7 +391,7 @@ impl Units {
     }
 
     /// The facts of a unit that finished starting.
-    async fn started(&self, database: &str) -> Result<Started, Error> {
+    async fn started(&self, database: &str, requested_us: Option<u64>) -> Result<Started, Error> {
         let state = self.state(database).await?;
         if state.active != ActiveState::Active {
             return Err(Error::NotReady("unit_not_active"));
@@ -354,14 +406,39 @@ impl Units {
                 .ok_or(Error::NotReady("no_invocation_id"))?,
             uid: state.uid.ok_or(Error::NotReady("no_uid"))?,
             socket,
+            requested_us,
+        })
+    }
+
+    /// What systemd and the journal recorded of the start that gave `started`: the time from the
+    /// agent's request to the exec of the postmaster, and from the exec to the three messages of
+    /// PostgreSQL's start. Empty where the unit started again since, so that its exec time and its
+    /// journal are another invocation's. A journal that cannot be read leaves the second part out.
+    pub async fn timeline(&self, database: &str, started: &Started) -> Result<Timeline, Error> {
+        let unit_name = Self::unit_of(database)?;
+        let state = self.state(database).await?;
+        let exec_us = self
+            .service_proxy(&unit_name)
+            .await?
+            .exec_main_start_timestamp_monotonic()
+            .await?;
+        if exec_us == 0 || state.invocation_id.as_deref() != Some(started.invocation_id.as_str()) {
+            return Ok(Timeline::default());
+        }
+        let journal = journal::read(&started.invocation_id).await.ok();
+        Ok(Timeline {
+            job_to_exec_us: started
+                .requested_us
+                .and_then(|requested| exec_us.checked_sub(requested)),
+            startup: journal.and_then(|journal| journal::startup(&journal, exec_us)),
         })
     }
 
     /// Starts the unit and returns when PostgreSQL accepts connections. Dropping the future does
     /// not stop the start.
     pub async fn start(&self, database: &str) -> Result<Started, Error> {
-        self.job(&Self::unit_of(database)?, JobKind::Start).await?;
-        self.started(database).await
+        let requested = self.job(&Self::unit_of(database)?, JobKind::Start).await?;
+        self.started(database, requested).await
     }
 
     /// Waits for a unit that is starting, one the agent found `activating` when it started, and
@@ -376,7 +453,7 @@ impl Units {
         let mut changes = unit.receive_active_state_changed().await;
         loop {
             match ActiveState::parse(&unit.active_state().await?) {
-                Some(ActiveState::Active) => return self.started(database).await,
+                Some(ActiveState::Active) => return self.started(database, None).await,
                 Some(ActiveState::Activating) => {}
                 _ => return Err(Error::NotReady("unit_not_active")),
             }
@@ -427,7 +504,7 @@ impl Units {
         } else {
             JobKind::Start
         };
-        self.job(name, kind).await
+        self.job(name, kind).await.map(drop)
     }
 
     /// Sets the CPU quota of a database's unit until the next boot, or lifts it with `None`.

@@ -1634,6 +1634,11 @@
                         "minimum": 0,
                         "maximum": 600000
                       },
+                      "roles": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
                       "release": {
                         "type": "integer",
                         "minimum": 0,

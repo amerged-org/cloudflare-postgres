@@ -16,6 +16,7 @@
       "archive",
       "queue_wait",
       "start",
+      "roles",
       "release"
     ],
     "WAKE_OUTCOMES": ["started", "refused"],

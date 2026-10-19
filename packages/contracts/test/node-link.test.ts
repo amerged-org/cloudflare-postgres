@@ -853,7 +853,8 @@ describe("what a node reports", () => {
         config: 1,
         archive: 1,
         start: 61,
-        release: 1,
+        roles: 2,
+        release: 3,
       },
     };
     expect(

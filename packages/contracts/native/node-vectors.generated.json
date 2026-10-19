@@ -8575,7 +8575,8 @@
               "archive": 1,
               "queue_wait": 1,
               "start": 61,
-              "release": 1
+              "roles": 2,
+              "release": 3
             }
           },
           {
@@ -8656,7 +8657,8 @@
               "archive": 1,
               "queue_wait": 1,
               "start": 61,
-              "release": 1
+              "roles": 2,
+              "release": 3
             }
           }
         ]
@@ -8687,7 +8689,8 @@
               "archive": 1,
               "queue_wait": 1,
               "start": 61,
-              "release": 1
+              "roles": 2,
+              "release": 3
             }
           }
         ]
@@ -8718,7 +8721,8 @@
               "archive": 1,
               "queue_wait": 1,
               "start": 61,
-              "release": 1
+              "roles": 2,
+              "release": 3
             }
           },
           {
@@ -8899,7 +8903,8 @@
               "archive": 1,
               "queue_wait": 1,
               "start": 61,
-              "release": 1
+              "roles": 2,
+              "release": 3
             }
           }
         ]
@@ -8930,7 +8935,8 @@
               "archive": 1,
               "queue_wait": 1,
               "start": 61,
-              "release": 1
+              "roles": 2,
+              "release": 3
             },
             "reason": "no_room"
           }
@@ -8962,7 +8968,8 @@
               "archive": 1,
               "queue_wait": 1,
               "start": 61,
-              "release": 1
+              "roles": 2,
+              "release": 3
             }
           }
         ]

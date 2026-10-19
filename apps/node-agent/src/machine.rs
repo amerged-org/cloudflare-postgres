@@ -8,7 +8,7 @@ use crate::{
     layout::Layout,
     link::NodeIdentity,
     storage::{self, Inventory, NoRoom, PoolSample, Removal, VolumeId},
-    units::{self, Started, UnitState, limits::Limits},
+    units::{self, Started, Timeline, UnitState, limits::Limits},
 };
 use std::{collections::BTreeMap, future::Future, io, num::NonZeroU32, path::PathBuf};
 
@@ -183,6 +183,13 @@ pub trait Machine: Send + Sync + 'static {
     fn units(&self) -> impl Future<Output = Result<Vec<UnitState>, units::Error>> + Send;
     /// Starts the unit and returns when PostgreSQL accepts connections.
     fn start(&self, database: &str) -> impl Future<Output = Result<Started, units::Error>> + Send;
+    /// What systemd and the journal recorded of the start that gave `started`: empty where the
+    /// unit started again since.
+    fn start_timeline(
+        &self,
+        database: &str,
+        started: &Started,
+    ) -> impl Future<Output = Result<Timeline, units::Error>> + Send;
     /// Waits for a unit that is starting, one the agent found activating when it started.
     fn wait_started(
         &self,
@@ -244,6 +251,8 @@ pub trait Machine: Send + Sync + 'static {
     fn memory(&self) -> Option<Memory>;
     /// The CPU times since boot, summed over the cores.
     fn cpu(&self) -> Option<CpuTimes>;
+    /// The throttling of the database's unit since it started; `None` where it has no cgroup.
+    fn throttle(&self, database: &str) -> Option<Throttle>;
 }
 
 /// `MemTotal` and `MemAvailable` of `/proc/meminfo`.
@@ -253,6 +262,14 @@ pub struct Memory {
     pub available_bytes: u64,
 }
 
+/// How often a unit's CPU quota stopped it, and for how long: `nr_throttled` and `throttled_usec`
+/// of its `cpu.stat`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Throttle {
+    pub nr_throttled: u64,
+    pub throttled_usec: u64,
+}
+
 /// The first line of `/proc/stat` and the cores it sums.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuTimes {
@@ -260,6 +277,9 @@ pub struct CpuTimes {
     pub busy: u64,
     /// All time, in clock ticks.
     pub total: u64,
+    /// Time the hypervisor ran something else while this machine wanted the CPU, in clock ticks,
+    /// summed over the cores. It is part of `busy`.
+    pub steal: u64,
     pub cores: u32,
     /// Clock ticks per second.
     pub ticks_per_second: u64,

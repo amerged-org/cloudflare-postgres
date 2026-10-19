@@ -69,6 +69,9 @@ pub trait Service {
     fn uid(&self) -> zbus::Result<u32>;
     #[zbus(property)]
     fn memory_max(&self) -> zbus::Result<u64>;
+    /// When the main process was exec'd, in microseconds of `CLOCK_MONOTONIC`; 0 before the first.
+    #[zbus(property)]
+    fn exec_main_start_timestamp_monotonic(&self) -> zbus::Result<u64>;
 }
 
 /// A property as `SetUnitProperties` takes it.

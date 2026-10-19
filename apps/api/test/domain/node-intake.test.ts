@@ -346,7 +346,8 @@ describe("the events of a node", () => {
         config: 1,
         archive: 1,
         start: 61,
-        release: 1,
+        roles: 2,
+        release: 3,
       },
     };
     expect((await post(f, "/node/v1/events", { events: [wake] })).status).toBe(
@@ -359,7 +360,14 @@ describe("the events of a node", () => {
       node_id: f.node,
       database_id: wake.database,
       outcome: "started",
-      phases_ms: { volume_check: 1, repair_check: 1, config: 1, start: 61 },
+      phases_ms: {
+        volume_check: 1,
+        repair_check: 1,
+        config: 1,
+        start: 61,
+        roles: 2,
+        release: 3,
+      },
     });
     expect(await minutes(f.node)).toEqual([]);
   });
