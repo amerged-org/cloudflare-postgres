@@ -703,6 +703,101 @@ describe("the results of a node's orders", () => {
     );
   });
 
+  it("only fails the resume that a refused sleep made, because that database is awake", async () => {
+    const f = await fixture();
+    const db = await created(f);
+    await report(f, db.id, 1);
+    const suspended = DatabaseWithOperation.parse(
+      await (await suspend(f, db.id)).json(),
+    );
+    expect(
+      await verdicts(
+        await report(f, db.id, 2, "ready", { refusal: "power_busy" }),
+      ),
+    ).toEqual(["accept"]);
+    // The refusal made a resume of the database that runs; the node holds the order back (a
+    // maintenance window, say) and fails it.
+    const made = await row(db.id);
+    expect(made).toMatchObject({
+      desired_state: "running",
+      generation: 3,
+      observed_power: "awake",
+    });
+    const resumeOperation = made!.power_operation as string;
+    expect(await operation(resumeOperation)).toMatchObject({
+      kind: "database.resume",
+      status: "pending",
+    });
+    expect(
+      await (await orderResult(f, resumeOperation, "maintenance")).json(),
+    ).toEqual({ databases: [], orders: 1 });
+    expect(await status(resumeOperation)).toEqual({
+      status: "failed",
+      error_code: "maintenance",
+    });
+    // Nothing suspends it again: it runs, it admits connections once its ready report is in, and
+    // the one suspension in its history is the refused one.
+    expect(await row(db.id)).toMatchObject({
+      desired_state: "running",
+      generation: 3,
+      observed_power: "awake",
+    });
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT id FROM operations WHERE database_id=? AND kind IN('database.suspend','database.hibernate')",
+        )
+          .bind(db.id)
+          .all<{ id: string }>()
+      ).results.map((value) => value.id),
+    ).toEqual([suspended.operation.id]);
+    expect(await verdicts(await report(f, db.id, 3))).toEqual(["accept"]);
+  });
+
+  it("asks for the report again while another writer keeps winning the recovery of a failed resume", async () => {
+    const f = await fixture();
+    const db = await created(f);
+    await report(f, db.id, 1);
+    await suspend(f, db.id);
+    await report(f, db.id, 2, "asleep");
+    const resumed = await resume(f, db.id);
+    // Every attempt finds the row changed under it.
+    const batch = env.DB.batch.bind(env.DB);
+    let writes = 0;
+    const spy = vi
+      .spyOn(env.DB, "batch")
+      .mockImplementation(async (statements: D1PreparedStatement[]) => {
+        await env.DB.prepare("UPDATE databases SET updated_at=? WHERE id=?")
+          .bind(
+            `2099-01-01T00:00:00.${String(writes++).padStart(3, "0")}Z`,
+            db.id,
+          )
+          .run();
+        return batch(statements);
+      });
+    const refused = await orderResult(f, resumed.operation.id, "no_room");
+    spy.mockRestore();
+    expect(writes).toBe(3);
+    // A result that came to nothing is no result: the node is told to post it again.
+    expect(refused.status).toBe(409);
+    expect(await status(resumed.operation.id)).toEqual({
+      status: "pending",
+      error_code: null,
+    });
+    expect(await row(db.id)).toMatchObject({
+      desired_state: "running",
+      generation: 3,
+    });
+    // The same result, posted again with nobody in the way, ends the resume.
+    expect(
+      await (await orderResult(f, resumed.operation.id, "no_room")).json(),
+    ).toEqual({ databases: [], orders: 1 });
+    expect(await row(db.id)).toMatchObject({
+      desired_state: "suspended",
+      generation: 4,
+    });
+  });
+
   it("leaves a database alone when the failure is late, another node's, or of a resume that ended", async () => {
     const f = await fixture();
     const db = await created(f);

@@ -270,7 +270,7 @@ These stay as worded in the integrator handover (HAND) and the old plan. Changes
   - The database must be ready (`409` otherwise).
   - If sessions are busy, a prepared transaction exists or the archive does not drain, suspend fails with `power_busy` or `power_archive`, and the database keeps running.
   - `resume` is also the supported pre-wake of an idle-sleeping database. Without capacity, it answers `409 conflict` with reason `node_capacity` and `Retry-After: 30`.
-  - A resume that the node cannot carry out fails its operation with the node's reason and suspends the database again as it was before (manual or idle), so that no database is left running and asleep with nothing to wake it; the same resume may be asked again.
+  - **Changed:** a resume that the node cannot carry out, or that exceeds 20 minutes, fails its operation with the reason. For a database that sleeps, the system then suspends it again as it was before the resume (manual or idle), so that no database is left to run and asleep with nothing to wake it, and the same resume may be asked again. A database that runs (its sleep was refused) keeps running, and only the operation fails.
 - **Usage** (HAND L826-849):
   - Rows are hourly or daily, per project or per database, at most 31 days per query.
   - A row becomes final two hours after its hour ends; bill only from final rows.

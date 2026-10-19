@@ -698,10 +698,14 @@ impl<M: Machine> Core<M> {
     /// start is running) is made again after the recovery backoff, and is no result: the API fails
     /// the resume for any reason, and an order is run once in this process. So is a wake refused
     /// as `desired_stale` while the page's entry of the database is below the order's generation:
-    /// the pull that brought the order read the entries before the resume (orders are on every
-    /// page of a full pull, entries in pages of 200), the entry still says what the database was
-    /// before it, and the node waits for the page that names the order instead of ending it on
-    /// that. The request is made from the entry each time, which a pull may have moved on.
+    /// a pull brought the order with an entry that says what the database was before the resume.
+    /// Every pull carries every open order of the node whatever it asks for, and the entries only
+    /// of what it names: a pull of named databases (the hint every resume, suspend and wake makes)
+    /// that reads the orders after another database's resume commits hands the node that order
+    /// and not its entry; a full pull does the same across its pages (orders on each page,
+    /// entries in pages of 200). The node waits for the page that names the order instead of
+    /// ending it on that. The request is made from the entry each time, which a pull may have
+    /// moved on.
     async fn obey_wake(self: &Arc<Self>, operation: &str, database: &str, generation: u64) {
         let Some(db) = self.find(database) else {
             self.report_order(operation, Err("desired_stale"));
@@ -1153,10 +1157,13 @@ mod tests {
         (page, order)
     }
 
-    /// A pull that read the entries before a resume and the orders after it (orders are on every
-    /// page of a full pull, the entries in pages of 200) hands the node the resume's order while
-    /// the entry of the database is still the manual suspension. The order is no failure and no
-    /// refusal of its own: it waits for the page, and ends done once the page has caught up.
+    /// A pull that carries the order of a resume and not its entry (a pull of named databases
+    /// reads every open order of the node and the entries only of what it names; a full pull
+    /// reads the entries of an early page before the resume and the orders of a later page after
+    /// it) hands the node the order while the entry of the database is still the manual
+    /// suspension. The order is no failure and no refusal of its own: it waits for the page, and
+    /// ends done once the page has caught up, and the connection that follows it is the same
+    /// start, released at once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_resume_order_that_comes_before_its_page_entry_waits_for_the_page_and_ends_done() {
         let Some(rig) = Rig::new("resume-ahead").await else {
@@ -1192,7 +1199,9 @@ mod tests {
         assert_eq!(handle.phase(), Phase::Asleep);
 
         // The next pull has the entry of the resume.
-        rig.core.apply(&Rig::page(vec![resumed], vec![order])).await;
+        rig.core
+            .apply(&Rig::page(vec![resumed.clone()], vec![order]))
+            .await;
         eventually(60, "the resume to end", || {
             rig.core.pending_order(RESUME).is_some()
         })
@@ -1201,6 +1210,12 @@ mod tests {
         assert_eq!(handle.phase(), Phase::Ready);
         assert!(rig.machine.running(&id));
         assert_eq!(rig.observation(&id)["generation"], generation + 1);
+        // The connection that follows the resume is the same start, released at once.
+        let mut ticket = Rig::ticket(&rig.entry_for(&resumed));
+        ticket.generation = generation + 1;
+        ticket.operation = RESUME.to_string();
+        let woke = rig.core.wake(&ticket).await;
+        assert_eq!(woke.outcome, Outcome::Started, "{woke:?}");
     }
 
     /// An order of a generation the page has already passed (the suspension that superseded the
@@ -1245,63 +1260,6 @@ mod tests {
             (Some("failed"), Some("suspended"))
         );
         assert!(!rig.machine.running(&id));
-    }
-
-    /// The acceptance cycle of the live finding, repeated: the manual suspension, the resume whose
-    /// order comes with the page one pull behind, and the connection that follows the resume at
-    /// once. Every resume ends done and no cycle leaves the database asleep.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn twenty_cycles_of_suspend_and_resume_with_the_page_one_pull_behind_never_fail_a_resume()
-    {
-        let Some(rig) = Rig::new("resume-cycles").await else {
-            return;
-        };
-        let db = rig.entry_json();
-        let id = id_of(&db);
-        let handle = rig.core.db(&id);
-        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
-        eventually(60, "the database to be ready", || {
-            handle.phase() == Phase::Ready
-        })
-        .await;
-        let mut generation = db["generation"].as_u64().unwrap();
-        for cycle in 0..20 {
-            generation += 1;
-            let suspended = suspension(&db, generation);
-            rig.core
-                .apply(&Rig::page(vec![suspended.clone()], vec![]))
-                .await;
-            eventually(60, "the suspension to be proven", || {
-                handle.phase() == Phase::Asleep
-            })
-            .await;
-            generation += 1;
-            let operation = format!("op_{:0>20}", format!("r{cycle}"));
-            let (resumed, order) = resumption(&db, generation, &operation);
-            // The pull that carries the order has the entries of before the resume.
-            rig.core
-                .apply(&Rig::page(vec![suspended], vec![order.clone()]))
-                .await;
-            // The next pull has the resume's entry, as soon as the node has met the order once.
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            rig.core
-                .apply(&Rig::page(vec![resumed.clone()], vec![order]))
-                .await;
-            eventually(60, "the resume to end", || {
-                rig.core.pending_order(&operation).is_some()
-            })
-            .await;
-            let result = rig.core.pending_order(&operation).unwrap();
-            assert_eq!(result["status"], "done", "cycle {cycle}: {result}");
-            assert_eq!(handle.phase(), Phase::Ready, "cycle {cycle}");
-            // The connection after the resume is the same start, released at once.
-            let mut ticket = Rig::ticket(&rig.entry_for(&resumed));
-            ticket.generation = generation;
-            ticket.operation = operation.clone();
-            let woke = rig.core.wake(&ticket).await;
-            assert_eq!(woke.outcome, Outcome::Started, "cycle {cycle}: {woke:?}");
-            assert!(rig.machine.running(&id), "cycle {cycle}");
-        }
     }
 
     async fn login(

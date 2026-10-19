@@ -248,11 +248,14 @@ export async function recoverQuiescence(
  * Ends a resume the node could not carry out, and puts the database back as it was before it: a
  * database that is to run and sleeps, with no operation left that wakes it, is one nothing wakes
  * (a connection wakes only an idle sleeper, and the node runs a resume's order once). So the
- * resume fails with the node's reason, and the database is suspended again at the next
- * generation, as its last suspension was, manual or idle, by an operation the node's report of
- * the sleep ends like any suspension. A node that starts the database late finds the newer
- * generation suspended and puts it to sleep again. The compare-and-set is on the row the resume
- * left; a later change of the database wins, and so does the end of this resume by another way.
+ * resume fails with the reason, and the database is suspended again at the next generation, as
+ * its last suspension was, manual or idle, by an operation the node's report of the sleep ends
+ * like any suspension. A node that starts the database late finds the newer generation suspended
+ * and puts it to sleep again. Only a database that D1 knows asleep is put back: one that runs (a
+ * resume made by a refused sleep, `recoverQuiescence`) is not stuck, its ready report admits it,
+ * and a suspension would stop what the owner wants running; this answers `null` and the caller
+ * ends the operation alone. The compare-and-set is on the row the resume left; a later change of
+ * the database wins, and so does the end of this resume by another way.
  */
 export async function recoverFailedResume(
   env: Env,
@@ -276,7 +279,7 @@ export async function recoverFailedResume(
     throw new Error("invalid_power_recovery");
   const row = await db
     .prepare(
-      `SELECT d.* FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation AND o.kind='database.resume' AND o.status IN('pending','running') WHERE d.id=? AND d.generation=? AND d.power_operation=? AND d.desired_state='running' AND d.deleted_at IS NULL`,
+      `SELECT d.* FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation AND o.kind='database.resume' AND o.status IN('pending','running') WHERE d.id=? AND d.generation=? AND d.power_operation=? AND d.desired_state='running' AND d.observed_power='hibernated' AND d.deleted_at IS NULL`,
     )
     .bind(expected.databaseId, expected.revision, expected.operation)
     .first<DatabaseRow>();
