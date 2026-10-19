@@ -1943,7 +1943,7 @@ Worst case for 256 MiB (*estimate*): 32 + 25 × (2 + 4) + 16 + 15 ≈ 215 MiB.
 - **Per database:**
   - a thin LV with virtual size = storage, tagged `pgcf.db.<id>`;
   - `mkfs.ext4 -J size=8 -i 65536 -m 1 -E lazy_itable_init=0,lazy_journal_init=0`;
-  - mounted 0700 without `discard`, with `fstrim` after each clean sleep.
+  - mounted 0700 `nosuid,nodev,noexec,noatime`, without `discard`, with `fstrim` after each clean sleep.
 - **Full-volume recovery:** `tune2fs -m 0` once, and back to `-m 1` after the next resize or when use drops.
 - **Sampling:** commands use `--reportformat json`. Pool status every 5 s (`dmsetup status`, or the read-only `devicemapper` crate). Per-LV `data_percent`, and `df` space and inodes, every 60 s.
 

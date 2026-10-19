@@ -309,7 +309,9 @@ fn a_volume_is_created_formatted_and_mounted_for_its_owner_alone() {
         .lines()
         .find(|l| l.contains(&format!("/{ID} ")))
         .unwrap();
-    assert!(line.contains(" rw,nosuid,nodev,noexec,"), "{line}");
+    // The kernel lists the access-time attribute last, and `relatime` is the default it replaces.
+    assert!(line.contains(" rw,nosuid,nodev,noexec,noatime "), "{line}");
+    assert!(!line.contains("relatime"), "{line}");
     assert!(!line.contains("discard"), "{line}");
 
     let inventory = lab.storage.inventory().unwrap();
