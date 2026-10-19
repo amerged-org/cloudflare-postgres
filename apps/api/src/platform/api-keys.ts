@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
+  ADMIN_KEY_DEFAULT_LIFETIME_DAYS,
+  ADMIN_KEY_MAX_LIFETIME_DAYS,
   hashApiKey,
+  isAdminScope,
   newApiKey,
   newApiKeyId,
   timingSafeEqual,
@@ -8,13 +11,44 @@ import {
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
-import { bearer, requireScope } from "../middleware/auth.ts";
+import { bearer, requireAdminRead, requireScope } from "../middleware/auth.ts";
 import {
   refuseCredentialReplay,
   withIdempotency,
 } from "../middleware/idempotency.ts";
 import { page } from "./pagination.ts";
 import { keyRow, type Row } from "./rows.ts";
+
+const DAY_MS = 86_400_000;
+
+/**
+ * When the new key stops working. A time asked for must lie ahead, and an administrator key's no
+ * further than a year: otherwise the default would mean nothing. Without one, an administrator key
+ * made by an administrator expires after 90 days, an integrator key never. The first key, made with
+ * the bootstrap token, has no earlier key to make its successor, so it never expires unless it asks.
+ */
+function keyExpiry(
+  body: ApiKeyCreate,
+  now: Date,
+  bootstrap: boolean,
+): string | null {
+  const admin = isAdminScope(body.scope);
+  if (body.expires_at === undefined)
+    return admin && !bootstrap
+      ? new Date(
+          now.getTime() + ADMIN_KEY_DEFAULT_LIFETIME_DAYS * DAY_MS,
+        ).toISOString()
+      : null;
+  const at = Date.parse(body.expires_at);
+  if (at <= now.getTime())
+    throw new ApiError("invalid_request", "expires_at must be in the future");
+  if (admin && at > now.getTime() + ADMIN_KEY_MAX_LIFETIME_DAYS * DAY_MS)
+    throw new ApiError(
+      "invalid_request",
+      `expires_at of an administrator key is at most ${ADMIN_KEY_MAX_LIFETIME_DAYS} days ahead`,
+    );
+  return body.expires_at;
+}
 
 export async function createApiKey(
   c: ApiContext,
@@ -29,11 +63,13 @@ export async function createApiKey(
       );
     const id = newApiKeyId();
     const generated = newApiKey();
-    const now = new Date().toISOString();
+    const created = new Date();
+    const now = created.toISOString();
+    const expires_at = keyExpiry(body, created, true);
     const result = await c.env.DB.prepare(
       `INSERT INTO api_keys
-      (id, lookup_id, key_hash, scope, project_id, name, created_at)
-      SELECT ?, ?, ?, 'admin', NULL, ?, ?
+      (id, lookup_id, key_hash, scope, project_id, name, created_at, expires_at)
+      SELECT ?, ?, ?, 'admin', NULL, ?, ?, ?
       WHERE NOT EXISTS (SELECT 1 FROM api_keys WHERE scope = 'admin')`,
     )
       .bind(
@@ -42,6 +78,7 @@ export async function createApiKey(
         await hashApiKey(c.env.API_KEY_PEPPER, generated.key),
         body.name,
         now,
+        expires_at,
       )
       .run();
     if (result.meta.changes === 0)
@@ -55,6 +92,7 @@ export async function createApiKey(
           name: body.name,
           lookup_id: generated.lookupId,
           created_at: now,
+          expires_at,
           revoked_at: null,
         },
         key: generated.key,
@@ -76,11 +114,13 @@ export async function createApiKey(
       }
       const id = newApiKeyId();
       const generated = newApiKey();
-      const now = new Date().toISOString();
+      const created = new Date();
+      const now = created.toISOString();
+      const expires_at = keyExpiry(body, created, false);
       const result = await c.env.DB.batch([
         c.env.DB.prepare(
-          `INSERT INTO api_keys (id, lookup_id, key_hash, scope, project_id, name, created_at)
-          SELECT ?, ?, ?, ?, ?, ?, ? WHERE ? IS NULL OR EXISTS (SELECT 1 FROM projects WHERE id = ? AND deleted_at IS NULL)`,
+          `INSERT INTO api_keys (id, lookup_id, key_hash, scope, project_id, name, created_at, expires_at)
+          SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ? IS NULL OR EXISTS (SELECT 1 FROM projects WHERE id = ? AND deleted_at IS NULL)`,
         ).bind(
           id,
           generated.lookupId,
@@ -89,6 +129,7 @@ export async function createApiKey(
           body.project_id ?? null,
           body.name,
           now,
+          expires_at,
           body.project_id ?? null,
           body.project_id ?? null,
         ),
@@ -108,6 +149,7 @@ export async function createApiKey(
             name: body.name,
             lookup_id: generated.lookupId,
             created_at: now,
+            expires_at,
             revoked_at: null,
           },
           key: generated.key,
@@ -119,7 +161,7 @@ export async function createApiKey(
 }
 
 export async function listApiKeys(c: ApiContext): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const pagination = page(c);
   const cursor = pagination.where();
   const rows = await c.env.DB.prepare(

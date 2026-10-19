@@ -5,6 +5,7 @@ pub mod admission;
 pub mod agent;
 pub mod api;
 pub mod archive;
+pub mod cache;
 pub mod credentials;
 pub mod diagnostics;
 pub(crate) mod events;

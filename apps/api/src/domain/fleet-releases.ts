@@ -23,7 +23,7 @@ import {
 } from "@pgcf/contracts/releases";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
-import { requireScope } from "../middleware/auth.ts";
+import { requireAdminRead, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
 import { hintNode } from "./node-hints.ts";
@@ -72,7 +72,7 @@ async function release(db: D1Database, id: string): Promise<FleetRelease> {
   return releaseRow(row);
 }
 export async function listFleetReleases(c: ApiContext): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   const pagination = page(
       c,
       c.req.query(),
@@ -93,7 +93,7 @@ export async function getFleetRelease(
   c: ApiContext,
   id: string,
 ): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   return c.json(await release(c.env.DB, id), 200);
 }
 /** The spec of a registration, with every URL named by this Worker's own delivery route. */
@@ -206,7 +206,7 @@ export async function getFleetRegionRelease(
   c: ApiContext,
   regionId: string,
 ): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   return c.json(await readFleetRegionRelease(c.env.DB, regionId), 200);
 }
 export async function assignFleetRegionRelease(
@@ -380,6 +380,6 @@ export async function getFleetNodeRelease(
   c: ApiContext,
   id: string,
 ): Promise<Response> {
-  await requireScope(c, "admin");
+  await requireAdminRead(c);
   return c.json(await readFleetNodeRelease(c.env.DB, id), 200);
 }

@@ -8,7 +8,7 @@ import {
   InfrastructureBackupRunStatus,
 } from "@pgcf/contracts/infrastructure-backups";
 import type { ApiApp } from "../app.ts";
-import { requireScope } from "../middleware/auth.ts";
+import { requireAdminRead, requireScope } from "../middleware/auth.ts";
 import {
   configureInfrastructureBackups,
   infrastructureBackupHealth,
@@ -45,7 +45,7 @@ export function registerInfrastructureBackups(app: ApiApp) {
       },
     }),
     async (c) => {
-      await requireScope(c, "admin");
+      await requireAdminRead(c);
       return c.json(await readInfrastructureBackupConfig(c.env.DB), 200);
     },
   );
@@ -123,7 +123,7 @@ export function registerInfrastructureBackups(app: ApiApp) {
       },
     }),
     async (c) => {
-      await requireScope(c, "admin");
+      await requireAdminRead(c);
       return c.json(
         {
           latest: await infrastructureBackupStatus(c.env.DB),

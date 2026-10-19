@@ -82,6 +82,8 @@ struct State {
     pool_lost: bool,
     /// A journal file is damaged: `journalctl` prints the entries it read, then fails.
     journal_damaged: bool,
+    /// How long reading the page cache takes: a disk that is slow to list.
+    cache_delay: Option<Duration>,
 }
 
 /// The kernel's boot ID of the node's `boots`th boot.
@@ -215,6 +217,10 @@ impl Local {
     /// Every database archives straight into its upload log, as `archive_with` does for one.
     pub fn direct_archive(&self) {
         self.state().direct_archive = true;
+    }
+    /// Reading what the page cache holds takes `delay` from now on.
+    pub fn slow_cache(&self, delay: Duration) {
+        self.state().cache_delay = Some(delay);
     }
     pub fn delay_next_start(&self, delay: Duration) {
         self.state().start_delay = Some(delay);
@@ -949,6 +955,52 @@ impl Machine for Local {
     fn throttle(&self, _: &str) -> Option<Throttle> {
         None
     }
+    /// The resident pages of the real files of the database's directory, as `mincore` says; the
+    /// kernel of a laptop has no `cachestat`, and the other counts are not known to `mincore`.
+    fn cache_residency(&self, database: &str) -> Option<crate::cache::Residency> {
+        let delay = self.state().cache_delay;
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+        crate::cache::read(&self.layout.data(database), mincore)
+    }
+}
+
+/// The pages of `file` that `mincore` finds in memory, of a private mapping of its `length` bytes.
+fn mincore(file: &fs::File, length: u64) -> io::Result<crate::cache::Pages> {
+    use std::os::fd::AsRawFd;
+    let length = usize::try_from(length).map_err(io::Error::other)?;
+    if length == 0 {
+        return Ok(crate::cache::Pages::default());
+    }
+    let page = usize::try_from(crate::cache::page_size()).map_err(io::Error::other)?;
+    let mut vector = vec![0u8; length.div_ceil(page)];
+    // SAFETY: a read-only mapping of an open file, unmapped before the function returns, and
+    // `mincore` writes one byte a page into `vector`, which has room for that many.
+    let (mapped, failure) = unsafe {
+        let map = libc::mmap(
+            std::ptr::null_mut(),
+            length,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        );
+        if map == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let result = libc::mincore(map, length, vector.as_mut_ptr().cast());
+        let failure = io::Error::last_os_error();
+        libc::munmap(map, length);
+        (result == 0, failure)
+    };
+    if !mapped {
+        return Err(failure);
+    }
+    Ok(crate::cache::Pages {
+        resident: vector.iter().filter(|byte| *byte & 1 == 1).count() as u64,
+        ..crate::cache::Pages::default()
+    })
 }
 
 impl Local {
@@ -978,5 +1030,28 @@ impl Local {
             socket,
             requested_us: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The double's counts are those of the kernel: a file that was just written is in memory, and
+    /// an empty one holds no page.
+    #[test]
+    fn mincore_finds_the_pages_of_a_file_that_was_just_written() {
+        let directory = testpg::directory("mincore");
+        let bytes = 64 * 4096;
+        fs::write(directory.join("full"), vec![7u8; bytes]).unwrap();
+        fs::write(directory.join("empty"), b"").unwrap();
+        let full = fs::File::open(directory.join("full")).unwrap();
+        let pages = mincore(&full, bytes as u64).unwrap();
+        assert_eq!(
+            pages.resident,
+            (bytes as u64).div_ceil(crate::cache::page_size())
+        );
+        let empty = fs::File::open(directory.join("empty")).unwrap();
+        assert_eq!(mincore(&empty, 0).unwrap().resident, 0);
     }
 }
