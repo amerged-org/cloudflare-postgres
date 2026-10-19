@@ -248,6 +248,43 @@ it("the ticket claim commits generation+1 with the ticket operation and hints th
   ).toEqual([{ operation, revision: generation }]);
 });
 
+it("the ticket claim raises the route revision by exactly one and the ticket keeps the revision from before it", async () => {
+  const f = await sleeper();
+  const epoch = () =>
+    env.DB.prepare(
+      "SELECT admission_revision,route_revision FROM database_admission_epochs WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first<{ admission_revision: number; route_revision: number }>();
+  const before = (await epoch())!;
+  const admitted = await actor(f.id).admitWake(f.id, "reader");
+  if (!admitted.ok || !("wake" in admitted)) throw new Error("no wake ticket");
+  // The Edge signs the revision the Actor's snapshot had when it issued the ticket.
+  expect(admitted.wake.route_revision).toBe(before.route_revision);
+  await expect
+    .poll(() => ticket(f.id), { interval: 5, timeout: 3000 })
+    .toEqual([
+      {
+        operation: admitted.wake.operation,
+        generation: admitted.wake.generation,
+        state: "claimed",
+      },
+    ]);
+  // The claim's own mutation raised both revisions by one. The node's page carries the epoch's
+  // route revision (`node-desired.ts`), so the page that names the claim is one above the ticket.
+  expect(await epoch()).toEqual({
+    admission_revision: before.admission_revision + 1,
+    route_revision: before.route_revision + 1,
+  });
+  expect(
+    (await readDatabaseAdmissionSnapshot(env, f.id))!.snapshot.route_revision,
+  ).toBe(before.route_revision + 1);
+  // Every connect of the same wake keeps the ticket, whose revision is now one behind the page.
+  expect(await actor(f.id).admitWake(f.id, "reader")).toMatchObject({
+    wake: admitted.wake,
+  });
+});
+
 it("a refused claim marks the ticket refused, notifies the node and the next admitWake issues a new ticket", async () => {
   const f = await sleeper();
   // The row moved to a manual suspension after the snapshot the Actor answers from.

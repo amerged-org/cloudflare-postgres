@@ -1309,6 +1309,14 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
             phases_ms: { admission: 1 },
           },
           {
+            ...wake,
+            id: eventId("1"),
+            outcome: "refused",
+            reason: "desired_stale",
+            stale: "route",
+            phases_ms: { admission: 1 },
+          },
+          {
             ...admission,
             id: eventId("f"),
             reason: "no_room",
@@ -1334,6 +1342,36 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     ["unknown-phase", { events: [{ ...wake, phases_ms: { boot: 1 } }] }, false],
+    [
+      "unknown-stale",
+      {
+        events: [
+          {
+            ...wake,
+            outcome: "refused",
+            reason: "desired_stale",
+            stale: "clock",
+          },
+        ],
+      },
+      false,
+    ],
+    [
+      "stale-of-a-started-wake",
+      { events: [{ ...wake, stale: "route" }] },
+      false,
+      true,
+    ],
+    [
+      "stale-with-another-reason",
+      {
+        events: [
+          { ...wake, outcome: "refused", reason: "no_room", stale: "route" },
+        ],
+      },
+      false,
+      true,
+    ],
     [
       "refused-without-reason",
       { events: [{ ...admission, reason: undefined }] },

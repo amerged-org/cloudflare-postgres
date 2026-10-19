@@ -45,6 +45,7 @@ import {
   WAKE_OUTCOMES,
   WAKE_PHASES,
   WAKE_REASONS,
+  WAKE_STALE,
   refusalRetryHint,
 } from "./node-local.ts";
 
@@ -1534,11 +1535,17 @@ export const NodeEvent = z.discriminatedUnion("type", [
       operation: OperationId,
       outcome: z.enum(WAKE_OUTCOMES),
       reason: z.enum(WAKE_REASONS).optional(),
+      /** How a `desired_stale` ticket is stale: nothing secret, one of `WAKE_STALE`. */
+      stale: z.enum(WAKE_STALE).optional(),
       phases_ms: Phases,
     })
     .refine(
       (event) => (event.outcome === "refused") === (event.reason !== undefined),
       { path: ["reason"], message: "Exactly a refusal names its reason" },
+    )
+    .refine(
+      (event) => event.stale === undefined || event.reason === "desired_stale",
+      { path: ["stale"], message: "Only a stale ticket says how it is stale" },
     ),
 ]);
 export type NodeEvent = z.infer<typeof NodeEvent>;

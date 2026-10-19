@@ -63,6 +63,71 @@ impl StartFailure {
     }
 }
 
+/// How a wake ticket does not match the entry of the page the node holds: the reason behind a
+/// `desired_stale` refusal, named in the wake event's `stale` (`WAKE_STALE` of the contract).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stale {
+    /// The node holds no entry for the database.
+    NoEntry,
+    /// The ticket's generation is neither the next one, nor the entry's, nor a claim's.
+    Generation,
+    /// The ticket's generation is the entry's, with another operation.
+    Operation,
+    /// The route revision changed since the Edge signed the ticket, other than by the claim of
+    /// the ticket's own wake.
+    Route,
+    /// The roles changed since the Edge signed the ticket.
+    Role,
+}
+impl Stale {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::NoEntry => "no_entry",
+            Self::Generation => "generation",
+            Self::Operation => "operation",
+            Self::Route => "route",
+            Self::Role => "role",
+        }
+    }
+}
+
+/// Whether the entry of the page still stands for a wake ticket. The ticket is of the next
+/// generation (the claim is not in the page yet), or it is the entry's own wake (the claim is in
+/// the page), or the node released it before the page named it (`claimed`). Its roles are the
+/// entry's, and so is its route revision, with one exception: the entry's own wake. The Actor
+/// signs the revision from before its claim, and every attempt of the claim raises it
+/// (`withAdmissionMutation` commits its epoch row also when the business write lost its
+/// compare-and-set and the claim is made again, up to three times), as does any other mutation of
+/// the database between the ticket and its claim. The page that carries the claim therefore holds
+/// the ticket's revision or a later one, and the gateway's `wake_state` takes the same. That is
+/// safe, because `same` proves this ticket's own claim committed (its operation is inserted only
+/// at the generation after the one it read, and the page names the newest operation at or below
+/// the generation); a move, a suspend, a resume or a change of roles advances the generation or
+/// the roles, and those stay checked. A ticket above the entry's revision is stale.
+fn ticket_matches(request: &WakeRequest, entry: &Entry, claimed: bool) -> Result<(), Stale> {
+    let next = request.generation == entry.generation + 1;
+    let same = request.generation == entry.generation && request.operation == entry.operation;
+    if !(next || same || claimed) {
+        return Err(if request.generation == entry.generation {
+            Stale::Operation
+        } else {
+            Stale::Generation
+        });
+    }
+    let route = if same {
+        request.route_revision <= entry.route_revision
+    } else {
+        request.route_revision == entry.route_revision
+    };
+    if !route {
+        return Err(Stale::Route);
+    }
+    if request.role_revision_hash != entry.role_hash() {
+        return Err(Stale::Role);
+    }
+    Ok(())
+}
+
 /// Whole milliseconds, rounded up: a step of 1 took at most a millisecond.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros().div_ceil(1000))
@@ -73,13 +138,16 @@ fn millis(duration: Duration) -> u64 {
 /// The log line of a wake (plan 9.9): its outcome and reason, the milliseconds of every step and
 /// of the whole wake. The observation report carries it to Cloudflare, where a cold wake's time
 /// is broken down by node.
-fn wake_line(result: &WakeResult, total_ms: u64) -> serde_json::Value {
+fn wake_line(result: &WakeResult, stale: Option<Stale>, total_ms: u64) -> serde_json::Value {
     let mut line = json!({
         "event": "wake", "database_id": result.database, "outcome": result.outcome,
         "total_ms": total_ms,
     });
     if let Some(reason) = &result.reason {
         line["reason"] = reason.clone().into();
+    }
+    if let Some(stale) = stale {
+        line["stale"] = stale.name().into();
     }
     for (step, ms) in &result.steps_ms {
         line[format!("step_{step}")] = (*ms).into();
@@ -362,7 +430,8 @@ impl<M: Machine> Core<M> {
     pub async fn wake(self: &Arc<Self>, request: &WakeRequest) -> WakeResult {
         let begun = Instant::now();
         let mut steps = BTreeMap::new();
-        let outcome = self.try_wake(request, &mut steps).await;
+        let mut stale = None;
+        let outcome = self.try_wake(request, &mut steps, &mut stale).await;
         let (outcome, reason, retry_after_seconds) = match &outcome {
             Ok(()) => (WakeOutcome::Started, None, None),
             Err((reason, retry)) => (WakeOutcome::Refused, Some((*reason).to_string()), *retry),
@@ -387,8 +456,11 @@ impl<M: Machine> Core<M> {
         if let Some(reason) = reason {
             event["reason"] = reason.into();
         }
+        if let Some(stale) = stale {
+            event["stale"] = stale.name().into();
+        }
         self.event(event);
-        crate::timing::emit_event(wake_line(&result, millis(begun.elapsed())));
+        crate::timing::emit_event(wake_line(&result, stale, millis(begun.elapsed())));
         result
     }
 
@@ -396,6 +468,7 @@ impl<M: Machine> Core<M> {
         self: &Arc<Self>,
         request: &WakeRequest,
         steps: &mut BTreeMap<String, u64>,
+        stale: &mut Option<Stale>,
     ) -> Result<(), (&'static str, Option<u32>)> {
         let checking = Instant::now();
         let refuse = |reason: &'static str| Err((reason, None));
@@ -403,47 +476,54 @@ impl<M: Machine> Core<M> {
             return refuse("fenced");
         }
         let Some(db) = self.find(&request.database) else {
+            *stale = Some(Stale::NoEntry);
             return refuse("desired_stale");
         };
         // The ticket is checked against the page's entry before anything waits for the database.
-        let ticket = |view: &View| -> Result<(), &'static str> {
-            let entry = view.entry.as_ref().ok_or("desired_stale")?;
+        // A refusal is a reason of `WAKE_REASONS`, and for `desired_stale` how the ticket is stale.
+        let ticket = |view: &View| -> Result<(), (&'static str, Option<Stale>)> {
+            let entry = view
+                .entry
+                .as_ref()
+                .ok_or(("desired_stale", Some(Stale::NoEntry)))?;
             if self.fences.blocks(&db.id, entry.storage_generation) {
-                return Err("superseded");
+                return Err(("superseded", None));
             }
             match entry.desired {
-                Desired::Deleted => return Err("deleted"),
-                Desired::Suspended => return Err("suspended"),
+                Desired::Deleted => return Err(("deleted", None)),
+                Desired::Suspended => return Err(("suspended", None)),
                 Desired::Running => {}
             }
             if view.moving.is_some() {
-                return Err("moving");
+                return Err(("moving", None));
             }
             if self.maintenance.load(Ordering::Relaxed) {
-                return Err("maintenance");
+                return Err(("maintenance", None));
             }
             let claimed = view.claim.as_ref().is_some_and(|claim| {
                 claim.generation == request.generation && claim.operation == request.operation
             });
-            let next = request.generation == entry.generation + 1;
-            let same =
-                request.generation == entry.generation && request.operation == entry.operation;
-            if request.route_revision != entry.route_revision
-                || request.role_revision_hash != entry.role_hash()
-                || !(next || same || claimed)
-            {
-                return Err("desired_stale");
-            }
-            Ok(())
+            ticket_matches(request, entry, claimed).map_err(|why| ("desired_stale", Some(why)))
         };
-        {
-            let view = db.view();
-            if let Err(reason) = ticket(&view) {
+        // The node has not looked at the database in this run (it restarted, and a start that
+        // reads LVM and systemd for every database at once may not have got to this one): its
+        // decision runs now, ahead of the retry's wait, and the wake waits for it. If the wait ends
+        // first the gateway holds the connections and asks again (`wake_in_progress`).
+        if !db.view().adopted {
+            if let Err((reason, why)) = ticket(&db.view()) {
+                *stale = why;
                 return refuse(reason);
             }
-            // The node has not looked at the database in this run: the gateway asks again.
-            if !view.adopted {
+            self.schedule(&db);
+            if !self.adopted(&db, self.timing.adopt_wait).await {
                 return refuse("wake_in_progress");
+            }
+        }
+        {
+            let view = db.view();
+            if let Err((reason, why)) = ticket(&view) {
+                *stale = why;
+                return refuse(reason);
             }
             match view.phase {
                 Phase::Ready if view.writer.is_some() => {
@@ -472,7 +552,8 @@ impl<M: Machine> Core<M> {
         // What happened while this wake waited for the database's flow.
         let (entry, record, phase) = {
             let view = db.view();
-            if let Err(reason) = ticket(&view) {
+            if let Err((reason, why)) = ticket(&view) {
+                *stale = why;
                 return refuse(reason);
             }
             (
@@ -1281,7 +1362,7 @@ mod tests {
                 .map(|(step, ms)| (step.to_string(), ms))
                 .collect(),
         };
-        let line = wake_line(&result, 230);
+        let line = wake_line(&result, None, 230);
         assert_eq!(
             line,
             json!({
@@ -1302,9 +1383,201 @@ mod tests {
         // A refusal names its reason.
         result.outcome = WakeOutcome::Refused;
         result.reason = Some("no_headroom".into());
-        let refused = wake_line(&result, 9);
+        let refused = wake_line(&result, None, 9);
         assert_eq!(refused["outcome"], "refused");
         assert_eq!(refused["reason"], "no_headroom");
+        assert!(refused.get("stale").is_none());
+        // A stale ticket names how.
+        result.reason = Some("desired_stale".into());
+        let stale = wake_line(&result, Some(Stale::Route), 9);
+        assert_eq!(stale["reason"], "desired_stale");
+        assert_eq!(stale["stale"], "route");
+        let at = "2026-10-18T10:11:12.345Z";
+        assert_eq!(
+            crate::events::sanitize(&stale, at).unwrap()["fields"]["stale"],
+            "route"
+        );
+    }
+
+    /// The ticket the Edge signs for `entry`'s next generation, as `Rig::ticket` does, at the
+    /// route revision the Actor's snapshot had when the claim was issued.
+    fn ticket_for(entry: &Entry, generation: u64, operation: &str, route: u64) -> WakeRequest {
+        WakeRequest {
+            database: entry.id.clone(),
+            operation: operation.into(),
+            generation,
+            route_revision: route,
+            role_revision_hash: entry.role_hash(),
+            queued_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn the_ways_a_ticket_is_stale_are_the_contracts() {
+        let local: Value = serde_json::from_str(include_str!(
+            "../../../../packages/contracts/native/node-local.generated.json"
+        ))
+        .unwrap();
+        let ours = [
+            Stale::NoEntry,
+            Stale::Generation,
+            Stale::Operation,
+            Stale::Route,
+            Stale::Role,
+        ]
+        .map(Stale::name);
+        assert_eq!(
+            local["constants"]["WAKE_STALE"],
+            serde_json::to_value(ours).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_ticket_matches_the_entry_it_was_signed_for_and_the_entry_its_own_claim_made() {
+        let mut before = Entry::parse(&crate::agent::testing::new_entry_json()).unwrap();
+        before.route_revision = 5;
+        let (g, r, wake) = (
+            before.generation,
+            before.route_revision,
+            "op_wwwwwwwwwwwwwwwwwwww",
+        );
+        // The claim commits the ticket's generation and operation and raises the route revision by
+        // one (`withAdmissionMutation`): the page the hint pulls.
+        let after = Entry {
+            generation: g + 1,
+            operation: wake.into(),
+            route_revision: r + 1,
+            ..before.clone()
+        };
+        let mut other_roles = before.clone();
+        other_roles.roles.pop();
+        let moved = Entry {
+            route_revision: r + 1,
+            ..before.clone()
+        };
+        let another = Entry {
+            operation: "op_aaaaaaaaaaaaaaaaaaaa".into(),
+            ..after.clone()
+        };
+        // Every attempt of the claim raises the revision, also one that lost its compare-and-set
+        // and is made again, and so does any other mutation of the database in between.
+        let lagging = Entry {
+            route_revision: r + 3,
+            ..after.clone()
+        };
+        let signed =
+            |entry: &Entry, generation: u64, route: u64| ticket_for(entry, generation, wake, route);
+        type Row<'a> = (&'a str, &'a Entry, WakeRequest, bool, Result<(), Stale>);
+        let rows: Vec<Row> = vec![
+            (
+                "before the claim: the next generation at the entry's route",
+                &before,
+                signed(&before, g + 1, r),
+                false,
+                Ok(()),
+            ),
+            (
+                "the node released it before the page names it",
+                &before,
+                signed(&before, g + 1, r),
+                true,
+                Ok(()),
+            ),
+            (
+                "after the claim: its own wake at the entry's route",
+                &after,
+                signed(&after, g + 1, r + 1),
+                false,
+                Ok(()),
+            ),
+            (
+                "after the claim: its own wake, the route one revision above the ticket's",
+                &after,
+                signed(&after, g + 1, r),
+                false,
+                Ok(()),
+            ),
+            (
+                "after the claim: the route two revisions above the ticket's",
+                &after,
+                signed(&after, g + 1, r - 1),
+                false,
+                Ok(()),
+            ),
+            (
+                "after the claim and two claim attempts that lost their compare-and-set: three above",
+                &lagging,
+                signed(&lagging, g + 1, r),
+                false,
+                Ok(()),
+            ),
+            (
+                "after the claim: a ticket above the entry's route",
+                &after,
+                signed(&after, g + 1, r + 2),
+                false,
+                Err(Stale::Route),
+            ),
+            (
+                "before the claim: a ticket above the entry's route",
+                &before,
+                signed(&before, g + 1, r + 1),
+                false,
+                Err(Stale::Route),
+            ),
+            (
+                "before the claim: a ticket below the entry's route",
+                &before,
+                signed(&before, g + 1, r - 1),
+                false,
+                Err(Stale::Route),
+            ),
+            (
+                "a move changed the route after the ticket, and no claim is in the page",
+                &moved,
+                signed(&moved, g + 1, r),
+                false,
+                Err(Stale::Route),
+            ),
+            (
+                "the entry's wake is another operation",
+                &another,
+                signed(&another, g + 1, r),
+                false,
+                Err(Stale::Operation),
+            ),
+            (
+                "a ticket of a generation the entry has passed",
+                &after,
+                signed(&after, g, r + 1),
+                false,
+                Err(Stale::Generation),
+            ),
+            (
+                "a ticket of a later generation than the next",
+                &before,
+                signed(&before, g + 2, r),
+                false,
+                Err(Stale::Generation),
+            ),
+            (
+                "the roles changed before the claim",
+                &other_roles,
+                signed(&before, g + 1, r),
+                false,
+                Err(Stale::Role),
+            ),
+        ];
+        for (what, entry, request, claimed, wanted) in rows {
+            assert_eq!(ticket_matches(&request, entry, claimed), wanted, "{what}");
+        }
+        // The role hash stays checked for the entry's own wake with the route one above.
+        let mut changed = after.clone();
+        changed.roles.pop();
+        assert_eq!(
+            ticket_matches(&signed(&after, g + 1, r), &changed, false),
+            Err(Stale::Role)
+        );
     }
 
     fn throttle(nr_throttled: u64, throttled_usec: u64) -> Option<Throttle> {
@@ -1733,6 +2006,89 @@ mod tests {
             reason("fenced")
         );
         assert!(!rig2.machine.running(&entry2.id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_delivered_again_after_its_claim_reached_the_page_is_still_that_wake() {
+        let Some(rig) = Rig::new("wake-claimed-page").await else {
+            return;
+        };
+        let mut json = rig.entry_json();
+        let (entry, db) = rig.create_from(&json).await;
+        json.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        // The Edge signed the ticket at the entry's route revision. The start takes a while, and
+        // the gateway delivers the ticket again before it is over.
+        let ticket = Rig::ticket(&entry);
+        rig.machine.delay_next_start(Duration::from_secs(2));
+        let first = {
+            let (core, ticket) = (rig.core.clone(), ticket.clone());
+            tokio::spawn(async move { core.wake(&ticket).await })
+        };
+        eventually(10, "the start to begin", || db.phase() == Phase::Starting).await;
+        // D1 committed the claim and the hint brought the page of the ticket's generation and
+        // operation. The claim took three attempts, two of which lost their compare-and-set to a
+        // periodic report, and each raised the route revision.
+        json["generation"] = ticket.generation.into();
+        json["operation"] = ticket.operation.clone().into();
+        json["route_revision"] = (entry.route_revision + 3).into();
+        rig.core.apply(&Rig::page(vec![json], vec![])).await;
+        let again = rig.core.wake(&ticket).await;
+        assert_eq!(
+            (again.outcome, again.reason.as_deref()),
+            (WakeOutcome::Refused, Some("wake_in_progress")),
+            "{again:?}"
+        );
+        assert_eq!(first.await.unwrap().outcome, WakeOutcome::Started);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_refused_for_a_stale_ticket_names_in_its_event_how_it_is_stale() {
+        let Some(rig) = Rig::new("wake-stale-event").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let ticket = || Rig::ticket(&entry);
+        let mut generation = ticket();
+        generation.generation = entry.generation + 2;
+        let mut operation = ticket();
+        operation.generation = entry.generation;
+        let mut route = ticket();
+        route.route_revision += 1;
+        let mut role = ticket();
+        role.role_revision_hash = "0".repeat(64);
+        let mut unknown = ticket();
+        unknown.database = "zzzzzzzzzzzzzzzzzzzz".into();
+        rig.core.take_events();
+        for (stale, request) in [
+            ("generation", generation),
+            ("operation", operation),
+            ("route", route),
+            ("role", role),
+            ("no_entry", unknown),
+        ] {
+            let result = rig.core.wake(&request).await;
+            assert_eq!(result.reason.as_deref(), Some("desired_stale"), "{stale}");
+            let events = rig.core.take_events();
+            assert!(contract_valid(
+                "NodeEventReport",
+                &json!({"events": events})
+            ));
+            let wake = events.iter().find(|e| e["type"] == "wake").unwrap();
+            assert_eq!(wake["reason"], "desired_stale");
+            assert_eq!(wake["stale"], stale);
+        }
+        // A refusal for another reason names no way of being stale.
+        rig.core.maintenance.store(true, Ordering::Relaxed);
+        assert_eq!(
+            rig.core.wake(&ticket()).await.reason.as_deref(),
+            Some("maintenance")
+        );
+        let events = rig.core.take_events();
+        let wake = events.iter().find(|e| e["type"] == "wake").unwrap();
+        assert_eq!(wake["reason"], "maintenance");
+        assert!(wake.get("stale").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

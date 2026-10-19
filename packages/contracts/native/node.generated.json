@@ -1631,6 +1631,16 @@
                       "release_failed"
                     ]
                   },
+                  "stale": {
+                    "type": "string",
+                    "enum": [
+                      "no_entry",
+                      "generation",
+                      "operation",
+                      "route",
+                      "role"
+                    ]
+                  },
                   "phases_ms": {
                     "type": "object",
                     "properties": {

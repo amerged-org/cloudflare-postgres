@@ -105,6 +105,22 @@ export type WakeReason = (typeof WAKE_REASONS)[number];
  * delivery and the gateway delivers the ticket again after `WAKE_REDELIVER_MS`.
  */
 export const WAKE_AGAIN_REASON = "wake_in_progress" satisfies WakeReason;
+/**
+ * How a wake ticket is stale, which the agent names in the `stale` of the wake event of a
+ * `desired_stale` refusal (the answer to the gateway stays `desired_stale`): the node holds no
+ * entry for the database; the ticket's generation is not the next one, the entry's own wake or a
+ * claim's; it is the entry's generation with another operation; the route revision changed since
+ * the Edge signed it, other than by the claim of the ticket's own wake (which may raise it more
+ * than once); the roles changed.
+ */
+export const WAKE_STALE = [
+  "no_entry",
+  "generation",
+  "operation",
+  "route",
+  "role",
+] as const;
+export type WakeStale = (typeof WAKE_STALE)[number];
 
 /** The refusals of the admission loop (plan 4.6). */
 export const ADMISSION_REFUSALS = ["no_room", "no_headroom"] as const;

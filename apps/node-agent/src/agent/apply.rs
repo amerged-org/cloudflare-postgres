@@ -233,7 +233,55 @@ impl<M: Machine> Core<M> {
                     break;
                 }
             }
+            core.retry_until_adopted(&db);
         });
+    }
+
+    /// A reconciliation that could not read what it decides from (LVM, systemd, the state file)
+    /// decided nothing, and nothing may be started on a database the node has not decided on. The
+    /// entry does not change meanwhile and a pull may be a minute away, so the decision is run
+    /// again here, after `Timing::recovery_retry` and then after twice as long, to
+    /// `recovery_retry_maximum`, until the node has made it. One task does this for a database.
+    /// The agent never drops an entry, so a database that left the page is decided on from its
+    /// last entry (it is retired or deleted, or it sleeps) and the task ends with that.
+    fn retry_until_adopted(self: &Arc<Self>, db: &Arc<Db>) {
+        {
+            let mut view = db.view();
+            if view.adopted || view.retrying {
+                return;
+            }
+            view.retrying = true;
+        }
+        let (core, db) = (self.clone(), db.clone());
+        tokio::spawn(async move {
+            let mut wait = core.timing.recovery_retry;
+            loop {
+                tokio::time::sleep(wait).await;
+                {
+                    let mut view = db.view();
+                    if view.adopted {
+                        view.retrying = false;
+                        break;
+                    }
+                }
+                core.schedule(&db);
+                wait = (wait * 2).min(core.timing.recovery_retry_maximum);
+            }
+        });
+    }
+
+    /// A decision that could not read one of its facts says which and why, until the node has
+    /// decided on the database: nothing else shows that it waits for its retry. Once it has, the
+    /// pulls that decide again and cannot read keep silent, since a full pull decides on every
+    /// database and the ring of events holds 64.
+    fn unread(db: &Db, fact: &'static str, error: crate::Error) {
+        if db.view().adopted {
+            return;
+        }
+        crate::timing::emit_event(json!({
+            "event": "reconcile_unread", "database_id": db.id, "fact": fact,
+            "class": crate::diagnostics::error_code(&error),
+        }));
     }
 
     /// Decides on a database's entry and does what that needs.
@@ -245,8 +293,8 @@ impl<M: Machine> Core<M> {
         if db.view().state.is_none() {
             match self.files(&db.id).load() {
                 Ok(state) => self.set(db, |view| view.state = state),
-                // A state that cannot be trusted is not taken for a new database.
-                Err(_) => {
+                // A state that was read and cannot be trusted is not taken for a new database.
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     self.set(db, |view| {
                         view.adopted = true;
                         view.phase = Phase::Error;
@@ -254,20 +302,24 @@ impl<M: Machine> Core<M> {
                     });
                     return;
                 }
+                // A file that could not be read (no descriptor left, a failing disk) says nothing
+                // about the database: like LVM and systemd, it is read again.
+                Err(error) => return Self::unread(db, "state", error.into()),
             }
         }
-        // What cannot be read is not known: nothing is decided on a guess, and the next pull
-        // decides. A volume taken for missing would fail the database; a unit taken for stopped
-        // would put a database that runs through recovery.
+        // What cannot be read is not known: nothing is decided on a guess, and the decision is
+        // tried again (`retry_until_adopted`). A volume taken for missing would fail the database;
+        // a unit taken for stopped would put a database that runs through recovery.
         let has_volume = match Self::volume_id(&entry) {
             Some(volume) => match self.machine.has_volume(&volume).await {
                 Ok(found) => found,
-                Err(_) => return,
+                Err(error) => return Self::unread(db, "volume", error.into()),
             },
             None => false,
         };
-        let Ok(unit) = self.machine.unit(&db.id).await else {
-            return;
+        let unit = match self.machine.unit(&db.id).await {
+            Ok(unit) => unit,
+            Err(error) => return Self::unread(db, "unit", error.into()),
         };
         let unit_awake = unit.active.awake();
         let step = {
@@ -626,29 +678,41 @@ impl<M: Machine> Core<M> {
         self.report_order(operation, outcome);
     }
 
-    /// `wake` (resume): the database starts through admission as a connection's wake would.
+    /// `wake` (resume): the database starts through admission as a connection's wake would. A wake
+    /// the node cannot decide yet (`again`: it has not decided on the database in this run, or a
+    /// start is running) is made again after the recovery backoff, and is no result: the API fails
+    /// the resume for any reason, and an order is run once in this process. The request is made
+    /// from the entry each time, which a pull may have moved on.
     async fn obey_wake(self: &Arc<Self>, operation: &str, database: &str, generation: u64) {
         let Some(db) = self.find(database) else {
             self.report_order(operation, Err("desired_stale"));
             return;
         };
-        let request = {
-            let view = db.view();
-            let Some(entry) = &view.entry else {
-                drop(view);
-                self.report_order(operation, Err("desired_stale"));
-                return;
+        let mut wait = self.timing.recovery_retry;
+        let result = loop {
+            let request = {
+                let view = db.view();
+                let Some(entry) = &view.entry else {
+                    drop(view);
+                    self.report_order(operation, Err("desired_stale"));
+                    return;
+                };
+                WakeRequest {
+                    database: database.to_string(),
+                    operation: operation.to_string(),
+                    generation,
+                    route_revision: entry.route_revision,
+                    role_revision_hash: entry.role_hash(),
+                    queued_at_ms: u64::try_from(super::now_ms()).unwrap_or(0),
+                }
             };
-            WakeRequest {
-                database: database.to_string(),
-                operation: operation.to_string(),
-                generation,
-                route_revision: entry.route_revision,
-                role_revision_hash: entry.role_hash(),
-                queued_at_ms: u64::try_from(super::now_ms()).unwrap_or(0),
+            let result = self.wake(&request).await;
+            if !result.again() {
+                break result;
             }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(self.timing.recovery_retry_maximum);
         };
-        let result = self.wake(&request).await;
         match (result.outcome, result.reason.as_deref()) {
             (Outcome::Started, _) => self.report_order(operation, Ok(())),
             (_, Some(reason)) => self.report_order(operation, Err(reason)),
@@ -1585,6 +1649,231 @@ mod tests {
             .await;
             assert_eq!(rig.machine.unit(&id).await.unwrap().main_pid, pid);
         }
+    }
+
+    /// A database that sleeps provenly, as the page names it once it was built, and an agent that
+    /// restarted while it slept: nothing is decided on it yet. Its entry and its archive path.
+    async fn restarted_sleeper(rig: Rig) -> (Rig, Value, String) {
+        let mut db = rig.entry_json();
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        let (_, handle) = rig.create_from(&db).await;
+        db.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        (rig, db, path)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_decision_that_could_not_read_its_facts_is_tried_again_until_the_database_is_adopted()
+    {
+        let Some(rig) = Rig::new("reconcile-retry").await else {
+            return;
+        };
+        let (rig, db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        // LVM and systemd answer the first questions with errors, as they do under the load of an
+        // agent's start: three of LVM, then two of systemd.
+        rig.machine.fail_next_volume_reads(3);
+        rig.machine.fail_next_unit_reads(2);
+        let before = rig.machine.reads();
+        // One pull, and no other: the page does not change, and nothing pulls again.
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(
+            30,
+            "the database to be adopted without another pull",
+            || handle.view().adopted,
+        )
+        .await;
+        assert_eq!(handle.phase(), Phase::Asleep);
+        // The retries are the failures and the round that read both; they end with the adoption.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let after = rig.machine.reads();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (6, 3));
+        assert_eq!(handle.view().reconcile, super::super::Reconcile::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_before_the_node_has_decided_on_the_database_has_it_decided_and_starts_it() {
+        // The retry would come in half a minute: only the wake brings the decision sooner.
+        let timing = crate::agent::Timing {
+            recovery_retry: std::time::Duration::from_secs(30),
+            recovery_retry_maximum: std::time::Duration::from_secs(30),
+            ..crate::agent::testing::timing()
+        };
+        let Some(rig) = Rig::with_timing("wake-adopts", timing).await else {
+            return;
+        };
+        let (rig, db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        rig.machine.set_volumes_unreadable(true);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(10, "the decision to be tried", || {
+            handle.view().reconcile == super::super::Reconcile::Idle
+        })
+        .await;
+        assert!(!handle.view().adopted);
+        // LVM answers again, and the Edge's wake arrives before anything decided.
+        rig.machine.set_volumes_unreadable(false);
+        let result = rig.core.wake(&Rig::ticket(&rig.entry_for(&db))).await;
+        assert_eq!(result.outcome, Outcome::Started, "{result:?}");
+        assert!(handle.view().adopted);
+        assert!(rig.machine.running(&id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_waits_for_the_decision_only_as_long_as_the_gateway_holds_it_for_the_answer() {
+        let timing = crate::agent::Timing {
+            recovery_retry: std::time::Duration::from_secs(30),
+            recovery_retry_maximum: std::time::Duration::from_secs(30),
+            adopt_wait: std::time::Duration::from_millis(300),
+            ..crate::agent::testing::timing()
+        };
+        let Some(rig) = Rig::with_timing("wake-adopt-bound", timing).await else {
+            return;
+        };
+        let (rig, db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        rig.machine.set_volumes_unreadable(true);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let ticket = Rig::ticket(&rig.entry_for(&db));
+        // LVM does not answer: the wake is refused as `wake_in_progress`, which the gateway does
+        // not answer its connections with, once the wait is over, and nothing was started.
+        let began = std::time::Instant::now();
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (Outcome::Refused, Some("wake_in_progress"))
+        );
+        assert!(began.elapsed() >= std::time::Duration::from_millis(300));
+        assert!(began.elapsed() < std::time::Duration::from_secs(3));
+        assert!(!rig.core.db(&id).view().adopted);
+        assert!(!rig.machine.running(&id));
+        // The gateway delivers the ticket again; LVM answers by then.
+        rig.machine.set_volumes_unreadable(false);
+        let again = rig.core.wake(&ticket).await;
+        assert_eq!(again.outcome, Outcome::Started, "{again:?}");
+        assert!(rig.machine.running(&id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_resume_order_at_the_start_of_the_agent_waits_for_the_decision_and_ends_done() {
+        // The wait of one wake is short here: the order must outlast it, as the order of a node
+        // whose LVM answers late outlasts the gateway's 2 s.
+        let timing = crate::agent::Timing {
+            adopt_wait: std::time::Duration::from_millis(300),
+            ..crate::agent::testing::timing()
+        };
+        let Some(rig) = Rig::with_timing("resume-after-restart", timing).await else {
+            return;
+        };
+        let (rig, db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        let operation = db["operation"].as_str().unwrap().to_string();
+        let resume = Order::Wake {
+            operation: operation.clone(),
+            database: id.clone(),
+            generation: db["generation"].as_u64().unwrap(),
+        };
+        rig.machine.set_volumes_unreadable(true);
+        rig.core
+            .apply(&Rig::page(vec![db.clone()], vec![resume]))
+            .await;
+        // LVM does not answer for several waits of a wake. The order has no result meanwhile: the
+        // API would fail the resume with it, and nothing starts the database again.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(rig.core.pending_order(&operation), None);
+        assert!(!rig.machine.running(&id));
+        rig.machine.set_volumes_unreadable(false);
+        eventually(30, "the resume to end", || {
+            rig.core.pending_order(&operation).is_some()
+        })
+        .await;
+        assert_eq!(
+            rig.core.pending_order(&operation).unwrap()["status"],
+            "done"
+        );
+        assert!(rig.machine.running(&id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_state_that_cannot_be_read_is_tried_again_and_only_one_that_cannot_be_trusted_fails()
+    {
+        let Some(rig) = Rig::new("state-unread").await else {
+            return;
+        };
+        let (rig, db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        let file = rig.core.files(&id).directory().join("state.json");
+        let kept = file.with_extension("kept");
+        // A file that cannot be read is no statement about the database: a directory stands in for
+        // it, which fails with `EISDIR` for any user.
+        std::fs::rename(&file, &kept).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(10, "the decision to be tried again", || {
+            let view = handle.view();
+            view.adopted || view.retrying
+        })
+        .await;
+        assert!(!handle.view().adopted);
+        assert_ne!(handle.phase(), Phase::Error);
+        // It reads again, and the node decides.
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::rename(&kept, &file).unwrap();
+        eventually(30, "the database to be adopted", || handle.view().adopted).await;
+        assert_eq!(handle.phase(), Phase::Asleep);
+
+        // A state that is read and cannot be trusted stays an error, not a new database.
+        let (rig, db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        std::fs::write(
+            rig.core.files(&id).directory().join("state.json"),
+            "{not a state",
+        )
+        .unwrap();
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(10, "the state to be refused", || handle.view().adopted).await;
+        assert_eq!(handle.phase(), Phase::Error);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_decision_that_could_not_read_says_so_only_until_the_database_is_adopted() {
+        let Some(rig) = Rig::new("reconcile-unread").await else {
+            return;
+        };
+        let (rig, db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        let unread = |id: &str| -> Vec<Value> {
+            crate::events::seen()
+                .into_iter()
+                .filter(|e| e["event"] == "reconcile_unread" && e["database_id"] == id)
+                .collect()
+        };
+        rig.machine.fail_next_volume_reads(1);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the database to be adopted", || handle.view().adopted).await;
+        // The first reading failed: the event names what could not be read and how.
+        let events = unread(&id);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["fields"]["fact"], "volume");
+        assert_eq!(events[0]["fields"]["class"], "storage_unexpected");
+        // Adopted, the pulls decide again and may fail to read, silently: the node already has
+        // its decision, and the ring of events holds only 64.
+        rig.machine.fail_next_unit_reads(2);
+        for _ in 0..2 {
+            rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+            eventually(10, "the pull to be decided on", || {
+                handle.view().reconcile == super::super::Reconcile::Idle
+            })
+            .await;
+        }
+        assert_eq!(unread(&id).len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

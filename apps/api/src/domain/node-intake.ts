@@ -186,6 +186,7 @@ export async function nodeEvents(
           operation: event.operation,
           outcome: event.outcome,
           ...(event.reason ? { reason: event.reason } : {}),
+          ...(event.stale ? { stale: event.stale } : {}),
           phases_ms: event.phases_ms,
           at: event.at,
         }),
