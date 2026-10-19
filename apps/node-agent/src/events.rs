@@ -111,6 +111,10 @@ impl Events {
     pub(crate) fn record(&self, line: &Value) {
         let at = facts::timestamp(crate::agent::now_ms());
         if let Some(event) = sanitize(line, &at) {
+            #[cfg(test)]
+            SEEN.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event.clone());
             self.ring().push(event);
             self.arrived.notify_one();
         }
@@ -150,6 +154,13 @@ static EVENTS: Events = Events::new(ALONE_EVERY);
 /// The agent's own ring, which `timing::emit_event` fills.
 pub(crate) fn global() -> &'static Events {
     &EVENTS
+}
+/// Every event this test process kept, which reports do not drain, for a test that waits for one.
+#[cfg(test)]
+static SEEN: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) fn seen() -> Vec<Value> {
+    SEEN.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
 /// Keeps `line`, a line of the agent's log, for the next report, as far as the contract allows.

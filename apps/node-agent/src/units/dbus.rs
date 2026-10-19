@@ -69,6 +69,15 @@ pub trait Service {
     fn uid(&self) -> zbus::Result<u32>;
     #[zbus(property)]
     fn memory_max(&self) -> zbus::Result<u64>;
+    /// When systemd created the main process, in microseconds of `CLOCK_MONOTONIC`; 0 before the
+    /// first. The process is systemd-executor then, which sets up the unit's sandbox before it
+    /// executes the service binary.
+    #[zbus(property)]
+    fn exec_main_start_timestamp_monotonic(&self) -> zbus::Result<u64>;
+    /// When systemd-executor was about to execute the service binary, in microseconds of
+    /// `CLOCK_MONOTONIC`; 0 before the first (systemd 256).
+    #[zbus(property)]
+    fn exec_main_handoff_timestamp_monotonic(&self) -> zbus::Result<u64>;
 }
 
 /// A property as `SetUnitProperties` takes it.

@@ -4,7 +4,7 @@
 use crate::{
     admission::Snapshot,
     archive::facts::timestamp,
-    machine::{CpuTimes, Memory},
+    machine::{CpuTimes, Memory, Throttle},
     storage::PoolSample,
 };
 use serde_json::{Value, json};
@@ -37,8 +37,24 @@ pub fn cpu_times(stat: &str, ticks_per_second: u64) -> Option<CpuTimes> {
     Some(CpuTimes {
         busy,
         total: busy + idle + iowait,
+        steal,
         cores: u32::try_from(cores).ok().filter(|c| *c > 0)?,
         ticks_per_second,
+    })
+}
+
+/// The throttling of a unit's `cpu.stat`: how often its CPU quota stopped it, and for how long.
+/// `None` for a text without the two counters, which the kernel writes where it has CFS bandwidth.
+pub fn throttle(cpu_stat: &str) -> Option<Throttle> {
+    let counter = |name: &str| {
+        cpu_stat.lines().find_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            (key == name).then_some(value)?.trim().parse().ok()
+        })
+    };
+    Some(Throttle {
+        nr_throttled: counter("nr_throttled")?,
+        throttled_usec: counter("throttled_usec")?,
     })
 }
 
@@ -156,6 +172,7 @@ mod tests {
         assert_eq!(times.cores, 4);
         assert_eq!(times.busy, 4705 + 150 + 1120 + 10 + 55 + 20);
         assert_eq!(times.total, times.busy + 16250 + 520);
+        assert_eq!(times.steal, 20);
         assert_eq!(times.ticks_per_second, 100);
         for broken in [
             "",
@@ -168,10 +185,36 @@ mod tests {
         }
     }
 
+    /// The `cpu.stat` of a database's unit in the lab after 3 million rows under `CPUQuota=10%`
+    /// (systemd 257, cgroup v2).
+    const CPU_STAT: &str = "usage_usec 564646\nuser_usec 459642\nsystem_usec 105004\ncore_sched.force_idle_usec 0\nnr_periods 47\nnr_throttled 46\nthrottled_usec 4220415\nnr_bursts 0\nburst_usec 0\n";
+
+    #[test]
+    fn the_throttling_of_a_unit_is_its_two_counters_in_cpu_stat() {
+        assert_eq!(
+            throttle(CPU_STAT),
+            Some(Throttle {
+                nr_throttled: 46,
+                throttled_usec: 4_220_415
+            })
+        );
+        // A name that only ends in a counter's is not the counter.
+        for broken in [
+            "",
+            "usage_usec 1\n",
+            "nr_throttled 7\n",
+            "nr_throttled 7\nthrottled_usec x\n",
+            "burst_nr_throttled 7\nthrottled_usec 1\n",
+        ] {
+            assert_eq!(throttle(broken), None, "{broken:?}");
+        }
+    }
+
     fn times(busy: u64, total: u64) -> CpuTimes {
         CpuTimes {
             busy,
             total,
+            steal: 0,
             cores: 4,
             ticks_per_second: 100,
         }

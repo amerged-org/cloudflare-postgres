@@ -132,6 +132,7 @@ pub(crate) fn timing() -> Timing {
         report_retry: Duration::from_millis(10),
         report_retry_maximum: Duration::from_millis(40),
         settle: Duration::from_secs(10),
+        detail: Duration::from_millis(100),
     }
 }
 

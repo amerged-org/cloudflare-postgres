@@ -66,6 +66,9 @@ pub struct Timing {
     /// How long a starting agent waits for its decisions on the databases of the first page before
     /// it serves the gateway, whose sessions end on a database the table does not show running.
     pub settle: Duration,
+    /// How long after a wake's release its `wake_detail` is read: past the login and the first
+    /// statements, which the CPU quota may throttle.
+    pub detail: Duration,
 }
 impl Default for Timing {
     fn default() -> Self {
@@ -79,6 +82,7 @@ impl Default for Timing {
             report_retry: Duration::from_secs(2),
             report_retry_maximum: Duration::from_secs(60),
             settle: Duration::from_secs(10),
+            detail: Duration::from_secs(2),
         }
     }
 }

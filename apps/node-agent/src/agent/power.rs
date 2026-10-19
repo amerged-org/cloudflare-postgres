@@ -7,12 +7,12 @@ use crate::{
     admission::{AdmitError, EarlySleep, Request},
     archive::server::{Registration, Table},
     layout::Layout,
-    machine::Machine,
+    machine::{CpuTimes, Machine, Throttle},
     proof::{self, Outcome, Proof, Steps, WakeRefusal},
     sleep::Refusal,
     state::{DatabaseState, ProvenSleepRecord},
     storage::VolumeId,
-    units::Started,
+    units::{Started, Timeline},
 };
 use pgcf_native_protocol::{
     agent::{ControlAction, SessionStatus, Writer},
@@ -81,6 +81,68 @@ fn wake_line(result: &WakeResult, total_ms: u64) -> serde_json::Value {
     line
 }
 
+/// How much a unit's quota throttled it between two readings. `None` where either is missing, or
+/// the counters went back: the unit started again, with a cgroup of its own.
+fn throttle_since(before: Option<Throttle>, after: Option<Throttle>) -> Option<Throttle> {
+    let (before, after) = (before?, after?);
+    Some(Throttle {
+        nr_throttled: after.nr_throttled.checked_sub(before.nr_throttled)?,
+        throttled_usec: after.throttled_usec.checked_sub(before.throttled_usec)?,
+    })
+}
+
+/// The CPU times of the machine and the moment they were read: where a steal window starts.
+pub(crate) type CpuMark = (Instant, Option<CpuTimes>);
+
+/// The milliseconds of CPU time the hypervisor took from the machine, summed over its cores, since
+/// `from` was read, and the milliseconds that passed: `(steal_ms, window_ms)`.
+fn steal_since(from: CpuMark, now: Option<CpuTimes>) -> Option<(u64, u64)> {
+    let (before, after) = (from.1?, now?);
+    let ticks = after.steal.checked_sub(before.steal)?;
+    Some((
+        ticks.checked_mul(1000)? / after.ticks_per_second.max(1),
+        millis(from.0.elapsed()),
+    ))
+}
+
+/// The log line of a started wake's detail (plan 11.1): numbers only, and none for what could not
+/// be read. `throttle` is the throttling since the release, `steal` the stolen CPU time and the
+/// window it was counted over.
+fn detail_line(
+    database: &str,
+    timeline: &Timeline,
+    throttle: Option<Throttle>,
+    steal: Option<(u64, u64)>,
+) -> serde_json::Value {
+    let mut line = json!({"event": "wake_detail", "database_id": database});
+    let startup = timeline.startup.as_ref();
+    for (name, value) in [
+        ("job_to_fork_us", timeline.job_to_fork_us),
+        ("fork_to_handoff_us", timeline.fork_to_handoff_us),
+        (
+            "handoff_to_starting_us",
+            startup.map(|s| s.handoff_to_starting_us),
+        ),
+        (
+            "starting_to_shut_down_us",
+            startup.map(|s| s.starting_to_shut_down_us),
+        ),
+        (
+            "shut_down_to_ready_us",
+            startup.map(|s| s.shut_down_to_ready_us),
+        ),
+        ("nr_throttled", throttle.map(|t| t.nr_throttled)),
+        ("throttled_usec", throttle.map(|t| t.throttled_usec)),
+        ("steal_ms", steal.map(|(steal_ms, _)| steal_ms)),
+        ("steal_window_ms", steal.map(|(_, window_ms)| window_ms)),
+    ] {
+        if let Some(value) = value {
+            line[name] = value.into();
+        }
+    }
+    line
+}
+
 impl<M: Machine> Core<M> {
     /// Changes the database's state file, and the view's copy of it: on disk before it returns.
     pub(crate) fn save_state(
@@ -106,14 +168,15 @@ impl<M: Machine> Core<M> {
 
     /// Starts the unit of `entry` through admission and waits for PostgreSQL to accept
     /// connections, up to `deadline`: the start itself goes on after it. The admission decision is
-    /// an event.
+    /// an event. It gives the unit, how long admission made the start wait, and the CPU times read
+    /// just before the unit was asked to start.
     pub(crate) async fn start_unit(
         self: &Arc<Self>,
         db: &Db,
         entry: &Entry,
         start: StartAs<'_>,
         deadline: Option<Duration>,
-    ) -> Result<(Started, Duration), StartFailure> {
+    ) -> Result<(Started, Duration, CpuMark), StartFailure> {
         let request = Request {
             database: db.id.clone(),
             memory_mib: entry.memory_mib,
@@ -146,17 +209,19 @@ impl<M: Machine> Core<M> {
             }
             // The database is awake, starting or already waiting: it is admitted.
             Err(AdmitError::Duplicate) => {
+                let mark = (Instant::now(), self.machine.cpu());
                 let started = self
                     .machine
                     .start(&db.id)
                     .await
                     .map_err(|_| StartFailure::Failed)?;
-                return Ok((started, Duration::ZERO));
+                return Ok((started, Duration::ZERO, mark));
             }
             Err(AdmitError::Stopped) => return Err(StartFailure::Failed),
         };
         let waited = permit.waited;
         self.event(event("admitted", waited, None));
+        let mark = (Instant::now(), self.machine.cpu());
         let running = self.machine.start(&db.id);
         let outcome = match deadline {
             Some(deadline) => tokio::time::timeout(deadline, running).await,
@@ -165,7 +230,7 @@ impl<M: Machine> Core<M> {
         match outcome {
             Ok(Ok(started)) => {
                 permit.ready();
-                Ok((started, waited))
+                Ok((started, waited, mark))
             }
             Ok(Err(_)) => {
                 // A unit that is awake still holds its memory: the permit stays counted until its
@@ -281,7 +346,6 @@ impl<M: Machine> Core<M> {
         let begun = Instant::now();
         let mut steps = BTreeMap::new();
         let outcome = self.try_wake(request, &mut steps).await;
-        steps.insert("release".to_string(), 0);
         let (outcome, reason, retry_after_seconds) = match &outcome {
             Ok(()) => (WakeOutcome::Started, None, None),
             Err((reason, retry)) => (WakeOutcome::Refused, Some((*reason).to_string()), *retry),
@@ -487,7 +551,7 @@ impl<M: Machine> Core<M> {
                 Some(self.timing.wake_start),
             )
             .await;
-        let (started, waited) = match started {
+        let (started, waited, steal) = match started {
             Ok(started) => started,
             Err(failure) => {
                 if !matches!(failure, StartFailure::Timeout) {
@@ -506,7 +570,11 @@ impl<M: Machine> Core<M> {
             millis(began.elapsed().saturating_sub(waited)),
         );
         // Roles the page changed while the database slept are written before anyone logs in.
-        if let Err(reason) = self.refresh_roles(&db, &entry).await {
+        let releasing = Instant::now();
+        let began = Instant::now();
+        let roles = self.refresh_roles(&db, &entry).await;
+        steps.insert("roles".into(), millis(began.elapsed()));
+        if let Err(reason) = roles {
             self.stop_unproven(&db).await;
             return refuse(reason);
         }
@@ -520,8 +588,47 @@ impl<M: Machine> Core<M> {
             view.awake_since_ms = Some(now_ms());
             view.refusal = None;
         });
+        steps.insert("release".into(), millis(releasing.elapsed()));
+        self.detail_later(&db, started, steal);
         self.after_ready(&db).await;
         Ok(())
+    }
+
+    /// Off the path of a wake, once its writer is released: one `wake_detail` event, read
+    /// `Timing::detail` later, when the login and the first statements are over. The CPU quota is
+    /// applied right after the release, so its throttling in between is in the event.
+    fn detail_later(self: &Arc<Self>, db: &Db, started: Started, steal: CpuMark) {
+        let (core, database) = (self.clone(), db.id.clone());
+        tokio::spawn(async move {
+            let throttle = core.machine.throttle(&database);
+            tokio::time::sleep(core.timing.detail).await;
+            let line = core.wake_detail(&database, &started, steal, throttle).await;
+            crate::timing::emit_event(line);
+        });
+    }
+
+    /// What the unit, the journal and the kernel say of a start that was released: the time to
+    /// the fork, to the handoff and to the three messages of PostgreSQL's start, the CPU quota's
+    /// throttling since the release, and the steal time since the unit was asked to start. `steal`
+    /// and `throttle` are the readings from then.
+    async fn wake_detail(
+        &self,
+        database: &str,
+        started: &Started,
+        steal: CpuMark,
+        throttle: Option<Throttle>,
+    ) -> serde_json::Value {
+        let timeline = self
+            .machine
+            .start_timeline(database, started)
+            .await
+            .unwrap_or_default();
+        detail_line(
+            database,
+            &timeline,
+            throttle_since(throttle, self.machine.throttle(database)),
+            steal_since(steal, self.machine.cpu()),
+        )
     }
 
     /// A wake of a database that runs: it is released to the ticket. The gateway releases a held
@@ -1099,7 +1206,7 @@ mod tests {
     use crate::{
         agent::testing::{Rig, eventually},
         node_link::contract_valid,
-        postgres,
+        postgres, testpg,
     };
     use pgcf_native_protocol::agent::{Mode, ToGateway};
     use serde_json::Value;
@@ -1124,7 +1231,7 @@ mod tests {
             retry_after_seconds: None,
             steps_ms: [("admission", 3), ("queue_wait", 120), ("pg_control", 4)]
                 .into_iter()
-                .chain([("mount", 31), ("start", 61), ("release", 0)])
+                .chain([("mount", 31), ("start", 61), ("roles", 0), ("release", 1)])
                 .map(|(step, ms)| (step.to_string(), ms))
                 .collect(),
         };
@@ -1134,7 +1241,8 @@ mod tests {
             json!({
                 "event": "wake", "database_id": "abcdefghijklmnopqrst", "outcome": "started",
                 "total_ms": 230, "step_admission": 3, "step_queue_wait": 120,
-                "step_pg_control": 4, "step_mount": 31, "step_start": 61, "step_release": 0,
+                "step_pg_control": 4, "step_mount": 31, "step_start": 61, "step_roles": 0,
+                "step_release": 1,
             })
         );
         // What a node sends of it is what Cloudflare accepts.
@@ -1151,6 +1259,111 @@ mod tests {
         let refused = wake_line(&result, 9);
         assert_eq!(refused["outcome"], "refused");
         assert_eq!(refused["reason"], "no_headroom");
+    }
+
+    fn throttle(nr_throttled: u64, throttled_usec: u64) -> Option<Throttle> {
+        Some(Throttle {
+            nr_throttled,
+            throttled_usec,
+        })
+    }
+    fn cpu(steal: u64) -> Option<CpuTimes> {
+        Some(CpuTimes {
+            busy: 0,
+            total: 0,
+            steal,
+            cores: 4,
+            ticks_per_second: 100,
+        })
+    }
+
+    #[test]
+    fn a_wake_detail_is_numbers_for_what_was_read_and_nothing_for_what_was_not() {
+        let timeline = Timeline {
+            job_to_fork_us: Some(2_300),
+            fork_to_handoff_us: Some(33_886),
+            startup: Some(crate::units::journal::Startup {
+                handoff_to_starting_us: 12_840,
+                starting_to_shut_down_us: 1_605,
+                shut_down_to_ready_us: 1_522,
+            }),
+        };
+        // The quota throttled the unit twice since the release; 3 ticks of 10 ms were stolen.
+        let throttled = throttle_since(throttle(0, 0), throttle(2, 7_500));
+        let stolen = steal_since((Instant::now(), cpu(10)), cpu(13));
+        assert_eq!(throttled, throttle(2, 7_500));
+        let (steal_ms, _window) = stolen.unwrap();
+        assert_eq!(steal_ms, 30);
+        let line = detail_line("abcdefghijklmnopqrst", &timeline, throttled, stolen);
+        assert_eq!(
+            line,
+            json!({
+                "event": "wake_detail", "database_id": "abcdefghijklmnopqrst",
+                "job_to_fork_us": 2_300, "fork_to_handoff_us": 33_886,
+                "handoff_to_starting_us": 12_840, "starting_to_shut_down_us": 1_605,
+                "shut_down_to_ready_us": 1_522,
+                "nr_throttled": 2, "throttled_usec": 7_500, "steal_ms": 30,
+                "steal_window_ms": line["steal_window_ms"],
+            })
+        );
+        // What the node sends of it is what Cloudflare accepts.
+        let at = "2026-10-18T10:11:12.345Z";
+        let event = crate::events::sanitize(&line, at).unwrap();
+        assert_eq!(event["fields"].as_object().unwrap().len(), 9);
+        assert!(contract_valid(
+            "NodeObservationReport",
+            &json!({"observed_at": at, "databases": [], "orders": [], "events": [event]})
+        ));
+
+        // A journal that could not be read, a unit that is gone and a machine without a clock
+        // leave their numbers out; the counters that went back are no reading.
+        let bare = detail_line("abcdefghijklmnopqrst", &Timeline::default(), None, None);
+        assert_eq!(
+            bare,
+            json!({"event": "wake_detail", "database_id": "abcdefghijklmnopqrst"})
+        );
+        assert_eq!(throttle_since(None, throttle(1, 1)), None);
+        assert_eq!(throttle_since(throttle(5, 100), throttle(0, 0)), None);
+        assert_eq!(steal_since((Instant::now(), None), cpu(1)), None);
+        assert_eq!(steal_since((Instant::now(), cpu(9)), cpu(1)), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_started_wake_emits_one_detail_after_its_release_and_not_on_its_path() {
+        let timing = crate::agent::Timing {
+            detail: Duration::from_millis(600),
+            ..crate::agent::testing::timing()
+        };
+        let Some(rig) = Rig::with_timing("wake-detail", timing).await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let details = || -> Vec<Value> {
+            crate::events::seen()
+                .into_iter()
+                .filter(|e| e["event"] == "wake_detail" && e["database_id"] == entry.id.as_str())
+                .collect()
+        };
+
+        // The wake returns released and the detail is not there yet.
+        let ticket = Rig::ticket(&entry);
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        assert_eq!(db.phase(), Phase::Ready);
+        assert!(details().is_empty());
+
+        // This machine has no journal and no cgroup: the steal time of the window is all it reads.
+        eventually(10, "the detail", || !details().is_empty()).await;
+        let detail = details().remove(0);
+        let fields = detail["fields"].as_object().unwrap();
+        assert!(fields["steal_ms"].is_u64() && fields["steal_window_ms"].as_u64() >= Some(1));
+        assert_eq!(fields.len(), 2, "{detail}");
+
+        // The same wake again finds the database released: no start, no detail.
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(details().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1272,6 +1485,51 @@ mod tests {
         // The same wake again, from a second connection, is the same start.
         let again = rig.core.wake(&ticket).await;
         assert_eq!(again.outcome, WakeOutcome::Started);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_times_the_roles_it_applies_and_the_release_that_holds_them() {
+        let Some(rig) = Rig::new("wake-roles").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let (entry, handle) = rig.create_from(&db).await;
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+
+        // Nothing changed while it slept: the roles are applied already, and the wake still times
+        // the release.
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        assert!(result.steps_ms.contains_key("release"), "{result:?}");
+        assert!(result.steps_ms.contains_key("roles"), "{result:?}");
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+
+        // While it sleeps the page changes a password: the wake writes it before the release.
+        db.as_object_mut().unwrap().remove("origin");
+        db["generation"] = json!(entry.generation + 1);
+        db["operation"] = json!(format!("op_{:0>20}", "roles"));
+        db["roles"] = json!([
+            {"name": "app", "owner": true, "password": testpg::password(5), "revision": 5},
+            {"name": "reader", "owner": false, "password": testpg::password(2), "revision": 2}
+        ]);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(10, "the entry", || {
+            handle
+                .view()
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.generation == entry.generation + 1)
+        })
+        .await;
+        let result = rig.core.wake(&Rig::ticket(&rig.entry_for(&db))).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        let (roles, release) = (result.steps_ms["roles"], result.steps_ms["release"]);
+        assert!(roles > 0, "{result:?}");
+        // The release is timed from the end of the start, so it holds the roles written after it.
+        // The publish of the writer is real here, and too fast to tell whether the timer stops
+        // after it; the writer being in the table is all this shows of it.
+        assert!(release >= roles, "{result:?}");
+        assert_eq!(rig.gateway.get(&entry.id).unwrap().mode, Mode::Running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1818,12 +2076,28 @@ mod tests {
         );
         rig.core.early_sleep(order).await;
         assert_eq!(a_db.phase(), Phase::Asleep);
-        // A frees its memory: the wake that waited is admitted.
+        // A frees its memory, a while later: the wake that waited is admitted.
+        tokio::time::sleep(Duration::from_secs(2)).await;
         rig.machine.set_available_bytes(8 << 30);
         let result = waiting.await.unwrap();
         assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
-        assert!(result.steps_ms.get("queue_wait").is_some_and(|ms| *ms > 0));
+        let queued = result.steps_ms.get("queue_wait").copied().unwrap_or(0);
+        assert!(queued >= 2_000, "{result:?}");
         assert_eq!(b_db.phase(), Phase::Ready);
+        // The steal window of its detail starts when the start is asked for, after the wait.
+        let detail_of_b = || {
+            crate::events::seen()
+                .into_iter()
+                .find(|e| e["event"] == "wake_detail" && e["database_id"] == b.id.as_str())
+        };
+        eventually(10, "the detail", || detail_of_b().is_some()).await;
+        let window = detail_of_b().unwrap()["fields"]["steal_window_ms"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            window < queued,
+            "window {window} ms, queue_wait {queued} ms"
+        );
         let events = rig.core.take_events();
         assert!(events.iter().any(|e| e["type"] == "early_sleep"
             && e["database"] == a.id.as_str()

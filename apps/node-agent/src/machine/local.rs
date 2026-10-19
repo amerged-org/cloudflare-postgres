@@ -3,7 +3,7 @@
 //! starts them and signalled as systemd signals them, in directories that stand for the thin
 //! volumes. Only systemd, LVM and the users are stood in for; their own behaviour is proved in the
 //! lab (`units::lab`, `storage::lab_tests`) and on a node.
-use super::{Account, Boot, CpuTimes, Machine, Memory, initdb_arguments};
+use super::{Account, Boot, CpuTimes, Machine, Memory, Throttle, initdb_arguments};
 use crate::{
     diagnostics::probe,
     layout::Layout,
@@ -14,7 +14,7 @@ use crate::{
     },
     testpg,
     units::{
-        self, ActiveState, Started, UnitState,
+        self, ActiveState, Started, Timeline, UnitState,
         limits::{Limits, Property},
         ready,
     },
@@ -670,6 +670,10 @@ impl Machine for Local {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
+    /// Neither systemd nor a journal runs here: nothing was recorded.
+    async fn start_timeline(&self, _: &str, _: &Started) -> Result<Timeline, units::Error> {
+        Ok(Timeline::default())
+    }
     async fn wait_started(&self, database: &str) -> Result<Started, units::Error> {
         let waited = Instant::now();
         loop {
@@ -936,9 +940,14 @@ impl Machine for Local {
         Some(CpuTimes {
             busy: state.cpu_calls * 50,
             total: state.cpu_calls * 600,
+            steal: state.cpu_calls * 2,
             cores: 6,
             ticks_per_second: 100,
         })
+    }
+    /// No cgroup here: nothing counted.
+    fn throttle(&self, _: &str) -> Option<Throttle> {
+        None
     }
 }
 
@@ -967,6 +976,7 @@ impl Local {
             invocation_id,
             uid: self.uid,
             socket,
+            requested_us: None,
         })
     }
 }

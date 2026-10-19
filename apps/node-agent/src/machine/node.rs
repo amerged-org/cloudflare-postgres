@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The node itself: `Storage` on LVM, `Units` over systemd's D-Bus, the users in `/etc/passwd`
 //! and `initdb` as the database's user.
-use super::{Account, Boot, CpuTimes, Machine, Memory, gateway_environment, initdb_arguments};
+use super::{
+    Account, Boot, CpuTimes, Machine, Memory, Throttle, gateway_environment, initdb_arguments,
+};
 use crate::{
     diagnostics::probe,
     layout::Layout,
@@ -10,7 +12,7 @@ use crate::{
         self, Config, Inventory, NoRoom, PoolSample, Removal, Storage, SystemRunner, VolumeId,
     },
     units::{
-        self, Started, UnitState, Units,
+        self, Started, Timeline, UnitState, Units,
         limits::Limits,
         users::{Users, account_name},
     },
@@ -348,6 +350,13 @@ impl Machine for Node {
     async fn wait_started(&self, database: &str) -> Result<Started, units::Error> {
         self.units.wait_started(database).await
     }
+    async fn start_timeline(
+        &self,
+        database: &str,
+        started: &Started,
+    ) -> Result<Timeline, units::Error> {
+        self.units.timeline(database, started).await
+    }
     async fn stop(&self, database: &str) -> Result<(), units::Error> {
         self.units.stop(database).await
     }
@@ -611,6 +620,11 @@ impl Machine for Node {
     fn cpu(&self) -> Option<CpuTimes> {
         let text = std::fs::read_to_string("/proc/stat").ok()?;
         crate::sample::cpu_times(&text, USER_HZ)
+    }
+
+    fn throttle(&self, database: &str) -> Option<Throttle> {
+        let text = std::fs::read_to_string(units::cpu_stat_path(database)?).ok()?;
+        crate::sample::throttle(&text)
     }
 }
 
