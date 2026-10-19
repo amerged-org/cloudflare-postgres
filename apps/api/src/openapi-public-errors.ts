@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /** Public handler errors, not a default set for every method or resource family.
- * Validation/body failures are 400; API-key authentication is 401 and admin scope is 403.
+ * Validation/body failures are 400; API-key authentication is 401 and admin scope is 403, which is
+ * also what a read-only admin_read key is told for any request that is not a GET.
  * D1, custody, actor and upstream failures reach app.ts's 500 boundary.
  * assertProjectAccess/databaseForRequest hide foreign project resources as 404, not 403.
  */
@@ -12,10 +13,11 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "POST /v1/api-keys": [400, 401, 403, 404, 409, 500],
   "GET /v1/api-keys": [400, 401, 403, 500],
   "DELETE /v1/api-keys/{id}": [400, 401, 403, 404, 409, 500],
+  "GET /v1/audit-events": [400, 401, 403, 500],
   "POST /v1/projects": [400, 401, 403, 404, 409, 500],
   "GET /v1/projects": [400, 401, 500],
   "GET /v1/projects/{id}": [400, 401, 404, 500],
-  "DELETE /v1/projects/{id}": [400, 401, 404, 409, 500],
+  "DELETE /v1/projects/{id}": [400, 401, 403, 404, 409, 500],
   "GET /v1/size-classes": [400, 401, 500],
   "PUT /v1/size-classes/{id}": [400, 401, 403, 404, 409, 500],
   "POST /v1/regions": [400, 401, 403, 409, 500],
@@ -25,26 +27,26 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/nodes": [400, 401, 403, 409, 500],
   "GET /v1/nodes/{id}": [400, 401, 403, 404, 409, 500],
 
-  "POST /v1/databases": [400, 401, 404, 409, 500],
+  "POST /v1/databases": [400, 401, 403, 404, 409, 500],
   "GET /v1/databases": [400, 401, 404, 500],
   "GET /v1/databases/{id}": [400, 401, 404, 500],
   // scheduleDatabaseResize is the public database path that can refuse capacity with 503.
-  "PATCH /v1/databases/{id}": [400, 401, 404, 409, 500, 503],
+  "PATCH /v1/databases/{id}": [400, 401, 403, 404, 409, 500, 503],
   // 409: the database is deleted.
-  "PUT /v1/databases/{id}/idle-time": [400, 401, 404, 409, 500],
+  "PUT /v1/databases/{id}/idle-time": [400, 401, 403, 404, 409, 500],
   // 403: not an admin key; 503: the node cannot take the growth.
   "PUT /v1/databases/{id}/resources": [400, 401, 403, 404, 409, 500, 503],
-  "DELETE /v1/databases/{id}": [400, 401, 404, 409, 500],
-  "POST /v1/databases/{id}/restore": [400, 401, 404, 409, 500],
-  "POST /v1/databases/{id}/suspend": [400, 401, 404, 409, 500],
-  "POST /v1/databases/{id}/resume": [400, 401, 404, 409, 500],
+  "DELETE /v1/databases/{id}": [400, 401, 403, 404, 409, 500],
+  "POST /v1/databases/{id}/restore": [400, 401, 403, 404, 409, 500],
+  "POST /v1/databases/{id}/suspend": [400, 401, 403, 404, 409, 500],
+  "POST /v1/databases/{id}/resume": [400, 401, 403, 404, 409, 500],
   "GET /v1/databases/{id}/roles": [400, 401, 404, 500],
-  "POST /v1/databases/{id}/roles": [400, 401, 404, 409, 500],
+  "POST /v1/databases/{id}/roles": [400, 401, 403, 404, 409, 500],
   "POST /v1/databases/{id}/roles/{name}/reset-password": [
-    400, 401, 404, 409, 500,
+    400, 401, 403, 404, 409, 500,
   ],
   // 400: the owner or the maintenance role; 409: a member_of target, a change in progress.
-  "DELETE /v1/databases/{id}/roles/{name}": [400, 401, 404, 409, 500],
+  "DELETE /v1/databases/{id}/roles/{name}": [400, 401, 403, 404, 409, 500],
   "GET /v1/databases/{id}/roles/{name}/connection-uri": [400, 401, 404, 500],
   "GET /v1/operations/{id}": [400, 401, 404, 500],
   "GET /v1/databases/{id}/operations": [400, 401, 404, 500],
@@ -58,7 +60,8 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "PUT /v1/nodes/{id}/database-placement": [400, 401, 403, 409, 500],
   // Only an administrator reads a report: any other key is told 404, as for a resource it does not own.
   "GET /v1/nodes/{id}/diagnostics": [400, 401, 404, 500],
-  "POST /v1/nodes/{id}/diagnostics": [400, 401, 404, 500],
+  // 403: a read-only admin_read key may read the answers but not ask.
+  "POST /v1/nodes/{id}/diagnostics": [400, 401, 403, 404, 500],
   "GET /v1/nodes/{id}/diagnostics/{diagnostic_id}": [400, 401, 404, 500],
   "POST /v1/nodes/{id}/mark-lost": [400, 401, 403, 404, 409, 500],
   "GET /v1/nodes/{id}/loss": [400, 401, 403, 404, 500],
@@ -93,7 +96,9 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "PUT /v1/resource-profiles/{id}": [400, 401, 403, 404, 409, 500],
   "GET /v1/resource-profiles/{id}/revisions/{revision}": [400, 401, 404, 500],
   "GET /v1/databases/{id}/resource-profile": [400, 401, 404, 500],
-  "PUT /v1/databases/{id}/resource-profile": [400, 401, 404, 409, 500, 503],
+  "PUT /v1/databases/{id}/resource-profile": [
+    400, 401, 403, 404, 409, 500, 503,
+  ],
   "GET /v1/regions/{id}/capacity-policy": [400, 401, 403, 404, 500],
   "PUT /v1/regions/{id}/capacity-policy": [400, 401, 403, 404, 409, 500],
   // A dry-run decision for an absent policy/region is 200/action=unconfigured.

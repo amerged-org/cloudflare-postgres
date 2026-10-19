@@ -49,6 +49,8 @@ export interface ApiVariables {
   /** The class of an unexpected failure, set by the error handler for the request's one failure line. */
   failureCause?: string;
   auth?: AuthPrincipal;
+  /** The audit row written before an administrator key's change ran; `recordAuditOutcome` completes it. */
+  auditEventId?: string;
   /** The record of the node a signed call claims to come from, found before its body is read. */
   nodeClaim?: NodeClaim;
   /** The node of a call signed with its key. */

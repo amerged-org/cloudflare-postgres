@@ -25,6 +25,7 @@ export const keyRow = (row: Row): ApiKey =>
     name: row.name,
     lookup_id: row.lookup_id,
     created_at: row.created_at,
+    expires_at: row.expires_at,
     revoked_at: row.revoked_at,
   });
 export const sizeRow = (row: Row): SizeClass =>

@@ -7,7 +7,7 @@ const directory = new URL("../../../apps/api/migrations/", import.meta.url);
 const migrations = readdirSync(directory)
   .filter((name) => name.endsWith(".sql"))
   .sort();
-const MIGRATION = "0076_single_archive_bucket.sql";
+const MIGRATION = "0078_single_archive_bucket.sql";
 const NOW = "2026-10-19T10:00:00.000Z";
 let db: DatabaseSync;
 

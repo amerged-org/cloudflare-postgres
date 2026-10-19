@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { MAINTENANCE_ROLE } from "./maintenance.ts";
-import { ApiKeyScope, ApiKeyString } from "./auth.ts";
+import { AdminScope, ApiKeyScope, ApiKeyString } from "./auth.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 import { Timestamp } from "./timestamp.ts";
 import {
@@ -29,7 +29,7 @@ export { Timestamp, roleExpiryInstant } from "./timestamp.ts";
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.2.0";
+export const API_CONTRACT_VERSION = "1.3.0";
 
 /** The pattern of `Timestamp` in the contract's own JSON Schema, which the OpenAPI generator drops. */
 export const TIMESTAMP_PATTERN: string = (() => {
@@ -735,6 +735,13 @@ export type DatabaseWithOperation = z.infer<typeof DatabaseWithOperation>;
 
 // ---------- API keys ----------
 
+/** An administrator key made through the API lives this long unless it asks for another time. */
+export const ADMIN_KEY_DEFAULT_LIFETIME_DAYS = 90;
+/** The latest expiry an administrator key may ask for, counted from its creation. */
+export const ADMIN_KEY_MAX_LIFETIME_DAYS = 366;
+/** The audit log keeps an event this long. */
+export const AUDIT_RETENTION_DAYS = 90;
+
 export const ApiKey = z
   .strictObject({
     id: ApiKeyId,
@@ -744,6 +751,9 @@ export const ApiKey = z
     name: DisplayName,
     lookup_id: z.string().regex(/^[a-z0-9]{12}$/),
     created_at: Timestamp,
+    expires_at: Timestamp.nullable().describe(
+      "From this time the key is refused with 401, as if it were revoked. null: it does not expire.",
+    ),
     revoked_at: Timestamp.nullable(),
   })
   .meta({ id: "ApiKey" });
@@ -755,20 +765,71 @@ export const ApiKeyCreate = z
     scope: ApiKeyScope,
     project_id: ProjectId.optional(),
     name: DisplayName,
+    expires_at: Timestamp.optional().describe(
+      `When the key stops working: a future time. Omitted: an admin or admin_read key made by an administrator key expires ${ADMIN_KEY_DEFAULT_LIFETIME_DAYS} days after its creation and an integrator key never expires. An administrator key may ask for at most ${ADMIN_KEY_MAX_LIFETIME_DAYS} days.`,
+    ),
   })
   .refine(
     (body) => (body.scope === "integrator") === (body.project_id !== undefined),
     {
-      message: "integrator keys require project_id; admin keys must omit it",
+      message:
+        "integrator keys require project_id; admin and admin_read keys must omit it",
       path: ["project_id"],
     },
   )
   .meta({
     id: "ApiKeyCreate",
     description:
-      "An integrator key requires project_id and is bound to that project; an admin key must omit it. Anything else is a 400.",
+      "An integrator key requires project_id and is bound to that project; an admin or admin_read key must omit it. Anything else is a 400. The first admin key, made with the bootstrap token, does not expire unless it asks to.",
   });
 export type ApiKeyCreate = z.infer<typeof ApiKeyCreate>;
+
+// ---------- Audit log ----------
+
+/** The methods the API serves; HEAD is answered by the GET handlers. */
+export const AUDIT_METHODS = [
+  "GET",
+  "HEAD",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+] as const;
+
+export const AuditEvent = z
+  .strictObject({
+    id: z.uuid(),
+    key_id: ApiKeyId.describe("The administrator key the request presented."),
+    scope: AdminScope.describe("The scope of that key."),
+    method: z.enum(AUDIT_METHODS),
+    route: z
+      .string()
+      .min(1)
+      .max(200)
+      .describe(
+        "The route template, such as /v1/api-keys/{id}: never the concrete path, a query or a body.",
+      ),
+    status: z
+      .number()
+      .int()
+      .min(100)
+      .max(599)
+      .nullable()
+      .describe(
+        "The HTTP status of the answer. null: the request was recorded before it ran and its outcome could not be written afterwards (or the Worker stopped before it answered); the change may have happened.",
+      ),
+    request_id: z
+      .string()
+      .regex(/^[A-Za-z0-9._~-]{1,128}$/)
+      .describe("The X-Request-Id of the request."),
+    created_at: Timestamp.describe("When the request was authenticated."),
+  })
+  .meta({
+    id: "AuditEvent",
+    description:
+      "One request of an administrator key. A request of an admin or admin_read key with any method but GET or HEAD is recorded before it runs; the refusal of a revoked or an expired administrator key that was presented with its real secret is recorded with status 401 (a wrong secret is not: the identifier in a key string is not secret). Reads that succeed are not recorded. No body, query, path parameter, key material or address is kept.",
+  });
+export type AuditEvent = z.infer<typeof AuditEvent>;
 
 /** The full key appears only in this creation response. */
 export const ApiKeyCreated = z

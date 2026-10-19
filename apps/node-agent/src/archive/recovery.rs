@@ -407,6 +407,20 @@ mod tests {
         }
         source.stop();
 
+        // The source's dump of its shared buffers came with the backup. In a restore it also
+        // names what the backup does not have (a relation that was dropped since, a database
+        // that was never there): two entries more, which a start of the restore must survive.
+        let dump = target.data().join("autoprewarm.blocks");
+        let text = std::fs::read_to_string(&dump).unwrap();
+        let mut blocks: Vec<&str> = text.lines().skip(1).collect();
+        assert!(!blocks.is_empty(), "the source wrote no dump");
+        blocks.extend(["5,1663,999999,0,0", "999999,1663,999999,0,0"]);
+        std::fs::write(
+            &dump,
+            format!("<<{}>>\n{}\n", blocks.len(), blocks.join("\n")),
+        )
+        .unwrap();
+
         // The restore: the agent's files of the small database, and the recovery settings.
         target.configure(256, None);
         let data = target.data();
@@ -418,6 +432,10 @@ mod tests {
         let rows = session.query("SELECT count(*) FROM t", &[]).await.unwrap();
         assert_eq!(rows[0].get::<_, i64>(0), 200);
         drop(session);
+        // Autoprewarm read the dump during the replay, at the consistent state, and loaded some
+        // of it.
+        let (loaded, of) = target.prewarmed().await;
+        assert!(loaded >= 1 && of == blocks.len() as u64, "{loaded} of {of}");
 
         // Recovery is over: the settings go, and the next start is the small database's own.
         target.stop();
@@ -428,7 +446,7 @@ mod tests {
         .unwrap();
         target.start();
         let session = target.agent().await;
-        for (name, value) in [("max_worker_processes", "2"), ("max_wal_senders", "0")] {
+        for (name, value) in [("max_worker_processes", "4"), ("max_wal_senders", "0")] {
             let rows = session.query(&format!("SHOW {name}"), &[]).await.unwrap();
             assert_eq!(rows[0].get::<_, String>(0), value, "{name}");
         }

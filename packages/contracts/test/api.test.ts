@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   ApiKeyCreate,
+  AuditEvent,
   DatabaseCreate,
   DatabaseIdleTime,
   DatabasePatch,
@@ -439,6 +440,52 @@ describe("request bodies", () => {
     expect(
       ApiKeyCreate.safeParse({ scope: "admin", name: "ops", extra: 1 }).success,
     ).toBe(false);
+  });
+
+  it("takes a read-only administrator scope with no project and an optional canonical expiry", () => {
+    const project_id = newProjectId();
+    expect(
+      ApiKeyCreate.safeParse({ scope: "admin_read", name: "monitoring" })
+        .success,
+    ).toBe(true);
+    expect(
+      ApiKeyCreate.safeParse({ scope: "admin_read", project_id, name: "x" })
+        .success,
+    ).toBe(false);
+    const expires_at = "2030-01-01T09:30:00.000Z";
+    expect(
+      ApiKeyCreate.safeParse({ scope: "admin", name: "ops", expires_at })
+        .success,
+    ).toBe(true);
+    for (const bad of ["2030-01-01", "2030-01-01T09:30:00Z", "tomorrow", 5])
+      expect(
+        ApiKeyCreate.safeParse({ scope: "admin", name: "ops", expires_at: bad })
+          .success,
+      ).toBe(false);
+  });
+
+  it("says in an audit event what was asked, and keeps no body or address", () => {
+    const event = {
+      id: randomUUID(),
+      key_id: "key_abcdefghij1234567890",
+      scope: "admin_read",
+      method: "POST",
+      route: "/v1/api-keys/{id}",
+      status: null,
+      request_id: "request-1",
+      created_at: "2030-01-01T09:30:00.000Z",
+    };
+    expect(AuditEvent.safeParse(event).success).toBe(true);
+    expect(AuditEvent.safeParse({ ...event, status: 403 }).success).toBe(true);
+    for (const change of [
+      { scope: "integrator" },
+      { method: "TRACE" },
+      { status: 99 },
+      { request_id: "has space" },
+      { ip: "203.0.113.7" },
+      { body: {} },
+    ])
+      expect(AuditEvent.safeParse({ ...event, ...change }).success).toBe(false);
   });
 
   it("requires a field in database patches", () => {

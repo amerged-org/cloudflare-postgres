@@ -30,8 +30,6 @@ tokio-tungstenite = "=0.30.0"
 sha2 = "=0.11.0"
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
 time = { version = "=0.3.55", features = ["formatting", "parsing"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
 libc = "=0.2.190"
 
 [dev-dependencies]
