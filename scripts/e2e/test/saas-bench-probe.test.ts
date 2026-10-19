@@ -592,6 +592,75 @@ test("a run whose rounds do not give every database each arm equally often, or n
   }
 });
 
+test("a call of an HTTP arm sends all its requests on one connection of its own, and no call borrows one a neighbour warmed", async () => {
+  const key = randomBytes(16).toString("hex");
+  const password = randomBytes(16).toString("hex");
+  const answered = ["x"];
+  for (const arm of ["http-batch", "http-auth-then-batch"] as const) {
+    // The rows each statement of the first three calls must answer, by its text.
+    const rows = new Map(
+      [0, 1, 2].flatMap((call) =>
+        buildTrips(arm, 1, call, 1)
+          .flat()
+          .map((statement) => [statement.sql, statement.rows] as const),
+      ),
+    );
+    const sockets: number[] = [];
+    const reply = (sql: string) => ({
+      fields: [{ name: "x", dataTypeID: 25 }],
+      rows: Array.from({ length: rows.get(sql)! }, () => answered),
+    });
+    const server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(chunk as Buffer);
+      let body: unknown = {};
+      if (request.method === "POST") {
+        // Each request of the driver lands here with the port of the connection it came on.
+        sockets.push(request.socket.remotePort!);
+        const sent = JSON.parse(Buffer.concat(chunks).toString()) as {
+          query?: string;
+          queries?: { query: string }[];
+        };
+        body = sent.queries
+          ? { results: sent.queries.map(({ query }) => reply(query)) }
+          : reply(sent.query!);
+      } else if (request.url === `/v1/databases/${database}`)
+        body = { observed_state: "hibernated" };
+      else
+        body = {
+          uri: `postgres://app:${password}@127.0.0.1:${(server.address() as { port: number }).port}/${database}`,
+          includes_password: true,
+        };
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(body));
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    try {
+      const result = await bench(
+        ["call", "--database", database, "--mode", arm, "--followups", "2"],
+        {
+          PGCF_API_URL: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+          PGCF_API_KEY: key,
+        },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      const perCall = buildTrips(arm, 1, 0, 1).length;
+      assert.equal(sockets.length, 3 * perCall, arm);
+      const connections = [0, 1, 2].map((call) =>
+        sockets.slice(call * perCall, (call + 1) * perCall),
+      );
+      // The requests of one call share a connection.
+      for (const own of connections)
+        assert.equal(new Set(own).size, 1, `${arm}: ${sockets}`);
+      // The cold call and each follow-up use another one.
+      assert.equal(new Set(connections.map(([port]) => port)).size, 3, arm);
+    } finally {
+      server.close();
+      server.closeAllConnections();
+    }
+  }
+});
+
 /** What the probe Worker answers for `mode=healthz`: two GETs on each path. */
 const get = (ms: number) => ({ ms, status: 200, ray_colo: "FRA" });
 
@@ -641,6 +710,46 @@ test("the healthz command asks the Worker for back-to-back GETs, once per sample
     assert.equal(summary.public.second.p50, 91);
     assert.equal(summary.binding.first.p50, 121);
     assert.equal(summary.binding.second.p50, 31);
+  } finally {
+    probe.stop();
+  }
+});
+
+test("a GET the Edge answered with an error page is a failed sample: not ok, out of the percentiles, and the run exits 1", async () => {
+  const probe = await startProbe((_call, query) =>
+    query.get("call") === "1"
+      ? {
+          colo: "FRA",
+          public: [{ ...get(4), status: 502 }, get(90)],
+          binding: [get(30), get(30)],
+        }
+      : {
+          colo: "FRA",
+          public: [get(180), get(90)],
+          binding: [get(120), get(30)],
+        },
+  );
+  const env = {
+    PGCF_BENCH_PROBE_URL: probe.url,
+    PGCF_BENCH_PROBE_TOKEN: "token",
+  };
+  try {
+    // Sample 0 is answered 200 by every GET: nothing to fail.
+    const clean = await bench(["healthz", "--samples", "1"], env);
+    assert.equal(clean.code, 0);
+    const result = await bench(["healthz", "--samples", "3"], env);
+    assert.equal(result.code, 1);
+    const output = lines(result.stdout);
+    assert.deepEqual(
+      output.slice(0, 3).map((line) => line.ok),
+      [true, false, true],
+    );
+    const summary = output[3]!.healthz_summary!;
+    assert.equal(summary.samples, 3);
+    assert.equal(summary.failures, 1);
+    // The 502 answered in 4 ms; neither it nor its sample's other GETs are in a percentile.
+    assert.equal(summary.public.first.p50, 180);
+    assert.equal(summary.binding.first.p50, 120);
   } finally {
     probe.stop();
   }

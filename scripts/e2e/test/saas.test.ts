@@ -24,6 +24,7 @@ import {
   summarizeArm,
   summarizeHealthz,
   timeCall,
+  type HealthzSample,
   type Session,
   type Timed,
 } from "../src/saas.ts";
@@ -476,13 +477,53 @@ test("a request the Edge refuses over HTTP keeps the driver's error class and th
     clock(),
   );
   assert.equal(timed.ok, false);
-  assert.equal(timed.failed_at, "auth");
+  assert.equal(timed.failed_at, "connect");
   assert.deepEqual(timed.error, {
     error_class: "NeonDbError",
     sqlstate: "53300",
     errno: null,
   });
   assert.doesNotMatch(JSON.stringify(timed), /secret/);
+});
+
+test("over HTTP a refusal, a wake that is not ready or a network error on the first request is a failed connect, as on a WebSocket; a statement's own error names the statement", async () => {
+  const failing = (code: string | undefined) =>
+    timeCall(
+      async () =>
+        httpSession(() =>
+          Object.assign(new Error("boom"), { name: "NeonDbError", code }),
+        ),
+      buildTrips("http-batch", 1, 1, 1),
+      clock(),
+    );
+  // 53300 admission, 57P03 wake, 28P01 password, class 08, and no SQLSTATE at all (a network or a server error).
+  for (const code of ["53300", "57P03", "28P01", "08006", undefined])
+    assert.equal((await failing(code)).failed_at, "connect", String(code));
+  for (const code of ["57014", "42P01"])
+    assert.equal((await failing(code)).failed_at, "auth", code);
+  // Once a request has been answered, the connection is open: a later failure is a statement's.
+  const trips = buildTrips("http-auth-then-batch", 1, 1, 1);
+  const rows = new Map(trips.flat().map((s) => [s.sql, s.rows]));
+  const later = await timeCall(
+    async () =>
+      httpSession((sql) =>
+        sql.startsWith("SELECT status, count")
+          ? Object.assign(new Error("boom"), { code: "53300" })
+          : rows.get(sql)!,
+      ),
+    trips,
+    clock(),
+  );
+  // The transaction names its first statement.
+  assert.equal(later.failed_at, "list");
+  // A WebSocket session has its connect step: a failed statement on it is the statement.
+  const socket = await timeCall(
+    async () =>
+      session(() => Object.assign(new Error("boom"), { code: "08006" })),
+    buildTrips("ws", 1, 1, 1),
+    clock(),
+  );
+  assert.equal(socket.failed_at, "auth");
 });
 
 test("the distribution-free rule allows 0 misses from 59 samples, 1 from 93 and 2 from 124", () => {
@@ -494,7 +535,11 @@ test("the distribution-free rule allows 0 misses from 59 samples, 1 from 93 and 
   assert.equal(allowed(93), 1);
   assert.equal(allowed(123), 1);
   assert.equal(allowed(124), 2);
+  // The first sample size of each count is a minimum: 153 allows 3, 181 allows 4 and 180 still only 3.
+  assert.equal(allowed(152), 2);
   assert.equal(allowed(153), 3);
+  assert.equal(allowed(180), 3);
+  assert.equal(allowed(181), 4);
   // Far beyond the range where 0.95^n is a number a double can hold.
   assert.ok(allowed(20_000)! > 800);
 });
@@ -661,6 +706,41 @@ test("the healthz summary compares the first and the second call of each path, a
   const unbound = summarizeHealthz([{ ...sample(100, 20), binding: null }]);
   assert.deepEqual(unbound.binding.first, { p50: null, p95: null });
   assert.deepEqual(summarizeHealthz([]).public.first, { p50: null, p95: null });
+});
+
+test("a healthz sample with a GET not answered 200 is a failure: its error page's time is no percentile", () => {
+  const sample = (first: number, second: number): HealthzSample => ({
+    colo: "FRA",
+    public: [
+      { ms: first + 60, status: 200, ray_colo: "FRA" },
+      { ms: second + 60, status: 200, ray_colo: "FRA" },
+    ],
+    binding: [
+      { ms: first, status: 200, ray_colo: null },
+      { ms: second, status: 200, ray_colo: null },
+    ],
+  });
+  const refused = (path: "public" | "binding", call: 0 | 1, status: number) => {
+    const bad = sample(5, 5);
+    bad[path]![call] = { ms: 5, status, ray_colo: null };
+    return bad;
+  };
+  // 403, 502 and 530 answer in a few milliseconds: they must not pull the percentiles down.
+  const summary = summarizeHealthz([
+    sample(100, 20),
+    sample(120, 30),
+    refused("public", 0, 403),
+    refused("public", 1, 502),
+    refused("binding", 1, 530),
+  ]);
+  assert.equal(summary.samples, 5);
+  assert.equal(summary.failures, 3);
+  assert.deepEqual(summary.public.first, { p50: 160, p95: 180 });
+  assert.deepEqual(summary.binding.second, { p50: 20, p95: 30 });
+  // A sample that is only error pages leaves no percentile.
+  const none = summarizeHealthz([refused("public", 0, 502)]);
+  assert.equal(none.failures, 1);
+  assert.deepEqual(none.binding.first, { p50: null, p95: null });
 });
 
 /** The binaries of a PostgreSQL 18 for the test, or none: CI requires them, a laptop may skip. */

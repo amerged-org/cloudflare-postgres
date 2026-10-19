@@ -38,7 +38,9 @@
  * `healthz` has the probe Worker time two back-to-back `GET /healthz` calls on the public hostname
  * and on its service binding to the Edge (the Edge answers them without admission), `--samples`
  * times with `--idle-s` between samples, and prints a line per sample and a summary: the p50 and
- * p95 of the first and of the second call on each path.
+ * p95 of the first and of the second call on each path. A sample the Worker could not take, or
+ * with a GET not answered 200, is not ok: its times are in no percentile, it counts in the
+ * summary's failures and the exit code is 1.
  *
  * `--via probe` makes each call from inside Cloudflare instead of from this machine: a probe
  * Worker (`probe/worker.ts`, route `/saas-bench`, deployed privately) answers
@@ -65,6 +67,7 @@ import { WebSocket } from "ws";
 import {
   armFor,
   buildTrips,
+  healthzAnswered,
   parseCommand,
   requestsUntilWarm,
   setupStatements,
@@ -393,7 +396,11 @@ async function healthz(samples: number, idleS: number): Promise<number> {
     const sample = await probeHealthz(n);
     results.push(sample);
     console.log(
-      JSON.stringify({ healthz: n + 1, ok: sample !== null, ...sample }),
+      JSON.stringify({
+        healthz: n + 1,
+        ok: healthzAnswered(sample),
+        ...sample,
+      }),
     );
   }
   const summary = summarizeHealthz(results);

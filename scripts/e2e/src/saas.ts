@@ -228,7 +228,9 @@ export interface Timed {
   /**
    * Where a failed call stopped: the check that the database was asleep (made by the driver, not
    * by the call), the connection, or the statement that failed (the first of a transaction whose
-   * statement the driver cannot name).
+   * statement the driver cannot name). Over HTTP, which has no connect step, the first request is
+   * the connection as well: its admission refusal, unready wake, wrong password, network or
+   * server error is `connect`, as on a WebSocket; a statement's own error names the statement.
    */
   failed_at?: "cold_check" | "connect" | StatementName;
   error?: {
@@ -251,6 +253,15 @@ class UnexpectedResult extends Error {
 }
 
 export const tenth = (value: number) => Math.round(value * 10) / 10;
+
+/**
+ * Whether a failure tells of the connection, not of a statement: class 08, an admission refusal,
+ * a wake not ready, a wrong password, or no SQLSTATE at all (a network or server error).
+ */
+const connectionFailure = (sqlstate: string | null) =>
+  sqlstate === null ||
+  sqlstate.startsWith("08") ||
+  ["53300", "57P03", "28P01"].includes(sqlstate);
 
 /**
  * Opens a session and sends `trips` on it in order, each one a single round trip; a failure ends
@@ -290,8 +301,13 @@ export async function timeCall(
     timed.request_ms = tenth(last - started);
     timed.ok = true;
   } catch (error) {
-    timed.failed_at = at;
     timed.error = safeProbeError(error);
+    timed.failed_at =
+      session?.connectionless &&
+      timed.statements_ms.length === 0 &&
+      connectionFailure(timed.error.sqlstate)
+        ? "connect"
+        : at;
     if ((error as { code?: unknown } | null)?.code === "unexpected_result")
       timed.error.error_class = "UnexpectedResult";
   } finally {
@@ -441,10 +457,27 @@ export interface HealthzSample {
   binding: GetTiming[] | null;
 }
 
-/** The p50 and p95 of the first and of the second GET on each path; a sample that failed is null. */
+/**
+ * Whether a sample is one to count: the Worker answered, and every GET was answered 200. The time
+ * of a 403, 502 or 530 is that of an error page, not of the Edge.
+ */
+export function healthzAnswered(sample: HealthzSample | null): boolean {
+  return (
+    sample !== null &&
+    [...sample.public, ...(sample.binding ?? [])].every(
+      (get) => get.status === 200,
+    )
+  );
+}
+
+/**
+ * The p50 and p95 of the first and of the second GET on each path. A sample that failed (null) or
+ * has a GET not answered 200 counts in none of them, only in `failures`.
+ */
 export function summarizeHealthz(samples: readonly (HealthzSample | null)[]) {
   const done = samples.filter(
-    (sample): sample is HealthzSample => sample !== null,
+    (sample): sample is HealthzSample =>
+      sample !== null && healthzAnswered(sample),
   );
   const column = (path: "public" | "binding", call: 0 | 1) => {
     const values = done.flatMap((sample) => sample[path]?.[call]?.ms ?? []);
