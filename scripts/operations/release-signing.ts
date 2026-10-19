@@ -1,29 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // The release key (ULTRA plan 9.3, docs/operations/release-signing.md): an Ed25519 key pair whose
-// private half only the GitHub environment `release-signing` holds (the environment secret
-// RELEASE_SIGNING_KEY; the environment's deployment branch policy allows only main) and whose
-// public half the node agent has compiled in, read from apps/node-agent/release-signing.pub. CI
-// signs the manifest of each release (`signedReleaseManifest`) in its own job; a node checks the
-// signature before it installs anything of the release; registration checks it too, so that a
-// release no node would accept is never registered. This module is the shared part: nothing here
-// prints a key.
+// private half is the Worker secret RELEASE_SIGNING_KEY of the signer (apps/release-signer),
+// which Cloudflare does not let anyone read back, and whose public half the node agent has
+// compiled in, read from apps/node-agent/release-signing.pub. The signer signs the manifest of a
+// release for CI's job `sign-release` (sign-release.ts); a node checks the signature before it
+// installs anything of the release, and registration checks it too, so that no release that
+// every node would refuse is registered. This module holds what the checks share and the
+// operator's one command that makes the key. Nothing here prints a key.
 //
-// The owner makes the key pair once, after the environment exists. The private key goes to the
-// pipe and nowhere else, so it is never on a disk or in a terminal. The file of the placeholder
-// key is replaced without a flag; a key that is already there is replaced only with --replace,
-// which is the rotation procedure and never a second first key:
+//   node scripts/operations/release-signing.ts provision --token-env NAME --account-env NAME
+//     [--worker NAME] [--public FILE] [--api-base URL] [--rotate]
 //
-//   node scripts/operations/sign-release.ts keygen --public apps/node-agent/release-signing.pub \
-//     | gh secret set RELEASE_SIGNING_KEY --env release-signing
+//     Makes the key pair in memory, sets the private half as the Worker's secret through the
+//     Cloudflare API, and only after the API accepted it writes the public half to FILE (default
+//     apps/node-agent/release-signing.pub), then prints the public key's fingerprint and the next
+//     steps. The private key is never written to a disk, a log or a terminal; nobody ever sees
+//     it. --token-env and --account-env name the environment variables that hold the API token
+//     (Workers Scripts edit on the account) and the account id: a value never goes on the
+//     command line. --worker is the signer (default pgcf-release-signer-dev), which has to be
+//     deployed already. The command refuses while the Worker already holds the secret or FILE
+//     already holds a key other than the placeholder; --rotate overrides both, and the
+//     procedure that goes with it, which keeps the old key signing until every node trusts the
+//     new one, is in the runbook.
+//
+// The order of the steps leaves the previous key usable after a failure of any of them: the
+// files are read first, the secret is listed before it is set, the file is replaced only once
+// the API has accepted the secret, and it is replaced atomically.
 import {
-  createPrivateKey,
+  createHash,
   createPublicKey,
   generateKeyPairSync,
-  sign,
   verify,
 } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { parseArgs } from "node:util";
+import { RELEASE_SIGNING_SECRET } from "../../packages/contracts/src/releases.ts";
 
 /** The public key the agent is built with: 64 lowercase hex digits and a line feed. */
 export const RELEASE_KEY_FILE = join(
@@ -32,9 +44,9 @@ export const RELEASE_KEY_FILE = join(
 );
 
 /**
- * The public key the repository carries until the owner makes the real one, so that every build
- * compiles before the key exists. Nobody holds its private half: a release it "verifies" can
- * not exist, and CI refuses to sign a build that carries it.
+ * The public key the repository carries until `provision` makes the real one, so that every
+ * build compiles before the key exists. Nobody holds its private half: a release it "verifies"
+ * can not exist, and CI refuses to sign a build that carries it.
  */
 export const PLACEHOLDER_RELEASE_KEY =
   // A public key, the one in release-signing.pub: not a secret.
@@ -44,37 +56,23 @@ export const PLACEHOLDER_RELEASE_KEY =
 const SPKI_ED25519 = Buffer.from("302a300506032b6570032100", "hex");
 const publicKeyPattern = /^[0-9a-f]{64}$/;
 
-/** A key pair: the private key as PKCS#8 PEM and the public key as 64 hex digits. */
-export function generateKeyPair(): { privateKey: string; publicKey: string } {
+/**
+ * A new key pair: the private key as the signer reads it from its secret (PKCS#8 in base64) and
+ * the public key as 64 hex digits.
+ */
+export function generateReleaseKey(): { secret: string; publicKey: string } {
   const pair = generateKeyPairSync("ed25519");
+  const der = pair.privateKey.export({ type: "pkcs8", format: "der" });
+  const secret = der.toString("base64");
+  der.fill(0);
   return {
-    privateKey: pair.privateKey.export({
-      type: "pkcs8",
-      format: "pem",
-    }) as string,
+    secret,
     publicKey: Buffer.from(
       pair.publicKey.export({ type: "spki", format: "der" }),
     )
       .subarray(SPKI_ED25519.length)
       .toString("hex"),
   };
-}
-
-/**
- * The signature of `text` (128 hex digits). The error names the variable and never shows what it
- * was given: a key that fails to parse is still a key.
- */
-export function signText(privateKey: string, text: string): string {
-  let key;
-  try {
-    key = createPrivateKey(privateKey.trim());
-    if (key.asymmetricKeyType !== "ed25519") throw new Error("not ed25519");
-  } catch {
-    throw new Error(
-      "RELEASE_SIGNING_KEY is not an Ed25519 private key in PEM form",
-    );
-  }
-  return sign(null, Buffer.from(text), key).toString("hex");
 }
 
 /** Whether `signature` is the signature of `text` by the holder of `publicKey`. */
@@ -109,34 +107,262 @@ export async function readReleaseKey(path: string): Promise<string> {
   return key;
 }
 
-/**
- * Makes a key pair: the public key goes to `publicPath`, and the private key goes to `output`,
- * which must be a pipe or a file and not a terminal, where it would stay in the scrollback. The
- * file of the placeholder (or no file) takes the first key without a flag. A file that holds
- * anything else is replaced only on request (`replace`): the nodes trust what it holds, and the
- * private half of the key it holds exists in one place only (the secret cannot be read back), so
- * a second run of the first-key command must never overwrite it.
- */
-export async function keygen(
-  publicPath: string,
-  output: { isTTY?: boolean; write(text: string): unknown },
-  replace = false,
-): Promise<void> {
-  if (output.isTTY)
-    throw new Error(
-      "the private key is written to a pipe, never to a terminal: pipe the command into `gh secret set RELEASE_SIGNING_KEY --env release-signing`",
+// ---------- The Cloudflare API ----------
+
+export interface ProvisionOptions {
+  /** The API's origin and path prefix: https, or http on this machine. */
+  apiBase: string;
+  apiToken: string;
+  accountId: string;
+  worker: string;
+  publicPath: string;
+  rotate: boolean;
+}
+const DEFAULT_API_BASE = "https://api.cloudflare.com/client/v4";
+type Fetch = (url: string, init?: RequestInit) => Promise<Response>;
+
+/** What the API answered, without any value of the request that it may have echoed. */
+function refusal(
+  action: string,
+  response: Response,
+  body: unknown,
+  hidden: string[],
+): Error {
+  const clean = (text: string) =>
+    hidden.reduce((rest, value) => rest.replaceAll(value, "[redacted]"), text);
+  const errors = (
+    body as { errors?: { code?: unknown; message?: unknown }[] } | null
+  )?.errors;
+  const reasons = (Array.isArray(errors) ? errors : [])
+    .slice(0, 3)
+    .map(({ code, message }) =>
+      `${typeof code === "number" ? code : "?"} ${typeof message === "string" ? clean(message).slice(0, 160) : ""}`.trim(),
     );
-  let held: string | undefined;
+  return new Error(
+    `the Cloudflare API refused to ${action}: ${response.status}${reasons.length > 0 ? ` ${reasons.join("; ")}` : ""}`,
+  );
+}
+
+function call(
+  options: ProvisionOptions,
+  method: "GET" | "PUT",
+  body: unknown,
+  fetchImpl: Fetch,
+): Promise<Response> {
+  const url = `${options.apiBase.replace(/\/$/, "")}/accounts/${options.accountId}/workers/scripts/${options.worker}/secrets`;
+  return fetchImpl(url, {
+    method,
+    headers: {
+      authorization: `Bearer ${options.apiToken}`,
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    redirect: "error",
+    signal: AbortSignal.timeout(30_000),
+  });
+}
+
+/** The names of the secrets the Worker holds; values are never listed by the API. */
+async function secretNames(
+  options: ProvisionOptions,
+  fetchImpl: Fetch,
+): Promise<string[]> {
+  const hidden = [options.apiToken];
+  let response: Response;
   try {
-    held = (await readFile(publicPath, "utf8")).trim();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    response = await call(options, "GET", undefined, fetchImpl);
+  } catch {
+    throw new Error("the Cloudflare API cannot be reached");
   }
-  if (held !== undefined && held !== PLACEHOLDER_RELEASE_KEY && !replace)
+  const body: unknown = await response.json().catch(() => null);
+  if (response.status === 404)
     throw new Error(
-      `${publicPath} holds a key that is not the placeholder: the nodes trust it, and nothing but the secret holds its private half. A new key is a key change, the rotation procedure of docs/operations/release-signing.md; pass --replace only for that`,
+      `the Worker ${options.worker} does not exist in this account: deploy it first (cd apps/release-signer && npx wrangler deploy)`,
     );
-  const pair = generateKeyPair();
-  await writeFile(publicPath, `${pair.publicKey}\n`, { mode: 0o644 });
-  output.write(pair.privateKey);
+  const result = (body as { success?: boolean; result?: unknown } | null)
+    ?.result;
+  if (
+    !response.ok ||
+    (body as { success?: boolean } | null)?.success !== true ||
+    !Array.isArray(result)
+  )
+    throw refusal("list the secrets of the Worker", response, body, hidden);
+  return result
+    .map((entry) => (entry as { name?: unknown } | null)?.name)
+    .filter((name): name is string => typeof name === "string");
+}
+
+/** Replaces the file at `path` with the public key, all at once. */
+async function writePublicKey(path: string, publicKey: string): Promise<void> {
+  const temporary = `${path}.${process.pid}.tmp`;
+  try {
+    await writeFile(temporary, `${publicKey}\n`, { mode: 0o644, flag: "wx" });
+    await rename(temporary, path);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+/** The SHA-256 of the 32 bytes of the public key, in hex: what the owner compares. */
+const fingerprintOf = (publicKey: string) =>
+  createHash("sha256").update(Buffer.from(publicKey, "hex")).digest("hex");
+
+/**
+ * Makes the key and sets it as the signer's secret, then records its public half. See the
+ * header for the order, which is the point.
+ */
+export async function provision(
+  options: ProvisionOptions,
+  fetchImpl: Fetch = fetch,
+): Promise<{ publicKey: string; fingerprint: string }> {
+  const base = URL.parse(options.apiBase);
+  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(
+    base?.hostname ?? "",
+  );
+  if (
+    !base ||
+    (base.protocol !== "https:" && !(base.protocol === "http:" && loopback)) ||
+    base.username !== "" ||
+    base.password !== ""
+  )
+    throw new Error("the API base is https, or http on this machine");
+
+  // 1. Read before anything is asked or made: a file that is none stops here, and a real key in
+  //    it stops the command unless it was asked to rotate.
+  const held = await readReleaseKey(options.publicPath);
+  if (held !== PLACEHOLDER_RELEASE_KEY && !options.rotate)
+    throw new Error(
+      `${options.publicPath} holds a key that is not the placeholder: the nodes trust it, and nothing but the Worker secret holds its private half. Pass --rotate only for the key change that docs/operations/release-signing.md describes`,
+    );
+  // 2. The Worker holds a key already: the one the nodes trust may be that one.
+  if (
+    (await secretNames(options, fetchImpl)).includes(RELEASE_SIGNING_SECRET) &&
+    !options.rotate
+  )
+    throw new Error(
+      `the Worker ${options.worker} already holds the secret ${RELEASE_SIGNING_SECRET}, which cannot be read back: setting it again would lose the key the nodes may trust. Pass --rotate only for the key change that docs/operations/release-signing.md describes`,
+    );
+
+  // 3. The key exists only from here, in memory.
+  const { secret, publicKey } = generateReleaseKey();
+  const hidden = [options.apiToken, secret];
+  let response: Response;
+  try {
+    response = await call(
+      options,
+      "PUT",
+      { name: RELEASE_SIGNING_SECRET, text: secret, type: "secret_text" },
+      fetchImpl,
+    );
+  } catch {
+    // The answer did not arrive: the API may or may not have set the secret.
+    throw new Error(
+      `the Cloudflare API did not answer the request that sets the secret, so it is not known whether the Worker now holds a new key. The new key's public half is ${publicKey}; the file ${options.publicPath} is unchanged`,
+    );
+  }
+  const body: unknown = await response.json().catch(() => null);
+  if (!response.ok || (body as { success?: boolean } | null)?.success !== true)
+    throw refusal("set the secret", response, body, hidden);
+
+  // 4. The Worker signs with the new key from here on; the file follows, and if it cannot, the
+  //    public half is in the message, which is no secret.
+  try {
+    await writePublicKey(options.publicPath, publicKey);
+  } catch {
+    throw new Error(
+      `the secret is set, but ${options.publicPath} could not be written: put this public key in it, 64 hex digits and a line feed: ${publicKey}`,
+    );
+  }
+  return { publicKey, fingerprint: fingerprintOf(publicKey) };
+}
+
+// ---------- The command ----------
+
+// An upper-case name, as variables are named: a token typed in its place is not one, and is
+// refused without being quoted.
+const variableName = /^[A-Z_][A-Z0-9_]{0,63}$/;
+/** The value of the variable that a command-line option names; a missing or malformed one is named, never shown. */
+function fromVariable(
+  environment: Record<string, string | undefined>,
+  name: string | undefined,
+  pattern: RegExp,
+  what: string,
+): string {
+  if (name === undefined || !variableName.test(name))
+    throw new Error(
+      `the option names the environment variable that holds ${what}: it takes a variable name, never the value itself`,
+    );
+  const value = environment[name];
+  if (!value) throw new Error(`set ${name}, which holds ${what}`);
+  if (!pattern.test(value)) throw new Error(`${name} does not hold ${what}`);
+  return value;
+}
+
+export async function main(
+  argv: string[],
+  environment: Record<string, string | undefined>,
+  print: (line: string) => void,
+): Promise<void> {
+  const [command, ...rest] = argv;
+  const { values } = parseArgs({
+    args: rest,
+    options: {
+      "token-env": { type: "string" },
+      "account-env": { type: "string" },
+      worker: { type: "string", default: "pgcf-release-signer-dev" },
+      public: { type: "string" },
+      "api-base": { type: "string", default: DEFAULT_API_BASE },
+      rotate: { type: "boolean", default: false },
+    },
+  });
+  if (command !== "provision" || !values["token-env"] || !values["account-env"])
+    throw new Error(
+      "usage: release-signing.ts provision --token-env NAME --account-env NAME [--worker NAME] [--public FILE] [--api-base URL] [--rotate]",
+    );
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(values.worker))
+    throw new Error("--worker is the name of a Worker");
+  const publicPath = values.public ?? RELEASE_KEY_FILE;
+  const { fingerprint } = await provision({
+    apiBase: values["api-base"],
+    apiToken: fromVariable(
+      environment,
+      values["token-env"],
+      /^[A-Za-z0-9_-]{20,128}$/,
+      "a Cloudflare API token",
+    ),
+    accountId: fromVariable(
+      environment,
+      values["account-env"],
+      /^[0-9a-f]{32}$/,
+      "the Cloudflare account id",
+    ),
+    worker: values.worker,
+    publicPath,
+    rotate: values.rotate,
+  });
+  print(
+    `set the secret ${RELEASE_SIGNING_SECRET} of the Worker ${values.worker}; the private key was never written or printed`,
+  );
+  print(`wrote the public key to ${publicPath}`);
+  print(`public key fingerprint (sha256 of its 32 bytes): ${fingerprint}`);
+  print("next:");
+  print(
+    "  1. commit the public key on the branch that carries the sign-release job, and merge only with it:",
+  );
+  print(
+    "     a main without it is red at the signing job (docs/operations/release-signing.md)",
+  );
+  print(
+    "  2. set the repository variable RELEASE_SIGNER_URL to the Worker's https origin",
+  );
+}
+
+if (import.meta.main) {
+  main(process.argv.slice(2), process.env, console.log).catch(
+    (error: unknown) => {
+      console.error(error instanceof Error ? error.message : "failed");
+      process.exitCode = 1;
+    },
+  );
 }

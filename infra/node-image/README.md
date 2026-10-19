@@ -103,9 +103,9 @@ Every push to `main` of this repository (not of a fork) whose `node-image` job p
 release files for 7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`: `pgcf-node.raw.zst`,
 `pgcf-node.json`, `packages.lock.json`, the four binaries and a `SHA256SUMS` of these seven files.
 The uncompressed image (about 1.7 GB) is not part of it, and no credential is. The job `sign-release`
-(the only job that holds the release key, from the GitHub environment `release-signing`) signs that
-release and keeps the signature as the artifact `pgcf-node-signature-<commit sha>-<run attempt>`, one
-file, `release.sig`: [release-signing.md](../../docs/operations/release-signing.md). The release is named
+(which holds no key: it has the signer Worker sign that release with the identity token of its run)
+keeps the signature as the artifact `pgcf-node-signature-<commit sha>-<run attempt>`, one file,
+`release.sig`: [release-signing.md](../../docs/operations/release-signing.md). The release is named
 `sha-<first 12 hex digits of the commit>`. The artifact belongs to the commit that built it, so the
 package lock comes from the artifact, not from the checkout, and the registration runs from a checkout
 of exactly that commit: it checks the signature with the release key of its checkout

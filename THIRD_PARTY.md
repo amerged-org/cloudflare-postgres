@@ -128,6 +128,11 @@ Direct root development tooling (`typescript`, `eslint`, `@eslint/js`, `typescri
 installed as runtime dependencies. Resolved dependency versions are recorded in `pnpm-lock.yaml`;
 build and test tooling is not relicensed as first-party code.
 
+The release signer Worker (`apps/release-signer`) adds no package: it signs and verifies with the Workers
+runtime's own WebCrypto (Ed25519 and RSASSA-PKCS1-v1_5) and takes the shared contracts. At run time it reads
+GitHub's public key set (`https://token.actions.githubusercontent.com/.well-known/jwks`) to check the identity
+token of an Actions run; that is a service it calls, and no component of it is redistributed.
+
 ### Reference only
 
 | Component                                                       | License    | Use                                                                                                     |
@@ -162,7 +167,7 @@ The actions run on GitHub-hosted runners and are not part of any PGCF runtime.
 | --------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
 | [actions/attest](https://github.com/actions/attest)                   | 4.1.0, `59d89421af93a897026c735860bf21b6eb4f7b26` | [MIT](https://github.com/actions/attest/blob/59d89421af93a897026c735860bf21b6eb4f7b26/LICENSE)          | Signs provenance for the sanitized native-probe report.     |
 | [actions/upload-artifact](https://github.com/actions/upload-artifact) | 7.0.0, `bbbca2ddaa5d8feaa63e36b76fdaad77386f024f` | [MIT](https://github.com/actions/upload-artifact/blob/bbbca2ddaa5d8feaa63e36b76fdaad77386f024f/LICENSE) | Publishes only the sanitized report with one-day retention; the check job also retains the tested Rust Edge bytes. |
-| [actions/download-artifact](https://github.com/actions/download-artifact) | 8.0.1, `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` | [MIT](https://github.com/actions/download-artifact/blob/3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/LICENSE) | Hands the release files of the `node-image` job to the `sign-release` job, which signs them. |
+| [actions/download-artifact](https://github.com/actions/download-artifact) | 8.0.1, `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` | [MIT](https://github.com/actions/download-artifact/blob/3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/LICENSE) | Hands the release files of the `node-image` job to the `sign-release` job, which has the signer sign them. |
 
 ## Not used
 

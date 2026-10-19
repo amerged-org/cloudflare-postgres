@@ -34,6 +34,7 @@ states what runs where; it does not repeat measurements.
 | Edge Worker                                      | TypeScript (`apps/edge`) is deployed; the Rust/Wasm target (`apps/edge-rust`) is built by CI and not deployed            |
 | Gateway                                          | Rust (`apps/native-gateway`): beside the node agent, on its table and the databases' Unix sockets; not deployed          |
 | Node runtime                                     | Not running: the Kubernetes runtime was retired on 2026-10-17; the node agent and the node image are built in Stage 3    |
+| Release signer                                   | TypeScript Worker (`apps/release-signer`): signs a release's manifest for CI, whose key is a Cloudflare secret; built, not deployed |
 
 The actual-RAM expansion threshold and automatic-purchase switch are operator settings exposed
 through the authenticated management API. Expansion requires ten fresh aligned consecutive

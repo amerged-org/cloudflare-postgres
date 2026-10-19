@@ -176,19 +176,50 @@ export const RELEASE_REFUSALS = [
   "release_signature_invalid",
 ] as const;
 
-const SignedDigest = z.object({ sha256: Sha256, size_bytes: Positive });
-const SignedRelease = z.object({
+const SignedDigest = z.strictObject({ sha256: Sha256, size_bytes: Positive });
+/**
+ * The facts a release's manifest is made of, and no key beyond them at any level: what a client
+ * asks the signer (`RELEASE_SIGN_PATH`) to sign and what the signer accepts. Every value is
+ * checked against its pattern, none of which holds a line feed.
+ */
+export const ReleaseManifestFields = z.strictObject({
   id: FleetReleaseId,
-  binaries: z.object(
+  binaries: z.strictObject(
     Object.fromEntries(
       RELEASE_BINARY_FILES.map((file) => [file, SignedDigest]),
     ) as Record<(typeof RELEASE_BINARY_FILES)[number], typeof SignedDigest>,
   ),
-  os: z.object({
+  os: z.strictObject({
     debian_snapshot: z.string().regex(/^[0-9]{8}T[0-9]{6}Z$/),
     package_lock: SignedDigest,
   }),
 });
+export type ReleaseManifestFields = z.infer<typeof ReleaseManifestFields>;
+
+/**
+ * The manifest's facts of anything that carries them: a registration with its id, or the release
+ * of a node's page (which also holds URLs). Whatever else the value holds is left out, and a
+ * fact that is missing or malformed is refused.
+ */
+export function releaseManifestFields(
+  release: ReleaseManifestFields,
+): ReleaseManifestFields {
+  const pin = (digest: { sha256: string; size_bytes: number } | undefined) => ({
+    sha256: digest?.sha256,
+    size_bytes: digest?.size_bytes,
+  });
+  return ReleaseManifestFields.parse({
+    id: release.id,
+    binaries: Object.fromEntries(
+      RELEASE_BINARY_FILES.map((file) => [file, pin(release.binaries?.[file])]),
+    ),
+    os: {
+      debian_snapshot: release.os?.debian_snapshot,
+      package_lock: pin(release.os?.package_lock),
+    },
+  });
+}
+
 /**
  * What the release key signs for a release (plan 9.3): the domain line and then one `name=value`
  * line each, in this order and no other, every line ended by a line feed: the release id; the
@@ -200,10 +231,8 @@ const SignedRelease = z.object({
  * which holds no line feed: no two releases have the same manifest. The page of a node carries
  * every fact in it (`NodeRelease`), which is how the agent builds the same text.
  */
-export function signedReleaseManifest(
-  release: z.input<typeof SignedRelease>,
-): string {
-  const { id, binaries, os } = SignedRelease.parse(release);
+export function signedReleaseManifest(release: ReleaseManifestFields): string {
+  const { id, binaries, os } = releaseManifestFields(release);
   const pin = ({ sha256, size_bytes }: z.infer<typeof SignedDigest>) =>
     `${sha256}:${size_bytes}`;
   return [
@@ -217,6 +246,15 @@ export function signedReleaseManifest(
     "",
   ].join("\n");
 }
+
+/**
+ * The route of the signer (`apps/release-signer`) that CI posts `ReleaseManifestFields` to, with
+ * a GitHub Actions identity token as its bearer credential. It answers with the signature of the
+ * release's manifest as `ReleaseSignature` text and a line feed.
+ */
+export const RELEASE_SIGN_PATH = "/sign";
+/** The Worker secret of the signer that holds the release key: an Ed25519 private key, PKCS#8 in base64. */
+export const RELEASE_SIGNING_SECRET = "RELEASE_SIGNING_KEY";
 
 const Digest = z.strictObject({ sha256: Sha256, size_bytes: Positive });
 /**

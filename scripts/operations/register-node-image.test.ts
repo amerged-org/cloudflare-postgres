@@ -24,11 +24,8 @@ import {
   uploadObject,
   type Manifest,
 } from "./register-node-image.ts";
-import {
-  generateKeyPair,
-  readReleaseKey,
-  signText,
-} from "./release-signing.ts";
+import { generateKeyPair, signText } from "./release-key-fixture.ts";
+import { readReleaseKey } from "./release-signing.ts";
 
 const sha = (text: string, algorithm = "sha256") =>
   createHash(algorithm).update(text).digest("hex");

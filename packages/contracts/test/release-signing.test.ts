@@ -7,7 +7,11 @@ import {
   RELEASE_MANIFEST_DOMAIN,
   RELEASE_REFUSALS,
   RELEASE_SIGNATURE_FILE,
+  RELEASE_SIGNING_SECRET,
+  RELEASE_SIGN_PATH,
+  ReleaseManifestFields,
   fleetReleaseSpec,
+  releaseManifestFields,
   signedReleaseManifest,
 } from "../src/releases.ts";
 
@@ -150,4 +154,58 @@ it("a node that refuses a release names one of two classes, which are the contra
   // An event field is a token of lowercase letters, digits and underscores.
   for (const code of RELEASE_REFUSALS)
     expect(code).toMatch(/^[a-z0-9_]{1,64}$/);
+});
+
+/** A copy of `value` with the value at `path` set to `to`, or removed when `to` is undefined. */
+function tweak(value: object, path: string[], to?: unknown): unknown {
+  const copy = structuredClone(value) as Record<string, unknown>;
+  let at = copy;
+  for (const key of path.slice(0, -1)) at = at[key] as Record<string, unknown>;
+  if (to === undefined) delete at[path.at(-1)!];
+  else at[path.at(-1)!] = to;
+  return copy;
+}
+
+it("the fields a signer accepts are the manifest's facts and no key beyond them, at any level", () => {
+  const whole = release();
+  const fields = releaseManifestFields(whole);
+  expect(fields).toEqual({
+    id: whole.id,
+    binaries: whole.binaries,
+    os: {
+      debian_snapshot: whole.os.debian_snapshot,
+      package_lock: whole.os.package_lock,
+    },
+  });
+  expect(ReleaseManifestFields.safeParse(fields).success).toBe(true);
+  // The text a signer signs from the fields is the text of the whole release: nothing else is in it.
+  expect(signedReleaseManifest(fields)).toBe(signedReleaseManifest(whole));
+  const extras: [string[], unknown][] = [
+    [["image"], whole.image],
+    [["signature"], "7".repeat(128)],
+    [["binaries", "pgcf-agent", "url"], "https://x.example/a"],
+    [["binaries", "other"], whole.binaries["pgcf-agent"]],
+    [["os", "kernel_release"], "6.12.113+deb13-amd64"],
+    [["os", "package_lock", "url"], "https://x.example/lock"],
+    [["extra"], 1],
+  ];
+  for (const [path, value] of extras)
+    expect(
+      ReleaseManifestFields.safeParse(tweak(fields, path, value)).success,
+      path.join("."),
+    ).toBe(false);
+  for (const path of [
+    ["id"],
+    ["binaries", "pgcf-wal-fetch"],
+    ["os", "package_lock"],
+  ])
+    expect(
+      ReleaseManifestFields.safeParse(tweak(fields, path)).success,
+      path.join("."),
+    ).toBe(false);
+});
+
+it("the signer's route and the name of its secret are the contract's", () => {
+  expect(RELEASE_SIGN_PATH).toBe("/sign");
+  expect(RELEASE_SIGNING_SECRET).toBe("RELEASE_SIGNING_KEY");
 });

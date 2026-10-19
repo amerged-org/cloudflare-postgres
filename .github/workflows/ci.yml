@@ -355,21 +355,26 @@ jobs:
         if: always()
         run: sudo rm -rf "$PGCF_NODE_IMAGE_WORK"
 
-  # The nodes refuse a release that the release key did not sign. The key is a secret of the GitHub
-  # environment `release-signing`, whose deployment branch policy allows only main
-  # (docs/operations/release-signing.md creates it): a run of a pull request or of another branch, even
-  # with an edited copy of this file, is refused the environment and never sees the secret. Only this
-  # job names it, and only its signing step reads it. It runs no build script and no image build; it
-  # takes the release files from the artifact of `node-image`.
+  # The nodes refuse a release that the release key did not sign. The key is the Worker secret of the
+  # signer (apps/release-signer): Cloudflare secrets cannot be read back, so no person, no job and no
+  # branch holds it. This job holds no secret at all. It proves who it is to the signer with the
+  # identity token of its own run (`id-token: write`, granted to this job and, for its attestation, to
+  # the dispatch-only `external_probe`, whose token the signer refuses because it says
+  # `workflow_dispatch`), which the signer accepts only from a push to main that runs this file on a
+  # GitHub-hosted runner (docs/operations/release-signing.md). It takes the release files from the
+  # artifact of `node-image` and runs no build script: the install below skips every dependency's
+  # scripts, and the only code that runs with the token's credential is scripts/operations/sign-release.ts.
+  # The job fails, it is never skipped, on a push to main while the signer cannot be reached or refuses,
+  # while RELEASE_SIGNER_URL is not set, and while the committed public key is still the placeholder.
   sign-release:
     needs: node-image
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.fork
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: release-signing
     permissions:
       contents: read
       actions: read
+      id-token: write
     steps:
       - name: Check out the revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -387,25 +392,25 @@ jobs:
           cache: pnpm
       - name: Validate the native CI toolchain
         run: node scripts/ci/toolchain.mjs check
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Install dependencies without running their scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Download the release files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.node-image.outputs.release_artifact_id }}
           path: ${{ runner.temp }}/release
           merge-multiple: true
-      # The step fails with a message that says what to do while the secret is missing, and while the
-      # public key of this checkout is still the placeholder: a key made before its public half reached
-      # main must not sign a build whose agent trusts a key that nobody holds.
+      # The step asks the signer for the signature of this build's manifest with an identity token for
+      # the signer's address, and fails with a message that says what to do when it cannot be had.
       - name: Sign the release
         env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNER_URL: ${{ vars.RELEASE_SIGNER_URL }}
         run: |
           release="$RUNNER_TEMP/release"
           node scripts/operations/sign-release.ts sign --image-dir "$release" --binaries "$release" \
             --lock "$release/packages.lock.json"
-      # The registration script's own dry run: it says whether the signature verifies with the key of this checkout.
+      # The registration script's own dry run: it says whether the signature verifies with the key of this
+      # checkout. It does not fail: the one release that changes the key is signed by the old key.
       - name: Dry-run the registration of the signed release
         run: |
           release="$RUNNER_TEMP/release"
