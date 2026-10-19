@@ -17,6 +17,8 @@ pub struct Layout {
     /// The barman-cloud commands of the jobs.
     pub barman_bin: PathBuf,
     pub systemd_run: PathBuf,
+    /// The helper that systemd runs to start every unit, which execs the unit's program.
+    pub systemd_executor: PathBuf,
     /// The `archive_command` client of the image (plan 7.5).
     pub archive_command: String,
     /// The `restore_command` client of the image (plan 7.8).
@@ -31,6 +33,7 @@ impl Default for Layout {
             postgres_bin: PathBuf::from("/usr/lib/postgresql/18/bin"),
             barman_bin: PathBuf::from("/usr/bin"),
             systemd_run: PathBuf::from("/usr/bin/systemd-run"),
+            systemd_executor: PathBuf::from("/usr/lib/systemd/systemd-executor"),
             archive_command: "/usr/libexec/pgcf/pgcf-archive".into(),
             fetch_command: crate::archive::recovery::WAL_FETCH_COMMAND.into(),
         }

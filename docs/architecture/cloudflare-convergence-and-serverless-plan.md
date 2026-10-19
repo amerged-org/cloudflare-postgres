@@ -1914,6 +1914,7 @@ Key external references:
 **PostgreSQL configuration:**
 - `listen_addresses=''`.
 - Socket directory `/run/pgcf/<id>`, owned by `pgcf-<id>`, mode 0750, with the gateway's group. The agent creates it at create and, because `/run` is empty after a reboot, for every database when the agent starts; never in the unit's `ExecStartPre=` (Stage 1: about 35 ms per start).
+- A reboot empties the page cache, so when the agent starts it has the kernel read `postgres` and `systemd-executor` ahead (`posix_fadvise` `WILLNEED`) and runs `postgres -V` once, in a task of its own with a bound of 30 s; a failure is the event `start_path_not_warmed` with its class, never a delayed start. Kept volumes are still mounted at boot as before.
 - `recovery_init_sync_method=syncfs`.
 - `archive_mode=on`, `archive_command='/usr/libexec/pgcf/pgcf-archive %p'`, and `archive_timeout` from the class.
 - `wal_init_zero=off`, `wal_recycle=on`, `min_wal_size=32MB`, and `max_wal_size` = 25 % of the volume.
