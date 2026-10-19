@@ -89,19 +89,45 @@ because a new paid resource needs the owner's explicit, costed go. Put the firew
 
 ### Moving to another archive bucket
 
-The archive paths stored in D1 (`s3://<bucket>/<region>/<database>/g<generation>-<operation>`)
-and the credentials of the nodes name the bucket, so a move changes more than the binding. The
-keys below the bucket stay valid: a key never contains the bucket, and it is unique per database
-generation and operation, so the objects are copied unchanged. Do it in a quiet window, with
-every database asleep and proven, and keep the old bucket untouched until the new one has passed
-a backup, WAL archiving and a point-in-time restore.
+The archive paths stored in D1 (`s3://<bucket>/<region>/<database>/g<generation>-<operation>`), the
+credentials the nodes hold and the Worker's binding name the bucket, so a move changes more than the
+binding. The keys below the bucket stay valid: a key never contains the bucket, and it is unique per
+database generation and operation, so the objects are copied unchanged and server side (CopyObject,
+which stays inside one jurisdiction's endpoint). The old bucket is only read, except by the rollback
+mirror below, until the owner says it may go. The move needs the owner's costed go for the new bucket;
+the plan puts it after the acceptance tests and before the go-live gates.
 
-1. Create the new bucket (same jurisdiction), give the parent key's policy both buckets, and copy
-   every object server side with CopyObject. Compare the size and ETag of every key afterwards;
-   repeat the copy inside the window for what changed since. Copy only, never delete.
-2. Deploy the Worker with `ARCHIVE` bound to the new bucket and `ARCHIVE_BUCKET_NAME` set to it.
-3. Rewrite the stored paths in one batch; each statement only touches rows that still name the
-   old bucket, so it can be repeated after a partial failure:
+Why the order matters. A node archives into the path of the page entry it holds, with the credential
+it holds (seven days, signed for the old bucket), and switches when it applies a page that names the
+new path and has read the new credential. A database that is awake, or wakes, before that writes its
+WAL into the old bucket only, and the node never sends that segment again. Nothing on the wake path
+looks at the bucket, so the Worker refuses no wake, and nothing records that a node applied a page or
+read an archive credential. The one acknowledgement is an order a node reports done: a pull reads
+the credentials, accepts the entries and only then obeys the orders, and the maintenance cycle puts
+every awake database to sleep with the proof. WAL segment keys are written once under unique names,
+so the union of both buckets holds every segment, and a last copy of what exists only in the old
+bucket, made after the last write into it, closes any gap.
+
+1. Deploy the Worker with the single `ARCHIVE` binding still naming the old bucket, then apply
+   migration `0078` (the old Worker cannot run on the new schema, the new one runs on the old).
+2. With the owner's costed go, create the new bucket (same jurisdiction). Replace the parent key
+   (`R2_PARENT_ACCESS_KEY_ID`, `R2_PARENT_SECRET_ACCESS_KEY`) by a token whose policy names both
+   buckets, and keep the old one in it until the old bucket is deleted.
+3. Copy every object that has a reader (the archive keys, `node-images/`, `infrastructure/v1/`) while
+   everything runs, and repeat until a pass copies only what changed. A key counts as copied when its
+   size and ETag, or its size and a LastModified not older than the source's, match, because R2 may
+   recompute a multipart ETag on a copy. Compare sizes and ETags of every key, the bodies of the ones
+   whose ETag differs, and the stored sha256 and custom metadata of the node images and infrastructure
+   exports (a HEAD returns a checksum only when it asks with `x-amz-checksum-mode`).
+4. Rehearse the rewrite below on a D1 export. Check that no create, restore, move or base backup is in
+   flight and that every node runs its region's release.
+5. Deploy the Worker with `ARCHIVE` bound to the new bucket and `ARCHIVE_BUCKET_NAME` set to it. From
+   here the Worker deletes (retention, expiry) in the new bucket only. Point the release registration
+   (`PGCF_R2_BUCKET` of `register-node-image.ts`) at the new bucket too: it uploads into that bucket
+   and the Worker reads the bound one.
+6. Rewrite the stored paths from a 0600 file in a 0700 directory (`wrangler d1 execute <database>
+   --remote --file <file>`), and delete the file. Every statement touches only rows that still name
+   the old bucket, so the file is run again after a partial failure:
    ```sql
    UPDATE databases SET archive_path='s3://<new>/'||substr(archive_path,length('s3://<old>/')+1)
      WHERE substr(archive_path,1,length('s3://<old>/'))='s3://<old>/';
@@ -109,13 +135,38 @@ a backup, WAL archiving and a point-in-time restore.
    The same for `retained_archives.archive_path`, `database_restores.source_archive_path`,
    `backup_retention_runs.archive_path` and, when a move row exists, `database_moves.source_archive_path`
    and `target_archive_path` (the trigger `database_moves_monotonic` refuses that change: drop it
-   and create it again from migration `0065` around the statement). Then `DELETE FROM
-   archive_credentials`: a node reads a credential once per identifier, so only new identifiers
-   make every node read one signed for the new bucket.
-4. Accept on the new bucket before anything is deleted: wake a database and write, take a base
-   backup, restore a database to a point in time, and wait for the next infrastructure backup.
-   Roll back, until the old bucket is deleted, by the reverse of steps 2 and 3, while nothing was
-   written to the new bucket; after a write, stay on the new bucket.
+   and create it again, text for text, from migration `0065` around the statements). The credential
+   rows stay: a credential is found by node, path and access, so the new paths make every page name a
+   new credential, and the old rows record when the old credentials expire.
+7. Run the maintenance cycle (`POST /v1/nodes/{id}/maintenance`) on every node that holds a database
+   and wait until it is `done`. The node answers new wakes with `57P03`, puts every awake database to
+   sleep with the proof and reopens placement; by then it has read the new credentials and accepted
+   the new paths, and no database is awake. Each database of the node also has a credential row for
+   its new path issued after the rewrite. Databases that were asleep stay asleep. If a cycle fails or
+   a node is offline, do not go on: that node's awake databases may still write into the old bucket.
+8. Copy again what the old bucket received since the warm copy (only keys modified since a time a
+   little before the last warm pass, so that a key the new bucket's retention has deleted since is not
+   brought back), and compare. Then delete from the new bucket the copies of what the old bucket's
+   retention deleted before step 5 (written there at or before step 5, absent in the old bucket), or
+   a deleted database's data outlives its recovery window.
+9. Accept on the new bucket: wake a database, write, let it sleep (its WAL appears under the same
+   prefix in the new bucket and the old bucket gets no new key), take a base backup, restore to a point
+   in time, `HEAD` and `GET` a release file through `/node/v1/releases/<release>/<file>` (it reads the
+   bound bucket; registering a known release again does not) and wait for the next infrastructure
+   backup.
+10. Repeat the last copy of step 8 and the check for new keys in the old bucket after an hour, a day
+    and after the last credential for the old bucket has expired (`max(expires_at)` of the rows that
+    name it, at most seven days). A pass that finds a key means a node still wrote into the old bucket:
+    the copy closed the gap; find the node (its credential read failed, usually a parent key that
+    lacks the new bucket) and wake its databases again. Only then, and with the owner's word, delete the
+    old bucket and its scope in the old token.
+
+If a step fails. Before step 5, nothing in production changed (a failed copy is repeated). After
+step 5 and while no credential row names the new bucket, redeploy the old configuration and run the
+rewrite with the two names swapped. Once a node has pulled a page that names the new bucket, do not
+swap back: fix forward, or first mirror what the new bucket holds and the old one lacks (a copy that
+only adds missing keys and never replaces one, which writes into the old bucket), then swap one
+database at a time. The migration of step 1 has no way back; D1 Time Travel is the last resort.
 
 ## Edge Worker
 

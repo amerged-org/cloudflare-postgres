@@ -498,6 +498,70 @@ it("expires the archive a move left behind once the recovery window has passed, 
   });
 });
 
+it("leaves a superseded archive that names another bucket alone, so that two of them cannot fill the batch", async () => {
+  const owned = await archive(),
+    foreign = [await archive(), await archive()];
+  await owned.backup(2, 1, 1, 2);
+  await owned.segments(1, 3);
+  const moved = async (
+    a: Awaited<ReturnType<typeof archive>>,
+    bucket: string,
+    completedDaysAgo: number,
+    tag: string,
+  ) => {
+    const current = (await a.row()).archive_path,
+      operation = "op_" + tag.repeat(20),
+      next = current.replace(/\/g1-op_[a-z0-9]{20}$/, `/g2-${operation}`),
+      completed = new Date(a.now - completedDaysAgo * DAY).toISOString();
+    await env.DB.exec(
+      `UPDATE databases SET storage_generation=2 WHERE id='${a.id}'`,
+    );
+    await env.DB.prepare("UPDATE databases SET archive_path=? WHERE id=?")
+      .bind(next, a.id)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO database_moves(operation,database_id,project_id,region_id,source_node_id,target_node_id,source_storage_generation,source_archive_path,status,target_generation,target_storage_generation,target_archive_path,backup_id,proven_sleep_json,created_at,updated_at,completed_at)
+      SELECT ?,d.id,d.project_id,d.region_id,d.node_id,?,1,?,'done',2,2,?,'20261018T093000','{}',?,?,? FROM databases d WHERE d.id=?`,
+    )
+      .bind(
+        operation,
+        a.other,
+        current.replace(`s3://${env.ARCHIVE_BUCKET_NAME}/`, `s3://${bucket}/`),
+        next,
+        completed,
+        completed,
+        completed,
+        a.id,
+      )
+      .run();
+    return operation;
+  };
+  // The two that name another bucket ended earlier, so they sort first and fill a batch of two.
+  const skipped = [
+    await moved(foreign[0]!, "another-bucket", 30, "a"),
+    await moved(foreign[1]!, "another-bucket", 29, "b"),
+  ];
+  await moved(owned, env.ARCHIVE_BUCKET_NAME, 20, "c");
+  const later = owned.now + 7 * DAY;
+  let archives = 0;
+  for (let pass = 0; archives === 0 && pass < 10; pass++)
+    archives += (await expireSupersededArchives(env, later, 3)).archives;
+  expect(archives).toBe(1);
+  expect(await list(owned.root + "/")).toEqual([]);
+  expect(
+    (
+      await env.DB.prepare(
+        "SELECT source_archive_deleted_at FROM database_moves WHERE operation IN(?,?)",
+      )
+        .bind(...skipped)
+        .all()
+    ).results,
+  ).toEqual([
+    { source_archive_deleted_at: null },
+    { source_archive_deleted_at: null },
+  ]);
+});
+
 it("expires the archive a failed move's target staged, once the recovery window has passed since the move ended", async () => {
   const a = await archive();
   const current = (await a.row()).archive_path;

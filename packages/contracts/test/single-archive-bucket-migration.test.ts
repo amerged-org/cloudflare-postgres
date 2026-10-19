@@ -38,8 +38,8 @@ afterEach(() => db.close());
 it("takes the archive bucket off the regions and keeps every region with its children and endpoint", () => {
   const endpoint = `https://${["r2", "example", "com"].join(".")}`;
   for (const [id, bucket] of [
-    ["eu-test", "pgcf-m1-eu-backups"],
-    ["us-test", "pgcf-backups-us"],
+    ["eu-test", "pgcf-test-eu"],
+    ["us-test", "pgcf-test-other"],
   ] as const) {
     db.prepare(
       `INSERT INTO regions(id,provider,provider_region,gateway_url,gateway_binding,backup_bucket,backup_endpoint_url,created_at,updated_at)

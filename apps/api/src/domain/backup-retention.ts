@@ -279,19 +279,22 @@ export async function expireSupersededArchives(
   limit = DELETE_BATCH,
 ): Promise<{ archives: number; objects: number }> {
   const at = new Date(now).toISOString();
+  // An archive that names another bucket is out of this Worker's reach and is never selected: two
+  // of them would otherwise fill the batch of two and starve the archives after them.
+  const named = `s3://${archiveBucket(env).bucketName}/`;
   const due = (status: string, path: string, deleted: string, side: string) =>
     `SELECT m.operation,m.region_id,m.${path} archive_path,d.archive_path current_path,m.completed_at,'${side}' side
     FROM database_moves m JOIN databases d ON d.id=m.database_id JOIN size_classes s ON s.id=d.size_class_id
     WHERE m.status='${status}' AND m.${deleted} IS NULL AND m.${path} IS NOT NULL
     AND strftime('%Y-%m-%dT%H:%M:%fZ',m.completed_at,'+'||s.backup_retention_days||' days')<=?
-    AND m.${path}<>d.archive_path`;
+    AND substr(m.${path},1,length(?))=? AND m.${path}<>d.archive_path`;
   const rows = (
     await env.DB.prepare(
       `${due("done", "source_archive_path", "source_archive_deleted_at", "source")}
       UNION ALL ${due("failed", "target_archive_path", "target_archive_deleted_at", "target")}
       ORDER BY completed_at,operation LIMIT 2`,
     )
-      .bind(at, at)
+      .bind(at, named, named, at, named, named)
       .all<{
         operation: string;
         region_id: string;

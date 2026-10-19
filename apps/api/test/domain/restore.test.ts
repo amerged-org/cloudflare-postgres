@@ -592,6 +592,62 @@ it("expiry cleanup deletes only the owned prefix and releases retained credentia
   ).toEqual({ id: f.id });
 });
 
+it("expiry cleanup leaves an archive that names another bucket alone and still purges the one after them", async () => {
+  // Two expired archives sort before the third and name a bucket this Worker does not have, as the
+  // old US archives do after the single-bucket change. They are neither claimed nor allowed to
+  // fill the batch of two that a run takes.
+  const foreign = [await archived(), await archived()],
+    owned = await archived();
+  for (const f of [...foreign, owned]) {
+    expect(
+      (await request(`/v1/databases/${f.id}`, f.integrator, "DELETE")).status,
+    ).toBe(202);
+    expect(await verdicts(await report(f, f.id, 2, "deleted"))).toEqual([
+      "accept",
+    ]);
+  }
+  const expiry = await env.DB.prepare(
+    "SELECT expires_at FROM retained_archives WHERE source_database_id=?",
+  )
+    .bind(owned.id)
+    .first<{ expires_at: string }>();
+  const now = Date.parse(expiry!.expires_at);
+  for (const [index, f] of foreign.entries())
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE databases SET archive_path=replace(archive_path,?,'s3://another-bucket/') WHERE id=?",
+      ).bind(`s3://${env.ARCHIVE_BUCKET_NAME}/`, f.id),
+      env.DB.prepare(
+        "UPDATE retained_archives SET archive_path=replace(archive_path,?,'s3://another-bucket/'),expires_at=? WHERE source_database_id=?",
+      ).bind(
+        `s3://${env.ARCHIVE_BUCKET_NAME}/`,
+        new Date(now - 1000 * (index + 2)).toISOString(),
+        f.id,
+      ),
+    ]);
+  expect((await cleanupRetainedArchives(env, now)).objects).toBe(3);
+  expect(await cleanupRetainedArchives(env, now)).toEqual({
+    purged: 1,
+    objects: 0,
+  });
+  expect(
+    (
+      await env.DB.prepare(
+        "SELECT cleanup_claim FROM retained_archives WHERE source_database_id IN(?,?)",
+      )
+        .bind(foreign[0]!.id, foreign[1]!.id)
+        .all()
+    ).results,
+  ).toEqual([{ cleanup_claim: null }, { cleanup_claim: null }]);
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) count FROM retained_archives WHERE source_database_id=?",
+    )
+      .bind(owned.id)
+      .first(),
+  ).toEqual({ count: 0 });
+});
+
 it("refuses a known WAL gap instead of promoting at the first missing segment", async () => {
   const f = await archived(),
     gap = `${f.prefix}wals/00000001${"0".repeat(8)}/00000001${"0".repeat(15)}3.gz`;
