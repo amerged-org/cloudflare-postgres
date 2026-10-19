@@ -14,12 +14,15 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::PoisonError};
 
 /// The most databases one report carries; the contract allows 200 (`NODE_DESIRED_PAGE_LIMIT_MAX`).
-/// The API takes 8 databases at a time (`OBSERVATION_CONCURRENCY`) and one costs it at most about
-/// 1.1 s (D1 about 45 ms and the Actor's publish, which it waits for no longer than 1 s: measured
-/// on EU1 with 235 databases), so a batch of 64 needs at most 64 / 8 x 1.1 s = 8.8 s. That is inside
-/// the API's 12 s budget and less than half of the 20 s a request may take (`REQUEST_TIMEOUT`).
-/// Taken one by one, 200 databases needed 59 to 209 s. 64 is a power of two: six halvings reach 1.
-const DATABASES_PER_REPORT: usize = 64;
+/// The API takes 8 at a time (`OBSERVATION_CONCURRENCY`). A database usually costs it 0.25 to 1.1 s
+/// (D1 about 45 ms and the Actor's publish, which it waits for 1 s at most: measured on EU1 with
+/// 235 databases). That is the typical cost, not a bound: a change of the runtime, an idle sleep
+/// and a refused sleep wait for their publish with no limit of 1 s. At the typical cost a batch of
+/// 64 needs 64 / 8 x 1.1 s = 8.8 s, inside the API's 12 s budget and less than half of the 20 s a
+/// request may take (`REQUEST_TIMEOUT`). A batch that takes longer is refused (503) or times out,
+/// and the next one is half as large (`too_big`). Taken one by one, 200 databases needed 59 to
+/// 209 s. 64 is a power of two: six halvings reach 1.
+pub(crate) const DATABASES_PER_REPORT: usize = 64;
 /// The most orders one report carries (`NODE_ORDER_LIMIT`).
 const ORDERS_PER_REPORT: usize = 1000;
 
@@ -316,6 +319,17 @@ impl<M: Machine> Core<M> {
             .observations
             .get(id)
             .cloned()
+    }
+    /// Queues an observation as `report` does, for a test that has no database to observe.
+    #[cfg(test)]
+    pub(crate) fn queue_observation(&self, observation: Value) {
+        let id = observation["id"].as_str().expect("an id").to_string();
+        self.reports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .observations
+            .insert(id, observation);
+        self.changed.notify_one();
     }
     #[cfg(test)]
     pub(crate) fn pending_order(&self, operation: &str) -> Option<Value> {

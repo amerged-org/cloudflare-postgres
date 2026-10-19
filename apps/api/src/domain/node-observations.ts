@@ -34,17 +34,22 @@ const CLAIM_WAIT_MS = 3000;
 const FAILING = "failing";
 /**
  * How many databases of one report are taken at the same time. Each is independent (a report names
- * each once) and waits mostly on D1 and on its own Actor, whose cold publish takes 250-1100 ms: 8
- * in flight take a report in one publish time per 8 databases, not per database.
+ * each once) and waits mostly on D1 and on its own Actor, whose cold publish usually takes 250-1100
+ * ms: 8 in flight take a report in one publish time per 8 databases, not per database.
  */
 const OBSERVATION_CONCURRENCY = 8;
 /**
- * How long a report may keep starting databases. The agent gives up on a request after 20 s. A
- * database started just before the budget ends still needs up to `CLAIM_WAIT_MS` and
- * `ADMISSION_PUBLISH_ANSWER_MS` (12 + 3 + 1 s), and the orders and the lifecycle after it a few
- * statements. A report with databases left unstarted is refused whole (503, retryable): the agent
- * keeps a report that was not answered with a success and posts it again, and what was applied
- * is applied again as the same.
+ * How long a report may keep starting databases. The agent gives up on a request after 20 s. The
+ * budget stops new starts only; it does not bound the ones started. Most databases are answered
+ * within `ADMISSION_PUBLISH_ANSWER_MS` of their commit, but three paths go through
+ * `withAdmissionMutation` and wait for the Actor's seed and begin, about 4 D1 round trips, the
+ * publish and the hint with no bound of their own: a changed runtime of a ready database
+ * (`applyObservation`), an idle sleep (`idleSleep`) and a refused sleep (`recoverQuiescence`). A
+ * report of a wake the Actor claimed waits up to `CLAIM_WAIT_MS` more. So the time a report takes
+ * after the budget is not bounded here. It stays correct: a report with databases left unstarted
+ * is refused whole (503, retryable), and one that outlasts the agent's timeout makes the agent
+ * halve its next batch; the agent keeps a report that was not answered with a success and posts it
+ * again, and what was applied is applied again as the same.
  */
 const OBSERVATION_BUDGET_MS = 12_000;
 /** A report is logged when it took this long, or named this many databases (plan 9.9). */
