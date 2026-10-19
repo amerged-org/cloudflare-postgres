@@ -59,7 +59,8 @@ let logs: ReturnType<typeof vi.spyOn>;
  */
 const edgeLogs = () =>
   logs.mock.calls.filter(
-    ([line]) => typeof line === "string" && line.includes('"conn_admission"'),
+    ([line]: unknown[]) =>
+      typeof line === "string" && line.includes('"conn_admission"'),
   );
 let database: string;
 /** The node the fixture database runs on, with the key it signs its reports with. */
