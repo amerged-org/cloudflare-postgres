@@ -206,6 +206,16 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Read the fencing and the recovery points of a lost node",
     "admin",
   ),
+  "POST /v1/nodes/{id}/maintenance": route(
+    "startNodeMaintenance",
+    "Run the maintenance cycle on one node",
+    "admin",
+  ),
+  "GET /v1/nodes/{id}/maintenance/{operation}": route(
+    "getNodeMaintenance",
+    "Read a maintenance cycle of a node",
+    "admin",
+  ),
   "POST /v1/nodes/{id}/reinstall-override": route(
     "overrideNodeReinstallGuard",
     "Acknowledge that reinstalling a lost node may overwrite unarchived WAL",

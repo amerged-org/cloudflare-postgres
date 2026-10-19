@@ -229,6 +229,21 @@ describe("actual generated API references in the Workers runtime", () => {
         "post",
       ).parameters?.some((parameter) => parameter.name === "Idempotency-Key"),
     ).toBe(false);
+    // The maintenance cycle of a node: a keyed start that answers 202 with the operation to read.
+    const maintenance = operation(
+      management,
+      "/v1/nodes/{id}/maintenance",
+      "post",
+    );
+    expect(maintenance.parameters).toContainEqual(
+      expect.objectContaining({ name: "Idempotency-Key", required: true }),
+    );
+    expect(maintenance.responses["202"]!.headers).toHaveProperty("Location");
+    expect(maintenance.responses).toHaveProperty("409");
+    expect(
+      operation(management, "/v1/nodes/{id}/maintenance/{operation}", "get")
+        .responses,
+    ).toHaveProperty("200");
     expect(
       operation(management, "/v1/projects", "post").responses["201"]!.headers,
     ).toHaveProperty("Location");

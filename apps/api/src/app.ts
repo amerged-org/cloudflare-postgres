@@ -50,6 +50,8 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/nodes/:id/mark-lost",
   "/v1/nodes/:id/loss",
   "/v1/nodes/:id/reinstall-override",
+  "/v1/nodes/:id/maintenance",
+  "/v1/nodes/:id/maintenance/:operation",
   "/v1/databases/:id/move",
   "/v1/databases/:id/moves",
   "/v1/costs/node-facts",

@@ -3,6 +3,7 @@ import type { NodeObservationReport } from "@pgcf/contracts";
 import type { Env } from "../env.ts";
 import { progressMoves } from "./database-moves.ts";
 import { isNodeFenced, recordOrderResults } from "./lifecycle-orders.ts";
+import { hintNode } from "./node-hints.ts";
 
 /**
  * What the lifecycle takes from a node's observation report (`POST /node/v1/observations`): the
@@ -18,12 +19,15 @@ export async function applyLifecycleObservations(
   report: NodeObservationReport,
   now = Date.now(),
 ): Promise<number> {
-  const taken = await recordOrderResults(
+  const { taken, maintenanceEnded } = await recordOrderResults(
     env.DB,
     nodeId,
     report.orders,
     new Date(now).toISOString(),
   );
+  // The node refuses wakes until it pulls a whole page without the order; it would wait for its
+  // next full pull.
+  if (maintenanceEnded) await hintNode(env, nodeId).catch(() => 0);
   if (await isNodeFenced(env.DB, nodeId)) return taken;
   await progressMoves(env, nodeId, report, now);
   await recordRecoveryPoints(env.DB, nodeId, report, now);

@@ -165,3 +165,38 @@ Thin physical allocation metrics stay null until a real measurement exists; neit
 quota nor zero stands in for an unknown measurement. The node agent's full-pool and full-volume
 recovery ([plan 4.3](../architecture/cloudflare-convergence-and-serverless-plan.md#43-disk-thin-lvm))
 is built in Stage 3.
+
+## Node maintenance cycle
+
+The cycle installs the packages that a release pins (a newer Debian snapshot, a kernel update) on
+one node and reboots it if needed (plan 9.3). Run it one node at a time, in an announced window,
+with the owner's go for a reboot. The endpoints require an admin API key.
+
+1. Register the release (`PUT /v1/fleet/releases/{id}`) and assign it to the node's region
+   (`PUT /v1/regions/{id}/release`). Wait until `GET /v1/nodes/{id}/release` says `converged`:
+   the node installs the packages with the agent of the release, and the route refuses a node
+   that runs another release with 409.
+2. Verify the node's UID, then submit `POST /v1/nodes/{id}/maintenance` with a persistent
+   `Idempotency-Key` and `{"expected_node_uid":"<verified UID>"}`. It answers 202 with the
+   operation and a `Location`. Placement on the node is closed, and the node holds new wakes
+   with `57P03`, puts every awake database to sleep with the proof, installs the packages,
+   reboots if the kernel or core libraries changed, runs its check and reports. Repeating the
+   request while the cycle is open returns the same operation.
+3. Poll `GET /v1/nodes/{id}/maintenance/{operation}`. `open` becomes `done` or `failed`; a
+   `failed` cycle names the class of the failure in `result_reason` (such as `power_busy` or
+   `power_archive` for a database that did not sleep with the proof, `release_missing`,
+   `lock_not_read`, `packages_not_installed`, `reboot_failed` or `check_failed`).
+4. `done` reopens placement, if this cycle closed it (`placement_closed_at` is not null). A
+   placement that an operator closed before or during the cycle stays closed: open it with
+   `PUT /v1/nodes/{id}/database-placement`. Either way the API hints the node when it records
+   the result, and the node serves wakes again as soon as it has pulled its page; if the hint is
+   lost, at its next full pull, within 60 s.
+5. After `failed`, placement stays closed and the node serves wakes again; its databases are
+   asleep. Read the node's events and logs, fix the cause, and submit the request again with a
+   new key: the new cycle takes over the closure the failed one left, so that its `done`
+   reopens placement.
+
+A lost or fenced node is refused with 409. A node that loses its link in the middle of the cycle
+keeps the order open until its agent answers after the reboot; staleness alone never declares it
+lost (plan 9.4). Debian keeps the previous kernel; a bad kernel is recovered from the boot menu
+over VNC or with a one-shot GRUB entry (plan 9.3).
