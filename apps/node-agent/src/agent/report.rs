@@ -3,6 +3,8 @@
 //! of each database it changed, how the orders ended, and the decisions the node took.
 use super::{Core, Db, Phase, View};
 use crate::{
+    Error,
+    api::Refusal,
     archive::facts::{self, ArchiveState},
     events::Events,
     machine::Machine,
@@ -11,12 +13,19 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::PoisonError};
 
-/// The most databases and orders one report carries (`NODE_DESIRED_PAGE_LIMIT_MAX`,
-/// `NODE_ORDER_LIMIT`).
-const DATABASES_PER_REPORT: usize = 200;
+/// The most databases one report carries; the contract allows 200 (`NODE_DESIRED_PAGE_LIMIT_MAX`).
+/// The API takes 8 at a time (`OBSERVATION_CONCURRENCY`). A database usually costs it 0.25 to 1.1 s
+/// (D1 about 45 ms and the Actor's publish, which it waits for 1 s at most: measured on EU1 with
+/// 235 databases). That is the typical cost, not a bound: a change of the runtime, an idle sleep
+/// and a refused sleep wait for their publish with no limit of 1 s. At the typical cost a batch of
+/// 64 needs 64 / 8 x 1.1 s = 8.8 s, inside the API's 12 s budget and less than half of the 20 s a
+/// request may take (`REQUEST_TIMEOUT`). A batch that takes longer is refused (503) or times out,
+/// and the next one is half as large (`too_big`). Taken one by one, 200 databases needed 59 to
+/// 209 s. 64 is a power of two: six halvings reach 1.
+pub(crate) const DATABASES_PER_REPORT: usize = 64;
+/// The most orders one report carries (`NODE_ORDER_LIMIT`).
 const ORDERS_PER_REPORT: usize = 1000;
 
-#[derive(Default)]
 pub(crate) struct Reports {
     /// The newest observation of each database that changed since the last post.
     observations: BTreeMap<String, Value>,
@@ -24,6 +33,50 @@ pub(crate) struct Reports {
     orders: BTreeMap<String, Value>,
     /// Events not yet queued for delivery.
     events: Vec<Value>,
+    /// How many databases the next report carries: `DATABASES_PER_REPORT`, halved by each post that
+    /// was too big, until one goes through.
+    limit: usize,
+}
+impl Default for Reports {
+    fn default() -> Self {
+        Self {
+            observations: BTreeMap::new(),
+            orders: BTreeMap::new(),
+            events: Vec::new(),
+            limit: DATABASES_PER_REPORT,
+        }
+    }
+}
+impl Reports {
+    /// The next batch of observations, at most `limit` of them: what is not asleep goes first (a
+    /// database that became ready, failed or was deleted is what Cloudflare waits for), then the
+    /// asleep ones, each group in the order of the database IDs.
+    fn take_databases(&mut self) -> Vec<Value> {
+        let mut ids: Vec<&String> = self.observations.keys().collect();
+        // The sort is stable and the keys come in order, so each group keeps the order of its keys.
+        ids.sort_by_key(|id| self.observations[*id]["state"] == "asleep");
+        let ids: Vec<String> = ids.into_iter().take(self.limit).cloned().collect();
+        ids.iter()
+            .filter_map(|id| self.observations.remove(id))
+            .collect()
+    }
+    /// A post carried its batch: the next one is whole again.
+    fn posted(&mut self) {
+        self.limit = DATABASES_PER_REPORT;
+    }
+    /// A post was too big for Cloudflare: the next batch is half as large, down to one database.
+    fn too_big(&mut self) {
+        self.limit = (self.limit / 2).max(1);
+    }
+}
+
+/// Whether a failed post says its batch did not fit Cloudflare's time: the request timed out, or
+/// the API answered with a server error (it answers 503 when the report outlasted its budget).
+pub(crate) fn too_big(error: &Error) -> bool {
+    crate::diagnostics::error_code(error) == "http_timeout"
+        || error
+            .downcast_ref::<Refusal>()
+            .is_some_and(|refusal| refusal.status >= 500)
 }
 
 /// A random UUID (version 4), the identifier of an event.
@@ -187,12 +240,7 @@ impl<M: Machine> Core<M> {
     pub(crate) fn take_report(&self, events: &Events) -> Option<Value> {
         let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
         let alone = reports.observations.is_empty() && reports.orders.is_empty();
-        let databases: Vec<String> = reports
-            .observations
-            .keys()
-            .take(DATABASES_PER_REPORT)
-            .cloned()
-            .collect();
+        let databases = reports.take_databases();
         let orders: Vec<String> = reports
             .orders
             .keys()
@@ -201,10 +249,7 @@ impl<M: Machine> Core<M> {
             .collect();
         let mut report = json!({
             "observed_at": facts::timestamp(super::now_ms()),
-            "databases": databases
-                .iter()
-                .filter_map(|id| reports.observations.remove(id))
-                .collect::<Vec<_>>(),
+            "databases": databases,
             "orders": orders
                 .iter()
                 .filter_map(|operation| reports.orders.remove(operation))
@@ -213,6 +258,23 @@ impl<M: Machine> Core<M> {
         // The agent's own log lines ride along, or leave alone.
         events.attach(&mut report, alone);
         (!alone || report.get("events").is_some()).then_some(report)
+    }
+    /// The report was accepted: the next one carries a whole batch.
+    pub(crate) fn report_posted(&self) {
+        self.reports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .posted();
+    }
+    /// The post of a report failed with `error`: if for want of time (`too_big`), the next report
+    /// is half as large.
+    pub(crate) fn report_failed(&self, error: &Error) {
+        if too_big(error) {
+            self.reports
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .too_big();
+        }
     }
     /// A report that was not accepted: what it holds is posted again, unless something newer
     /// about the same database or order was queued since.
@@ -257,6 +319,17 @@ impl<M: Machine> Core<M> {
             .observations
             .get(id)
             .cloned()
+    }
+    /// Queues an observation as `report` does, for a test that has no database to observe.
+    #[cfg(test)]
+    pub(crate) fn queue_observation(&self, observation: Value) {
+        let id = observation["id"].as_str().expect("an id").to_string();
+        self.reports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .observations
+            .insert(id, observation);
+        self.changed.notify_one();
     }
     #[cfg(test)]
     pub(crate) fn pending_order(&self, operation: &str) -> Option<Value> {
@@ -329,6 +402,150 @@ mod tests {
         let again = rig.core.take_report(&events).unwrap();
         assert_eq!(again["events"], alone["events"]);
         assert_eq!(again["orders"], json!([]));
+    }
+
+    fn queued(reports: &mut Reports, id: &str, state: &str) {
+        reports
+            .observations
+            .insert(id.into(), json!({"id": id, "state": state}));
+    }
+    fn ids(batch: &[Value]) -> Vec<&str> {
+        batch.iter().map(|o| o["id"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn a_report_carries_what_is_not_asleep_first_and_each_group_in_key_order() {
+        let mut reports = Reports::default();
+        // Asleep databases whose ids sort before the others, and the states that matter more.
+        for n in 0..100 {
+            queued(&mut reports, &format!("a{n:03}"), "asleep");
+        }
+        for (id, state) in [
+            ("z3", "ready"),
+            ("z1", "error"),
+            ("z5", "deleted"),
+            ("z2", "building"),
+            ("z4", "unproven"),
+        ] {
+            queued(&mut reports, id, state);
+        }
+        let batch = reports.take_databases();
+        assert_eq!(batch.len(), DATABASES_PER_REPORT);
+        let ids = ids(&batch);
+        assert_eq!(ids[..5], ["z1", "z2", "z3", "z4", "z5"]);
+        // The asleep ones follow in key order, as many as fit.
+        let rest: Vec<String> = (0..DATABASES_PER_REPORT - 5)
+            .map(|n| format!("a{n:03}"))
+            .collect();
+        assert_eq!(
+            ids[5..],
+            rest.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        // What did not fit waits, and goes next in the same order.
+        assert_eq!(reports.observations.len(), 105 - DATABASES_PER_REPORT);
+        let next = reports.take_databases();
+        assert_eq!(
+            ids_of(&next)[0],
+            format!("a{:03}", DATABASES_PER_REPORT - 5)
+        );
+    }
+    fn ids_of(batch: &[Value]) -> Vec<String> {
+        ids(batch).into_iter().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn the_batch_halves_after_a_post_that_was_too_big_and_is_whole_again_after_one_that_went() {
+        let mut reports = Reports::default();
+        for n in 0..1000 {
+            queued(&mut reports, &format!("d{n:04}"), "asleep");
+        }
+        let mut sizes = Vec::new();
+        for _ in 0..8 {
+            sizes.push(reports.take_databases().len());
+            reports.too_big();
+        }
+        // Down to one and no further.
+        assert_eq!(
+            sizes,
+            [DATABASES_PER_REPORT, 32, 16, 8, 4, 2, 1, 1],
+            "the first batch is whole, every later one half of the one before"
+        );
+        // A post that went brings the whole batch back at once.
+        reports.posted();
+        assert_eq!(reports.take_databases().len(), DATABASES_PER_REPORT);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_report_that_was_too_big_goes_back_whole_and_the_next_is_half_as_large() {
+        let Some(rig) = Rig::new("report-batches").await else {
+            return;
+        };
+        let events = Events::new(Duration::from_secs(60));
+        {
+            let mut reports = rig.core.reports.lock().unwrap();
+            for n in 0..150 {
+                queued(&mut reports, &format!("d{n:03}"), "asleep");
+            }
+            queued(&mut reports, "e000", "ready");
+        }
+        let first = rig.core.take_report(&events).unwrap();
+        let sent = |report: &Value| report["databases"].as_array().unwrap().clone();
+        assert_eq!(sent(&first).len(), DATABASES_PER_REPORT);
+        assert_eq!(sent(&first)[0]["id"], "e000", "what is not asleep leads");
+        // The API ran out of time on it: it is queued again, and the next report is half of it.
+        rig.core.unsent(&events, &first);
+        let refusal: Error = Box::new(Refusal {
+            status: 503,
+            code: Some("capacity_exhausted".into()),
+        });
+        rig.core.report_failed(&refusal);
+        let second = rig.core.take_report(&events).unwrap();
+        assert_eq!(sent(&second), sent(&first)[..DATABASES_PER_REPORT / 2]);
+        // A failure that is no matter of size leaves the size alone; a success restores it.
+        rig.core.unsent(&events, &second);
+        let unauthorized: Error = Box::new(Refusal {
+            status: 401,
+            code: None,
+        });
+        rig.core.report_failed(&unauthorized);
+        assert_eq!(
+            sent(&rig.core.take_report(&events).unwrap()).len(),
+            DATABASES_PER_REPORT / 2
+        );
+        rig.core.report_posted();
+        assert_eq!(
+            sent(&rig.core.take_report(&events).unwrap()).len(),
+            DATABASES_PER_REPORT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeout_or_a_server_error_is_too_big_and_other_failures_are_not() {
+        let refusal = |status| -> crate::Error { Box::new(Refusal { status, code: None }) };
+        assert!(too_big(&refusal(503)));
+        assert!(too_big(&refusal(500)));
+        assert!(!too_big(&refusal(401)));
+        assert!(!too_big(&refusal(409)));
+        assert!(!too_big(&"node request exceeds bound".into()));
+        // A real timeout: a server that accepts the connection and never answers.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let timed_out = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap()
+            .post(url)
+            .send()
+            .await
+            .unwrap_err();
+        assert!(too_big(&timed_out.into()));
+        // A refused connection is no size problem.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", closed.local_addr().unwrap());
+        drop(closed);
+        let refused = reqwest::Client::new().post(url).send().await.unwrap_err();
+        assert!(!too_big(&refused.into()));
     }
 
     #[test]
