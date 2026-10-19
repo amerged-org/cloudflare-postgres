@@ -59,14 +59,18 @@ const LOGGED_REPORT_DATABASES = 50;
 
 interface Row extends DatabaseRow {
   proven_sleep_json: string | null;
-  /** 1 while an operation of the database is open. */
-  open: number;
+  /** 1 once a report has written the sleep's lifecycle event of the database's generation. */
+  slept: number;
   operation: string;
   restore_operation: string | null;
   restore_status: string | null;
 }
-/** Whether an operation of the database is open: one that a report of the database can end. */
-const OPEN_OPERATION = `EXISTS(SELECT 1 FROM operations w WHERE w.database_id=d.id AND w.status IN('pending','running'))`;
+/**
+ * Whether the sleep's event of the database's generation is written. The first report applied to a
+ * suspended database asleep at the generation writes it, in one batch with every other statement
+ * that report runs, and no other writer does.
+ */
+const SLEEP_EVENT = `EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.generation=d.generation AND e.kind IN('suspended','hibernated'))`;
 const OPERATION_OF_GENERATION = `(SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
   ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1)`;
 
@@ -365,10 +369,13 @@ function sameRuntime(stored: string | null | undefined, next: string | null) {
  * steady states are told; the rest of the states are rare and take the whole path. Role removals
  * and refused sleeps are outcomes, never a repeat. What the report would write besides is the
  * time of the backup observation, which `touchObserved` takes alone. A row can be in the state
- * the node reports without any report having brought it there (a cold resize takes the next
- * generation and observes it at once), and then the statements that follow have not run: while an
- * operation of the database is open, the report is applied whole. (A role removal needs no clause
- * of its own: only a report that names roles ends one, and a sleep ends the ones that wait before
+ * the node reports without any report having brought it there: a cold resize takes the next
+ * generation and observes it at once, so the statements that follow (the sleep's event, which
+ * meters the new resources, and the end of the resize) have not run. The resize may be failed
+ * meanwhile (`operation_timeout`, after 20 minutes with the node, its agent or its link down), so
+ * no open operation shows it. A suspended database's sleep is therefore held only once the event
+ * of that generation is written, which only a report writes. (A role removal needs no clause of
+ * its own: only a report that names roles ends one, and a sleep ends the ones that wait before
  * it, while a removal asked of a suspended database is created ended.)
  */
 function holds(
@@ -378,7 +385,6 @@ function holds(
   columns: ReturnType<typeof reportedColumns>,
 ): boolean {
   return (
-    row.open === 0 &&
     (observation.state === "ready" || observation.state === "asleep") &&
     observation.roles === undefined &&
     observation.refusal === undefined &&
@@ -387,7 +393,8 @@ function holds(
     row.observed_generation === observation.generation &&
     sameRuntime(row.runtime_json, set.runtime) &&
     (observation.state !== "asleep" ||
-      row.proven_sleep_json === JSON.stringify(observation.proven_sleep)) &&
+      (row.proven_sleep_json === JSON.stringify(observation.proven_sleep) &&
+        (row.desired_state !== "suspended" || row.slept === 1))) &&
     row.status_message === columns.message &&
     row.archiving_health === columns.health &&
     row.archiving_health_since === columns.since &&
@@ -797,7 +804,7 @@ async function readRow(
   nodeId: string,
 ): Promise<Row | null> {
   return env.DB.prepare(
-    `SELECT d.*,${OPEN_OPERATION} open,${OPERATION_OF_GENERATION} operation,x.operation_id restore_operation,ro.status restore_status
+    `SELECT d.*,${SLEEP_EVENT} slept,${OPERATION_OF_GENERATION} operation,x.operation_id restore_operation,ro.status restore_status
      FROM databases d LEFT JOIN database_restores x ON x.target_database_id=d.id
      LEFT JOIN operations ro ON ro.id=x.operation_id AND ro.kind='database.restore'
      WHERE d.id=? AND d.node_id=?`,

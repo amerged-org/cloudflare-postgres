@@ -6,6 +6,7 @@
 import { env } from "cloudflare:workers";
 import { DatabaseWithOperation, NODE_DATABASE_STALE_MS } from "@pgcf/contracts";
 import { afterEach, describe, expect, it } from "vitest";
+import { runCron } from "../../src/cron.ts";
 import type { Env } from "../../src/env.ts";
 import {
   cleanupFixtures,
@@ -264,25 +265,37 @@ describe("a database that is unchanged and alive", () => {
   });
 });
 
+/** A sleeping database and the larger class a cold resize of it asks for. */
+async function sleeper(f: F, actors: ReturnType<typeof countingActors>) {
+  const id = await created(f);
+  await post(f, actors, [await observationOf(id, 1)]);
+  await suspend(f, id);
+  const asleep = await observationOf(id, 2, "asleep");
+  await post(f, actors, [asleep]);
+  const target = "r" + crypto.randomUUID().replaceAll("-", "").slice(0, 20);
+  classes.push(target);
+  await env.DB.prepare(
+    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
+     SELECT ?,1024,750,5,80,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,1,created_at,updated_at FROM size_classes WHERE id=?`,
+  )
+    .bind(target, f.size)
+    .run();
+  return { id, asleep, target };
+}
+const sleepEvents = (id: string, generation: number) =>
+  env.DB.prepare(
+    "SELECT kind FROM lifecycle_events WHERE database_id=? AND generation=? AND kind IN('suspended','hibernated')",
+  )
+    .bind(id, generation)
+    .all<{ kind: string }>();
+
 describe("a database that D1 itself moved to the state the node reports", () => {
   it("still ends the cold resize that moved it with the asleep report of its generation", async () => {
     const f = await fixture();
-    const id = await created(f);
     const actors = countingActors();
-    await post(f, actors, [await observationOf(id, 1)]);
-    await suspend(f, id);
-    const asleep = await observationOf(id, 2, "asleep");
-    await post(f, actors, [asleep]);
     // A cold resize takes the next generation and observes it at once: the row is already what
     // the node will report of it, but no report of it has run the statements that end the resize.
-    const target = "r" + crypto.randomUUID().replaceAll("-", "").slice(0, 20);
-    classes.push(target);
-    await env.DB.prepare(
-      `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
-       SELECT ?,1024,750,5,80,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,1,created_at,updated_at FROM size_classes WHERE id=?`,
-    )
-      .bind(target, f.size)
-      .run();
+    const { id, asleep, target } = await sleeper(f, actors);
     const resized = await request(
       `/v1/databases/${id}`,
       f.integrator,
@@ -313,5 +326,45 @@ describe("a database that D1 itself moved to the state the node reports", () => 
         .bind(operation.id)
         .first("status"),
     ).toBe("succeeded");
+  });
+
+  it("still writes the sleep's event of that generation when the node reports it after the resize timed out", async () => {
+    const f = await fixture();
+    const actors = countingActors();
+    const { id, asleep, target } = await sleeper(f, actors);
+    const resized = DatabaseWithOperation.parse(
+      await (
+        await request(
+          `/v1/databases/${id}`,
+          f.integrator,
+          "PATCH",
+          { size_class_id: target },
+          crypto.randomUUID(),
+        )
+      ).json(),
+    ).operation;
+    // The node, its agent or its link was down for 20 minutes: the resize is failed, and the row
+    // stays what the cold resize made it, which is what the node reports when it returns.
+    await env.DB.prepare("UPDATE operations SET updated_at=? WHERE id=?")
+      .bind(new Date(Date.now() - 21 * 60_000).toISOString(), resized.id)
+      .run();
+    await runCron(env);
+    expect(
+      await env.DB.prepare("SELECT error_code FROM operations WHERE id=?")
+        .bind(resized.id)
+        .first("error_code"),
+    ).toBe("operation_timeout");
+    expect((await sleepEvents(id, 3)).results).toEqual([]);
+    expect(
+      await verdicts(
+        await post(f, actors, [
+          await observationOf(id, 3, "asleep", {
+            proven_sleep: asleep.proven_sleep,
+          }),
+        ]),
+      ),
+    ).toEqual(["accept"]);
+    // The event is where a sleeping database's resources are metered from.
+    expect((await sleepEvents(id, 3)).results).toHaveLength(1);
   });
 });
