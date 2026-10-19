@@ -13,7 +13,7 @@ import {
 import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
 import { withAdmissionMutation } from "./admission-mutations.ts";
-import { regionArchive } from "./archive-bindings.ts";
+import { archiveBucket } from "./archive-bucket.ts";
 import { BACKUP_DATA, keysOf, walRangeArchived } from "./archive-chain.ts";
 import { validatedArchivePrefix } from "./archive.ts";
 import {
@@ -464,7 +464,6 @@ interface DatabaseState {
   storage_generation: number;
   archive_path: string;
   deleted_at: string | null;
-  backup_bucket: string;
 }
 
 /**
@@ -477,15 +476,8 @@ async function sourceArchiveHolds(
   database: DatabaseState,
   observed: NodeDatabaseObservation,
 ): Promise<boolean> {
-  const selected = regionArchive(env, {
-    id: database.region_id,
-    backup_bucket: database.backup_bucket,
-  });
-  const prefix = validatedArchivePrefix(
-    database,
-    database,
-    selected.bucketName,
-  );
+  const selected = archiveBucket(env);
+  const prefix = validatedArchivePrefix(database, selected.bucketName);
   const backupId = observed.backup!.backup_id,
     last = observed.proven_sleep!.last_archived_segment;
   const described = await selected.bucket.get(
@@ -536,7 +528,7 @@ async function beginRestore(
       Math.max(move.source_storage_generation, staged!.highest) + 1,
     generation = database.generation + 1,
     path = archiveDestinationPath(
-      database.backup_bucket,
+      archiveBucket(env).bucketName,
       database.region_id,
       database.id,
       storageGeneration,
@@ -682,7 +674,7 @@ export async function progressMoves(
   ).results;
   for (const move of active) {
     const database = await env.DB.prepare(
-      "SELECT d.id,d.node_id,d.region_id,d.generation,d.storage_generation,d.archive_path,d.deleted_at,r.backup_bucket FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id=?",
+      "SELECT id,node_id,region_id,generation,storage_generation,archive_path,deleted_at FROM databases WHERE id=?",
     )
       .bind(move.database_id)
       .first<DatabaseState>();

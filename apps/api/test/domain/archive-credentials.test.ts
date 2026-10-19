@@ -294,7 +294,7 @@ it("is unavailable, with nothing to leak, while the Worker has no parent key", a
   ).rejects.toThrow("archive_credentials_unavailable");
 });
 
-it("refuses a region whose bucket is not the one the path names", async () => {
+it("refuses a path whose bucket is not the one this Worker is bound to", async () => {
   const f = await lifecycle(),
     row = await f.row(),
     now = Date.now();
@@ -303,13 +303,13 @@ it("refuses a region whose bucket is not the one the path names", async () => {
     { nodeId: f.node, archivePath: row.archive_path, access: "read_write" },
     now,
   );
-  await env.DB.prepare(
-    "UPDATE regions SET backup_bucket='another-bucket' WHERE id=?",
-  )
-    .bind(f.region)
-    .run();
   await expect(
-    deliverArchiveCredential(keyedEnv(), f.node, reference.id, now),
+    deliverArchiveCredential(
+      { ...keyedEnv(), ARCHIVE_BUCKET_NAME: "another-bucket" },
+      f.node,
+      reference.id,
+      now,
+    ),
   ).rejects.toThrow("archive_credentials_unavailable");
 });
 

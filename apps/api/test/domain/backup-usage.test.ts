@@ -181,7 +181,6 @@ it("ignores unrelated configuration revisions while preserving exact immutable s
   const identity = {
     archive_path: f.path,
     region_id: f.region,
-    backup_bucket: env.ARCHIVE_BUCKET_NAME,
     deleted_at: null,
   };
   expect(

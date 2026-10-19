@@ -14,7 +14,6 @@ flowchart LR
     n_36ffcdc5f79f["Workflow<br/>INFRASTRUCTURE_BACKUP<br/>name: pgcf-infrastructure-backup<br/>class_name: InfrastructureBackup"]
     n_85c654928d8c["version_metadata<br/>CF_VERSION_METADATA"]
     n_71083a5197e9["R2 bucket<br/>ARCHIVE<br/>bucket_name:<br/>replace-r2-backup-bucket"]
-    n_12eaf448c6b2["R2 bucket<br/>ARCHIVE_US<br/>bucket_name:<br/>replace-r2-us-backup-bucket"]
     n_056b63fe76be["Durable Object<br/>DATABASE_ACTOR<br/>class_name: DatabaseActor"]
     n_d0efe52f1f47["Durable Object<br/>CRON_WATCHDOG<br/>class_name: CronWatchdog"]
     n_7a30182df25a["pgcf-api-dev<br/>configuration template"]
@@ -27,7 +26,6 @@ flowchart LR
     n_7a30182df25a --> n_71083a5197e9
     n_7a30182df25a --> n_85c654928d8c
     n_7a30182df25a --> n_056b63fe76be
-    n_7a30182df25a --> n_12eaf448c6b2
     n_7a30182df25a --> n_36ffcdc5f79f
 ```
 
@@ -36,13 +34,12 @@ flowchart LR
 - [apps/api/wrangler.example.jsonc:3](../../../apps/api/wrangler.example.jsonc#L3)
 - [apps/api/wrangler.example.jsonc:11](../../../apps/api/wrangler.example.jsonc#L11)
 - [apps/api/wrangler.example.jsonc:13](../../../apps/api/wrangler.example.jsonc#L13)
-- [apps/api/wrangler.example.jsonc:21](../../../apps/api/wrangler.example.jsonc#L21)
-- [apps/api/wrangler.example.jsonc:26](../../../apps/api/wrangler.example.jsonc#L26)
+- [apps/api/wrangler.example.jsonc:24](../../../apps/api/wrangler.example.jsonc#L24)
+- [apps/api/wrangler.example.jsonc:61](../../../apps/api/wrangler.example.jsonc#L61)
 - [apps/api/wrangler.example.jsonc:62](../../../apps/api/wrangler.example.jsonc#L62)
-- [apps/api/wrangler.example.jsonc:63](../../../apps/api/wrangler.example.jsonc#L63)
-- [apps/api/wrangler.example.jsonc:66](../../../apps/api/wrangler.example.jsonc#L66)
-- [apps/api/wrangler.example.jsonc:83](../../../apps/api/wrangler.example.jsonc#L83)
-- [apps/api/wrangler.example.jsonc:88](../../../apps/api/wrangler.example.jsonc#L88)
-- [apps/api/wrangler.example.jsonc:90](../../../apps/api/wrangler.example.jsonc#L90)
+- [apps/api/wrangler.example.jsonc:65](../../../apps/api/wrangler.example.jsonc#L65)
+- [apps/api/wrangler.example.jsonc:82](../../../apps/api/wrangler.example.jsonc#L82)
+- [apps/api/wrangler.example.jsonc:87](../../../apps/api/wrangler.example.jsonc#L87)
+- [apps/api/wrangler.example.jsonc:89](../../../apps/api/wrangler.example.jsonc#L89)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

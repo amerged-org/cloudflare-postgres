@@ -27,9 +27,9 @@ recovers the same customer EU1.
 3. Save the returned target ID and operation ID. Repeating the same request and key returns the
    same target; a transport failure does not justify issuing a new key or replaying SQL writes.
 4. Poll the operation. The source stays unchanged. The target uses new storage and its own
-   region's bucket, endpoint and archive path; its configuration revision is independent of its
-   storage generation. Source backup/WAL selection still uses the source region's catalog and
-   bucket, including when the source has been deleted.
+   region's endpoint and a new archive path in the installation's archive bucket; its
+   configuration revision is independent of its storage generation. Source backup/WAL selection
+   still uses the source's archive path and catalog, including when the source has been deleted.
 5. Ready requires recovery promotion, SQL database-name mapping, actual role/settings and volume
    checks, and removal of the temporary restore administrator. Authenticate to the target over
    the normal endpoint and compare the required tables, roles, sequences and committed markers.

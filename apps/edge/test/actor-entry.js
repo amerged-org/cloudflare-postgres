@@ -54,8 +54,8 @@ export async function seedFixtureDatabase(
     ).bind(now, now),
     env.DB.prepare(
       `INSERT INTO regions (id, provider, provider_region, gateway_url,
-      gateway_binding, backup_bucket, backup_endpoint_url, created_at, updated_at)
-      VALUES (?, 'test-provider', 'test-region', ?, ?, 'test-backups', ?, ?, ?)`,
+      gateway_binding, backup_endpoint_url, created_at, updated_at)
+      VALUES (?, 'test-provider', 'test-region', ?, ?, ?, ?, ?)`,
     ).bind(
       region,
       gatewayUrl,

@@ -213,13 +213,13 @@ it("refuses a restore into another region, whose nodes cannot read the source's 
   const f = await archived(),
     targetNode = newNodeId(),
     targetKey = await nodeKeyPair(),
-    now = new Date().toISOString(),
-    bucket = "pgcf-api-us-test";
-  // The other region has a bucket and a node that reports and could take the database.
+    now = new Date().toISOString();
+  // The other region has a node that reports and could take the database.
   await env.DB.batch([
-    env.DB.prepare(
-      "UPDATE regions SET backup_bucket=?,backup_endpoint_url=? WHERE id=?",
-    ).bind(bucket, "https://target.r2.cloudflarestorage.com", f.foreign),
+    env.DB.prepare("UPDATE regions SET backup_endpoint_url=? WHERE id=?").bind(
+      "https://target.r2.cloudflarestorage.com",
+      f.foreign,
+    ),
     env.DB.prepare(
       "INSERT INTO nodes(id,region_id,hostname,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,public_key,enrolled_at) VALUES(?,?,?,1,1,4096,2000,30,128,100,?,?,?,?,?,?)",
     ).bind(
@@ -235,12 +235,6 @@ it("refuses a restore into another region, whose nodes cannot read the source's 
     ),
   ]);
   await reports(targetNode);
-  const mapping = {
-    ARCHIVE_BINDINGS: JSON.stringify({
-      [f.region]: { binding: "ARCHIVE", bucket: env.ARCHIVE_BUCKET_NAME },
-      [f.foreign]: { binding: "ARCHIVE_US", bucket },
-    }),
-  };
   const count = async () =>
     (await env.DB.prepare("SELECT COUNT(*) n FROM databases").first<number>(
       "n",
@@ -252,11 +246,11 @@ it("refuses a restore into another region, whose nodes cannot read the source's 
   // A node reads only archives of its own region, so the restore could never build there.
   expect(
     await refusal(
-      await overridden(
+      await request(
         `/v1/databases/${f.id}/restore`,
         f.integrator,
+        "POST",
         { mode: "full", name: "cross-region-restored", region_id: f.foreign },
-        mapping,
         "cross-region-restore",
       ),
     ),
@@ -270,11 +264,11 @@ it("refuses a restore into another region, whose nodes cannot read the source's 
   // The source's own region stays the place to restore into.
   expect(
     (
-      await overridden(
+      await request(
         `/v1/databases/${f.id}/restore`,
         f.integrator,
+        "POST",
         { mode: "full", name: "same-region-restored", region_id: f.region },
-        mapping,
         "same-region-restore",
       )
     ).status,

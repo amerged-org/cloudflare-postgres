@@ -22,7 +22,7 @@ const ConfigFields = {
     .nullable()
     .describe("ID of the control D1 database to export."),
   d1_region_id: RegionId.nullable().describe(
-    "Existing region whose R2 archive bucket stores the D1 export.",
+    "Existing region the D1 export is recorded under; the export is stored in the installation's one R2 archive bucket.",
   ),
   notification_recipient: Email.nullable().describe(
     "Address that receives infrastructure alert emails. Email is sent only when the Worker secret RESEND_API_KEY and both addresses are set and no valid alert webhook is configured; null disables email.",
@@ -41,7 +41,7 @@ export const InfrastructureBackupConfigInput = z
       ctx.addIssue({
         code: "custom",
         message:
-          "Enabled daily backups require the control D1 identity and an existing R2 region",
+          "Enabled daily backups require the control D1 identity and an existing region to record the export under",
       });
   });
 export const InfrastructureBackupConfig = z.strictObject({
@@ -107,7 +107,7 @@ export const InfrastructureBackupArtifactStatus =
       .string()
       .max(1024)
       .describe(
-        "Key in the region's R2 archive bucket: infrastructure/v1/<day>/<run>/<artifact>.pgcfenc.",
+        "Key in the installation's R2 archive bucket: infrastructure/v1/<day>/<run>/<artifact>.pgcfenc.",
       ),
     kid: z
       .string()

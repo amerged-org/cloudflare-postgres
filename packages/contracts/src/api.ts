@@ -243,7 +243,6 @@ const RegionFields = {
     .string()
     .regex(/^[A-Z][A-Z0-9_]{0,63}$/)
     .nullable(),
-  backup_bucket: BucketName,
   backup_endpoint_url: HttpsUrl,
 };
 

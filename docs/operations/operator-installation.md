@@ -11,17 +11,25 @@ real expansion uses the configured threshold/purchase policy.
 
 Use a source commit that passed the common CI checks.
 
-Keep the private API configuration outside Git. It supplies D1, region-specific R2 bindings,
+Keep the private API configuration outside Git. It supplies D1, the one R2 archive binding,
 NodeActor/DatabaseActor/CronWatchdog Durable Objects and the AddNode and InfrastructureBackup
 Workflows. Start from `apps/api/wrangler.example.jsonc`; replace every placeholder. Import secret
 values from private custody and preserve the existing four root secrets. Export D1 before applying
 additive migrations and rehearse them against the export.
 
-The EU archive uses the EU-jurisdiction binding and EU S3 endpoint. Every other region has a
-separate bucket on the account's general S3 endpoint. Choose that region's location hint when
-creating its bucket; the hint does not guarantee jurisdiction. `ARCHIVE_BINDINGS` must map each
-exact region ID to its actual Worker binding and bucket. A mismatching or missing binding fails
-closed.
+Every region archives into one R2 bucket, named without a region. The `ARCHIVE` binding is that
+bucket (with `"jurisdiction": "eu"` on an EU installation) and the variable `ARCHIVE_BUCKET_NAME`
+names the same bucket. A region row holds no bucket, only the S3 endpoint of it
+(`backup_endpoint_url`, `https://<account>.eu.r2.cloudflarestorage.com` for the EU jurisdiction),
+which is the same for every region. The keys keep regions apart:
+`<region>/<database>/g<generation>-<operation>/database/` for a database generation,
+`node-images/<release>/` for the node image releases and `infrastructure/v1/` for the daily
+infrastructure backups. A binding that is missing, or a name that is not the bucket the archive
+paths in D1 name, fails closed with an internal error.
+
+The nodes' temporary R2 credentials are signed for `ARCHIVE_BUCKET_NAME` and one database
+generation's prefix, so the parent key (`R2_PARENT_ACCESS_KEY_ID` and
+`R2_PARENT_SECRET_ACCESS_KEY`, an R2 API token) must have object read and write on that bucket.
 
 Route tokens are versioned. The Edge signs a token that the gateway verifies before it dials
 PostgreSQL.
@@ -78,6 +86,36 @@ because a new paid resource needs the owner's explicit, costed go. Put the firew
   cycle and starts the install when the firewall is confirmed.
 - To verify an install, try a TCP connect to port 22 of the instance's public IPv4 address from
   outside during the rescue and after the reboot. Both must time out.
+
+### Moving to another archive bucket
+
+The archive paths stored in D1 (`s3://<bucket>/<region>/<database>/g<generation>-<operation>`)
+and the credentials of the nodes name the bucket, so a move changes more than the binding. The
+keys below the bucket stay valid: a key never contains the bucket, and it is unique per database
+generation and operation, so the objects are copied unchanged. Do it in a quiet window, with
+every database asleep and proven, and keep the old bucket untouched until the new one has passed
+a backup, WAL archiving and a point-in-time restore.
+
+1. Create the new bucket (same jurisdiction), give the parent key's policy both buckets, and copy
+   every object server side with CopyObject. Compare the size and ETag of every key afterwards;
+   repeat the copy inside the window for what changed since. Copy only, never delete.
+2. Deploy the Worker with `ARCHIVE` bound to the new bucket and `ARCHIVE_BUCKET_NAME` set to it.
+3. Rewrite the stored paths in one batch; each statement only touches rows that still name the
+   old bucket, so it can be repeated after a partial failure:
+   ```sql
+   UPDATE databases SET archive_path='s3://<new>/'||substr(archive_path,length('s3://<old>/')+1)
+     WHERE substr(archive_path,1,length('s3://<old>/'))='s3://<old>/';
+   ```
+   The same for `retained_archives.archive_path`, `database_restores.source_archive_path`,
+   `backup_retention_runs.archive_path` and, when a move row exists, `database_moves.source_archive_path`
+   and `target_archive_path` (the trigger `database_moves_monotonic` refuses that change: drop it
+   and create it again from migration `0065` around the statement). Then `DELETE FROM
+   archive_credentials`: a node reads a credential once per identifier, so only new identifiers
+   make every node read one signed for the new bucket.
+4. Accept on the new bucket before anything is deleted: wake a database and write, take a base
+   backup, restore a database to a point in time, and wait for the next infrastructure backup.
+   Roll back, until the old bucket is deleted, by the reverse of steps 2 and 3, while nothing was
+   written to the new bucket; after a write, stay on the new bucket.
 
 ## Edge Worker
 

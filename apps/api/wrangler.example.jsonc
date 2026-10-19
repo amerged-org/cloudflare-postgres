@@ -17,15 +17,14 @@
       "migrations_dir": "migrations",
     },
   ],
+  // One R2 bucket for every region: the backups and WAL of all databases, the node image releases
+  // and the infrastructure backups. Name it without a region. ARCHIVE_BUCKET_NAME below names the
+  // same bucket, and the archive paths in D1 and the nodes' temporary credentials name it too.
   "r2_buckets": [
     {
       "binding": "ARCHIVE",
       "bucket_name": "replace-r2-backup-bucket",
       "jurisdiction": "eu",
-    },
-    {
-      "binding": "ARCHIVE_US",
-      "bucket_name": "replace-r2-us-backup-bucket",
     },
   ],
   // Optional authenticated alert receiver; direct Resend also supports API-configured sender/recipient.
@@ -47,7 +46,6 @@
     // Durable Object location hint for new DatabaseActor objects, near the database regions and D1.
     // Set the same value on the Edge Worker. An existing object never moves.
     "DATABASE_ACTOR_LOCATION_HINT": "weur",
-    "ARCHIVE_BINDINGS": "{\"<EU_REGION_ID>\":{\"binding\":\"ARCHIVE\",\"bucket\":\"replace-r2-backup-bucket\"},\"<US_REGION_ID>\":{\"binding\":\"ARCHIVE_US\",\"bucket\":\"replace-r2-us-backup-bucket\"}}",
     // The id of the Contabo firewall every node sits behind: active, created once with no inbound
     // rule, as docs/operations/operator-installation.md describes. AddNode sends the installer's
     // rescue only once the firewall lists the instance.
@@ -55,6 +53,7 @@
     "CONTABO_ORDER_DEFAULT_USER": "<CONTABO_ORDER_DEFAULT_USER>",
     "CONTABO_ORDER_SSH_KEY_IDS": "<CONTABO_ORDER_SSH_KEY_IDS_JSON>",
     "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>",
+    // The name of the bucket the ARCHIVE binding is bound to.
     "ARCHIVE_BUCKET_NAME": "replace-r2-backup-bucket",
   },
   "durable_objects": {

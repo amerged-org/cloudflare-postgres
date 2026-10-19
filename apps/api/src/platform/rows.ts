@@ -40,7 +40,6 @@ export const regionRow = (row: Row): Region =>
     provider_region: row.provider_region,
     gateway_url: row.gateway_url,
     gateway_binding: row.gateway_binding,
-    backup_bucket: row.backup_bucket,
     backup_endpoint_url: row.backup_endpoint_url,
     agent_last_seen_at: row.agent_last_seen_at,
     created_at: row.created_at,

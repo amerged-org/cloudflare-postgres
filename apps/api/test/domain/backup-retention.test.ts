@@ -583,7 +583,7 @@ it("purges expired credentials in the same step, and fails the step after the ot
       .bind(reference.id)
       .first(),
   ).toBeNull();
-  // A region whose bucket is not bound here: the windows cannot be applied.
+  // An archive in a bucket this Worker is not bound to: the windows cannot be applied.
   const again = await ensureArchiveCredential(
     env.DB,
     {
@@ -593,14 +593,12 @@ it("purges expired credentials in the same step, and fails the step after the ot
     },
     a.now - 9 * DAY,
   );
-  await env.DB.prepare(
-    "UPDATE regions SET backup_bucket='unbound-bucket' WHERE id=?",
-  )
-    .bind(a.region)
-    .run();
-  await expect(runBackupRetention(env, a.now + 7 * 3600_000)).rejects.toThrow(
-    "backup_retention_failed",
-  );
+  await expect(
+    runBackupRetention(
+      { ...env, ARCHIVE_BUCKET_NAME: "unbound-bucket" },
+      a.now + 7 * 3600_000,
+    ),
+  ).rejects.toThrow("backup_retention_failed");
   expect(
     await env.DB.prepare("SELECT id FROM archive_credentials WHERE id=?")
       .bind(again.id)

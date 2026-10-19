@@ -32,6 +32,8 @@ export interface ArchiveCredentialScope {
 }
 export interface ArchiveCredentialEnvironment {
   DB: D1Database;
+  /** The one archive bucket of the installation; a credential names no other. */
+  ARCHIVE_BUCKET_NAME: string;
   R2_PARENT_ACCESS_KEY_ID?: string;
   R2_PARENT_SECRET_ACCESS_KEY?: string;
 }
@@ -218,7 +220,6 @@ interface DeliveryRow {
   archive_path: string;
   access: ArchiveAccess;
   expires_at: string;
-  backup_bucket: string;
   backup_endpoint_url: string;
   database_node_id: string | null;
   database_archive_path: string;
@@ -231,8 +232,8 @@ interface DeliveryRow {
  * The credential for a node that asks for one it was issued, signed now with the Worker's parent
  * key; null for anything else (unknown, another node's, expired, a lost or fenced node's, a
  * write right for a storage generation the node does not serve and does not restore). Throws
- * `archive_credentials_unavailable` when the Worker has no parent key or the region's bucket is not
- * the one the path names. The caller never logs the result.
+ * `archive_credentials_unavailable` when the Worker has no parent key or the path names another
+ * bucket than the installation's one. The caller never logs the result.
  */
 export async function deliverArchiveCredential(
   env: ArchiveCredentialEnvironment,
@@ -241,7 +242,7 @@ export async function deliverArchiveCredential(
   now: number,
 ): Promise<ArchiveCredential | null> {
   const row = await env.DB.prepare(
-    `SELECT c.id,c.node_id,c.archive_path,c.access,c.expires_at,r.backup_bucket,r.backup_endpoint_url,
+    `SELECT c.id,c.node_id,c.archive_path,c.access,c.expires_at,r.backup_endpoint_url,
       d.node_id database_node_id,d.archive_path database_archive_path,
       CASE WHEN n.lost_at IS NOT NULL OR EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=n.id) THEN 1 ELSE 0 END lost,
       CASE WHEN EXISTS(SELECT 1 FROM database_moves m WHERE m.database_id=c.database_id AND m.status='restoring'
@@ -278,7 +279,7 @@ export async function deliverArchiveCredential(
     parent.accessKeyId === "" ||
     parent.secretAccessKey === "" ||
     !path ||
-    path.bucket !== row.backup_bucket ||
+    path.bucket !== env.ARCHIVE_BUCKET_NAME ||
     account === undefined
   )
     throw unavailable();

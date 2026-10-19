@@ -30,7 +30,7 @@ import {
 } from "./rows.ts";
 import { syncDatabaseActor } from "./database-actor-sync.ts";
 import { validatedArchivePrefix } from "./archive.ts";
-import { regionArchive } from "./archive-bindings.ts";
+import { archiveBucket } from "./archive-bucket.ts";
 import { restoreBackup } from "./restore-catalog.ts";
 import { retainedArchiveRestorable } from "./retained-archives.ts";
 interface Retained {
@@ -131,9 +131,7 @@ export async function restoreDatabase(
           { reason: "region_unavailable" },
         );
       const [region, size] = await Promise.all([
-        c.env.DB.prepare(
-          "SELECT id,backup_bucket,backup_endpoint_url FROM regions WHERE id=?",
-        )
+        c.env.DB.prepare("SELECT id FROM regions WHERE id=?")
           .bind(source.region_id)
           .first<RegionRow>(),
         c.env.DB.prepare("SELECT * FROM size_classes WHERE id=? AND enabled=1")
@@ -152,8 +150,8 @@ export async function restoreDatabase(
         own,
         await regionBounds(c.env.DB, region.id),
       );
-      const selected = regionArchive(c.env, region),
-        prefix = validatedArchivePrefix(source, region, selected.bucketName);
+      const selected = archiveBucket(c.env),
+        prefix = validatedArchivePrefix(source, selected.bucketName);
       const backup = await restoreBackup(
         selected.bucket,
         prefix,
@@ -198,7 +196,7 @@ export async function restoreDatabase(
           decidedAt,
         );
       const archive = archiveDestinationPath(
-        region.backup_bucket,
+        selected.bucketName,
         region.id,
         targetId,
         storageGeneration,
@@ -245,7 +243,6 @@ export async function restoreDatabase(
             name: body.name,
           },
           size,
-          region,
           resources: own,
           nodeId: node?.id ?? null,
           pendingMemoryMib: node?.pending_memory_mib,

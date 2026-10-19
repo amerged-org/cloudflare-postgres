@@ -2,7 +2,7 @@
 
 Daily infrastructure backups protect the Cloudflare control database (D1). They
 complement the Barman database base backups and WAL; they do not replace them. All
-storage uses the installation's existing, region-bound R2 archive buckets. No Contabo
+storage uses the installation's one R2 archive bucket. No Contabo
 API call or server purchase occurs during capture.
 
 ## Installation configuration
@@ -48,7 +48,7 @@ Content-Type: application/json
   "enabled": true,
   "d1_account_id": "<CLOUDFLARE_ACCOUNT_ID>",
   "d1_database_id": "<CONTROL_D1_DATABASE_UUID>",
-  "d1_region_id": "<EXISTING_R2_REGION_ID>",
+  "d1_region_id": "<EXISTING_REGION_ID>",
   "notification_recipient": null,
   "notification_sender": null
 }
@@ -59,7 +59,7 @@ Content-Type: application/json
 with its per-artifact hashes/byte counts, R2 object keys and error codes, and current
 backup freshness. It returns no private client configuration, signed export URL or
 encryption key. Earlier attempts of that day stay in D1 only. Disabling backups, or
-changing the D1 account, database or archive region, revokes an unfinished run's
+changing the D1 account, database or the region the export is recorded under, revokes an unfinished run's
 capability. Changing only the alert sender or recipient never does: the update carries
 every valid pending or running run to the new revision in the same transaction, and a
 run the cron creates while the update is in flight takes the revision in the statement

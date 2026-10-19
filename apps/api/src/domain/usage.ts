@@ -43,7 +43,6 @@ export function usageLifecycleStatement(
 export interface BackupUsageIdentity {
   archive_path: string;
   region_id: string;
-  backup_bucket: string;
   deleted_at: string | null;
 }
 /** The raw samples one database keeps for one UTC hour; a producer past it is refused. */
@@ -132,7 +131,7 @@ function insertUsageSample(
     AND NOT EXISTS(SELECT 1 FROM usage_hourly WHERE database_id=? AND hour=? AND final=1)
     ${bounded ? `AND (SELECT count(*) FROM usage_samples WHERE database_id=? AND interval_start>=? AND interval_start<?)<${USAGE_HOUR_SAMPLE_LIMIT}` : ""}
     AND (? <> 'gateway' OR NOT EXISTS(SELECT 1 FROM usage_samples WHERE database_id=? AND source='gateway' AND producer_id=? AND interval_start<? AND interval_end>?))
-    AND (?=0 OR EXISTS(SELECT 1 FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id=? AND d.region_id=? AND d.archive_path=? AND d.deleted_at IS ? AND r.backup_bucket=?))`,
+    AND (?=0 OR EXISTS(SELECT 1 FROM databases d WHERE d.id=? AND d.region_id=? AND d.archive_path=? AND d.deleted_at IS ?))`,
     )
     .bind(
       ...identityOf(p),
@@ -155,7 +154,6 @@ function insertUsageSample(
       backupIdentity?.region_id ?? null,
       backupIdentity?.archive_path ?? null,
       backupIdentity?.deleted_at ?? null,
-      backupIdentity?.backup_bucket ?? null,
     );
 }
 /**
@@ -221,7 +219,7 @@ export async function recordUsageSamples(
     db
       .prepare(
         backupIdentity
-          ? "SELECT d.id,d.region_id,d.archive_path,d.deleted_at,r.backup_bucket FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id IN(SELECT value FROM json_each(?))"
+          ? "SELECT id,region_id,archive_path,deleted_at FROM databases WHERE id IN(SELECT value FROM json_each(?))"
           : live
             ? "SELECT d.id,d.region_id FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL AND d.desired_state<>'deleted' AND d.id IN(SELECT value FROM json_each(?))"
             : "SELECT id,region_id FROM databases WHERE id IN(SELECT value FROM json_each(?))",
@@ -243,7 +241,6 @@ export async function recordUsageSamples(
       region_id: string;
       archive_path?: string;
       deleted_at?: string | null;
-      backup_bucket?: string;
     }>,
     D1Result<{ database_id: string; hour: string; n: number }>,
   ];
@@ -258,8 +255,7 @@ export async function recordUsageSamples(
     if (
       backupIdentity &&
       (database.archive_path !== backupIdentity.archive_path ||
-        database.deleted_at !== backupIdentity.deleted_at ||
-        database.backup_bucket !== backupIdentity.backup_bucket)
+        database.deleted_at !== backupIdentity.deleted_at)
     )
       throw new ApiError(
         "conflict",
