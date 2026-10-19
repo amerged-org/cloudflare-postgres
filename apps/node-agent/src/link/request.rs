@@ -109,6 +109,26 @@ impl Transport {
         }
         result
     }
+    /// The bytes at `url`, at most `maximum` of them, for a file that proves itself and so has no
+    /// pinned digest: the signature of a release. The whole request is bounded in time, because
+    /// the agent waits for the answer before it trusts a release. A refusal is the API's
+    /// (`Refusal`), with the status the server sent.
+    pub async fn fetch_bytes(&self, url: &str, maximum: usize) -> Result<Vec<u8>, Error> {
+        let response = self
+            .download
+            .get(url)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Box::new(Refusal {
+                status: status.as_u16(),
+                code: None,
+            }));
+        }
+        bounded(response, maximum).await
+    }
     async fn download_to(
         &self,
         url: &str,

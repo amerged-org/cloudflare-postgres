@@ -156,6 +156,45 @@ it("refuses a body that is not a registration: a full spec, a URL, an unknown fi
   ).toBe(400);
 });
 
+it("registers a release only with a signature of 64 bytes in hex, which it stores and shows but cannot check", async () => {
+  const f = await setup();
+  const { signature, ...unsigned } = f.value;
+  for (const body of [
+    unsigned,
+    { ...unsigned, signature: null },
+    { ...unsigned, signature: "" },
+    { ...unsigned, signature: signature.slice(1) },
+    { ...unsigned, signature: signature.toUpperCase() },
+    { ...unsigned, signature: `${signature}00` },
+  ])
+    expect((await f.approve(body)).status).toBe(400);
+  expect(
+    await env.DB.prepare("SELECT 1 FROM fleet_releases WHERE id=?")
+      .bind(f.id)
+      .first(),
+  ).toBeNull();
+  // The API has no key to check it against: whatever the registration states is what it stores
+  // and every reader sees, in the release and in the list.
+  const stored = FleetRelease.parse(await (await f.approve()).json());
+  expect(stored.spec.signature).toBe(signature);
+  expect(
+    FleetRelease.parse(
+      await (await request(`/v1/fleet/releases/${f.id}`, f.admin)).json(),
+    ).spec.signature,
+  ).toBe(signature);
+  const listed = (await (
+    await request("/v1/fleet/releases?limit=100", f.admin)
+  ).json()) as {
+    data: { id: string; spec: { signature: string } }[];
+  };
+  expect(
+    listed.data.find((release) => release.id === f.id)?.spec.signature,
+  ).toBe(signature);
+  // A release is immutable with its signature: another one is another release.
+  const resigned = { ...f.value, signature: "0".repeat(128) };
+  expect((await f.approve(resigned)).status).toBe(409);
+});
+
 it("names the URLs of the spec itself: every file of the release is served by this Worker", async () => {
   const f = await setup();
   const release = FleetRelease.parse(await (await f.approve()).json());

@@ -46,8 +46,10 @@ rustls-pki-types 1.15.1, tokio-postgres 0.7.18 and libc 0.2.190 (`MIT OR Apache-
 0.23.45 and tokio-rustls 0.26.6 (`Apache-2.0 OR ISC OR MIT` and `MIT OR Apache-2.0`), jsonschema
 0.58.6 and zbus 5.19.0 (MIT; zbus drives the database units over systemd's D-Bus API), and
 webpki-roots 1.0.9 (`CDLA-Permissive-2.0`). The agent signs the node's requests with its Ed25519
-key through ring and speaks the link's TLS WebSocket to Cloudflare through tokio-rustls and
-tokio-tungstenite. Its tests also use rcgen 0.14.10 (`MIT OR Apache-2.0`). rustls-pki-types is used
+key through ring, checks the Ed25519 signature of each release against the release key through
+the same crate (`ring::signature::ED25519`; no crate was added for release signing, and the
+script that makes and checks the key uses Node's own `node:crypto`), and speaks the link's TLS
+WebSocket to Cloudflare through tokio-rustls and tokio-tungstenite. Its tests also use rcgen 0.14.10 (`MIT OR Apache-2.0`). rustls-pki-types is used
 directly for PEM parsing; the unmaintained rustls-pemfile wrapper is not used. The gateway's SCRAM
 client uses hmac and zeroize directly, with sha2, and takes its random nonces from ring.
 
@@ -130,6 +132,11 @@ Direct root development tooling (`typescript`, `eslint`, `@eslint/js`, `typescri
 installed as runtime dependencies. Resolved dependency versions are recorded in `pnpm-lock.yaml`;
 build and test tooling is not relicensed as first-party code.
 
+The release signer Worker (`apps/release-signer`) adds no package: it signs and verifies with the Workers
+runtime's own WebCrypto (Ed25519 and RSASSA-PKCS1-v1_5) and takes the shared contracts. At run time it reads
+GitHub's public key set (`https://token.actions.githubusercontent.com/.well-known/jwks`) to check the identity
+token of an Actions run; that is a service it calls, and no component of it is redistributed.
+
 ### Reference only
 
 | Component                                                       | License    | Use                                                                                                     |
@@ -167,6 +174,7 @@ part of any PGCF runtime.
 | [pnpm/action-setup](https://github.com/pnpm/action-setup)             | 6.1.0, `ea17c68df8912ef543352723c149a84f56e3d413` | [MIT](https://github.com/pnpm/action-setup/blob/ea17c68df8912ef543352723c149a84f56e3d413/LICENSE.md)   | Installs pnpm at the version in `package.json`.                                                                                        |
 | [actions/attest](https://github.com/actions/attest)                   | 4.1.0, `59d89421af93a897026c735860bf21b6eb4f7b26` | [MIT](https://github.com/actions/attest/blob/59d89421af93a897026c735860bf21b6eb4f7b26/LICENSE)          | Signs provenance for the sanitized native-probe report.                                                                                |
 | [actions/upload-artifact](https://github.com/actions/upload-artifact) | 7.0.0, `bbbca2ddaa5d8feaa63e36b76fdaad77386f024f` | [MIT](https://github.com/actions/upload-artifact/blob/bbbca2ddaa5d8feaa63e36b76fdaad77386f024f/LICENSE) | Publishes the sanitized probe report with one-day retention, the tested Rust Edge bytes, and the node release files and boot logs. |
+| [actions/download-artifact](https://github.com/actions/download-artifact) | 8.0.1, `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` | [MIT](https://github.com/actions/download-artifact/blob/3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/LICENSE) | Hands the release files of the `node-image` job to the `sign-release` job, which has the signer sign them. |
 
 ## Not used
 

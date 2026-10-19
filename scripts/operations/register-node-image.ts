@@ -3,15 +3,22 @@
 // release to the archive bucket's `node-images/<version>/` prefix and registers their digests with
 // the management API. Every node installs from, and updates to, what is registered.
 //
-//   node scripts/operations/register-node-image.ts --image-dir DIR --binaries DIR [--lock FILE] [--dry-run]
+//   node scripts/operations/register-node-image.ts --image-dir DIR --binaries DIR [--lock FILE]
+//     [--signature FILE] [--release-key FILE] [--dry-run]
 //
-//   --image-dir  the `out` directory of `node infra/node-image/node-image.ts build`:
-//                pgcf-node.raw.zst and pgcf-node.json. The release name is the one the image was
-//                built as (`--release`), which is also the image version a node enrolls as.
-//   --binaries   the directory the build took pgcf-agent, pgcf-native-gateway, pgcf-archive and
-//                pgcf-wal-fetch from; they must be the files the image was built with.
-//   --lock       the package lock the image was built from (default infra/node-image/packages.lock.json).
-//   --dry-run    reads the files, prints the manifest and stops before any network call.
+//   --image-dir    the `out` directory of `node infra/node-image/node-image.ts build`:
+//                  pgcf-node.raw.zst and pgcf-node.json. The release name is the one the image was
+//                  built as (`--release`), which is also the image version a node enrolls as.
+//   --binaries     the directory the build took pgcf-agent, pgcf-native-gateway, pgcf-archive and
+//                  pgcf-wal-fetch from; they must be the files the image was built with.
+//   --lock         the package lock the image was built from (default infra/node-image/packages.lock.json).
+//   --signature    the signature CI made of the release (default DIR/release.sig, where CI puts it,
+//                  docs/operations/release-signing.md). A registration without one is refused.
+//   --release-key  the public key the signature must verify with: the key the agents that are
+//                  running now trust (default apps/node-agent/release-signing.pub). It is another
+//                  one only for the release that rotates the key, which the old key signs.
+//   --dry-run      reads the files, prints the manifest and stops before any network call; a
+//                  signature that is missing or that the key refuses is reported, not refused.
 //
 // Credentials come from these environment variables, in memory only. Their values are never
 // printed or written, and an error names a variable, never its value:
@@ -45,12 +52,20 @@ import {
   RELEASE_BINARY_FILES,
   RELEASE_IMAGE_FILE,
   RELEASE_LOCK_FILE,
+  RELEASE_SIGNATURE_FILE,
+  ReleaseSignature,
   packagesSha256,
   releaseObjectKey,
+  signedReleaseManifest,
   type FleetPinnedFile,
   type FleetReleaseSpec,
   type ReleaseFile,
 } from "../../packages/contracts/src/releases.ts";
+import {
+  RELEASE_KEY_FILE,
+  readReleaseKey,
+  verifyText,
+} from "./release-signing.ts";
 
 export interface FileDigest {
   sha256: string;
@@ -127,9 +142,11 @@ export interface Upload {
   path: string;
   digest: FileDigest;
 }
+/** What the build produced, as the API registers it: the digests, and the signature made of them is another thing. */
+export type ReleaseDigests = Omit<FleetReleaseRegistration, "signature">;
 export interface Manifest {
   version: string;
-  registration: FleetReleaseRegistration;
+  registration: ReleaseDigests;
   uploads: Upload[];
 }
 
@@ -247,7 +264,7 @@ export async function releaseManifest(options: {
   }
   return {
     version: version.data,
-    registration: FleetReleaseRegistration.parse({
+    registration: FleetReleaseRegistration.omit({ signature: true }).parse({
       image: {
         ...image,
         raw_sha256: summary.raw.sha256,
@@ -460,6 +477,7 @@ const pin = ({ sha256, size_bytes }: FleetPinnedFile) => ({
 });
 /** The digests a stored release pins, in the shape of a registration. */
 const registeredPins = (spec: FleetReleaseSpec): FleetReleaseRegistration => ({
+  signature: spec.signature,
   image: {
     ...pin(spec.image),
     raw_sha256: spec.image.raw_sha256,
@@ -477,14 +495,21 @@ const registeredPins = (spec: FleetReleaseSpec): FleetReleaseRegistration => ({
 });
 
 /**
- * Registers the manifest as the release `version`; the API checks the bucket before it records it.
- * Its answer is the whole stored release, which must be this version with the registered digests.
+ * Registers the manifest as the release `version`, with the signature CI made of it; the API
+ * checks the bucket before it records it and only stores the signature, which it cannot check.
+ * Its answer is the whole stored release, which must be this version with the registered digests
+ * and the registered signature.
  */
 export async function registerRelease(
   api: { apiUrl: string; apiKey: string },
   manifest: Manifest,
+  signature: string,
   fetchImpl: Fetch = fetch,
 ): Promise<FleetRelease> {
+  const registration: FleetReleaseRegistration = {
+    ...manifest.registration,
+    signature,
+  };
   const origin = new URL(api.apiUrl);
   if (origin.protocol !== "https:")
     throw new Error("PGCF_API_URL must be an https URL");
@@ -496,7 +521,7 @@ export async function registerRelease(
         authorization: `Bearer ${api.apiKey}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify(manifest.registration),
+      body: JSON.stringify(registration),
     },
   );
   const body: unknown = await response.json().catch(() => null);
@@ -513,11 +538,45 @@ export async function registerRelease(
     throw new Error(
       `the API stored the release as "${release.id}", not "${manifest.version}"`,
     );
-  if (!isDeepStrictEqual(registeredPins(release.spec), manifest.registration))
+  if (!isDeepStrictEqual(registeredPins(release.spec), registration))
     throw new Error(
       "the API stored a release whose pins differ from the registered ones",
     );
   return release;
+}
+
+// ---------- The signature ----------
+
+/**
+ * The signature CI wrote for this release, and whether `keyPath`'s key verifies it for the
+ * release's manifest (`signedReleaseManifest`): `undefined` when there is no signature file. A
+ * signature the key refuses is a release no node would accept, so a registration stops before it
+ * uploads anything.
+ */
+export async function checkSignature(
+  manifest: Manifest,
+  options: { signaturePath: string; keyPath: string },
+): Promise<{ signature: string; verified: boolean } | undefined> {
+  let text: string;
+  try {
+    text = await readFile(options.signaturePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  const signature = ReleaseSignature.safeParse(text.replace(/\n$/, ""));
+  if (!signature.success)
+    throw new Error(
+      `${options.signaturePath} is not a signature: 128 lowercase hex digits and a line feed`,
+    );
+  return {
+    signature: signature.data,
+    verified: verifyText(
+      await readReleaseKey(options.keyPath),
+      signedReleaseManifest({ id: manifest.version, ...manifest.registration }),
+      signature.data,
+    ),
+  };
 }
 
 // ---------- The command ----------
@@ -548,12 +607,14 @@ async function main(
       "image-dir": { type: "string" },
       binaries: { type: "string" },
       lock: { type: "string" },
+      signature: { type: "string" },
+      "release-key": { type: "string" },
       "dry-run": { type: "boolean", default: false },
     },
   });
   if (!values["image-dir"] || !values.binaries)
     throw new Error(
-      "usage: register-node-image.ts --image-dir DIR --binaries DIR [--lock FILE] [--dry-run]",
+      "usage: register-node-image.ts --image-dir DIR --binaries DIR [--lock FILE] [--signature FILE] [--release-key FILE] [--dry-run]",
     );
   // The credentials come first, so a missing one fails before gigabytes are read.
   const credentials = values["dry-run"]
@@ -573,7 +634,32 @@ async function main(
     console.log(
       `  ${key}  ${digest.size_bytes} bytes  sha256 ${digest.sha256}`,
     );
-  if (credentials === undefined || api === undefined) return;
+  const keyPath = resolve(values["release-key"] ?? RELEASE_KEY_FILE),
+    checked = await checkSignature(manifest, {
+      signaturePath: resolve(
+        values.signature ?? join(values["image-dir"], RELEASE_SIGNATURE_FILE),
+      ),
+      keyPath,
+    });
+  if (credentials === undefined || api === undefined) {
+    console.log(
+      checked === undefined
+        ? "  not signed: CI signs the builds of main (docs/operations/release-signing.md)"
+        : checked.verified
+          ? `  signature verifies with ${keyPath}`
+          : `  signature does NOT verify with ${keyPath}: a registration refuses it`,
+    );
+    return;
+  }
+  if (checked === undefined)
+    throw new Error(
+      "the release is not signed: CI signs the builds of main and keeps release.sig with the files; the nodes refuse a release without it (docs/operations/release-signing.md)",
+    );
+  if (!checked.verified)
+    throw new Error(
+      `the signature does not verify with ${keyPath}, so the nodes would refuse the release: it is not the signature of this build, or the key of this checkout is not the key of the running agents (pass --release-key for the release that rotates it)`,
+    );
+  console.log(`  signature verifies with ${keyPath}`);
   for (const upload of manifest.uploads) {
     const existing = await existingObject(credentials, upload);
     if (existing === "same") {
@@ -585,7 +671,7 @@ async function main(
       `  uploaded ${upload.key}${existing === "unverified" ? " (R2 held no sha256 for it)" : ""}`,
     );
   }
-  const release = await registerRelease(api, manifest);
+  const release = await registerRelease(api, manifest, checked.signature);
   console.log(`registered ${release.id} (spec sha256 ${release.spec_sha256})`);
 }
 

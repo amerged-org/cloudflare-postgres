@@ -333,6 +333,12 @@ impl Link {
             .await
     }
 
+    /// The bytes at `url`, at most `maximum` of them: what a release serves without a pin, such as
+    /// its signature, which proves itself.
+    pub async fn fetch_bytes(&self, url: &str, maximum: usize) -> Result<Vec<u8>, Error> {
+        self.inner.api.transport().fetch_bytes(url, maximum).await
+    }
+
     async fn post(&self, name: &str, schema: &str, report: &Value) -> Result<(), Error> {
         if !contract_valid(schema, report) {
             return Err(format!("native {name} report invalid").into());

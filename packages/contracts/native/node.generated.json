@@ -2347,6 +2347,11 @@
       "configured",
       "rebooting",
       "failed"
-    ]
+    ],
+    "RELEASE_REFUSALS": [
+      "release_signature_missing",
+      "release_signature_invalid"
+    ],
+    "RELEASE_SIGNATURE_FILE": "release.sig"
   }
 }

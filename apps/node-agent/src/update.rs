@@ -6,14 +6,107 @@
 //! maintenance cycle: the lock says which versions the image has, what differs from the node is
 //! installed through apt from the release's snapshot, and the node reboots if the kernel or a
 //! core library changed.
+//!
+//! A release is trusted only when the release key signed it (plan 8, 9.3). The key is compiled in
+//! (`RELEASE_KEY`); the signature is of the release's manifest, which the agent builds of the page
+//! and checks (`verify`) before it downloads, stages or installs anything of the release. The page's
+//! digests pin the files and the signature pins the page, so an administrator who can change the
+//! API's records and the bucket's objects still cannot make a node run a file nobody signed.
 use crate::Error;
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
 };
+
+/// The public key that signs releases: `apps/node-agent/release-signing.pub`, read when the agent is
+/// built. A file that holds no key stops the build. A node trusts no other key, and there is no
+/// setting or file on the node that changes it: another key reaches nodes only as a new agent, in
+/// a release the old key signed (`docs/operations/release-signing.md`).
+pub const RELEASE_KEY: [u8; 32] = hex_key(include_str!("../release-signing.pub"));
+
+/// The 32 bytes of 64 lower-case hex symbols, which a line feed may follow.
+const fn hex_key(text: &str) -> [u8; 32] {
+    let bytes = text.as_bytes();
+    assert!(
+        bytes.len() == 64 || (bytes.len() == 65 && bytes[64] == b'\n'),
+        "release-signing.pub holds 64 lower-case hex symbols and a line feed"
+    );
+    let mut key = [0u8; 32];
+    let mut at = 0;
+    while at < 32 {
+        key[at] = (hex_value(bytes[2 * at]) << 4) | hex_value(bytes[2 * at + 1]);
+        at += 1;
+    }
+    key
+}
+const fn hex_value(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => panic!("release-signing.pub holds lower-case hex symbols"),
+    }
+}
+
+/// The file beside the binaries that the API answers with the release's signature
+/// (`RELEASE_SIGNATURE_FILE`), and the most a node reads of it: 128 hex symbols and some room.
+pub const SIGNATURE_FILE: &str = "release.sig";
+pub const SIGNATURE_MAX_BYTES: usize = 256;
+
+/// The first line of the signed manifest (`RELEASE_MANIFEST_DOMAIN`).
+const MANIFEST_DOMAIN: &str = "pgcf-release-manifest/v1\n";
+
+/// Why a node does not trust a release; the codes are the contract's `RELEASE_REFUSALS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseRefusal {
+    /// The API has no signature for the release.
+    SignatureMissing,
+    /// What it has is not the release key's signature of the release's manifest.
+    SignatureInvalid,
+}
+impl ReleaseRefusal {
+    pub const ALL: [Self; 2] = [Self::SignatureMissing, Self::SignatureInvalid];
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SignatureMissing => "release_signature_missing",
+            Self::SignatureInvalid => "release_signature_invalid",
+        }
+    }
+}
+
+/// Whether `signature`, the text the API serves, is the signature of `key` over the manifest of
+/// `release`: 128 lower-case hex symbols, which whitespace may surround.
+pub fn verify(key: &[u8; 32], release: &Release, signature: &[u8]) -> Result<(), ReleaseRefusal> {
+    let text = std::str::from_utf8(signature)
+        .map_err(|_| ReleaseRefusal::SignatureInvalid)?
+        .trim();
+    if text.is_empty() {
+        return Err(ReleaseRefusal::SignatureMissing);
+    }
+    let bytes = unhex(text).ok_or(ReleaseRefusal::SignatureInvalid)?;
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(&release.manifest(), &bytes)
+        .map_err(|_| ReleaseRefusal::SignatureInvalid)
+}
+/// The bytes of lower-case hex symbols; `None` for anything else, an odd count included.
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    let value = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| match *pair {
+            [high, low] => Some((value(high)? << 4) | value(low)?),
+            _ => None,
+        })
+        .collect()
+}
 
 /// A file Cloudflare pins by digest and size, and where to read it (`FleetPinnedFile`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +151,39 @@ impl Release {
             debian_snapshot: release["os"]["debian_snapshot"].as_str()?.to_string(),
             package_lock: Pinned::parse(&release["os"]["package_lock"])?,
         })
+    }
+
+    /// What the release key signs for this release (`signedReleaseManifest` of the contract): the
+    /// domain line, then the release id, the digest and size of each binary in the order of
+    /// `BINARIES`, the snapshot and the digest and size of the package lock, one `name=value`
+    /// line each.
+    pub fn manifest(&self) -> Vec<u8> {
+        let mut text = String::from(MANIFEST_DOMAIN);
+        let _ = writeln!(text, "release={}", self.id);
+        for (name, pinned) in &self.binaries {
+            let _ = writeln!(
+                text,
+                "binary.{name}={}:{}",
+                pinned.sha256, pinned.size_bytes
+            );
+        }
+        let _ = writeln!(text, "os.debian_snapshot={}", self.debian_snapshot);
+        let _ = writeln!(
+            text,
+            "os.package_lock={}:{}",
+            self.package_lock.sha256, self.package_lock.size_bytes
+        );
+        text.into_bytes()
+    }
+
+    /// Where the API serves the release's signature: beside the agent's binary, under
+    /// `SIGNATURE_FILE`. `None` if the binary's URL does not end in its name.
+    pub fn signature_url(&self) -> Option<String> {
+        let (_, agent) = self.binaries.iter().find(|(name, _)| name == AGENT)?;
+        let directory = agent.url.strip_suffix(AGENT)?;
+        directory
+            .ends_with('/')
+            .then(|| format!("{directory}{SIGNATURE_FILE}"))
     }
 }
 
@@ -607,6 +733,173 @@ mod tests {
             ),
             None
         );
+    }
+
+    // ---------- signed releases ----------
+
+    /// A key pair made for one test; nothing of the private half is kept.
+    fn throwaway() -> ring::signature::Ed25519KeyPair {
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    }
+    fn public(pair: &ring::signature::Ed25519KeyPair) -> [u8; 32] {
+        use ring::signature::KeyPair;
+        pair.public_key().as_ref().try_into().unwrap()
+    }
+    /// The signature of `bytes` as the API serves it: 128 lower-case hex digits.
+    fn signed(pair: &ring::signature::Ed25519KeyPair, bytes: &[u8]) -> Vec<u8> {
+        hex(pair.sign(bytes).as_ref()).into_bytes()
+    }
+    fn vector_release() -> Release {
+        let vectors = crate::link::test_server::release_vectors();
+        Release::parse(&vectors[0]["release"]).unwrap()
+    }
+
+    #[test]
+    fn the_manifest_a_node_builds_of_its_page_is_the_text_the_contract_states() {
+        let vectors = crate::link::test_server::release_vectors();
+        assert!(!vectors.is_empty());
+        for vector in vectors {
+            let release = Release::parse(&vector["release"]).unwrap();
+            assert_eq!(
+                String::from_utf8(release.manifest()).unwrap(),
+                vector["manifest"].as_str().unwrap(),
+                "{}",
+                vector["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_is_accepted_only_with_the_signature_of_the_key_over_its_manifest() {
+        let (key, release) = (throwaway(), vector_release());
+        let signature = signed(&key, &release.manifest());
+        assert_eq!(verify(&public(&key), &release, &signature), Ok(()));
+        // The file may end with a line feed.
+        let mut lined = signature.clone();
+        lined.push(b'\n');
+        assert_eq!(verify(&public(&key), &release, &lined), Ok(()));
+        // Every fact the manifest holds is covered: the release id, each binary's digest and size,
+        // the order of the binaries, the snapshot and the package lock.
+        let changes: [fn(&mut Release); 6] = [
+            |r| r.id = "sha-0123456789ac".into(),
+            |r| r.binaries[0].1.sha256 = "9".repeat(64),
+            |r| r.binaries[1].1.size_bytes += 1,
+            |r| {
+                let (archive, fetch) = (r.binaries[2].1.clone(), r.binaries[3].1.clone());
+                r.binaries[2].1 = fetch;
+                r.binaries[3].1 = archive;
+            },
+            |r| r.debian_snapshot = "20261017T000000Z".into(),
+            |r| r.package_lock.sha256 = "9".repeat(64),
+        ];
+        for change in changes {
+            let mut other = release.clone();
+            change(&mut other);
+            assert_eq!(
+                verify(&public(&key), &other, &signature),
+                Err(ReleaseRefusal::SignatureInvalid)
+            );
+        }
+        // A URL is not covered: the digests are what a node checks a download against.
+        let mut elsewhere = release.clone();
+        elsewhere.package_lock.url = "https://elsewhere.example/packages.lock.json".into();
+        assert_eq!(verify(&public(&key), &elsewhere, &signature), Ok(()));
+        // Another key's signature, and a signature of the manifest without its domain line.
+        assert_eq!(
+            verify(&public(&throwaway()), &release, &signature),
+            Err(ReleaseRefusal::SignatureInvalid)
+        );
+        let manifest = release.manifest();
+        let domain = manifest.iter().position(|b| *b == b'\n').unwrap() + 1;
+        assert_eq!(
+            verify(&public(&key), &release, &signed(&key, &manifest[domain..])),
+            Err(ReleaseRefusal::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn no_signature_is_missing_and_anything_that_is_no_signature_is_invalid() {
+        let (key, release) = (throwaway(), vector_release());
+        let signature = signed(&key, &release.manifest());
+        for nothing in [&b""[..], b"\n", b"  \n"] {
+            assert_eq!(
+                verify(&public(&key), &release, nothing),
+                Err(ReleaseRefusal::SignatureMissing)
+            );
+        }
+        let upper = String::from_utf8(signature.clone())
+            .unwrap()
+            .to_ascii_uppercase();
+        for bad in [
+            &signature[1..],
+            &signature[..126],
+            &[signature.as_slice(), b"00"].concat(),
+            upper.as_bytes(),
+            &[b'z'; 128],
+            b"<html>not found</html>",
+            &[0xff; 64],
+        ] {
+            assert_eq!(
+                verify(&public(&key), &release, bad),
+                Err(ReleaseRefusal::SignatureInvalid),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_classes_and_the_signature_file_are_the_contracts() {
+        use crate::node_link::constant;
+        let ours: Vec<&str> = ReleaseRefusal::ALL.iter().map(|r| r.code()).collect();
+        let theirs: Vec<&str> = constant("RELEASE_REFUSALS")
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|code| code.as_str().unwrap())
+            .collect();
+        assert_eq!(ours, theirs);
+        assert_eq!(constant("RELEASE_SIGNATURE_FILE"), SIGNATURE_FILE);
+    }
+
+    #[test]
+    fn the_signature_is_read_beside_the_binaries_and_nowhere_else() {
+        let mut release = vector_release();
+        assert_eq!(
+            release.signature_url().as_deref(),
+            Some("https://releases.example/release.sig")
+        );
+        release.binaries[0].1.url = "https://releases.example/other-agent".into();
+        assert_eq!(release.signature_url(), None);
+        release.binaries[0].1.url = "https://releases.example/xpgcf-agent".into();
+        assert_eq!(release.signature_url(), None);
+    }
+
+    #[test]
+    fn the_release_key_is_the_public_key_checked_in_for_the_build() {
+        let file = include_str!("../release-signing.pub");
+        assert_eq!(hex(&RELEASE_KEY), file.trim_end());
+        assert_eq!(
+            hex_key("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"),
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+                0xcc, 0xdd, 0xee, 0xff
+            ]
+        );
+    }
+    #[test]
+    #[should_panic(expected = "release-signing.pub")]
+    fn a_key_file_that_holds_no_key_stops_the_build() {
+        let _ = hex_key("not a key");
+    }
+    #[test]
+    #[should_panic(expected = "release-signing.pub")]
+    fn a_key_file_with_a_digit_that_is_not_lower_case_hex_stops_the_build() {
+        let _ = hex_key("00112233445566778899AABBCCDDEEFF00112233445566778899aabbccddeeff");
     }
 
     fn release(id: &str, files: &[(&str, &[u8])]) -> Release {

@@ -102,20 +102,27 @@ characters (CI uses `sha-<12 hex digits of the commit>`).
 Every push to `main` of this repository (not of a fork) whose `node-image` job passed keeps the
 release files for 7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`: `pgcf-node.raw.zst`,
 `pgcf-node.json`, `packages.lock.json`, the four binaries and a `SHA256SUMS` of these seven files.
-The uncompressed image (about 1.7 GB) is not part of it, and no credential is. The release is named
+The uncompressed image (about 1.7 GB) is not part of it, and no credential is. The job `sign-release`
+(which holds no key and runs only when `check` and `node-image` both passed: it has the signer Worker sign
+that release with the identity token of its run) keeps the signature as the artifact `pgcf-node-signature-<commit sha>-<run attempt>`, one file,
+`release.sig`: [release-signing.md](../../docs/operations/release-signing.md). The release is named
 `sha-<first 12 hex digits of the commit>`. The artifact belongs to the commit that built it, so the
-package lock comes from the artifact, not from the checkout. Only the `push` run carries it: a
-manually dispatched run of the same commit (the external probe, for one) uploads nothing, which is why
-the lookup below filters on `--event push`.
+package lock comes from the artifact, not from the checkout, and the registration runs from a checkout
+of exactly that commit: it checks the signature with the release key of its checkout
+(`apps/node-agent/release-signing.pub`), which must be the key the build's agent carries. Only the
+`push` run carries the artifacts: a manually dispatched run of the same commit (the external probe, for
+one) uploads nothing, which is why the lookup below filters on `--event push`.
 
 ```sh
 git fetch origin main && sha=$(git rev-parse origin/main)   # or any commit on main whose CI run passed
+git switch --detach "$sha"                                   # the registration needs this commit's release key
 run=$(gh run list --workflow ci.yml --branch main --event push --commit "$sha" --status success --json databaseId --jq '.[0].databaseId')
 # --pattern extracts each artifact into a directory named after it; a re-run adds one per attempt.
-gh run download "$run" --pattern "pgcf-node-release-$sha-*" --dir .local/node-release
+gh run download "$run" --pattern "pgcf-node-release-$sha-*" --pattern "pgcf-node-signature-$sha-*" --dir .local/node-release
 release=$(ls -d .local/node-release/pgcf-node-release-"$sha"-* | tail -n 1)
+signature=$(ls -d .local/node-release/pgcf-node-signature-"$sha"-* | tail -n 1)
 (cd "$release" && sha256sum --check SHA256SUMS)   # shasum -a 256 -c SHA256SUMS on macOS
-node scripts/operations/register-node-image.ts --image-dir "$release" --binaries "$release" --lock "$release/packages.lock.json"
+node scripts/operations/register-node-image.ts --image-dir "$release" --binaries "$release" --lock "$release/packages.lock.json" --signature "$signature/release.sig"
 ```
 
 The artifact expires after 7 days. Register within that time, or re-run all jobs of that CI run to
@@ -125,7 +132,10 @@ overwritten, so register one attempt and keep using it.
 ### Or build it locally
 
 When there is no artifact (it expired, or the release comes from a commit that is not on `main`),
-build the release yourself with the local Docker builder:
+build the release yourself with the local Docker builder. A local build is **not signed**: CI holds no
+key, the signer Worker holds it, and the Worker signs only for the job `sign-release` of a push to
+`main` (`.github/workflows/ci.yml`). The nodes refuse a release that is not signed, so the registration
+refuses it too: use this path for the lab and for `--dry-run`, and register only what CI built.
 
 ```sh
 # 1. The four binaries, built for linux/amd64 with the pinned Rust toolchain (CI does this too):
@@ -134,8 +144,8 @@ mkdir -p .local/node-image/binaries
 for binary in pgcf-agent pgcf-native-gateway pgcf-archive pgcf-wal-fetch; do install -m 0755 "target/release/$binary" .local/node-image/binaries/; done
 # 2. The image, with the local Docker builder (see Building above):
 node infra/node-image/node-image.ts build --binaries .local/node-image/binaries --release sha-0123456789ab
-# 3. Upload the six files and register the release:
-node scripts/operations/register-node-image.ts --image-dir .local/node-image/out --binaries .local/node-image/binaries
+# 3. Check the files (a registration needs the signature that only CI makes):
+node scripts/operations/register-node-image.ts --image-dir .local/node-image/out --binaries .local/node-image/binaries --dry-run
 ```
 
 Step 1 builds on Linux; on another host build in a linux/amd64 container with the same toolchain.
@@ -152,13 +162,19 @@ their values:
 | `PGCF_R2_ACCESS_KEY_ID`, `PGCF_R2_SECRET_ACCESS_KEY` | an R2 API token with object read and write on that bucket |
 | `PGCF_API_URL`, `PGCF_API_KEY` | the management API's origin and an administrator key |
 
-`--dry-run` reads the files, prints the manifest and stops before any network call.
+`--dry-run` reads the files, prints the manifest and stops before any network call; it reports whether
+the release is signed and whether its signature verifies, and refuses for neither.
+`--signature FILE` names the signature (default `<image-dir>/release.sig`), and `--release-key FILE`
+the public key it must verify with (default `apps/node-agent/release-signing.pub`, the key of the
+agents built from this checkout).
 
 What the script does, and what the API checks:
 
 - It refuses a build whose compressed image, package lock or any of the four binaries is not the
   one `pgcf-node.json` describes (so binaries rebuilt since the image was built are refused: build
   the image again), and a release name that is no version.
+- It reads the signature and checks it against the release key before it uploads a byte: a release
+  without a signature, or with one that does not verify, is refused, because every node would refuse it.
 - It uploads `pgcf-node.raw.zst`, `packages.lock.json` and the four binaries to
   `node-images/<version>/` with `x-amz-checksum-sha256`, so R2 itself verifies each digest. A file
   that is already there with the same content (size, md5 and the sha256 R2 reports for it) is
@@ -166,8 +182,10 @@ What the script does, and what the API checks:
   holds no sha256 for, because another tool stored it, is sent again with the checksum: the API
   refuses a file without it. One with another content stops the run, because a registered release
   is never overwritten.
-- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file. The API refuses
-  the registration unless the bucket holds every file at that size with that sha256, and it names
+- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file and the signature.
+  The API refuses a registration without a well-formed signature (64 bytes in hex; it holds no key,
+  so it stores and shows the signature and cannot check it). It refuses the registration
+  unless the bucket holds every file at that size with that sha256, and it names
   every URL of the stored, immutable spec itself, as `/node/v1/releases/<version>/<file>` on its
   own origin (`NODE_API_ORIGIN`). Nothing in the registration is a URL or a credential. The script
   prints the release id and spec sha256 of the answer, and fails if the stored spec is another

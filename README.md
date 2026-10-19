@@ -37,6 +37,7 @@ states what runs where; it does not repeat measurements.
 | Edge Worker                                     | TypeScript (`apps/edge`) is deployed; the Rust/Wasm target (`apps/edge-rust`) is built and tested by CI and not deployed                     |
 | Gateway                                         | Rust (`apps/native-gateway`) on every node beside the agent, reached through the node's Tunnel behind Cloudflare Access; runs on EU1        |
 | Node runtime                                    | The Debian image, the Rust node agent, the PostgreSQL units and the thin LVM volumes ([node image](infra/node-image/README.md), [agent](apps/node-agent/README.md)); EU1 runs it |
+| Release signer                                  | TypeScript Worker (`apps/release-signer`): signs a release's manifest for CI, whose key is a Cloudflare secret; built, not deployed         |
 
 Placement follows the
 [ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#48-placement-in-cloudflare):

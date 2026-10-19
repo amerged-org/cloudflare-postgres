@@ -6,7 +6,11 @@ import type { z } from "zod";
 import * as link from "../src/node-link.ts";
 import * as local from "../src/node-local.ts";
 import { bytesToBase64url } from "../src/encoding.ts";
-import { FleetReleaseId, packagesSha256 } from "../src/releases.ts";
+import {
+  FleetReleaseId,
+  packagesSha256,
+  signedReleaseManifest,
+} from "../src/releases.ts";
 
 const id = `d${"b".repeat(19)}`,
   other = `e${"b".repeat(19)}`,
@@ -1576,6 +1580,42 @@ export async function packageVectors() {
       dpkg: dpkg(["ii ", "linux-image-6.12.111+deb13-amd64", "6.12.111-1"]),
       packages: installed,
       sha256,
+    },
+  ];
+}
+
+/**
+ * A release as the page of a node names it and the text the release key signs for it
+ * (`signedReleaseManifest`), which the agent builds from the page alone. Every digest differs, so
+ * a manifest with two of them swapped is another one. It carries no signature and no key: the
+ * agent's tests make a throwaway key and sign the text.
+ */
+export function releaseVectors() {
+  const pin = (name: string, digit: string, size: number) => ({
+    url: `https://releases.example/${name}`,
+    sha256: digit.repeat(64),
+    size_bytes: size,
+  });
+  const release = {
+    id: "sha-0123456789ab",
+    binaries: {
+      "pgcf-agent": pin("pgcf-agent", "1", 11_000_000),
+      "pgcf-native-gateway": pin("pgcf-native-gateway", "2", 12_000_000),
+      "pgcf-archive": pin("pgcf-archive", "3", 5_000_000),
+      "pgcf-wal-fetch": pin("pgcf-wal-fetch", "4", 5_100_000),
+    },
+    os: {
+      image_version: "sha-0123456789ab",
+      debian_snapshot: "20261016T000000Z",
+      package_lock: pin("packages.lock.json", "5", 90_000),
+    },
+  };
+  link.NodeRelease.parse(release);
+  return [
+    {
+      name: "distinct-digests",
+      release,
+      manifest: signedReleaseManifest(release),
     },
   ];
 }

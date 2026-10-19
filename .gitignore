@@ -19,6 +19,8 @@ wrangler.jsonc
 wrangler.json
 wrangler.toml
 worker-configuration.d.ts
+# The release signer's configuration holds no secret and no account id, so it is tracked
+!/apps/release-signer/wrangler.jsonc
 
 # Local agent harness state
 .claude/
