@@ -109,7 +109,8 @@ _Integrator access and catalog_).
 
 ### 1.4 Projects and keys
 
-There are two key scopes:
+There are three key scopes. You hold an integrator key; the table compares it with the operator's
+`admin` key:
 
 |                                                                                            | Integrator key                                                                                              | Admin key                                              |
 | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
@@ -121,7 +122,7 @@ There are two key scopes:
 | Projects                                                                                   | list and read its own; delete its own once it holds no live database (this also revokes the project's keys) | create, list, delete                                   |
 | API keys, nodes, capacity policy, costs, operational health, infrastructure backups, fleet | `403`                                                                                                       | yes                                                    |
 
-A third scope, `admin_read`, is the operator's read-only administrator key, for monitoring and
+The third scope, `admin_read`, is the operator's read-only administrator key, for monitoring and
 dashboards: it reads what an admin key reads, and every request that is not a GET is refused with
 `403` before it runs. You are never given one. The operator's keys leave an audit log
 (`GET /v1/audit-events`, administrator keys only); yours do not.

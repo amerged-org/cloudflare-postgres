@@ -342,6 +342,21 @@ describe("actual generated API references in the Workers runtime", () => {
     );
   });
 
+  it("documents 403 on every write under /v1, which a read-only administrator key is refused", async () => {
+    const doc = await document("/v1/openapi.json");
+    const without = operations(doc)
+      .filter(
+        ({ path, method, operation }) =>
+          path.startsWith("/v1/") &&
+          method !== "get" &&
+          method !== "head" &&
+          operation.security?.length,
+      )
+      .filter(({ operation }) => !("403" in operation.responses))
+      .map(({ path, method }) => `${method.toUpperCase()} ${path}`);
+    expect(without).toEqual([]);
+  });
+
   it("documents the role lifecycle: attributes, deletion, required keys and the operation kind", async () => {
     const doc = await document("/v1/openapi.json");
     const create = operation(doc, "/v1/databases/{id}/roles", "post");

@@ -95,9 +95,10 @@ export async function auditBeforeChange(
 }
 
 /**
- * Records the refusal of a key that matches an administrator key's lookup identifier: its secret is
- * wrong, or it was revoked or has expired. The request is refused whatever the log says, so a
- * failed write is logged and changes nothing.
+ * Records the refusal of an administrator key that was presented with its real secret and was
+ * revoked or has expired. The caller never gets here for a wrong secret, which anyone can send
+ * with a lookup identifier. The request is refused whatever the log says, so a failed write is
+ * logged and changes nothing.
  */
 export async function auditRefusedKey(
   c: ApiContext,

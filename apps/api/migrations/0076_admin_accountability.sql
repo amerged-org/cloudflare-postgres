@@ -41,8 +41,9 @@ PRAGMA defer_foreign_keys = OFF;
 
 -- Contract: one row per request that an administrator key (`admin` or `admin_read`) made with a
 -- method other than GET or HEAD, written before the request runs and completed with its status
--- afterwards, and one row per refusal (401) of a key that matches an administrator key's lookup
--- identifier: a wrong secret, a revoked key or an expired one. `status` is NULL until the answer is
+-- afterwards, and one row per refusal (401) of a revoked or an expired administrator key presented
+-- with its real secret; a wrong secret is not recorded, because the lookup identifier is not secret
+-- and anyone could otherwise grow the table. `status` is NULL until the answer is
 -- known, and stays NULL when it could not be written or the Worker stopped first; the change may
 -- then have happened. `route` is the route template (`/v1/api-keys/{id}`), never the path asked
 -- for. No body, query, key material or address is kept, and `key_id` carries no foreign key: a row

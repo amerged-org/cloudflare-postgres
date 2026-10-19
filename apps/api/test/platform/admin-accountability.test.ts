@@ -79,6 +79,7 @@ describe("a read-only administrator key", () => {
     for (const path of [
       "/v1/nodes",
       `/v1/nodes/${f.node}`,
+      `/v1/nodes/${f.node}/diagnostics`,
       "/v1/operational-health?scope=regions",
       "/v1/api-keys",
       "/v1/audit-events",
@@ -119,6 +120,8 @@ describe("a read-only administrator key", () => {
         `/v1/nodes/${f.node}/mark-lost`,
         { expected_node_uid: f.nodeUid, reason: "acct" },
       ],
+      // Reading a probe's answer is allowed to this key; asking for one is a change.
+      ["POST", `/v1/nodes/${f.node}/diagnostics`, { probe: "pool" }],
     ];
     for (const [method, path, body] of attempts) {
       const response = await request(path, reader.key, method, body);
@@ -318,7 +321,7 @@ describe("the audit log", () => {
     ).toEqual([[reader.api_key.id, "admin_read", "POST", "/v1/projects", 403]]);
   });
 
-  it("records a refused administrator key, and nothing for a key it cannot name or an integrator's", async () => {
+  it("records an administrator key that was refused with its real secret, and nothing for any other refused key", async () => {
     const f = await fixture();
     const revoked = await mint(f.admin, { scope: "admin" });
     await request(`/v1/api-keys/${revoked.api_key.id}`, f.admin, "DELETE");
@@ -326,7 +329,8 @@ describe("the audit log", () => {
     await env.DB.prepare("UPDATE api_keys SET expires_at=? WHERE id=?")
       .bind(new Date(Date.now() - 1000).toISOString(), expired.api_key.id)
       .run();
-    // The lookup identifier of a real administrator key with another secret.
+    // The lookup identifier is in every key string and listed to every admin_read holder, so it is
+    // not a secret: a request that only knows it must not be able to write a row.
     const wrongSecret = `${f.admin.slice(0, "pgcf_sk_".length + 12 + 1)}${newApiKey().key.slice(-43)}`;
     const integrator = await mint(f.admin, {
       scope: "integrator",
@@ -337,7 +341,7 @@ describe("the audit log", () => {
 
     for (const key of [revoked.key, expired.key, wrongSecret])
       expect((await request("/v1/nodes", key)).status).toBe(401);
-    // No key row to name; a key that is not an administrator's.
+    // A wrong secret (above), a lookup identifier that names no row and an integrator's key leave no row.
     expect((await request("/v1/nodes", newApiKey().key)).status).toBe(401);
     expect((await request("/v1/projects", integrator.key)).status).toBe(401);
 
@@ -352,12 +356,15 @@ describe("the audit log", () => {
     ).toEqual([
       [revoked.api_key.id, "admin", "GET", "/v1/nodes", 401],
       [expired.api_key.id, "admin", "GET", "/v1/nodes", 401],
-      [await keyIdOf(f.admin), "admin", "GET", "/v1/nodes", 401],
     ]);
   });
 
   it("fails closed: a state-changing request whose audit row cannot be written does not run", async () => {
     const f = await fixture();
+    // Made before the log is taken away: it takes writes of its own.
+    const revoked = await mint(f.admin, { scope: "admin" });
+    await request(`/v1/api-keys/${revoked.api_key.id}`, f.admin, "DELETE");
+    const rowsBefore = (await count("audit_events")) ?? 0;
     await env.DB.prepare(
       "CREATE TRIGGER audit_refuses_insert BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_unavailable'); END",
     ).run();
@@ -368,18 +375,21 @@ describe("the audit log", () => {
     expect(refused.status).toBe(500);
     expect(await code(refused)).toBe("internal");
     expect(await count("projects")).toBe(before);
-    // Reading and being refused do not depend on the log.
+    // Reading and being refused do not depend on the log. The revoked key has its real secret, so
+    // its refusal is one that is recorded, and the insert of that row fails: the answer is still 401.
     expect((await request("/v1/nodes", f.admin)).status).toBe(200);
+    const stale = await request("/v1/nodes", revoked.key);
+    expect(stale.status).toBe(401);
+    expect(await code(stale)).toBe("unauthorized");
     expect((await request("/v1/nodes", newApiKey().key)).status).toBe(401);
-    const revoked = await keyIdOf(f.admin);
-    expect(revoked).toBeTruthy();
+    expect(await count("audit_events")).toBe(rowsBefore);
     // The log is back: the same request runs and is recorded.
     await env.DB.prepare("DROP TRIGGER audit_refuses_insert").run();
     const created = await request("/v1/projects", f.admin, "POST", {
       name: "acct-created",
     });
     expect(created.status).toBe(201);
-    expect(await count("audit_events")).toBe(1);
+    expect(await count("audit_events")).toBe(rowsBefore + 1);
   });
 
   it("does not claim an outcome it could not record, and does not undo the change", async () => {

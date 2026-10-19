@@ -32,7 +32,7 @@ const scopes = [
       "An error is `{error: {code, message, request_id, details?}}`. `details.reason` is the stable cause where a code stands for several, and a `Retry-After` header advises the delay of a transient refusal.",
       "A mutation that names `Idempotency-Key` is repeated safely under the same key for 24 hours, per API key.",
       "A resource of another project is reported as `404`, never `403`.",
-      "An administrator key has scope `admin` (reads and changes) or `admin_read` (reads only: a request that is not a GET is refused with `403` before it runs, on every route). A route described as for administrator keys takes `admin_read` as well when it only reads. An API key may carry an `expires_at`, from which it is refused with `401` like a revoked one. Every request of an administrator key that is not a GET, and every refusal of such a key, is recorded in the audit log (`GET /v1/audit-events`); a change whose record cannot be written is not run.",
+      "An administrator key has scope `admin` (reads and changes) or `admin_read` (reads only: a request that is not a GET is refused with `403` before it runs, on every route). A route described as for administrator keys takes `admin_read` as well when it only reads. An API key may carry an `expires_at`, from which it is refused with `401` like a revoked one. Every request of an administrator key that is not a GET, and the refusal of a revoked or expired one presented with its real secret, is recorded in the audit log (`GET /v1/audit-events`); a change whose record cannot be written is not run.",
     ].join("\n\n"),
   ],
   [

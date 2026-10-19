@@ -828,7 +828,7 @@ export const AuditEvent = z
   .meta({
     id: "AuditEvent",
     description:
-      "One request of an administrator key. A request of an admin or admin_read key with any method but GET or HEAD is recorded before it runs; a request of a key that matches an administrator key's identifier but is refused (a wrong secret, a revoked or an expired key) is recorded with status 401. Reads that succeed are not recorded. No body, query, path parameter, key material or address is kept.",
+      "One request of an administrator key. A request of an admin or admin_read key with any method but GET or HEAD is recorded before it runs; the refusal of a revoked or an expired administrator key that was presented with its real secret is recorded with status 401 (a wrong secret is not: the identifier in a key string is not secret). Reads that succeed are not recorded. No body, query, path parameter, key material or address is kept.",
   });
 export type AuditEvent = z.infer<typeof AuditEvent>;
 

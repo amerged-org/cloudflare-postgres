@@ -52,9 +52,10 @@ export async function getAuth(c: ApiContext): Promise<AuthPrincipal> {
     (row.expires_at !== null && row.expires_at <= now) ||
     row.project_deleted_at
   ) {
-    // A key that names an administrator's row is recorded however it fails; one that names none, or
-    // an integrator's, is not: anyone who can send a request would otherwise grow the log.
-    if (row && isAdminScope(row.scope))
+    // Only an administrator key presented with its real secret is recorded: a revoked or expired
+    // one. The lookup identifier is not secret (it is inside every key string and listed to every
+    // admin_read holder), so a request that only knows it must not be able to write a row.
+    if (row && matches && isAdminScope(row.scope))
       await auditRefusedKey(c, { id: row.id, scope: row.scope });
     throw new ApiError("unauthorized", "Invalid API key");
   }

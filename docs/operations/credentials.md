@@ -34,19 +34,22 @@ expire unless it asks: no earlier key exists to make its successor, and `POST /v
 bootstrap token works once only, so a first key that lapsed could not be replaced through the API.
 Keys made before the audit migration (`0076`) have no expiry; replace them with keys that do, then
 revoke them. Make the successor of an administrator key before the key expires, and read
-`expires_at` in `GET /v1/api-keys`.
+`expires_at` in `GET /v1/api-keys`; nothing warns before a key lapses, and if every `admin` key has
+lapsed see [Lapsed administrator keys](#lapsed-administrator-keys).
 
 **Audit log.** `GET /v1/audit-events` (either administrator scope; newest first, the usual `limit`
 and `cursor`) lists every request an `admin` or `admin_read` key made with a method other than
-`GET`, and every refusal of a key that carries an administrator key's identifier but a wrong
-secret, or was revoked or has expired. An event holds the key's ID and scope, the method, the
+`GET`, and every refusal of an administrator key that was revoked or has expired and was presented
+with its real secret. An event holds the key's ID and scope, the method, the
 route template (`/v1/api-keys/{id}`, never the path that was asked for), the HTTP status, the
 `X-Request-Id` and the time. It holds no body, query, key, secret or address; to tie an event to
 what it did, read the resource it names in the route (the key that asked is also kept on role
 and probe records). An event is listed for 90 days; the next change or refused administrator key
 deletes the older ones (the minute cron has no statement to spare: its tests hold it to 850).
-Not recorded: successful reads, a refused key that matches no key row or an integrator's (anyone
-could otherwise grow the log), and the one bootstrap request, which has no key to name.
+Not recorded: successful reads; a key with a wrong secret, one that matches no key row and an
+integrator's key (the identifier in a key string is not secret and `GET /v1/api-keys` lists it, so
+anyone could otherwise grow the log by sending it); and the one bootstrap request, which has no key
+to name.
 
 A change is written to the log **before** it runs, and its status is added when the answer is
 known. This order is deliberate: a change cannot be taken back, so a row written afterwards could
@@ -55,6 +58,27 @@ answers `500` (log line `audit_write_failed`); the retry is safe. If only the st
 written, the answer stands and the event keeps `status: null`, which says the outcome is unknown
 (also after a Worker that stopped mid-request), never that it succeeded. A refused key is
 refused whatever the log says. Look for `null` statuses after an incident.
+
+## Lapsed administrator keys
+
+An administrator key made by an administrator expires after at most 366 days, and nothing warns
+before it does: write down each key's `expires_at` when you make it. If the last working `admin`
+key has lapsed (or was revoked), the API cannot make another. The bootstrap token creates a key
+only while no `admin` row exists at all, and a lapsed or revoked row counts.
+
+With access to the Cloudflare account, open the PGCF database in the D1 console, find an `admin`
+key whose secret you still hold and move its `expires_at` ahead (add `, revoked_at = NULL` to
+bring back a revoked one):
+
+```sql
+SELECT id, name, expires_at, revoked_at FROM api_keys WHERE scope = 'admin';
+UPDATE api_keys SET expires_at = '2026-12-31T00:00:00.000Z' WHERE id = '<key id>';
+```
+
+Use a time a few days ahead in exactly that form (UTC, milliseconds, `Z`); the table refuses any
+other. Then make the successor with that key at once (`POST /v1/api-keys`) and let the extended key
+lapse or revoke it. The edit goes around the API, so **it is not in the audit log**
+(`GET /v1/audit-events`): write down when and why it was made.
 
 ## Worker and routing secrets
 
