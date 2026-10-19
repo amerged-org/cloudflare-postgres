@@ -10,7 +10,7 @@ import {
   NodeProbeRequest,
   NodeProbeResult,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext, AuthPrincipal } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { page } from "../platform/pagination.ts";

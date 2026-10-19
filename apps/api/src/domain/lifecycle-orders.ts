@@ -6,7 +6,7 @@ import {
   type NodeOrderResult,
 } from "@pgcf/contracts";
 import type { NodeMaintenance } from "@pgcf/contracts/nodes";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
 import { hintNode } from "./node-hints.ts";
 
