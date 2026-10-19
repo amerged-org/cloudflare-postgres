@@ -22,7 +22,7 @@ authority on what still blocks go-live; operator procedures are in the other run
 | Topic                             | State on 2026-10-19                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Runtime                           | Databases run on EU1, a Debian node installed from the PGCF image: one sandboxed systemd PostgreSQL 18 service per database on its own thin LVM volume, one Rust node agent, no Kubernetes. The Stage 5 acceptance of the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md) (cold-request p95, density, storage and crash tests) is not finished; its gates decide what still blocks go-live.                                                                                  |
-| First request after a wake        | A sleeping database starts PostgreSQL from its own volume on the next connection. On EU1 on 2026-10-19, after 60 to 137 minutes asleep, the first request as one HTTP `/sql` transaction took a median of 611 ms through a service binding (8 samples, all under 1 s) and 648 ms through the public hostname (6 samples); the same request statement by statement over a WebSocket took a median of about 0.8 s and 1.0 to 1.1 s. These are small samples, not a p95: the sub-second gate is not yet claimed ([3.4](#34-timeouts-and-retries-for-a-sleeping-database), [3.7](#37-http-query-mode-neon)). |
+| First request after a wake        | A sleeping database starts PostgreSQL from its own volume on the next connection. On EU1 on 2026-10-19 the first request as one HTTP `/sql` transaction, after 60 to 137 minutes asleep, took a median of 611 ms through a service binding (8 samples, all under 1 s) and 648 ms through the public hostname (6 samples). The first request statement by statement over a WebSocket, after at least 2 h asleep, took a median of 789 ms through a service binding and 989 ms through the public hostname (5 databases each). The series differ in sample size, sleep time and request. These are small samples, not a p95: the sub-second gate is not yet claimed ([3.4](#34-timeouts-and-retries-for-a-sleeping-database), [3.7](#37-http-query-mode-neon)). |
 | Redundancy                        | One customer node (EU1), one PostgreSQL instance per database, no replica, no second node. Losing EU1 stops every database until it is restored from R2 onto new capacity ([7](#7-failure-and-recovery)).                                                                                                                                                                                                                                                                                                |
 | Capacity numbers                  | The density test that measures how many databases a node may carry has not run (Stage 5.6). The numbers in [4](#4-capacity-and-limits-you-must-enforce) are the plan's admission rules and starting values, not measured capacity.                                                                                                                                                                                                                                                                       |
 | New databases                     | Every database lives on a thin LVM volume of its node, placed by the 80 % rule of [2.1](#21-create). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced.                                                                                                                                                                                                                                                                                       |
@@ -62,16 +62,18 @@ explicitly (drivers do). `replication` startup parameters are refused (`0A000`).
 A database lives on one node of one region, chosen at creation (`region_id`). The operator can move
 it to another node of the region under the same ID (`POST /v1/databases/{id}/move`, admin): the
 source proves the sleep, your connections get `57P03` while the move runs, and a move that fails
-leaves the database where it was. There is one node today, so no move is possible yet, and
-automatic rebalancing comes after go-live. The hostname is the same for every region; the Edge
+leaves the database where it was. The target may be the database's own node (a move from one
+volume to another); a move to another node needs a second node in the region, and there is one
+today. Automatic rebalancing comes after go-live. The hostname is the same for every region; the Edge
 finds the region from the database's record.
 
 The installation serves one region: EU. Its region ID is `eu-dev` (the Worker and region IDs carry
 the name `dev`). `GET /v1/regions` with your key lists `{id, provider_region}` of the regions that
 accept placement and nothing else about them: those with a node that is ready, schedulable, not
-lost and open for new databases. A `us-dev` record still exists but the US region is cancelled
-and has no usable node: it is not listed, and a database created there waits unplaced
-indefinitely. Customer databases run only on EU1.
+lost and open for new databases. There is no US node yet: the plan installs US1 from the same
+image once EU1 has passed its acceptance (plan 9.6). A region without such a node is not listed,
+and a database created in a region record that has none waits unplaced ("Waiting for verified
+regional capacity") until a node there opens. Customer databases run only on EU1.
 
 ### 1.3 Size classes
 
@@ -419,13 +421,16 @@ retried at once.
 
 - A running database takes new memory and CPU limits as live limits on its unit, without ending its
   sessions; PostgreSQL's own settings follow the new memory at its next start, and storage grows
-  online. A hibernated database changes immediately and starts on the new class at its next wake.
+  online. A hibernated database changes immediately and starts on the new class at its next wake:
+its memory and CPU are admitted by its node then, while its storage growth must fit the node's
+logical cap now (see below).
 - The target class must be enabled and within the region's memory maximum. A running database that
   grows must fit the node now, else `503 capacity_exhausted` ("Current node has insufficient
   memory, CPU or storage"): its active RAM would reach 80 % with the extra memory, its CPU would
   exceed the node's cores, or its storage would take the node's sold storage past four times its
-  pool. A smaller or equal size needs no room, and a hibernated database takes any size at once and
-  needs room at its next wake.
+  pool. A smaller or equal size needs no room. A hibernated database waits for its next wake only
+  for memory and CPU; growth of its storage is sold from now on and is refused with the same
+  `503` when it would pass the logical cap.
 - Storage may only grow; shrinking is `400` ("Storage shrink is not supported"). Growth through the
   API is **not yet verified live**.
 - The operator can roll a new revision of a resource profile out to every database assigned to
@@ -527,7 +532,7 @@ your markers before cutover.
 | `archive_unusable`   | the v1 catalog reads at most 16,000 objects and 64 base backups per database, and the listing was incomplete, invalid or beyond that bound |
 | `name_in_use`        | a live database of the project already has the target `name`; choose another                                                               |
 | `source_unavailable` | the source's class is disabled, its region record is gone or its credentials are unavailable                                               |
-| `region_unavailable` | the `region_id` of the request names no region                                                                                             |
+| `region_unavailable` | the `region_id` of the request is not the source's own region (a restore stays in the source's region)                                     |
 | `generation_changed` | the source, its retained archive or the placement changed under the request; retry                                                         |
 
 A restore needs capacity like a create; without it the target waits unplaced and the operation
@@ -631,8 +636,9 @@ client and PostgreSQL, and PGCF's Edge and gateway only relay it.
 
 A sleeping database has no process: its volume stays mounted, and the next connection starts
 PostgreSQL from it through the node's own admission. Measured on EU1 on 2026-10-19 (the plan's Done
-rows; the first request is the five-statement SaaS mix, and the sample sizes are too small for a
-p95):
+rows; the first request is the SaaS page request, which the plan's rows record as 6 to 8
+statements; the series differ in sample size, sleep time and statements, and the sample sizes are
+too small for a p95):
 
 | Series | First request |
 | --- | --- |
@@ -717,11 +723,12 @@ limit first. Counters are per Cloudflare location and eventually consistent.
 
 **Measured on the live installation (EU1, 2026-10-19):** the format below is checked by the actual
 `@neondatabase/serverless` 1.2.0 driver against the Edge and by the gateway's protocol tests. A
-SaaS page request of six statements as **one `transaction()` on a database that had slept one to two
-hours** took 472 to 784 ms (median 611 ms, 8 samples) from a Worker through a service binding to the
-Edge and 440 to 1,070 ms (median 648 ms, 6 samples) through the public hostname. The same request
-statement by statement over a WebSocket took a median of about 0.8 s (binding) and 1.0 to 1.1 s
-(public hostname). These are small samples, not a p95.
+SaaS page request as **one `transaction()` on a database that had slept 60 to 137 minutes** (all
+steps in one request) took 472 to 784 ms (median 611 ms, 8 samples) from a Worker through a service
+binding to the Edge and 440 to 1,070 ms (median 648 ms, 6 samples) through the public hostname. The
+first request statement by statement over a WebSocket, after at least 2 h of sleep, took a median
+of 789 ms (binding) and 989 ms (public hostname) over 5 databases. These are separate series, not
+a paired comparison, and small samples, not a p95.
 
 `POST https://<host>/sql` serves the Neon driver's HTTP query mode: `neon()`, its
 `transaction()`, and `Pool.query()` with `poolQueryViaFetch`. One query or one transaction is one
@@ -767,10 +774,12 @@ statements in one burst (Neon puts the break-even at two to three queries).
 
 ### 3.8 Recommended patterns for Workers
 
-Estimates from the plan's measurements (15-42 ms per statement round trip from a Worker,
-0.47-0.53 s for an 8-statement request on an awake database); only the batching gain is measured on
-PGCF so far (the first request after sleep as one HTTP transaction: about 0.2 s less through a
-service binding and about 0.4 s less through the public hostname, 3.7).
+The "Expected gain" column is an estimate, built on round-trip figures of earlier measurements
+(15-42 ms per statement from a Worker, 0.47-0.53 s for an 8-statement request on an awake
+database) that are not in the plan's current rows and were not re-measured on the node runtime.
+PGCF has no paired measurement of the batching gain yet: the first request after sleep as one HTTP
+transaction had a median of 611 ms (binding) and 648 ms (public hostname), the WebSocket series
+789 and 989 ms, but the series differ in samples, sleep time and statements (3.4, 3.7).
 
 | Pattern                          | How                                                                                                                               | Expected gain                                                                                                        | Cost                                                                                |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
@@ -886,16 +895,18 @@ pgcf -G "$PGCF_API/v1/usage" \
 | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `provisioned_seconds`, `awake_seconds`                               | seconds between creation and deletion, and seconds between a ready or wake event and the next hibernation or suspension                                                       |
 | `memory_mib_seconds`, `cpu_millicore_seconds`                        | the class's memory and CPU **limits** times awake seconds; not measured consumption                                                                                           |
-| `reserved_cpu_millicore_seconds` | the class's CPU limit times **provisioned** seconds: sleeping time is included, and nothing is added to the limit |
-| `reserved_memory_mib_seconds` | the memory limit times **provisioned** seconds: sleeping time is included, and nothing is added to the limit |
-| `reserved_storage_byte_seconds` | the allocated storage (the effective `storage_gib`) times provisioned seconds |
+| `reserved_cpu_millicore_seconds` | **scheduled for removal (plan 3.4); do not build on it.** Today: the class's CPU limit times **provisioned** seconds, sleeping time included |
+| `reserved_memory_mib_seconds` | **scheduled for removal (plan 3.4); do not build on it.** Today: the memory limit times **provisioned** seconds, sleeping time included |
+| `reserved_storage_byte_seconds` | **scheduled for removal (plan 11.4); do not build on it.** Today: the allocated storage (the effective `storage_gib`) times provisioned seconds |
 | `storage_used_bytes_max`, `storage_allocated_bytes` | maximum of the node's filesystem samples in the period (bytes used on the volume); the effective storage size |
 | `backup_bytes_max`                                                   | maximum archive size in R2 measured in the period                                                                                                                             |
 | `ingress_bytes`, `egress_bytes`, `connections`, `connection_seconds` | gateway counters of the hour, summed over its measurement intervals (none spans two hours); `null` with `traffic_coverage` when an interval of the hour is missing or unknown |
 
 For compute time price `awake_seconds` and `memory_mib_seconds`; for storage use
 `storage_allocated_bytes` and `storage_used_bytes_max`; for traffic read `ingress_bytes` and
-`egress_bytes` of final rows.
+`egress_bytes` of final rows. The three `reserved_*` metrics are still in the contract and in every
+row, but they described the retired Kubernetes runtime's requests and are scheduled for removal
+(plan 3.4 and 11.4, no backwards compatibility): bill from the metrics above, not from them.
 
 **Traffic across an hour boundary.** The gateway counts cumulative totals and the node agent reads
 them once a minute. When two readings enclose a UTC hour boundary, the
@@ -928,21 +939,22 @@ any price.
 ## 6. Alerts and operations
 
 Alerts are infrastructure alerts for the **operator**. You do not receive them: they go to the
-operator's alert webhook, which was configured on 2026-10-19 (go-live gate G5 still needs one real
-alarm to reach the named recipient). The operator reads their state in
+operator's alert webhook, which was configured on 2026-10-19. Four active episodes were delivered
+that day and the receiver acknowledged them (plan 11.2); go-live gate G5 still lacks the named
+recipient's confirmation and a runbook action for every kind of alert. The operator reads their state in
 `GET /v1/operational-health?scope=regions`.
 
 One episode exists per region and kind. A new episode gets a new `event_id`, is delivered at least
 once with retries at least 60 s apart and a five-second deadline, and clears only when its
 measurement is fresh and below the threshold.
 
-| Kind                                                          | Fires when                                                                                                                                   | Threshold (capacity policy, read 2026-10-15)      |
+| Kind                                                          | Fires when                                                                                                                                   | Threshold (set in the capacity policy; the plan's value, 4.10, where it names one) |
 | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| `regional_node_ram_warning`                                   | any node's 30-minute average of active RAM reaches the threshold                                                                             | `node_ram_warning_threshold_ppm` = 850,000 (85 %) |
-| `regional_node_cpu_warning`                                   | any node's 30-minute average CPU load reaches it                                                                                             | `node_cpu_warning_threshold_ppm` = 900,000        |
-| `regional_node_storage_warning`                               | the node's thin-pool data or metadata fill reaches it (placement closes a pool at 80 % data or 50 % metadata)                                | `node_storage_warning_threshold_ppm` = 800,000    |
-| `regional_ram_warning`                                        | regional RAM utilisation reaches it                                                                                                          | `ram_warning_threshold_ppm` = `null` (off); it needs a regional RAM window that no node reports yet, so it never fires |
-| `regional_node_cap_reached`                                   | allocated nodes reach `max_nodes`                                                                                                            | `cap_warning_enabled` = off                       |
+| `regional_node_ram_warning`                                   | any node's 30-minute average of active RAM reaches the threshold                                                                             | `node_ram_warning_threshold_ppm`, 850,000 (85 %) |
+| `regional_node_cpu_warning`                                   | any node's 30-minute average CPU load reaches it                                                                                             | `node_cpu_warning_threshold_ppm`, 900,000 (90 %)  |
+| `regional_node_storage_warning`                               | the node's thin-pool data or metadata fill reaches it (placement closes a pool at 80 % data or 50 % metadata)                                | `node_storage_warning_threshold_ppm`; the plan names no value (placement closes the pool at 800,000 for data and 500,000 for metadata) |
+| `regional_ram_warning`                                        | regional RAM utilisation reaches it                                                                                                          | `ram_warning_threshold_ppm`; it needs a regional RAM window that no node reports yet, so it never fires |
+| `regional_node_cap_reached`                                   | allocated nodes reach `max_nodes`                                                                                                            | `cap_warning_enabled`, off by default            |
 | `regional_node_stale`                                         | a node's observation is older than 180 s, or the node is marked lost and a database is still placed on it                                                                         | fixed                                             |
 | `infrastructure_backup_failed`, `infrastructure_backup_stale` | the daily D1 backup fails, or none completed for 36 h                                                                                        | fixed                                             |
 | `database_archive_failing`                                    | a running, awake database reports `health.archiving: failing`                                                                                | fixed    |
@@ -955,7 +967,8 @@ measurement is fresh and below the threshold.
 | `node_unexpected_reboot` | a node rebooted and no maintenance order of it asked for it, within the last 24 h | fixed |
 | `control_cron_stalled`, `control_cron_step_failing`           | no minute-cron run completed for 300 s, or a step failed in each of its last 5 runs                                                          | fixed                              |
 
-Thresholds are integer parts per million (1,000,000 = 100 %, valid 1 to 1,000,000, `null`
+The values in the table are the plan's; the installation's own settings are read with
+`GET /v1/regions/{id}/capacity-policy`. Thresholds are integer parts per million (1,000,000 = 100 %, valid 1 to 1,000,000, `null`
 disables) set with `PUT /v1/regions/{id}/capacity-policy`. The minute cron evaluates the first
 four regions that have a policy; the fixed-rule kinds are evaluated for every region.
 

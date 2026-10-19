@@ -78,13 +78,19 @@ every flow updates in small steps.
 | `/var/lib/pgcf/agent/databases/<id>`           | The database's state file (proven-sleep record, roles applied, newest base backup, whether the storage generation was built) and its upload log; not on the volume, which the database's user can rearrange |
 | `/var/lib/pgcf/agent/uids.json`, `fences.json` | The uid handed to each database, and the fence and superseded orders, fsynced before the agent acts on them                                                                                                 |
 | `/var/lib/pgcf/agent/usage.json`, `jobs/`      | The usage meter's place, and the barman jobs' environment files                                                                                                                                             |
+| `/var/lib/pgcf/agent/boot-id`, `probes-done`   | The boot ID the agent last reported (a different kernel boot ID is a reboot, and the previous boot's journal goes to Cloudflare), and the diagnostic requests it has answered, so that a page that still lists one does not run it twice |
 | `/var/lib/pgcf/credentials/`                   | The node's Ed25519 key (`node-key.pk8`, readable by the agent only) and identity, the gateway's environment, the encrypted Tunnel token                                                                     |
 | `/var/lib/pgcf/enrollment/seed.json`           | The installer's seed, deleted after the enrollment                                                                                                                                                          |
 | `/var/lib/pgcf/bin/<release>/`, `bin/current`  | The binaries of each release and the link to the one that runs                                                                                                                                              |
 | `/run/pgcf/<id>`                               | The database's socket directory (`pgcf-<id>:pgcf-gateway`, 0750), made again for every database when the agent starts                                                                                       |
 | `/run/pgcf/agent/gateway.sock`, `archive.sock` | The gateway's channel (the gateway's user only) and the archive socket (the databases, known by uid)                                                                                                        |
 
-`layout.rs` is the one place that names these paths; tests give it another root.
+`layout.rs` names the volumes, the agent's own directory, the databases' files, the jobs and the
+sockets, and tests give it another root. The rest are named where they are used: `credentials/`,
+`enrollment/seed.json` and `node-key.pk8` in `link/identity.rs` and `link/file.rs` (and
+`machine/node.rs`, which writes the gateway's environment and the Tunnel token there), `usage.json`
+in `agent/mod.rs`, `bin/current` in `update.rs`, `boot-id` in `diagnostics/boot_report.rs` and
+`probes-done` in `service.rs`.
 
 ## PostgreSQL configuration
 

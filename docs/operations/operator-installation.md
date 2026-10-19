@@ -46,7 +46,7 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
   `NODE_DNS_SERVERS` a JSON array of one to three resolvers the node is installed with.
 - `CLOUDFLARE_API_TOKEN` (a private secret with edit access to Tunnels and to the zone's DNS
   records) makes the node's Tunnel when the node first reads its credentials. Its gateway gets the
-  hostname `<node>.<domain>` under `NODE_GATEWAY_DOMAIN`, a domain of the zone
+  hostname `pgcf-node-<id>.<domain>` under `NODE_GATEWAY_DOMAIN`, a domain of the zone
   `NODE_GATEWAY_ZONE_ID`; the Cloudflare account is the one of the region's R2 endpoint. Without
   the token, the domain or the zone a node gets no credentials and stays closed to placement.
 - `NODE_SHELL_HOSTNAME` is off unless it is the string `true`. The node's shell hostname
@@ -263,8 +263,9 @@ shows what would go.
 The rules a region's nodes decide by when they act alone (plan 4.3 to 4.7 and 7.5) are the region's
 node policy. Every node's desired page carries it, and a region without one serves no page (the
 nodes get a 409 "The region's node policy is not set"), so set it before the first node installs.
-Read and replace it with an administrator key at `GET` and `PUT /v1/regions/{id}/node-policy`; the
-nodes of the region pull the new page at once.
+Read it with `GET` and replace it with `PUT` at `/v1/regions/{id}/node-policy` (an administrator
+key; `PUT` needs scope `admin`). A PUT changes every node of the region that is not lost at once:
+each is told to pull the new page, and admission uses the new values from then on.
 
 | Group        | Fields                                                                                                                                                           | The plan's starting values for EU1 (12 GB) |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
@@ -277,7 +278,10 @@ nodes of the region pull the new page at once.
 The starting values come from plan sections 4.3 to 4.6 and 7.5 and stay estimates until Stage 5
 measures the node; the memory budget is the visible RAM minus the system, the mounted volumes, the
 backup jobs and the page-cache floor (plan 4.5). `awake_budget_mib` is also the memory limit of
-`pgcf.slice`, the kernel's backstop under either memory rule.
+`pgcf.slice`, the kernel's backstop under either memory rule, but the agent sets that limit only
+when it starts. After a change of `awake_budget_mib`, admission follows the new value at once while
+the slice keeps the old limit until the node's agent next starts (a release that changes the agent,
+or a reboot), so the two disagree until then.
 
 ## Capacity policy, purchases and notifications
 

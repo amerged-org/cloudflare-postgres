@@ -44,8 +44,9 @@ a node takes new databases until its active RAM or its CPU load reaches 80 %, ea
 highest 30-minute average of the last seven days, and among the nodes that qualify the fullest
 wins. A node whose thin pool placement has closed (data at 80 %, metadata at 50 % or the sold
 storage at four times its data) takes none. Each start is admitted by the node itself, from its own
-free RAM and pool, and only explicit orders (suspend, delete, move, maintenance) stop a running
-database. A database that no node can host is accepted and waits as "Waiting for verified regional
+free RAM and pool. No lease expiry, stale sample or missing observation stops a running database:
+besides its own idle sleep and the node's early sleep, only explicit orders (suspend, delete, move,
+maintenance) do. A database that no node can host is accepted and waits as "Waiting for verified regional
 capacity". Missing observations remain unknown. A node is added only when no node fits and the
 operator has enabled it: purchases and autoscale are operator settings of the authenticated
 management API, fresh installations do not purchase automatically or send notifications, and this

@@ -93,13 +93,24 @@ For `ROUTE_MASTER_KEYS` (`{"active":"<kid>","keys":{"<kid>":"<base64url>"}}`), t
 Worker hold the master keyring and sign with the active key. A node's gateway verifies with the
 keys derived for that node from every master key. The agent reads them from Cloudflare when it
 starts (and again when its desired page names a higher credentials revision, which no API route
-raises today) and writes them to `gateway.env`; a running gateway reads that file only when it
-starts. To rotate, add the new key beside the old one with the old one still active, deploy the API
-and the Edge, let every node's agent start once (a release that changes the agent) and then its
-gateway start afterwards (a reboot of the node, or a release that changes the gateway's binary),
-and only then make the new key active and deploy both again. Existing routing tokens expire within
-30 seconds. Verify a fresh connection before retiring the old key from the keyring, and never make
-a key active that a node's gateway has not received.
+raises today) and writes them to `gateway.env`; a running gateway reads that file only when its
+unit starts. **This rotation has never been exercised, and nothing reports which key IDs a node's
+gateway holds**, so no check tells you beforehand that every gateway has the new key. The only
+restarts of a running gateway are a release that changes the gateway's binary and a reboot that is
+due anyway (a maintenance cycle in its announced window; never a reboot made for this purpose, which
+needs the owner's go and, from the canary on, an announced window, plan 9.3). A gateway restart
+ends every open client session: the release restarts the gateway without draining it first, the
+gateway refuses new work, drops what is left after at most 30 seconds, and clients reconnect. A
+release that changes both the agent and the gateway restarts the gateway before the agent has
+written the new file, so the gateway needs a later release or reboot of its own. To rotate: add the
+new key beside the old one with the old one still active, deploy the API and the Edge, let every
+node's agent start once (a release that changes the agent), let every gateway start afterwards,
+make the new key active and deploy both again. Existing routing tokens expire within 30 seconds.
+After the switch open a fresh connection to a database on every node: a node whose gateway lacks the
+key refuses it, and making the old key active again, which is still in the keyring, restores it.
+Retire the old key from the keyring only after every node passed. Until `credentials_revision` can
+be raised by an API route, treat rotating this key as a planned operation with the owner's go, not
+as routine.
 
 For the Edge's Access service token (`ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET`), rotate the
 token's secret in Zero Trust with a grace period; the Client ID stays the same

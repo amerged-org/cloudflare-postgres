@@ -346,7 +346,7 @@ Limits:
 1. **Measure before building anything,** with scratch Workers on the Cloudflare account, deleted afterwards, as the cold-actor measurement did:
    - keep-warm with at least 100 objects: alarms every 10, 30 and 60 s; `admitWake` latency after one hour and after 24 hours without a connect; the share of answers that stay warm; and the bill;
    - for A's fallback case: the latency of a cold KV read from the Edge for a key unread for one hour and for 24 hours.
-   These two numbers decide between the options. Nothing else does.
+   These two numbers decide between the options. Nothing else does. Only the first measurement is approved (D14a); the second is asked for only if keep-warm fails or is refused (D14d).
 2. **If keep-warm keeps at least 95 % of first connects warm at a price the owner accepts, build it:** an alarm in `DatabaseActor`, re-armed while the database exists, is not deleted and is in the scope the owner sets. It changes no protocol, no invariant and no node behaviour, it helps every connect, and it brings Cloudflare's own share of the connect towards the 150 ms target.
 3. **Do not build Option B.** It leaves the actor's cold start in series, and its gain depends on NodeActor being warm: the same problem one hop further.
 4. **Build Option A only if keep-warm fails or is refused,** in the node-bound form with a KV placement record, only after the model test of section 7 passes and its mutants fail, and only if the measured KV read p95 is clearly below the cold actor's. Start with the exact-match rule in place from the first commit; never ship a form that hands a socket over without it.
@@ -355,9 +355,10 @@ Limits:
 
 | # | Decision | Proposed default |
 | --- | --- | --- |
-| D14a | Approve the measurement of keep-warm and of KV cold reads (scratch Workers, deleted afterwards) | Yes (approved 2026-10-19) |
+| D14a | Approve the measurement of whether, and at what billed cost, the DatabaseActor can be kept warm (scratch Workers, deleted afterwards) | Yes (approved 2026-10-19; this measurement only) |
 | D14b | On its result: a costed go for keeping actors warm, and its scope (every live database, or only those with a connect in the last N days) | Every live database, if 8.2 step 2 holds |
 | D14c | Only if keep-warm is out: accept **speculative starts**. A node may start a sleeping database on an Edge request that the DatabaseActor has not yet authorized, under every node check, with no client byte before the actor's exact match. This amends plan 1.6 and 5.2, adds a KV namespace (a new resource, costed go), and accepts unclaimed starts as a logged, self-healing state | No, unless keep-warm fails |
+| D14d | Only on the Option A path: approve the measurement of cold KV reads from the Edge (scratch Workers, deleted afterwards) | Not approved; ask only if keep-warm fails or is refused |
 
 If neither keep-warm nor speculative starts is accepted, the cold actor stays on the path, at the floor of a cold Durable Object (105 / 230 ms at p50 / p95) once the split is done. The rest of the connect budget then has to come from the client's path to the Edge and from the node.
 

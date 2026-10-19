@@ -113,8 +113,13 @@ proof in the ULTRA plan; targeted tests alone are not live backup acceptance.
 
 While the provider's export job runs, the control database stops answering requests. Cloudflare
 documents the unavailability and states no duration. The exporter sends no D1 request of its own
-meanwhile, and no running database needs D1 to keep writing. The plan records the nightly export
-blocking D1 for about 4 s on the live installation (ULTRA plan 9.10). A wake admits from the
+meanwhile, and no running database needs D1 to keep writing. **How long D1 stops is not
+established.** ULTRA plan 9.10 states about 4 s, tagged as measured on EU1, which the plan's legend
+defines as the retired Kubernetes runtime; the plan does not say how it was taken. The earlier
+sampling of that runtime (usage posts of the regional agent, one per 15 s) showed gaps of 37 to 72 s
+in four of six nightly runs, a stall of at least 37 s in three of them and none in two, and so
+contradicts it. Nothing on the node runtime has measured the length yet, and gate G6 does not ask
+for it: record the stall of a nightly run in the plan when one is measured. A wake admits from the
 DatabaseActor's own state and commits its claim to D1 after the answer, so it is not expected to
 wait for the export. That is not yet observed: go-live gate G6 needs a night with an awake database
 under writes and one wake during the export that shows no failed wake.
