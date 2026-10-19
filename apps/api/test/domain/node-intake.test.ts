@@ -2,6 +2,7 @@
 import { env } from "cloudflare:workers";
 import { newDatabaseId, newNodeId, newOperationId } from "@pgcf/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { rollupUsageHour } from "../../src/domain/usage-rollup.ts";
 import {
   cleanupFixtures,
   fixture,
@@ -17,12 +18,17 @@ afterEach(async () => {
 });
 
 type F = Awaited<ReturnType<typeof fixture>>;
-async function database(f: F) {
-  const response = await f.create();
+async function database(f: F, name?: string) {
+  const response = await f.create(name);
   expect(response.status).toBe(202);
   return ((await response.json()) as { database: { id: string } }).database.id;
 }
 const GIB = 1024 ** 3;
+const MINUTE = 60_000;
+/** The start of a quarter hour that is over, so that a report may name any minute of it. */
+const quarterHour = () => Math.floor(Date.now() / 900_000) * 900_000 - 900_000;
+const reportedAt = (start: number, minute: number, seconds = 1) =>
+  new Date(start + minute * MINUTE + seconds * 1000).toISOString();
 const volume = (id: string, extra: Record<string, unknown> = {}) => ({
   database: id,
   storage_generation: 1,
@@ -118,17 +124,27 @@ describe("the volumes of a node", () => {
     expect(await stored(f.node)).toHaveLength(450);
   });
 
-  it("become the storage samples that the database's health and usage read, once per quarter hour", async () => {
+  it("become a storage sample in every minute for a database that can grow and in the first report of each quarter hour for a hibernated one", async () => {
     const f = await fixture();
-    const id = await database(f);
-    const at = new Date(
-      Math.floor(Date.now() / 900_000) * 900_000 - 900_000 + 1000,
-    ).toISOString();
-    await volumes(f, [volume(id), volume(newDatabaseId())], at);
+    const growing = await database(f, "growing"),
+      asleep = await database(f, "asleep");
+    await env.DB.prepare(
+      "UPDATE databases SET observed_power='hibernated' WHERE id=?",
+    )
+      .bind(asleep)
+      .run();
+    const start = quarterHour();
+    // Minute 7 is the first report of its quarter hour, minute 15 the first of the next. The orphan has no database to bill.
+    await volumes(
+      f,
+      [volume(growing), volume(asleep), volume(newDatabaseId())],
+      reportedAt(start, 7),
+    );
+    // The same minute again, with other figures: the first sample of the minute stays.
     await volumes(
       f,
       [
-        volume(id, {
+        volume(growing, {
           filesystem: {
             total_bytes: 5 * GIB,
             used_bytes: 999,
@@ -136,51 +152,137 @@ describe("the volumes of a node", () => {
             inodes_used: 0,
           },
         }),
+        volume(asleep),
       ],
-      new Date(Date.parse(at) + 60_000).toISOString(),
+      reportedAt(start, 7, 31),
+    );
+    await volumes(f, [volume(growing), volume(asleep)], reportedAt(start, 8));
+    await volumes(
+      f,
+      [volume(growing), volume(asleep, { mounted: false, filesystem: null })],
+      reportedAt(start, 15),
     );
     const samples = await env.DB.prepare(
-      "SELECT database_id,producer_id,sequence,payload FROM usage_samples WHERE source='agent'",
+      "SELECT database_id,producer_id,sequence,payload FROM usage_samples WHERE source='agent' ORDER BY sequence,database_id",
     ).all<{
       database_id: string;
       producer_id: string;
       sequence: number;
       payload: string;
     }>();
-    // The orphan has no database to be billed, and the second report is in the same quarter hour.
-    expect(samples.results).toHaveLength(1);
-    expect(samples.results[0]).toMatchObject({
-      database_id: id,
-      producer_id: f.nodeUid,
-      sequence: Math.floor(Date.parse(at) / 900_000),
-    });
-    expect(JSON.parse(samples.results[0]!.payload)).toMatchObject({
+    const minute = Math.floor(start / MINUTE);
+    expect(
+      samples.results.map((row) => [row.database_id, row.sequence]),
+    ).toEqual(
+      [
+        [growing, minute + 7],
+        [growing, minute + 8],
+        [growing, minute + 15],
+        [asleep, minute + 7],
+        [asleep, minute + 15],
+      ].sort(
+        (a, b) =>
+          (a[1] as number) - (b[1] as number) ||
+          (a[0] as string).localeCompare(b[0] as string),
+      ),
+    );
+    expect(new Set(samples.results.map((row) => row.producer_id))).toEqual(
+      new Set([f.nodeUid]),
+    );
+    const payload = (database: string, sequence: number) =>
+      JSON.parse(
+        samples.results.find(
+          (row) => row.database_id === database && row.sequence === sequence,
+        )!.payload,
+      );
+    expect(payload(growing, minute + 7)).toMatchObject({
       source: "agent",
       storage_used_bytes: 200 * 1024 ** 2,
       storage_allocated_bytes: 5 * GIB,
     });
+    // An unmounted volume counts the pool's chunks.
+    expect(payload(asleep, minute + 15).storage_used_bytes).toBe(
+      300 * 1024 ** 2,
+    );
+  });
+
+  it("take a hibernated database's one sample of a quarter hour from its first report, whichever minute that is", async () => {
+    const f = await fixture();
+    const growing = await database(f, "growing"),
+      asleep = await database(f, "asleep");
+    await env.DB.prepare(
+      "UPDATE databases SET observed_power='hibernated' WHERE id=?",
+    )
+      .bind(asleep)
+      .run();
+    const start = quarterHour();
+    // The clock is past the last report: a sample may not be dated after the control plane's now.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start + 20 * MINUTE);
+    // The reports of minutes 0 and 15 (the quarter-hour marks) are late, lost or never made: the
+    // quarter hour is not left without a sample, and a later report of it adds none.
+    for (const minute of [1, 2, 16, 17, 18])
+      expect(
+        (
+          await volumes(
+            f,
+            [volume(growing), volume(asleep)],
+            reportedAt(start, minute),
+          )
+        ).status,
+      ).toBe(200);
+    const rows = await env.DB.prepare(
+      "SELECT database_id,sequence FROM usage_samples WHERE source='agent' AND database_id=? ORDER BY sequence",
+    )
+      .bind(asleep)
+      .all<{ database_id: string; sequence: number }>();
+    const minute = Math.floor(start / MINUTE);
+    expect(rows.results.map((row) => row.sequence)).toEqual([
+      minute + 1,
+      minute + 16,
+    ]);
+    const awake = await env.DB.prepare(
+      "SELECT count(*) n FROM usage_samples WHERE source='agent' AND database_id=?",
+    )
+      .bind(growing)
+      .first<number>("n");
+    expect(awake).toBe(5);
+  });
+
+  it("let the database's health and its usage rollup see a volume that filled between two quarter hours", async () => {
+    const f = await fixture();
+    const id = await database(f);
+    const start = quarterHour();
+    // The database reads its disk at the same instant the node reported: nine minutes into the quarter.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start + 9 * MINUTE);
+    await volumes(f, [volume(id)], reportedAt(start, 7));
+    const full = {
+      total_bytes: 5 * GIB,
+      used_bytes: 4.75 * GIB,
+      inodes_total: 327_680,
+      inodes_used: 1500,
+    };
+    await volumes(f, [volume(id, { filesystem: full })], reportedAt(start, 8));
     const view = (await (
       await request(`/v1/databases/${id}`, f.integrator)
     ).json()) as {
+      health: { disk: { status: string; used_ratio: number } };
       storage: { used_bytes: number; allocated_bytes: number };
     };
     expect(view.storage).toMatchObject({
-      used_bytes: 200 * 1024 ** 2,
+      used_bytes: 4.75 * GIB,
       allocated_bytes: 5 * GIB,
     });
-    // The next quarter hour is a sample of its own, and an unmounted volume counts the pool's chunks.
-    await volumes(
-      f,
-      [volume(id, { mounted: false, filesystem: null })],
-      new Date(Date.parse(at) + 900_000).toISOString(),
+    expect(view.health.disk).toEqual({ status: "warning", used_ratio: 0.95 });
+    const usage = await rollupUsageHour(
+      env.DB,
+      id,
+      Math.floor(start / 3_600_000) * 3_600_000,
+      Date.now(),
     );
-    const later = await env.DB.prepare(
-      "SELECT payload FROM usage_samples WHERE source='agent' ORDER BY sequence",
-    ).all<{ payload: string }>();
-    expect(later.results).toHaveLength(2);
-    expect(JSON.parse(later.results[1]!.payload).storage_used_bytes).toBe(
-      300 * 1024 ** 2,
-    );
+    expect(usage.metrics.storage_used_bytes_max).toBe(4.75 * GIB);
+    expect(usage.metrics.storage_allocated_bytes).toBe(5 * GIB);
   });
 
   it("are refused when a mounted volume has no filesystem or a volume is named twice", async () => {

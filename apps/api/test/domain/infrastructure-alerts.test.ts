@@ -322,7 +322,7 @@ it("durably warns once at the configured ten-minute boundary and exposes callbac
     allocated_nodes: 1,
     max_nodes: 3,
   });
-  expect(delivered[0]!.key).toBe(event.event_id);
+  expect(delivered[0]!.key).toBe(`${event.event_id}:${event.occurred_at}`);
   expect(delivered[0]!.authorization).toBe("Bearer test-alert-receiver-token");
   await runInfrastructureAlerts(configured(), f.region, at + 2, receiver);
   expect(delivered).toHaveLength(1);
@@ -396,9 +396,12 @@ it("retries an unknown callback with its identical durable event and never rearm
   await sample(f, 75, at + 5);
   await runInfrastructureAlerts(configured(), f.region, at + 5, receiver);
   expect(bodies).toHaveLength(3);
-  expect(InfraAlert.parse(JSON.parse(bodies[2]!)).event_id).not.toBe(
-    InfraAlert.parse(JSON.parse(bodies[0]!)).event_id,
+  // The warning that comes back is the same error: the same id, and a new start to tell it apart.
+  const [first, again] = [bodies[0]!, bodies[2]!].map((body) =>
+    InfraAlert.parse(JSON.parse(body)),
   );
+  expect(again!.event_id).toBe(first!.event_id);
+  expect(again!.occurred_at).not.toBe(first!.occurred_at);
 });
 
 it("leaves a node out of the regional RAM window while placement is closed on it, as a maintenance cycle closes it", async () => {
@@ -524,7 +527,7 @@ it("supports an authenticated generic service binding without resolving an exter
   expect(events[0]).toMatchObject({
     url: "https://infrastructure-alert.invalid/",
     authorization: "Bearer test-alert-receiver-token",
-    idempotency: event.event_id,
+    idempotency: `${event.event_id}:${event.occurred_at}`,
   });
 });
 

@@ -243,15 +243,22 @@ lists each kind's rule and action.
 
 Configure either an `INFRASTRUCTURE_ALERT_WEBHOOK` service binding or an HTTPS
 `INFRASTRUCTURE_ALERT_WEBHOOK_URL`, plus your own `INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN` secret.
-The adopter's receiving service verifies the bearer token and durably deduplicates the
-`event_id` / `Idempotency-Key` together with the exact request body before acknowledging it.
+The adopter's receiving service verifies the bearer token and durably deduplicates the pair
+`event_id` and `occurred_at` (equivalently the `Idempotency-Key` together with the exact request
+body) before acknowledging it. `event_id` names the error: a version 8 UUID (RFC 9562) derived from the
+region, the kind and the subjects the event lists (the nodes or databases, or the failing cron steps), so the same error has the same `event_id`
+every time, also after it cleared and came back, and another set of subjects is a new error with a
+new one. A retry repeats the pair and the body; a recurrence has the same `event_id` and a new
+`occurred_at` (the start of its episode), and the receiver treats it as a new occurrence of the
+incident that `event_id` names. The `Idempotency-Key` is `<event_id>:<occurred_at>`, one value per
+episode.
 That service may use any mail provider. Alternatively, import `RESEND_API_KEY` as a private
 Worker secret and configure `notification_sender` and `notification_recipient` through
 `PUT /v1/infrastructure-backups/config`. The sender must belong to your verified Resend domain.
 PGCF supplies no default recipient, sender or mail-provider credentials; a configured webhook
 takes precedence over direct email.
 
-PGCF retries an unacknowledged event with its original ID and body, at least 60 seconds apart,
+PGCF retries an unacknowledged event with its original ID, start and body, at least 60 seconds apart,
 with a five-second callback deadline. A successful callback records acceptance by the receiving
 service or Resend API; final inbox delivery is observed in the operator's mail account. Inspect
 event status through
