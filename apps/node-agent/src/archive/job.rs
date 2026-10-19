@@ -18,6 +18,9 @@ use tokio::{
 
 /// The slice of all backup jobs (`infra/node-image`): CPU and IO weight 20, `MemoryMax=512M`.
 pub const BACKUP_SLICE: &str = "pgcf-backup.slice";
+/// What every job's unit name starts with: `pgcf-job-<kind>-<database>-<sequence>`. Its lines in
+/// the journal carry the job's whole command line, and the boot report leaves them out by it.
+pub const UNIT_PREFIX: &str = "pgcf-job-";
 /// Barman's server name for every database; the archive prefix already makes it unique.
 pub const SERVER_NAME: &str = "database";
 /// What the agent hides from a job: every other database's volume and the agent's own state.
@@ -425,7 +428,7 @@ impl Runner {
     ) -> Outcome {
         let started = std::time::Instant::now();
         let unit = format!(
-            "pgcf-job-{}-{}-{}",
+            "{UNIT_PREFIX}{}-{}-{}",
             job.kind.label(),
             db.id,
             self.sequence.fetch_add(1, Ordering::Relaxed)

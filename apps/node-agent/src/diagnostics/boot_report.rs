@@ -4,14 +4,17 @@
 //! the tail of the previous boot's journal, reduced to the lines of the agent, the gateway,
 //! cloudflared, networkd, PID 1 and the kernel, and to the fields of `NodeJournalEntry`. The
 //! lines of a database's unit and of a backup job are never reported: their output can hold the
-//! tenant's SQL.
+//! tenant's SQL. An event line of the agent is reported as far as the observation report carries
+//! events, so the tail of a failed job's stderr in it stays on the node.
 use crate::{
     Error,
-    archive::facts,
+    archive::{facts, job},
+    events,
     layout::Layout,
     link::Link,
     machine::{Boot, Machine},
     node_link::constant,
+    units,
 };
 use serde_json::{Value, json};
 use std::{
@@ -62,8 +65,33 @@ pub fn boot_report_due(stored: Option<&str>, current: &str) -> bool {
     stored != Some(current)
 }
 
-/// The unit names whose lines can hold a tenant's SQL: a database's unit and a backup job.
-const TENANT_UNITS: [&str; 2] = ["pgcf-pg@", "pgcfbackup"];
+/// The unit names whose lines can hold a tenant's SQL: a database's unit and a backup job. PID 1
+/// writes a job's whole command line, an address and a role included, into the lines about it.
+const TENANT_UNITS: [&str; 2] = [units::UNIT_PREFIX, job::UNIT_PREFIX];
+
+/// The unit of the agent, whose event lines go through `events::sanitize` on their way here.
+const AGENT_UNIT: &str = "pgcf-agent.service";
+
+/// The text of a line of the agent. An event, a JSON object with a valid name, keeps what
+/// `events::sanitize` keeps of it, as in the observation report: the contract refuses error text,
+/// and the tail of a failed job's stderr is such text. Any other line (a panic, the error that
+/// ended the process) is the text it is.
+fn agent_text(text: String) -> String {
+    let Ok(line) = serde_json::from_str::<Value>(&text) else {
+        return text;
+    };
+    let Some(mut event) = events::sanitize(&line, "") else {
+        return text;
+    };
+    let Value::Object(mut kept) = event["fields"].take() else {
+        return text;
+    };
+    kept.insert("event".into(), event["event"].take());
+    if let Some(database) = event.get_mut("database_id") {
+        kept.insert("database_id".into(), database.take());
+    }
+    Value::Object(kept).to_string()
+}
 
 /// The values of a field of a line as `journalctl --output=json` prints it: text; the bytes of a
 /// value that is not text, as an array of numbers; null for a value it left out for its size; and
@@ -126,17 +154,24 @@ fn entry(line: &str) -> Option<Value> {
         (1..=16).contains(&transport.len()) && transport.bytes().all(|b| b.is_ascii_lowercase())
     })?;
     let name = |field: &str| first(field).filter(|name| (1..=255).contains(&name.len()));
+    let unit = name("_SYSTEMD_UNIT");
     let priority = first("PRIORITY")
         .and_then(|priority| priority.parse::<u8>().ok())
         .filter(|priority| *priority <= 7)
         .unwrap_or(6);
+    let message = first("MESSAGE").unwrap_or_default();
+    let message = if unit.as_deref() == Some(AGENT_UNIT) {
+        agent_text(message)
+    } else {
+        message
+    };
     Some(json!({
         "at": facts::timestamp(micros / 1000),
-        "unit": name("_SYSTEMD_UNIT"),
+        "unit": unit,
         "identifier": name("SYSLOG_IDENTIFIER"),
         "transport": transport,
         "priority": priority,
-        "message": cut(first("MESSAGE").unwrap_or_default(), bound("NODE_BOOT_REPORT_MESSAGE_MAX_BYTES")),
+        "message": cut(message, bound("NODE_BOOT_REPORT_MESSAGE_MAX_BYTES")),
     }))
 }
 
@@ -213,7 +248,12 @@ pub async fn report_boot<M: Machine>(machine: &M, link: &Link) -> Result<(), Err
 mod tests {
     use super::*;
     use crate::{
-        archive::facts,
+        archive::{
+            facts,
+            job::{Exit, Outcome},
+            server::failed_job_line,
+            test_support::credential,
+        },
         link::{
             LinkConfig, Paths, Timing, Transport,
             test_server::{Cloud, Failure, tempdir},
@@ -222,10 +262,14 @@ mod tests {
         node_link::{constant, contract_valid},
     };
     use serde_json::json;
+    use std::time::Duration;
 
     /// Lines `journalctl --output=json` printed on a systemd 257 node for the boot before the
-    /// present one, as the arguments select them, and the lines of a database's unit and of a
-    /// backup job that the arguments do not select, which the report must not carry either.
+    /// present one, as the arguments select them, and the lines of a database's unit and of the
+    /// agent's backup jobs, which the report must not carry. PID 1 wrote the job lines when
+    /// `systemd-run` ran the arguments of `systemd_run_arguments` for a WAL upload that succeeded
+    /// and a base backup that failed; the job's own output goes to `systemd-run` and not to the
+    /// journal, so none of it is here.
     const JOURNAL: &str = include_str!("previous-boot.jsonl");
     const CURRENT: &str = "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90";
     const EARLIER: &str = "9a7c1d2e-4b3f-4a65-8e10-6c5d4b3a2f10";
@@ -297,9 +341,10 @@ mod tests {
     #[test]
     fn the_journal_is_reduced_to_the_fields_of_the_contract_and_keeps_no_line_of_a_tenants_unit() {
         let entries = sanitize(JOURNAL);
-        // 18 lines: the kernel's two, the gateway's, cloudflared's, the agent's three and its
-        // three of PID 1 are kept; a database's unit and a backup job have two lines of their own
-        // and six of PID 1.
+        // 19 lines: the kernel's two, the gateway's, cloudflared's, the agent's three and its
+        // three of PID 1 are kept; a database's unit has a line of its own and three of PID 1, and
+        // the two backup jobs have five of PID 1.
+        assert_eq!(JOURNAL.lines().count(), 19);
         assert_eq!(entries.len(), 10, "{entries:#?}");
         let names = [
             "at",
@@ -317,7 +362,14 @@ mod tests {
             assert_eq!(keys, expected, "{entry}");
         }
         let text = serde_json::to_string(&entries).unwrap();
-        for tenant in ["pgcf-pg@", "pgcfbackup", "SELECT", "barman"] {
+        for tenant in [
+            "pgcf-pg@",
+            "pgcf-job-",
+            "SELECT",
+            "barman",
+            "--endpoint-url",
+            "pgcf_backup",
+        ] {
             assert!(!text.contains(tenant), "{tenant}");
         }
         assert_eq!(
@@ -362,6 +414,62 @@ mod tests {
             entries,
         );
         assert!(contract_valid("NodeBootReport", &report), "{report}");
+    }
+
+    #[test]
+    fn an_event_of_the_agent_is_reported_as_the_observation_report_carries_it_and_other_text_as_written()
+     {
+        // What the agent logs when a job for the archive failed, with the tail of barman's stderr.
+        let outcome = Outcome {
+            exit: Exit::Code(1),
+            stdout: String::new(),
+            stderr: "ERROR: Upload of 000000010000000000000003 to https://account.r2.cloudflarestorage.com/pgcf-eu failed: /var/lib/pgcf/db/abcdefghijklmnopqrst/data/pg_wal".into(),
+            elapsed: Duration::from_millis(1234),
+        };
+        let event = failed_job_line(
+            "archive_failed",
+            "abcdefghijklmnopqrst",
+            "000000010000000000000003",
+            &outcome,
+            &credential(),
+        );
+        assert!(event["stderr"].as_str().unwrap().contains("account.r2"));
+        let panic = "thread 'main' panicked at apps/node-agent/src/service.rs:12:5:\nout of memory";
+        let gateway = r#"{"event":"sql_stages","database":"abcdefghijklmnopqrst","outcome":"ok","agent_ms":{"a":1}}"#;
+        let journal = [
+            line("pgcf-agent.service", &json!(event.to_string())),
+            line("pgcf-agent.service", &json!(panic)),
+            line(
+                "pgcf-agent.service",
+                &json!(r#"{"event":"agent_started","uptime_s":12}"#),
+            ),
+            line("pgcf-gateway.service", &json!(gateway)),
+        ]
+        .join("\n");
+        let messages: Vec<String> = sanitize(&journal)
+            .iter()
+            .map(|e| e["message"].as_str().unwrap().to_string())
+            .collect();
+        let reported: Value = serde_json::from_str(&messages[0]).unwrap();
+        let keys: Vec<&str> = reported
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["at_ms", "database_id", "elapsed_ms", "event", "file"],
+            "{reported}"
+        );
+        assert_eq!(reported["event"], "archive_failed");
+        assert_eq!(reported["database_id"], "abcdefghijklmnopqrst");
+        assert_eq!(reported["file"], "000000010000000000000003");
+        assert_eq!(reported["elapsed_ms"], 1234);
+        // The text of a panic, a line of the gateway and an event with nothing to drop stay as written.
+        assert_eq!(messages[1], panic);
+        assert_eq!(messages[2], r#"{"event":"agent_started","uptime_s":12}"#);
+        assert_eq!(messages[3], gateway);
     }
 
     #[test]
