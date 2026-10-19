@@ -14,19 +14,23 @@ pub use crate::archive::job::BACKUP_ROLE;
 const SMALL_DATABASE_MEMORY_MIB: u64 = 512;
 
 /// What a small database runs besides the memory settings (plan Appendix C): one autovacuum worker
-/// out of two slots, one I/O worker, no parallel query or parallel maintenance, two background
-/// worker slots, and no replication of any kind. Nothing replicates: `pg_hba.conf` refuses
-/// replication connections and barman's base backup uses the backup API, so no WAL sender, slot
-/// or logical worker (and no logical replication launcher process) is ever needed. A recovery
-/// compares `max_worker_processes` and `max_wal_senders` with the source's, so a restore runs with
-/// more (`archive::recovery::settings`).
+/// out of two slots, one I/O worker, no parallel query or parallel maintenance, four background
+/// worker slots, and no replication of any kind. Autoprewarm needs two of the slots, its leader
+/// and its worker for one database at a time (with one slot the load fails with "registering
+/// dynamic bgworker autoprewarm failed", checked on PostgreSQL 18); the other two are spare for a
+/// parallel worker a session asks for. `max_parallel_workers` keeps its default of 8: it only
+/// caps the workers, which come from the free slots, and none is planned. Nothing replicates:
+/// `pg_hba.conf` refuses replication connections and barman's base backup uses the backup API, so
+/// no WAL sender, slot or logical worker (and no logical replication launcher process) is ever
+/// needed. A recovery compares `max_worker_processes` and `max_wal_senders` with the source's, so
+/// a restore runs with more (`archive::recovery::settings`).
 const SMALL_DATABASE_SETTINGS: &str = "\
 autovacuum_max_workers = 1\n\
 autovacuum_worker_slots = 2\n\
 io_workers = 1\n\
 max_parallel_workers_per_gather = 0\n\
 max_parallel_maintenance_workers = 0\n\
-max_worker_processes = 2\n\
+max_worker_processes = 4\n\
 max_logical_replication_workers = 0\n\
 max_wal_senders = 0\n\
 max_replication_slots = 0\n";
@@ -80,6 +84,14 @@ fn plain(text: &str) -> bool {
 }
 
 /// `postgresql.conf`. `None` for a setting that cannot be written as it is.
+///
+/// Every database runs autoprewarm: PostgreSQL's `pg_prewarm` library, loaded at start, writes the
+/// list of the shared buffers (`autoprewarm.blocks` in the data directory) when the database
+/// stops, and reads those blocks again after the next start. With `autoprewarm_interval = 0` the
+/// list is written at shutdown only, so a running database pays nothing for it. The reading is
+/// background work of one process after the database accepts connections; it competes with the
+/// first queries for the disk, and what it gains is the first queries' pages in memory, which the
+/// page cache lost while the database slept (plan 5.9). Nothing needs `CREATE EXTENSION`.
 pub fn postgresql_conf(settings: &Settings) -> Option<String> {
     let socket = settings.socket_directory.to_str().filter(|s| plain(s))?;
     let archive = match settings.archive_command {
@@ -104,6 +116,9 @@ pub fn postgresql_conf(settings: &Settings) -> Option<String> {
          maintenance_work_mem = {maintenance}MB\n\
          huge_pages = off\n\
          jit = off\n\
+         shared_preload_libraries = 'pg_prewarm'\n\
+         pg_prewarm.autoprewarm = on\n\
+         pg_prewarm.autoprewarm_interval = 0\n\
          wal_level = replica\n\
          {archive}\
          archive_timeout = {timeout}s\n\
@@ -168,6 +183,7 @@ pub fn pg_ident(agent_user: &str, database_user: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testpg::Cluster;
     use std::path::PathBuf;
 
     fn conf(memory_mib: u64, volume_gib: u64) -> String {
@@ -228,6 +244,9 @@ mod tests {
             "maintenance_work_mem = 16MB",
             "huge_pages = off",
             "jit = off",
+            "shared_preload_libraries = 'pg_prewarm'",
+            "pg_prewarm.autoprewarm = on",
+            "pg_prewarm.autoprewarm_interval = 0",
             "archive_mode = on",
             "archive_command = '/usr/libexec/pgcf/pgcf-archive %p'",
             "archive_timeout = 60s",
@@ -240,7 +259,7 @@ mod tests {
             "io_workers = 1",
             "max_parallel_workers_per_gather = 0",
             "max_parallel_maintenance_workers = 0",
-            "max_worker_processes = 2",
+            "max_worker_processes = 4",
             "max_logical_replication_workers = 0",
             "max_wal_senders = 0",
             "max_replication_slots = 0",
@@ -272,7 +291,7 @@ mod tests {
     }
 
     /// The whole file of a 256 MiB and of a 1 GiB class, as PostgreSQL 18 reads it. The small
-    /// class trims what it never uses (no replication, no logical workers, two background
+    /// class trims what it never uses (no replication, no logical workers, four background
     /// workers, two autovacuum slots, no parallel maintenance); a larger class keeps the defaults.
     #[test]
     fn the_rendered_configuration_of_a_small_and_a_larger_class_is_pinned() {
@@ -293,6 +312,9 @@ mod tests {
                  maintenance_work_mem = {maintenance}MB\n\
                  huge_pages = off\n\
                  jit = off\n\
+                 shared_preload_libraries = 'pg_prewarm'\n\
+                 pg_prewarm.autoprewarm = on\n\
+                 pg_prewarm.autoprewarm_interval = 0\n\
                  wal_level = replica\n\
                  archive_mode = on\n\
                  archive_command = '/usr/libexec/pgcf/pgcf-archive %p'\n\
@@ -313,7 +335,7 @@ mod tests {
              io_workers = 1\n\
              max_parallel_workers_per_gather = 0\n\
              max_parallel_maintenance_workers = 0\n\
-             max_worker_processes = 2\n\
+             max_worker_processes = 4\n\
              max_logical_replication_workers = 0\n\
              max_wal_senders = 0\n\
              max_replication_slots = 0\n\
@@ -332,6 +354,239 @@ mod tests {
         // The class boundary is the plan's: 512 MiB is small, one more is not.
         assert!(conf(512, 1).contains("max_wal_senders = 0"));
         assert!(!conf(513, 1).contains("max_wal_senders"));
+    }
+
+    /// Every class runs autoprewarm: the library loads at start, the list of shared buffers is
+    /// written at shutdown only (a running database pays nothing), and the worker slots are not
+    /// the connections' (`max_connections` is the setting's own in every class).
+    #[test]
+    fn every_class_runs_autoprewarm_with_room_for_its_workers_and_the_same_connections() {
+        let value = |text: &str, name: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name} = ")))
+                .map(String::from)
+        };
+        for (memory, volume) in [
+            (128, 1),
+            (256, 1),
+            (512, 1),
+            (513, 1),
+            (1024, 100),
+            (4096, 100),
+        ] {
+            let text = conf(memory, volume);
+            let class = format!("{memory} MiB");
+            assert_eq!(
+                value(&text, "shared_preload_libraries").as_deref(),
+                Some("'pg_prewarm'"),
+                "{class}"
+            );
+            assert_eq!(
+                value(&text, "pg_prewarm.autoprewarm").as_deref(),
+                Some("on"),
+                "{class}"
+            );
+            assert_eq!(
+                value(&text, "pg_prewarm.autoprewarm_interval").as_deref(),
+                Some("0"),
+                "{class}"
+            );
+            // The leader and the worker for one database at a time, and two more: the default of
+            // 8 where the class does not set it.
+            let workers: u32 =
+                value(&text, "max_worker_processes").map_or(8, |v| v.parse().unwrap());
+            assert!(workers >= 4, "{class}: {workers}");
+            assert_eq!(
+                value(&text, "max_connections").as_deref(),
+                Some("25"),
+                "{class}"
+            );
+            // No parallel worker draws from the slots in the small class.
+            if tuning(memory).small {
+                assert_eq!(
+                    value(&text, "max_parallel_workers_per_gather").as_deref(),
+                    Some("0"),
+                    "{class}"
+                );
+            }
+        }
+    }
+
+    /// The process titles of what `postmaster` forked, as `ps` shows them.
+    fn children(cluster: &Cluster) -> Vec<String> {
+        let pid_file = std::fs::read_to_string(cluster.data().join("postmaster.pid")).unwrap();
+        let pid = pid_file.lines().next().unwrap().to_string();
+        let output = std::process::Command::new("ps")
+            .args(["-axo", "ppid=,command="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let (parent, title) = line.trim_start().split_once(' ')?;
+                (parent == pid).then(|| title.trim().to_string())
+            })
+            .collect()
+    }
+    /// Waits for the autoprewarm leader to be a process of the postmaster: the postmaster starts
+    /// its background workers right after it says `ready`, so a look at once may find none.
+    async fn leader(cluster: &Cluster) {
+        for _ in 0..200 {
+            if children(cluster)
+                .iter()
+                .any(|title| title.ends_with("autoprewarm leader"))
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("no leader: {:?}\n{}", children(cluster), cluster.log());
+    }
+    /// Waits for `text` in the log of the cluster.
+    async fn logged(cluster: &Cluster, text: &str) {
+        for _ in 0..200 {
+            if cluster.log().contains(text) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{text:?} was not logged:\n{}", cluster.log());
+    }
+
+    /// Checked against PostgreSQL 18 as the unit starts it: the library loads without `CREATE
+    /// EXTENSION`; its leader is a process without a database, so no row of `pg_stat_activity`;
+    /// nothing is dumped while the database runs; a clean stop writes `autoprewarm.blocks` with
+    /// the blocks of the shared buffers; and the next start reads them.
+    #[tokio::test]
+    async fn autoprewarm_starts_with_the_database_dumps_at_its_stop_and_reads_the_dump_at_the_next_start()
+     {
+        use std::fs;
+        let Some(cluster) = Cluster::create("prewarm") else {
+            return;
+        };
+        cluster.start();
+        leader(&cluster).await;
+        let session = cluster.agent().await;
+        let show = |name: &'static str| {
+            let session = &session;
+            async move {
+                let rows = session.query(&format!("SHOW {name}"), &[]).await.unwrap();
+                rows[0].get::<_, String>(0)
+            }
+        };
+        assert_eq!(show("shared_preload_libraries").await, "pg_prewarm");
+        assert_eq!(show("pg_prewarm.autoprewarm").await, "on");
+        assert_eq!(show("pg_prewarm.autoprewarm_interval").await, "0");
+        assert_eq!(show("max_worker_processes").await, "4");
+        let rows = session
+            .query(
+                "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'autoprewarm%'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 0);
+
+        // About 330 blocks, read once so that they sit in the shared buffers.
+        session
+            .batch("CREATE TABLE t AS SELECT g, repeat('x', 100) AS pad FROM generate_series(1, 20000) g")
+            .await
+            .unwrap();
+        session.query("SELECT count(*) FROM t", &[]).await.unwrap();
+        let rows = session
+            .query(
+                "SELECT pg_relation_filenode('t')::pg_catalog.int8, (SELECT oid::pg_catalog.int8 FROM pg_database WHERE datname = current_database())",
+                &[],
+            )
+            .await
+            .unwrap();
+        let (filenode, database): (i64, i64) = (rows[0].get(0), rows[0].get(1));
+        drop(session);
+        let dump = cluster.data().join("autoprewarm.blocks");
+        assert!(!dump.exists(), "nothing is dumped while the database runs");
+
+        cluster.stop();
+        let text = fs::read_to_string(&dump).unwrap();
+        let listed = text
+            .lines()
+            .filter(|line| line.starts_with(&format!("{database},1663,{filenode},0,")))
+            .count();
+        assert!(listed >= 250, "{listed} blocks of the table in\n{text}");
+        let total = text.lines().count() as u64 - 1;
+        assert_eq!(text.lines().next().unwrap(), format!("<<{total}>>"));
+
+        cluster.start();
+        let (loaded, of) = cluster.prewarmed().await;
+        assert_eq!((loaded, of), (total, total), "{}", cluster.log());
+    }
+
+    /// A restored directory brings the dump of its source, and a crash can leave anything. A dump
+    /// that names a database, a relation, a tablespace, a fork or a block that is not there, and
+    /// one that is no dump at all, do not stop a start or leave the database without its answer;
+    /// the next clean stop writes a dump of its own.
+    #[tokio::test]
+    async fn a_dump_of_what_is_gone_or_a_damaged_one_does_not_stop_a_start() {
+        use std::fs;
+        let Some(cluster) = Cluster::create("prewarm-stale") else {
+            return;
+        };
+        cluster.start();
+        let session = cluster.agent().await;
+        let rows = session
+            .query(
+                "SELECT (SELECT oid::pg_catalog.int8 FROM pg_database WHERE datname = 'postgres'), pg_relation_filenode('pg_class')::pg_catalog.int8",
+                &[],
+            )
+            .await
+            .unwrap();
+        let (database, relation): (i64, i64) = (rows[0].get(0), rows[0].get(1));
+        drop(session);
+        cluster.stop();
+        let dump = cluster.data().join("autoprewarm.blocks");
+        // Of six blocks at most two exist; a database that does not exist ends its worker with
+        // FATAL, which PostgreSQL logs and goes on from.
+        let stale = format!(
+            "<<6>>\n999999,1663,999999,0,0\n{database},1663,999999,0,0\n{database},1663,{relation},0,99999999\n{database},9999,{relation},0,0\n{database},1663,{relation},7,0\n{database},1663,{relation},0,0\n"
+        );
+        for (what, text) in [
+            ("stale", stale.as_str()),
+            ("no dump", "this is not a dump\n"),
+            ("only a header", "<<5>>\n"),
+            ("empty", ""),
+        ] {
+            fs::write(&dump, text).unwrap();
+            cluster.start();
+            let session = cluster.agent().await;
+            let rows = session
+                .query("SELECT 1::pg_catalog.int4", &[])
+                .await
+                .unwrap();
+            assert_eq!(rows[0].get::<_, i32>(0), 1, "{what}");
+            drop(session);
+            if what == "stale" {
+                let (loaded, of) = cluster.prewarmed().await;
+                assert!(of == 6 && (1..6).contains(&loaded), "{loaded} of {of}");
+            } else {
+                // The leader that met the damaged file ends with an error; the postmaster starts
+                // another, which does not read the file again and dumps at the stop.
+                logged(&cluster, "exited with exit code 1").await;
+            }
+            leader(&cluster).await;
+            cluster.stop();
+            let written = fs::read_to_string(&dump).unwrap();
+            let blocks = written.lines().count() as u64 - 1;
+            assert!(blocks >= 1, "{what}: {written}");
+            assert_eq!(
+                written.lines().next().unwrap(),
+                format!("<<{blocks}>>"),
+                "{what}"
+            );
+            assert!(
+                cluster.log().contains("database system is shut down"),
+                "{what}:\n{}",
+                cluster.log()
+            );
+        }
     }
 
     #[test]

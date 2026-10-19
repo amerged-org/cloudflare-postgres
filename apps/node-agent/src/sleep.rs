@@ -14,7 +14,7 @@ static POWER_CONTRACT: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| 
     .expect("generated power constants")
 });
 /// The sessions the sleep guard counts as busy, for the refusal's log line only.
-pub(crate) const BUSY_SESSIONS: &str = "SELECT pg_catalog.left(pg_catalog.string_agg(pg_catalog.concat_ws('/', usename, application_name, state, backend_type), ','), 512) AS sessions FROM pg_catalog.pg_stat_activity WHERE datid IS NOT NULL AND pid <> pg_catalog.pg_backend_pid() AND (state IS DISTINCT FROM 'idle' OR xact_start IS NOT NULL)";
+pub(crate) const BUSY_SESSIONS: &str = "SELECT pg_catalog.left(pg_catalog.string_agg(pg_catalog.concat_ws('/', usename, application_name, state, backend_type), ','), 512) AS sessions FROM pg_catalog.pg_stat_activity WHERE datid IS NOT NULL AND pid <> pg_catalog.pg_backend_pid() AND backend_type <> 'autoprewarm worker' AND (state IS DISTINCT FROM 'idle' OR xact_start IS NOT NULL)";
 /// The size of a WAL segment of the cluster, in bytes.
 const SEGMENT_BYTES: &str = "SELECT pg_catalog.pg_size_bytes(pg_catalog.current_setting('wal_segment_size'))::pg_catalog.int8 AS bytes";
 pub(crate) fn sql(name: &str) -> &'static str {
@@ -233,6 +233,59 @@ mod tests {
         assert_eq!(guard(&agent).await.unwrap(), Some(Refusal::Prepared));
         idle.batch("COMMIT PREPARED 'pgcf_t'").await.unwrap();
         assert_eq!(guard(&agent).await.unwrap(), None);
+    }
+
+    /// After every start the autoprewarm worker is a process connected to a database, with no
+    /// state: the guard's count of sessions that are not idle would take it for work, and a
+    /// database that is woken and put to sleep at once would be refused (`sql_busy`, seen on the
+    /// four tests that sleep a database right after a wake). The worker is held here for as long
+    /// as the test looks: the dump names a table that a prepared transaction keeps locked, and
+    /// the worker waits for it.
+    #[tokio::test]
+    async fn the_autoprewarm_worker_is_no_busy_session() {
+        let Some(cluster) = Cluster::create("guard-prewarm") else {
+            return;
+        };
+        cluster.append_conf("max_prepared_transactions = 2\n");
+        let agent = started(&cluster).await;
+        agent
+            .batch("CREATE TABLE t AS SELECT generate_series(1, 20000) AS a")
+            .await
+            .unwrap();
+        agent.query("SELECT count(*) FROM t", &[]).await.unwrap();
+        agent
+            .batch("BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE; PREPARE TRANSACTION 'pgcf_t'")
+            .await
+            .unwrap();
+        drop(agent);
+        cluster.stop();
+
+        // The lock is back at the start, and the worker waits for it.
+        let agent = started(&cluster).await;
+        let mut waiting = 0;
+        for _ in 0..200 {
+            let rows = agent
+                .query(
+                    "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'autoprewarm worker'",
+                    &[],
+                )
+                .await
+                .unwrap();
+            waiting = rows[0].get::<_, i64>(0);
+            if waiting == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(waiting, 1, "{}", cluster.log());
+        agent.query(sql("CLEAR"), &[]).await.unwrap();
+        let rows = agent.query(sql("GUARD"), &[]).await.unwrap();
+        // The prepared transaction is the one thing that keeps the database awake here.
+        assert_eq!(rows[0].get::<_, i32>("busy"), 0);
+        assert_eq!(rows[0].get::<_, i32>("prepared"), 1);
+        let sessions = busy_sessions(&agent).await;
+        assert_eq!(sessions, None, "{sessions:?}");
+        agent.batch("ROLLBACK PREPARED 'pgcf_t'").await.unwrap();
     }
 
     #[tokio::test]

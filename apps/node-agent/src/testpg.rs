@@ -265,6 +265,22 @@ impl Cluster {
     pub fn log(&self) -> String {
         fs::read_to_string(self.volume().join("postgres.log")).unwrap_or_default()
     }
+    /// The two numbers of "autoprewarm successfully prewarmed N of M previously-loaded blocks",
+    /// waited for: the leader logs them when it has read `autoprewarm.blocks`.
+    pub async fn prewarmed(&self) -> (u64, u64) {
+        for _ in 0..200 {
+            let log = self.log();
+            if let Some(line) = log.lines().find(|l| l.contains("autoprewarm successfully")) {
+                let numbers: Vec<u64> = line
+                    .split_whitespace()
+                    .filter_map(|word| word.parse().ok())
+                    .collect();
+                return (numbers[numbers.len() - 2], numbers[numbers.len() - 1]);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the dump was not read:\n{}", self.log());
+    }
     /// The agent's session.
     pub async fn agent(&self) -> crate::postgres::Session {
         crate::postgres::agent(&self.socket_directory())
