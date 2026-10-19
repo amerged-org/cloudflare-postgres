@@ -92,6 +92,12 @@ impl Node {
             users: Mutex::new(users),
         })
     }
+    /// The agent's start, and only the agent's (not the check's, which runs `connect` too): the
+    /// device links of an earlier agent are dropped, because the namespace that held the volumes
+    /// they name is gone. Each volume gets its link back when it is attached.
+    pub async fn reset_device_links(&self) -> Result<(), storage::Error> {
+        self.storage(|storage| storage.reset_device_links()).await
+    }
     /// The user of the scratch database that `pgcf-agent check` makes, or finds: a system account
     /// of the system's own uid range. The agent's table of uids stays the running agent's alone;
     /// a second process, the check, never writes it.
@@ -655,9 +661,11 @@ mod tests {
 #[cfg(test)]
 mod lab {
     //! The node's machine against a real systemd as PID 1, LVM on a loop device and PostgreSQL 18.
-    //! It runs as root in the lab with the node image's units (`pgcf-pg@.service`, `pgcf.slice`) and a
-    //! group `pgcf-gateway`, with `--ignored`; anywhere else it is skipped. It makes users, a volume
-    //! group and a database, and removes them again.
+    //! It runs as root in the lab with the node image's units (`pgcf-pg@.service`, `pgcf.slice`, the
+    //! masks of `modprobe@loop`, `@dm_mod` and `@dm_verity`) and a group `pgcf-gateway`, with
+    //! `--ignored`; anywhere else it is skipped. It makes users, a volume group and a database, and
+    //! removes them again. Like the units' lab it belongs under `unshare --mount --propagation
+    //! slave`, so that its mounts stay out of PID 1's namespace as the agent's do.
     use super::*;
     use crate::{
         machine::Machine,
@@ -683,6 +691,21 @@ mod lab {
         sh("systemctl", &["show", "-p", property, "--value", unit])
     }
 
+    /// What udev does on a node and a container does not: the `/dev/dm-<minor>` node of a
+    /// device-mapper device, which systemd's image dissection reads the device number through.
+    fn dm_node(device: &str) {
+        let name = device.trim_start_matches("/dev/mapper/");
+        let info = sh(
+            "dmsetup",
+            &["info", "-c", "--noheadings", "-o", "major,minor", name],
+        );
+        let (major, minor) = info.split_once(':').unwrap();
+        let node = format!("/dev/dm-{minor}");
+        if !Path::new(&node).exists() {
+            sh("mknod", &[&node, "b", major, minor]);
+        }
+    }
+
     /// The loop device, the volume group and the users, removed again however the test ends.
     struct Lab {
         disk: PathBuf,
@@ -696,6 +719,7 @@ mod lab {
             };
             run("systemctl", &["stop", &format!("pgcf-pg@{ID}.service")]);
             run("umount", &[&format!("/var/lib/pgcf/db/{ID}")]);
+            let _ = std::fs::remove_file(format!("/run/pgcf/dev/{ID}"));
             run("vgremove", &["-f", &self.group]);
             run("losetup", &["-d", &self.loop_device]);
             run("userdel", &[&format!("pgcf-{ID}")]);
@@ -761,6 +785,14 @@ mod lab {
             (metadata.uid(), metadata.mode() & 0o777)
         };
         assert_eq!(owner(&layout.volume(ID)), (account.uid, 0o700));
+        // The agent has attached the volume, so the unit has its link, and only the agent's
+        // namespace has the mount.
+        let link = layout.device_link(ID);
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from(node.device(&volume))
+        );
+        dm_node(&node.device(&volume));
         node.prepare_socket_directory(ID, &account).unwrap();
         assert_eq!(owner(&layout.socket_directory(ID)), (account.uid, 0o750));
         let data = layout.data(ID);
@@ -842,6 +874,13 @@ mod lab {
             listed(node.inventory().await.unwrap()),
             Some((2 << 30, false))
         );
+        // A volume that is not attached has no link: no start on its empty directory.
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        let refused = node.start(ID).await.unwrap_err();
+        assert!(
+            matches!(&refused, units::Error::Job { result, .. } if result == "assert"),
+            "{refused:?}"
+        );
         assert!(
             node.mount_volumes(std::slice::from_ref(&volume))
                 .await
@@ -849,6 +888,20 @@ mod lab {
                 .is_empty()
         );
         assert!(data.join("PG_VERSION").exists());
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from(node.device(&volume))
+        );
+        // The agent's start drops every link; the volume gets its own back when it is attached.
+        node.reset_device_links().await.unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert!(
+            node.mount_volumes(std::slice::from_ref(&volume))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(std::fs::symlink_metadata(&link).is_ok());
 
         // The memory all databases may hold together, and what the kernel reports.
         node.set_slice_memory(300).await.unwrap();

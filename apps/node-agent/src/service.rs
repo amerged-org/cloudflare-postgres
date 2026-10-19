@@ -202,6 +202,10 @@ impl<M: Machine> Service<M> {
         service.spawn(async move {
             archive.serve(listener).await;
         });
+        // The agent's mounts of the volumes are made first: a start that was in flight when the
+        // agent began reads its database's `postmaster.pid` through them, and the namespace of the
+        // agent before is gone with its mounts.
+        service.boot(&page).await;
         // Starts that were in flight when the agent began end with their units' answers.
         for permit in resumed {
             let (machine, database) = (machine.clone(), permit.database().to_string());
@@ -212,8 +216,6 @@ impl<M: Machine> Service<M> {
                 }
             });
         }
-
-        service.boot(&page).await;
         service.pull_page(page).await;
         // The link stands: the previous boot's journal goes to Cloudflare, if there was a boot.
         let s = service.clone();
@@ -276,7 +278,10 @@ impl<M: Machine> Service<M> {
 
     /// What the first page of a boot does (plan 5.6 job 4, 4.3): the memory ceiling of all
     /// databases and the volumes of the page's databases mounted, and again what the agent
-    /// restored when it started (`restore_runtime`), now that the mounts are there.
+    /// restored when it started (`restore_runtime`), now that the mounts are there. The mounts
+    /// are the agent's own, in its mount namespace, which a restart of the agent ends: it makes
+    /// them all again, so a node serves no wake before they are made (databases that run are not
+    /// touched: their units have mounts of their own).
     async fn boot(&self, page: &Page) {
         let budget = self.core.policy().admission.admission.awake_budget_mib;
         let _ = self.machine.set_slice_memory(budget).await;

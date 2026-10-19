@@ -977,6 +977,9 @@ impl<M: Machine> Core<M> {
         let Some(account) = self.machine.account(&entry.id) else {
             return false;
         };
+        let Some(volume) = Self::volume_id(entry) else {
+            return false;
+        };
         let Some(store) = self.store(&entry.archive_path, crate::credentials::Access::ReadWrite)
         else {
             return false;
@@ -988,7 +991,7 @@ impl<M: Machine> Core<M> {
         register(
             &self.table,
             self.layout(),
-            &self.job_database(&db.id, &account.name),
+            &self.job_database(&volume, &account.name),
             account.uid,
             store,
             upload_log,

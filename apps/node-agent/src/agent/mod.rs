@@ -34,6 +34,7 @@ use crate::{
     layout::Layout,
     machine::Machine,
     state::{DatabaseState, Files},
+    storage::VolumeId,
     usage::Meter,
 };
 use pgcf_native_protocol::agent as protocol;
@@ -361,12 +362,15 @@ impl<M: Machine> Core<M> {
     pub(crate) fn files(&self, id: &str) -> Files {
         Files::new(self.layout().database_files(id))
     }
-    /// The database as the barman jobs know it.
-    pub(crate) fn job_database(&self, id: &str, user: &str) -> JobDatabase {
+    /// The database as the barman jobs know it, with the device of the storage generation
+    /// `volume` that they mount, which is the generation the job reads or writes.
+    pub(crate) fn job_database(&self, volume: &VolumeId, user: &str) -> JobDatabase {
+        let id = volume.database();
         JobDatabase {
             id: id.to_string(),
             user: user.to_string(),
             volume: self.layout().volume(id),
+            device: self.machine.device(volume).into(),
             socket_directory: self.layout().socket_directory(id),
         }
     }

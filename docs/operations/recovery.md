@@ -110,6 +110,12 @@ a damaged journal file fails them with `Failed to iterate through journal`).
   cloudflared's metrics) and Unix sockets. A TCP or UDP socket on another address is an incident.
   `/run/ssh-unix-local/socket` must not be listed there, nor `sshd-unix-local` or `sshd-vsock` in
   `sockets`: the image masks the ssh generator that would bind sshd to them.
+- **Volumes.** A database's volume is mounted in the agent's own mount namespace and in its
+  unit's, never in PID 1's: from a shell `findmnt`, `df`, `fstrim`, `resize2fs` and `ls
+  /var/lib/pgcf/db/<id>` see no volume. Run a command in the agent's namespace with `nsenter
+  --target "$(systemctl show --property=MainPID --value pgcf-agent.service)" --mount -- <command>`,
+  and `pgcf-agent check` the same way. `e2fsck` refuses a volume that a unit or a job still holds
+  open, and so does `lvremove`. Never write into the volume of a database that runs.
 - **Limits.** A result is at most 1 MiB; the oldest entries, or the end of a text (marked
   `[truncated]`), go first. The lines of a database's unit (`pgcf-pg@…`) or of a backup job
   (`pgcf-job-…`), and the lines PID 1 writes about them, are never sent; in a text, every line

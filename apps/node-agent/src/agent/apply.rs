@@ -1875,4 +1875,26 @@ mod tests {
             "the generation the page serves is not retired"
         );
     }
+    /// A restore writes the generation it builds, and a move's target is the next generation of a
+    /// database whose source generation is still in the way: the jobs of a generation mount the
+    /// device of that generation, whichever generation the database's link names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_jobs_of_a_generation_mount_the_device_of_that_generation() {
+        let Some(rig) = Rig::new("job-device").await else {
+            return;
+        };
+        let id = id_of(&rig.entry_json());
+        let layout = rig.core.layout().clone();
+        for generation in [1, 7] {
+            let volume = crate::storage::VolumeId::new(&id, generation).unwrap();
+            let database = rig.core.job_database(&volume, "pgcf-user");
+            assert_eq!(
+                database.device,
+                std::path::PathBuf::from(format!("/dev/mapper/pgcf-db_{id}_g{generation}"))
+            );
+            // One directory for every generation: the job mounts the device at the database's path.
+            assert_eq!(database.volume, layout.volume(&id));
+            assert_eq!(database.id, id);
+        }
+    }
 }

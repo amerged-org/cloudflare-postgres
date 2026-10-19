@@ -22,7 +22,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     slice,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
     time::Instant,
 };
 
@@ -36,12 +36,18 @@ struct Kernel {
     ext4_errors: fn(u32) -> io::Result<u64>,
 }
 
+/// The hold on `Storage::changes`.
+type Changes<'a> = tokio::sync::MutexGuard<'a, ()>;
+
 pub struct Storage<R = SystemRunner> {
     runner: R,
     config: Config,
     latest: Mutex<Option<PoolSample>>,
-    /// Serializes everything that changes the group, the pool or a volume.
-    changes: Mutex<()>,
+    /// Serializes everything that changes the group, the pool or a volume. A fair lock: whoever
+    /// asks first has it first, so that a wake that needs its own volume mounted gets in between
+    /// two volumes of the batch `mount_all` is mounting, which a lock that the batch can take
+    /// again at once would not let it.
+    changes: tokio::sync::Mutex<()>,
     listing: Listing,
     kernel: Kernel,
 }
@@ -59,7 +65,7 @@ impl<R: CommandRunner> Storage<R> {
             runner,
             config,
             latest: Mutex::new(None),
-            changes: Mutex::new(()),
+            changes: tokio::sync::Mutex::new(()),
             listing: Listing::new(VOLUME_LIST_MAX_AGE),
             kernel: Kernel {
                 minor: host::block_minor,
@@ -75,9 +81,10 @@ impl<R: CommandRunner> Storage<R> {
         commands::device(&self.config, id)
     }
 
-    fn lock(&self) -> MutexGuard<'_, ()> {
+    fn lock(&self) -> Changes<'_> {
         // The lock guards no data: a panic while holding it leaves nothing half-updated in memory.
-        self.changes.lock().unwrap_or_else(PoisonError::into_inner)
+        // Storage runs on the blocking pool (`Node::storage`), never in an async task.
+        self.changes.blocking_lock()
     }
     fn run(&self, command: Vec<String>) -> Result<Output, Error> {
         let output = self.runner.run(&command);
@@ -116,6 +123,33 @@ impl<R: CommandRunner> Storage<R> {
     /// A database has one directory, the unit's mount point, whatever generation is mounted.
     fn mount_dir(&self, id: &VolumeId) -> PathBuf {
         self.config.mount_root.join(id.database())
+    }
+    /// The link of the database's unit (`Config::device_links`), and the device it names for `id`.
+    fn link_of(&self, id: &VolumeId) -> (PathBuf, String) {
+        (
+            self.config.device_links.join(id.database()),
+            commands::device(&self.config, id),
+        )
+    }
+    /// Lets the database's unit start on this volume: the link names the device of this
+    /// generation, by rename. Only for a volume that the agent has mounted in its namespace and
+    /// that is not suspect; the rest of this module drops it before anything detaches, repairs or
+    /// removes the volume.
+    fn install_link(&self, id: &VolumeId) -> Result<(), Error> {
+        let (link, device) = self.link_of(id);
+        Ok(host::install_link(&link, &device)?)
+    }
+    /// Takes the link away while it is this volume's: a start of the unit is refused from then on.
+    fn drop_link(&self, id: &VolumeId) -> Result<(), Error> {
+        let (link, device) = self.link_of(id);
+        Ok(host::drop_link(&link, &device)?)
+    }
+    /// The agent's start: no link of an earlier agent stays, because the namespace that held the
+    /// volumes it names is gone. A volume gets its link back when `mount_all` or a wake attaches
+    /// it. The check, which runs `open` as well, must not call this.
+    pub fn reset_device_links(&self) -> Result<(), Error> {
+        let _guard = self.lock();
+        Ok(host::reset_links(&self.config.device_links)?)
     }
     /// The mount of this volume's own filesystem at its directory, if any.
     fn mount_of<'a>(&self, id: &VolumeId, mounts: &'a [Mount]) -> Option<&'a Mount> {
@@ -233,7 +267,7 @@ impl<R: CommandRunner> Storage<R> {
     }
 
     /// `poll_pool` inside a change, which holds the lock.
-    fn sample_pool(&self, held: &MutexGuard<'_, ()>) -> Result<PoolSample, Error> {
+    fn sample_pool(&self, held: &Changes<'_>) -> Result<PoolSample, Error> {
         let sample = self.read_pool()?;
         if !sample.writable() {
             self.mark_suspects(held)?;
@@ -246,13 +280,18 @@ impl<R: CommandRunner> Storage<R> {
     /// makes none. So the pool's state, not ext4's error count, decides which volumes may be
     /// damaged: every volume mounted now. The tag is LVM metadata, so it outlives the agent and
     /// the node, and it stays until `recover_volume` has repaired the volume.
-    fn mark_suspects(&self, _held: &MutexGuard<'_, ()>) -> Result<(), Error> {
+    fn mark_suspects(&self, _held: &Changes<'_>) -> Result<(), Error> {
         let lvs = self.read_lvs()?;
         let mounts = self.mounts()?;
-        let unmarked: Vec<VolumeId> = self
+        let mounted: Vec<(VolumeId, bool)> = self
             .database_volumes(&lvs)
-            .filter(|(id, lv)| !lv.has_tag(SUSPECT_TAG) && self.mount_of(id, &mounts).is_some())
-            .map(|(id, _)| id)
+            .filter(|(id, _)| self.mount_of(id, &mounts).is_some())
+            .map(|(id, lv)| (id, lv.has_tag(SUSPECT_TAG)))
+            .collect();
+        let unmarked: Vec<VolumeId> = mounted
+            .iter()
+            .filter(|(_, suspect)| !suspect)
+            .map(|(id, _)| id.clone())
             .collect();
         if !unmarked.is_empty() {
             self.run(commands::volumes_add_tag(
@@ -260,6 +299,12 @@ impl<R: CommandRunner> Storage<R> {
                 &unmarked,
                 SUSPECT_TAG,
             ))?;
+        }
+        // A suspect volume may not be started on, whoever asks: every volume mounted now has no
+        // link, also one a failed attempt left, which the tag no longer makes a candidate. Units
+        // that run keep their own mounts and are stopped by their databases' recovery.
+        for (id, _) in &mounted {
+            self.drop_link(id)?;
         }
         Ok(())
     }
@@ -424,7 +469,7 @@ impl<R: CommandRunner> Storage<R> {
             if mounts.iter().any(|mount| mount.source == device) {
                 return Err(Error::Mounted);
             }
-            self.run(commands::mkfs(&self.config, id))?;
+            self.run(commands::mkfs(&self.config, id, size_bytes))?;
             self.run(commands::volumes_add_tag(
                 &self.config,
                 slice::from_ref(id),
@@ -434,18 +479,22 @@ impl<R: CommandRunner> Storage<R> {
         self.attach(id, suspect)
     }
 
-    /// Mounts the formatted volume at its directory with mode 0700, unless it is. The directory
-    /// is the database's, so a filesystem of another volume on it, another generation's included,
-    /// refuses the mount. A volume tagged as suspect is not mounted: `recover_volume` repairs it
-    /// first.
+    /// Mounts the formatted volume at its directory with mode 0700, unless it is, and then gives
+    /// the database's unit its link. The directory is the database's, so a filesystem of another
+    /// volume on it, another generation's included, refuses the mount. A volume tagged as suspect
+    /// is not mounted: `recover_volume` repairs it first; one that is mounted and suspect keeps
+    /// its mount and has no link.
     fn attach(&self, id: &VolumeId, suspect: bool) -> Result<(), Error> {
         let (dir, device) = (self.mount_dir(id), commands::device(&self.config, id));
         // The table is read now: an earlier attach of the same call has changed it.
         if let Some(top) = self.top_mount(id, &self.mounts()?) {
-            return if top.source == device {
-                Ok(())
+            if top.source != device {
+                return Err(self.occupied(id, top));
+            }
+            return if suspect {
+                self.drop_link(id)
             } else {
-                Err(self.occupied(id, top))
+                self.install_link(id)
             };
         }
         if suspect {
@@ -462,7 +511,8 @@ impl<R: CommandRunner> Storage<R> {
         }
         host::mount_ext4(&device, &dir)?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-        Ok(())
+        // Last: the link is the unit's permission to start, and exists only for what is mounted.
+        self.install_link(id)
     }
 
     /// Makes `grow` or `mount` see a formatted volume.
@@ -506,7 +556,7 @@ impl<R: CommandRunner> Storage<R> {
         if size_bytes > current {
             self.run(commands::volume_extend(&self.config, id, size_bytes))?;
         }
-        self.run(commands::resize_fs(&self.config, id))?;
+        self.run(commands::resize_fs(&self.config, id, size_bytes))?;
         if released {
             let usage = host::fs_usage(&self.mount_dir(id))?;
             self.apply_reserve(id, usage.reserve_action(true, false), true)?;
@@ -527,9 +577,15 @@ impl<R: CommandRunner> Storage<R> {
     /// mounted, and the unit would start its data. A volume that does not mount is returned and
     /// the others still are. One that does not exist, or whose create stopped before its
     /// filesystem, is the create's to finish.
+    ///
+    /// The change lock is held for one volume at a time, not for all: with a thousand volumes the
+    /// batch takes seconds (a mount is about 100 ms on a node), and a wake that needs its own
+    /// volume mounted waits for one mount, not for the batch.
     pub fn mount_all(&self, current: &[VolumeId]) -> Result<Vec<(VolumeId, Error)>, Error> {
-        let _guard = self.lock();
-        let lvs = self.read_lvs()?;
+        let lvs = {
+            let _guard = self.lock();
+            self.read_lvs()?
+        };
         let mut failures = Vec::new();
         for id in current {
             let lv = match self.volume(&lvs, id) {
@@ -540,6 +596,7 @@ impl<R: CommandRunner> Storage<R> {
                     continue;
                 }
             };
+            let _guard = self.lock();
             if let Err(error) = self.attach(id, lv.has_tag(SUSPECT_TAG)) {
                 failures.push((id.clone(), error));
             }
@@ -547,9 +604,11 @@ impl<R: CommandRunner> Storage<R> {
         Ok(failures)
     }
 
-    /// Unmounts the volume's own filesystem. What is on top at its directory must be that
+    /// Unmounts the volume's own filesystem, after taking its link away: from the first moment no
+    /// unit can be started on a volume that is going. What is on top at its directory must be that
     /// filesystem; `umount` would take whatever is on top.
     fn detach(&self, id: &VolumeId) -> Result<(), Error> {
+        self.drop_link(id)?;
         let mounts = self.mounts()?;
         let Some(own) = self.mount_of(id, &mounts) else {
             return Ok(());
@@ -568,7 +627,28 @@ impl<R: CommandRunner> Storage<R> {
 
     pub fn unmount_volume(&self, id: &VolumeId) -> Result<(), Error> {
         let _guard = self.lock();
-        self.detach(id)
+        let result = self.detach(id);
+        if result.is_err() {
+            // The volume is still attached, so its unit may still be started on it.
+            self.restore_link(id);
+        }
+        result
+    }
+
+    /// After an unmount that did not happen: the link of a volume that is still mounted and not
+    /// suspect. A failure here leaves the volume without a link, which refuses starts: the next
+    /// attach of the volume makes it again.
+    fn restore_link(&self, id: &VolumeId) {
+        let attached = self
+            .mounts()
+            .is_ok_and(|mounts| self.mount_of(id, &mounts).is_some());
+        let suspect = self
+            .read_lvs()
+            .and_then(|lvs| Ok(self.volume(&lvs, id)?.has_tag(SUSPECT_TAG)))
+            .unwrap_or(true);
+        if attached && !suspect {
+            let _ = self.install_link(id);
+        }
     }
 
     /// Removes the volume of a deleted database or of a superseded generation, and its chunks
@@ -586,10 +666,11 @@ impl<R: CommandRunner> Storage<R> {
                 if self.mounts()?.iter().any(|mount| mount.source == device) {
                     return Err(Error::Mounted);
                 }
-                self.run(commands::volume_remove(&self.config, id))?;
+                self.drop_link(id)?;
+                self.remove_logical_volume(id)?;
             }
-            // Removing what is gone is done; its empty directory may remain.
-            Err(Error::Missing) => {}
+            // Removing what is gone is done; its empty directory and its link may remain.
+            Err(Error::Missing) => self.drop_link(id)?,
             Err(error) => return Err(error),
         }
         let others = self
@@ -601,6 +682,19 @@ impl<R: CommandRunner> Storage<R> {
         match fs::remove_dir(self.mount_dir(id)) {
             Err(error) if error.kind() != ErrorKind::NotFound => Err(error.into()),
             _ => Ok(()),
+        }
+    }
+
+    /// `lvremove` of a volume that no mount of the agent holds. A unit or a job has its own
+    /// mount of the volume, in a namespace the agent's mount table does not list, so the refusal
+    /// of lvm2 ("in use") is what tells that one still has it, and it is `Busy`. lvm2 itself asks
+    /// again for about five seconds before it refuses (`activation/retry_deactivation`), which
+    /// covers the moment in which the device of a unit or a job that has just ended is still open
+    /// (measured in the lab: 40-240 ms); a job that runs on is for the caller to try again.
+    fn remove_logical_volume(&self, id: &VolumeId) -> Result<(), Error> {
+        match self.run(commands::volume_remove(&self.config, id)) {
+            Err(Error::Command { stderr, .. }) if stderr.contains(" in use") => Err(Error::Busy),
+            other => other.map(|_| ()),
         }
     }
 
@@ -671,6 +765,9 @@ impl<R: CommandRunner> Storage<R> {
     /// by setting the flag, and `-p` runs again. Anything it still refuses needs an operator.
     pub fn recover_volume(&self, id: &VolumeId, policy: &Policy) -> Result<(), Error> {
         let guard = self.lock();
+        // First of all: from here on no start may run on a volume that is being repaired, and the
+        // link comes back only with the repaired volume's attach.
+        self.drop_link(id)?;
         let lvs = self.read_lvs()?;
         let suspect = self.formatted(&lvs, id)?.has_tag(SUSPECT_TAG);
         let sample = self.sample_pool(&guard)?;
@@ -908,6 +1005,57 @@ mod tests {
         storage.changed_elsewhere();
         assert!(storage.exists(&id).unwrap());
         assert_eq!(storage.runner.ran("lvs"), 2);
+    }
+
+    /// Answers `lvs` with the recorded report and `lvremove` with the failure given.
+    struct Refusing {
+        lvs: String,
+        stderr: &'static str,
+    }
+    impl CommandRunner for Refusing {
+        fn run(&self, command: &[String]) -> io::Result<Output> {
+            match command[0].as_str() {
+                "lvs" => Ok(Output {
+                    code: 0,
+                    stdout: self.lvs.clone(),
+                    stderr: String::new(),
+                }),
+                "lvremove" => Ok(Output {
+                    code: 5,
+                    stdout: String::new(),
+                    stderr: self.stderr.into(),
+                }),
+                _ => Err(io::Error::from(io::ErrorKind::InvalidInput)),
+            }
+        }
+    }
+
+    /// The agent's mount table lists no mount of a unit or a job, which are in namespaces of their
+    /// own: lvm2 refuses a volume that one has open, and that is `Busy`, not a failed command.
+    #[test]
+    fn a_volume_that_lvm2_says_is_in_use_is_busy_and_any_other_refusal_stays_a_command_error() {
+        let removal = Removal::DatabaseDeleted {
+            storage_generation: 1,
+        };
+        let remove = |stderr| {
+            let storage = Storage::new(
+                Refusing {
+                    lvs: LVS.into(),
+                    stderr,
+                },
+                Config {
+                    device_links: std::env::temp_dir()
+                        .join(format!("pgcf-in-use-{}", stderr.len())),
+                    ..Config::default()
+                },
+            );
+            storage.remove_volume(&listed_volume(), removal)
+        };
+        // As lvm2 2.03.31 wrote it for a thin volume that a process holds open (lab).
+        let in_use = "  Logical volume pgcf/db_a1b2c3d4e5f6g7h8i9j0_g1 in use.\n";
+        assert!(matches!(remove(in_use), Err(Error::Busy)));
+        let other = "  Failed to find logical volume \"pgcf/db_a1b2c3d4e5f6g7h8i9j0_g1\"\n";
+        assert!(matches!(remove(other), Err(Error::Command { code: 5, .. })));
     }
 
     #[test]

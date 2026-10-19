@@ -227,7 +227,7 @@ offers the previous kernel through the `.old` links. A one-shot boot of the prev
 | `pgcf-pg@<id>.service` | `pgcf-<id>` | One PostgreSQL per database, in `pgcf.slice`; started only by the agent |
 | `pgcf.slice` | | All databases; the agent sets the awake-database memory budget, 80 % of RAM until then |
 | `pgcfbackup.slice` | | barman-cloud jobs (transient units the agent starts); 512 MiB, CPU and IO weight 20; no dash in the name, because systemd nests `pgcf-backup.slice` inside `pgcf.slice` and the jobs would run under the databases' memory ceiling |
-| `pgcf-agent.service` | root | `pgcf-agent run`, `Type=notify`; host mount namespace (see below); creates `/run/pgcf/agent` |
+| `pgcf-agent.service` | root | `pgcf-agent run`, `Type=notify`; a mount namespace of its own, `PrivateMounts=yes` (see [The agent unit](#the-agent-unit)); creates `/run/pgcf/agent` |
 | `pgcf-gateway.service` | `pgcf-gateway` | `pgcf-native-gateway` in local mode on loopback; starts once `/var/lib/pgcf/credentials/gateway.env` exists |
 | `pgcf-cloudflared.service` | `pgcf-cloudflared` | The Tunnel; starts once `/var/lib/pgcf/credentials/tunnel-token.cred` exists |
 | `ssh.service` | root | Loopback only, user certificates only (no CA ships, so no login until a CA key is written; nothing writes one yet); host keys are created at first boot |
@@ -260,9 +260,34 @@ package from creating a default cluster.
   resets such a directory's group to the unit's own before every start, and no `ExecStartPre=`
   creates it, because that process costs about 35 ms on every start (measured on EU1 in the
   Stage 1 lab).
-- **Mount check:** `AssertPathIsMountPoint=/var/lib/pgcf/db/<id>`: a start on an unmounted volume
-  fails (`Condition…` would "succeed" with the unit inactive). `After=` the mount unit only orders
-  the stop before the unmount at shutdown; nothing ties the database's life to the mount.
+- **Volume and device link:** the unit mounts its own volume:
+  `MountImages=/run/pgcf/dev/<id>:/var/lib/pgcf/db/<id>:root:nosuid,nodev,noexec,noatime`, and
+  `AssertPathExists=/run/pgcf/dev/<id>` fails a start without the link (`Condition…` would "succeed"
+  with the unit inactive; a dangling link fails it too). `/run/pgcf/dev/<id>` is a symlink that the
+  agent keeps, and it exists only while the agent has the volume attached:
+  - It points to the device of the generation that is attached (`/dev/mapper/pgcf-db_<id>_g<n>`),
+    and the agent makes it by rename once it has mounted the volume in its own namespace.
+  - It is removed first of all before a volume is unmounted, repaired (`recover_volume`) or
+    removed, when the pool's failure marks a volume as suspect, and for every volume when the agent
+    starts. It is retargeted to the next generation only after that one is attached, and never made
+    for a volume that is not attached or is suspect. A unit that is running does not need it: it
+    keeps its own mount.
+  - `/run/pgcf/dev` is root's alone (mode 0700; the agent makes it and refuses a directory that
+    another user owns or has another mode), because the root executor follows what is in it and
+    mounts whatever it names into the unit's namespace. It is never a socket directory or a volume.
+  - The second mount of a filesystem that is mounted already costs next to nothing, and both mounts
+    are one superblock: what the agent writes while the database is stopped (its configuration),
+    and its resize and `fstrim` while it runs, are seen by both at once. The mount options stay
+    those of the agent's (no `ro`: a second mount of a read-write filesystem fails with it).
+  - There is no mount unit and no `After=…mount`: no volume is in PID 1's mount namespace. The
+    stop of a database before the node goes down is the unit's own, as the boot test shows.
+  - Why: systemd's executor copies PID 1's mount namespace for every unit it starts and reads
+    `/proc/self/mountinfo` about 64 times (`umount_recursive_full` and
+    `bind_remount_recursive_with_mountinfo`), so the start of a unit grew with every volume
+    mounted there. Lab (systemd 257.13, Debian 13, one container): the executor's handoff took 36
+    to 243 ms for 17 to 1,000 volumes mounted, and 35 to 40 ms for the same volumes in the agent's
+    namespace. EU1 measured 105 ms at 17 volumes and 245 ms at 164, about 1 ms per volume, which is
+    6.6 times the lab's slope; the live effect of the change is not measured yet.
 - **Stop and restart:** `KillMode=mixed`, `KillSignal=SIGINT` (fast shutdown), `TimeoutStopSec=30`,
   `Restart=no`: every start goes through the agent's admission.
 - **Limits:** `MemorySwapMax=0`, `TasksMax=64` and, until the agent applies the database's size, the
@@ -276,8 +301,9 @@ package from creating a default cluster.
 - **OOM:** `OOMPolicy=continue`, `OOMScoreAdjust=-900`, `PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj`,
   `PG_OOM_ADJUST_VALUE=0`: the postmaster is protected, backends are not.
 - **Sandbox:** `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
-  `ProtectSystem=strict` with only the data directory writable; `ProtectHome`, `PrivateTmp`,
-  `PrivateDevices`, a private `/dev/shm` of 64 MiB mounted `noexec,nosuid,nodev`
+  `ProtectSystem=strict` with only the unit's own volume (a mount of its own) and the socket
+  directory writable; `ProtectHome`, `PrivateTmp`, `PrivateDevices`, a private `/dev/shm` of 64 MiB
+  mounted `noexec,nosuid,nodev`
   (`TemporaryFileSystem`; a database's own size goes in a drop-in that applies at its next start);
   `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`,
   `ProtectProc=invisible`, `ProcSubset=pid`; `RestrictNamespaces`, `RestrictRealtime`,
@@ -287,16 +313,56 @@ package from creating a default cluster.
   `io_uring_setup/enter/register`, `userfaultfd`, the SysV message queues and semaphores `msg*` and
   `sem*`, the POSIX message queues `mq_*`; `shmget`, `shmat`, `shmdt` and `shmctl` stay; a forbidden
   call kills the process), `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`.
+- **Device policy:** with `PrivateDevices=yes` the policy is closed, and systemd adds to the policy of
+  every unit with `MountImages=` the devices that image dissection touches: `block-device-mapper`,
+  `block-blkext` and `block-loop` (`rwm`), `/dev/mapper/control` and `/dev/loop-control` (`rw`), next
+  to `ProtectClock`'s `char-rtc` (`r`), which the unit had. `systemctl show -p DeviceAllow` lists
+  exactly these six, and the boot test and the units' lab assert it. Nothing else widens it. It is
+  one layer less between a compromised postmaster and every other database's raw volume, and it
+  cannot be avoided while `MountImages=` is used. What neutralises it: the unit's private `/dev`
+  has no block device node (the user cannot open one), the empty `CapabilityBoundingSet=` rules out
+  `mknod`, `NoNewPrivileges=yes` keeps it so, and the device nodes are `root:disk 0660`.
+- **What a database's user sees of the others:** its mount table lists its own volume only (the
+  agent's mounts and the other units' are in namespaces of their own), the other databases'
+  directories under `/var/lib/pgcf/db` are empty directories it cannot write, and `/var/lib/pgcf/db`
+  cannot be listed. The ids of the other databases stay visible, as before and in both designs: in
+  `/etc/passwd`, under `/run/pgcf`, in `/sys/block/dm-*/dm/name` (every volume's name, so every id
+  and generation), in the cgroup tree (`/sys/fs/cgroup/pgcf.slice/pgcf-pg@<id>.service`) with a
+  neighbour's `memory.current` and `cgroup.procs`, and in `/sys/block/dm-*/stat` and
+  `/sys/fs/ext4/dm-*` (a neighbour's I/O and write counters). The isolation does not hide other
+  databases; it keeps their data and their volumes out of reach. A database's own tenant data
+  cannot make its volume unmountable: every filesystem ends 1 MiB before its volume (see below).
 - **Not set:** `PrivatePIDs` and `PrivateIPC`, because PostgreSQL's `postmaster.pid` interlock needs
   them off (the lab showed a second unit on the same directory being refused); `unix_socket_group`,
   because PostgreSQL would call `chown`, which the filter kills.
 
 ### The agent unit
 
-The agent mounts the database volumes. It runs in the host mount namespace on purpose: any
-filesystem sandboxing option (`ProtectSystem`, `PrivateTmp`, `ReadWritePaths`, …) would give it a
-private mount namespace, and volumes it mounts there would be invisible to the database units. Its
-restart never stops a database, because the databases are independent units.
+The agent mounts the database volumes, in a mount namespace of its own: `PrivateMounts=yes`, and no
+other filesystem sandboxing option (the agent needs to see the node). PID 1 and the executors of
+the units never see its mounts, which is the point: a unit's start does not grow with the number of
+volumes (see Volume and device link above). Its mounts (attach, `fstrim`, `resize2fs`, `e2fsck`
+after it has unmounted, the configuration it writes, `pg_control` and `postmaster.pid` reads) work as
+before inside the namespace; the database units and the backup jobs mount their volumes themselves
+(`MountImages=`).
+
+- The namespace ends with the agent. An agent restart (a release, a crash) ends every mount it made
+  and drops every device link; it mounts every current volume again when it gets its first desired
+  page, one volume at a time, and serves no wake before it has. The databases that run are not
+  touched: a unit has its own mount, which does not depend on the agent's. A restart also ends the
+  page cache of the volumes of sleeping databases (their last mount is gone), so the first wake
+  after it reads from disk. Measure the restart on a node with many volumes before relying on it
+  (live check in the plan).
+- A shell on the node sees none of this: `findmnt`, `df`, `ls /var/lib/pgcf/db/<id>`, `e2fsck`
+  and `fstrim` from the break-glass shell see no volume. Run a command in the agent's namespace
+  with `nsenter --target "$(systemctl show --property=MainPID --value pgcf-agent.service)" --mount
+  -- <command>`. `pgcf-agent check` is run that way (the agent runs it from its own namespace
+  after an update): started from a shell, it would mount the scratch volume in PID 1's namespace.
+- `e2fsck` refuses while a unit or a job holds the device (it opens it exclusively); the agent
+  repairs a volume only after its unit has stopped. Removing a volume asks lvm2, which refuses a
+  device that a unit or a job (whose mounts the agent's mount table does not list) still has
+  open: `remove_volume` answers `Busy` then, after the five seconds lvm2 itself waits, and the
+  caller tries again.
 
 ### cloudflared
 
@@ -312,8 +378,9 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
 - `/var/lib/pgcf/bin/current/pgcf-agent run` runs the agent and signals readiness with `READY=1`.
 - `pgcf-agent check` (plan 5.6 item 10) creates the scratch database on its first call and wakes
   the same database on later calls, queries it over its socket and exits 0 only when it answered;
-  its volume carries the tag `pgcf.db.<id>` like every database volume. The boot test runs it on
-  two boots and requires the same volume both times.
+  its volume carries the tag `pgcf.db.<id>` like every database volume. Run it in the agent's mount
+  namespace (see The agent unit). The boot test runs it that way on two boots and requires the same
+  volume both times.
 - At first boot the agent creates the volume group `pgcf` on `/dev/disk/by-partlabel/pgcf-lvm`
   with a large metadata area, and the thin pool `pgcf/pgcf_thinpool` over the whole partition.
   On this image's lvm2 2.03.31, `lvcreate --type thin-pool` refuses `--errorwhenfull`; the working
@@ -323,10 +390,20 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   leaves 31.05 GiB of pool data next to 1 GiB of metadata and its 1 GiB spare.
 - `/var/lib/pgcf/db` is mode 0711 (the agent creates it so, and tmpfiles resets it at every boot): a
   database reaches its own directory, but nobody can list this one. The IDs are not hidden: the
-  accounts `pgcf-<id>` are in `/etc/passwd`, `/run/pgcf` is 0755 and the mount table lists every
-  mount.
-- Each database's volume is mounted at `/var/lib/pgcf/db/<id>` (mode 0700, owner `pgcf-<id>`) with
-  the data directory `data` inside. The agent creates `/run/pgcf/<id>` (owner `pgcf-<id>`, group
+  accounts `pgcf-<id>` are in `/etc/passwd`, `/run/pgcf` is 0755, and sysfs and the cgroup tree show
+  every volume's name and every database's unit (see Sandbox); the mount table of a database's unit
+  lists its own volume only.
+- Every filesystem is made and grown with an explicit size that ends at least 1 MiB (`FS_END_GAP_BYTES`)
+  before the end of its volume: `mkfs.ext4 … <volume size - 1 MiB>K` and `resize2fs <device> <new
+  size - 1 MiB>K`; systemd never grows it. The units and the jobs mount a volume through systemd's
+  image dissection, whose libblkid probers read the last blocks of the device as root and refuse a
+  device that carries a RAID or ZFS signature there (verified: a 512-byte Intel RAID anchor in the
+  second-to-last sector made the mount fail). With the gap, data in a filesystem never reaches those
+  blocks, which nothing writes and a thin volume reads as zeros. A filesystem made before the gap
+  existed fills its volume and gets the gap at its next growth.
+- Each database's volume is mounted by the agent, in its namespace, at `/var/lib/pgcf/db/<id>` (mode
+  0700, owner `pgcf-<id>`) with the data directory `data` inside, and its unit mounts it again there
+  from the link `/run/pgcf/dev/<id>`. The agent creates `/run/pgcf/<id>` (owner `pgcf-<id>`, group
   `pgcf-gateway`, mode 0750) when it creates a database and again for every database when it
   starts, because `/run` is empty after a boot. It clears the database's `CPUQuota` (`CPUQuota=`)
   whenever the database stops and, when the agent itself starts, for every stopped `pgcf-pg@` unit:
@@ -467,5 +544,5 @@ The guest reports one line per check on the second serial port:
 
 | Boot | Checks |
 | --- | --- |
-| First | no failed unit; nothing listens outside loopback; the journal syncs every 15 s (`systemd-analyze cat-config`); no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; `sshd -t` passes and `sshd -T` reports the operator shell's values; a certificate from a throwaway CA is refused on 127.0.0.1 and ::1, accepted once that CA is installed and refused again when it is removed; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`, and the slice carries the image's 512 MiB `MemoryMax`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750 |
-| Second | no failed unit; loopback only; the journal syncs every 15 s; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |
+| First | no failed unit; nothing listens outside loopback; the journal syncs every 15 s (`systemd-analyze cat-config`); no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; `sshd -t` passes and `sshd -T` reports the operator shell's values; a certificate from a throwaway CA is refused on 127.0.0.1 and ::1, accepted once that CA is installed and refused again when it is removed; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`, and the slice carries the image's 512 MiB `MemoryMax`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check`, run in the agent's mount namespace, creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750; no volume is in PID 1's mount namespace and the agent's has the scratch volume; its filesystem ends at least 1 MiB before its volume; the database unit's `DeviceAllow` is `char-rtc r` and the five entries of `MountImages=` with a closed policy, a private `/dev` and no capability; a start of a unit without a link fails its assertion; the scratch database, started from its link, runs on across a restart of the agent, whose start has dropped every link, and stays awake into the reboot |
+| Second | no failed unit; loopback only; the journal syncs every 15 s; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database, with no volume in PID 1's mount namespace; the database that was awake at the reboot was stopped cleanly before the node went down, and neither PostgreSQL nor ext4 recovered anything at this start |

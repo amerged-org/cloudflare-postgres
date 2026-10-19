@@ -190,6 +190,23 @@ pool() {
 	}
 }
 
+# The agent runs in a mount namespace of its own (pgcf-agent.service has PrivateMounts=yes): every
+# volume is mounted there and in the namespace of the unit that runs on it, and in no other. A
+# command that works on a volume from a shell goes through the agent's namespace; so does the check,
+# which the agent itself runs from its own namespace after an update.
+agent_pid() {
+	systemctl show --property=MainPID --value pgcf-agent.service
+}
+in_agent_namespace() {
+	local pid
+	pid=$(agent_pid)
+	[ "${pid:-0}" -gt 0 ] || {
+		echo "the agent does not run"
+		return 1
+	}
+	nsenter --target "$pid" --mount -- "$@"
+}
+
 scratch_volumes() {
 	lvs --noheadings --options lv_uuid,lv_tags pgcf 2>/dev/null | awk '$2 ~ /(^|,)pgcf\.db\./ { print $1 }'
 }
@@ -197,7 +214,7 @@ scratch_volumes() {
 # Plan 9.1: `pgcf-agent check` creates a scratch database on a thin volume and queries it; after a
 # reboot the same database wakes again (no second volume appears).
 scratch_database() {
-	/var/lib/pgcf/bin/current/pgcf-agent check || return 1
+	in_agent_namespace /var/lib/pgcf/bin/current/pgcf-agent check || return 1
 	local volumes
 	volumes=$(scratch_volumes)
 	if [ "$(wc -w <<<"$volumes")" -ne 1 ]; then
@@ -209,6 +226,34 @@ scratch_database() {
 	else
 		[ "$volumes" = "$(cat "$state/scratch-volume")" ]
 	fi
+}
+
+# PID 1's namespace is what every unit's executor copies and re-reads again and again, so a start
+# grows with the volumes mounted in it: none is, and the agent's namespace has the scratch volume.
+no_volume_in_pid_1_namespace() {
+	if grep -q ' /var/lib/pgcf/db/' /proc/1/mountinfo; then
+		echo "a volume is mounted in PID 1's namespace"
+		return 1
+	fi
+	grep -q ' /var/lib/pgcf/db/' "/proc/$(agent_pid)/mountinfo" || {
+		echo "the agent's namespace has no volume"
+		return 1
+	}
+}
+
+# Every filesystem ends 1 MiB before its volume, so that nothing a database writes forms a RAID or
+# ZFS signature at the end of the device, which systemd's image dissection would refuse to mount.
+scratch_filesystem_gap() {
+	local id volume bytes filesystem
+	id=$(scratch_id)
+	volume="pgcf/db_${id}_g1"
+	bytes=$(lvs --noheadings --nosuffix --units b --options lv_size "$volume" | tr -d ' ')
+	filesystem=$(dumpe2fs -h "/dev/mapper/pgcf-db_${id}_g1" 2>/dev/null |
+		awk -F: '/^Block count:/ { count = $2 + 0 } /^Block size:/ { size = $2 + 0 } END { print count * size }')
+	[ -n "$bytes" ] && [ "$filesystem" -gt 0 ] && [ $((filesystem + 1048576)) -le "$bytes" ] || {
+		echo "filesystem $filesystem of a volume of $bytes"
+		return 1
+	}
 }
 
 scratch_id() {
@@ -322,6 +367,86 @@ backup_slice_top_level() {
 	}
 }
 
+# MountImages= puts the devices that image dissection touches on the unit's device policy; the unit's
+# private /dev and its empty capability set are what keep a database's user from using them.
+database_unit_device_allow() {
+	local expected actual
+	expected=$(printf '%s\n' '/dev/loop-control rw' '/dev/mapper/control rw' 'block-blkext rwm' \
+		'block-device-mapper rwm' 'block-loop rwm' 'char-rtc r')
+	actual=$(systemctl show --property=DeviceAllow --value pgcf-pg@pgcfboottest0000000.service | grep -v '^$' | LC_ALL=C sort)
+	[ "$actual" = "$expected" ] || {
+		echo "DeviceAllow: $actual"
+		return 1
+	}
+	[ "$(systemctl show --property=DevicePolicy --value pgcf-pg@pgcfboottest0000000.service)" = closed ] &&
+		[ "$(systemctl show --property=PrivateDevices --value pgcf-pg@pgcfboottest0000000.service)" = yes ] &&
+		[ -z "$(systemctl show --property=CapabilityBoundingSet --value pgcf-pg@pgcfboottest0000000.service | tr -d ' ')" ] ||
+		{
+			echo "the policy is not closed, the /dev not private or a capability is left"
+			return 1
+		}
+}
+
+# A start without the agent's link /run/pgcf/dev/<id> fails its assertion: nothing runs on an empty
+# mount point. The unit has the link only while the agent has the volume attached.
+database_unit_needs_the_link() {
+	local unit=pgcf-pg@pgcfboottest0000000.service
+	[ ! -e /run/pgcf/dev/pgcfboottest0000000 ] || {
+		echo "the test instance has a link"
+		return 1
+	}
+	if systemctl start "$unit" 2>/dev/null; then
+		systemctl stop "$unit"
+		echo "the unit started without a link"
+		return 1
+	fi
+	[ "$(systemctl show --property=ActiveState --value "$unit")" = inactive ] &&
+		[ "$(systemctl show --property=AssertResult --value "$unit")" = no ]
+}
+
+# The mount units of the volumes are gone, and with them the ordering of a stop before an unmount: a
+# database that is awake when the node reboots must stop cleanly and be found clean afterwards. This
+# starts the scratch database from the agent's link and leaves it running; the agent restarts under
+# it, which drops its links and ends its namespace, and the database runs on.
+scratch_database_runs_across_an_agent_restart() {
+	local unit=pgcf-pg@pgcfcheckscratch0000.service before after
+	[ -L /run/pgcf/dev/pgcfcheckscratch0000 ] || {
+		echo "the checked volume has no link"
+		return 1
+	}
+	systemctl start "$unit" || return 1
+	before=$(systemctl show --property=MainPID --property=InvocationID "$unit")
+	systemctl restart pgcf-agent.service || return 1
+	after=$(systemctl show --property=MainPID --property=InvocationID "$unit")
+	[ "$(systemctl is-active "$unit")" = active ] && [ "$before" = "$after" ] || {
+		echo "the database did not run on: $before / $after"
+		return 1
+	}
+	# The new agent has no namespace to name: its start dropped every link.
+	[ ! -e /run/pgcf/dev/pgcfcheckscratch0000 ] || {
+		echo "a link survived the agent's start"
+		return 1
+	}
+}
+
+# After the reboot with that database awake: the unit stopped on its own, cleanly, before the node
+# went down, and neither PostgreSQL nor ext4 had anything to recover at this start.
+scratch_database_was_stopped_cleanly() {
+	local unit=pgcf-pg@pgcfcheckscratch0000.service
+	journalctl --boot=-1 --unit="$unit" --no-pager --output=cat 2>/dev/null | grep -q 'database system is shut down' || {
+		echo "the previous boot has no clean shutdown of the database"
+		return 1
+	}
+	if journalctl --boot=0 --unit="$unit" --no-pager --output=cat 2>/dev/null | grep -qE 'automatic recovery in progress|not properly shut down'; then
+		echo "PostgreSQL recovered after the reboot"
+		return 1
+	fi
+	if journalctl --boot=0 --dmesg --no-pager --output=cat 2>/dev/null | grep -qE 'EXT4-fs \(dm-[0-9]+\).*(recovery complete|orphan)'; then
+		echo "ext4 replayed a journal or cleaned orphans after the reboot"
+		return 1
+	fi
+}
+
 check no_failed_units no_failed_units
 check loopback_only loopback_only
 check no_ssh_socket no_ssh_socket
@@ -347,6 +472,15 @@ check pool wait_for 120 pool
 [ "$phase" = 1 ] || check socket_directory_after_boot wait_for 30 socket_directory
 check scratch_database scratch_database
 check socket_directory socket_directory
+check no_volume_in_pid_1_namespace no_volume_in_pid_1_namespace
+if [ "$phase" = 1 ]; then
+	check scratch_filesystem_gap scratch_filesystem_gap
+	check database_unit_device_allow database_unit_device_allow
+	check database_unit_needs_the_link database_unit_needs_the_link
+	check scratch_database_runs_across_an_agent_restart scratch_database_runs_across_an_agent_restart
+else
+	check scratch_database_was_stopped_cleanly scratch_database_was_stopped_cleanly
+fi
 check loopback_only_after_database loopback_only
 
 if [ "$failures" -eq 0 ]; then

@@ -68,6 +68,64 @@ test("a database unit's system-call filter denies the kernel's second-stage prim
   }
 });
 
+test("a database unit mounts its own volume from the agent's link and refuses to start without it", () => {
+  const unit = readFileSync(new URL("pgcf-pg@.service", units), "utf8");
+  // The volume is in the agent's mount namespace only: PID 1's namespace is what every executor
+  // copies and re-reads, so a start would grow with the number of volumes mounted there.
+  assert.deepEqual(assignments(unit, "MountImages"), [
+    "/run/pgcf/dev/%i:/var/lib/pgcf/db/%i:root:nosuid,nodev,noexec,noatime",
+  ]);
+  // The link exists only while the agent has the volume attached: a dangling or missing link
+  // fails the start (an assertion, where a condition would skip it), and nothing runs on an empty
+  // directory.
+  assert.deepEqual(assignments(unit, "AssertPathExists"), ["/run/pgcf/dev/%i"]);
+  assert.doesNotMatch(unit, /^AssertPathIsMountPoint=/m, "there is no mount in PID 1's namespace to assert");
+  assert.doesNotMatch(unit, /^After=.*\.mount/m, "no mount unit exists for the volume");
+  // The volume is writable as the unit's own mount; listing it fails with ENOENT on the host.
+  assert.deepEqual(assignments(unit, "ReadWritePaths"), ["/run/pgcf/%i"]);
+  // A `ro` option makes the second mount of the superblock fail (226/NAMESPACE).
+  const [, , partition, options] = (assignments(unit, "MountImages")[0] ?? "").split(":");
+  assert.equal(partition, "root");
+  assert.ok(!(options ?? "").split(",").includes("ro"));
+  for (const option of ["nosuid", "nodev", "noexec", "noatime"]) {
+    assert.ok((options ?? "").split(",").includes(option), option);
+  }
+});
+
+test("MountImages= opens the device policy to block devices: a private /dev and no capability keep them out of a database's reach", () => {
+  const unit = readFileSync(new URL("pgcf-pg@.service", units), "utf8");
+  // systemd adds block-device-mapper, block-blkext and block-loop (rwm) and /dev/mapper/control and
+  // /dev/loop-control (rw) to the policy of a unit with MountImages=. The nodes of the devices are
+  // not in the unit's /dev, and without CAP_MKNOD (the bounding set is empty) the user cannot
+  // make one: these two directives are what the widening rests on.
+  assert.deepEqual(assignments(unit, "PrivateDevices"), ["yes"]);
+  assert.deepEqual(assignments(unit, "CapabilityBoundingSet"), [""]);
+  assert.deepEqual(assignments(unit, "NoNewPrivileges"), ["yes"]);
+  assert.deepEqual(assignments(unit, "ProtectSystem"), ["strict"]);
+  assert.deepEqual(assignments(unit, "DeviceAllow"), [], "the image adds no device of its own");
+});
+
+test("the agent runs in a mount namespace of its own: its volumes never reach PID 1 or the executors", () => {
+  const unit = readFileSync(new URL("pgcf-agent.service", units), "utf8");
+  assert.deepEqual(assignments(unit, "PrivateMounts"), ["yes"]);
+  // The agent alone mounts and unmounts volumes, trims and grows them; no other filesystem sandbox
+  // is set: the agent needs to see the node.
+  for (const key of ["ProtectSystem", "ProtectHome", "PrivateTmp", "ReadWritePaths", "ReadOnlyPaths", "InaccessiblePaths"]) {
+    assert.deepEqual(assignments(unit, key), [], key);
+  }
+});
+
+test("the three oneshots that MountImages= pulls into every start are masked: a start forks none of them", () => {
+  // modprobe@.service has no RemainAfterExit, so loop, dm_mod and dm_verity would run again for every
+  // database that starts (about 7 ms, three forks). dm_mod loads on its own when the device-mapper
+  // control node is opened.
+  for (const module of ["loop", "dm_mod", "dm_verity"]) {
+    const mask = new URL(`etc/systemd/system/modprobe@${module}.service`, image);
+    assert.equal(lstatSync(mask).isSymbolicLink(), true, module);
+    assert.equal(readlinkSync(mask), "/dev/null", module);
+  }
+});
+
 test("a database's private /dev/shm cannot run code, hold setuid files or hold device nodes", () => {
   const unit = readFileSync(new URL("pgcf-pg@.service", units), "utf8");
   const shm = assignments(unit, "TemporaryFileSystem").find((value) => value.startsWith("/dev/shm:"));

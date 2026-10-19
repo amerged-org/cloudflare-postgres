@@ -38,7 +38,7 @@ pub use pool::{NoRoom, Policy, PoolMode, PoolSample};
 pub use store::Storage;
 pub use usage::{Alert, FsUsage, Inventory, MountInfo, Removal, ReserveAction, VolumeInfo};
 
-use crate::units::DB_ROOT;
+use crate::units::{DB_ROOT, DEVICE_LINKS};
 use std::{path::PathBuf, time::Duration};
 
 /// How often the agent reads the pool (plan 4.3: the sample is at most 10 s old for the room rule).
@@ -61,6 +61,11 @@ pub struct Config {
     /// Each volume is mounted at `<mount_root>/<database id>`: the directory is the database's, so
     /// one storage generation of it is mounted at a time.
     pub mount_root: PathBuf,
+    /// The directory of the device links (0700, the agent's alone): `<device_links>/<database id>`
+    /// points to the device of the generation the agent has attached, and exists only while it
+    /// has. The database's unit mounts its volume from that link (`MountImages=`), so a unit
+    /// starts on an attached volume only.
+    pub device_links: PathBuf,
     /// The LVM metadata area of the physical volume: about 95,000 volumes (Stage 1).
     pub pv_metadata_bytes: u64,
     pub pool_metadata_bytes: u64,
@@ -78,6 +83,7 @@ impl Default for Config {
             group: "pgcf".into(),
             pool: "pgcf_thinpool".into(),
             mount_root: PathBuf::from(DB_ROOT),
+            device_links: PathBuf::from(DEVICE_LINKS),
             pv_metadata_bytes: 64 << 20,
             pool_metadata_bytes: 1 << 30,
             logical_cap_factor: 4,

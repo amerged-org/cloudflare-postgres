@@ -340,8 +340,9 @@ impl<M: Machine> Core<M> {
             let store = self
                 .store(&entry.archive_path, Access::ReadWrite)
                 .ok_or("archive_unusable")?;
+            let volume = Self::volume_id(entry).ok_or("backup_failed")?;
             let backup = self
-                .take_backup(&self.job_database(&db.id, &account.name), &store, timeline)
+                .take_backup(&self.job_database(&volume, &account.name), &store, timeline)
                 .await?;
             self.save_state(db, |state| state.backup = Some(backup))
                 .map_err(|_| "backup_failed")
@@ -436,7 +437,7 @@ impl<M: Machine> Core<M> {
             .ok_or("archive_unusable")?;
         self.begin_state(db, entry)?;
         let (account, volume) = self.provision(entry).await?;
-        let job_database = self.job_database(id, &account.name);
+        let job_database = self.job_database(&volume, &account.name);
         // The archive path is the database's own and must hold nothing but backups of the cluster
         // on this volume: a generation never writes into an archive that holds something else
         // (barman overwrites without asking). The first base backup is the last step before the
@@ -556,11 +557,13 @@ impl<M: Machine> Core<M> {
             .store(&source.path, Access::ReadOnly)
             .ok_or("archive_unusable")?;
         self.begin_state(db, entry)?;
-        let (account, _volume) = self.provision(entry).await?;
+        let (account, volume) = self.provision(entry).await?;
         self.apply_limits(entry)
             .await
             .map_err(|_| build_failed!())?;
-        let job_database = self.job_database(id, &account.name);
+        // The restore writes the generation it builds: its device, whatever the database's link
+        // names.
+        let job_database = self.job_database(&volume, &account.name);
         let upload_log = self.files(id).upload_log(entry.storage_generation);
         let host = Rebuild {
             core: self.clone(),

@@ -164,7 +164,21 @@ pub fn dm_status_thin() -> Vec<String> {
 pub fn device(config: &Config, id: &VolumeId) -> String {
     format!("/dev/mapper/{}", dm_name(&config.group, &id.lv_name()))
 }
-pub fn mkfs(config: &Config, id: &VolumeId) -> Vec<String> {
+/// What a filesystem leaves unused at the end of its volume. The unit and the jobs mount a volume
+/// through systemd's image dissection, which runs libblkid's probers as root over the whole
+/// device: RAID and ZFS signatures sit in the last blocks of a device, and a filesystem that ends
+/// with the device lets a database's own data form one there, which makes the dissection refuse
+/// the mount (the database could no longer start or archive). Nothing writes to the gap, so it
+/// stays zero.
+pub const FS_END_GAP_BYTES: u64 = 1 << 20;
+/// The size `mkfs.ext4` and `resize2fs` are given for a volume of `volume_bytes`, in KiB with the
+/// suffix both tools read as such.
+fn fs_size(volume_bytes: u64) -> String {
+    format!("{}K", volume_bytes.saturating_sub(FS_END_GAP_BYTES) / 1024)
+}
+/// The filesystem is made with an explicit size that ends `FS_END_GAP_BYTES` before the end of
+/// the volume, never the whole device.
+pub fn mkfs(config: &Config, id: &VolumeId, volume_bytes: u64) -> Vec<String> {
     words([
         "mkfs.ext4",
         "-F",
@@ -178,10 +192,12 @@ pub fn mkfs(config: &Config, id: &VolumeId) -> Vec<String> {
         "-E",
         "lazy_itable_init=0,lazy_journal_init=0",
         &device(config, id),
+        &fs_size(volume_bytes),
     ])
 }
-pub fn resize_fs(config: &Config, id: &VolumeId) -> Vec<String> {
-    words(["resize2fs", &device(config, id)])
+/// Grows the filesystem to the size `mkfs` gives a volume of `volume_bytes`.
+pub fn resize_fs(config: &Config, id: &VolumeId, volume_bytes: u64) -> Vec<String> {
+    words(["resize2fs", &device(config, id), &fs_size(volume_bytes)])
 }
 pub fn fsck(config: &Config, id: &VolumeId) -> Vec<String> {
     words(["e2fsck", "-p", &device(config, id)])
@@ -299,15 +315,16 @@ mod tests {
         let config = Config::default();
         let device = "/dev/mapper/pgcf-db_a1b2c3d4e5f6g7h8i9j0_g3";
         assert_eq!(super::device(&config, &id()), device);
+        // 1 GiB volume: the filesystem ends 1 MiB before it.
         assert_eq!(
-            line(mkfs(&config, &id())),
+            line(mkfs(&config, &id(), 1 << 30)),
             format!(
-                "mkfs.ext4 -F -q -J size=8 -i 65536 -m 1 -E lazy_itable_init=0,lazy_journal_init=0 {device}"
+                "mkfs.ext4 -F -q -J size=8 -i 65536 -m 1 -E lazy_itable_init=0,lazy_journal_init=0 {device} 1047552K"
             )
         );
         assert_eq!(
-            line(resize_fs(&config, &id())),
-            format!("resize2fs {device}")
+            line(resize_fs(&config, &id(), 2 << 30)),
+            format!("resize2fs {device} 2096128K")
         );
         assert_eq!(line(fsck(&config, &id())), format!("e2fsck -p {device}"));
         assert_eq!(
@@ -322,6 +339,30 @@ mod tests {
             line(trim(&config, &id())),
             "fstrim /var/lib/pgcf/db/a1b2c3d4e5f6g7h8i9j0"
         );
+    }
+
+    /// A database's data can be anything, so the last bytes of the device are never the
+    /// filesystem's: libblkid finds a RAID or ZFS label in the last 512 KiB, at most 1 MiB of a
+    /// device, and the filesystem ends before that for every size of volume.
+    #[test]
+    fn a_filesystem_ends_at_least_one_mib_before_its_volume() {
+        let (config, id) = (Config::default(), id());
+        for extents in [1u64, 2, 3, 8, 256, 25_600] {
+            let volume = extents * (4 << 20);
+            let size = |command: Vec<String>| -> u64 {
+                let last = command.last().unwrap();
+                last.strip_suffix('K').unwrap().parse::<u64>().unwrap() * 1024
+            };
+            for command in [mkfs(&config, &id, volume), resize_fs(&config, &id, volume)] {
+                let fs_bytes = size(command);
+                assert!(
+                    volume - fs_bytes >= FS_END_GAP_BYTES,
+                    "{volume}: {fs_bytes}"
+                );
+                // Whole kibibytes, and whole 4 KiB blocks, so the tools round nothing.
+                assert_eq!(fs_bytes % 4096, 0);
+            }
+        }
     }
 
     /// The list of volumes is dropped after exactly these: every command of the storage is here.
@@ -350,8 +391,8 @@ mod tests {
             dm_status_pool(),
             dm_table_pool(),
             dm_status_thin(),
-            mkfs(&config, &id),
-            resize_fs(&config, &id),
+            mkfs(&config, &id, 1 << 30),
+            resize_fs(&config, &id, 2 << 30),
             fsck(&config, &id),
             replay_journal(&config, &id),
             reserve(&config, &id, 0),

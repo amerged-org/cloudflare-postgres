@@ -93,6 +93,7 @@ impl Lab {
             device: loop_device.clone().into(),
             group: name,
             mount_root: dir.join("db"),
+            device_links: dir.join("run/dev"),
             pool_metadata_bytes: 8 << 20,
             ..Config::default()
         };
@@ -134,6 +135,16 @@ impl Lab {
     }
     fn mount_table(&self) -> String {
         fs::read_to_string("/proc/self/mountinfo").unwrap()
+    }
+    /// What the database's device link names, if there is one.
+    fn link(&self, id: &VolumeId) -> Option<PathBuf> {
+        fs::read_link(self.config().device_links.join(id.database())).ok()
+    }
+    /// The link names exactly this volume's device, and that device is the filesystem mounted at
+    /// the database's directory: the unit that follows the link mounts what the agent has.
+    fn linked_to_the_mounted_volume(&self, id: &VolumeId) -> bool {
+        let device = PathBuf::from(commands::device(self.config(), id));
+        self.link(id).as_deref() == Some(device.as_path()) && self.mounted(id)
     }
     /// The volume's own filesystem is mounted at its directory.
     fn mounted(&self, id: &VolumeId) -> bool {
@@ -296,6 +307,7 @@ fn a_volume_is_created_formatted_and_mounted_for_its_owner_alone() {
         assert!(lv.has_tag(tag), "{tag}: {:?}", lv.tags);
     }
     assert!(lab.mounted(&id));
+    assert!(lab.linked_to_the_mounted_volume(&id));
     assert_eq!(
         fs::metadata(lab.dir_of(&id)).unwrap().mode() & 0o7777,
         0o700
@@ -674,6 +686,9 @@ fn a_full_pool_marks_the_mounted_volumes_and_recovery_brings_them_back_with_thei
         "{result:?}"
     );
     assert!(lab.storage.needs_repair(&a).unwrap() && lab.storage.needs_repair(&b).unwrap());
+    // They are still mounted, and no unit may start on either: the marking took their links.
+    assert!(lab.mounted(&a) && lab.mounted(&b));
+    assert!(lab.link(&a).is_none() && lab.link(&b).is_none());
     let sample = lab.storage.poll_pool().unwrap();
     assert_eq!(sample.mode, PoolMode::OutOfDataSpace);
     assert_eq!(lab.storage.room(&policy()), Err(NoRoom::Unwritable));
@@ -721,12 +736,15 @@ fn a_full_pool_marks_the_mounted_volumes_and_recovery_brings_them_back_with_thei
         Err(Error::NeedsRepair)
     ));
     assert!(!lab.mounted(&a));
+    assert!(lab.link(&a).is_none());
     // Its journal holds transactions whose flag was lost: `e2fsck -p` alone refuses (4).
     let output = SystemRunner.run(&commands::fsck(lab.config(), &a)).unwrap();
     assert_eq!(output.code, 4, "{}", output.stderr);
 
     lab.storage.recover_volume(&a, &policy()).unwrap();
     assert!(lab.mounted(&a));
+    // The repaired volume is attached again, and only now has its link.
+    assert!(lab.linked_to_the_mounted_volume(&a));
     assert!(damaged(&lab).is_empty());
     assert!(!lab.storage.needs_repair(&a).unwrap());
     assert!(!lab.lv(&a).unwrap().has_tag(commands::SUSPECT_TAG));
@@ -937,4 +955,245 @@ fn a_volume_that_is_not_active_is_not_reported_as_empty() {
     assert!(matches!(result, Err(Error::Unexpected(_))), "{result:?}");
     sh("lvchange", &["--quiet", "--activate", "y", &path]);
     assert!(lab.volume(&a).pool_used_bytes > 20 << 20);
+}
+
+/// The filesystem's size from its superblock: block count times block size.
+fn filesystem_bytes(lab: &Lab, id: &VolumeId) -> u64 {
+    let report = sh("dumpe2fs", &["-h", &commands::device(lab.config(), id)]);
+    let field = |name: &str| -> u64 {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    field("Block count:") * field("Block size:")
+}
+
+/// The last `mib` MiB of the volume's device, read raw.
+fn device_tail(lab: &Lab, id: &VolumeId, mib: u64) -> Vec<u8> {
+    let size_mib = lab.lv(id).unwrap().size_bytes >> 20;
+    let output = Command::new("dd")
+        .arg(format!("if={}", commands::device(lab.config(), id)))
+        .args([
+            "bs=1M",
+            &format!("skip={}", size_mib - mib),
+            &format!("count={mib}"),
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    output.stdout
+}
+
+/// The databases' units and jobs mount a volume through systemd's image dissection, whose libblkid
+/// probers read the last blocks of the device as root: nothing a tenant writes may reach them.
+#[test]
+fn a_filesystem_ends_one_mib_before_its_volume_when_made_and_when_grown_and_the_tail_stays_zero() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 128);
+    let gap = commands::FS_END_GAP_BYTES;
+    assert_eq!(filesystem_bytes(&lab, &a), (128 << 20) - gap);
+    // The tenant fills everything its filesystem has, with data of any kind.
+    assert!(!lab.tenant_dd(&a, "fill", 131072, "/dev/urandom"));
+    assert!(device_tail(&lab, &a, 1).iter().all(|byte| *byte == 0));
+    // Growing keeps the gap at the new end, and the same call again changes nothing.
+    lab.storage.grow_volume(&a, 256 << 20).unwrap();
+    assert_eq!(filesystem_bytes(&lab, &a), (256 << 20) - gap);
+    lab.storage.grow_volume(&a, 256 << 20).unwrap();
+    assert_eq!(filesystem_bytes(&lab, &a), (256 << 20) - gap);
+    assert!(!lab.tenant_dd(&a, "fill2", 262144, "/dev/urandom"));
+    assert!(device_tail(&lab, &a, 1).iter().all(|byte| *byte == 0));
+    // A volume that sleeps unmounted is mounted to grow, and ends the same way.
+    lab.storage.unmount_volume(&a).unwrap();
+    lab.storage.grow_volume(&a, 512 << 20).unwrap();
+    assert_eq!(filesystem_bytes(&lab, &a), (512 << 20) - gap);
+}
+
+/// The unit mounts its volume from `<device_links>/<id>` as root (`MountImages=`), so the link
+/// names the device of the attached generation and exists only while the agent has it attached.
+#[test]
+fn a_database_has_a_device_link_exactly_while_its_volume_is_attached() {
+    let lab = Lab::open(1024);
+    let (g1, g2) = (id(ID, 1), id(ID, 2));
+    assert!(lab.link(&g1).is_none());
+    lab.create(&g1, 128);
+    assert!(lab.linked_to_the_mounted_volume(&g1));
+    // The directory is root's alone: the root executor follows what is in it.
+    let links = fs::metadata(&lab.config().device_links).unwrap();
+    assert_eq!((links.uid(), links.mode() & 0o7777), (0, 0o700));
+    // The link is made again for a volume that is mounted already, and never staged visibly.
+    lab.storage.mount_volume(&g1).unwrap();
+    assert_eq!(fs::read_dir(&lab.config().device_links).unwrap().count(), 1);
+
+    // An unmount that fails leaves the volume attached, so it keeps its link.
+    let holder = Holder(
+        Command::new("sleep")
+            .arg("60")
+            .current_dir(lab.dir_of(&g1))
+            .spawn()
+            .unwrap(),
+    );
+    assert!(matches!(lab.storage.unmount_volume(&g1), Err(Error::Busy)));
+    assert!(lab.linked_to_the_mounted_volume(&g1));
+    drop(holder);
+
+    // Unmounted: no link, and so no start.
+    lab.storage.unmount_volume(&g1).unwrap();
+    assert!(lab.link(&g1).is_none() && !lab.mounted(&g1));
+    lab.storage.mount_volume(&g1).unwrap();
+    assert!(lab.linked_to_the_mounted_volume(&g1));
+
+    // The next generation takes the directory, and the link, only after g1 has gone from both.
+    let result = lab.storage.create_volume(&g2, 128 << 20, &policy());
+    assert!(matches!(result, Err(Error::OtherGeneration)), "{result:?}");
+    assert!(lab.linked_to_the_mounted_volume(&g1));
+    lab.storage.unmount_volume(&g1).unwrap();
+    assert!(lab.link(&g1).is_none());
+    lab.create(&g2, 128);
+    assert!(lab.linked_to_the_mounted_volume(&g2));
+    // g1 does not come back over g2, and neither its unmount nor its removal touches g2's link.
+    assert!(matches!(
+        lab.storage.mount_volume(&g1),
+        Err(Error::OtherGeneration)
+    ));
+    lab.storage.unmount_volume(&g1).unwrap();
+    assert!(lab.linked_to_the_mounted_volume(&g2));
+    let order = Removal::Superseded {
+        storage_generation: 1,
+        remove_volume: true,
+    };
+    lab.storage.remove_volume(&g1, order).unwrap();
+    assert!(lab.linked_to_the_mounted_volume(&g2));
+
+    // A volume that goes loses its link before it is removed, and the link of a volume that is
+    // not there is cleaned up as well.
+    lab.storage.unmount_volume(&g2).unwrap();
+    assert!(lab.link(&g2).is_none());
+    std::os::unix::fs::symlink(
+        commands::device(lab.config(), &g2),
+        lab.config().device_links.join(g2.database()),
+    )
+    .unwrap();
+    lab.storage
+        .remove_volume(
+            &g2,
+            Removal::DatabaseDeleted {
+                storage_generation: 2,
+            },
+        )
+        .unwrap();
+    assert!(lab.link(&g2).is_none());
+}
+
+/// An agent's start: the namespace that held the volumes is gone, and with it the truth of every
+/// link. A link is made again with the attach of its volume, whether the volume is mounted by
+/// then or not.
+#[test]
+fn the_agents_start_drops_every_link_and_an_attach_makes_them_again() {
+    let lab = Lab::open(1024);
+    let (a, b) = (id(ID, 1), id(OTHER, 1));
+    lab.create(&a, 64);
+    lab.create(&b, 64);
+    // A link of a database that is gone, and one that was staged and never renamed.
+    let links = lab.config().device_links.clone();
+    std::os::unix::fs::symlink("/dev/mapper/gone", links.join("zzzzzzzzzzzzzzzzzzzz")).unwrap();
+    std::os::unix::fs::symlink("/dev/mapper/gone", links.join("yyyyyyyyyyyyyyyyyyyy.new")).unwrap();
+    lab.storage.reset_device_links().unwrap();
+    assert_eq!(fs::read_dir(&links).unwrap().count(), 0);
+    assert_eq!(fs::metadata(&links).unwrap().mode() & 0o7777, 0o700);
+    // `a` is still mounted, `b` is not (as after the restart that ended the agent's namespace).
+    lab.storage.unmount_volume(&b).unwrap();
+    assert!(lab.mounted(&a) && lab.link(&a).is_none());
+    assert!(
+        lab.storage
+            .mount_all(&[a.clone(), b.clone()])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(lab.linked_to_the_mounted_volume(&a) && lab.linked_to_the_mounted_volume(&b));
+}
+
+/// A wake needs its own volume mounted, and a node with many volumes mounts them for seconds
+/// after its agent starts: the wake waits for one mount of the batch, not for all of them.
+#[test]
+fn a_wake_mounts_its_own_volume_while_the_batch_is_still_running() {
+    let lab = Lab::open(3072);
+    let ids: Vec<VolumeId> = (0..40)
+        .map(|n| id(&format!("a1b2c3d4e5f6g7h8i{n:03}"), 1))
+        .collect();
+    for volume in &ids {
+        lab.create(volume, 32);
+        lab.storage.unmount_volume(volume).unwrap();
+    }
+    let (first, last) = (ids[0].clone(), ids[ids.len() - 1].clone());
+    let storage = &lab.storage;
+    let (batch_ended, wake_ended) = std::thread::scope(|scope| {
+        let batch = scope.spawn(|| {
+            assert!(storage.mount_all(&ids).unwrap().is_empty());
+            std::time::Instant::now()
+        });
+        // The batch has begun when its first volume is mounted.
+        while !lab.mounted(&first) {
+            std::thread::yield_now();
+        }
+        storage.mount_volume(&last).unwrap();
+        let wake_ended = std::time::Instant::now();
+        (batch.join().unwrap(), wake_ended)
+    });
+    assert!(
+        wake_ended < batch_ended,
+        "the wake's mount waited for the whole batch"
+    );
+    assert!(
+        ids.iter()
+            .all(|volume| lab.linked_to_the_mounted_volume(volume))
+    );
+}
+
+/// A unit or a job mounts the volume in a namespace of its own, which the agent's mount table does
+/// not list: lvm2's refusal is what says that one still has it. lvm2 asks again for about five
+/// seconds before it refuses, so a device that is let go of in that time does not stop the removal.
+#[test]
+fn a_volume_that_a_unit_or_a_job_still_has_open_is_busy_and_goes_when_it_lets_go() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 128);
+    lab.storage.unmount_volume(&a).unwrap();
+    let ordered = Removal::DatabaseDeleted {
+        storage_generation: 1,
+    };
+    let hold = |seconds: u32| {
+        Holder(
+            Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "exec sleep {seconds} < {}",
+                    commands::device(lab.config(), &a)
+                ))
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let holder = hold(60);
+    std::thread::sleep(Duration::from_millis(200));
+    let result = lab.storage.remove_volume(&a, ordered);
+    assert!(matches!(result, Err(Error::Busy)), "{result:?}");
+    assert!(lab.lv(&a).is_some());
+    drop(holder);
+
+    // One that lets go while lvm2 still asks again does not stop the removal.
+    let holder = hold(60);
+    std::thread::sleep(Duration::from_millis(200));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        drop(holder);
+    });
+    lab.storage.remove_volume(&a, ordered).unwrap();
+    release.join().unwrap();
+    assert!(lab.lv(&a).is_none());
 }

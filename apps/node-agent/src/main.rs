@@ -81,6 +81,8 @@ mod linux {
     pub async fn run() -> Result<(), Error> {
         let layout = Layout::default();
         let node = Arc::new(Node::connect(layout.clone(), storage::Config::default()).await?);
+        // The volumes the agent before mounted are unmounted with its namespace: so are their links.
+        node.reset_device_links().await?;
         // What a boot lost is back before the agent is ready, link or no link.
         restore_runtime(&*node).await;
         // After a boot the first wake would read its start path from the disk: have it cached in

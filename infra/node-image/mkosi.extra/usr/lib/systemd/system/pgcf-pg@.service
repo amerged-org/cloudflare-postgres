@@ -7,13 +7,20 @@
 # /run/pgcf/<id> (owner pgcf-<id>, group pgcf-gateway, mode 0750) when it creates the database and
 # at its own start, and removes it with the database; no ExecStartPre= does, which would add a
 # process to every start.
+#
+# The unit mounts its own volume (MountImages=), from the link /run/pgcf/dev/<id> that the agent
+# keeps: it points to the device of the generation the agent has attached and mounted in its own
+# mount namespace (pgcf-agent.service), and exists only while the agent has it attached. No volume
+# is in PID 1's mount namespace: systemd's executor copies that namespace for every unit it starts
+# and reads its mount table about 64 times, so a start would take longer with every volume mounted
+# there (about 1 ms per volume on EU1). The second mount of a filesystem that is mounted already
+# costs next to nothing, and both mounts are one superblock: what the agent writes while the
+# database is stopped, and its resize and fstrim while it runs, are seen at once.
 [Unit]
 Description=PGCF database %i
 Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
-# A start on an unmounted volume must fail, not silently skip.
-AssertPathIsMountPoint=/var/lib/pgcf/db/%i
-# Stop before the volume is unmounted at shutdown, without tying the database's life to the mount.
-After=var-lib-pgcf-db-%i.mount
+# A start without the agent's link fails, not silently skips and not on an empty directory.
+AssertPathExists=/run/pgcf/dev/%i
 
 [Service]
 Type=notify
@@ -47,8 +54,12 @@ PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
 ProtectSystem=strict
-# The socket directory must exist: a start without it fails instead of running unreachable.
-ReadWritePaths=/var/lib/pgcf/db/%i /run/pgcf/%i
+# The socket directory must exist: a start without it fails instead of running unreachable. The
+# volume is not listed here: it is writable as a mount of the unit's own, and listing a path that
+# is not on the host fails with ENOENT. Never `ro` among the mount options: the second mount of a
+# filesystem that is mounted read-write fails with it (226/NAMESPACE).
+ReadWritePaths=/run/pgcf/%i
+MountImages=/run/pgcf/dev/%i:/var/lib/pgcf/db/%i:root:nosuid,nodev,noexec,noatime
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

@@ -695,7 +695,7 @@ Each database runs as one systemd service, `pgcf-pg@<id>`, from a template in th
 - **No network.** Only a Unix socket, and no IP address family at all.
 - **Locked down:** a read-only system, private `/tmp` and devices, a private size-limited `/dev/shm`, no capabilities, a system-call filter, and no new privileges.
 - **Own limits.** Memory, CPU, IO and task limits as in 4.4, inside the slice that holds all databases.
-- **Its own volume.** The service refuses to start unless the database's volume is mounted.
+- **Its own volume.** The unit mounts its volume itself, from a link that the agent keeps and removes, and refuses to start unless the agent has the volume attached. The volumes are in the agent's mount namespace and in the units' own, never in PID 1's, so that the cost of a start does not grow with the number of volumes (Appendix C, `infra/node-image/README.md`).
 - **Stopped cleanly.** A stop is a fast shutdown. systemd never restarts a crashed unit by itself; the agent restarts it through admission (section 4.6).
 - **Authentication.** Tenant roles log in over the socket with SCRAM-SHA-256. The agent and backup roles use peer authentication. Nothing else can log in.
 - **Archiving** goes through a small client that talks to the agent (section 7.5). The tenant's PostgreSQL never sees an R2 credential.
@@ -722,7 +722,7 @@ One binary, `apps/node-agent`, is the only actor on the node. Its jobs:
 7. **Recovery.** At boot, and after any failed proof or unexpected stop, find unproven databases and recover them through admission (section 7.10).
 8. **Fencing orders from Cloudflare.** A superseded generation is never started or archived again (section 7.11).
 9. **Metrics and diagnostics:** usage deltas (existing arithmetic), archive lag, pool %, after every reboot the sanitized tail of the previous boot's journal, and, when an administrator asks, one of eight read-only probes (section 9.9).
-10. **A health check** (`pgcf-agent check`): create a scratch database, start it, query it over its socket, then stop and delete it. The CI boot test uses it, and it runs after every update.
+10. **A health check** (`pgcf-agent check`): create a scratch database, start it, query it over its socket, then stop and delete it. The CI boot test uses it, and it runs after every update. It runs in the agent's mount namespace (the agent starts it from there; a shell uses `nsenter`), because the volumes are mounted nowhere else.
 
 An agent restart never stops a database. The units are independent of the agent, and its state is rebuilt from the running units at start.
 
@@ -780,7 +780,7 @@ Changes:
 **What still decides the p95** is not the node:
 - **The Cloudflare path:** the connect tail (up to 670 ms) and the four later round trips. Lane E works on both.
 - **A cold page cache** for a database idle for days. Stage 1 measured +16 / +14 ms on the first statement and +2 / +45 ms on the node path (p50 / p95, the database's files evicted, 509 MB dataset); the Kubernetes runtime saw 70–130 ms more on the first statement.
-  - Volumes stay mounted while asleep, so a stopped database's files stay cached until the memory is needed. Only an unmount drops them (*measured (lab)*: a 64.3 MB table stayed fully cached after stop; unmounting dropped it to 0).
+  - Volumes stay mounted while asleep, so a stopped database's files stay cached until the memory is needed. Only an unmount drops them (*measured (lab)*: a 64.3 MB table stayed fully cached after stop; unmounting dropped it to 0). The mounts of sleeping databases are the agent's, in its own namespace: a restart of the agent ends them, and the files of the sleeping databases leave the cache with them (a running database's unit has a mount of its own).
   - Under memory pressure, that cache goes first.
   - A measured miss because of it (EU1, 2026-10-19: a first request of 6–8 statements took a median of 789 ms with the databases' files partly cached and 1,085 ms through a service binding right after a reboot had emptied the page cache, the node path unchanged and the statements 20–60 ms slower) added `pg_prewarm` with `autoprewarm` to every database on branch `cold-cache` (11.1): the list of the shared buffers is written at each clean stop and read again in the background after the next start, where it competes with the first queries for the disk, and the live A/B in 11.2 decides whether it stays.
 
@@ -1160,7 +1160,7 @@ That covers a crash, a reboot or a Contabo shutdown that stopped PostgreSQL with
 - a read-only system and private `/tmp`, devices and `/dev/shm` (no code, no setuid file, no device node in it);
 - seccomp without io_uring, userfaultfd, the kernel keyring, the message queues and the SysV semaphores, and no capabilities;
 - its own memory, CPU, IO and task limits;
-- its own filesystem on its own thin volume, mounted 0700;
+- its own filesystem on its own thin volume, mounted 0700 by its own unit in a mount namespace of its own;
 - zeroed chunks;
 - backup jobs under its own user.
 
@@ -1204,7 +1204,7 @@ A reinstall issues a new token, and a lost node's key is restricted to the fence
 - The audit log (`audit_events`, `GET /v1/audit-events`) holds every request of an administrator key that is not a GET: key ID, scope, method, route template, status, request ID and time; no body, query, key material or address. A change is written before it runs and its status after, because a change cannot be taken back: a row that cannot be written refuses the request (500), and a status that cannot be written stays null, which means unknown, never success. A refusal (401) of a revoked or an expired administrator key presented with its real secret is recorded; a wrong secret, an unknown key and an integrator's key are not, because the lookup identifier is not secret (it is inside every key string and listed to every `admin_read` holder) and anyone could otherwise grow the table. An event is listed for 90 days, and the next change or refused administrator key deletes the older ones (the minute cron is at its 850-statement bound).
 - Not covered: successful reads, the one bootstrap request, and anything done in the Cloudflare account itself (secrets, the D1 console), which the account's own log records. A key is a shared secret: the log says which key, not which person, and there are no user logins.
 
-**Kernel security.** Isolation rests on the shared kernel, so kernel fixes reach nodes on a fixed schedule (section 9.3). The image also shrinks what a database's user can ask of that kernel: `kernel.io_uring_disabled = 2`, `dev.tty.ldisc_autoload = 0`, and `/var/lib/pgcf/db` at 0711, so that directory cannot be listed. A database's ID stays readable to every database's user elsewhere: the account name `pgcf-<id>` in `/etc/passwd` and `/etc/group`, the `/run/pgcf/<id>` directories under the 0755 `/run/pgcf`, and the mount table in `/proc/self/mountinfo`; the mode does not hide it.
+**Kernel security.** Isolation rests on the shared kernel, so kernel fixes reach nodes on a fixed schedule (section 9.3). The image also shrinks what a database's user can ask of that kernel: `kernel.io_uring_disabled = 2`, `dev.tty.ldisc_autoload = 0`, and `/var/lib/pgcf/db` at 0711, so that directory cannot be listed. A database's ID stays readable to every database's user elsewhere: the account name `pgcf-<id>` in `/etc/passwd` and `/etc/group`, the `/run/pgcf/<id>` directories under the 0755 `/run/pgcf`, the names of the volumes in `/sys/block/dm-*/dm/name`, and the units' cgroups under `/sys/fs/cgroup/pgcf.slice`, which also show a neighbour's `memory.current`; its I/O counters are in `/sys/block/dm-*/stat` and `/sys/fs/ext4/dm-*`. The mode does not hide any of it, and the isolation does not claim to hide other databases: it keeps their data and volumes out of reach. A unit's own mount table lists its own volume only, because the volumes are mounted in the agent's mount namespace and in the units' own, never in PID 1's. A unit with `MountImages=` also gets the block-device entries of the device policy (`DeviceAllow`: `block-device-mapper`, `block-blkext`, `block-loop` `rwm`, `/dev/mapper/control` and `/dev/loop-control` `rw`); the private `/dev` and the empty capability set are what keep a database's user from using them.
 
 **Repository rules.** Never print or commit secrets, `.env*` files, node keys, Tunnel or enrollment tokens, or R2 keys. Never content-search private files.
 
@@ -1228,6 +1228,7 @@ A reinstall issues a new token, and a lost node's key is restricted to the fence
    - after the VM reboots, the scratch database wakes again;
    - nothing listens except on loopback, and no ssh socket exists;
    - the kernel surface, the database unit's system-call filter and the certificate-only sshd are as sections 5.5 and 8 and Appendix C describe;
+   - no volume is in PID 1's mount namespace, the agent's has the scratch volume, the unit's device policy is the six entries Appendix C names, a unit without the agent's link fails its start, and a database awake at the reboot stops cleanly and starts without any recovery;
    - the journal syncs every 15 s.
 5. Compress with zstd (Stage 1: the Contabo rescue system has zstd and gzip but no `xz` binary), and write the sha256 sums and `pgcf-node.json` (with the digests of the four binaries baked into the image). Then it collects the files a registration takes (the compressed image, `pgcf-node.json`, `packages.lock.json`, the four binaries and their sums, never the raw image) and runs the registration script's `--dry-run` on them; on a push to `main` of this repository (not of a fork) it keeps them for 7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`. The job holds no R2 or API credential, so it uploads nothing to R2 and registers nothing; the operator does (below).
 
@@ -1928,7 +1929,7 @@ Key external references:
   - PGDG builds `--with-systemd`, and the postmaster sends `READY=1` when it accepts connections.
 - **User:** `User=pgcf-%i`, a fixed uid from a node-local range, created as a normal `/etc/passwd` entry on the writable root. Never `DynamicUser`, because it recycles uids.
 - **Slice:** `Slice=pgcf.slice`. Weights and limits on the slice avoid the +20 ms per start and +58 ms per stop caused by toggling the cgroup `cpu` controller in `system.slice` (*measured (lab)*; the Stage 1 rerun on EU1 measured no such cost, 11.1).
-- **Mount check:** `AssertPathIsMountPoint=/var/lib/pgcf/db/%i`. With `Condition…`, a start on an unmounted volume "succeeds" with the unit inactive (*measured (lab)*).
+- **Volume and link:** `MountImages=/run/pgcf/dev/%i:/var/lib/pgcf/db/%i:root:nosuid,nodev,noexec,noatime` and `AssertPathExists=/run/pgcf/dev/%i`. With `Condition…`, a start on an unmounted volume "succeeds" with the unit inactive (*measured (lab)*). The link is a symlink in a root-only directory (0700) that the agent keeps: it names the device of the attached generation, is made by rename after the volume is mounted in the agent's namespace, and is removed before the volume is unmounted, repaired or removed, when the pool's failure marks it suspect, and for every volume when the agent starts. The agent unit has `PrivateMounts=yes`. Why: systemd's executor copies PID 1's mount namespace for every start and reads its mount table about 64 times, so a start grew linearly with the volumes mounted there; this is the only fix inside systemd 257. The image masks `modprobe@loop`, `@dm_mod` and `@dm_verity`, which `MountImages=` would run again for every start. The details are in `infra/node-image/README.md`.
 - **Stop and restart:** `KillMode=mixed`, `KillSignal=SIGINT`, `TimeoutStopSec=30`, `Restart=no`.
 - **Limits:**
   - `MemoryMax` = memory, `MemoryHigh` = 90 %, `MemorySwapMax=0`, `TasksMax=64`;
@@ -1938,7 +1939,7 @@ Key external references:
 - **OOM:** `OOMPolicy=continue`, `OOMScoreAdjust=-900`, `PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj`, `PG_OOM_ADJUST_VALUE=0` (*measured (lab)*: postmaster -900, children 0).
 - **Sandbox:**
   - network: `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
-  - filesystem: `ProtectSystem=strict` with `ReadWritePaths` limited to its data and socket directories; `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `TemporaryFileSystem=/dev/shm:size=<from memory size>,mode=1777,noexec,nosuid,nodev` (without the mode PostgreSQL cannot create its segments; Stage 1);
+  - filesystem: `ProtectSystem=strict` with the unit's own volume (its own mount) and `ReadWritePaths=` its socket directory writable; `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `TemporaryFileSystem=/dev/shm:size=<from memory size>,mode=1777,noexec,nosuid,nodev` (without the mode PostgreSQL cannot create its segments; Stage 1);
   - kernel and processes: `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectProc=invisible`, `ProcSubset=pid`;
   - privileges: `RestrictNamespaces`, `RestrictSUIDSGID`, `NoNewPrivileges`, empty `CapabilityBoundingSet`;
   - system calls and memory: `SystemCallFilter=@system-service`, then `~@privileged @resources`, then `~@keyring io_uring_setup io_uring_enter io_uring_register userfaultfd msgget msgsnd msgrcv msgctl semget semop semtimedop semctl mq_open mq_unlink mq_timedsend mq_timedreceive mq_notify mq_getsetattr` (`@system-service` allows these, they are the usual second stage of a kernel exploit, and PostgreSQL uses none: `io_method=worker`, SysV shared memory, unnamed POSIX semaphores; `shmget`, `shmat`, `shmdt` and `shmctl` stay), `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`;
@@ -1982,13 +1983,13 @@ Worst case for 256 MiB (*estimate*): 32 + 25 × (2 + 4) + 16 + 15 ≈ 215 MiB.
   - About 95 MiB of pool metadata is needed for 128 GiB at 64 KiB chunks (*estimate*).
 - **Per database:**
   - a thin LV with virtual size = storage, tagged `pgcf.db.<id>`;
-  - `mkfs.ext4 -J size=8 -i 65536 -m 1 -E lazy_itable_init=0,lazy_journal_init=0`;
-  - mounted 0700 `nosuid,nodev,noexec,noatime`, without `discard`, with `fstrim` after each clean sleep.
+  - `mkfs.ext4 -J size=8 -i 65536 -m 1 -E lazy_itable_init=0,lazy_journal_init=0 <device> <storage - 1 MiB>K`, and `resize2fs <device> <new storage - 1 MiB>K` at a growth: every filesystem ends 1 MiB before its volume, so that data cannot form a RAID or ZFS signature at the end of the device, which makes systemd's image dissection refuse the mount;
+  - mounted 0700 `nosuid,nodev,noexec,noatime`, without `discard`, with `fstrim` after each clean sleep, by the agent in its own mount namespace and again by the unit.
 - **Full-volume recovery:** `tune2fs -m 0` once, and back to `-m 1` after the next resize or when use drops.
 - **Sampling:** commands use `--reportformat json`. Pool status every 5 s (`dmsetup status --noflush`, so that the poll forces no commit of the pool's metadata, or the read-only `devicemapper` crate). Per-LV `data_percent`, and `df` space and inodes, every 60 s.
 
 **Barman jobs:**
-- Started with `systemd-run --uid=pgcf-<id> --slice=<backup slice> -p MemoryMax=<per job> -p InaccessiblePaths=<other databases, agent state>`, with `MemoryMax` 128M for a WAL upload, 128M for a WAL fetch and 256M for a base backup or restore (7.5).
+- Started with `systemd-run --uid=pgcf-<id> --slice=<backup slice> -p MemoryMax=<per job> -p TemporaryFileSystem=/var/lib/pgcf:ro -p InaccessiblePaths=-/run/pgcf/agent -p MountImages=<device>:<volume>:root:nosuid,nodev,noexec,noatime`, with `ReadOnlyPaths=<volume>` for a job that only reads (never the `ro` mount option, which fails with 226/NAMESPACE) and `MemoryMax` 128M for a WAL upload, 128M for a WAL fetch and 256M for a base backup or restore (7.5). The device is the one of the generation the job reads or writes; a restore names its target generation's. The job mounts the volume itself, as the unit does: the pattern it replaced (`TemporaryFileSystem=` over the directory that holds the volumes' mounts) took 2.15 s per job at 1,000 volumes in the lab, with a cost that grew with the square of their number.
 - **Backup slice:** a top-level name without a dash, such as `pgcfbackup.slice`. systemd reads a dash in a slice name as nesting, so `pgcf-backup.slice` sits inside `pgcf.slice` (Stage 1: control group `/pgcf.slice/pgcf-backup.slice`); its jobs would then count against the awake-database limit, which 4.5 budgets separately. The agent's `BACKUP_SLICE` is `pgcfbackup.slice` (it was `pgcf-backup.slice`, a slice the image has no unit for, until 2026-10-19); a node-agent test reads the image's unit directory for the name and the `MemoryMax`, and the boot test reads the loaded slice's `MemoryMax`.
 - Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_DEFAULT_REGION=auto` through `LoadCredential=`, read by a wrapper into the job's environment. Never `systemd-run -E` or `Environment=`: every local user can read those over D-Bus (Stage 1).
 - `--endpoint-url https://<account>.eu.r2.cloudflarestorage.com` for the EU-jurisdiction bucket, and TMPDIR on node disk.
@@ -2003,6 +2004,7 @@ Worst case for 256 MiB (*estimate*): 32 + 25 × (2 + 4) + 16 + 15 ≈ 215 MiB.
 - mkosi settings: `Distribution=debian`, `Release=trixie`, `Snapshot=<fixed snapshot.debian.org time>`, `Format=disk`, `Bootloader=grub`, `BiosBootloader=grub`, `SourceDateEpoch`, `Seed`; no docs and no recommends.
 - Partitions: BIOS boot (1 MiB), ESP (512 MiB), and a writable ext4 root of about 8 GiB that includes `/var`. `systemd-repart` adds the LVM partition over the rest of the disk at first boot.
 - Binaries live in `/var/lib/pgcf/bin/<version>/`.
+- `modprobe@loop.service`, `modprobe@dm_mod.service` and `modprobe@dm_verity.service` are masked (links to `/dev/null` in `/etc/systemd/system`).
 - Firewall: nftables drops inbound traffic except established flows and ICMPv6 neighbour discovery.
 
 **Agent crates** (pinned in `Cargo.lock`, listed in THIRD_PARTY.md): `zbus_systemd`, `sd-notify`, `tokio-postgres`, `postgres-protocol`, and `devicemapper` (MPL-2.0, read-only use).

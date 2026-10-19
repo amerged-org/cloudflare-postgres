@@ -3,6 +3,11 @@
 //! in `pgcfbackup.slice`, as a transient unit the agent starts with `systemd-run`. The unit has
 //! network access and a memory limit of its own; it sees its database's volume and nothing else of
 //! the node's state, and it holds the one credential scoped to its database's archive prefix.
+//!
+//! A job mounts the volume itself (`MountImages=` of the device it is given), like the database's
+//! unit does: the agent's own mount of the volume is in the agent's mount namespace, which the
+//! executor of a job never copies, and a start that has to copy the namespace of PID 1 grows with
+//! the number of mounts there (plan Appendix C).
 use crate::credentials::{Access, Credential, Scope};
 use serde_json::Value;
 use std::{
@@ -25,8 +30,14 @@ pub const BACKUP_SLICE: &str = "pgcfbackup.slice";
 pub const UNIT_PREFIX: &str = "pgcf-job-";
 /// Barman's server name for every database; the archive prefix already makes it unique.
 pub const SERVER_NAME: &str = "database";
-/// What the agent hides from a job: every other database's volume and the agent's own state.
+/// What the agent hides from a job: every other database's volume and the agent's own state. The
+/// job's own volume is mounted again inside what is left (`MOUNT_OPTIONS`).
 pub const STATE_DIRECTORY: &str = "/var/lib/pgcf";
+/// The mount options of every mount of a volume, the unit's and a job's alike
+/// (`pgcf-pg@.service`; `storage::host` mounts with the same attributes): a database's user can
+/// leave anything in its volume. Never `ro`: a second mount of a filesystem that is mounted
+/// read-write fails with it (status 226/NAMESPACE), so a read-only job uses `ReadOnlyPaths=`.
+pub const MOUNT_OPTIONS: &str = "nosuid,nodev,noexec,noatime";
 pub const AGENT_RUN_DIRECTORY: &str = "/run/pgcf/agent";
 /// Barman's temporary files go to the node's disk, not to a tmpfs.
 pub const TEMPORARY_DIRECTORY: &str = "/var/tmp";
@@ -135,13 +146,17 @@ impl Kind {
     }
 }
 
-/// The database a job serves: its Linux user (and group of the same name), its volume and the
-/// directory of its PostgreSQL socket.
+/// The database a job serves: its Linux user (and group of the same name), its volume, the device
+/// the job mounts it from and the directory of its PostgreSQL socket.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Database {
     pub id: String,
     pub user: String,
     pub volume: PathBuf,
+    /// The device of the storage generation the job reads or writes, named by the generation and
+    /// not through the database's link: a restore writes the generation it builds, which no
+    /// link needs to name, and a link exists only for a volume the agent has attached.
+    pub device: PathBuf,
     pub socket_directory: PathBuf,
 }
 impl Database {
@@ -310,6 +325,7 @@ pub fn systemd_run_arguments(
     barman: &Path,
 ) -> Vec<String> {
     let volume = text(&db.volume);
+    let device = text(&db.device);
     let property = |value: String| ["-p".to_string(), value];
     let mut arguments: Vec<String> = [
         "--wait",
@@ -335,15 +351,15 @@ pub fn systemd_run_arguments(
         "PrivateTmp=yes".into(),
         "NoNewPrivileges=yes".into(),
         "UMask=0077".into(),
-        // Every other database and the agent's state vanish; the job's own volume stays.
+        // Every other database and the agent's state vanish; the job mounts its own volume.
         format!("TemporaryFileSystem={STATE_DIRECTORY}:ro"),
         format!("InaccessiblePaths=-{AGENT_RUN_DIRECTORY}"),
     ];
-    if job.writable {
-        properties.push(format!("BindPaths={volume}"));
-        properties.push(format!("ReadWritePaths={volume}"));
-    } else {
-        properties.push(format!("BindReadOnlyPaths={volume}"));
+    properties.push(format!(
+        "MountImages={device}:{volume}:root:{MOUNT_OPTIONS}"
+    ));
+    if !job.writable {
+        properties.push(format!("ReadOnlyPaths={volume}"));
     }
     arguments.extend(properties.into_iter().flat_map(property));
     arguments.push("--".into());
@@ -651,6 +667,7 @@ mod tests {
             id: "abcdefghijklmnopqrst".into(),
             user: "pgcf-abcdefghijklmnopqrst".into(),
             volume: "/var/lib/pgcf/db/abcdefghijklmnopqrst".into(),
+            device: "/dev/mapper/pgcf-db_abcdefghijklmnopqrst_g1".into(),
             socket_directory: "/run/pgcf/abcdefghijklmnopqrst".into(),
         }
     }
@@ -943,7 +960,9 @@ mod tests {
             "-p",
             "InaccessiblePaths=-/run/pgcf/agent",
             "-p",
-            "BindReadOnlyPaths=/var/lib/pgcf/db/abcdefghijklmnopqrst",
+            "MountImages=/dev/mapper/pgcf-db_abcdefghijklmnopqrst_g1:/var/lib/pgcf/db/abcdefghijklmnopqrst:root:nosuid,nodev,noexec,noatime",
+            "-p",
+            "ReadOnlyPaths=/var/lib/pgcf/db/abcdefghijklmnopqrst",
             "--",
             "/usr/bin/barman-cloud-wal-archive",
         ]
@@ -952,22 +971,46 @@ mod tests {
         .chain(wal.arguments.iter().cloned())
         .collect();
         assert_eq!(arguments, expected);
-        // A job that writes gets its volume read-write and nothing else.
+        // A job that writes gets its volume read-write and nothing else, from the device it was
+        // given: the restore's is the target generation's, whatever the database's link says.
         let restore = Job::restore(&store, "20261017T225342", &db.data_directory());
+        let target = Database {
+            device: "/dev/mapper/pgcf-db_abcdefghijklmnopqrst_g7".into(),
+            ..database()
+        };
         let writing = systemd_run_arguments(
             "unit",
-            &db,
+            &target,
             &restore,
             256,
             Path::new("/e"),
             Path::new("/usr/bin"),
         );
         assert!(writing.contains(&"MemoryMax=256M".to_string()));
-        assert!(writing.contains(&"BindPaths=/var/lib/pgcf/db/abcdefghijklmnopqrst".to_string()));
-        assert!(
-            writing.contains(&"ReadWritePaths=/var/lib/pgcf/db/abcdefghijklmnopqrst".to_string())
-        );
-        assert!(!writing.iter().any(|a| a.starts_with("BindReadOnlyPaths")));
+        assert!(writing.contains(
+            &"MountImages=/dev/mapper/pgcf-db_abcdefghijklmnopqrst_g7:/var/lib/pgcf/db/abcdefghijklmnopqrst:root:nosuid,nodev,noexec,noatime"
+                .to_string()
+        ));
+        // The job mounts the volume itself: nothing of the host's namespace is bound in, and a
+        // read-only job gets its read-only view from `ReadOnlyPaths=`. A `ro` mount option would
+        // make the second mount of the device's filesystem fail (226/NAMESPACE).
+        for arguments in [&writing, &arguments] {
+            assert!(!arguments.iter().any(|a| a.starts_with("Bind")));
+            assert!(!arguments.iter().any(|a| a.starts_with("ReadWritePaths")));
+            let mounts: Vec<_> = arguments
+                .iter()
+                .filter_map(|a| a.strip_prefix("MountImages="))
+                .collect();
+            assert_eq!(mounts.len(), 1);
+            let options = mounts[0].rsplit(':').next().unwrap();
+            assert!(
+                !options.split(',').any(|option| option == "ro"),
+                "{options}"
+            );
+            assert!(arguments.contains(&"TemporaryFileSystem=/var/lib/pgcf:ro".to_string()));
+            assert!(arguments.contains(&"InaccessiblePaths=-/run/pgcf/agent".to_string()));
+        }
+        assert!(!writing.iter().any(|a| a.starts_with("ReadOnlyPaths")));
         // A bound is whole seconds, rounded up.
         let short = Job {
             timeout: Duration::from_millis(1500),
@@ -1275,5 +1318,101 @@ mod tests {
             assert_eq!(outcome.exit, Exit::TimedOut);
             assert!(started.elapsed() < Duration::from_secs(1));
         }
+    }
+}
+
+/// A job against a real systemd: the unit mounts its volume itself, from the device of the
+/// generation it is given. They run as root in the lab of `units::lab` (systemd as PID 1, the
+/// image's units and slices, run under `unshare --mount --propagation slave`), with `--ignored`.
+#[cfg(test)]
+mod lab {
+    use super::*;
+    use crate::{credentials::Credential, units::DB_ROOT, units::lab::Database as LabDatabase};
+
+    fn job(program: &'static str, arguments: &[&str], writable: bool) -> Job {
+        Job {
+            kind: if writable {
+                Kind::WalFetch
+            } else {
+                Kind::WalArchive
+            },
+            program,
+            arguments: arguments
+                .iter()
+                .map(|argument| argument.to_string())
+                .collect(),
+            timeout: Duration::from_secs(30),
+            writable,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs systemd as PID 1, root and the node image's units and slices (lab)"]
+    async fn a_job_mounts_the_volume_it_is_given_and_sees_no_other_database() {
+        if !Path::new("/run/systemd/system").is_dir() {
+            eprintln!("skipped: systemd is not PID 1 on this host");
+            return;
+        }
+        let (own, other) = (LabDatabase::new(21), LabDatabase::new(22));
+        let db = Database {
+            id: own.id.clone(),
+            user: crate::units::users::account_name(&own.id),
+            volume: own.root.clone(),
+            device: own.volume.device().into(),
+            socket_directory: Path::new("/run/pgcf").join(&own.id),
+        };
+        let scratch = Path::new("/var/tmp/pgcf-lab-jobs");
+        let _ = std::fs::remove_dir_all(scratch);
+        crate::link::file::create_private_directory(scratch).unwrap();
+        let runner = Runner::new("/usr/bin/systemd-run", "/usr/bin", scratch);
+        let credential =
+            Credential::delivered("fixturekeyid", "fixturesecret", "fixturetoken", 1 << 40)
+                .unwrap();
+        let written = own.root.join("written");
+
+        // A job that writes reaches the volume the agent has mounted too: one superblock.
+        let write = job("touch", &[written.to_str().unwrap()], true);
+        let outcome = runner.run(&db, &write, 128, &credential).await;
+        assert_eq!(outcome.exit, Exit::Code(0), "{}", outcome.stderr);
+        assert!(written.exists());
+
+        // A job that only reads does not write, whatever its user could: `ReadOnlyPaths=` makes the
+        // mount read-only for the job alone, which a `ro` mount option could not.
+        let read = job(
+            "touch",
+            &[written.with_extension("more").to_str().unwrap()],
+            false,
+        );
+        let outcome = runner.run(&db, &read, 128, &credential).await;
+        assert_eq!(outcome.exit, Exit::Code(1));
+        assert!(
+            outcome.stderr.contains("Read-only file system"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(!written.with_extension("more").exists());
+        // And the agent can still write: the superblock is read-write for everyone else.
+        std::fs::write(written.with_extension("agent"), "a").unwrap();
+
+        // What it sees of the node: its own volume and nothing of the other database's.
+        let list = job("ls", &["/var/lib/pgcf", DB_ROOT], false);
+        let outcome = runner.run(&db, &list, 128, &credential).await;
+        assert_eq!(outcome.exit, Exit::Code(0), "{}", outcome.stderr);
+        assert_eq!(
+            outcome.stdout.split_whitespace().collect::<Vec<_>>(),
+            ["/var/lib/pgcf:", "db", "/var/lib/pgcf/db:", own.id.as_str()],
+            "{}",
+            other.id
+        );
+
+        // A device that is not the volume's is not mounted: the job fails instead of running on
+        // an empty directory.
+        let wrong = Database {
+            device: "/dev/mapper/pgcflab-gone".into(),
+            ..db.clone()
+        };
+        let outcome = runner.run(&wrong, &read, 128, &credential).await;
+        assert_ne!(outcome.exit, Exit::Code(0));
+        let _ = std::fs::remove_dir_all(scratch);
     }
 }
