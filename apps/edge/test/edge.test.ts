@@ -54,13 +54,13 @@ const withAccess = {
 const live: { socket: WebSocket; ctx: ExecutionContext }[] = [];
 let logs: ReturnType<typeof vi.spyOn>;
 /**
- * The Edge's own lines. The real DatabaseActor runs in this isolate, so its admission lines
- * (actor_admit) land in the same spy.
+ * Every line but the actor_admit one. The real DatabaseActor runs in this isolate and logs one for
+ * each admission, which lands in the same spy; any other line still counts.
  */
 const edgeLogs = () =>
   logs.mock.calls.filter(
     ([line]: unknown[]) =>
-      typeof line === "string" && line.includes('"conn_admission"'),
+      !(typeof line === "string" && line.includes('"actor_admit"')),
   );
 let database: string;
 /** The node the fixture database runs on, with the key it signs its reports with. */

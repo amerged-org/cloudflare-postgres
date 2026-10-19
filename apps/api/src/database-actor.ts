@@ -42,9 +42,8 @@ const WAKE_FALLBACK_READ_MS = 1000;
 const GATE_LOG_MS = 1000;
 /** A wake claim whose commit lost its row to a concurrent write is read and tried again this often. */
 const WAKE_CLAIM_RETRIES = 2;
-/** Actors constructed and admissions taken by this isolate; only for the actor_admit line. */
+/** Actors constructed by this isolate; only for the actor_admit line. */
 let isolateActors = 0;
-let isolateAdmissions = 0;
 /**
  * A wake ticket of a sleeping database (pool design 2026-10-16): the operation and generation its
  * claim commits in D1, and the route revision and role hash the Edge signs into route v5 with it.
@@ -194,6 +193,8 @@ export class DatabaseActor extends DurableObject<Env> {
     super(ctx, env);
     isolateActors++;
   }
+  /** When this instance was constructed (not the isolate: workerd answers Date.now() with 0 in the global scope). */
+  private readonly constructedAt = Date.now();
   private hasSchema: boolean | undefined;
   /**
    * The tables of the admission path this instance knows to exist. A read never creates one: SQLite
@@ -201,8 +202,6 @@ export class DatabaseActor extends DurableObject<Env> {
    * answer then waits for a commit. Only the write that needs the table creates it.
    */
   private tables = new Set<string>();
-  /** Whether this instance has taken an admitWake yet; only for the actor_admit line. */
-  private admitted = false;
   private waiters = new Map<
     string,
     { deadline: number; resolve: (ready: boolean) => void; owner: object }
@@ -649,10 +648,6 @@ export class DatabaseActor extends DurableObject<Env> {
     user: unknown,
     options?: { deadline?: number; waiterId?: string },
   ): Promise<DatabaseWakeAdmission> {
-    // Counted on arrival, so concurrent calls do not all find the instance or the isolate fresh.
-    const freshInstance = !this.admitted,
-      freshIsolate = ++isolateAdmissions === 1;
-    this.admitted = true;
     const trace: AdmissionTrace = { path: "refused", reused: null };
     const result = await this.#admitWake(databaseId, user, options, trace);
     if (!result.ok) this.refused("admit_wake", databaseId, result.sqlstate);
@@ -664,8 +659,8 @@ export class DatabaseActor extends DurableObject<Env> {
         waiter_id: options?.waiterId ?? null,
         path: trace.path,
         reused: trace.reused,
-        fresh_instance: freshInstance,
-        fresh_isolate: freshIsolate,
+        // 0 when this very call built the instance; a node report or another call may have built it.
+        instance_age_ms: Date.now() - this.constructedAt,
         isolate_actors: isolateActors,
         at_ms: Date.now(),
       }),

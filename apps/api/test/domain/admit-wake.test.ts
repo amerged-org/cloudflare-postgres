@@ -343,6 +343,13 @@ const sqlTexts = (id: string) =>
   );
 const texts = (exec: { mock: { calls: unknown[][] } }) =>
   exec.mock.calls.map(([query]) => String(query));
+/** The actor_admit lines of one database that a console.log spy has seen so far. */
+const admitLines = (log: { mock: { calls: unknown[][] } }, id: string) =>
+  log.mock.calls
+    .map(([line]) => (typeof line === "string" ? line : ""))
+    .filter((line) => line.includes('"actor_admit"'))
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((line) => line.database_id === id);
 
 it("an admission runs no statement SQLite counts as a write", async () => {
   // SQLite counts CREATE TABLE IF NOT EXISTS as a write even when the table exists, and workerd
@@ -409,14 +416,8 @@ it("an Actor that holds no snapshot or ticket yet answers without creating their
   expect(await tables()).toEqual(["database_presence", "database_wake"]);
 });
 
-it("an admission logs one actor_admit line with its path and the freshness of the instance", async () => {
+it("an admission logs one actor_admit line with the path it took", async () => {
   const log = vi.spyOn(console, "log");
-  const admitted = (id: string) =>
-    log.mock.calls
-      .map(([line]) => (typeof line === "string" ? line : ""))
-      .filter((line) => line.includes('"actor_admit"'))
-      .map((line) => JSON.parse(line) as Record<string, unknown>)
-      .filter((line) => line.database_id === id);
   const awake = await admissionSnapshotFixture();
   expect(await publishDatabaseAdmission(env, awake.id)).toBe(true);
   const waiterId = crypto.randomUUID();
@@ -449,60 +450,42 @@ it("an admission logs one actor_admit line with its path and the freshness of th
   await actor(legacy.id).admitWake(legacy.id, "reader");
 
   const lines = [
-    ...admitted(awake.id),
-    ...admitted(sleeping.id),
-    ...admitted(legacy.id),
+    ...admitLines(log, awake.id),
+    ...admitLines(log, sleeping.id),
+    ...admitLines(log, legacy.id),
   ];
   expect(
-    admitted(awake.id).map(({ waiter_id, path, reused, fresh_instance }) => [
+    admitLines(log, awake.id).map(({ waiter_id, path, reused }) => [
       waiter_id,
       path,
       reused,
-      fresh_instance,
     ]),
   ).toEqual([
-    [waiterId, "snapshot", null, true],
-    [null, "snapshot", null, false],
-    [null, "refused", null, false],
+    [waiterId, "snapshot", null],
+    [null, "snapshot", null],
+    [null, "refused", null],
   ]);
   expect(
-    admitted(sleeping.id).map(({ path, reused, fresh_instance }) => [
-      path,
-      reused,
-      fresh_instance,
-    ]),
+    admitLines(log, sleeping.id).map(({ path, reused }) => [path, reused]),
   ).toEqual([
-    ["ticket", false, true],
-    ["ticket", true, false],
+    ["ticket", false],
+    ["ticket", true],
   ]);
-  expect(
-    admitted(legacy.id).map(({ path, fresh_instance }) => [
-      path,
-      fresh_instance,
-    ]),
-  ).toEqual([["ensure_awake", true]]);
+  expect(admitLines(log, legacy.id).map(({ path }) => path)).toEqual([
+    "ensure_awake",
+  ]);
   // Nothing but these fields: no role, password or token.
-  for (const line of lines) {
+  for (const line of lines)
     expect(Object.keys(line)).toEqual([
       "event",
       "database_id",
       "waiter_id",
       "path",
       "reused",
-      "fresh_instance",
-      "fresh_isolate",
+      "instance_age_ms",
       "isolate_actors",
       "at_ms",
     ]);
-    expect(typeof line.fresh_isolate).toBe("boolean");
-    expect(line.isolate_actors).toBeGreaterThanOrEqual(3);
-  }
-  // Every admission after the first of the isolate finds the isolate warm.
-  expect(
-    admitted(awake.id)
-      .slice(1)
-      .every((line) => line.fresh_isolate === false),
-  ).toBe(true);
   held.open();
   await expect
     .poll(async () => (await ticket(sleeping.id))[0]?.state, {
@@ -510,6 +493,42 @@ it("an admission logs one actor_admit line with its path and the freshness of th
       timeout: 3000,
     })
     .toBe("claimed");
+});
+
+it("an actor_admit line says how long its instance has existed and how many Actors the isolate built", async () => {
+  // Another call may build the instance first: a node report publishes the snapshot before any
+  // connect. So the line carries the instance's age, which is 0 only when this call built it.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const log = vi.spyOn(console, "log");
+    const published = await admissionSnapshotFixture();
+    expect(await publishDatabaseAdmission(env, published.id)).toBe(true);
+    vi.advanceTimersByTime(5000);
+    await actor(published.id).admitWake(published.id, "app");
+    const [warm] = admitLines(log, published.id);
+    expect(warm).toMatchObject({ path: "snapshot", instance_age_ms: 5000 });
+
+    // An id nothing has called: this very admission builds its Actor, one more in the isolate.
+    const cold = newDatabaseId();
+    await actor(cold).admitWake(cold, "app");
+    vi.advanceTimersByTime(7);
+    await actor(cold).admitWake(cold, "app");
+    const [first, second] = admitLines(log, cold);
+    expect(first).toMatchObject({ instance_age_ms: 0 });
+    expect(second).toMatchObject({ instance_age_ms: 7 });
+    expect(first!.isolate_actors).toBe((warm!.isolate_actors as number) + 1);
+    expect(second!.isolate_actors).toBe(first!.isolate_actors);
+
+    // Admitting on the first database again builds nothing.
+    await actor(published.id).admitWake(published.id, "app");
+    const [, again] = admitLines(log, published.id);
+    expect(again).toMatchObject({
+      instance_age_ms: 5007,
+      isolate_actors: first!.isolate_actors,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it("a manual suspension is not wakeable and answers 57P03", async () => {
