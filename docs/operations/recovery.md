@@ -1,14 +1,15 @@
 # Operator recovery
 
 The operator deployment uses local PostgreSQL volumes and R2 archives. Loss of a VPS is recovered
-from R2; the last recoverable commit depends on the WAL that actually reached R2. There is no
-synchronous replica or zero-loss promise. Record both recovery duration and the last restored
-commit in the ULTRA plan after each real drill.
+from R2. A database whose sleep was proven loses nothing; an awake one loses at most its
+`archive_timeout_seconds` plus the upload time, because the last recoverable commit depends on the
+WAL that actually reached R2. There is no synchronous replica or zero-loss promise. Record both
+recovery duration and the last restored commit in the ULTRA plan after each real drill.
 
 The operator topology is EU only: customer EU1 (6 vCPU, 12 GB RAM), as recorded in the canonical
-[ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md). The Kubernetes
-runtime was retired on 2026-10-17; no node executes databases until the Debian node runtime of
-the plan is installed. Never order a replacement node without the owner's explicit, costed go.
+[ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md). EU1 is the region's
+only node, so losing it stops every database until each is restored from R2 onto new capacity.
+Never order a replacement node without the owner's explicit, costed go.
 
 Recovery drills use separate targets while preserving the healthy source and its committed data.
 Do not reset, re-adopt, fence, delete or decommission EU1 for an acceptance drill. The incident
@@ -30,11 +31,12 @@ recovers the same customer EU1.
    region's bucket, endpoint and archive path; its configuration revision is independent of its
    storage generation. Source backup/WAL selection still uses the source region's catalog and
    bucket, including when the source has been deleted.
-5. Ready requires recovery promotion, SQL database-name mapping, actual role/settings and volume
-   checks, and removal of the temporary restore administrator. Authenticate to the target over
-   the normal endpoint and compare the required tables, roles, sequences and committed markers.
-   Confirm promotion by writing a new target marker, then obtain a completed base backup and
-   archived WAL in the target's own archive. Source credentials must not write those objects.
+5. Ready means the node promoted the restored database onto a later timeline than the backup's,
+   with the backup's system identifier, reset its roles and took the first base backup of the new
+   timeline into the target's own archive, which counts only when it is DONE (plan 7.8). Authenticate
+   to the target over the normal endpoint and compare the required tables, roles, sequences and
+   committed markers. Confirm promotion by writing a new target marker. Source credentials never
+   write the target's archive: the restore reads the source with a read-only credential.
 6. Switch the adopter's connection only after these checks. Once writes reach the target, do not
    switch back to an older source without reconciling those writes.
 
@@ -49,20 +51,44 @@ missing or ambiguous coverage is refused rather than creating an empty database.
 
 ## Lost node
 
-Node-loss and node-addition endpoints require an admin API key.
+Node-loss and node-addition endpoints require an admin API key. A node is never declared lost from
+staleness alone, and fencing comes before any database moves (plan 7.11, 9.4).
 
-1. Read `/v1/operational-health?scope=nodes` and verify the actual node UID. A stale heartbeat
-   excludes placement after 180 seconds; it does not automatically authorize a replacement order.
+1. Read `/v1/operational-health?scope=nodes` and verify the actual node UID. A node whose newest
+   sample is older than 180 seconds is stale: placement excludes it and `regional_node_stale`
+   fires, and that does not declare it lost or authorize a replacement order. Look at the node
+   first ([below](#looking-at-a-node)); a silent node answers nothing, so check the instance in the
+   Contabo panel.
 2. Submit `POST /v1/nodes/{id}/mark-lost` with
-   `{"expected_node_uid":"<verified UID>","reason":"<short incident description>"}`.
-   Loss is terminal and repeated calls preserve the original record. Metadata, archives and
+   `{"expected_node_uid":"<verified UID>","reason":"<short incident description>"}`. One batch
+   writes the fence before anything else: the node's key is restricted to the fenced scope (it still
+   signs the pull of its desired page and its observation reports and nothing else; every other
+   signed call answers `403 node_fenced`), its page holds a `fence` order and, for each database on
+   it, a `superseded` order for its current storage generation with the volume kept, and every move
+   from or toward the node ends. The node is marked lost, which closes its databases at the Edge.
+   Loss is terminal, repeated calls preserve the original record, and metadata, archives and
    historical provider receipts remain available. Heartbeats cannot make the node healthy again.
-3. Restore affected databases onto available healthy capacity using the separate-target restore
-   procedure above. An established database on a lost node must report recovery required.
-4. Reinstalling a node uses AddNode in recover mode with the pull installer
-   ([plan 9.2](../architecture/cloudflare-convergence-and-serverless-plan.md#92-installing-a-node-on-contabo-no-relay-no-ssh)
-   and [9.4](../architecture/cloudflare-convergence-and-serverless-plan.md#94-node-loss-and-recovery)),
-   which is built in Stage 3. Until then, recover databases by restore.
+3. The minute cron finishes the fence one step per run and retries each step until it holds: it
+   deletes the node's Tunnel (its token dies with it), orders the instance powered off through the
+   Contabo API, and reads the instance until the provider says stopped. `GET /v1/nodes/{id}/loss`
+   shows `fencing` or `fenced`, the time of each step, the class of the step that failed last (a
+   fence stuck for days raises `control_cron_step_failing`) and, for each database of the node, the
+   proven-sleep record and the newest base backup the node last reported: the recovery point.
+4. Only when the status is `fenced`, restore the affected databases onto healthy capacity with the
+   separate-target restore procedure above. Each restore is a new database with a new ID; the
+   integrator rebinds. The last archived commit is what comes back, not the last acknowledged one
+   (a database with a proven-sleep record loses nothing).
+5. A node that comes back after the fence pulls a page that holds the fence and the superseded
+   orders and no database. The agent writes them to disk before it acts, never lifts one because it
+   left the page, starts and archives none of those databases, and keeps their volumes. A fence
+   ends only with a reinstall, which is a new install with a new key.
+6. To reinstall the same instance, or replace it, use AddNode in recover mode with the pull
+   installer ([plan 9.2](../architecture/cloudflare-convergence-and-serverless-plan.md#92-installing-a-node-on-contabo-no-relay-no-ssh);
+   [adding a node](operator-installation.md#adding-reinstalling-and-updating-a-node)). A replacement
+   server is a purchase and needs the owner's costed go. The reinstall guard refuses recover mode
+   while the fence is incomplete and while any database of the node lacks a proven-sleep record for
+   its current generation, because a reinstall overwrites any WAL that never reached R2; the owner
+   acknowledges that loss with `POST /v1/nodes/{id}/reinstall-override` and a reason.
 
 ## Looking at a node
 
@@ -121,15 +147,16 @@ a damaged journal file fails them with `Failed to iterate through journal`).
 
 ## Control plane
 
-Keep a D1 export, the deployment source, private Worker binding configuration, Worker secret
-values, agent credentials and routing keyrings together in an encrypted operator backup.
-Cloudflare cannot return previously issued secret values. Keep the decryption key outside the
-repository and an independent copy outside the machine that created it.
+Keep a D1 export, the deployment source, private Worker binding configuration and Worker secret
+values (including the R2 parent key and the routing keyrings) together in an encrypted operator
+backup. Cloudflare cannot return previously issued secret values. Keep the decryption key outside
+the repository and an independent copy outside the machine that created it.
 
 After control loss, restore the export into a separate D1 database, check SQLite integrity and
-foreign keys, and verify region/node/credential identity before switching Worker bindings.
-Restore secret values without replacing the retained agent identity. Recover PostgreSQL through
-R2 into separate targets. Validate SQL and routing before opening traffic.
+foreign keys, and verify region, node and credential identity before switching Worker bindings.
+A node's key lives on the node and its public key in D1, so a restored D1 recognises the nodes
+without a reinstall; restore the secret values unchanged. If nodes were lost as well, recover
+PostgreSQL through R2 into separate targets. Validate SQL and routing before opening traffic.
 
 Restoring a daily D1 export into a scratch D1 database is open as go-live gate G6 of the ULTRA
 plan; the daily artifacts have so far only been read back.
@@ -147,24 +174,36 @@ adapter changes and customer prices outside this generic service.
 
 ## Thin storage admission and recovery
 
-Thin storage is enabled per node. Existing thick volumes keep their backend and data. A thin
-volume keeps its class, Node UID, volume-group UUID and pool UUID; logical quota growth is
-forward-only within the configured finite maximum.
+Every database lives on its own thin LVM volume of the node's one thin pool (plan 4.3). The pool is
+created at full size at first boot and does not grow.
 
-- Room: the node refuses a create, restore, wake and start when its pool has no room (its own room
-  rule: a pool sample at most 10 s old, free data at least the reserve, metadata below 75 %).
-  Cloudflare places no new database or restore on a node whose pool is at 80 % of its data or 50 %
-  of its metadata, or whose sold storage reached four times its data. Logical quota totals do not
-  reserve extents. `thin_storage_blocked` fires when the pool has no room. The pool does not grow.
-- A full pool fails writes at once (`--errorwhenfull y`). PostgreSQL then stops with PANIC and no
-  commit is acknowledged without durable WAL. Free pool space by deleting databases on the node;
-  the next start recovers from WAL.
-  Running writers are never stopped for storage.
+- **Room.** A node refuses a create, restore, wake and start when its own room rule fails: a pool
+  sample no older than the policy's `sample_max_age_seconds`, free data of at least the policy's
+  `reserve_bytes` and metadata below `metadata_no_room_percent`. The refusal is `57P03` with the
+  DETAIL "storage"; running databases keep running. Cloudflare places no new database or restore on
+  a node whose pool is at 80 % of its data or 50 % of its metadata, or whose sold storage reached
+  four times its data (`regional_node_pool_closed`). Sold sizes do not reserve space.
+  `thin_storage_blocked` fires when the pool has no room. Free space by deleting databases on the
+  node.
+- **A full pool.** Writes fail at once (`--errorwhenfull y`) and no commit is acknowledged without
+  durable WAL. ext4 on the affected volumes then aborts its journal and remounts read-only, so
+  those databases stop. Once space is back above the reserve, the agent recovers each affected
+  database itself: it stops the unit, unmounts the volume, repairs it with `e2fsck -p`, mounts it
+  again and wakes the database through admission; PostgreSQL runs crash recovery from its durable
+  WAL, and every acknowledged commit survives. A volume it cannot repair (`e2fsck` refuses) needs an
+  operator. Running writers are never stopped for storage.
+- **A full volume.** A tenant can fill its own volume by reaching its size, by using up its inodes
+  or by keeping WAL during an R2 outage. The agent reports each volume's space and inodes every 60
+  seconds, and `database_volume_warning` (80 %) and `database_volume_critical` (90 %) fire. Raise the
+  size with `PUT /v1/databases/{id}/resources` (storage only grows) or have the integrator free
+  space. When a volume is full PostgreSQL stops on the failed WAL write, and crash recovery itself
+  must write: the agent frees the filesystem's 1 % root-only reserve once so that recovery can
+  finish and the integrator can delete data or resize; a database that still cannot start needs its
+  size raised. Nothing extends a volume by itself.
 
 Thin physical allocation metrics stay null until a real measurement exists; neither a logical
-quota nor zero stands in for an unknown measurement. The node agent's full-pool and full-volume
-recovery ([plan 4.3](../architecture/cloudflare-convergence-and-serverless-plan.md#43-disk-thin-lvm))
-is built in Stage 3.
+quota nor zero stands in for an unknown measurement. The agent's full-pool and full-volume recovery
+is tested against lab volumes; the live test (Stage 5.5 of the ULTRA plan) has not run yet.
 
 ## Node maintenance cycle
 

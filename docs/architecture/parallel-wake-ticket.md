@@ -1,6 +1,6 @@
 # Proposal: the DatabaseActor off the serial cold path
 
-**Status:** design proposal for the owner, 2026-10-19. Nothing here is built. It changes nothing in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md); a decision on it is recorded there (11.5) and its measurements in 11.1.
+**Status:** design proposal for the owner, 2026-10-19. Nothing here is built. It changes nothing in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md). The owner's decision (D14, part a) is recorded there in 11.3: only the measurement of whether and at what billed cost the DatabaseActor can be kept warm is approved; no keep-warm, no parallel wake ticket and no KV admission cache until its numbers and a costed go. Its measurements go to 11.1.
 
 **Question.** A cold DatabaseActor sits in series in front of every first connect after a quiet period. Can the Edge reach the node in parallel with the actor (Option A), or can the actor start the node earlier (Option B), without breaking the invariants of plan 3.3?
 
@@ -35,10 +35,10 @@ So the node starts only after the actor has answered, and the actor's whole cold
 | --- | --- | --- |
 | `admitWake` seen by the Edge, warm actor | 18–37 ms | *measured (EU1)*, plan 11.1 row "Stage 5.3 cold first request" |
 | `admitWake` seen by the Edge, cold actor | 230–549 ms in that row; 112–633 ms across the live Edge logs of 2026-10-18 summarised for this proposal | *measured (EU1)* |
-| Cold minimal Durable Object, same SQL (the Cloudflare floor) | 105 / 230 ms (p50 / p95) | *measured (Dev)*, row "Cold DatabaseActor measured" |
-| Cold actor in the Worker as then deployed (1.96 MB) | 184–254 / 317–449 ms; 173 of its 198 ms pass before `admitWake` starts; the way back is 26 ms | *measured (Dev)*, same row |
-| Lighter Worker, merged in `c46d838c` | −25 ms (−74..−15) and −28 ms (−57..−12) at the median; p95 369 → 324 and 351 → 301 ms | *measured (Dev)*, same row |
-| Separate actor script (not done) | a further −10 to −20 ms; the 105 ms floor stays | *measured (Dev)*, same row |
+| Cold minimal Durable Object, same SQL (the Cloudflare floor) | 105 / 230 ms (p50 / p95) | *measured (scratch Workers)*, row "Cold DatabaseActor measured" |
+| Cold actor in the Worker as then deployed (1.96 MB) | 184–254 / 317–449 ms; 173 of its 198 ms pass before `admitWake` starts; the way back is 26 ms | *measured (scratch Workers)*, same row |
+| Lighter Worker, merged in `c46d838c` | −25 ms (−74..−15) and −28 ms (−57..−12) at the median; p95 369 → 324 and 351 → 301 ms | *measured (scratch Workers)*, same row |
+| Separate actor script (not done) | a further −10 to −20 ms; the 105 ms floor stays | *measured (scratch Workers)*, same row |
 | Gateway upgrade (Edge → Tunnel → gateway → Edge) | 70–110 ms | *measured (EU1)*, Stage 5.3 row |
 | Node path before `wake-node-path` | admission p50 130 / p95 203 ms, start p50 183 / p95 362 / max 539 ms, sum p50 320 / p95 518 ms | *measured (EU1)*, Stage 5.3 row (node power-cut 30 min before) |
 | Node path after `wake-node-path` (merged `f025bf7a`) | the two volume checks 0.02–0.03 ms; start 99–245 ms (p50–p95 range across units) | *measured (lab)* and *measured (EU1, Stage 1)*, plan 5.9 steps 3 and 5 |
@@ -335,15 +335,15 @@ Limits:
 
 | Alternative | Removes | Numbers | Cost and risk |
 | --- | --- | --- | --- |
-| Lighter actor Worker (merged, `c46d838c`) | Part of the module load | −25 / −28 ms at the median; p95 369 → 324 and 351 → 301 ms (*measured (Dev)*) | Done |
-| Separate actor script (the split) | The rest of the script | A further −10 to −20 ms; the 105 / 230 ms floor stays (*measured (Dev)*) | `migrations` become `exports` for good; four ordered deploys, no gradual rollout, a production write |
+| Lighter actor Worker (merged, `c46d838c`) | Part of the module load | −25 / −28 ms at the median; p95 369 → 324 and 351 → 301 ms (*measured (scratch Workers)*) | Done |
+| Separate actor script (the split) | The rest of the script | A further −10 to −20 ms; the 105 / 230 ms floor stays (*measured (scratch Workers)*) | `migrations` become `exports` for good; four ordered deploys, no gradual rollout, a production write |
 | **Keep the actor warm** with an alarm, for every live database or those with a connect in the last N days (the metric needs days, since its databases are idle at least one hour) | The whole cold start, for awake and asleep databases alike | Admission 18–37 ms instead of 112–633 ms on each connect it covers (*measured (EU1)*) | Alarm invocations are billed as Durable Object requests: USD 0.15 per million on the Workers Paid plan (Cloudflare's pricing page, 2026-10-19). Per 1,000 databases per month, before the included million: every 60 s, 43.2 million alarms, about USD 6.5; every 30 s, about USD 13; every 10 s, about USD 39 (*estimate*). Duration is not estimated. Whether it works is not measured: Cloudflare hibernates an object that meets its conditions (no timer, no pending I/O) after 10 s of inactivity and discards its in-memory state (its constructor runs again), and it does not document whether the module stays evaluated, which is the measured cost |
 | Option B | The way back and the Edge–gateway leg | About 0–50 ms (*estimate*) | A second wake path; NodeActor (sampled every 15 s, hibernatable) may be cold itself |
 | Option A | The shorter of actor and node path | About 40–250 ms, only on a placement hit (*estimate*) | Protocol change, a new node behaviour, a KV namespace for the hit rate |
 
 ### 8.2 What I would do
 
-1. **Measure before building anything,** with scratch Workers on the Dev account, deleted afterwards, as the cold-actor measurement did:
+1. **Measure before building anything,** with scratch Workers on the Cloudflare account, deleted afterwards, as the cold-actor measurement did:
    - keep-warm with at least 100 objects: alarms every 10, 30 and 60 s; `admitWake` latency after one hour and after 24 hours without a connect; the share of answers that stay warm; and the bill;
    - for A's fallback case: the latency of a cold KV read from the Edge for a key unread for one hour and for 24 hours.
    These two numbers decide between the options. Nothing else does.
@@ -351,13 +351,13 @@ Limits:
 3. **Do not build Option B.** It leaves the actor's cold start in series, and its gain depends on NodeActor being warm: the same problem one hop further.
 4. **Build Option A only if keep-warm fails or is refused,** in the node-bound form with a KV placement record, only after the model test of section 7 passes and its mutants fail, and only if the measured KV read p95 is clearly below the cold actor's. Start with the exact-match rule in place from the first commit; never ship a form that hands a socket over without it.
 
-### 8.3 The decision the owner has to take (proposed D13)
+### 8.3 The decision the owner has to take (D14)
 
 | # | Decision | Proposed default |
 | --- | --- | --- |
-| D13a | Approve the Dev measurement of keep-warm and of KV cold reads (scratch Workers, deleted afterwards) | Yes |
-| D13b | On its result: a costed go for keeping actors warm, and its scope (every live database, or only those with a connect in the last N days) | Every live database, if 8.2 step 2 holds |
-| D13c | Only if keep-warm is out: accept **speculative starts**. A node may start a sleeping database on an Edge request that the DatabaseActor has not yet authorized, under every node check, with no client byte before the actor's exact match. This amends plan 1.6 and 5.2, adds a KV namespace (a new resource, costed go), and accepts unclaimed starts as a logged, self-healing state | No, unless keep-warm fails |
+| D14a | Approve the measurement of keep-warm and of KV cold reads (scratch Workers, deleted afterwards) | Yes (approved 2026-10-19) |
+| D14b | On its result: a costed go for keeping actors warm, and its scope (every live database, or only those with a connect in the last N days) | Every live database, if 8.2 step 2 holds |
+| D14c | Only if keep-warm is out: accept **speculative starts**. A node may start a sleeping database on an Edge request that the DatabaseActor has not yet authorized, under every node check, with no client byte before the actor's exact match. This amends plan 1.6 and 5.2, adds a KV namespace (a new resource, costed go), and accepts unclaimed starts as a logged, self-healing state | No, unless keep-warm fails |
 
 If neither keep-warm nor speculative starts is accepted, the cold actor stays on the path, at the floor of a cold Durable Object (105 / 230 ms at p50 / p95) once the split is done. The rest of the connect budget then has to come from the client's path to the Edge and from the node.
 
@@ -372,5 +372,5 @@ If neither keep-warm nor speculative starts is accepted, the cold actor stays on
   - `packages/native-protocol/src/wake.rs`, `agent.rs`;
   - `apps/native-gateway/src/transport.rs`, `hold.rs`, `local.rs`;
   - `apps/node-agent/src/agent/power.rs`, `mod.rs`, `link/socket.rs`.
-- [ULTRA plan](cloudflare-convergence-and-serverless-plan.md): sections 3.1, 3.3, 4.6, 5.3, 5.7–5.9, 7.9–7.11, 8, 9.4, 9.5, 11.1 (rows "Stage 5.3 cold first request" and "Cold DatabaseActor measured"), 11.5.
+- [ULTRA plan](cloudflare-convergence-and-serverless-plan.md): sections 3.1, 3.3, 4.6, 5.3, 5.7–5.9, 7.9–7.11, 8, 9.4, 9.5, 11.1 (rows "Stage 5.3 cold first request" and "Cold DatabaseActor measured"), 11.3 (D14), 11.5.
 - Cloudflare, Durable Objects [pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) and [lifecycle](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/), read 2026-10-19.

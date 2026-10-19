@@ -4,8 +4,8 @@ One Debian 13 ("trixie") disk image for every PGCF node: EU1, US1 and every late
 image release, so OS patches, PostgreSQL upgrades and agent releases are identical everywhere
 ([ULTRA plan](../../docs/architecture/cloudflare-convergence-and-serverless-plan.md) 5.4, 9.1,
 9.6). Nodes differ only in configuration that the installer and the agent write: network, hostname,
-enrollment seed, keys and credentials. These are the image's builder notes (plan Appendix C); the
-agent's own notes are in `apps/node-agent/README.md`.
+enrollment seed, keys and credentials. These are the image's builder notes; the agent's own notes
+are in [apps/node-agent/README.md](../../apps/node-agent/README.md).
 
 ## Pinned inputs
 
@@ -452,9 +452,9 @@ database.
 The API side renders the userData from the registered release and serves the image and the progress route (`POST` of
 `{"checkpoint", "detail"}` with the Bearer token). It refuses the token once `rebooting` or `failed`
 has arrived, so a second run in rescue, for example after a reboot that leads back into rescue,
-stops at `started` before it touches the disk. Stage 1 left rescue through the API's
-`actions/restart`; whether the script's own reboot leaves rescue is recorded at the first install
-(Stage 4). If enrollment does not follow `rebooting`, AddNode restarts the instance through the API.
+stops at `started` before it touches the disk. If enrollment does not follow `rebooting`, AddNode
+restarts the instance through the API. EU1's live install enrolled the node 28.0 s after the
+`rebooting` checkpoint (plan 11.1).
 
 ## Boot test
 

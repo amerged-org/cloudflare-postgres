@@ -1,6 +1,6 @@
 # Third-party components
 
-Reviewed: 2026-10-17. The repository's [Apache License 2.0](LICENSE) covers original
+Reviewed: 2026-10-19. The repository's [Apache License 2.0](LICENSE) covers original
 project work only. Upstream components keep their own licenses, notices and source obligations.
 No upstream source is vendored in the repository.
 Direct application dependencies are listed below at the version
@@ -29,10 +29,10 @@ and source headers say GPL version 3 or later. Record the declaration at the pin
 
 ## Native Rust gateway and node agent
 
-The native gateway (`apps/native-gateway`), the node agent library (`apps/node-agent`), the
-shared protocol crate (`packages/native-protocol`), the archive clients (`apps/pgcf-archive`,
-`apps/pgcf-wal-fetch`) and the PostgreSQL test harness (`packages/test-postgres`) are first-party
-Apache-2.0. The archive clients and the test harness use only the Rust standard library (the
+The native gateway (`apps/native-gateway`), the node agent (`apps/node-agent`, the binary
+`pgcf-agent`), the shared protocol crate (`packages/native-protocol`), the archive clients
+(`apps/pgcf-archive`, `apps/pgcf-wal-fetch`) and the PostgreSQL test harness
+(`packages/test-postgres`) are first-party Apache-2.0. The archive clients and the test harness use only the Rust standard library (the
 archive clients' tests also read the contract's vectors with serde_json). Each `Cargo.toml` pins its
 direct crates exactly; `Cargo.lock` binds their archive checksums and transitive versions. No
 upstream source is vendored here.
@@ -68,7 +68,7 @@ The shared native protocol crate remains first-party Apache-2.0.
 
 The host bindings use wasm-bindgen 0.2.129, js-sys/web-sys 0.3.106 and
 wasm-bindgen-futures 0.4.79 (`MIT OR Apache-2.0`), serde-wasm-bindgen 0.6.5 (MIT),
-and futures-channel/futures-util 0.3.34 (`MIT OR Apache-2.0`). Preserve their
+futures-channel/futures-util 0.3.34 and url 2.5.8 (`MIT OR Apache-2.0`). Preserve their
 notices and the Rust standard-library notices with distributed Worker artifacts.
 
 The build-only `worker-build` 0.8.7 tool is Apache-2.0; its verified crate archive
@@ -90,12 +90,16 @@ snapshot and on apt-archive.postgresql.org.
 | Component | License | Role |
 | --- | --- | --- |
 | [Debian 13 "trixie"](https://www.debian.org/) packages at snapshot `20261016T133910Z`, Linux 6.12.113 (`6.12.113-1`) | Per package (DFSG); the kernel GPL-2.0 | Node operating system |
-| [systemd 257](https://github.com/systemd/systemd) | LGPL-2.1-or-later | Units, sandboxing, cgroups, credentials, first-boot partitioning |
-| [GRUB 2](https://www.gnu.org/software/grub/) | GPL-3.0-or-later | BIOS and UEFI boot loader |
+| [systemd 257](https://github.com/systemd/systemd) (`257.13-1~deb13u1`) | LGPL-2.1-or-later | Units, sandboxing, cgroups, credentials, first-boot partitioning |
+| [GRUB 2](https://www.gnu.org/software/grub/) (`2.12-9+deb13u2`) | GPL-3.0-or-later | BIOS and UEFI boot loader |
 | [PostgreSQL 18.6](https://www.postgresql.org/) (PGDG `18.6-1.pgdg13+2`, with its `libpq5` pinned to the same version) | [PostgreSQL License](https://www.postgresql.org/about/licence/) | The database engine, unmodified |
 | [pgvector 0.8.7](https://github.com/pgvector/pgvector) (PGDG `0.8.7-1.pgdg13+1`) | PostgreSQL License | Extension |
 | [barman-cli-cloud 3.20.1](https://github.com/EnterpriseDB/barman) (PGDG `3.20.1-1.pgdg13+1`) | GPL-3.0 | WAL archive, base backup and restore to R2; run as a separate program, not linked |
-| [lvm2](https://sourceware.org/lvm2/), [thin-provisioning-tools](https://github.com/jthornber/thin-provisioning-tools) | GPL-2.0, LGPL-2.1 / GPL-3.0 | Thin pool and volumes, run as separate programs |
+| [Python 3.13](https://www.python.org/) (`3.13.5-1`), [boto3 1.37.9](https://github.com/boto/boto3) and botocore (Debian `python3-boto3`, `python3-botocore`) | PSF-2.0; Apache-2.0 | The runtime barman-cloud runs on |
+| [lvm2 2.03.31](https://sourceware.org/lvm2/) (`2.03.31-2`), [thin-provisioning-tools 1.1.0](https://github.com/jthornber/thin-provisioning-tools) (`1.1.0-4+b1`) | GPL-2.0, LGPL-2.1 / GPL-3.0 | Thin pool and volumes, run as separate programs |
+| [e2fsprogs 1.47.2](https://e2fsprogs.sourceforge.net/) (`1.47.2-3+b12`) | GPL-2.0 (programs), LGPL-2.0 (libraries) | ext4 of each database volume (`mkfs.ext4`, `e2fsck`, `tune2fs`), run as separate programs |
+| [OpenSSH 10.0](https://www.openssh.com/) (`1:10.0p1-7+deb13u4`) | BSD-style | sshd of the operator shell, loopback only |
+| [nftables 1.1.3](https://netfilter.org/projects/nftables/) (`1.1.3-1`) | GPL-2.0-only | The inbound-drop firewall |
 | [cloudflared 2026.10.0](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/2026.10.0/LICENSE) | The node's Tunnel; release `.deb` pinned by sha256 `9721287c28f78cb623e77c7b95a63feea87e909054d75666a0ec9eff20e5d548` |
 | [mkosi v27.1](https://github.com/systemd/mkosi) (commit `ecf7f5702bb2052b7a69cab3fe7d37bc3b9ad77b`) | LGPL-2.1-or-later | Build tool only; not in the image |
 
@@ -113,7 +117,7 @@ read from the installed package manifests.
 | [hono](https://github.com/honojs/hono)                                                                  | 4.13.12 | MIT               | HTTP framework of the API Worker.                                                         |
 | [zod](https://github.com/colinhacks/zod)                                                                | 4.6.5   | MIT               | Shared schemas and validation; bundled into the CLI, with its actual LICENSE shipped.     |
 | [@hono/zod-openapi](https://github.com/honojs/middleware/tree/main/packages/zod-openapi)                | 1.6.3   | MIT               | OpenAPI document generated from the route schemas.                                        |
-| [wrangler](https://github.com/cloudflare/workers-sdk)                                                   | 4.145.0 | MIT OR Apache-2.0 | Worker build, type generation and deployment tooling.                                     |
+| [wrangler](https://github.com/cloudflare/workers-sdk)                                                   | 4.145.0 (4.146.0 for `apps/edge-rust`) | MIT OR Apache-2.0 | Worker build, type generation and deployment tooling.                                     |
 | [ws](https://github.com/websockets/ws)                                                                  | 8.22.0  | MIT               | CLI WebSocket client, the probe tests, the SaaS benchmark's socket and the Edge benchmark's loopback shim; the CLI installs the upstream runtime package with its notice. |
 | [esbuild](https://github.com/evanw/esbuild)                                                             | 0.25.12 | MIT               | Bundles the installable CLI (build only).                                                 |
 | [@neondatabase/serverless](https://github.com/neondatabase/serverless)                                  | 1.2.0   | MIT               | Client driver used by the probe Worker and the Edge HTTP query mode test (also listed above). |
@@ -150,16 +154,19 @@ regular and italic fonts from latex.css 1.14.0 under the GUST Font License 1.0
 HTML and in [Mermaider's notices](https://github.com/sebmer-com/mermaider/blob/main/THIRD_PARTY.md).
 No Mermaider analysis source is vendored here.
 
-## Acceptance workflow actions
+## CI workflow actions
 
-The supplemental native TCP probe uses these official actions in the existing CI workflow.
-They are pinned to immutable commits; their own bundled dependencies retain their upstream notices.
-The actions run on GitHub-hosted runners and are not part of any PGCF runtime.
+The single CI workflow uses these official actions, pinned to immutable commits; their own bundled
+dependencies retain their upstream notices. The actions run on GitHub-hosted runners and are not
+part of any PGCF runtime.
 
-| Action                                                                | Release and commit                                | License                                                                                                 | Role                                                        |
-| --------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| [actions/attest](https://github.com/actions/attest)                   | 4.1.0, `59d89421af93a897026c735860bf21b6eb4f7b26` | [MIT](https://github.com/actions/attest/blob/59d89421af93a897026c735860bf21b6eb4f7b26/LICENSE)          | Signs provenance for the sanitized native-probe report.     |
-| [actions/upload-artifact](https://github.com/actions/upload-artifact) | 7.0.0, `bbbca2ddaa5d8feaa63e36b76fdaad77386f024f` | [MIT](https://github.com/actions/upload-artifact/blob/bbbca2ddaa5d8feaa63e36b76fdaad77386f024f/LICENSE) | Publishes only the sanitized report with one-day retention; the check job also retains the tested Rust Edge bytes. |
+| Action                                                                | Release and commit                                | License                                                                                                 | Role                                                                                                                                   |
+| --------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| [actions/checkout](https://github.com/actions/checkout)               | 7.0.1, `3d3c42e5aac5ba805825da76410c181273ba90b1` | [MIT](https://github.com/actions/checkout/blob/3d3c42e5aac5ba805825da76410c181273ba90b1/LICENSE)        | Checks out the revision.                                                                                                               |
+| [actions/setup-node](https://github.com/actions/setup-node)           | 7.0.0, `820762786026740c76f36085b0efc47a31fe5020` | [MIT](https://github.com/actions/setup-node/blob/820762786026740c76f36085b0efc47a31fe5020/LICENSE)     | Installs the pinned Node.                                                                                                              |
+| [pnpm/action-setup](https://github.com/pnpm/action-setup)             | 6.1.0, `ea17c68df8912ef543352723c149a84f56e3d413` | [MIT](https://github.com/pnpm/action-setup/blob/ea17c68df8912ef543352723c149a84f56e3d413/LICENSE.md)   | Installs pnpm at the version in `package.json`.                                                                                        |
+| [actions/attest](https://github.com/actions/attest)                   | 4.1.0, `59d89421af93a897026c735860bf21b6eb4f7b26` | [MIT](https://github.com/actions/attest/blob/59d89421af93a897026c735860bf21b6eb4f7b26/LICENSE)          | Signs provenance for the sanitized native-probe report.                                                                                |
+| [actions/upload-artifact](https://github.com/actions/upload-artifact) | 7.0.0, `bbbca2ddaa5d8feaa63e36b76fdaad77386f024f` | [MIT](https://github.com/actions/upload-artifact/blob/bbbca2ddaa5d8feaa63e36b76fdaad77386f024f/LICENSE) | Publishes the sanitized probe report with one-day retention, the tested Rust Edge bytes, and the node release files and boot logs. |
 
 ## Not used
 
@@ -168,6 +175,7 @@ The actions run on GitHub-hosted runners and are not part of any PGCF runtime.
 | [Neon storage engine, proxy](https://github.com/neondatabase/neon), [NeonVM](https://github.com/neondatabase/autoscaling) (Apache-2.0) | The public repository is effectively dormant. Its storage is a different architecture. NeonVM needs nested virtualization, which Contabo Cloud VPS lack. |
 | [Xata OSS](https://github.com/xataio/xata) (Apache-2.0)                                                                                | Requires Kubernetes, CloudNativePG and OpenEBS, the platform PGCF left; access runs through the Cloudflare edge and Tunnel.                              |
 | [PgBouncer](https://github.com/pgbouncer/pgbouncer) (ISC), [Supavisor](https://github.com/supabase/supavisor) (Apache-2.0)             | No server-side pooler in v1; reconsider with measured connection pressure.                                                                               |
+| Kubernetes, CloudNativePG, Talos Linux, OpenEBS, Cilium, Flux, cert-manager, containerd, Helm | Retired on 2026-10-17 with the Kubernetes runtime (branch `archive/kubernetes-runtime`); nothing of them ships and their notices were removed. |
 
 ## Rules
 

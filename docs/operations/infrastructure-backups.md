@@ -113,39 +113,11 @@ proof in the ULTRA plan; targeted tests alone are not live backup acceptance.
 
 While the provider's export job runs, the control database stops answering requests. Cloudflare
 documents the unavailability and states no duration. The exporter sends no D1 request of its own
-meanwhile. No running database needs D1 to keep writing. A wake that arrives during the window
-needs D1.
-
-Measured on the retired Kubernetes runtime from the usage samples of the six runs that reached or
-passed the export. The regional agent posted one sample every 15 s per emitting database; a gap in `usage_samples.observed_at` of
-source `agent` inside a run (`SELECT DISTINCT observed_at FROM usage_samples WHERE source='agent'
-AND observed_at BETWEEN <created_at> AND <completed_at> ORDER BY observed_at`, spacings above 25 s)
-is the time its posts did not complete:
-
-| Run | D1 plaintext | Sample gap | Last stored sample before it, after run creation |
-| --- | --- | --- | --- |
-| 2026-10-12, attempt 3 | 396 MB | none (one spacing of 20.9 s) | not visible |
-| 2026-10-13 | 413 MB | 00:00:48 to 00:01:56 (68 s) | 20 s |
-| 2026-10-14, attempt 1 | not read back | 00:04:04 to 00:05:13 (69 s) | 126 s |
-| 2026-10-14, attempt 2 | not read back | none | not visible |
-| 2026-10-14, attempt 3 | not read back | 00:35:00 to 00:36:12 (72 s) | 121 s |
-| 2026-10-15 | 468 MB | 00:02:21 to 00:02:58 (37 s) | 70 s |
-
-The gap runs from the last sample that was stored to the first one stored afterwards, so the stall
-itself is up to 30 s shorter than the gap: in three runs it lasted at least 37 s, and in the fourth
-between 7 and 37 s. It does not follow the database size, and in
-two runs no stall is visible at all. The gateway's samples show the same gap as one longer interval.
-
-Unknown:
-
-- Why two runs show no stall, and what the 20 to 126 s before the window are (initialization,
-  image manifest reads and the provider's job start are the code's steps there; none is timed).
-- The effect on a wake during the window: no wake arrived in any nightly window.
-- Whether a request during the window waits or is rejected: the code tolerates both.
-
-The raw samples this relies on are being reduced (pruned once their hourly rollup is final, none
-from idle databases), so read the derivation while they exist. Go-live gate G6 also needs a night
-with an awake database under writes and one wake during the export that shows no failed wake.
+meanwhile, and no running database needs D1 to keep writing. The plan records the nightly export
+blocking D1 for about 4 s on the live installation (ULTRA plan 9.10). A wake admits from the
+DatabaseActor's own state and commits its claim to D1 after the answer, so it is not expected to
+wait for the export. That is not yet observed: go-live gate G6 needs a night with an awake database
+under writes and one wake during the export that shows no failed wake.
 
 ## Optional email or webhook delivery
 
@@ -162,12 +134,12 @@ Per-node threshold warnings use the same delivery. Set `node_ram_warning_thresho
 million (`850000` means 85%); `null` disables one. The cron checks every node of a
 policy region each minute:
 
-- RAM uses the node's own fresh ten-minute window.
-- CPU averages reported CPU usage over the same ten minutes against node CPU capacity.
-  Only reporters that send the optional CPU sample fields supply it (the node agent,
-  Stage 3); otherwise CPU stays unknown and sends nothing.
-- Storage uses the fresh LVM sample: thin-pool data or metadata fill, otherwise
-  volume-group allocation.
+- RAM is the 30-minute average of the node's active RAM, (MemTotal - MemAvailable) / MemTotal,
+  over its own samples.
+- CPU is the 30-minute average of the node's CPU load, busy time over all its cores.
+  RAM and CPU need samples that span at least ten minutes and a newest sample at most 180 s old;
+  otherwise they stay unknown and send nothing.
+- Storage is the fuller of the thin pool's data and metadata in the node's newest sample.
 
 The email subject is `PGCF infrastructure: <kind> (<region>)` and its body is the
 event JSON, including `node_ids`, `threshold_ppm` and the highest `utilization_ppm`.
@@ -197,7 +169,7 @@ same event ID while it stays active; a cleared episode sends nothing.
 
 | Kind | Fires when | Rule | Action |
 | --- | --- | --- | --- |
-| `regional_ram_warning` | regional ten-minute RAM utilization reaches the threshold | `ram_warning_threshold_ppm`, off by default | Read `GET /v1/regions/{id}/capacity-decision`; add a node or reduce awake databases |
+| `regional_ram_warning` | regional ten-minute RAM utilization reaches the threshold | `ram_warning_threshold_ppm`, off by default; it needs a regional RAM window of ten fresh one-minute samples from every node, which no node reports yet, so it stays unknown | Read `GET /v1/regions/{id}/capacity-decision`; add a node or reduce awake databases |
 | `regional_node_cap_reached` | allocated nodes reached `max_nodes` | `cap_warning_enabled` with a finite `max_nodes` | Raise `max_nodes` in the capacity policy or free a slot |
 | `regional_node_ram_warning` | a node's 30-minute average of active RAM, (MemTotal - MemAvailable) / MemTotal, reaches the threshold | `node_ram_warning_threshold_ppm`; judged from at least ten minutes of samples | Reduce awake databases on the listed node or add capacity |
 | `regional_node_cpu_warning` | a node's 30-minute average CPU load, busy time over all its cores, reaches the threshold | `node_cpu_warning_threshold_ppm`; judged from at least ten minutes of samples | Reduce awake databases on the listed node or add capacity |
@@ -227,18 +199,21 @@ Rules of the database and Thin storage kinds:
 - **Base backup.** The 36 h count starts at the latest of the last completed base backup,
   the database's placement (`created`) and its last wake (`woke`, written by every resume
   and wake). A `ready` event is not a wake: any generation bump, such as a role change or a
-  resize, writes one. The daily 03:00 UTC backup skips a sleeping database, so a database
-  that slept through it is not reported until it has been awake 36 h without a backup. The
-  agent's backup report must be fresh (at most 180 s old) and `ok` with a completion time,
-  or `failing`; a sleeping database and an unknown report are excluded.
-- **Thin storage.** From the node's fresh physical sample (at most 120 s old),
-  `thin_pool_no_room` means no database starts on the node: its free data is under the
-  profile's `data_reserve_bytes` or its free metadata under `metadata_reserve_bytes`. The pool
-  does not grow; `regional_node_storage_warning` reports it filling before that.
-  `thin_pool_unobserved` means a node with a bound thin volume has no physical sample of its
-  pool at most 120 s old, so neither the room rule nor this alert sees the pool fill. Running
-  databases are never stopped for storage; a pool that does fill fails the write and
-  PostgreSQL stops without acknowledging it.
+  resize, writes one. The node takes a base backup when a database is created and after a
+  restore, before an idle sleep when one is due (none on the current timeline, or the newest is
+  older than 24 h) and, for an always-warm database, once the newest is older than 24 h; it never
+  wakes a sleeping database for a backup, so a database that slept through its due time is not
+  reported until it has been awake 36 h without a backup. The agent's backup report must be fresh
+  (at most 180 s old) and `ok` with a completion time, or `failing`; a sleeping database and an
+  unknown report are excluded.
+- **Thin storage.** From the node's newest pool sample (at most 180 s old), `thin_pool_no_room`
+  means the node's own room rule says no room: free data under the region node policy's
+  `reserve_bytes` or metadata at or above its `metadata_no_room_percent`, so no database starts, is
+  created or is restored there. The pool does not grow; `regional_node_storage_warning` reports it
+  filling before that. `thin_pool_unobserved` means a node that holds a database has no pool sample
+  at most 180 s old, so neither the room rule nor this alert sees the pool fill. Running databases
+  are never stopped for storage; a pool that does fill fails the write and PostgreSQL stops without
+  acknowledging it ([recovery](recovery.md#thin-storage-admission-and-recovery)).
 - **Subjects.** An episode lists at most 64 databases (longest-standing first) or nodes,
   16 for Thin storage (by ID). A subject that fails and is not listed yet replaces the
   episode with a new event that lists the current subjects (this also holds for
