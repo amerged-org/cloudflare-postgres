@@ -1,0 +1,12 @@
+  {
+      "report": [
+          {
+              "lv": [
+                  {"lv_name":"pgcf_thinpool", "lv_attr":"twi-aotz--", "data_percent":"12.01", "metadata_percent":"10.12"}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }

@@ -5,11 +5,13 @@ import {
   ArchiveCredential,
   NODE_API_PATHS,
   NODE_AWAKE_LIMIT,
+  NODE_BOOT_REPORT_MAX_BYTES,
   NODE_DESIRED_PAGE_LIMIT_MAX,
   NODE_FENCED_PATHS,
   NODE_LINK_MESSAGE_MAX_BYTES,
   NODE_REQUEST_MAX_LIFETIME_SECONDS,
   NODE_USAGE_BATCH_MAX,
+  NodeBootReport,
   NodeCredentials,
   NodeDatabaseObservation,
   NodeDesiredPage,
@@ -19,6 +21,8 @@ import {
   NodeEventReport,
   NodeFencedResponse,
   NodeObservationReport,
+  NodeProbeRequest,
+  NodeProbeResult,
   NodeSample,
   NodeUsageReport,
   NodeVolumeReport,
@@ -794,6 +798,52 @@ describe("what a node reports", () => {
     ).toBe(false);
   });
 
+  it("says hello with the boot and the operating system of the node, and refuses a hello without them", () => {
+    const os = {
+      boot_id: "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+      booted_at: now,
+      kernel_release: "6.12.111+deb13-amd64",
+      packages_sha256: "a".repeat(64),
+    };
+    const hello = {
+      type: "hello",
+      protocol: 1,
+      agent_version: "0.1.0",
+      release_id: "release-25",
+      os,
+    };
+    expect(AgentLinkMessage.safeParse(hello).success).toBe(true);
+    expect(
+      AgentLinkMessage.safeParse({ ...hello, os: undefined }).success,
+    ).toBe(false);
+    expect(AgentLinkMessage.safeParse({ ...hello, os: null }).success).toBe(
+      false,
+    );
+    for (const change of [
+      { boot_id: "not-a-uuid" },
+      { booted_at: "2026-10-17T12:00:00Z" },
+      { kernel_release: "" },
+      { kernel_release: "k".repeat(65) },
+      { kernel_release: "6.12 amd64" },
+      { packages_sha256: "A".repeat(64) },
+      { packages_sha256: "a".repeat(63) },
+      { extra: 1 },
+    ])
+      expect(
+        AgentLinkMessage.safeParse({ ...hello, os: { ...os, ...change } })
+          .success,
+        JSON.stringify(change),
+      ).toBe(false);
+    for (const field of Object.keys(os))
+      expect(
+        AgentLinkMessage.safeParse({
+          ...hello,
+          os: { ...os, [field]: undefined },
+        }).success,
+        field,
+      ).toBe(false);
+  });
+
   it("reports each volume with its filesystem while mounted", () => {
     const volume = {
       database: id,
@@ -1213,5 +1263,129 @@ describe("credentials and the node's policy", () => {
       { io: { ...page.policy.io, write_bytes_per_second: 0 } },
     ])
       expect(NodeDesiredPage.safeParse(withPolicy(broken)).success).toBe(false);
+  });
+});
+
+describe("the report of the previous boot", () => {
+  const entry = {
+    at: now,
+    unit: "pgcf-agent.service",
+    identifier: "pgcf-agent",
+    transport: "stdout",
+    priority: 6,
+    message: "agent started",
+  };
+  const report = (entries: object[]) => ({
+    boot_id: "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+    previous_boot_id: null,
+    kernel_release: "6.12.111+deb13-amd64",
+    entries,
+  });
+
+  it("takes at most 1,000 entries and names its path", () => {
+    expect(NODE_API_PATHS.diagnostics).toBe("/node/v1/diagnostics");
+    const thousand = Array.from({ length: 1000 }, () => entry);
+    expect(NodeBootReport.safeParse(report(thousand)).success).toBe(true);
+    expect(NodeBootReport.safeParse(report([...thousand, entry])).success).toBe(
+      false,
+    );
+  });
+
+  it("counts a message in bytes, not in characters", () => {
+    const message = (text: string) =>
+      NodeBootReport.safeParse(report([{ ...entry, message: text }])).success;
+    expect(message("a".repeat(2048))).toBe(true);
+    expect(message("\u00e9".repeat(1024))).toBe(true);
+    expect(message("\u00e9".repeat(1025))).toBe(false);
+    expect(message("a".repeat(2049))).toBe(false);
+  });
+
+  it("is refused beyond 1 MiB of JSON, which 1,000 full messages are", () => {
+    const full = { ...entry, message: "a".repeat(2048) };
+    const fits = Math.floor(
+      NODE_BOOT_REPORT_MAX_BYTES / JSON.stringify(full).length,
+    );
+    expect(
+      NodeBootReport.safeParse(
+        report(Array.from({ length: fits - 1 }, () => full)),
+      ).success,
+    ).toBe(true);
+    expect(
+      NodeBootReport.safeParse(report(Array.from({ length: 1000 }, () => full)))
+        .success,
+    ).toBe(false);
+  });
+});
+
+describe("a probe on request", () => {
+  const asked = { probe: "journal", boot: -1, since_seconds: 60, lines: 2000 };
+
+  it("takes the defaults for the numbers left out and the ends of the ranges", () => {
+    expect(NodeProbeRequest.parse({ probe: "boots" })).toEqual({
+      probe: "boots",
+      boot: 0,
+      since_seconds: 3600,
+      lines: 200,
+    });
+    expect(NodeProbeRequest.parse(asked)).toEqual(asked);
+    expect(
+      NodeProbeRequest.parse({ ...asked, since_seconds: 86_400 }),
+    ).toBeDefined();
+  });
+
+  it("refuses a number out of range, an unknown probe and any field of a command", () => {
+    for (const broken of [
+      { ...asked, boot: 1 },
+      { ...asked, boot: -2 },
+      { ...asked, since_seconds: 59 },
+      { ...asked, since_seconds: 86_401 },
+      { ...asked, lines: 0 },
+      { ...asked, lines: 2001 },
+      { ...asked, lines: 1.5 },
+      { ...asked, probe: "shell" },
+      { ...asked, command: "ss" },
+      { ...asked, path: "/proc/1/environ" },
+    ])
+      expect(NodeProbeRequest.safeParse(broken).success).toBe(false);
+  });
+
+  it("is listed eight at most on the desired page, and a page without any is a page", () => {
+    const request = (n: number) => ({
+      id: `5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b8${n}`,
+      probe: "pool",
+      boot: 0,
+      since_seconds: 3600,
+      lines: 200,
+    });
+    const listed = (count: number) =>
+      NodeDesiredPage.safeParse({
+        ...page,
+        diagnostics: Array.from({ length: count }, (_, n) => request(n)),
+      }).success;
+    expect(NodeDesiredPage.safeParse(page).success).toBe(true);
+    expect(listed(8)).toBe(true);
+    expect(listed(9)).toBe(false);
+  });
+
+  it("answers with its own probe and at most 1 MiB, whatever the side that carries the output", () => {
+    const result = (change: object) => ({
+      kind: "probe",
+      diagnostic_id: "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81",
+      probe: "listeners",
+      status: "ok",
+      entries: [],
+      text: "",
+      ...change,
+    });
+    const room = 1024 * 1024 - JSON.stringify(result({})).length;
+    expect(
+      NodeProbeResult.safeParse(result({ text: "a".repeat(room) })).success,
+    ).toBe(true);
+    expect(
+      NodeProbeResult.safeParse(result({ text: "a".repeat(room + 1) })).success,
+    ).toBe(false);
+    expect(NodeProbeResult.safeParse(result({ kind: "boot" })).success).toBe(
+      false,
+    );
   });
 });

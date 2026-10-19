@@ -18,6 +18,7 @@ import {
   nodeRequestVectors,
   nodeSchemas,
   nodeSchemaVectors,
+  packageVectors,
   refusalVectors,
 } from "./node-vectors.ts";
 
@@ -46,6 +47,17 @@ const files = {
       NODE_DESIRED_PAGE_LIMIT_MAX: link.NODE_DESIRED_PAGE_LIMIT_MAX,
       NODE_REPORT_EVENTS_MAX: link.NODE_REPORT_EVENTS_MAX,
       NODE_REPORT_EVENT_FIELDS_MAX: link.NODE_REPORT_EVENT_FIELDS_MAX,
+      NODE_BOOT_REPORT_ENTRIES_MAX: link.NODE_BOOT_REPORT_ENTRIES_MAX,
+      NODE_BOOT_REPORT_MESSAGE_MAX_BYTES:
+        link.NODE_BOOT_REPORT_MESSAGE_MAX_BYTES,
+      NODE_BOOT_REPORT_MAX_BYTES: link.NODE_BOOT_REPORT_MAX_BYTES,
+      NODE_PROBES: link.NODE_PROBES,
+      NODE_PROBE_BOOTS: link.NODE_PROBE_BOOTS,
+      NODE_PROBE_SINCE_SECONDS_MIN: link.NODE_PROBE_SINCE_SECONDS_MIN,
+      NODE_PROBE_SINCE_SECONDS_MAX: link.NODE_PROBE_SINCE_SECONDS_MAX,
+      NODE_PROBE_LINES_MAX: link.NODE_PROBE_LINES_MAX,
+      NODE_PROBE_REQUESTS_MAX: link.NODE_PROBE_REQUESTS_MAX,
+      NODE_PROBE_RESULT_MAX_BYTES: link.NODE_PROBE_RESULT_MAX_BYTES,
       NODE_REQUEST_TOKEN_PREFIX: link.NODE_REQUEST_TOKEN_PREFIX,
       NODE_REQUEST_SIGNATURE_DOMAIN: link.NODE_REQUEST_SIGNATURE_DOMAIN,
       NODE_REQUEST_MAX_LIFETIME_SECONDS: link.NODE_REQUEST_MAX_LIFETIME_SECONDS,
@@ -65,6 +77,7 @@ const files = {
   "node-vectors.generated.json": {
     schemas: nodeSchemaVectors(),
     requests: await nodeRequestVectors(),
+    packages: await packageVectors(),
   },
   "node-local.generated.json": {
     version: 1,

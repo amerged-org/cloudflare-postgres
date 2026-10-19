@@ -18,10 +18,14 @@ import {
   type PlacementNeed,
 } from "../../src/domain/placement.ts";
 import {
+  assignRelease,
+  RELEASE_OS,
   cleanupFixtures,
   fixture,
+  nodeOs,
   nodeRequest,
   nodeSample,
+  request,
 } from "./fixtures.ts";
 import {
   enroll,
@@ -32,9 +36,14 @@ import {
   openLink as connect,
 } from "./node-fixtures.ts";
 
+const releases: string[] = [];
 afterEach(async () => {
   await forgetInstalls();
   await cleanupFixtures();
+  for (const id of releases.splice(0))
+    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+      .bind(id)
+      .run();
 });
 
 const MINUTE = 60_000;
@@ -53,12 +62,16 @@ const closed = (socket: WebSocket) =>
       { once: true },
     ),
   );
-const hello = (release: string | null = null) =>
+const hello = (
+  release: string | null = null,
+  os: Record<string, unknown> = nodeOs(),
+) =>
   JSON.stringify({
     type: "hello",
     protocol: 1,
     agent_version: "0.1.0",
     release_id: release,
+    os,
   });
 const sampleMessage = (at: number, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type: "sample", sample: nodeSample(at, extra) });
@@ -93,6 +106,63 @@ describe("the link of a node", () => {
     socket.close(1000);
   });
 
+  it("stores the boot and the operating system a hello reports, and says whether they are its region's release", async () => {
+    const f = await fixture(0);
+    const inventory = async () => {
+      const { os, os_converged } = await (
+        await request(`/v1/nodes/${f.node}`, f.admin)
+      ).json<{
+        os: Record<string, string> | null;
+        os_converged: boolean | null;
+      }>();
+      return { os, os_converged };
+    };
+    const said = async (os: Record<string, unknown>) => {
+      const socket = await connect(f, false);
+      const welcome = next(socket);
+      socket.send(hello(null, os));
+      expect(JSON.parse(await welcome)).toEqual({
+        type: "welcome",
+        protocol: 1,
+      });
+      return socket;
+    };
+    // Nothing reported yet: nothing to compare.
+    expect(await inventory()).toEqual({ os: null, os_converged: null });
+
+    // The region has no release: the node's OS is known, and has nothing to be compared with.
+    const old = nodeOs({ kernel_release: "6.12.111+deb13-amd64" });
+    let socket = await said(old);
+    expect(
+      await env.DB.prepare(
+        "SELECT os_boot_id,os_booted_at,os_kernel_release,os_packages_sha256 FROM nodes WHERE id=?",
+      )
+        .bind(f.node)
+        .first(),
+    ).toEqual({
+      os_boot_id: old.boot_id,
+      os_booted_at: old.booted_at,
+      os_kernel_release: old.kernel_release,
+      os_packages_sha256: old.packages_sha256,
+    });
+    expect(await inventory()).toEqual({ os: old, os_converged: null });
+
+    // The release names another kernel: not converged. A kernel that matches with other packages
+    // is not either; the release's kernel and packages together are.
+    releases.push(await assignRelease(f));
+    expect(await inventory()).toEqual({ os: old, os_converged: false });
+    for (const [os, converged] of [
+      [nodeOs({ packages_sha256: "e".repeat(64) }), false],
+      [nodeOs(), true],
+    ] as const) {
+      socket.close(1000);
+      socket = await said(os);
+      expect(await inventory()).toEqual({ os, os_converged: converged });
+      expect(os.kernel_release).toBe(RELEASE_OS.kernel_release);
+    }
+    socket.close(1000);
+  });
+
   it("closes a link on anything but a hello and then samples", async () => {
     const f = await fixture(0);
     for (const [message, greeted] of [
@@ -115,9 +185,22 @@ describe("the link of a node", () => {
           agent_version: "x",
           release_id: null,
           extra: 1,
+          os: nodeOs(),
         }),
         false,
       ],
+      // A hello says what the node boots and runs; one without it, or with a partial one, is no hello.
+      [
+        JSON.stringify({
+          type: "hello",
+          protocol: 1,
+          agent_version: "x",
+          release_id: null,
+        }),
+        false,
+      ],
+      [hello(null, { ...nodeOs(), boot_id: "not-a-uuid" }), false],
+      [hello(null, { ...nodeOs(), extra: 1 }), false],
       [
         JSON.stringify({ type: "sample", sample: { observed_at: "now" } }),
         true,

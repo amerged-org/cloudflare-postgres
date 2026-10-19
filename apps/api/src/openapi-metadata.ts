@@ -181,6 +181,21 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Set the node gate for new database placement",
     "admin",
   ),
+  "GET /v1/nodes/{id}/diagnostics": route(
+    "listNodeDiagnostics",
+    "List the boot reports of a node",
+    "admin",
+  ),
+  "POST /v1/nodes/{id}/diagnostics": route(
+    "requestNodeProbe",
+    "Ask a node for a read-only probe",
+    "admin",
+  ),
+  "GET /v1/nodes/{id}/diagnostics/{diagnostic_id}": route(
+    "getNodeDiagnostic",
+    "Read a boot report or the result of a probe",
+    "admin",
+  ),
   "POST /v1/nodes/{id}/mark-lost": route(
     "markNodeLost",
     "Declare a physical node lost and fence it",
@@ -409,6 +424,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "POST /node/v1/usage": route(
     "reportNodeUsage",
     "Report the node's metered usage of its databases",
+    "node",
+  ),
+  "POST /node/v1/diagnostics": route(
+    "reportNodeBoot",
+    "Report the previous boot's journal after a reboot, or the result of a probe",
     "node",
   ),
 };

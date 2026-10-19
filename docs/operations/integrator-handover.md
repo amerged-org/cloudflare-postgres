@@ -925,6 +925,7 @@ measurement is fresh and below the threshold.
 | `regional_node_pool_closed`                                   | a node's newest sample closes its thin pool for placement: data at 80 %, metadata at 50 % or the sold storage at 4 times its data           | fixed                                             |
 | `database_volume_warning`, `database_volume_critical`         | a database volume's space or inodes are at least 80 % (below 90 %), or at least 90 %, used                                                   | fixed                                             |
 | `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed |
+| `node_unexpected_reboot` | a node rebooted and no maintenance order of it asked for it, within the last 24 h | fixed |
 | `control_cron_stalled`, `control_cron_step_failing`           | no minute-cron run completed for 300 s, or a step failed in each of its last 5 runs                                                          | fixed (same release)                              |
 
 Thresholds are integer parts per million (1,000,000 = 100 %, valid 1 to 1,000,000, `null`

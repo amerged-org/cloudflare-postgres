@@ -22,6 +22,7 @@ import {
   NODE_OBSERVATION_MAX_AGE_MS,
 } from "./placement.ts";
 import { cronErrorCode, readCronHealth } from "./cron-health.ts";
+import { purgeNodeDiagnostics } from "./node-diagnostics.ts";
 import type { Env } from "../env.ts";
 import { regionalRamWindowSql } from "./memory-capacity.ts";
 import { regionalNodeCountSql } from "./node-capacity-count.ts";
@@ -801,9 +802,12 @@ const subjectObservation = (
 
 /** A refused enrollment keeps its episode this long after the last refusal (plan 8). */
 const ENROLLMENT_REFUSAL_ALERT_MS = 24 * 3_600_000;
+/** An unexpected reboot keeps its episode this long after the node's report (SEC-05). */
+const UNEXPECTED_REBOOT_ALERT_MS = 24 * 3_600_000;
 const HEALTH_KINDS = [
   "regional_node_stale",
   "node_enrollment_refused",
+  "node_unexpected_reboot",
   "infrastructure_backup_failed",
   "infrastructure_backup_stale",
   "database_archive_failing",
@@ -858,6 +862,14 @@ async function regionHealthAlerts(
      WHERE a.region_id=? AND i.refused_at>=? ORDER BY i.refused_at DESC,i.node_id LIMIT 64`,
   )
     .bind(regionId, new Date(now - ENROLLMENT_REFUSAL_ALERT_MS).toISOString())
+    .all<{ node_id: string }>();
+  // The nodes that rebooted although no maintenance order asked for it, newest report first.
+  const rebooted = await env.DB.prepare(
+    `SELECT d.node_id FROM node_diagnostics d JOIN nodes n ON n.id=d.node_id
+     WHERE n.region_id=? AND d.kind='boot' AND d.expected_reboot=0 AND d.received_at>=?
+     GROUP BY d.node_id ORDER BY MAX(d.received_at) DESC,d.node_id LIMIT 64`,
+  )
+    .bind(regionId, new Date(now - UNEXPECTED_REBOOT_ALERT_MS).toISOString())
     .all<{ node_id: string }>();
   const backups = (health ?? []).filter(
       (value) => value.region_id === regionId,
@@ -923,6 +935,16 @@ async function regionHealthAlerts(
             state: "active",
             detail: { node_ids: refused.results.map((node) => node.node_id) },
             subjects: refused.results.map((node) => node.node_id),
+          }
+        : { state: "resolved" },
+    ],
+    [
+      "node_unexpected_reboot",
+      rebooted.results.length
+        ? {
+            state: "active",
+            detail: { node_ids: rebooted.results.map((node) => node.node_id) },
+            subjects: rebooted.results.map((node) => node.node_id),
           }
         : { state: "resolved" },
     ],
@@ -1053,7 +1075,8 @@ async function reconcileAndDeliver(
  * Evaluates, for every region, the alarms that need no policy threshold: node heartbeats, daily
  * backup health and the database and Thin storage conditions. One durable episode per region and
  * kind; a region's failure is logged and does not skip the others, and an unreadable backup health
- * leaves only the backup kinds unknown.
+ * leaves only the backup kinds unknown. It also deletes the node diagnostics that are older than
+ * 30 days: the reboot alert reads the last day of them.
  */
 export async function runInfrastructureHealthAlerts(
   env: Env,
@@ -1074,6 +1097,17 @@ export async function runInfrastructureHealthAlerts(
       }),
     );
     failure = { error };
+  }
+  try {
+    await purgeNodeDiagnostics(env.DB, now);
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        event: "node_diagnostics_purge_failed",
+        error_code: cronErrorCode(error),
+      }),
+    );
+    failure ??= { error };
   }
   const regions = await env.DB.prepare(
     "SELECT id FROM regions ORDER BY id",

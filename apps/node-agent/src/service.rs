@@ -13,6 +13,7 @@ use crate::{
         server::{Server, Table, bind as bind_archive},
     },
     credentials::Credentials,
+    diagnostics::probe,
     fence::Fences,
     gateway::{Feed, bind as bind_gateway},
     link::{Desired as Page, Link, LinkEvent, LinkEvents},
@@ -94,6 +95,8 @@ pub struct Service<M: Machine> {
     tasks: Mutex<JoinSet<()>>,
     /// The release of the newest page (plan 9.3).
     release: Mutex<Option<update::Release>>,
+    /// The probes an administrator asked for that the agent has answered or is running (SEC-09).
+    probes: probe::Answered,
     /// A release is being installed.
     updating: AtomicBool,
     /// The release that was installed runs another agent: the agent restarts to run it.
@@ -185,6 +188,7 @@ impl<M: Machine> Service<M> {
             cpu: Mutex::new(None),
             tasks: Mutex::new(JoinSet::new()),
             release: Mutex::new(None),
+            probes: probe::Answered::load(layout.agent().join("probes-done")),
             updating: AtomicBool::new(false),
             restart: Notify::new(),
         });
@@ -211,6 +215,9 @@ impl<M: Machine> Service<M> {
 
         service.boot(&page).await;
         service.pull_page(page).await;
+        // The link stands: the previous boot's journal goes to Cloudflare, if there was a boot.
+        let s = service.clone();
+        service.spawn(async move { s.report_boot().await });
         // The gateway is served once the node has found what runs: its first table is then what
         // runs, and the sessions it kept across the agent's restart go on.
         core.settled(config.timing.settle).await;
@@ -375,7 +382,33 @@ impl<M: Machine> Service<M> {
         self.deliver_credentials(&page).await;
         self.apply_credentials(&page).await;
         self.core.apply(&page).await;
+        self.answer_probes(&page);
         self.consider_update(&page.release);
+    }
+
+    /// The probes an administrator asked for (SEC-09): each request of the page that the agent has
+    /// not answered and is not running starts now, in the background, and its result goes to
+    /// Cloudflare. A page lists a request until Cloudflare has its result, so a result that did not
+    /// arrive runs again with the next page.
+    fn answer_probes(self: &Arc<Self>, page: &Page) {
+        for request in &page.diagnostics {
+            if !self.probes.begin(&request.id) {
+                continue;
+            }
+            let (service, request) = (self.clone(), request.clone());
+            self.spawn(async move {
+                let result = probe::run(&*service.machine, &request).await;
+                let sent = service.link.post_probe(&result).await;
+                service.probes.end(&request.id, sent.is_ok());
+                crate::timing::emit_event(match sent {
+                    Ok(()) => json!({"event": "probe_answered", "probe": request.probe.name()}),
+                    Err(error) => json!({
+                        "event": "probe_not_sent", "probe": request.probe.name(),
+                        "class": crate::diagnostics::error_code(&error),
+                    }),
+                });
+            });
+        }
     }
 
     async fn pull(self: &Arc<Self>, ids: Option<&[String]>) {
@@ -476,7 +509,13 @@ impl<M: Machine> Service<M> {
         loop {
             self.core.slept_signal.notified().await;
             for operation in self.core.take_slept() {
-                match self.cycle().await {
+                let outcome = self.cycle().await;
+                // A cycle that failed may have installed part of the set or all of it before the
+                // reboot failed: only the boot of a node that reboots says what it holds.
+                if !matches!(outcome, Ok(true)) {
+                    self.report_os().await;
+                }
+                match outcome {
                     // The node reboots: the page lists the order until it is answered, and the
                     // agent that starts after the boot finds the packages in place.
                     Ok(true) => {}
@@ -487,6 +526,33 @@ impl<M: Machine> Service<M> {
                     Err(reason) => self.core.report_order(&operation, Err(reason)),
                 }
             }
+        }
+    }
+
+    /// After a boot, the tail of the previous boot's journal (SEC-05). A node that stopped
+    /// answering has no shell to tell why.
+    async fn report_boot(&self) {
+        if let Err(error) =
+            crate::diagnostics::boot_report::report_boot(&*self.machine, &self.link).await
+        {
+            crate::timing::emit_event(json!({
+                "event": "boot_report_not_sent", "class": crate::diagnostics::error_code(&error),
+            }));
+        }
+    }
+
+    /// The packages may have changed without a reboot, in a cycle that ended or failed: the next
+    /// hello of the link names the digest of what is installed now (SEC-03). After a reboot the
+    /// agent starts again and says it.
+    async fn report_os(&self) {
+        let reported = match crate::machine::os_report(&*self.machine).await {
+            Ok(os) => self.link.set_os(&os),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = reported {
+            crate::timing::emit_event(json!({
+                "event": "os_not_reported", "class": crate::diagnostics::error_code(&error),
+            }));
         }
     }
 
@@ -794,6 +860,7 @@ mod tests {
                 image_version: "25".into(),
                 agent_version: "0.1.0".into(),
                 release_id: None,
+                os: crate::machine::os_report(&*machine).await.unwrap(),
                 timing: LinkTiming {
                     interval: Duration::from_millis(300),
                     ..LinkTiming::default()
@@ -952,6 +1019,7 @@ mod tests {
                     image_version: "25".into(),
                     agent_version: "0.1.0".into(),
                     release_id: None,
+                    os: crate::machine::os_report(&*machine).await.unwrap(),
                     timing: LinkTiming {
                         interval: Duration::from_millis(300),
                         ..LinkTiming::default()
@@ -1078,6 +1146,7 @@ mod tests {
                 image_version: "25".into(),
                 agent_version: "0.1.0".into(),
                 release_id: None,
+                os: crate::machine::os_report(&**machine).await.unwrap(),
                 timing: LinkTiming {
                     interval: Duration::from_millis(300),
                     ..LinkTiming::default()
@@ -1099,6 +1168,121 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_agent_that_starts_after_a_reboot_posts_the_journal_of_the_boot_before() {
+        let Some((machine, _fixture, _root)) =
+            site("boot-journal", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let reports = || cloud.acknowledged("/node/v1/diagnostics");
+        // The first start of the node: no boot before it, and the agent remembers this one.
+        let first = serve(&machine, &cloud, &base).await;
+        let before = machine.boot().unwrap().id;
+        eventually(30, "the first boot to be remembered", || {
+            machine.layout().agent().join("boot-id").exists()
+        })
+        .await;
+        first.stop();
+        drop(first);
+        assert!(reports().is_empty());
+        // The node reboots and the agent starts again: it says which boot the lines are of.
+        machine.reboot().await.unwrap();
+        let second = serve(&machine, &cloud, &base).await;
+        eventually(30, "the report of the previous boot", || {
+            !reports().is_empty()
+        })
+        .await;
+        let [report] = &reports()[..] else {
+            panic!("one report: {:?}", reports());
+        };
+        assert_eq!(report["previous_boot_id"], before);
+        assert_eq!(report["boot_id"], machine.boot().unwrap().id);
+        assert!(!report["entries"].as_array().unwrap().is_empty());
+        second.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_probe_on_the_page_runs_once_its_result_is_posted_and_a_result_that_did_not_arrive_runs_it_again()
+     {
+        let Some((machine, _fixture, _root)) =
+            site("probe", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let listeners = "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81";
+        let boots = "6c2a1d3f-8e45-4b9c-af72-1d4e3b5a7c92";
+        let request = |id: &str, probe: &str| json!({"id": id, "probe": probe, "boot": 0, "since_seconds": 3600, "lines": 200});
+        let results = |id: &str| -> Vec<Value> {
+            cloud
+                .acknowledged("/node/v1/diagnostics")
+                .into_iter()
+                .filter(|body| body["diagnostic_id"] == id)
+                .collect()
+        };
+        let ran = |program: &str| {
+            machine
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with(&format!("diagnostic {program} ")))
+                .count()
+        };
+        let pulls = || {
+            cloud
+                .requests()
+                .iter()
+                .filter(|seen| seen.method == "GET" && seen.path() == "/node/v1/desired")
+                .count()
+        };
+        // The first page lists the request: the probe runs, and the result is posted, signed.
+        cloud.with(|inner| inner.diagnostics = vec![request(listeners, "listeners")]);
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(30, "the result of the probe", || {
+            results(listeners).len() == 1
+        })
+        .await;
+        let result = &results(listeners)[0];
+        assert_eq!(result["probe"], "listeners");
+        assert_eq!(result["status"], "ok");
+        assert!(result["text"].as_str().unwrap().contains("127.0.0.1:8443"));
+        assert!(contract_valid("NodeProbeResult", result));
+        // The page lists it still, as one pulled while the result was on its way does: it does not
+        // run again, for the pages the link asks for, nor for the agent that starts again.
+        for _ in 0..3 {
+            let before = pulls();
+            cloud.push(json!({"type": "desired"}));
+            eventually(30, "a pull", || pulls() > before).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!((ran("ss"), results(listeners).len()), (1, 1));
+        service.stop();
+        drop(service);
+        let service = serve(&machine, &cloud, &base).await;
+        let before = pulls();
+        eventually(30, "a page after the start", || pulls() > before).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!((ran("ss"), results(listeners).len()), (1, 1));
+        // A result that Cloudflare did not take: the request is on the next page, and runs again.
+        cloud.with(|inner| {
+            inner.probe_failures = 1;
+            inner.diagnostics.push(request(boots, "boots"));
+        });
+        cloud.push(json!({"type": "desired"}));
+        eventually(30, "the first try of the probe", || ran("journalctl") == 1).await;
+        eventually(30, "the second try", || {
+            cloud.push(json!({"type": "desired"}));
+            ran("journalctl") == 2 && results(boots).len() == 1
+        })
+        .await;
+        assert_eq!(results(boots)[0]["probe"], "boots");
+        assert_eq!(ran("ss"), 1);
+        service.stop();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1165,6 +1349,7 @@ mod tests {
             ("postgresql-18", "18.6-1"),
             ("cloudflared", "2026.10.0"),
         ]);
+        let before = crate::update::packages_digest(&machine.installed_packages().await.unwrap());
         let cloud = Cloud::start().await;
         let deb = b"cloudflared 2026.10.1".to_vec();
         let url = cloud.serve_file("/files/cloudflared.deb", deb.clone());
@@ -1172,6 +1357,7 @@ mod tests {
             "packages": [
                 {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
                 {"name": "postgresql-18", "version": "18.7-1", "architecture": "amd64", "url": "https://snapshot.example/pg.deb", "size": 10, "sha256": "b".repeat(64)},
+                {"name": "cloudflared", "version": "2026.10.1", "architecture": "amd64", "url": url, "size": deb.len(), "sha256": digest(&deb)},
             ],
             "extra": [
                 {"name": "cloudflared", "version": "2026.10.1", "architecture": "amd64", "url": url, "size": deb.len(), "sha256": digest(&deb)},
@@ -1196,12 +1382,14 @@ mod tests {
         })
         .await;
         // The pinned versions are installed from the release's snapshot, the extra package as the
-        // file it downloaded, and the node is checked afterwards. No reboot: no kernel changed.
+        // file it downloaded (a real lock lists it among its packages too), and the node is checked
+        // afterwards. No reboot: no kernel changed.
         let calls = machine.calls();
         let at = |what: &str| calls.iter().position(|call| call.starts_with(what));
         assert!(
             calls.contains(
-                &"install 20261016T000000Z postgresql-18=18.7-1 + cloudflared.deb".to_string()
+                &"install 20261016T000000Z postgresql-18=18.7-1 cloudflared=2026.10.1 + cloudflared.deb"
+                    .to_string()
             ),
             "{calls:?}"
         );
@@ -1210,6 +1398,28 @@ mod tests {
             "{calls:?}"
         );
         assert!(at("reboot").is_none(), "{calls:?}");
+        // The packages changed and the node did not boot again: the hello says the digest of what
+        // is installed now, on the link that was up or on a new one, and no hello says another boot.
+        let installed = machine.installed_packages().await.unwrap();
+        assert_eq!(installed["cloudflared"], "2026.10.1");
+        let after = crate::update::packages_digest(&installed);
+        assert_ne!(after, before);
+        eventually(30, "the new packages to be said", || {
+            cloud.with(|inner| {
+                inner
+                    .hellos
+                    .iter()
+                    .any(|hello| hello["os"]["packages_sha256"] == after.as_str())
+            })
+        })
+        .await;
+        let hellos = cloud.with(|inner| inner.hellos.clone());
+        assert!(
+            hellos
+                .iter()
+                .all(|hello| hello["os"]["boot_id"] == hellos[0]["os"]["boot_id"]),
+            "{hellos:?}"
+        );
         service.stop();
     }
 
@@ -1271,6 +1481,7 @@ mod tests {
         };
         runs(&machine, "r1", &same(b"bin"));
         machine.set_packages(&[("bash", "5.2")]);
+        let booted = machine.boot().unwrap().id;
         let cloud = Cloud::start().await;
         let lock = json!({
             "packages": [
@@ -1313,6 +1524,20 @@ mod tests {
         let service = serve(&machine, &cloud, &base).await;
         eventually(60, "the order to be answered", || answer().is_some()).await;
         assert_eq!(answer(), Some(json!("done")));
+        // The agent that started after the boot says another boot, the kernel the lock named and
+        // the lock's packages: what the API compares with the release.
+        let digest = crate::update::packages_digest(&machine.installed_packages().await.unwrap());
+        eventually(30, "the new boot to be said", || {
+            cloud.with(|inner| {
+                inner.hellos.iter().any(|hello| {
+                    let os = &hello["os"];
+                    os["boot_id"] != booted.as_str()
+                        && os["kernel_release"] == "6.12.99-amd64"
+                        && os["packages_sha256"] == digest.as_str()
+                })
+            })
+        })
+        .await;
         let calls = machine.calls();
         assert!(calls.contains(&"health_check".to_string()), "{calls:?}");
         assert!(
@@ -1321,6 +1546,63 @@ mod tests {
                 .all(|call| !call.starts_with("install") && call != "reboot"),
             "{calls:?}"
         );
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cycle_whose_reboot_fails_still_says_the_packages_it_installed() {
+        let Some((machine, _fixture, _root)) = site("maintenance-reboot-fails", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1", &same(b"bin"));
+        machine.set_packages(&[
+            ("bash", "5.2"),
+            ("linux-image-6.12.111+deb13-amd64", "6.12.111-1"),
+        ]);
+        let before = crate::machine::os_report(&*machine).await.unwrap();
+        machine.fail_next_reboot();
+        let cloud = Cloud::start().await;
+        let lock = json!({
+            "packages": [
+                {"name": "bash", "version": "5.3", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
+                {"name": "linux-image-6.12.113+deb13-amd64", "version": "6.12.113-1", "architecture": "amd64", "url": "https://snapshot.example/k.deb", "size": 10, "sha256": "c".repeat(64)},
+            ],
+            "extra": [],
+        })
+        .to_string();
+        let release = release_of(&cloud, "r1", &same(b"bin"), lock.as_bytes());
+        let operation = "op_ffffffffffffffffffff";
+        cloud.with(|inner| {
+            inner.release = Some(release);
+            inner.orders = vec![json!({"type": "maintenance", "operation": operation})];
+        });
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(60, "the order to fail", || {
+            cloud
+                .acknowledged("/node/v1/observations")
+                .iter()
+                .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                .any(|order| {
+                    order["operation"] == operation
+                        && order["status"] == "failed"
+                        && order["reason"] == "reboot_failed"
+                })
+        })
+        .await;
+        // The packages are installed and the node did not boot again. Of the two kernels only the
+        // running one counts, so the digest changed with bash alone, and the hello says it: a
+        // rollback to the release that was running must not find the old digest.
+        let after = crate::machine::os_report(&*machine).await.unwrap();
+        assert_ne!(after["packages_sha256"], before["packages_sha256"]);
+        assert_eq!(after["boot_id"], before["boot_id"]);
+        assert_eq!(after["kernel_release"], "6.12.111+deb13-amd64");
+        eventually(30, "the new packages to be said", || {
+            cloud.with(|inner| inner.hellos.iter().any(|hello| hello["os"] == after))
+        })
+        .await;
         service.stop();
     }
 
@@ -1341,6 +1623,7 @@ mod tests {
                 image_version: "25".into(),
                 agent_version: "0.1.0".into(),
                 release_id: None,
+                os: crate::machine::os_report(&*machine).await.unwrap(),
                 timing: LinkTiming {
                     interval: Duration::from_millis(300),
                     ..LinkTiming::default()

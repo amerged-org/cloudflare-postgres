@@ -1,0 +1,14 @@
+  {
+      "report": [
+          {
+              "lv": [
+              ]
+          }
+      ]
+      ,
+      "log": [
+          {"log_seq_num":"1", "log_type":"error", "log_context":"processing", "log_object_type":"lv", "log_object_name":"pgcf_thinpool", "log_object_id":"", "log_object_group":"pgcf", "log_object_group_id":"jJAPkZ-4Wbx-hiHF-hlDV-LhHY-dnIU-zOUKky", "log_message":"Failed to find logical volume \"pgcf/pgcf_thinpool\"", "log_errno":"-1", "log_ret_code":"0"},
+          {"log_seq_num":"2", "log_type":"status", "log_context":"processing", "log_object_type":"lv", "log_object_name":"pgcf_thinpool", "log_object_id":"", "log_object_group":"pgcf", "log_object_group_id":"jJAPkZ-4Wbx-hiHF-hlDV-LhHY-dnIU-zOUKky", "log_message":"failure", "log_errno":"-1", "log_ret_code":"5"},
+          {"log_seq_num":"3", "log_type":"status", "log_context":"processing", "log_object_type":"vg", "log_object_name":"pgcf", "log_object_id":"jJAPkZ-4Wbx-hiHF-hlDV-LhHY-dnIU-zOUKky", "log_object_group":"", "log_object_group_id":"", "log_message":"failure", "log_errno":"-1", "log_ret_code":"5"}
+      ]
+  }

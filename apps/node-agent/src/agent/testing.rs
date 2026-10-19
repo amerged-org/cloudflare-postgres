@@ -312,6 +312,7 @@ impl Rig {
             policy: page["policy"].clone(),
             credentials_revision: 1,
             orders,
+            diagnostics: Vec::new(),
             databases,
             complete: true,
         }

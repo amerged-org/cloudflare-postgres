@@ -14,6 +14,7 @@ import {
   API_ORIGIN,
   cleanupFixtures,
   fixture,
+  nodeOs,
   nodeSample,
   refusal,
   request,
@@ -76,6 +77,7 @@ async function hello(
       protocol: 1,
       agent_version: "0.1.0",
       release_id: release,
+      os: nodeOs(),
     }),
   );
   await welcome;
@@ -133,6 +135,10 @@ it("refuses a body that is not a registration: a full spec, a URL, an unknown fi
     },
     { ...f.value, os: { ...f.value.os, debian_snapshot: "today" } },
     { ...f.value, os: { ...f.value.os, image_version: "other" } },
+    { ...f.value, os: { ...f.value.os, packages_sha256: undefined } },
+    { ...f.value, os: { ...f.value.os, packages_sha256: "latest" } },
+    { ...f.value, os: { ...f.value.os, kernel_release: undefined } },
+    { ...f.value, os: { ...f.value.os, kernel_release: "6.12 amd64" } },
     {},
   ])
     expect((await f.approve(body)).status).toBe(400);
@@ -174,6 +180,9 @@ it("names the URLs of the spec itself: every file of the release is served by th
       url: url("packages.lock.json"),
       ...f.value.os.package_lock,
     },
+    // What a node that runs the lock reports back, fixed with the release.
+    packages_sha256: f.value.os.packages_sha256,
+    kernel_release: f.value.os.kernel_release,
   });
   expect(release.spec.image.url).toMatch(
     new RegExp(

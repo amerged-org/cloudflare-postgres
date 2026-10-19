@@ -6,6 +6,11 @@ import {
   OperationId,
   RegionId,
   NodeId,
+  NodeDiagnostic,
+  NodeDiagnosticSummary,
+  NodeProbeAccepted,
+  NodeProbeDiagnostic,
+  NodeProbeRequest,
   listEnvelope,
 } from "@pgcf/contracts";
 import {
@@ -16,6 +21,11 @@ import {
 } from "@pgcf/contracts/nodes";
 import type { ApiContext } from "../env.ts";
 import type { ApiApp } from "../app.ts";
+import {
+  getNodeDiagnostic,
+  listNodeDiagnostics,
+  requestNodeProbe,
+} from "../domain/node-diagnostics.ts";
 import {
   approvePurchase,
   capacityDecision,
@@ -108,6 +118,75 @@ export function registerNodes(app: ApiApp): void {
         c,
         NodeId.parse(c.req.param("id")),
         NodeMarkLost.parse(await c.req.json()),
+      ),
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/nodes/{id}/diagnostics",
+      security,
+      tags: ["Nodes"],
+      summary: "List a node's boot reports",
+      description:
+        "The reports a node sent after each reboot, newest first, without their journal lines. expected_reboot is true when a maintenance order of the node was open when its last sample of the previous boot arrived, or closed after it, false when none was (the node_unexpected_reboot alert), and null when the agent knew no earlier boot. Reports are kept for 30 days. Administrator keys only: any other key is told 404.",
+      request: { params: z.object({ id: NodeId }), query: ListQuery },
+      responses: responses(
+        listEnvelope(NodeDiagnosticSummary),
+        200,
+        "Boot reports",
+      ),
+    },
+    async (c) => listNodeDiagnostics(c, NodeId.parse(c.req.param("id"))),
+  );
+  register(
+    app,
+    {
+      method: "post",
+      path: "/v1/nodes/{id}/diagnostics",
+      security,
+      tags: ["Nodes"],
+      summary: "Ask a node for a read-only probe",
+      description: [
+        "The node has no shell. This asks its agent to read one thing and send it back: the probe is one of journal (the lines of the agent, the gateway, cloudflared, networkd, PID 1 and the kernel), kernel, boots (the boots the journal holds), failed_units, sockets (the socket units), listeners (the listening TCP, UDP and Unix sockets), pressure (kernel pressure, memory and load figures) and pool (the thin pool's fill). Each is a fixed command or a read of fixed files that the agent builds itself; there is no command, path or unit to give.",
+        "boot is 0 (this boot, the default) or -1 (the one before) and lines is 1 to 2000 (default 200); they bound the journal and kernel probes. since_seconds is 60 to 86400 (default 3600) and bounds the journal probe only. The others ignore all three. The answer is capped at 1 MiB and never holds a line of a database's unit or of a backup job. The node learns of the request within a pull of its desired page, which it is told to make now, runs it once and posts the result. The page lists at most eight open requests of a node at a time, the oldest first: later ones wait for an answer to make room, and expire after ten minutes if none does.",
+        "202 with the id of the request. Read it with GET on the same path and that id: requested, received or expired. The key that asked is recorded. Administrator keys only: any other key is told 404.",
+      ].join("\n\n"),
+      request: {
+        params: z.object({ id: NodeId }),
+        body: body(NodeProbeRequest),
+      },
+      responses: responses(NodeProbeAccepted, 202, "Probe requested"),
+    },
+    async (c) => requestNodeProbe(c, NodeId.parse(c.req.param("id"))),
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/nodes/{id}/diagnostics/{diagnostic_id}",
+      security,
+      tags: ["Nodes"],
+      summary: "Read a node's boot report or probe",
+      description: [
+        "A boot report (kind boot) holds the tail of the previous boot's journal: at most 1,000 lines of the agent, the gateway, cloudflared, networkd, PID 1 and the kernel, oldest first, each with its time, unit, program, transport, syslog priority and text (at most 2,048 bytes). An event line of the agent keeps only the fields an observation event may carry; lines of the databases' units and of backup jobs are never reported.",
+        "A probe (kind probe, asked for with POST on the node's diagnostics) is requested until the node's result arrives, received once it has (body holds the result, at most 1 MiB: journal and kernel answer with entries, every other probe with text, and status failed says the command ended with a status other than 0 or could not be run), and expired when ten minutes pass without one. A result is kept for 30 days.",
+        "Administrator keys only: any other key is told 404.",
+      ].join("\n\n"),
+      request: {
+        params: z.object({ id: NodeId, diagnostic_id: z.uuid() }),
+      },
+      responses: responses(
+        z.discriminatedUnion("kind", [NodeDiagnostic, NodeProbeDiagnostic]),
+        200,
+        "Boot report or probe",
+      ),
+    },
+    async (c) =>
+      getNodeDiagnostic(
+        c,
+        NodeId.parse(c.req.param("id")),
+        z.uuid().parse(c.req.param("diagnostic_id")),
       ),
   );
   register(

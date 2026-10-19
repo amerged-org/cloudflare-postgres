@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-import { NODE_STALE_MS, bytesToHex, type NodeInventory } from "@pgcf/contracts";
+import {
+  NODE_STALE_MS,
+  NodeOs,
+  bytesToHex,
+  type NodeInventory,
+} from "@pgcf/contracts";
 import {
   FleetRelease,
   FleetReleaseId,
@@ -272,23 +277,31 @@ interface NodeReleaseRow {
   last_observed_at: string | null;
   reported_release_id: string | null;
   agent_version: string | null;
+  os_boot_id: string | null;
+  os_booted_at: string | null;
+  os_kernel_release: string | null;
+  os_packages_sha256: string | null;
   desired_release_id: string | null;
   desired_spec_sha256: string | null;
+  desired_kernel_release: string | null;
+  desired_packages_sha256: string | null;
 }
 const nodeReleaseSelect = `SELECT n.id node_id,n.region_id,n.node_uid,n.lost_at,n.last_observed_at,n.reported_release_id,n.agent_version,
-    f.release_id desired_release_id,r.spec_sha256 desired_spec_sha256
+    n.os_boot_id,n.os_booted_at,n.os_kernel_release,n.os_packages_sha256,
+    f.release_id desired_release_id,r.spec_sha256 desired_spec_sha256,
+    json_extract(r.spec_json,'$.os.kernel_release') desired_kernel_release,
+    json_extract(r.spec_json,'$.os.packages_sha256') desired_packages_sha256
     FROM nodes n LEFT JOIN fleet_region_releases f ON f.region_id=n.region_id LEFT JOIN fleet_releases r ON r.id=f.release_id`;
+/** What the fleet knows of a node beyond its row: its release status and what its link reported. */
+export type NodeFleet = {
+  status: FleetNodeReleaseStatus;
+} & Pick<NodeInventory, "observation" | "os" | "os_converged">;
 /**
  * Where a node stands against its region's release. A node follows the release of its region:
- * its page names it, and the agent's hello names the release it runs.
+ * its page names it, and the agent's hello names the release it runs and the operating system
+ * it boots. The OS is the release's when the kernel and the installed packages are.
  */
-function nodeReleaseStatus(
-  row: NodeReleaseRow,
-  now = Date.now(),
-): {
-  status: FleetNodeReleaseStatus;
-  observation: NodeInventory["observation"];
-} {
+function nodeReleaseStatus(row: NodeReleaseRow, now = Date.now()): NodeFleet {
   const seen =
       row.last_observed_at === null ? null : Date.parse(row.last_observed_at),
     stale = seen === null || seen < now - NODE_STALE_MS || seen > now + 5000;
@@ -302,6 +315,15 @@ function nodeReleaseStatus(
           : stale
             ? "stale"
             : "converged";
+  const os =
+    row.os_boot_id === null
+      ? null
+      : NodeOs.parse({
+          boot_id: row.os_boot_id,
+          booted_at: row.os_booted_at,
+          kernel_release: row.os_kernel_release,
+          packages_sha256: row.os_packages_sha256,
+        });
   return {
     status: FleetNodeReleaseStatus.parse({
       node_id: row.node_id,
@@ -318,6 +340,12 @@ function nodeReleaseStatus(
       observed_at: row.last_observed_at,
       agent_version: row.agent_version,
     },
+    os,
+    os_converged:
+      os === null || row.desired_release_id === null
+        ? null
+        : os.kernel_release === row.desired_kernel_release &&
+          os.packages_sha256 === row.desired_packages_sha256,
   };
 }
 export async function readFleetNodeRelease(
@@ -335,15 +363,7 @@ export async function readFleetNodeRelease(
 export async function readFleetNodeReleaseInventories(
   db: D1Database,
   ids: string[],
-): Promise<
-  Map<
-    string,
-    {
-      status: FleetNodeReleaseStatus;
-      observation: NodeInventory["observation"];
-    }
-  >
-> {
+): Promise<Map<string, NodeFleet>> {
   if (ids.length === 0) return new Map();
   const rows = await db
     .prepare(
