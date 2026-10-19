@@ -101,6 +101,37 @@ export const NODE_SAMPLE_INTERVAL_MS = 15_000;
 export const NODE_VOLUME_REPORT_INTERVAL_MS = 60_000;
 /** A node whose link stays silent this long is stale; staleness never declares it lost. */
 export const NODE_STALE_MS = 180_000;
+/**
+ * The anti-entropy of observations (plan 5.3). A node posts what it observed of a database when
+ * that changes, and the API keeps it; a report that does not name a database says nothing of it,
+ * in particular never that it is gone. To repair what a lost change, a restored D1 or an API
+ * that lost its state would leave behind, the node says again what it said of each database, once
+ * in this period, at a point of the period that its identifier fixes, so that the databases never
+ * come in one minute. The period is never shortened: at 15 minutes 300 databases
+ * are 20 observations a minute, where a full pass each minute was 300 and filled the API's minute
+ * at about 1,200 databases. The node's own sample and volume report (every 15 s and 60 s) are its
+ * liveness, and they stay. A database that Cloudflare waits for, a build, a restore or a move
+ * (an entry with an origin, or an open move order), is not on this clock: the node keeps posting
+ * it with every full pull, because the API's create, restore and move steps wait for the next
+ * report that names it.
+ *
+ * Who reads the time of a database's own observation, and what each needs:
+ * - `databases.backup_observed_at` (`health.backup` of a database and of the operator listing, and
+ *   the alert `database_base_backup_stale`) is the one reader that needs it: a database that is
+ *   unchanged and alive was last named at most one period ago, so these judge a report fresh for
+ *   `NODE_DATABASE_STALE_MS`. The API touches the column when an unchanged observation arrives.
+ * - `regional_node_stale`, placement, `thin_storage_blocked` (`thin_pool_unobserved`), the node
+ *   alerts and the fleet release state read the node's own sample (`nodes.last_observed_at`), not
+ *   a database's observation: unchanged at 180 s.
+ * - Storage samples, `health.disk` and the volume alerts come from the volume report of the node,
+ *   one per minute, and from nothing a database observation carries: unchanged.
+ * - The proven-sleep record and the recovery points are facts, written when they change; their
+ *   time is when they were observed, never a proof of life, and nothing judges their age.
+ * - The cron step `database_actors` reads D1's rows and no observation time.
+ */
+export const NODE_OBSERVATION_RESEND_MS = 15 * 60_000;
+/** A database's own observation is stale when it is older than three periods of the resend. */
+export const NODE_DATABASE_STALE_MS = 3 * NODE_OBSERVATION_RESEND_MS;
 export const NODE_LINK_MESSAGE_MAX_BYTES = 64 * 1024;
 export const NODE_DESIRED_PAGE_LIMIT_MAX = 200;
 export const NODE_ORDER_LIMIT = 1000;
@@ -1175,7 +1206,8 @@ export interface GenerationRef {
   generation: number;
   operation: string;
 }
-export type ObservationVerdict = "accept" | "stale" | "conflict";
+export const OBSERVATION_VERDICTS = ["accept", "stale", "conflict"] as const;
+export type ObservationVerdict = (typeof OBSERVATION_VERDICTS)[number];
 /**
  * Whether the API takes an observation of a database. `desired` is D1's current generation,
  * `claim` the wake ticket the DatabaseActor issued whose claim D1 has not committed yet (null
@@ -1271,6 +1303,26 @@ export const NodeObservationReport = z
     { message: "A report names each database and order once" },
   );
 export type NodeObservationReport = z.infer<typeof NodeObservationReport>;
+
+/**
+ * The answer to a report: the verdict on each database of it (`observationVerdict`), where the
+ * report named it. The node holds a database's observation as taken by the API only on `accept`;
+ * on `stale` and `conflict` the page wins and the node reports again from the page it pulls next.
+ * A fenced node's report is read for its orders alone, and its answer names no database.
+ */
+export const NodeObservationAnswer = z.strictObject({
+  databases: z
+    .array(
+      z.strictObject({
+        id: DatabaseId,
+        verdict: z.enum(OBSERVATION_VERDICTS),
+      }),
+    )
+    .max(NODE_DESIRED_PAGE_LIMIT_MAX),
+  /** How many results of the report's orders the API took. */
+  orders: z.number().int().nonnegative(),
+});
+export type NodeObservationAnswer = z.infer<typeof NodeObservationAnswer>;
 
 // ---------- Samples (link) and volumes (POST /node/v1/volumes) ----------
 

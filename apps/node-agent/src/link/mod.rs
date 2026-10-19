@@ -269,10 +269,29 @@ impl Link {
     }
 
     /// Posts what the node observed of its databases and how its orders ended
-    /// (`NodeObservationReport`). The agent builds a new report from its state when this fails.
-    pub async fn post_observation(&self, report: &Value) -> Result<(), Error> {
-        self.post("observations", "NodeObservationReport", report)
-            .await
+    /// (`NodeObservationReport`). Returns the databases whose observation Cloudflare took (the
+    /// verdict `accept`), which it holds from then on; the others, `stale` or in `conflict`, it
+    /// does not hold, and the node reports them again from the page it pulls next. The agent builds
+    /// a new report from its state when this fails.
+    pub async fn post_observation(&self, report: &Value) -> Result<Vec<String>, Error> {
+        if !contract_valid("NodeObservationReport", report) {
+            return Err("native observations report invalid".into());
+        }
+        let answer = self
+            .inner
+            .api
+            .post_answer(path("observations")?, report)
+            .await?;
+        if !contract_valid("NodeObservationAnswer", &answer) {
+            return Err("native observations answer invalid".into());
+        }
+        Ok(answer["databases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|database| database["verdict"] == "accept")
+            .filter_map(|database| database["id"].as_str().map(str::to_string))
+            .collect())
     }
 
     /// Posts the journal of the previous boot (`NodeBootReport`), once after a reboot.
@@ -441,10 +460,34 @@ mod tests {
         assert_eq!(archive["id"], "crd_kkkkkkkkkkkkkkkkkkkk");
         // Posts, the sample over the link.
         let observation = vector("NodeObservationReport", "asleep");
-        link.post_observation(&observation).await.unwrap();
+        let id = observation["databases"][0]["id"].as_str().unwrap();
+        // Cloudflare's verdict on each database of the report: the node holds what it accepted.
+        assert_eq!(link.post_observation(&observation).await.unwrap(), [id]);
+        cloud.with(|inner| {
+            inner.verdicts.insert(id.to_string(), "conflict");
+        });
+        assert!(
+            link.post_observation(&observation)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        cloud.with(|inner| {
+            inner.verdicts.insert(id.to_string(), "stale");
+        });
+        assert!(
+            link.post_observation(&observation)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        cloud.with(|inner| inner.verdicts.clear());
         let volumes = vector("NodeVolumeReport", "volumes");
         link.post_volumes(&volumes).await.unwrap();
-        assert_eq!(cloud.acknowledged("/node/v1/observations"), [observation]);
+        assert_eq!(
+            cloud.acknowledged("/node/v1/observations"),
+            vec![observation.clone(); 3]
+        );
         assert_eq!(cloud.acknowledged("/node/v1/volumes"), [volumes]);
         let sample = vector("NodeSample", "sample");
         link.post_samples(&sample).await.unwrap();
@@ -603,9 +646,13 @@ mod tests {
         assert_eq!(next(&mut events).await, Some(LinkEvent::Desired(None)));
         let desired = link.desired_page(None).await.unwrap();
         assert!(matches!(desired.orders[0], Order::Fence { .. }));
-        link.post_observation(&vector("NodeObservationReport", "asleep"))
-            .await
-            .unwrap();
+        // The observations of a fenced node are read for its orders alone: no database is taken.
+        assert!(
+            link.post_observation(&vector("NodeObservationReport", "asleep"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             link.post_volumes(&vector("NodeVolumeReport", "volumes"))
                 .await

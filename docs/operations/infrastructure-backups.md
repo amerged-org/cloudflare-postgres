@@ -226,8 +226,9 @@ Rules of the database and Thin storage kinds:
   restore, before an idle sleep when one is due (none on the current timeline, or the newest is
   older than 24 h) and, for an always-warm database, once the newest is older than 24 h; it never
   wakes a sleeping database for a backup, so a database that slept through its due time is not
-  reported until it has been awake 36 h without a backup. The agent's backup report must be fresh
-  (at most 180 s old) and `ok` with a completion time, or `failing`; a sleeping database and an
+  reported until it has been awake 36 h without a backup. The database's backup report must be fresh
+  (at most 45 min old: a node names a database that did not change once in 15 min) and `ok` with a
+  completion time, or `failing`; a sleeping database and an
   unknown report are excluded.
 - **Thin storage.** From the node's newest pool sample (at most 180 s old), `thin_pool_no_room`
   means the node's own room rule says no room: free data under the region node policy's

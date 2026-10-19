@@ -4,6 +4,7 @@ import {
   INFRA_ALERT_ACTIONS,
   InfraAlert,
   InfraAlertStatus,
+  NODE_DATABASE_STALE_MS,
   type InfraAlertKind,
 } from "@pgcf/contracts";
 import {
@@ -755,7 +756,9 @@ async function readRegionSubjects(
     )
     .bind(
       regionId,
-      new Date(now - NODE_OBSERVATION_MAX_AGE_MS).toISOString(),
+      // The backup observation of a database that did not change is repeated once in each
+      // anti-entropy period, not once in each minute.
+      new Date(now - NODE_DATABASE_STALE_MS).toISOString(),
       new Date(now - BASE_BACKUP_MAX_AGE_MS).toISOString(),
     )
     .all<SubjectRow>();

@@ -8663,6 +8663,64 @@
       }
     },
     {
+      "schema": "NodeObservationAnswer",
+      "name": "one-of-each",
+      "valid": true,
+      "refinement": false,
+      "value": {
+        "databases": [
+          { "id": "dbbbbbbbbbbbbbbbbbbb", "verdict": "accept" },
+          { "id": "ebbbbbbbbbbbbbbbbbbb", "verdict": "stale" },
+          { "id": "sbbbbbbbbbbbbbbbbbbb", "verdict": "conflict" }
+        ],
+        "orders": 2
+      }
+    },
+    {
+      "schema": "NodeObservationAnswer",
+      "name": "a-fenced-node",
+      "valid": true,
+      "refinement": false,
+      "value": { "databases": [], "orders": 1 }
+    },
+    {
+      "schema": "NodeObservationAnswer",
+      "name": "unknown-verdict",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "databases": [{ "id": "dbbbbbbbbbbbbbbbbbbb", "verdict": "rejected" }],
+        "orders": 0
+      }
+    },
+    {
+      "schema": "NodeObservationAnswer",
+      "name": "no-identifier",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "databases": [{ "id": "not-a-database", "verdict": "accept" }],
+        "orders": 0
+      }
+    },
+    {
+      "schema": "NodeObservationAnswer",
+      "name": "negative-orders",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "databases": [{ "id": "dbbbbbbbbbbbbbbbbbbb", "verdict": "accept" }],
+        "orders": -1
+      }
+    },
+    {
+      "schema": "NodeObservationAnswer",
+      "name": "an-unknown-key",
+      "valid": false,
+      "refinement": false,
+      "value": { "databases": [], "orders": 0, "hint": true }
+    },
+    {
       "schema": "NodeSample",
       "name": "sample",
       "valid": true,

@@ -50,6 +50,9 @@ pub struct Intervals {
     pub pool: Duration,
     /// The whole desired page, which a message the link lost would leave unread.
     pub full_pull: Duration,
+    /// The look for the databases whose turn in the anti-entropy period has come
+    /// (`Core::resend_due`).
+    pub resend: Duration,
     /// Observations, events and results are posted this long after the first change, so that a
     /// burst is one request.
     pub batch: Duration,
@@ -70,6 +73,7 @@ impl Default for Intervals {
             usage: Duration::from_secs(60),
             pool: crate::storage::POOL_SAMPLE_INTERVAL,
             full_pull: Duration::from_secs(60),
+            resend: Duration::from_secs(60),
             batch: Duration::from_millis(200),
         }
     }
@@ -782,21 +786,25 @@ impl<M: Machine> Service<M> {
     // ---- the node reports
 
     /// Posts what the core queued: the observations and results, and the events. The events of
-    /// the agent's log wake it as well, so that a node whose databases do not change reports them.
+    /// the agent's log wake it as well, so that a node whose databases do not change reports them,
+    /// and so does the anti-entropy, which asks each minute for the databases whose turn has come.
     async fn report(&self) {
         let events = crate::events::global();
         let mut wait = self.intervals.batch;
+        let mut resend = tokio::time::interval(self.intervals.resend);
+        resend.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 () = self.core.changed.notified() => {}
                 () = events.due() => {}
+                _ = resend.tick() => self.core.resend_due(crate::agent::now_ms()),
             }
             tokio::time::sleep(self.intervals.batch).await;
             while let Some(report) = self.core.take_report(events) {
                 match self.link.post_observation(&report).await {
-                    Ok(()) => {
+                    Ok(accepted) => {
                         wait = self.intervals.batch;
-                        self.core.report_posted();
+                        self.core.report_posted(&report, &accepted);
                     }
                     Err(error) => {
                         crate::timing::emit_event(json!({
@@ -991,6 +999,7 @@ mod tests {
             usage: Duration::from_millis(300),
             pool: Duration::from_millis(300),
             full_pull: Duration::from_secs(30),
+            resend: Duration::from_secs(30),
             batch: Duration::from_millis(50),
         }
     }
@@ -1593,6 +1602,91 @@ mod tests {
                 (100 - batch / 2 - batch, 200)
             ]
         );
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_observation_the_api_accepted_is_posted_again_only_when_it_changes_and_one_it_did_not_accept_is_posted_again()
+     {
+        let Some((machine, _fixture, _root)) =
+            site("report-delta", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        let path = crate::node_link::constant("NODE_API_PATHS")["observations"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // How often the API took the database's observation in a report it answered.
+        let taken = |id: &str| -> usize {
+            cloud
+                .requests()
+                .into_iter()
+                .filter(|seen| seen.path() == path && seen.status == 200)
+                .flat_map(|seen| {
+                    seen.body["databases"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter(|db| db["id"] == id)
+                .count()
+        };
+        let all = asleep_observations(3);
+        let ids: Vec<String> = all
+            .iter()
+            .map(|observation| observation["id"].as_str().unwrap().to_string())
+            .collect();
+        let queue = |observation: &Value| service.core().queue_observation(observation.clone());
+        let quiet = || tokio::time::sleep(Duration::from_millis(600));
+
+        // The API takes the first and the third, and answers `conflict` for the second.
+        cloud.with(|inner| {
+            inner.verdicts.insert(ids[1].clone(), "conflict");
+        });
+        all.iter().for_each(queue);
+        eventually(30, "the first report of each", || {
+            ids.iter().all(|id| taken(id) == 1)
+        })
+        .await;
+        // A full pull says them again: what the API took is not posted, what it did not take is.
+        all.iter().for_each(queue);
+        eventually(30, "the conflicting one again", || taken(&ids[1]) == 2).await;
+        quiet().await;
+        assert_eq!(
+            ids.iter().map(|id| taken(id)).collect::<Vec<_>>(),
+            [1, 2, 1]
+        );
+
+        // What changed goes at once: the archive failing is stored.
+        let mut failing = all[0].clone();
+        failing["archive"]["failing_since"] = "2026-10-19T10:00:00.000Z".into();
+        queue(&failing);
+        eventually(30, "the changed observation", || taken(&ids[0]) == 2).await;
+        // The archive's backlog and last segment are no change of what the API stores.
+        let mut backlog = failing.clone();
+        backlog["archive"]["ready_files"] = 7.into();
+        backlog["archive"]["last_segment"] = "000000010000000000000009".into();
+        queue(&backlog);
+        quiet().await;
+        assert_eq!(taken(&ids[0]), 2);
+
+        // A report the API refused is posted again whole, and its entries are held after the
+        // answer that took them, not before.
+        cloud.with(|inner| inner.observation_failures = 1);
+        let mut refused = all[2].clone();
+        refused["archive"]["failing_since"] = "2026-10-19T11:00:00.000Z".into();
+        queue(&refused);
+        eventually(30, "the observation after the refusal", || {
+            taken(&ids[2]) == 2
+        })
+        .await;
+        queue(&refused);
+        quiet().await;
+        assert_eq!(taken(&ids[2]), 2);
         service.stop();
     }
 

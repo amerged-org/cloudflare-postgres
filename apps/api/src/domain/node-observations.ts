@@ -10,6 +10,7 @@ import {
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext, Env } from "../env.ts";
+import { eachBounded } from "./bounded.ts";
 import { databaseActor } from "./database-actor-sync.ts";
 import { recoverQuiescence } from "./lifecycle.ts";
 import { powerTransitionStatements } from "./power-transition.ts";
@@ -57,6 +58,7 @@ const LOGGED_REPORT_MS = 2000;
 const LOGGED_REPORT_DATABASES = 50;
 
 interface Row extends DatabaseRow {
+  proven_sleep_json: string | null;
   operation: string;
   restore_operation: string | null;
   restore_status: string | null;
@@ -337,10 +339,78 @@ function reportedColumns(
   };
 }
 
+/** The runtime of the row and of the one the report would write, but for the time of the report. */
+function sameRuntime(stored: string | null | undefined, next: string | null) {
+  if (next === null) return stored == null;
+  if (stored == null) return false;
+  const a = JSON.parse(stored) as DatabaseRuntime,
+    b = JSON.parse(next) as DatabaseRuntime;
+  return (
+    a.node_id === b.node_id &&
+    a.generation === b.generation &&
+    a.storage_generation === b.storage_generation &&
+    a.instance === b.instance
+  );
+}
+
+/**
+ * Whether D1 already holds what applying `observation` would write: every column of the update,
+ * and so every statement that follows it, which the first report of this state already ran. A
+ * node says what it said again once in each anti-entropy period (`NODE_OBSERVATION_RESEND_MS`),
+ * and most of what it says then is this: a database asleep or ready as it was. Only these two
+ * steady states are told; the rest of the states are rare and take the whole path. Role removals
+ * and refused sleeps are outcomes, never a repeat. What the report would write besides is the
+ * time of the backup observation, which `touchObserved` takes alone.
+ */
+function holds(
+  row: Row,
+  observation: NodeDatabaseObservation,
+  set: { state: string; power: string; runtime: string | null },
+  columns: ReturnType<typeof reportedColumns>,
+): boolean {
+  return (
+    (observation.state === "ready" || observation.state === "asleep") &&
+    observation.roles === undefined &&
+    observation.refusal === undefined &&
+    row.observed_state === set.state &&
+    row.observed_power === set.power &&
+    row.observed_generation === observation.generation &&
+    sameRuntime(row.runtime_json, set.runtime) &&
+    (observation.state !== "asleep" ||
+      row.proven_sleep_json === JSON.stringify(observation.proven_sleep)) &&
+    row.status_message === columns.message &&
+    row.archiving_health === columns.health &&
+    row.archiving_health_since === columns.since &&
+    (row.backup_health ?? "unknown") === columns.backup_health &&
+    (row.backup_last_completed_at ?? null) === columns.backup_last_completed_at
+  );
+}
+
+/**
+ * What an unchanged observation still proves: that the node names the database and its backup now,
+ * which is the time `health.backup` and `database_base_backup_stale` judge by. One column, only
+ * forward, and not `updated_at`, which versions the row for the writers that race this one.
+ */
+async function touchObserved(
+  env: Env,
+  node: NodeCaller,
+  row: Row,
+  observation: NodeDatabaseObservation,
+  reportedAt: string,
+): Promise<void> {
+  if (observation.backup === null) return;
+  await env.DB.prepare(
+    `UPDATE databases SET backup_observed_at=?
+     WHERE id=? AND node_id=? AND (backup_observed_at IS NULL OR backup_observed_at<?)`,
+  )
+    .bind(reportedAt, row.id, node.id, reportedAt)
+    .run();
+}
+
 /**
  * Applies one accepted report of a database. Returns whether D1 took it: the update is a
  * compare-and-set on the row it was made from, so a concurrent change wins and the node is told
- * its report conflicted.
+ * its report conflicted. A report of what D1 already holds writes and publishes nothing.
  */
 async function applyObservation(
   env: Env,
@@ -423,6 +493,10 @@ async function applyObservation(
     row.restore_status === "failed"
   )
     return false;
+  if (holds(row, observation, set, columns)) {
+    await touchObserved(env, node, row, observation, reportedAt);
+    return true;
+  }
   const wasReady =
     row.observed_state === "ready" &&
     row.observed_power === "awake" &&
@@ -836,37 +910,22 @@ async function takeObservations(
 ): Promise<Taken> {
   const { databases } = report;
   const taken: Taken = { verdicts: [], deferred: 0, slowest: 0 };
-  const state: { next: number; failure?: { cause: unknown } } = { next: 0 };
-  const worker = async () => {
-    while (
-      state.failure === undefined &&
-      state.next < databases.length &&
-      Date.now() - started < budgetMs
-    ) {
-      const index = state.next++,
-        at = Date.now();
-      try {
-        taken.verdicts[index] = await takeObservation(
-          env,
-          node,
-          report.observed_at,
-          databases[index]!,
-        );
-      } catch (cause) {
-        state.failure ??= { cause };
-        return;
-      }
+  const begun = await eachBounded(
+    databases,
+    OBSERVATION_CONCURRENCY,
+    started + budgetMs,
+    async (observation, index) => {
+      const at = Date.now();
+      taken.verdicts[index] = await takeObservation(
+        env,
+        node,
+        report.observed_at,
+        observation,
+      );
       taken.slowest = Math.max(taken.slowest, Date.now() - at);
-    }
-  };
-  await Promise.all(
-    Array.from(
-      { length: Math.min(OBSERVATION_CONCURRENCY, databases.length) },
-      worker,
-    ),
+    },
   );
-  if (state.failure) throw state.failure.cause;
-  taken.deferred = databases.length - state.next;
+  taken.deferred = databases.length - begun;
   return taken;
 }
 
@@ -900,7 +959,10 @@ function logReport(
 
 /**
  * `POST /node/v1/observations` (plan 5.3): what a node reports of its databases and its orders,
- * and the events of its own log.
+ * and the events of its own log. A node names a database when its observation changed, and again
+ * once in each anti-entropy period (`NODE_OBSERVATION_RESEND_MS`), so a report is a delta: a
+ * database it does not name is not gone, asleep or stale, it is unchanged, and nothing here reads
+ * its absence as anything.
  */
 export async function nodeObservations(
   c: ApiContext,

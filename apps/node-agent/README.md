@@ -188,6 +188,13 @@ Worker. The concurrency and memory limits of the jobs come from the policy.
 - **Events and logs** (`timing.rs`, `events.rs`). The agent logs one JSON line per event to stderr
   and names a failure by its class, never by an error's text, which can carry an address or a path.
   The lines also travel in the next observation report, reduced to the contract's fields.
+- **Observations** (`agent/report.rs`). A database's observation goes to Cloudflare when what the
+  API stores of it differs from what the API last accepted (its answer's verdict `accept`, one per
+  database), and again once in each anti-entropy period (`NODE_OBSERVATION_RESEND_MS`, 15 minutes) at
+  a point of the period that the database's identifier fixes. A refused, lost or `stale` and
+  `conflict` answer keeps the database unaccepted. While Cloudflare waits for a database (an entry
+  with an origin, or a move order that holds it) every pull says it. A restarted agent holds
+  nothing, so its first pull says every database once.
 - **Boot report and probes** (`diagnostics/`). After a reboot the agent posts the sanitized tail of
   the previous boot's journal; on request it runs one of eight read-only probes, each a fixed
   command with no shell. Neither ever reports the lines of a database's unit or of a backup job.

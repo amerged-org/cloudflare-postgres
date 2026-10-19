@@ -2,6 +2,7 @@
 import { DatabaseId } from "@pgcf/contracts";
 import { DatabasePresence } from "../database-actor.ts";
 import type { ApiContext, Env } from "../env.ts";
+import { eachBounded } from "./bounded.ts";
 
 /**
  * The DatabaseActor of a database. A new object is created at the installation's configured
@@ -62,21 +63,59 @@ async function sync(env: Env, id: string): Promise<boolean> {
   return publishDatabaseAdmission(env, id);
 }
 
-/** One bounded keyset page; the cron and trusted callers decide when to read the next. */
+/**
+ * How many publishes of a page are under way at once. Each waits mostly on D1 and on its own
+ * Actor, whose cold publish takes 250-1100 ms (measured on EU1): one after the other, a page of
+ * 200 took 50-220 s, which is more than the minute the cron has; 8 at a time (as the intake of
+ * observations does) it takes a fraction of that.
+ */
+export const ACTOR_RECONCILE_CONCURRENCY = 8;
+/**
+ * How long a page may keep starting publishes: the step shares its minute with the steps after
+ * it. The budget stops new starts only, and the page goes on after the last one that was
+ * published, in the next minute.
+ */
+export const ACTOR_RECONCILE_BUDGET_MS = 20_000;
+
+/**
+ * One bounded keyset page; the cron and trusted callers decide when to read the next. The
+ * publishes of the page overlap (`ACTOR_RECONCILE_CONCURRENCY`) and start only until the budget is
+ * spent: `ids` are the databases published, the head of the page, and `next` the cursor after them
+ * (the page's last, or `null` after the last page of the table). A failure of any publish stops
+ * the starts and is the page's; the cursor then stays where it was.
+ */
 export async function reconcileDatabaseActors(
   env: Env,
   after?: string,
   limit = 200,
+  budgetMs = ACTOR_RECONCILE_BUDGET_MS,
 ): Promise<{ ids: string[]; next: string | null }> {
   if (after !== undefined) DatabaseId.parse(after);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200)
     throw new Error("invalid_actor_page_limit");
+  const until = Date.now() + budgetMs;
   const page = await env.DB.prepare(
     `SELECT id FROM databases ${after ? "WHERE id>?" : ""} ORDER BY id LIMIT ?`,
   )
     .bind(...(after ? [after, limit] : [limit]))
     .all<{ id: string }>();
-  for (const row of page.results) await sync(env, DatabaseId.parse(row.id));
-  const ids = page.results.map((row) => row.id);
-  return { ids, next: ids.length === limit ? ids.at(-1)! : null };
+  const found = page.results.map((row) => row.id);
+  const started = await eachBounded(
+    found,
+    ACTOR_RECONCILE_CONCURRENCY,
+    until,
+    async (id) => {
+      await sync(env, DatabaseId.parse(id));
+    },
+  );
+  const ids = found.slice(0, started);
+  return {
+    ids,
+    next:
+      started < found.length
+        ? (ids.at(-1) ?? after ?? null)
+        : found.length === limit
+          ? ids.at(-1)!
+          : null,
+  };
 }
