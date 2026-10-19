@@ -9,10 +9,11 @@ import {
 } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import {
+  deliverAlertRows,
   infrastructureAlertStatus,
   runInfrastructureHealthAlerts,
 } from "../../src/domain/infrastructure-alerts.ts";
-import { cleanupFixtures, fixture } from "./fixtures.ts";
+import { cleanupFixtures, fixture, nodeRequest } from "./fixtures.ts";
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -121,7 +122,7 @@ it("alarms a failing WAL archive once, with the databases and the runbook action
   expect(sent).toHaveLength(1);
   const episode = await status(f, "database_archive_failing");
   expect(episode).toMatchObject({ active: true });
-  expect(sent[0]!.key).toBe(episode!.event_id);
+  expect(sent[0]!.key).toBe(`${episode!.event_id}:${episode!.occurred_at}`);
   // The mail API asks for a user agent; a Worker's outbound request does not always carry one.
   expect(sent[0]!.agent).toBe("pgcf-infrastructure-alerts");
   expect(sent[0]!.body.subject).toBe(
@@ -170,12 +171,35 @@ it("never alarms an unknown archive, keeps an episode through an unknown reading
   await set("failing");
   await runInfrastructureHealthAlerts(hook.env, now + 4000, hook.fetcher);
   const second = await status(f, "database_archive_failing");
-  expect(second).toMatchObject({ active: true });
-  expect(second!.event_id).not.toBe(first!.event_id);
+  // The same error is the same id however often it comes back; the episode is told apart by when
+  // it started, and the cleared row is delivered again for it.
+  expect(second).toMatchObject({
+    active: true,
+    event_id: first!.event_id,
+    delivered_at: new Date(now + 4000).toISOString(),
+  });
+  expect(second!.occurred_at).not.toBe(first!.occurred_at);
   expect(hook.events.map((value) => value.event.kind)).toEqual([
     "database_archive_failing",
     "database_archive_failing",
   ]);
+  expect(hook.events.map((value) => value.event.event_id)).toEqual([
+    first!.event_id,
+    first!.event_id,
+  ]);
+  expect(hook.events.map((value) => value.event.occurred_at)).toEqual([
+    first!.occurred_at,
+    second!.occurred_at,
+  ]);
+  // Each episode has its own Idempotency-Key, which a mail provider that refuses a changed body
+  // under one key needs; a retry of an episode keeps it.
+  expect(hook.events.map((value) => value.key)).toEqual([
+    `${first!.event_id}:${first!.occurred_at}`,
+    `${second!.event_id}:${second!.occurred_at}`,
+  ]);
+  // The open episode is not delivered again.
+  await runInfrastructureHealthAlerts(hook.env, now + 70_000, hook.fetcher);
+  expect(hook.events).toHaveLength(2);
 });
 
 it("does not alarm a database that cannot archive and announces each database that newly fails", async () => {
@@ -515,5 +539,183 @@ it("logs a refused delivery with its status and nothing of the destination", asy
   expect(await status(f, "database_archive_failing")).toMatchObject({
     active: true,
     delivered_at: null,
+  });
+});
+
+it("warns of a volume that crosses 80 % between two quarter-hour marks, from the node's newest volume report", async () => {
+  const f = await fixture(),
+    hook = receiver(),
+    id = await database(f, "filling", awake(Date.now(), {}));
+  // Minutes 7 and 8 of a quarter hour that is over. The alert reads the newest report of the node
+  // (`node_volumes`), not the stored storage samples, so it never waited for a quarter-hour mark.
+  const start = Math.floor(Date.now() / 900_000) * 900_000 - 900_000,
+    report = (minute: number, percent: number) => {
+      const total = 5 * 1024 ** 3;
+      return nodeRequest(f, "/node/v1/volumes", {
+        method: "POST",
+        body: {
+          observed_at: new Date(start + minute * 60_000 + 1000).toISOString(),
+          volumes: [
+            {
+              database: id,
+              storage_generation: 1,
+              mounted: true,
+              size_bytes: total,
+              pool_used_bytes: 0,
+              filesystem: {
+                total_bytes: total,
+                used_bytes: Math.floor((total * percent) / 100),
+                inodes_total: 327_680,
+                inodes_used: 1500,
+              },
+            },
+          ],
+        },
+      });
+    },
+    warnings = () =>
+      hook.events.filter(
+        (value) => value.event.kind === "database_volume_warning",
+      );
+  expect((await report(7, 50)).status).toBe(200);
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    start + 7 * 60_000 + 20_000,
+    hook.fetcher,
+  );
+  expect(warnings()).toHaveLength(0);
+  expect((await report(8, 85)).status).toBe(200);
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    start + 8 * 60_000 + 20_000,
+    hook.fetcher,
+  );
+  expect(warnings()).toHaveLength(1);
+  expect(warnings()[0]!.event).toMatchObject({
+    region_id: f.region,
+    database_ids: [id],
+    action: INFRA_ALERT_ACTIONS.database_volume_warning,
+  });
+});
+
+/** The stored row of a kind, as the delivery reads it. */
+const rowOf = async (f: Fixture, kind: InfraAlertKind) =>
+  (await env.DB.prepare(
+    "SELECT * FROM infrastructure_alerts WHERE region_id=? AND kind=?",
+  )
+    .bind(f.region, kind)
+    .first<{
+      kind: InfraAlertKind;
+      active: number;
+      event_id: string;
+      payload: string;
+      delivered_at: string | null;
+      last_attempt_at: string | null;
+    }>())!;
+
+it("does not send what it read of an episode that has come back under the same id since", async () => {
+  const f = await fixture(),
+    now = Date.now(),
+    hook = receiver(),
+    id = await database(
+      f,
+      "archive",
+      awake(now, {
+        archiving_health: "failing",
+        archiving_health_since: ago(now, HOUR),
+      }),
+    ),
+    set = (health: string) =>
+      env.DB.prepare("UPDATE databases SET archiving_health=? WHERE id=?")
+        .bind(health, id)
+        .run();
+  // Without a destination the episode is armed and stays pending.
+  await runInfrastructureHealthAlerts(env, now);
+  const stale = await rowOf(f, "database_archive_failing");
+  await set("ok");
+  await runInfrastructureHealthAlerts(env, now + 1000);
+  await set("failing");
+  await runInfrastructureHealthAlerts(env, now + 2000);
+  const current = await rowOf(f, "database_archive_failing");
+  expect(current.event_id).toBe(stale.event_id);
+  expect(current.payload).not.toBe(stale.payload);
+  // A delivery that still holds the first episode neither sends it nor takes its place.
+  expect(
+    await deliverAlertRows(
+      hook.env,
+      f.region,
+      [stale],
+      now + 3000,
+      hook.fetcher,
+    ),
+  ).toEqual({ delivered: 0, pending: 1 });
+  expect(hook.events).toHaveLength(0);
+  expect(await rowOf(f, "database_archive_failing")).toEqual(current);
+  expect(
+    await deliverAlertRows(
+      hook.env,
+      f.region,
+      [current],
+      now + 3000,
+      hook.fetcher,
+    ),
+  ).toEqual({ delivered: 1, pending: 0 });
+  expect(hook.events.map((value) => value.event.occurred_at)).toEqual([
+    InfraAlert.parse(JSON.parse(current.payload)).occurred_at,
+  ]);
+});
+
+it("does not clear an episode that came back under the same id while its clearing was decided", async () => {
+  const f = await fixture(),
+    now = Date.now(),
+    hook = receiver(),
+    id = await database(
+      f,
+      "archive",
+      awake(now, {
+        archiving_health: "failing",
+        archiving_health_since: ago(now, HOUR),
+      }),
+    );
+  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+  const first = await rowOf(f, "database_archive_failing");
+  await env.DB.prepare("UPDATE databases SET archiving_health='ok' WHERE id=?")
+    .bind(id)
+    .run();
+  // Another evaluation re-opens the episode between this one's read and its clearing write.
+  const reopened = InfraAlert.parse({
+    ...JSON.parse(first.payload),
+    occurred_at: new Date(now + 500).toISOString(),
+  });
+  const racing = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          if (
+            sql.startsWith(
+              "UPDATE infrastructure_alerts SET active=0 WHERE region_id=? AND kind=? AND event_id=?",
+            )
+          )
+            void target
+              .prepare(
+                "UPDATE infrastructure_alerts SET payload=?,delivered_at=NULL,last_attempt_at=NULL WHERE region_id=? AND kind=?",
+              )
+              .bind(JSON.stringify(reopened), f.region, first.kind)
+              .run();
+          return target.prepare(sql);
+        };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  await runInfrastructureHealthAlerts(
+    { ...hook.env, DB: racing },
+    now + 1000,
+    hook.fetcher,
+  );
+  expect(await rowOf(f, "database_archive_failing")).toMatchObject({
+    active: 1,
+    event_id: first.event_id,
+    payload: JSON.stringify(reopened),
   });
 });

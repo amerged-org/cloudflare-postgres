@@ -298,8 +298,8 @@ unplaced), `health` and `storage`:
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `health.archiving` | `ok`, `failing`, `unknown`, with `since`                                                                                                                                                                                                                                                                                                        |
 | `health.backup`    | `status` is `ok` while the last completed base backup is at most 36 h old, `stale` when older, `failing` when the node reports failing or its last failure is newer than its last completion, `unknown` without a report within 180 s or without a completed backup; `last_base_backup_at` is when that backup finished, `null` while unknown |
-| `health.disk`      | `status` is `warning` from 90 % used and `unknown` without a usage sample within 180 s; `used_ratio` is used divided by allocated bytes of the newest sample, `null` when it measured nothing                                                                                                                                                   |
-| `storage`          | `{used_bytes, allocated_bytes, observed_at}` of the newest sample the node's agent reported, with `null` figures where it measured nothing; the whole object is `null` before the first sample. It is not cut off by age: judge `observed_at` yourself                                                                                        |
+| `health.disk`      | `status` is `warning` from 90 % used and `unknown` without a usage sample within 180 s; `used_ratio` is used divided by allocated bytes of the newest sample, `null` when it measured nothing. An awake database is sampled every minute; a hibernated one cannot grow and is sampled every 15 minutes, so it reads `unknown` between samples                                                                                                                                                   |
+| `storage`          | `{used_bytes, allocated_bytes, observed_at}` of the newest sample the node's agent reported (at most a minute old for an awake database, at most 15 minutes for a hibernated one), with `null` figures where it measured nothing; the whole object is `null` before the first sample. It is not cut off by age: judge `observed_at` yourself                                                                                        |
 
 `null` and `unknown` mean not known, never fine and never zero. These are the very figures the
 operator reads in `GET /v1/operational-health?scope=databases`: one source, two views.
@@ -858,8 +858,11 @@ readable by another.
 - **Write limits.** Each database's write bandwidth and IOPS are capped by its size, which bounds
   how fast one tenant can fill the pool.
 
-Watch size yourselves: `storage` and `health.disk` of the database show the newest volume figures
-(`pg_database_size()` and `storage_used_bytes_max` in usage remain the other sources).
+Watch size yourselves: `storage` and `health.disk` of the database show the newest volume figures,
+sampled every minute while the database is awake and every 15 minutes while it is hibernated
+(`pg_database_size()` and `storage_used_bytes_max` in usage, the largest sample of the hour,
+remain the other sources). A volume can fill in a few minutes, so poll `health.disk` at least
+once a minute for a database you are bulk-loading.
 
 ### 4.4 Your checklist
 
@@ -949,9 +952,14 @@ side, and every kind of alert carries its runbook action. The plan keeps the gat
 owner confirms the recipient. The operator reads the alerts' state in
 `GET /v1/operational-health?scope=regions`.
 
-One episode exists per region and kind. A new episode gets a new `event_id`, is delivered at least
-once with retries at least 60 s apart and a five-second deadline, and clears only when its
-measurement is fresh and below the threshold.
+One episode exists per region and kind. Its `event_id` names the error: the same error (same
+region, kind and failing subjects) has the same `event_id` every time it occurs, also after it
+cleared and came back, and a different set of subjects is a new error with a new `event_id`. An
+episode is delivered at least once with retries at least 60 s apart and a five-second deadline
+(a retry repeats the `event_id`, the `occurred_at` and the body), and clears only when its
+measurement is fresh and below the threshold. A recurrence has the same `event_id` and a new
+`occurred_at`; a receiver deduplicates the pair and treats a known `event_id` with a new
+`occurred_at` as a new occurrence of the incident that ID names.
 
 | Kind                                                          | Fires when                                                                                                                                   | Threshold (set in the capacity policy; the plan's value, 4.10, where it names one) |
 | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |

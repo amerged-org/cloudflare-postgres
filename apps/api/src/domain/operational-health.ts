@@ -45,7 +45,7 @@ export const DiskHealth = HealthClock.safeExtend({
   status: z
     .enum(DISK_HEALTH_STATUSES)
     .describe(
-      "warning: at least 90 % of the allocated storage is used; unknown: no agent usage sample within 180 s.",
+      "warning: at least 90 % of the allocated storage is used; unknown: no agent usage sample within 180 s. An awake database is sampled every minute, a hibernated one every 15 minutes.",
     ),
   storage_used_bytes: z.number().int().nonnegative().nullable(),
   storage_allocated_bytes: z.number().int().positive().nullable(),

@@ -128,7 +128,9 @@ it("raises a stalled cron from its own alarm in every region, once, and clears i
     action: INFRA_ALERT_ACTIONS.control_cron_stalled,
     cron: { failing_steps: [] },
   });
-  expect(mine[0]!.key).toBe(mine[0]!.event.event_id);
+  expect(mine[0]!.key).toBe(
+    `${mine[0]!.event.event_id}:${mine[0]!.event.occurred_at}`,
+  );
   expect(Date.parse(mine[0]!.event.cron!.last_completed_at!)).toBeLessThan(
     now - 5 * MINUTE,
   );

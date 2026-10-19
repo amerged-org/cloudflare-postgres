@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
+  bytesToHex,
   INFRA_ALERT_ACTIONS,
   InfraAlert,
   InfraAlertStatus,
@@ -51,6 +52,35 @@ interface AlertCondition {
   >;
 }
 const retryMs = 60_000;
+
+/**
+ * The identifier of an error, so that the same error always has the same one: a UUID of version 5
+ * (RFC 4122 variant) made from the first 16 bytes of the SHA-256 of a fixed domain string, the
+ * region, the kind and the sorted subjects (the nodes or databases the event lists), one per line.
+ * The same region, kind and subjects give the same ID again after the error cleared and came back,
+ * another set of subjects is another error with its own ID, and a kind without subjects is told
+ * apart by region and kind alone. The ID names the error, not the episode: with `occurred_at`,
+ * the start of the episode, it names one notification.
+ */
+export async function alertEventId(
+  regionId: string,
+  kind: InfraAlertKind,
+  subjects: readonly string[] = [],
+): Promise<string> {
+  const input = [
+    "pgcf.infrastructure-alert.v1",
+    regionId,
+    kind,
+    ...[...new Set(subjects)].sort(),
+  ].join("\n");
+  const bytes = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input)),
+  ).subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytesToHex(bytes);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 /** floor(used * 1000000 / total) in SQLite int64 for byte counts up to Number.MAX_SAFE_INTEGER. */
 function ppmSql(used: string, total: string): string {
@@ -345,7 +375,7 @@ export async function runInfrastructureAlerts(
     }
     const event = InfraAlert.parse({
       version: 1,
-      event_id: crypto.randomUUID(),
+      event_id: await alertEventId(regionId, kind, detail?.node_ids),
       kind,
       region_id: regionId,
       occurred_at: timestamp,
@@ -433,13 +463,14 @@ export async function deliverAlertRows(
     const condition = conditions?.find((value) => value.kind === row.kind);
     if (conditions && condition?.active !== true) continue;
     const claim = await env.DB.prepare(
-      `UPDATE infrastructure_alerts SET last_attempt_at=? WHERE region_id=? AND kind=? AND event_id=? AND active=1 AND delivered_at IS NULL AND (last_attempt_at IS NULL OR last_attempt_at<=?)${condition ? " AND " + condition.snapshot.sql : ""}`,
+      `UPDATE infrastructure_alerts SET last_attempt_at=? WHERE region_id=? AND kind=? AND event_id=? AND payload=? AND active=1 AND delivered_at IS NULL AND (last_attempt_at IS NULL OR last_attempt_at<=?)${condition ? " AND " + condition.snapshot.sql : ""}`,
     )
       .bind(
         timestamp,
         regionId,
         row.kind,
         row.event_id,
+        row.payload,
         new Date(now - retryMs).toISOString(),
         ...(condition?.snapshot.bindings ?? []),
       )
@@ -465,7 +496,7 @@ export async function deliverAlertRows(
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${webhook?.token ?? email!.token}`,
-          "Idempotency-Key": row.event_id,
+          "Idempotency-Key": `${row.event_id}:${InfraAlert.parse(JSON.parse(row.payload)).occurred_at}`,
           "User-Agent": "pgcf-infrastructure-alerts",
         },
         body,
@@ -591,9 +622,9 @@ async function reconcileEpisode(
   if (observation.state === "resolved") {
     if (!active) return false;
     await env.DB.prepare(
-      "UPDATE infrastructure_alerts SET active=0 WHERE region_id=? AND kind=? AND event_id=?",
+      "UPDATE infrastructure_alerts SET active=0 WHERE region_id=? AND kind=? AND event_id=? AND payload=?",
     )
-      .bind(regionId, kind, current!.event_id)
+      .bind(regionId, kind, current!.event_id, current!.payload)
       .run();
     return true;
   }
@@ -605,7 +636,7 @@ async function reconcileEpisode(
   }
   const event = InfraAlert.parse({
     version: 1,
-    event_id: crypto.randomUUID(),
+    event_id: await alertEventId(regionId, kind, observation.subjects),
     kind,
     region_id: regionId,
     occurred_at: new Date(now).toISOString(),
@@ -617,7 +648,7 @@ async function reconcileEpisode(
   });
   // Arms a cleared episode, or replaces exactly the one this evaluation read.
   await env.DB.prepare(
-    `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES(?,?,1,?,?) ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0 OR infrastructure_alerts.event_id=?`,
+    `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES(?,?,1,?,?) ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0 OR (infrastructure_alerts.event_id=? AND infrastructure_alerts.payload=?)`,
   )
     .bind(
       regionId,
@@ -625,6 +656,7 @@ async function reconcileEpisode(
       event.event_id,
       JSON.stringify(event),
       current?.event_id ?? null,
+      current?.payload ?? null,
     )
     .run();
   return true;
