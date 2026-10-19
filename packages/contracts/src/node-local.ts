@@ -37,12 +37,19 @@ export const UNIX_SOCKET_PATH_MAX_BYTES = 100;
 /** A delivered wake without a result is delivered again after this long. */
 export const WAKE_REDELIVER_MS = 3_000;
 
-/** Phases of a wake on the node, in order; wake results and wake events time them in ms. */
+/**
+ * Phases of a wake on the node; wake results and wake events time them in ms. `admission` is the
+ * whole check before the start: `volume_check` to `archive`, in the order the agent takes them.
+ */
 export const WAKE_PHASES = [
   "admission",
-  "queue_wait",
-  "pg_control",
+  "volume_check",
+  "repair_check",
   "mount",
+  "pg_control",
+  "config",
+  "archive",
+  "queue_wait",
   "start",
   "release",
 ] as const;

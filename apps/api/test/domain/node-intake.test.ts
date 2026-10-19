@@ -337,10 +337,14 @@ describe("the events of a node", () => {
       operation: newOperationId(),
       outcome: "started",
       phases_ms: {
-        admission: 1,
+        admission: 5,
+        volume_check: 1,
+        repair_check: 1,
         queue_wait: 0,
         pg_control: 2,
         mount: 0,
+        config: 1,
+        archive: 1,
         start: 61,
         release: 1,
       },
@@ -355,7 +359,7 @@ describe("the events of a node", () => {
       node_id: f.node,
       database_id: wake.database,
       outcome: "started",
-      phases_ms: { start: 61 },
+      phases_ms: { volume_check: 1, repair_check: 1, config: 1, start: 61 },
     });
     expect(await minutes(f.node)).toEqual([]);
   });

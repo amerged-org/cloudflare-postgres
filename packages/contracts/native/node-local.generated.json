@@ -8,9 +8,13 @@
     "WAKE_REDELIVER_MS": 3000,
     "WAKE_PHASES": [
       "admission",
-      "queue_wait",
-      "pg_control",
+      "volume_check",
+      "repair_check",
       "mount",
+      "pg_control",
+      "config",
+      "archive",
+      "queue_wait",
       "start",
       "release"
     ],

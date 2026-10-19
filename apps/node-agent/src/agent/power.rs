@@ -57,6 +57,7 @@ impl StartFailure {
     }
 }
 
+/// Whole milliseconds, rounded up: a step of 1 took at most a millisecond.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros().div_ceil(1000))
         .unwrap_or(u64::MAX)
@@ -409,11 +410,16 @@ impl<M: Machine> Core<M> {
             _ => return refuse("wake_in_progress"),
         }
         let volume = Self::volume_id(&entry).ok_or(("volume_missing", None))?;
-        match self.machine.has_volume(&volume).await {
-            Ok(true) => {}
-            _ => return refuse("volume_missing"),
+        let began = Instant::now();
+        let exists = self.machine.has_volume(&volume).await;
+        steps.insert("volume_check".into(), millis(began.elapsed()));
+        if !matches!(exists, Ok(true)) {
+            return refuse("volume_missing");
         }
-        match self.machine.needs_repair(&volume).await {
+        let began = Instant::now();
+        let repair = self.machine.needs_repair(&volume).await;
+        steps.insert("repair_check".into(), millis(began.elapsed()));
+        match repair {
             Ok(false) => {}
             Ok(true) => {
                 // The volume may have lost writes while the pool took none: recovery repairs it.
@@ -445,14 +451,19 @@ impl<M: Machine> Core<M> {
         steps.insert("pg_control".into(), millis(began.elapsed()));
         // The configuration of a database whose size or settings changed is written while its
         // unit is stopped, which is the only time the agent may write below its mount point.
-        if let Err(error) = self.refresh_configuration(&db, &entry).await {
+        let began = Instant::now();
+        let refreshed = self.refresh_configuration(&db, &entry).await;
+        steps.insert("config".into(), millis(began.elapsed()));
+        if let Err(error) = refreshed {
             crate::timing::emit_event(json!({
                 "event": "configuration_failed", "database_id": db.id,
                 "class": crate::diagnostics::error_code(&error),
             }));
             return refuse("release_failed");
         }
+        let began = Instant::now();
         self.ensure_archive(&db, &entry);
+        steps.insert("archive".into(), millis(began.elapsed()));
         steps.insert("admission".into(), millis(checking.elapsed()));
         self.set(&db, |view| {
             view.phase = Phase::Starting;
@@ -1217,7 +1228,15 @@ mod tests {
         let result = rig.core.wake(&ticket).await;
         assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
         assert_eq!(result.reason, None);
-        for step in ["pg_control", "start", "admission"] {
+        for step in [
+            "volume_check",
+            "repair_check",
+            "pg_control",
+            "config",
+            "archive",
+            "start",
+            "admission",
+        ] {
             assert!(
                 result.steps_ms.contains_key(step),
                 "{step}: {:?}",
@@ -1325,6 +1344,48 @@ mod tests {
             reason("fenced")
         );
         assert!(!rig2.machine.running(&entry2.id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_is_refused_at_the_check_of_a_volume_that_is_gone_or_damaged() {
+        let Some(rig) = Rig::new("wake-volume").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        // A refused wake names the steps it took, and none after the check that refused it.
+        let took = |result: &WakeResult, steps: &[&str]| {
+            steps.iter().any(|step| result.steps_ms.contains_key(*step))
+        };
+
+        // LVM does not answer: the volume is not known to be there.
+        rig.machine.set_volumes_unreadable(true);
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (WakeOutcome::Refused, Some("volume_missing"))
+        );
+        let after_volume_check = [
+            "repair_check",
+            "pg_control",
+            "config",
+            "archive",
+            "admission",
+        ];
+        assert!(!took(&result, &after_volume_check));
+        assert_eq!(db.phase(), Phase::Asleep);
+        rig.machine.set_volumes_unreadable(false);
+
+        // The volume may have lost writes: the wake does not start it, and recovery repairs it.
+        rig.machine.set_needs_repair(true);
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (WakeOutcome::Refused, Some("volume_suspended"))
+        );
+        assert!(!took(&result, &after_volume_check[1..]));
+        assert!(!rig.machine.running(&entry.id));
+        assert_eq!(db.phase(), Phase::Unproven);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

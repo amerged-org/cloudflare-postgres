@@ -22,6 +22,7 @@ mod ids;
 // ignored test, never meets them.
 #[cfg(all(test, target_os = "linux", pgcf_storage_lab))]
 mod lab_tests;
+mod listing;
 mod lvm;
 mod mountinfo;
 mod pool;
@@ -44,6 +45,10 @@ use std::{path::PathBuf, time::Duration};
 pub const POOL_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the agent reads every volume's space and inodes.
 pub const VOLUME_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+/// How old the volume list may be when a wake answers from it. The node sample reads the list
+/// every 15 s (`NODE_SAMPLE_INTERVAL_MS`), so while it runs a wake finds a list this young; when
+/// it does not, the wake reads the list itself.
+pub const VOLUME_LIST_MAX_AGE: Duration = Duration::from_secs(20);
 
 /// Where the node's storage is. `Config::default()` is the node image's layout; the fields exist
 /// so that tests can run the same code on a loop device.

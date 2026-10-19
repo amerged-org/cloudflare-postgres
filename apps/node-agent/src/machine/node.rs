@@ -47,10 +47,8 @@ fn lookup(path: &str, name: &str) -> Option<Vec<String>> {
     std::fs::read_to_string(path)
         .ok()?
         .lines()
-        .find_map(|line| {
-            let fields: Vec<String> = line.split(':').map(String::from).collect();
-            (fields.first().map(String::as_str) == Some(name)).then_some(fields)
-        })
+        .find(|line| line.split(':').next() == Some(name))
+        .map(|line| line.split(':').map(String::from).collect())
 }
 
 /// Runs a program of the system to its end; its failure carries what it said.
@@ -495,7 +493,11 @@ impl Machine for Node {
             .arg("check")
             .stdin(Stdio::null())
             .output()
-            .await?;
+            .await;
+        // The check tags the volumes it finds mounted when the pool takes no writes, in a storage
+        // of its own: what this one listed before may be out of date, however the check ended.
+        self.storage.changed_elsewhere();
+        let output = output?;
         if output.status.success() {
             Ok(())
         } else {
@@ -531,6 +533,26 @@ impl Machine for Node {
     fn cpu(&self) -> Option<CpuTimes> {
         let text = std::fs::read_to_string("/proc/stat").ok()?;
         crate::sample::cpu_times(&text, USER_HZ)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wake looks its database's user up twice, in a file with a line for every database.
+    #[test]
+    fn a_user_is_found_by_the_first_field_of_its_line_alone() {
+        let path = std::env::temp_dir().join(format!("pgcf-lookup-{}", std::process::id()));
+        let text =
+            "root:x:0:0:root:/root:/bin/bash\npgcf-a:x:20000:20001::/nonexistent:/bin/false\n";
+        std::fs::write(&path, text).unwrap();
+        let path_text = path.to_str().unwrap();
+        let found = lookup(path_text, "pgcf-a").unwrap();
+        assert_eq!(found[2..4], ["20000", "20001"]);
+        assert!(lookup(path_text, "20000").is_none() && lookup(path_text, "pgcf").is_none());
+        assert!(lookup("/nonexistent/passwd", "root").is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }
 

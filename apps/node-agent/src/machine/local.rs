@@ -58,6 +58,8 @@ struct State {
     start_delay: Option<Duration>,
     /// LVM, or systemd, cannot be read: what they hold is not known.
     volumes_unreadable: bool,
+    /// Every volume must be repaired before its database starts again.
+    needs_repair: bool,
     units_unreadable: bool,
     /// The `archive_command` of a database, where it is not the layout's.
     archive_commands: HashMap<String, String>,
@@ -195,6 +197,9 @@ impl Local {
     }
     pub fn set_volumes_unreadable(&self, unreadable: bool) {
         self.state().volumes_unreadable = unreadable;
+    }
+    pub fn set_needs_repair(&self, needs_repair: bool) {
+        self.state().needs_repair = needs_repair;
     }
     pub fn set_units_unreadable(&self, unreadable: bool) {
         self.state().units_unreadable = unreadable;
@@ -372,7 +377,7 @@ impl Machine for Local {
         Ok(())
     }
     async fn needs_repair(&self, _id: &VolumeId) -> Result<bool, storage::Error> {
-        Ok(false)
+        Ok(self.state().needs_repair)
     }
     async fn recover_volume(
         &self,

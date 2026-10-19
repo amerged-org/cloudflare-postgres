@@ -17,7 +17,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     slice,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -44,6 +47,18 @@ fn policy() -> Policy {
 }
 fn id(database: &str, generation: u64) -> VolumeId {
     VolumeId::new(database, generation).unwrap()
+}
+
+/// Runs the commands on the system and counts the `lvs` among them.
+struct Counting(Arc<AtomicUsize>);
+
+impl CommandRunner for Counting {
+    fn run(&self, command: &[String]) -> std::io::Result<Output> {
+        if command[0] == "lvs" {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        SystemRunner.run(command)
+    }
 }
 
 /// A loop device of its own with its own volume group, removed again when the test ends.
@@ -594,11 +609,51 @@ fn a_booted_node_mounts_every_formatted_volume_again() {
 }
 
 #[test]
+fn a_wake_asks_the_kernel_and_not_lvm2_about_a_mounted_volume() {
+    let lab = Lab::open(512);
+    let a = id(ID, 1);
+    lab.create(&a, 128);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let storage = Storage::new(Counting(reads.clone()), lab.config().clone());
+    let reads = || reads.load(Ordering::Relaxed);
+
+    // The first question reads the list; the others are the kernel's, whatever volumes there are.
+    assert!(storage.exists(&a).unwrap());
+    assert_eq!(reads(), 1);
+    for _ in 0..3 {
+        assert!(storage.exists(&a).unwrap());
+        assert!(!storage.needs_repair(&a).unwrap());
+    }
+    assert_eq!(reads(), 1);
+
+    // ext4 has no entry for a volume that is not mounted: lvm2 and the mount table answer.
+    lab.storage.unmount_volume(&a).unwrap();
+    assert!(storage.exists(&a).unwrap());
+    assert!(!storage.needs_repair(&a).unwrap());
+    assert_eq!(reads(), 2);
+
+    // A volume that was removed is gone for the next question, though the list showed it.
+    lab.storage
+        .remove_volume(
+            &a,
+            Removal::DatabaseDeleted {
+                storage_generation: 1,
+            },
+        )
+        .unwrap();
+    assert!(!storage.exists(&a).unwrap());
+    assert!(matches!(storage.needs_repair(&a), Err(Error::Missing)));
+}
+
+#[test]
 fn a_full_pool_marks_the_mounted_volumes_and_recovery_brings_them_back_with_their_data() {
     let lab = Lab::open(320);
     let (a, b) = (id(ID, 1), id(OTHER, 1));
     lab.create(&a, 256);
     lab.create(&b, 256);
+    // A wake before the pool fills finds both clean, and the list that says so is kept.
+    lab.storage.inventory().unwrap();
+    assert!(!lab.storage.needs_repair(&a).unwrap() && !lab.storage.needs_repair(&b).unwrap());
     // `kept` is committed before the pool fills.
     assert!(lab.tenant_dd(&a, "kept", 1024, "/dev/urandom"));
     let kept = fs::read(lab.dir_of(&a).join("kept")).unwrap();
