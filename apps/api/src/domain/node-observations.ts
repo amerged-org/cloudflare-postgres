@@ -59,10 +59,14 @@ const LOGGED_REPORT_DATABASES = 50;
 
 interface Row extends DatabaseRow {
   proven_sleep_json: string | null;
+  /** 1 while an operation of the database is open. */
+  open: number;
   operation: string;
   restore_operation: string | null;
   restore_status: string | null;
 }
+/** Whether an operation of the database is open: one that a report of the database can end. */
+const OPEN_OPERATION = `EXISTS(SELECT 1 FROM operations w WHERE w.database_id=d.id AND w.status IN('pending','running'))`;
 const OPERATION_OF_GENERATION = `(SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
   ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1)`;
 
@@ -360,7 +364,12 @@ function sameRuntime(stored: string | null | undefined, next: string | null) {
  * and most of what it says then is this: a database asleep or ready as it was. Only these two
  * steady states are told; the rest of the states are rare and take the whole path. Role removals
  * and refused sleeps are outcomes, never a repeat. What the report would write besides is the
- * time of the backup observation, which `touchObserved` takes alone.
+ * time of the backup observation, which `touchObserved` takes alone. A row can be in the state
+ * the node reports without any report having brought it there (a cold resize takes the next
+ * generation and observes it at once), and then the statements that follow have not run: while an
+ * operation of the database is open, the report is applied whole. (A role removal needs no clause
+ * of its own: only a report that names roles ends one, and a sleep ends the ones that wait before
+ * it, while a removal asked of a suspended database is created ended.)
  */
 function holds(
   row: Row,
@@ -369,6 +378,7 @@ function holds(
   columns: ReturnType<typeof reportedColumns>,
 ): boolean {
   return (
+    row.open === 0 &&
     (observation.state === "ready" || observation.state === "asleep") &&
     observation.roles === undefined &&
     observation.refusal === undefined &&
@@ -410,7 +420,9 @@ async function touchObserved(
 /**
  * Applies one accepted report of a database. Returns whether D1 took it: the update is a
  * compare-and-set on the row it was made from, so a concurrent change wins and the node is told
- * its report conflicted. A report of what D1 already holds writes and publishes nothing.
+ * its report conflicted. A report of what D1 already holds writes nothing but the time of the
+ * backup observation; it still publishes the Actor's snapshot, which is the repair of a publish
+ * that failed after the report that asked for it.
  */
 async function applyObservation(
   env: Env,
@@ -495,6 +507,9 @@ async function applyObservation(
     return false;
   if (holds(row, observation, set, columns)) {
     await touchObserved(env, node, row, observation, reportedAt);
+    // The repair of what an earlier report of this state left undone: its publish may have failed
+    // after the commit, and the report that was failed for it comes again to this path.
+    await answeredWithin(publishDatabaseAdmission(env, row.id), row.id);
     return true;
   }
   const wasReady =
@@ -619,6 +634,34 @@ async function applyObservation(
   });
 }
 
+/**
+ * Waits for a publish of the Actor's snapshot for `ADMISSION_PUBLISH_ANSWER_MS`. A publish is a few
+ * Actor RPCs and D1 reads. A failure within the bound fails the report, so the node sends it
+ * again; one still running after it finishes in the background and is logged if it fails.
+ */
+async function answeredWithin(
+  publishing: Promise<unknown>,
+  databaseId: string,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = await Promise.race([
+    publishing.then(() => true),
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), ADMISSION_PUBLISH_ANSWER_MS);
+    }),
+  ]).finally(() => clearTimeout(timer));
+  if (!settled)
+    void publishing.catch((error) =>
+      console.error(
+        JSON.stringify({
+          event: "admission_publish_failed",
+          database_id: databaseId,
+          error: error instanceof Error ? error.name : "error",
+        }),
+      ),
+    );
+}
+
 /** The push that releases a waiting connection and the publish of the Actor's snapshot. */
 async function afterCommit(
   env: Env,
@@ -654,27 +697,7 @@ async function afterCommit(
         publishedAt = Date.now();
         return value;
       });
-  if (publishing) {
-    // A publish is a few Actor RPCs and D1 reads. A failure within the bound fails this report,
-    // so the node sends it again; one still running after it finishes in the background.
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const settled = await Promise.race([
-      publishing.then(() => true),
-      new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => resolve(false), ADMISSION_PUBLISH_ANSWER_MS);
-      }),
-    ]).finally(() => clearTimeout(timer));
-    if (!settled)
-      void publishing.catch((error) =>
-        console.error(
-          JSON.stringify({
-            event: "admission_publish_failed",
-            database_id: row.id,
-            error: error instanceof Error ? error.name : "error",
-          }),
-        ),
-      );
-  }
+  if (publishing) await answeredWithin(publishing, row.id);
   if (
     becameReady ||
     (observation.state === "asleep" && row.observed_power !== "hibernated")
@@ -774,7 +797,7 @@ async function readRow(
   nodeId: string,
 ): Promise<Row | null> {
   return env.DB.prepare(
-    `SELECT d.*,${OPERATION_OF_GENERATION} operation,x.operation_id restore_operation,ro.status restore_status
+    `SELECT d.*,${OPEN_OPERATION} open,${OPERATION_OF_GENERATION} operation,x.operation_id restore_operation,ro.status restore_status
      FROM databases d LEFT JOIN database_restores x ON x.target_database_id=d.id
      LEFT JOIN operations ro ON ro.id=x.operation_id AND ro.kind='database.restore'
      WHERE d.id=? AND d.node_id=?`,

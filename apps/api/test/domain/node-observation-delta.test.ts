@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // A node that posts an observation of a database only when it changed, and again once in each
 // anti-entropy period (plan 5.3, 11.2). Real D1 and Durable Objects; the only double wraps the
-// real DatabaseActor binding to count the admission publishes it receives.
+// real DatabaseActor binding to count the admission publishes it receives and, when told, to fail
+// them as an Actor that cannot be reached does.
 import { env } from "cloudflare:workers";
 import { DatabaseWithOperation, NODE_DATABASE_STALE_MS } from "@pgcf/contracts";
 import { afterEach, describe, expect, it } from "vitest";
@@ -16,7 +17,12 @@ import {
   verdicts,
 } from "./fixtures.ts";
 
-afterEach(cleanupFixtures);
+const classes: string[] = [];
+afterEach(async () => {
+  await cleanupFixtures();
+  for (const id of classes.splice(0))
+    await env.DB.prepare("DELETE FROM size_classes WHERE id=?").bind(id).run();
+});
 
 type F = Awaited<ReturnType<typeof fixture>>;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -34,6 +40,7 @@ const eventCount = async (id: string) =>
 /** The real DatabaseActor namespace, which counts the publishes of each database. */
 function countingActors() {
   const published: string[] = [];
+  const refusing = { on: false };
   const namespace = {
     idFromName: (name: string) => env.DATABASE_ACTOR.idFromName(name),
     get: (
@@ -46,6 +53,7 @@ function countingActors() {
           if (property !== "publishAdmissionSnapshot")
             return Reflect.get(target, property);
           return (...args: unknown[]) => {
+            if (refusing.on) return Promise.reject(new Error("unreachable"));
             published.push((args[0] as { database_id: string }).database_id);
             return (
               target as unknown as Record<
@@ -58,7 +66,7 @@ function countingActors() {
       });
     },
   } as unknown as Env["DATABASE_ACTOR"];
-  return { namespace, published };
+  return { namespace, published, refusing };
 }
 
 async function created(f: F, name = "database") {
@@ -88,7 +96,7 @@ const post = (
   });
 
 describe("an observation that says what D1 already holds", () => {
-  it("writes nothing and publishes nothing, and still proves the database alive", async () => {
+  it("writes nothing but the time it proves the database alive, and publishes the Actor's snapshot as before", async () => {
     const f = await fixture();
     const id = await created(f);
     const actors = countingActors();
@@ -110,7 +118,8 @@ describe("an observation that says what D1 already holds", () => {
     expect(after.updated_at).toBe(before.updated_at);
     expect(after.runtime_json).toBe(before.runtime_json);
     expect(await eventCount(id)).toBe(events);
-    expect(actors.published).toHaveLength(published);
+    // The Actor's snapshot is published again: the repair of a publish that failed.
+    expect(actors.published).toHaveLength(published + 1);
     // What proves the database alive is touched.
     expect(after.backup_observed_at! > before.backup_observed_at!).toBe(true);
   });
@@ -134,7 +143,7 @@ describe("an observation that says what D1 already holds", () => {
     const after = (await row(id))!;
     expect(after.updated_at).toBe(before.updated_at);
     expect(after.proven_sleep_json).toBe(before.proven_sleep_json);
-    expect(actors.published).toHaveLength(published);
+    expect(actors.published).toHaveLength(published + 1);
     expect(after.backup_observed_at).toBe(before.backup_observed_at);
   });
 
@@ -177,7 +186,31 @@ describe("an observation that says what D1 already holds", () => {
       },
     ]);
     expect((await row(id))!.updated_at).toBe(stored.updated_at);
-    expect(actors.published).toHaveLength(count);
+    expect(actors.published).toHaveLength(count + 1);
+  });
+});
+
+describe("a report whose Actor publish failed", () => {
+  it("is repaired by the report the node sends again, which publishes although D1 holds it", async () => {
+    const f = await fixture();
+    const id = await created(f);
+    const actors = countingActors();
+    const observed = await observationOf(id, 1);
+    // D1 commits the ready state, the Actor cannot be reached: the report fails, so the node posts
+    // it again.
+    actors.refusing.on = true;
+    expect((await post(f, actors, [observed])).status).toBe(500);
+    expect(await row(id)).toMatchObject({ observed_state: "ready" });
+    expect(actors.published).toHaveLength(0);
+    // The Actor is reached again; D1 holds the observation already, and the snapshot is published.
+    actors.refusing.on = false;
+    expect(await verdicts(await post(f, actors, [observed]))).toEqual([
+      "accept",
+    ]);
+    expect(actors.published).toEqual([id]);
+    // A publish that fails again fails the report of an unchanged database as well.
+    actors.refusing.on = true;
+    expect((await post(f, actors, [observed])).status).toBe(500);
   });
 });
 
@@ -228,5 +261,57 @@ describe("a database that is unchanged and alive", () => {
     // Three periods without a report of it: nobody is looking at it any more.
     await age(NODE_DATABASE_STALE_MS + 60_000);
     expect(await health()).toBe("unknown");
+  });
+});
+
+describe("a database that D1 itself moved to the state the node reports", () => {
+  it("still ends the cold resize that moved it with the asleep report of its generation", async () => {
+    const f = await fixture();
+    const id = await created(f);
+    const actors = countingActors();
+    await post(f, actors, [await observationOf(id, 1)]);
+    await suspend(f, id);
+    const asleep = await observationOf(id, 2, "asleep");
+    await post(f, actors, [asleep]);
+    // A cold resize takes the next generation and observes it at once: the row is already what
+    // the node will report of it, but no report of it has run the statements that end the resize.
+    const target = "r" + crypto.randomUUID().replaceAll("-", "").slice(0, 20);
+    classes.push(target);
+    await env.DB.prepare(
+      `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
+       SELECT ?,1024,750,5,80,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,1,created_at,updated_at FROM size_classes WHERE id=?`,
+    )
+      .bind(target, f.size)
+      .run();
+    const resized = await request(
+      `/v1/databases/${id}`,
+      f.integrator,
+      "PATCH",
+      { size_class_id: target },
+      crypto.randomUUID(),
+    );
+    expect(resized.status).toBe(202);
+    const operation = DatabaseWithOperation.parse(
+      await resized.json(),
+    ).operation;
+    expect(await row(id)).toMatchObject({
+      generation: 3,
+      observed_generation: 3,
+    });
+    expect(
+      await verdicts(
+        await post(f, actors, [
+          // The same proof of the same sleep: the node has no other to give.
+          await observationOf(id, 3, "asleep", {
+            proven_sleep: asleep.proven_sleep,
+          }),
+        ]),
+      ),
+    ).toEqual(["accept"]);
+    expect(
+      await env.DB.prepare("SELECT status FROM operations WHERE id=?")
+        .bind(operation.id)
+        .first("status"),
+    ).toBe("succeeded");
   });
 });

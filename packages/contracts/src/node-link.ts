@@ -127,7 +127,11 @@ export const NODE_STALE_MS = 180_000;
  *   one per minute, and from nothing a database observation carries: unchanged.
  * - The proven-sleep record and the recovery points are facts, written when they change; their
  *   time is when they were observed, never a proof of life, and nothing judges their age.
- * - The cron step `database_actors` reads D1's rows and no observation time.
+ * - The Actor's admission snapshot is published by every report that names the database, changed
+ *   or not, and a publish that fails within a second fails the report, which the node sends
+ *   again: the period is how often a snapshot that a lost publish left behind is repaired. The
+ *   cron step `database_actors` republishes a page of 200 databases a minute and is the other
+ *   repair; it reads D1's rows and no observation time.
  */
 export const NODE_OBSERVATION_RESEND_MS = 15 * 60_000;
 /** A database's own observation is stale when it is older than three periods of the resend. */

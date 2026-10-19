@@ -843,13 +843,12 @@ mod tests {
         // one the node last knew the API took, and it is said all the same.
         rig.core.unsent(&events, &third);
         rig.core.queue_observation(a.clone());
-        assert_eq!(
-            rig.core.take_report(&events).unwrap()["databases"],
-            json!([a])
-        );
-        // The same answer for a report that went: it holds what it took.
-        let again = rig.core.take_report(&events);
-        assert!(again.is_none());
+        let fourth = rig.core.take_report(&events).unwrap();
+        assert_eq!(fourth["databases"], json!([a]));
+        // This one is answered: the API took a, and a is not said again.
+        rig.core.report_posted(&fourth, &ids);
+        rig.core.queue_observation(a.clone());
+        assert!(rig.core.take_report(&events).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
