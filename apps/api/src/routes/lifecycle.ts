@@ -9,7 +9,8 @@ import {
   RegionId,
   Timestamp,
 } from "@pgcf/contracts";
-import { ApiError, type ApiApp } from "../app.ts";
+import { ApiError } from "../api-error.ts";
+import type { ApiApp } from "../app.ts";
 import {
   listDatabaseMoves,
   startDatabaseMove,

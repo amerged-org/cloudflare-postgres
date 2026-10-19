@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { runCron } from "../../src/cron.ts";
 import { armCronWatchdog } from "../../src/cron-watchdog.ts";
-import { ApiError } from "../../src/app.ts";
+import { ApiError } from "../../src/api-error.ts";
 import {
   CRON_STEPS,
   cronErrorCode,

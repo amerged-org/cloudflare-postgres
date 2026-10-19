@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { BucketName, RegionId } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 export interface ArchiveEnvironment {
   ARCHIVE: R2Bucket;
   ARCHIVE_BUCKET_NAME: string;

@@ -260,7 +260,7 @@ it("stale CAS cannot leave a partial power operation or change another intent", 
     .bind(f.id)
     .first<import("../../src/domain/rows.ts").DatabaseRow>();
   const { powerTransitionStatements } =
-    await import("../../src/domain/lifecycle.ts");
+    await import("../../src/domain/power-transition.ts");
   const { newOperationId } = await import("@pgcf/contracts");
   const first = newOperationId(),
     second = newOperationId(),

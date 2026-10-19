@@ -9,6 +9,7 @@ import {
 } from "@pgcf/contracts";
 import { HTTPException } from "hono/http-exception";
 import { routePath } from "hono/route";
+import { ApiError } from "./api-error.ts";
 import { registerApiDocuments } from "./openapi.ts";
 import type { ApiContext, ApiEnv } from "./env.ts";
 import { registerDomain } from "./routes/domain.ts";
@@ -105,18 +106,6 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/node/v1/events",
   "/node/v1/usage",
 ]);
-
-export class ApiError extends Error {
-  readonly code: ErrorCode;
-  readonly details?: ErrorDetails;
-
-  constructor(code: ErrorCode, message: string, details?: ErrorDetails) {
-    super(message);
-    this.name = "ApiError";
-    this.code = code;
-    this.details = details;
-  }
-}
 
 export function apiError(
   c: ApiContext,

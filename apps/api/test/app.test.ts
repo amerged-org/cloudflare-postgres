@@ -9,7 +9,8 @@ import {
 } from "@pgcf/contracts";
 import { HTTPException } from "hono/http-exception";
 import { describe, expect, it } from "vitest";
-import { ApiError, createApp, JSON_BODY_MAX_BYTES } from "../src/app.ts";
+import { ApiError } from "../src/api-error.ts";
+import { createApp, JSON_BODY_MAX_BYTES } from "../src/app.ts";
 
 function request(path: string, init?: RequestInit): Request {
   return new Request(

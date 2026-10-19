@@ -5,7 +5,7 @@ import {
   parseRouteKeyring,
   serializeRouteKeyring,
 } from "@pgcf/contracts/route-token";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext, Env } from "../env.ts";
 import type { NodeCaller } from "./node-auth.ts";
 import {

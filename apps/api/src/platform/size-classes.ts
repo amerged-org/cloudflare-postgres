@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { SizeClassUpsert } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";

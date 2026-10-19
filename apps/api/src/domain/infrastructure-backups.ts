@@ -10,7 +10,7 @@ import {
   InfrastructureBackupRunStatus,
   InfrastructureBackupHealth,
 } from "@pgcf/contracts/infrastructure-backups";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
 import { regionArchive } from "./archive-bindings.ts";
 import {

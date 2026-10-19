@@ -10,7 +10,7 @@ import {
   type NodeDatabaseObservation,
   type NodeObservationReport,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
 import { withAdmissionMutation } from "./admission-mutations.ts";
 import { regionArchive } from "./archive-bindings.ts";

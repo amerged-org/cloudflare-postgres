@@ -16,7 +16,7 @@ import {
   type FleetReleaseSpec,
   type ReleaseFile,
 } from "@pgcf/contracts/releases";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";

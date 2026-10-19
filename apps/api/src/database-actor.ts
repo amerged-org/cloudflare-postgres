@@ -1,35 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
+// This module is what a cold DatabaseActor evaluates before it answers an admission, so it imports
+// only the contract modules and the snapshot schema it needs. What writes D1 and tells the region
+// loads on first use (`d1`), so the awake path never evaluates it. A wake ticket's claim starts in
+// the moment the answer is returned, and the answer leaves only after that microtask has evaluated
+// the module: database-actor-d1.ts therefore stays small.
 import { DurableObject } from "cloudflare:workers";
 import {
   ADMISSION_DEADLINE_MS,
-  DatabaseId,
   DatabaseRegionRoute as RegionRoute,
-  type DatabaseAdmission,
-  type DatabaseWakeAdmission,
   DatabaseRuntime,
-  type NodeDatabaseTarget,
-  RoleName,
-  Timestamp,
-  newOperationId,
-  roleExpiryInstant,
-} from "@pgcf/contracts";
-import { z } from "zod";
+} from "@pgcf/contracts/database-admission";
+import type {
+  DatabaseAdmission,
+  DatabaseWakeAdmission,
+  NodeDatabaseTarget,
+} from "@pgcf/contracts/database-admission";
+import { DatabaseId, RoleName, newOperationId } from "@pgcf/contracts/ids";
 import { roleRevisionHash } from "@pgcf/contracts/route-token";
+import { Timestamp, roleExpiryInstant } from "@pgcf/contracts/timestamp";
+import { z } from "zod";
 
 import type { Env } from "./env.ts";
-import { powerTransitionStatements } from "./domain/lifecycle.ts";
-import { hintDatabases } from "./domain/node-hints.ts";
 import type { DatabaseRow } from "./domain/rows.ts";
-import { readDatabasePresence } from "./domain/database-actor-sync.ts";
 import {
   AdmissionMutationIntent,
   DatabaseAdmissionSnapshot,
 } from "./domain/admission-state.ts";
-import {
-  withAdmissionMutation,
-  type LocalAdmissionActor,
-} from "./domain/admission-mutations.ts";
-import { readDatabaseAdmissionSnapshot } from "./domain/database-admission-snapshot.ts";
+import type { LocalAdmissionActor } from "./domain/admission-mutations.ts";
+/** The D1 side of the actor: the claim, the snapshot read and the hint. */
+const d1 = () => import("./database-actor-d1.ts");
 const PersistedAdmissionMutationIntent = AdmissionMutationIntent.extend({
   started_at: z.number().int().nonnegative().default(0),
 });
@@ -102,7 +101,7 @@ function roleAdmitted(
     (role.valid_until === null || roleExpiryInstant(role.valid_until) > now)
   );
 }
-export type { DatabaseAdmission } from "@pgcf/contracts";
+export type { DatabaseAdmission } from "@pgcf/contracts/database-admission";
 /**
  * The gateway the Edge dials for a database (plan 5.3, 5.8): routes are signed with the key of one
  * node and only its gateway verifies them, so the node's own gateway, a public hostname with no
@@ -402,6 +401,7 @@ export class DatabaseActor extends DurableObject<Env> {
       begin: (intent: AdmissionMutationIntent) =>
         this.beginAdmissionMutationLocked(intent),
       publish: async (completedMutation: string) => {
+        const { readDatabaseAdmissionSnapshot } = await d1();
         const state = await readDatabaseAdmissionSnapshot(this.env, databaseId);
         return state
           ? this.publishAdmissionSnapshotLocked(
@@ -520,6 +520,7 @@ export class DatabaseActor extends DurableObject<Env> {
           if (JSON.stringify(next.roles) === JSON.stringify(previous.roles))
             return;
           // Equal clocks cannot order conflicting role sets; only a fresh trusted D1 read can repair them.
+          const { readDatabasePresence } = await d1();
           const current = await readDatabasePresence(
             this.env.DB,
             next.database_id,
@@ -774,6 +775,7 @@ export class DatabaseActor extends DurableObject<Env> {
     let outcome: "claimed" | "already" | "refused" | "lost" | "failed" =
       "failed";
     try {
+      const { powerTransitionStatements, withAdmissionMutation } = await d1();
       for (let attempt = 0; ; attempt++) {
         const read = await this.env.DB.prepare(
           `SELECT d.*,EXISTS(SELECT 1 FROM operations o WHERE o.id=d.power_operation AND o.database_id=d.id AND o.project_id=d.project_id
@@ -873,7 +875,9 @@ export class DatabaseActor extends DurableObject<Env> {
   }
   /** Tells the node a ticket was refused, so it pulls the page that refutes it. */
   private async refuteTicket(id: string): Promise<void> {
-    await hintDatabases(this.env, [id]).catch(() => 0);
+    await d1()
+      .then(({ hintDatabases }) => hintDatabases(this.env, [id]))
+      .catch(() => 0);
   }
   /** The local admission actor of a ticket claim: its barrier is the Actor's own ticket mutation. */
   private ticketAdmissionActor(databaseId: string): LocalAdmissionActor {
@@ -885,6 +889,7 @@ export class DatabaseActor extends DurableObject<Env> {
           return this.beginAdmissionMutationLocked(intent);
         }),
       publish: async (completedMutation) => {
+        const { readDatabaseAdmissionSnapshot } = await d1();
         const state = await readDatabaseAdmissionSnapshot(this.env, databaseId);
         return state
           ? this.gate("ticketPublish", () =>
@@ -1003,7 +1008,8 @@ export class DatabaseActor extends DurableObject<Env> {
       // pulls the page that holds the claimed generation.
       const hinted = Date.now();
       this.ctx.waitUntil(
-        hintDatabases(this.env, [id])
+        d1()
+          .then(({ hintDatabases }) => hintDatabases(this.env, [id]))
           .catch(() => 0)
           .then(() =>
             // The wake split's first stage on this side: the claim itself and the node hint.
@@ -1064,6 +1070,8 @@ export class DatabaseActor extends DurableObject<Env> {
               .bind(row.power_operation, id, row.project_id, row.generation)
               .first();
             if (!sleepingIntent) return undefined;
+            const { powerTransitionStatements, withAdmissionMutation } =
+              await d1();
             const operation = newOperationId(),
               now = new Date().toISOString(),
               previous = row,

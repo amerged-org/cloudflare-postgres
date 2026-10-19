@@ -9,7 +9,7 @@ import {
   type RoleCreate,
 } from "@pgcf/contracts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import { keyring } from "../crypto/keyring.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { MAINTENANCE_ROLE } from "./maintenance.ts";
 import { ApiKeyScope, ApiKeyString } from "./auth.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
+import { Timestamp } from "./timestamp.ts";
 import {
   DatabaseEffectiveResources,
   DatabaseResourcesCreate,
@@ -18,6 +19,8 @@ import {
   RoleName,
   SizeClassId,
 } from "./ids.ts";
+// Defined in timestamp.ts, so that a module that needs only these does not evaluate this file.
+export { Timestamp, roleExpiryInstant } from "./timestamp.ts";
 
 /**
  * The version of the API contract that the served OpenAPI documents carry as `info.version`: the
@@ -28,11 +31,6 @@ import {
  */
 export const API_CONTRACT_VERSION = "1.2.0";
 
-/** ISO-8601 UTC timestamp exactly as Date#toISOString renders it. */
-export const Timestamp = z.iso
-  .datetime({ precision: 3 })
-  .meta({ id: "Timestamp" });
-export type Timestamp = z.infer<typeof Timestamp>;
 /** The pattern of `Timestamp` in the contract's own JSON Schema, which the OpenAPI generator drops. */
 export const TIMESTAMP_PATTERN: string = (() => {
   const { pattern } = z.toJSONSchema(z.iso.datetime({ precision: 3 }));
@@ -552,16 +550,6 @@ export const ROLE_CONNECTION_LIMIT_MAX = 10000;
 export const ROLE_MEMBER_OF_MAX = 8;
 /** Roles of one database; the owner and roles whose removal is not confirmed count. */
 export const ROLE_LIMIT = 100;
-
-/**
- * The instant, in milliseconds since the epoch, from which PostgreSQL refuses the credential of a
- * role whose `valid_until` is given. The region hands the expiry to PostgreSQL as a Kubernetes
- * time, which holds whole seconds, and cuts the fraction: a role is refused from the start of the
- * second its expiry falls in. Everything that decides whether a role may log in uses this instant.
- */
-export function roleExpiryInstant(validUntil: string): number {
-  return Math.floor(Date.parse(validUntil) / 1000) * 1000;
-}
 
 const RoleConnectionLimit = z
   .number()

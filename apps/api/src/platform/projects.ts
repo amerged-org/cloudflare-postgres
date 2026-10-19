@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { newProjectId, type ProjectCreate } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import {
   assertProjectAccess,

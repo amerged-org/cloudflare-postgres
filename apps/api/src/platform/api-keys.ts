@@ -6,7 +6,7 @@ import {
   timingSafeEqual,
   type ApiKeyCreate,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import { bearer, requireScope } from "../middleware/auth.ts";
 import {

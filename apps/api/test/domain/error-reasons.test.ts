@@ -2,7 +2,7 @@
 import { env } from "cloudflare:workers";
 import { bytesToHex, DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
-import { ApiError } from "../../src/app.ts";
+import { ApiError } from "../../src/api-error.ts";
 import { withAdmissionMutation } from "../../src/domain/admission-mutations.ts";
 import { scheduleDatabaseResize } from "../../src/domain/databases.ts";
 import type { DatabaseRow } from "../../src/domain/rows.ts";

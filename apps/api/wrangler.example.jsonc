@@ -5,6 +5,9 @@
   "compatibility_date": "2026-10-02",
   // The daily infrastructure backup streams AES-256-GCM through node:crypto.
   "compatibility_flags": ["nodejs_compat"],
+  // Every cold Durable Object, a DatabaseActor included, loads this whole bundle in an isolate of its own
+  // before it answers: a smaller bundle answers sooner.
+  "minify": true,
   "version_metadata": { "binding": "CF_VERSION_METADATA" },
   "d1_databases": [
     {

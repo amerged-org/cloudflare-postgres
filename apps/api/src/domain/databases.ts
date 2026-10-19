@@ -10,7 +10,7 @@ import {
   newRolePassword,
   OWNER_ROLE_NAME,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
 import type { ApiContext, Env } from "../env.ts";
 import {

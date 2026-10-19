@@ -8,10 +8,11 @@ import {
   type NodeOrderResult,
   type ObservationVerdict,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { databaseActor } from "./database-actor-sync.ts";
-import { recoverQuiescence, powerTransitionStatements } from "./lifecycle.ts";
+import { recoverQuiescence } from "./lifecycle.ts";
+import { powerTransitionStatements } from "./power-transition.ts";
 import { hintDatabases } from "./node-hints.ts";
 import { applyLifecycleObservations } from "./lifecycle-observations.ts";
 import { USAGE_SNAPSHOT_SQL } from "./resources.ts";

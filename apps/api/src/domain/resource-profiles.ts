@@ -8,7 +8,7 @@ import {
   ResourceProfileRollout,
   type ResourceProfileRolloutUpdate,
 } from "@pgcf/contracts";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { Env, ApiContext } from "../env.ts";
 import { getAuth, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";

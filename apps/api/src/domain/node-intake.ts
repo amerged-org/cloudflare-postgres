@@ -7,7 +7,7 @@ import {
   type NodeEvent,
 } from "@pgcf/contracts";
 import type { UsageSample } from "@pgcf/contracts/usage";
-import { ApiError } from "../app.ts";
+import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import type { NodeCaller } from "./node-auth.ts";
 import { recordUsageSamples } from "./usage.ts";
