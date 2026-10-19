@@ -47,6 +47,18 @@ afterEach(async () => {
 });
 
 const MINUTE = 60_000;
+/**
+ * Waits until two samples taken now (2 s and 1 s ago) fall into one minute that still has time to
+ * run, so that D1 holds the first until the minute's alarm: from 4 s to 40 s into a minute, or the
+ * next one's 5 s. Live in CI both the last 20 s and the first 2 s of a minute broke the tests.
+ */
+async function insideAMinute() {
+  const phase = Date.now() % MINUTE;
+  if (phase < 4_000 || phase > MINUTE - 20_000)
+    await new Promise((resolve) =>
+      setTimeout(resolve, (5_000 - phase + MINUTE) % MINUTE),
+    );
+}
 const placementNeed: PlacementNeed = {
   memory_mib: 256,
   cpu_millicores: 500,
@@ -355,11 +367,8 @@ describe("the samples of a node", () => {
     const f = await fixture(0);
     const socket = await connect(f);
     // Samples of the minute that is running, so that its alarm is still to come, and both of them
-    // inside it: near the end of a minute, wait until the next one is 3 s old.
-    if (Date.now() % MINUTE > MINUTE - 20_000)
-      await new Promise((resolve) =>
-        setTimeout(resolve, MINUTE - (Date.now() % MINUTE) + 3_000),
-      );
+    // inside it.
+    await insideAMinute();
     const now = Date.now();
     for (const offset of [2_000, 1_000]) {
       socket.send(sampleMessage(now - offset));
@@ -383,10 +392,7 @@ describe("the samples of a node", () => {
   it("keeps the newest sample of a boot that ended as the end of that boot, also when its minute's alarm has not written it", async () => {
     const f = await fixture(0);
     const socket = await connect(f);
-    if (Date.now() % MINUTE > MINUTE - 20_000)
-      await new Promise((resolve) =>
-        setTimeout(resolve, MINUTE - (Date.now() % MINUTE) + 3_000),
-      );
+    await insideAMinute();
     const now = Date.now(),
       iso = (at: number) => new Date(at).toISOString();
     for (const offset of [2_000, 1_000]) {
