@@ -107,8 +107,9 @@ async function pageRelease(
     .first<{ id: string; spec_json: string }>();
   if (row === null) return null;
   const spec = FleetReleaseSpec.parse(JSON.parse(row.spec_json));
-  // The kernel and the packages a node is expected to report stay with the API, which compares
-  // them: an agent of an older build refuses a page that carries more than it knows.
+  // The kernel and the digests of the packages and the host files a node is expected to report
+  // stay with the API, which compares them; the host files themselves are on the page, because
+  // the agent writes them and the release key signs them.
   return NodeRelease.parse({
     id: row.id,
     binaries: spec.binaries,

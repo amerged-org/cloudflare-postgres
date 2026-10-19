@@ -7,6 +7,7 @@ import {
   FleetReleaseRegistration,
   FleetReleaseSpec,
   RELEASE_FILES,
+  type HostFile,
   fleetReleaseSpec,
   packagesSha256,
   releaseFileUrl,
@@ -20,7 +21,7 @@ const pinned = (name: string, size = 4096) => ({
 });
 function spec() {
   return {
-    version: 2,
+    version: 3,
     image: {
       url: "https://releases.example/pgcf-node-1.2.0.raw.zst",
       sha256: "a".repeat(64),
@@ -41,6 +42,17 @@ function spec() {
       package_lock: pinned("packages.lock.json"),
       packages_sha256: "d".repeat(64),
       kernel_release: "6.12.113+deb13-amd64",
+      host_files: [
+        {
+          path: "/usr/lib/systemd/system/pgcf-agent.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "e".repeat(64),
+          size_bytes: 900,
+          apply: "restart_unit:pgcf-agent.service",
+        },
+      ],
+      host_files_sha256: "f".repeat(64),
     },
     signature: "5".repeat(128),
   };
@@ -49,7 +61,7 @@ function spec() {
 it("one release is one node image, four binaries and the package lock, nothing else", () => {
   expect(FleetReleaseSpec.safeParse(spec()).success).toBe(true);
   for (const change of [
-    (value: ReturnType<typeof spec>) => ({ ...value, version: 1 }),
+    (value: ReturnType<typeof spec>) => ({ ...value, version: 2 }),
     (value: ReturnType<typeof spec>) => ({ ...value, roles: {} }),
     (value: ReturnType<typeof spec>) => ({ ...value, components: [] }),
     (value: ReturnType<typeof spec>) => ({ ...value, route_token_version: 6 }),
@@ -124,10 +136,12 @@ it("the page's release is the spec's binaries and the operating system a node in
   });
   // What the node is expected to report back is the API's to compare and is not on the page: an
   // agent of an older build refuses a page that carries more than it knows.
-  const { packages_sha256, kernel_release, ...installed } = release.spec.os;
-  expect([packages_sha256, kernel_release]).toEqual([
+  const { packages_sha256, kernel_release, host_files_sha256, ...installed } =
+    release.spec.os;
+  expect([packages_sha256, kernel_release, host_files_sha256]).toEqual([
     "d".repeat(64),
     "6.12.113+deb13-amd64",
+    "f".repeat(64),
   ]);
   const page = { id: release.id, binaries: release.spec.binaries };
   expect(NodeRelease.safeParse({ ...page, os: installed }).success).toBe(true);
@@ -201,6 +215,17 @@ function registration() {
       package_lock: digest("5", 90_000),
       packages_sha256: "6".repeat(64),
       kernel_release: "6.12.113+deb13-amd64",
+      host_files: [
+        {
+          path: "/usr/lib/systemd/system/pgcf-agent.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "8".repeat(64),
+          size_bytes: 900,
+          apply: "restart_unit:pgcf-agent.service",
+        },
+      ] as HostFile[],
+      host_files_sha256: "9".repeat(64),
     },
     signature: "7".repeat(128),
   };
@@ -240,7 +265,7 @@ it("a release is registered by its digests and sizes alone, never by a URL", () 
         package_lock: { ...digest("5", 1), url: "https://x.example/l" },
       },
     }),
-    (value: ReturnType<typeof registration>) => ({ ...value, version: 2 }),
+    (value: ReturnType<typeof registration>) => ({ ...value, version: 3 }),
     (value: ReturnType<typeof registration>) => ({
       ...value,
       os: { ...value.os, packages_sha256: undefined },

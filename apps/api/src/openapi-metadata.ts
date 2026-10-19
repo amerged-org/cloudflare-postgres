@@ -396,6 +396,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Read a release's node image with the installer's token",
     "installer",
   ),
+  "GET /node/v1/releases/{version}/host-files/{sha256}": route(
+    "getReleaseHostFile",
+    "Read a host file of a release by its digest",
+    "none",
+  ),
   "GET /node/v1/releases/{version}/{file}": route(
     "getReleaseFile",
     "Read a binary or the package lock of a release",

@@ -234,7 +234,10 @@ with the owner's go for a reboot. Starting a cycle requires an `admin` API key; 
    `Idempotency-Key` and `{"expected_node_uid":"<verified UID>"}`. It answers 202 with the
    operation and a `Location`. Placement on the node is closed, and the node holds new wakes
    with `57P03`, puts every awake database to sleep with the proof, installs the packages of the
-   lock and reboots if the kernel or core libraries changed. It purges the installed packages the
+   lock and reboots if the kernel or core libraries changed, or if a host file of the release that
+   takes effect only at a boot (sysusers, tmpfiles) was written since the node booted: then the
+   cycle reboots even with nothing to install, and `os_converged` becomes true after the boot
+   ([changing a unit without a new image](operator-installation.md#changing-a-unit-or-a-configuration-file-no-new-image)). It purges the installed packages the
    lock no longer names (never a kernel image, an essential or protected package) when nothing
    needs a reboot, or, after a reboot, in the cycle it runs for the open order once it is up; then
    it runs its check and reports. Repeating the request while the cycle is open returns the same
@@ -245,8 +248,10 @@ with the owner's go for a reboot. Starting a cycle requires an `admin` API key; 
    `failed` cycle names the class of the failure in `result_reason` (such as `power_busy` or
    `power_archive` for a database that did not sleep with the proof, `release_missing`,
    `release_signature_missing` or `release_signature_invalid` for a release the node does not trust
-   (its agent checks the release key's signature before it reads the lock, and reports the event
-   `release_refused`; [release-signing.md](release-signing.md)), `signature_not_read`,
+   (its agent checks the release key's signature and its own rules for the release's host files
+   before it reads the lock, and reports the event `release_refused`, with the classes
+   `host_file_path_refused`, `host_file_mode_refused`, `host_file_apply_refused` and
+   `host_files_invalid` as well; [release-signing.md](release-signing.md)), `signature_not_read`,
    `lock_not_read`, `packages_not_read`, `packages_not_installed`, `reboot_failed` or
    `check_failed`; `packages_not_installed` also names a purge that dpkg refused).
 4. `done` reopens placement, if this cycle closed it (`placement_closed_at` is not null). A

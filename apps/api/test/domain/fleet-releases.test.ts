@@ -6,12 +6,17 @@ import {
   FleetNodeReleaseStatus,
   FleetRegionReleaseStatus,
   FleetRelease,
+  hostFileObjectKey,
+  hostFilesSha256,
   releaseFileUrl,
   releaseObjectKey,
 } from "@pgcf/contracts/releases";
 import { createApp } from "../../src/app.ts";
 import {
   API_ORIGIN,
+  GATEWAY_UNIT_SHA256,
+  HOST_FILES,
+  HOST_FILE_BODIES,
   cleanupFixtures,
   fixture,
   nodeOs,
@@ -139,6 +144,28 @@ it("refuses a body that is not a registration: a full spec, a URL, an unknown fi
     { ...f.value, os: { ...f.value.os, packages_sha256: "latest" } },
     { ...f.value, os: { ...f.value.os, kernel_release: undefined } },
     { ...f.value, os: { ...f.value.os, kernel_release: "6.12 amd64" } },
+    // The host files: all of them, in the contract's shape, with the digest a node reports.
+    { ...f.value, os: { ...f.value.os, host_files: undefined } },
+    { ...f.value, os: { ...f.value.os, host_files: [] } },
+    { ...f.value, os: { ...f.value.os, host_files_sha256: undefined } },
+    {
+      ...f.value,
+      os: { ...f.value.os, host_files: [...HOST_FILES].reverse() },
+    },
+    {
+      ...f.value,
+      os: {
+        ...f.value.os,
+        host_files: [{ ...HOST_FILES[1], path: "/etc/passwd" }],
+      },
+    },
+    {
+      ...f.value,
+      os: {
+        ...f.value.os,
+        host_files: [{ ...HOST_FILES[1], url: "https://elsewhere.example/f" }],
+      },
+    },
     {},
   ])
     expect((await f.approve(body)).status).toBe(400);
@@ -219,9 +246,13 @@ it("names the URLs of the spec itself: every file of the release is served by th
       url: url("packages.lock.json"),
       ...f.value.os.package_lock,
     },
-    // What a node that runs the lock reports back, fixed with the release.
+    // The files of the image a node holds, with how each takes effect, and no URL: a node reads
+    // one by its digest beside the release's files.
+    host_files: HOST_FILES,
+    // What a node that runs the lock and holds the files reports back, fixed with the release.
     packages_sha256: f.value.os.packages_sha256,
     kernel_release: f.value.os.kernel_release,
+    host_files_sha256: f.value.os.host_files_sha256,
   });
   expect(release.spec.image.url).toMatch(
     new RegExp(
@@ -282,7 +313,49 @@ it("registers only what the archive bucket holds: every file, at its size, with 
   );
   await conflict(unverified, registration, "pgcf-wal-fetch");
   await env.ARCHIVE.delete(releaseObjectKey(unverified, "pgcf-wal-fetch"));
+  // A host file that was never uploaded, one of another size, and one stored without the sha256
+  // R2 verified are refused as the six files are, naming the object.
+  const noHost = `${f.id}-e`;
+  await conflict(
+    noHost,
+    await stageRelease(noHost, { skipHostFiles: [HOST_FILES[1]!.path] }),
+    hostFileObjectKey(noHost, GATEWAY_UNIT_SHA256),
+  );
+  const bigHost = `${f.id}-f`;
+  const bigger = await stageRelease(bigHost);
+  (bigger.os.host_files[1] as { size_bytes: number }).size_bytes += 1;
+  // The digest a node reports covers the sizes: the registration states it again for its list.
+  bigger.os.host_files_sha256 = await hostFilesSha256(bigger.os.host_files);
+  await conflict(
+    bigHost,
+    bigger,
+    hostFileObjectKey(bigHost, GATEWAY_UNIT_SHA256),
+  );
+  const looseHost = `${f.id}-g`;
+  const loose = await stageRelease(looseHost, {
+    skipHostFiles: [HOST_FILES[1]!.path],
+  });
+  const looseKey = hostFileObjectKey(looseHost, GATEWAY_UNIT_SHA256);
+  await env.ARCHIVE.put(looseKey, HOST_FILE_BODIES.gateway);
+  await conflict(looseHost, loose, looseKey);
+  await env.ARCHIVE.delete(looseKey);
   // The registration works once the files are there.
+  expect((await f.approve()).status).toBe(200);
+});
+
+it("states the digest a node reports for the host files itself: a registration whose digest is not the list's is refused", async () => {
+  const f = await setup();
+  const wrong = structuredClone(f.value);
+  wrong.os.host_files_sha256 = "0".repeat(64);
+  expect(await refusal(await f.approve(wrong))).toMatchObject({
+    status: 400,
+    code: "invalid_request",
+  });
+  expect(
+    await env.DB.prepare("SELECT 1 FROM fleet_releases WHERE id=?")
+      .bind(f.id)
+      .first(),
+  ).toBeNull();
   expect((await f.approve()).status).toBe(200);
 });
 

@@ -488,11 +488,45 @@ and actual delivery are separate evidence. The alert kinds and their runbook act
    `ready` once the node has sampled with its credentials, which also opens it for placement.
    A node that does not enroll after the installer's reboot is restarted once through the API.
 5. A new release reaches a running node without a reboot: assign it to the region and the node pulls
-   its binaries (plan 9.3). Packages and kernels change only in the
-   [maintenance cycle](recovery.md#node-maintenance-cycle), one node at a time.
+   its binaries and writes its host files (plan 9.3; the section below). Packages and kernels change
+   only in the [maintenance cycle](recovery.md#node-maintenance-cycle), one node at a time.
 
 Verify an install as described under [the node firewall](#the-node-firewall) and
 [Cloudflare Access](#cloudflare-access-for-node-gateways-and-shells).
+
+### Changing a unit or a configuration file: no new image
+
+A systemd unit, a mask, or the sshd, journald, sysctl, tmpfiles, sysusers or modprobe configuration
+of the image is a host file: it ships with the signed release, so a change needs no reinstall.
+
+1. Edit the file in `infra/node-image/mkosi.extra` and merge it. A new file in one of the
+   allow-listed directories also needs its row in `HOST_FILE_APPLY` (how it takes effect) in
+   `infra/node-image/host-files.ts`; the build and the registration stop at a file the two tables do
+   not name. A file outside those directories (the bootloader, `fstab`, the firewall, the presets)
+   is the image's alone and still needs a new image: the
+   [node image README](../../infra/node-image/README.md#what-ships-with-the-image-what-with-a-release)
+   lists both.
+2. CI builds the image and signs the release; register the signed build from a checkout of that
+   commit and assign it to the region, as for any release. The dry run prints the number of host
+   files and their digest.
+3. Each node writes the files that differ after its binaries (a release that changes the agent is
+   installed by the old agent, and the new one writes the files after its restart), reads systemd's
+   units again once and restarts what changed: the gateway, cloudflared, ssh, journald and
+   systemd-sysctl by name, the agent last. A per-database unit takes the new file at each database's
+   next start and a running database is not touched.
+4. Read the result with `GET /v1/nodes/{id}`: `os.host_files_sha256` equals the release's
+   `spec.os.host_files_sha256` and `os_converged` is true. A file that takes effect only at a boot
+   (`reboot`: sysusers, tmpfiles) leaves `os_converged` false until the
+   [maintenance cycle](recovery.md#node-maintenance-cycle) has run: it reboots the node for such a file
+   even when it has nothing to install, and the node is converged after the boot. The node's events
+   (`host_files_applied`, `host_files_not_applied`, `release_refused`) carry a class and never a file's
+   contents. The classes of a refusal are `host_file_path_refused`, `host_file_mode_refused`,
+   `host_file_apply_refused` and `host_files_invalid`; a file that could not be read, written or told
+   to systemd is `host_files_not_applied`, tried again with the next page.
+
+A change that moves what systemd mounts or in which mount namespace (the V4h change of the volumes)
+is not delivered this way: it needs every database asleep with its proof and its volumes unmounted
+in one step, and no hook exists for it; it reaches a node with an image.
 
 ## API-only resource profiles and regional configuration
 

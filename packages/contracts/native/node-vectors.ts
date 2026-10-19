@@ -8,8 +8,10 @@ import * as local from "../src/node-local.ts";
 import { bytesToBase64url } from "../src/encoding.ts";
 import {
   FleetReleaseId,
+  hostFilesSha256,
   packagesSha256,
   signedReleaseManifest,
+  type HostFile,
 } from "../src/releases.ts";
 
 const id = `d${"b".repeat(19)}`,
@@ -125,6 +127,16 @@ const page = {
         sha256: "b".repeat(64),
         size_bytes: 2000,
       },
+      host_files: [
+        {
+          path: "/usr/lib/systemd/system/pgcf-agent.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "c".repeat(64),
+          size_bytes: 900,
+          apply: "restart_unit:pgcf-agent.service",
+        },
+      ],
     },
   },
   policy: {
@@ -350,6 +362,7 @@ const hello = {
     booted_at: now,
     kernel_release: "6.12.111+deb13-amd64",
     packages_sha256: "a".repeat(64),
+    host_files_sha256: "b".repeat(64),
   },
 };
 
@@ -1647,7 +1660,7 @@ export async function packageVectors() {
  * a manifest with two of them swapped is another one. It carries no signature and no key: the
  * agent's tests make a throwaway key and sign the text.
  */
-export function releaseVectors() {
+export async function releaseVectors() {
   const pin = (name: string, digit: string, size: number) => ({
     url: `https://releases.example/${name}`,
     sha256: digit.repeat(64),
@@ -1665,6 +1678,54 @@ export function releaseVectors() {
       image_version: "sha-0123456789ab",
       debian_snapshot: "20261016T000000Z",
       package_lock: pin("packages.lock.json", "5", 90_000),
+      // Every kind, mode and way to take effect, ascending by path, each digest different.
+      host_files: [
+        {
+          path: "/etc/ssh/sshd_config.d/10-pgcf.conf",
+          kind: "file",
+          mode: "0644",
+          sha256: "6".repeat(64),
+          size_bytes: 1500,
+          apply: "restart_unit:ssh.service",
+        },
+        {
+          path: "/etc/systemd/system/modprobe@loop.service",
+          kind: "symlink-to-dev-null",
+          apply: "daemon_reload",
+        },
+        {
+          path: "/usr/lib/sysctl.d/90-pgcf.conf",
+          kind: "file",
+          mode: "0644",
+          sha256: "7".repeat(64),
+          size_bytes: 800,
+          apply: "restart_unit:systemd-sysctl.service",
+        },
+        {
+          path: "/usr/lib/systemd/system/pgcf-agent.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "8".repeat(64),
+          size_bytes: 1100,
+          apply: "restart_unit:pgcf-agent.service",
+        },
+        {
+          path: "/usr/lib/systemd/system/pgcf-pg@.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "9".repeat(64),
+          size_bytes: 4300,
+          apply: "next_start",
+        },
+        {
+          path: "/usr/lib/sysusers.d/pgcf.conf",
+          kind: "file",
+          mode: "0755",
+          sha256: "a".repeat(64),
+          size_bytes: 300,
+          apply: "reboot",
+        },
+      ] as HostFile[],
     },
   };
   link.NodeRelease.parse(release);
@@ -1673,6 +1734,8 @@ export function releaseVectors() {
       name: "distinct-digests",
       release,
       manifest: signedReleaseManifest(release),
+      // What a node that holds the release's host files reports in its hello.
+      host_files_sha256: await hostFilesSha256(release.os.host_files),
     },
   ];
 }

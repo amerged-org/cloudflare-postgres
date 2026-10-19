@@ -61,8 +61,10 @@ pub fn refuse_init_mount_namespace(own: &Path, init: &Path) -> io::Result<()> {
 }
 
 /// What the hello reports of the node's operating system (`NodeOs`, SEC-03): this boot, the running
-/// kernel, and the digest of the installed packages (`update::packages_digest`). The agent reads it
-/// when it starts and again after a maintenance cycle that did not reboot, not with every sample.
+/// kernel, the digest of the installed packages (`update::packages_digest`) and the digest of the
+/// host files it holds, read from its disk (`hostfiles::observed_digest`). The agent reads it when
+/// it starts and again after a maintenance cycle that did not reboot and after it wrote host
+/// files, not with every sample.
 pub async fn os_report<M: Machine>(machine: &M) -> Result<Value, crate::Error> {
     let boot = machine
         .boot()
@@ -70,11 +72,14 @@ pub async fn os_report<M: Machine>(machine: &M) -> Result<Value, crate::Error> {
     let installed =
         update::without_idle_kernels(machine.installed_packages().await?, &boot.kernel_release);
     let booted_at_ms = i64::try_from(boot.booted_at)?.saturating_mul(1000);
+    let layout = machine.layout();
+    let held = crate::hostfiles::State::load(&layout.host_files());
     Ok(json!({
         "boot_id": boot.id,
         "booted_at": crate::archive::facts::timestamp(booted_at_ms),
         "kernel_release": boot.kernel_release,
         "packages_sha256": update::packages_digest(&installed),
+        "host_files_sha256": crate::hostfiles::observed_digest(&layout.host_root, &held, &boot.id),
     }))
 }
 
@@ -354,6 +359,9 @@ pub trait Machine: Send + Sync + 'static {
     // ---- updates (plan 9.3)
     /// Restarts one of the image's own services and waits for the job.
     fn restart_service(&self, unit: &str) -> impl Future<Output = Result<(), units::Error>> + Send;
+    /// Has systemd read its unit files again (`systemctl daemon-reload`), once a release has
+    /// written host files (`hostfiles`). No unit restarts for it.
+    fn daemon_reload(&self) -> impl Future<Output = Result<(), units::Error>> + Send;
     /// The installed Debian packages and their versions.
     fn installed_packages(
         &self,

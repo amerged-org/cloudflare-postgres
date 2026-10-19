@@ -38,6 +38,9 @@ pub trait Manager {
         runtime: bool,
         properties: &[(&str, Value<'_>)],
     ) -> zbus::Result<()>;
+    /// Reads the unit files again, as `systemctl daemon-reload` does; the answer comes when systemd
+    /// is done.
+    fn reload(&self) -> zbus::Result<()>;
     fn list_units_by_patterns(
         &self,
         states: &[&str],

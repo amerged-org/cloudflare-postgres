@@ -172,20 +172,27 @@ What the script does, and what the API checks:
 
 - It refuses a build whose compressed image, package lock or any of the four binaries is not the
   one `pgcf-node.json` describes (so binaries rebuilt since the image was built are refused: build
-  the image again), and a release name that is no version.
+  the image again), and a release name that is no version. It also derives the release's host
+  files from the checkout's `mkosi.extra` ([host-files.ts](host-files.ts)) and refuses a tree whose
+  list is not the one the summary states (`host_files_sha256`): check out the commit that was
+  built (`--tree DIR` names another tree).
 - It reads the signature and checks it against the release key before it uploads a byte: a release
   without a signature, or with one that does not verify, is refused, because every node would refuse it.
 - It uploads `pgcf-node.raw.zst`, `packages.lock.json` and the four binaries to
-  `node-images/<version>/` with `x-amz-checksum-sha256`, so R2 itself verifies each digest. A file
+  `node-images/<version>/`, and every host file that has content to
+  `node-images/<version>/host-files/<sha256>` (two files of the same bytes are one object), with
+  `x-amz-checksum-sha256`, so R2 itself verifies each digest. A file
   that is already there with the same content (size, md5 and the sha256 R2 reports for it) is
   skipped, so a run that stopped half way is repeated. A file with the same size and md5 that R2
   holds no sha256 for, because another tool stored it, is sent again with the checksum: the API
   refuses a file without it. One with another content stops the run, because a registered release
   is never overwritten.
-- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file and the signature.
-  The API refuses a registration without a well-formed signature (64 bytes in hex; it holds no key,
-  so it stores and shows the signature and cannot check it). It refuses the registration
-  unless the bucket holds every file at that size with that sha256, and it names
+- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file, the host
+  files (path, mode, sha256, size and how each takes effect) with the digest a node that holds them
+  reports, and the signature. The API refuses a registration without a well-formed signature (64
+  bytes in hex; it holds no key, so it stores and shows the signature and cannot check it), one
+  whose host files digest is not the list's own, and one unless the bucket holds every file and
+  every host file at that size with that sha256, and it names
   every URL of the stored, immutable spec itself, as `/node/v1/releases/<version>/<file>` on its
   own origin (`NODE_API_ORIGIN`). Nothing in the registration is a URL or a credential. The script
   prints the release id and spec sha256 of the answer, and fails if the stored spec is another
@@ -237,6 +244,47 @@ boots `/vmlinuz` and `/initrd.img`, which Debian's kernel packages point at the 
 offers the previous kernel through the `.old` links. A one-shot boot of the previous kernel:
 `grub-editenv /efi/grub/grubenv set next_entry=previous`, then reboot. The kernel console is on
 `tty0` (Contabo VNC) and `ttyS0`. Both entries carry `systemd.ssh_auto=no`.
+
+## What ships with the image, what with a release
+
+A node gets files two ways. The image is written once, at an install or a reinstall. A release
+reaches every running node, signed by CI (plan 9.3), and carries more than binaries.
+
+| Reaches a running node with a release, no reinstall | Needs a new image |
+| --- | --- |
+| The four binaries (`pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive`, `pgcf-wal-fetch`) | The bootloader and the kernel command line (`efi/grub/grub.cfg`) |
+| The Debian packages of the lock, in a maintenance cycle | The partition layout and first-boot partitioning (`mkosi.repart`, `usr/lib/repart.d`), `fstab` |
+| **The host files**: the systemd units and masks (`/usr/lib/systemd/system`, `/etc/systemd/system`) and the sshd, journald, sysctl, tmpfiles, sysusers and modprobe configuration (the allow-listed directories of [host-files.ts](host-files.ts)) | The firewall (`nftables.conf`), sshd's data files (`pgcf_revoked.krl`, `principals/`), the generator mask `systemd-ssh-generator`, the presets (which units are enabled), the links `/usr/libexec/pgcf/*`, `mkosi.skeleton` (package configuration at install) |
+| | The initial boot and cloud-init, the installer and the installer's userData |
+| | The first agent that can write host files (an agent of an earlier build refuses a page whose release lists them), and any change of the mount topology (a change that moves volumes between mount namespaces needs every database asleep and its volumes unmounted in one step; no hook exists for it) |
+
+Everything in `mkosi.extra` is one or the other, and the build stops at a file that is neither:
+`HOST_FILE_APPLY` in [host-files.ts](host-files.ts) says how each host file takes effect, and
+`IMAGE_ONLY` lists the rest with the reason. [host-files.test.ts](host-files.test.ts) and
+[units.test.ts](units.test.ts) hold the tables to the tree.
+
+### Changing a unit or a configuration file without a new image
+
+1. Edit the file in `infra/node-image/mkosi.extra` (a new file in an allow-listed directory also
+   needs its row in `HOST_FILE_APPLY`; the registration says so if it is missing). Nothing else.
+2. Merge. CI builds the image, whose summary pins the digest of the host files of that tree, runs
+   the registration's dry run, and the `sign-release` job has the signer sign the release: the
+   signed text carries every host file with its digest and how it takes effect.
+3. Register the signed build (`register-node-image.ts`, from a checkout of the commit that was
+   built) and assign it to the region (`PUT /v1/regions/<region>/release`).
+4. Each node's agent installs the binaries first, and then writes the files that differ: if the
+   agent's own binary changed, the agent that runs after its restart writes them. It reads systemd's
+   units again once and restarts what changed (the gateway, cloudflared, ssh, journald,
+   systemd-sysctl; the agent's own last). A per-database unit (`pgcf-pg@.service`, `next_start`)
+   takes the new file at each database's next start, and a database that runs keeps its old
+   definition until it sleeps. A file marked `reboot` (sysusers, tmpfiles) waits for the next
+   maintenance cycle, which reboots for it even when there is nothing to install.
+5. Check `GET /v1/nodes/{id}`: `os.host_files_sha256` is the release's `spec.os.host_files_sha256`
+   and `os_converged` is true (after the cycle, if a file waits for a reboot). A refused or failed
+   apply is a node event with a class and no contents: `release_refused` with
+   `host_file_path_refused`, `host_file_mode_refused`, `host_file_apply_refused` or
+   `host_files_invalid` when the signed list breaks the agent's own rules, and
+   `host_files_not_applied` for a file that could not be read, written or told to systemd.
 
 ## Units
 
@@ -490,18 +538,32 @@ token or the route keyring changed.
   `current`. It restarts `pgcf-gateway` if the gateway's binary changed (the gateway is not drained
   first yet) and exits if its own changed, so that `Restart=always` starts the new one; the
   databases keep running. The previous release's directory stays, older ones go.
-- **The image's units and the agent's binary go together, in one order.** The units and the masks
-  (`pgcf-pg@.service`, `pgcf-agent.service`, the `modprobe@` masks) ship only with the image; a
-  release changes the binaries only. The new units mount the volume themselves from the link
-  `/run/pgcf/dev/<id>` and assert it; the agent makes the link. So: first a release whose agent
-  makes the link, which works on the old image (its agent unit has no private mount namespace, so
-  the volumes are in PID 1's, and the old database units assert the mount point, with none of
-  the gain in start time), then the new image on each node, which is a reinstall. The reverse is an outage: an agent from before the link on an image
-  with the new units makes no link, so every start of `pgcf-pg@` fails its assertion and no
-  database wakes. A node on the new image therefore never gets an older release: **never assign a
-  release older than the first one that makes the link to a region that has such a node.** Nothing
-  refuses it; the release assignment does not check the image (the maintenance cycle's `pgcf-agent
-  check` follows a package install, not a release move).
+- **The units and the agent's binary go together, in one order.** The units and the masks
+  (`pgcf-pg@.service`, `pgcf-agent.service`, the `modprobe@` masks) reach a node as host files of a
+  release (see above), after the binaries and by the agent that runs the release's own binary, so
+  a unit that asserts something the agent makes (the new `pgcf-pg@.service` mounts the volume from
+  the link `/run/pgcf/dev/<id>` and asserts it) is never written before the agent that makes it.
+  The change that introduced those units, `MountImages=` with `PrivateMounts=yes`, moves volumes
+  out of PID 1's mount namespace and no file delivers that, so it reaches a node with the image
+  (a reinstall), after a release whose agent makes the link (which works on the old image: its
+  agent unit has no private mount namespace, so the volumes are in PID 1's, and the old database
+  units assert the mount point, with none of the gain in start time). The reverse is an outage: an
+  agent from before the link on an image with the new units makes no link, so every start of
+  `pgcf-pg@` fails its assertion and no database wakes. A node on the new image therefore never
+  gets an older release: **never assign a release older than the first one that makes the link to
+  a region that has such a node.** Nothing refuses it; the release assignment does not check the
+  image (the maintenance cycle's `pgcf-agent check` follows a package install, not a release move).
+- **Host files** (`hostfiles.rs`, plan 9.3). After the binaries of a release are in place and the
+  signature and the agent's own rules held, the agent compares each file of the release's list with
+  the disk (digest, size, mode, kind, owner) and writes what differs: a hidden file beside the target
+  is written, synced and renamed over it, and the directory is synced, so a crash leaves the old
+  unit or the new one and never a torn one. It never follows a link (a directory on the way is
+  opened with `O_NOFOLLOW` component by component, and a link at the target is replaced), makes no
+  directory but the last allow-listed one, leaves a directory at a target alone and removes only a
+  file it wrote for an earlier list that this one drops (it keeps `agent/host-files.json` with the
+  paths it owns and what is left to tell systemd, saved before the first write). Then one
+  `daemon-reload`, then the restarts in name order, the agent's own last, each taken out of the
+  record when done. It reports the digest of the facts it reads from the disk in its hello.
 - In the maintenance cycle (plan 9.3) it reads the release's package lock (the `packages.lock.json`
   of the image the release is built from), installs what differs from `dpkg` with
   `apt-get install --no-install-recommends --allow-downgrades -o Dpkg::Options::=--force-confold

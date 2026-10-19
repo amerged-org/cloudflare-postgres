@@ -11,8 +11,13 @@
 //! (`RELEASE_KEY`); the signature is of the release's manifest, which the agent builds of the page
 //! and checks (`verify`) before it downloads, stages or installs anything of the release. The page's
 //! digests pin the files and the signature pins the page, so an administrator who can change the
-//! API's records and the bucket's objects still cannot make a node run a file nobody signed.
-use crate::Error;
+//! API's records and the bucket's objects still cannot make a node run a file nobody signed. The
+//! manifest also lists the release's host files (`hostfiles`), each with its digest and how it
+//! takes effect; the agent writes them only after the signature held and its own rules did.
+use crate::{
+    Error,
+    hostfiles::{self, HostFile},
+};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde_json::Value;
 use std::{
@@ -58,7 +63,7 @@ pub const SIGNATURE_FILE: &str = "release.sig";
 pub const SIGNATURE_MAX_BYTES: usize = 256;
 
 /// The first line of the signed manifest (`RELEASE_MANIFEST_DOMAIN`).
-const MANIFEST_DOMAIN: &str = "pgcf-release-manifest/v1\n";
+const MANIFEST_DOMAIN: &str = "pgcf-release-manifest/v2\n";
 
 /// Why a node does not trust a release; the codes are the contract's `RELEASE_REFUSALS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,19 +72,31 @@ pub enum ReleaseRefusal {
     SignatureMissing,
     /// What it has is not the release key's signature of the release's manifest.
     SignatureInvalid,
+    /// The signed host files break the agent's own rules (`hostfiles::check`).
+    HostFiles(hostfiles::Refusal),
 }
 impl ReleaseRefusal {
-    pub const ALL: [Self; 2] = [Self::SignatureMissing, Self::SignatureInvalid];
+    pub const ALL: [Self; 6] = [
+        Self::SignatureMissing,
+        Self::SignatureInvalid,
+        Self::HostFiles(hostfiles::Refusal::Path),
+        Self::HostFiles(hostfiles::Refusal::Mode),
+        Self::HostFiles(hostfiles::Refusal::Apply),
+        Self::HostFiles(hostfiles::Refusal::Invalid),
+    ];
     pub const fn code(self) -> &'static str {
         match self {
             Self::SignatureMissing => "release_signature_missing",
             Self::SignatureInvalid => "release_signature_invalid",
+            Self::HostFiles(refusal) => refusal.code(),
         }
     }
 }
 
 /// Whether `signature`, the text the API serves, is the signature of `key` over the manifest of
-/// `release`: 128 lower-case hex symbols, which whitespace may surround.
+/// `release`: 128 lower-case hex symbols, which whitespace may surround. A release that the key
+/// signed is then held to the agent's own rules for its host files, as the last check before
+/// anything is written as root.
 pub fn verify(key: &[u8; 32], release: &Release, signature: &[u8]) -> Result<(), ReleaseRefusal> {
     let text = std::str::from_utf8(signature)
         .map_err(|_| ReleaseRefusal::SignatureInvalid)?
@@ -90,7 +107,8 @@ pub fn verify(key: &[u8; 32], release: &Release, signature: &[u8]) -> Result<(),
     let bytes = unhex(text).ok_or(ReleaseRefusal::SignatureInvalid)?;
     UnparsedPublicKey::new(&ED25519, key)
         .verify(&release.manifest(), &bytes)
-        .map_err(|_| ReleaseRefusal::SignatureInvalid)
+        .map_err(|_| ReleaseRefusal::SignatureInvalid)?;
+    hostfiles::check(&release.host_files).map_err(ReleaseRefusal::HostFiles)
 }
 /// The bytes of lower-case hex symbols; `None` for anything else, an odd count included.
 fn unhex(text: &str) -> Option<Vec<u8>> {
@@ -138,6 +156,8 @@ pub struct Release {
     /// The Debian snapshot the packages of the image's lock come from.
     pub debian_snapshot: String,
     pub package_lock: Pinned,
+    /// The files of the image that the release changes in place, ascending by path.
+    pub host_files: Vec<HostFile>,
 }
 impl Release {
     /// A release of a page that passed the contract's schema.
@@ -150,13 +170,18 @@ impl Release {
                 .collect::<Option<_>>()?,
             debian_snapshot: release["os"]["debian_snapshot"].as_str()?.to_string(),
             package_lock: Pinned::parse(&release["os"]["package_lock"])?,
+            host_files: release["os"]["host_files"]
+                .as_array()?
+                .iter()
+                .map(HostFile::parse)
+                .collect::<Option<_>>()?,
         })
     }
 
     /// What the release key signs for this release (`signedReleaseManifest` of the contract): the
     /// domain line, then the release id, the digest and size of each binary in the order of
-    /// `BINARIES`, the snapshot and the digest and size of the package lock, one `name=value`
-    /// line each.
+    /// `BINARIES`, the snapshot, the digest and size of the package lock and the host files in the
+    /// list's order, one `name=value` line each.
     pub fn manifest(&self) -> Vec<u8> {
         let mut text = String::from(MANIFEST_DOMAIN);
         let _ = writeln!(text, "release={}", self.id);
@@ -173,7 +198,31 @@ impl Release {
             "os.package_lock={}:{}",
             self.package_lock.sha256, self.package_lock.size_bytes
         );
+        for file in &self.host_files {
+            let _ = writeln!(text, "os.host_file={}", file.line());
+        }
         text.into_bytes()
+    }
+
+    /// The digest of the release's host files, which a node that holds them reports.
+    pub fn host_files_digest(&self) -> String {
+        hostfiles::list_digest(&self.host_files)
+    }
+
+    /// Where the API serves a host file of the release: beside the agent's binary, in the
+    /// release's `host-files` directory, under the file's sha256. `None` if the binary's URL does
+    /// not end in its name.
+    pub fn host_file_url(&self, sha256: &str) -> Option<String> {
+        let (_, agent) = self.binaries.iter().find(|(name, _)| name == AGENT)?;
+        let directory = agent.url.strip_suffix(AGENT)?;
+        directory.ends_with('/').then(|| {
+            format!(
+                "{directory}{}/{sha256}",
+                crate::node_link::constant("RELEASE_HOST_FILES_DIRECTORY")
+                    .as_str()
+                    .unwrap_or("host-files")
+            )
+        })
     }
 
     /// Where the API serves the release's signature: beside the agent's binary, under
@@ -783,7 +832,7 @@ mod tests {
         assert_eq!(verify(&public(&key), &release, &lined), Ok(()));
         // Every fact the manifest holds is covered: the release id, each binary's digest and size,
         // the order of the binaries, the snapshot and the package lock.
-        let changes: [fn(&mut Release); 6] = [
+        let changes: [fn(&mut Release); 14] = [
             |r| r.id = "sha-0123456789ac".into(),
             |r| r.binaries[0].1.sha256 = "9".repeat(64),
             |r| r.binaries[1].1.size_bytes += 1,
@@ -794,6 +843,18 @@ mod tests {
             },
             |r| r.debian_snapshot = "20261017T000000Z".into(),
             |r| r.package_lock.sha256 = "9".repeat(64),
+            // The host files: how a file takes effect, its digest, its size, its mode, its path,
+            // the files that are there and the order they are in.
+            |r| r.host_files[0].apply = "next_start".into(),
+            |r| r.host_files[2].apply = "reboot".into(),
+            |r| r.host_files[2].sha256 = "9".repeat(64),
+            |r| r.host_files[2].size_bytes += 1,
+            |r| r.host_files[5].mode = "0644".into(),
+            |r| {
+                r.host_files.pop();
+            },
+            |r| r.host_files.swap(0, 1),
+            |r| r.host_files[1].path = "/usr/lib/sysctl.d/90-pgcf.confx".into(),
         ];
         for change in changes {
             let mut other = release.clone();
@@ -818,6 +879,57 @@ mod tests {
             verify(&public(&key), &release, &signed(&key, &manifest[domain..])),
             Err(ReleaseRefusal::SignatureInvalid)
         );
+    }
+
+    #[test]
+    fn a_signed_release_whose_host_files_break_the_agents_rules_is_refused_by_the_rule() {
+        use hostfiles::Refusal;
+        let (key, release) = (throwaway(), vector_release());
+        type Bend = fn(&mut Release);
+        let cases: [(Bend, Refusal); 6] = [
+            (
+                |r| r.host_files[0].path = "/etc/passwd".into(),
+                Refusal::Path,
+            ),
+            (
+                |r| r.host_files[0].path = "/etc/ssh/sshd_config.d/../x".into(),
+                Refusal::Path,
+            ),
+            (|r| r.host_files[0].mode = "0600".into(), Refusal::Mode),
+            (
+                |r| r.host_files[0].apply = "restart_unit:sshd.service".into(),
+                Refusal::Apply,
+            ),
+            (|r| r.host_files.swap(0, 1), Refusal::Invalid),
+            (|r| r.host_files.clear(), Refusal::Invalid),
+        ];
+        for (change, class) in cases {
+            let mut other = release.clone();
+            change(&mut other);
+            // The key signed this very text: the signature holds, and the agent's rule does not.
+            let signature = signed(&key, &other.manifest());
+            assert_eq!(
+                verify(&public(&key), &other, &signature),
+                Err(ReleaseRefusal::HostFiles(class)),
+                "{class:?}"
+            );
+        }
+        assert_eq!(
+            verify(&public(&key), &release, &signed(&key, &release.manifest())),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_host_file_is_read_by_its_digest_beside_the_binaries() {
+        let release = vector_release();
+        assert_eq!(
+            release.host_file_url(&"a".repeat(64)).unwrap(),
+            format!("https://releases.example/host-files/{}", "a".repeat(64))
+        );
+        let mut elsewhere = release;
+        elsewhere.binaries[0].1.url = "https://releases.example/other-agent".into();
+        assert_eq!(elsewhere.host_file_url(&"a".repeat(64)), None);
     }
 
     #[test]
@@ -924,6 +1036,7 @@ mod tests {
                 sha256: String::new(),
                 size_bytes: 0,
             },
+            host_files: Vec::new(),
         }
     }
     /// A fetcher that writes what the test serves under the URL, and counts its downloads.

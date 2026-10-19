@@ -8,6 +8,7 @@ import {
   RELEASE_REFUSALS,
   RELEASE_SIGNATURE_FILE,
   ReleaseManifestFields,
+  type HostFile,
   fleetReleaseSpec,
   releaseManifestFields,
   signedReleaseManifest,
@@ -35,6 +36,22 @@ function registration() {
       package_lock: digest("5", 90_000),
       packages_sha256: "6".repeat(64),
       kernel_release: "6.12.113+deb13-amd64",
+      host_files: [
+        {
+          path: "/etc/systemd/system/modprobe@loop.service",
+          kind: "symlink-to-dev-null",
+          apply: "daemon_reload",
+        },
+        {
+          path: "/usr/lib/systemd/system/pgcf-gateway.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "8".repeat(64),
+          size_bytes: 1200,
+          apply: "restart_unit:pgcf-gateway.service",
+        },
+      ] as HostFile[],
+      host_files_sha256: "9".repeat(64),
     },
     signature: "7".repeat(128),
   };
@@ -42,10 +59,10 @@ function registration() {
 const release = () => ({ id: "sha-0123456789ab", ...registration() });
 
 it("the signed manifest is one fixed byte string: a domain line, the release id and every digest a node executes or installs", () => {
-  expect(RELEASE_MANIFEST_DOMAIN).toBe("pgcf-release-manifest/v1\n");
+  expect(RELEASE_MANIFEST_DOMAIN).toBe("pgcf-release-manifest/v2\n");
   expect(signedReleaseManifest(release())).toBe(
     [
-      "pgcf-release-manifest/v1",
+      "pgcf-release-manifest/v2",
       "release=sha-0123456789ab",
       `binary.pgcf-agent=${"1".repeat(64)}:11000000`,
       `binary.pgcf-native-gateway=${"2".repeat(64)}:12000000`,
@@ -53,6 +70,8 @@ it("the signed manifest is one fixed byte string: a domain line, the release id 
       `binary.pgcf-wal-fetch=${"4".repeat(64)}:5100000`,
       "os.debian_snapshot=20261016T000000Z",
       `os.package_lock=${"5".repeat(64)}:90000`,
+      "os.host_file=/etc/systemd/system/modprobe@loop.service symlink-to-dev-null - - daemon_reload",
+      `os.host_file=/usr/lib/systemd/system/pgcf-gateway.service file 0644 ${"8".repeat(64)}:1200 restart_unit:pgcf-gateway.service`,
       "",
     ].join("\n"),
   );
@@ -94,6 +113,7 @@ it("a manifest is never built of a value that could read as another", () => {
     (value) => (value.binaries["pgcf-wal-fetch"].size_bytes = 1.5),
     (value) => (value.os.debian_snapshot = "20261016\nT000000Z"),
     (value) => (value.os.package_lock.size_bytes = 0),
+    (value) => (value.os.host_files[1]!.path = "/etc/passwd"),
   ];
   for (const change of broken) {
     const other = release();
@@ -144,10 +164,14 @@ it("the spec the API stores and serves carries the signature, which a node reads
   ).toBe("https://api.example.org/node/v1/releases/v1/release.sig");
 });
 
-it("a node that refuses a release names one of two classes, which are the contract's", () => {
+it("a node that refuses a release names one of these classes, which are the contract's", () => {
   expect(RELEASE_REFUSALS).toEqual([
     "release_signature_missing",
     "release_signature_invalid",
+    "host_file_path_refused",
+    "host_file_mode_refused",
+    "host_file_apply_refused",
+    "host_files_invalid",
   ]);
   // An event field is a token of lowercase letters, digits and underscores.
   for (const code of RELEASE_REFUSALS)
@@ -173,6 +197,7 @@ it("the fields a signer accepts are the manifest's facts and no key beyond them,
     os: {
       debian_snapshot: whole.os.debian_snapshot,
       package_lock: whole.os.package_lock,
+      host_files: whole.os.host_files,
     },
   });
   expect(ReleaseManifestFields.safeParse(fields).success).toBe(true);
@@ -184,6 +209,8 @@ it("the fields a signer accepts are the manifest's facts and no key beyond them,
     [["binaries", "pgcf-agent", "url"], "https://x.example/a"],
     [["binaries", "other"], whole.binaries["pgcf-agent"]],
     [["os", "kernel_release"], "6.12.113+deb13-amd64"],
+    [["os", "host_files_sha256"], "9".repeat(64)],
+    [["os", "host_files", "0", "url"], "https://x.example/f"],
     [["os", "package_lock", "url"], "https://x.example/lock"],
     [["extra"], 1],
   ];

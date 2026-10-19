@@ -26,6 +26,9 @@ pub struct Layout {
     /// The file of the CA public key that sshd trusts for the operator shell (plan 8): it exists
     /// only while Cloudflare's credentials carry the key, and sshd refuses every login without it.
     pub ssh_user_ca: PathBuf,
+    /// `/`: where the host files of a release are written (`hostfiles`). A path of a release is
+    /// below this root, which no test and no node changes but the tests' machines.
+    pub host_root: PathBuf,
 }
 
 impl Default for Layout {
@@ -40,6 +43,7 @@ impl Default for Layout {
             archive_command: "/usr/libexec/pgcf/pgcf-archive".into(),
             fetch_command: crate::archive::recovery::WAL_FETCH_COMMAND.into(),
             ssh_user_ca: PathBuf::from("/etc/ssh/pgcf_user_ca.pub"),
+            host_root: PathBuf::from("/"),
         }
     }
 }
@@ -102,6 +106,10 @@ impl Layout {
     }
     pub fn archive_socket(&self) -> PathBuf {
         self.agent_run().join("archive.sock")
+    }
+    /// What the agent keeps of the host files it wrote (`hostfiles::State`).
+    pub fn host_files(&self) -> PathBuf {
+        crate::hostfiles::state_path(&self.agent())
     }
     /// The scratch directory of the barman jobs' environment files.
     pub fn jobs(&self) -> PathBuf {

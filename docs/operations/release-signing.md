@@ -33,12 +33,17 @@ that node boots their image, whose agent trusts their key. That is an open decis
   edited `ci.yml`, could print it; an environment secret needs a branch policy that has to be created
   and checked before the secret is set, and it can be read by any job the policy admits. A secret that
   GitHub holds is also a secret that the job's code can read. Here no job holds a key at all.
-- **What is signed.** The manifest of the release, one fixed text: the line `pgcf-release-manifest/v1`
-  (so that a signature made for anything else never verifies as a release's), then `release=<id>`, the
-  `<sha256>:<size>` of `pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive` and `pgcf-wal-fetch`, the
-  Debian snapshot, and the `<sha256>:<size>` of the package lock, one `name=value` line each, every
-  line ended by a line feed. The lock in turn pins every package and every download (cloudflared)
-  a maintenance cycle installs, so the signature reaches all of them. The contract is
+- **What is signed.** The manifest of the release, one fixed text: the line `pgcf-release-manifest/v2`
+  (so that a signature made for anything else, or for another version of the format, never verifies
+  as a release's), then `release=<id>`, the `<sha256>:<size>` of `pgcf-agent`,
+  `pgcf-native-gateway`, `pgcf-archive` and `pgcf-wal-fetch`, the Debian snapshot, the
+  `<sha256>:<size>` of the package lock and one `os.host_file=<path> <kind> <mode> <sha256>:<size>
+  <apply>` line for each host file of the release in path order (`-` for the mode and digest of a
+  mask), one `name=value` line each, every line ended by a line feed. The lock in turn pins every
+  package and every download (cloudflared) a maintenance cycle installs, so the signature reaches
+  all of them, and the host file lines pin every systemd unit, mask and configuration file the
+  agent writes as root, with how each takes effect. v2 is the host files' version of the format;
+  a release signed as v1 does not verify with an agent that reads v2, and none is in the field. The contract is
   `signedReleaseManifest` in `packages/contracts/src/releases.ts`; the agent builds the same text of its
   desired page, and a shared vector keeps the two equal. The image is not in it.
 - **The signer** takes `POST /sign` and nothing else (every other path is 404, every other method 405).

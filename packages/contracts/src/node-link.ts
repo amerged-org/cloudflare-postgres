@@ -667,7 +667,11 @@ export const NodeRelease = z.strictObject({
   id: FleetReleaseId,
   binaries: FleetReleaseBinaries,
   /** What the node installs. What it is expected to report back stays with the API. */
-  os: FleetReleaseOs.omit({ packages_sha256: true, kernel_release: true }),
+  os: FleetReleaseOs.omit({
+    packages_sha256: true,
+    kernel_release: true,
+    host_files_sha256: true,
+  }),
 });
 export type NodeRelease = z.infer<typeof NodeRelease>;
 
@@ -1695,14 +1699,17 @@ export type NodeProbeDiagnostic = z.infer<typeof NodeProbeDiagnostic>;
 
 /**
  * The boot and the operating system a node reports in its hello: the kernel's boot ID and the
- * time of the boot (a reboot is a new ID), `uname -r`, and `packagesSha256` of the packages dpkg
- * reports as installed. The API compares the last two with the release of the node's region.
+ * time of the boot (a reboot is a new ID), `uname -r`, `packagesSha256` of the packages dpkg
+ * reports as installed, and `hostFilesSha256` of the host files the node holds, read from its
+ * disk, with a file that waits for a reboot counted as not there yet. The API compares the last
+ * three with the release of the node's region.
  */
 export const NodeOs = z.strictObject({
   boot_id: z.uuid(),
   booted_at: Timestamp,
   kernel_release: KernelRelease,
   packages_sha256: Sha256,
+  host_files_sha256: Sha256,
 });
 export type NodeOs = z.infer<typeof NodeOs>;
 

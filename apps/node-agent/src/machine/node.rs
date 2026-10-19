@@ -487,6 +487,10 @@ impl Machine for Node {
         self.units.start_service(unit, true).await
     }
 
+    async fn daemon_reload(&self) -> Result<(), units::Error> {
+        self.units.reload().await
+    }
+
     async fn installed_packages(&self) -> io::Result<BTreeMap<String, String>> {
         let output = tokio::process::Command::new("dpkg-query")
             .args(["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n"])

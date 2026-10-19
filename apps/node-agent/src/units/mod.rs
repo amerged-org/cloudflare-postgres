@@ -523,6 +523,13 @@ impl Units {
         self.job(name, kind).await.map(drop)
     }
 
+    /// Has systemd read its unit files again (`systemctl daemon-reload`): what a release wrote
+    /// becomes the definition a unit starts with. The units that run keep running with the
+    /// definition they started with until they restart.
+    pub async fn reload(&self) -> Result<(), Error> {
+        Ok(self.manager.reload().await?)
+    }
+
     /// Sets the CPU quota of a database's unit until the next boot, or lifts it with `None`.
     pub async fn set_cpu_quota(
         &self,

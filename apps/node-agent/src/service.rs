@@ -16,6 +16,7 @@ use crate::{
     diagnostics::probe,
     fence::Fences,
     gateway::{Feed, bind as bind_gateway},
+    hostfiles,
     link::{Desired as Page, Link, LinkEvent, LinkEvents},
     machine::{CpuTimes, Machine},
     sample::{Inputs, busy_millicores, node_sample},
@@ -25,7 +26,7 @@ use crate::{
 use pgcf_native_protocol::wake::WakeRequest;
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -117,6 +118,9 @@ pub struct Service<M: Machine> {
     tasks: Mutex<JoinSet<()>>,
     /// The release of the newest page (plan 9.3).
     release: Mutex<Option<update::Release>>,
+    /// The digest of the host files list that the disk was last found to hold whole and that
+    /// systemd was told of: a page that names the same list reads nothing from the disk.
+    host_files_held: Mutex<Option<String>>,
     /// The key a release must be signed with, and the verdict on the release last checked: a
     /// release is trusted only when this says so (`verified`).
     release_key: [u8; 32],
@@ -127,6 +131,9 @@ pub struct Service<M: Machine> {
     updating: AtomicBool,
     /// The release that was installed runs another agent: the agent restarts to run it.
     restart: Notify,
+    /// The agent's binary was replaced and this process is about to leave: whatever is left to do
+    /// for the release is for the agent that starts from the new link.
+    superseded: AtomicBool,
 }
 
 /// The identifiers of the archive credentials an entry of the page needs: its own, and the one
@@ -214,11 +221,13 @@ impl<M: Machine> Service<M> {
             cpu: Mutex::new(None),
             tasks: Mutex::new(JoinSet::new()),
             release: Mutex::new(None),
+            host_files_held: Mutex::new(None),
             release_key: config.release_key,
             verdict: Mutex::new(None),
             probes: probe::Answered::load(layout.agent().join("probes-done")),
             updating: AtomicBool::new(false),
             restart: Notify::new(),
+            superseded: AtomicBool::new(false),
         });
 
         // The two sockets of the agent: the archive socket for the databases' units, and the
@@ -487,23 +496,48 @@ impl<M: Machine> Service<M> {
 
     // ---- updates (plan 9.3)
 
-    /// The release of the page: if the node does not run it, it is installed, in the background.
+    /// The release of the page: if the node does not run it, or does not hold its host files, it is
+    /// installed, in the background.
     fn consider_update(self: &Arc<Self>, page_release: &Value) {
         let Some(release) = update::Release::parse(page_release) else {
             return;
         };
         *self.release.lock().unwrap_or_else(PoisonError::into_inner) = Some(release.clone());
         let bin = self.machine.layout().bin();
-        if update::current_release(&bin).as_deref() == Some(release.id.as_str())
+        let binaries = update::current_release(&bin).as_deref() == Some(release.id.as_str());
+        let files = self
+            .host_files_held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            == Some(release.host_files_digest().as_str());
+        if (binaries && files)
+            || self.superseded.load(Ordering::Acquire)
             || self.updating.swap(true, Ordering::AcqRel)
         {
             return;
         }
         let service = self.clone();
         self.spawn(async move {
-            service.install(&release, &bin).await;
+            service.update(&release, &bin).await;
             service.updating.store(false, Ordering::Release);
         });
+    }
+
+    /// Brings the node to the release (plan 9.3). The order is one rule: the binaries first, the
+    /// host files after them, and the files are written by the agent that runs the release's own
+    /// binary. A release whose agent changed is therefore installed by the agent that runs before
+    /// it, which then leaves; the agent that starts from the new link finds the binaries current
+    /// and writes the files. The new agent knows what the new files are for (a unit that it makes
+    /// links for, a socket it serves), and the old agent never writes a file for a release it does
+    /// not run. A release whose agent did not change gets its files straight after its binaries.
+    async fn update(&self, release: &update::Release, bin: &std::path::Path) {
+        if update::current_release(bin).as_deref() != Some(release.id.as_str())
+            && !self.install(release, bin).await
+        {
+            return;
+        }
+        self.host_files(release).await;
     }
 
     /// Whether the release key signed `release` (plan 8, 9.3): nothing of a release is downloaded,
@@ -567,10 +601,11 @@ impl<M: Machine> Service<M> {
     /// Installs the release's binaries, and restarts what runs one that changed: the gateway
     /// (its sessions reconnect) and then the agent, which exits and is started by systemd from the
     /// new link. The databases keep running: they are units of their own. A release that the key
-    /// did not sign is not touched: the node keeps what it runs.
-    async fn install(&self, release: &update::Release, bin: &std::path::Path) {
+    /// did not sign is not touched: the node keeps what it runs. It answers whether the binaries
+    /// are in place and this agent is the one that runs them, so that the host files may follow.
+    async fn install(&self, release: &update::Release, bin: &std::path::Path) -> bool {
         if self.verified(release).await.is_err() {
-            return;
+            return false;
         }
         let link = self.link.clone();
         let switched = update::install_binaries(bin, release, |pinned, path| {
@@ -588,7 +623,7 @@ impl<M: Machine> Service<M> {
                     "event": "release_not_installed", "release": release.id,
                     "class": crate::diagnostics::error_code(&error),
                 }));
-                return;
+                return false;
             }
         };
         crate::timing::emit_event(json!({"event": "release_installed", "release": release.id}));
@@ -600,8 +635,155 @@ impl<M: Machine> Service<M> {
             }));
         }
         if switched.agent {
+            self.superseded.store(true, Ordering::Release);
             self.restart.notify_one();
         }
+        !switched.agent
+    }
+
+    /// Writes the release's host files (`hostfiles`, plan 9.3) once the binaries are in place and
+    /// the release key and the agent's own rules have passed it, tells systemd what that needs (one
+    /// reload, the restarts, the agent's own last), and reports the digest of what the disk holds.
+    /// What differs on the disk is written, nothing else: a second call, and a call after a crash
+    /// at any point, ends in the same state. A file that waits for a reboot waits for the
+    /// maintenance cycle.
+    async fn host_files(&self, release: &update::Release) {
+        if self.superseded.load(Ordering::Acquire) || self.verified(release).await.is_err() {
+            return;
+        }
+        let layout = self.machine.layout();
+        let (root, path) = (layout.host_root.clone(), layout.host_files());
+        let boot = self.machine.boot().map(|boot| boot.id).unwrap_or_default();
+        let failed = |class: String| {
+            crate::timing::emit_event(json!({
+                "event": "host_files_not_applied", "release": release.id, "class": class,
+            }));
+        };
+        let held = hostfiles::State::load(&path);
+        let plan = match hostfiles::plan(&root, &held, &release.host_files) {
+            Ok(plan) => plan,
+            Err(error) => return failed(crate::diagnostics::error_code(&error.into())),
+        };
+        let recorded = held.files == release.host_files && held.release == release.id;
+        let mut changed = !plan.is_empty() || !recorded;
+        if changed {
+            let bytes = match self.fetch_host_files(release, &plan).await {
+                Ok(bytes) => bytes,
+                Err(class) => return failed(class),
+            };
+            let target = hostfiles::Target {
+                root: &root,
+                state: &path,
+                boot_id: &boot,
+            };
+            match hostfiles::apply(
+                &target,
+                &release.id,
+                &release.host_files,
+                &plan,
+                &bytes,
+                &mut |_| Ok(()),
+            ) {
+                Ok(applied) if applied.written + applied.removed > 0 => {
+                    crate::timing::emit_event(json!({
+                        "event": "host_files_applied", "release": release.id,
+                        "written": applied.written, "removed": applied.removed,
+                    }));
+                }
+                Ok(_) => {}
+                Err(error) => return failed(crate::diagnostics::error_code(&error.into())),
+            }
+        }
+        // What an earlier apply began and a crash or a failure left is finished here as well.
+        changed |= hostfiles::State::load(&path).unfinished();
+        if let Err(class) = self.finish_host_files(&path).await {
+            return failed(class);
+        }
+        if changed {
+            self.report_os().await;
+        }
+        *self
+            .host_files_held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(release.host_files_digest());
+    }
+
+    /// The bytes of the files `plan` writes, each read from the API by its digest and checked
+    /// against the size and the sha256 of the signed page, by their digest.
+    async fn fetch_host_files(
+        &self,
+        release: &update::Release,
+        plan: &hostfiles::Plan,
+    ) -> Result<HashMap<String, Vec<u8>>, String> {
+        let mut bytes = HashMap::new();
+        let work = self.machine.layout().agent().join("host-files");
+        let _ = std::fs::remove_dir_all(&work);
+        if plan
+            .writes
+            .iter()
+            .all(|file| file.kind != hostfiles::Kind::File)
+        {
+            return Ok(bytes);
+        }
+        crate::link::file::create_private_directory(&work)
+            .map_err(|error| crate::diagnostics::error_code(&error.into()))?;
+        for file in plan
+            .writes
+            .iter()
+            .filter(|file| file.kind == hostfiles::Kind::File)
+        {
+            let url = release
+                .host_file_url(&file.sha256)
+                .ok_or("host_file_not_read")?;
+            let path = work.join(&file.sha256);
+            self.link
+                .fetch(&url, file.size_bytes, &file.sha256, &path)
+                .await
+                .map_err(|_| "host_file_not_read")?;
+            bytes.insert(
+                file.sha256.clone(),
+                std::fs::read(&path).map_err(|_| "host_file_not_read")?,
+            );
+        }
+        let _ = std::fs::remove_dir_all(&work);
+        Ok(bytes)
+    }
+
+    /// What systemd has to be told after host files were written, in the order the record keeps:
+    /// one reload, then each unit that runs one that changed (the agent's own last, by leaving).
+    /// Each step is taken out of the record when it is done, so a failure or a crash between two
+    /// of them is picked up by the next call.
+    async fn finish_host_files(&self, path: &std::path::Path) -> Result<(), String> {
+        let mut state = hostfiles::State::load(path);
+        if state.reload {
+            self.machine
+                .daemon_reload()
+                .await
+                .map_err(|error| crate::diagnostics::error_code(&error.into()))?;
+            state.reload = false;
+            state
+                .save(path)
+                .map_err(|_| "host_files_not_finished".to_string())?;
+        }
+        let (units, agent) = hostfiles::restart_order(&state);
+        for unit in units {
+            self.machine
+                .restart_service(&unit)
+                .await
+                .map_err(|error| crate::diagnostics::error_code(&error.into()))?;
+            state.restarts.retain(|restarted| *restarted != unit);
+            state
+                .save(path)
+                .map_err(|_| "host_files_not_finished".to_string())?;
+        }
+        if agent {
+            state.restarts.retain(|unit| unit != hostfiles::AGENT_UNIT);
+            state
+                .save(path)
+                .map_err(|_| "host_files_not_finished".to_string())?;
+            self.restart.notify_one();
+        }
+        Ok(())
     }
 
     /// Completes when the agent has to restart to run the release it installed. The caller stops
@@ -749,6 +931,14 @@ impl<M: Machine> Service<M> {
                 .installed_packages()
                 .await
                 .map_err(|_| "packages_not_read")?;
+        }
+        // A host file that takes effect at a boot is a reason to reboot as a new kernel is, and it
+        // too comes before anything that can fail: the cycle that runs after the boot finds
+        // nothing waiting, purges, checks and answers.
+        let boot = self.machine.boot().map(|boot| boot.id).unwrap_or_default();
+        if hostfiles::State::load(&self.machine.layout().host_files()).reboot_pending(&boot) {
+            self.machine.reboot().await.map_err(|_| "reboot_failed")?;
+            return Ok(true);
         }
         let stale = update::purgeable(&lock, &installed);
         if !stale.is_empty() {
@@ -1389,9 +1579,30 @@ mod tests {
             update::hex(key.sign(&manifest).as_ref()),
         );
     }
+    /// A host file of a release as the tests state it: its path, its content (`None` for a mask),
+    /// its mode and how it takes effect.
+    type Host<'a> = (&'a str, Option<&'a str>, &'a str, &'a str);
+    /// What a release carries when a test is not about host files: one file that needs a reload.
+    const DEFAULT_HOST: [Host<'static>; 1] = [(
+        "/etc/sysctl.d/90-test.conf",
+        Some("kernel.panic = 10\n"),
+        "0644",
+        "daemon_reload",
+    )];
     /// The release `id` as the page names it: its binaries served by the double, and the package
     /// lock, which is `lock` (served too), and its signature by the key of the tests.
     fn release_of(cloud: &Cloud, id: &str, files: &[(&str, &[u8])], lock: &[u8]) -> Value {
+        release_with(cloud, id, files, lock, &DEFAULT_HOST)
+    }
+    /// The same with the host files of the release, ascending by path, each served by its digest
+    /// beside the binaries, where the agent reads it.
+    fn release_with(
+        cloud: &Cloud,
+        id: &str,
+        files: &[(&str, &[u8])],
+        lock: &[u8],
+        host: &[Host],
+    ) -> Value {
         let pin = |name: &str, bytes: &[u8]| {
             let url = cloud.serve_file(&format!("/files/{id}/{name}"), bytes.to_vec());
             json!({"url": url, "sha256": digest(bytes), "size_bytes": bytes.len()})
@@ -1400,10 +1611,25 @@ mod tests {
             .iter()
             .map(|(name, bytes)| (name.to_string(), pin(name, bytes)))
             .collect();
+        let host_files: Vec<Value> = host
+            .iter()
+            .map(|(path, content, mode, apply)| match content {
+                Some(text) => {
+                    let sha256 = digest(text.as_bytes());
+                    cloud.serve_file(
+                        &format!("/files/{id}/host-files/{sha256}"),
+                        text.as_bytes().to_vec(),
+                    );
+                    json!({"path": path, "kind": "file", "mode": mode, "sha256": sha256,
+                           "size_bytes": text.len(), "apply": apply})
+                }
+                None => json!({"path": path, "kind": "symlink-to-dev-null", "apply": apply}),
+            })
+            .collect();
         let release = json!({
             "id": id, "binaries": binaries,
             "os": {"image_version": "25", "debian_snapshot": "20261016T000000Z",
-                   "package_lock": pin("packages.lock.json", lock)}
+                   "package_lock": pin("packages.lock.json", lock), "host_files": host_files}
         });
         sign_release(cloud, &release, test_key());
         release
@@ -1724,6 +1950,486 @@ mod tests {
             machine.calls()
         );
         service.stop();
+    }
+
+    // ---- host files (plan 9.3)
+
+    const MASK: &str = "/etc/systemd/system/modprobe@loop.service";
+    const AGENT_UNIT: &str = "/usr/lib/systemd/system/pgcf-agent.service";
+    const GATEWAY_UNIT: &str = "/usr/lib/systemd/system/pgcf-gateway.service";
+    const DATABASE_UNIT: &str = "/usr/lib/systemd/system/pgcf-pg@.service";
+    const SYSUSERS: &str = "/usr/lib/sysusers.d/pgcf.conf";
+    /// What the host files of a release say, ascending by path.
+    const UNITS: [Host<'static>; 4] = [
+        (MASK, None, "", "daemon_reload"),
+        (
+            AGENT_UNIT,
+            Some("[Service]\n# agent 2\n"),
+            "0644",
+            "restart_unit:pgcf-agent.service",
+        ),
+        (
+            GATEWAY_UNIT,
+            Some("[Service]\n# gateway 2\n"),
+            "0644",
+            "restart_unit:pgcf-gateway.service",
+        ),
+        (
+            DATABASE_UNIT,
+            Some("[Service]\n# database 2\n"),
+            "0755",
+            "next_start",
+        ),
+    ];
+    fn on_disk(machine: &crate::machine::local::Local, path: &str) -> std::path::PathBuf {
+        machine
+            .layout()
+            .host_root
+            .join(path.trim_start_matches('/'))
+    }
+    /// The calls that systemd saw, in order: the reloads and the restarts.
+    fn systemd_calls(machine: &crate::machine::local::Local) -> Vec<String> {
+        machine
+            .calls()
+            .into_iter()
+            .filter(|call| call == "daemon-reload" || call.starts_with("restart "))
+            .collect()
+    }
+    /// What the node said of the host files it holds in its hello.
+    fn said_host_files(cloud: &Cloud) -> Vec<String> {
+        cloud.with(|inner| {
+            inner
+                .hellos
+                .iter()
+                .map(|hello| {
+                    hello["os"]["host_files_sha256"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn host_files_follow_the_binaries_and_the_agent_that_runs_them_writes_them() {
+        let Some((machine, _fixture, _root)) = site("host-files-order", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r0", &same(b"old"));
+        let cloud = Cloud::start().await;
+        // r1 changes the agent and the gateway, and its units: the gateway's, the database's, the
+        // agent's own and a mask.
+        let mut files = same(b"old");
+        files[0].1 = b"new agent";
+        files[1].1 = b"new gateway";
+        let release = release_with(&cloud, "r1-order", &files, b"{}", &UNITS);
+        cloud.with(|inner| inner.release = Some(release));
+        let base = tempdir();
+        let first = serve(&machine, &cloud, &base).await;
+        let bin = machine.layout().state.join("bin");
+        eventually(30, "the link to move to r1", || {
+            crate::update::current_release(&bin).as_deref() == Some("r1-order")
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), first.restart_requested())
+            .await
+            .expect("the agent asks to be restarted");
+        // The old agent has installed the binaries and left: it wrote no file of a release whose
+        // agent it does not run, and told systemd nothing about them.
+        let before = std::fs::read_to_string(on_disk(&machine, GATEWAY_UNIT)).unwrap();
+        assert_eq!(before, "[Service]\n# pgcf-gateway.service of the image\n");
+        assert!(!on_disk(&machine, DATABASE_UNIT).exists());
+        assert!(std::fs::symlink_metadata(on_disk(&machine, MASK)).is_err());
+        assert!(!machine.layout().host_files().exists());
+        assert!(!systemd_calls(&machine).contains(&"daemon-reload".to_string()));
+        // Not by a later page either, while the old agent is still there to read it.
+        cloud.push(json!({"type": "desired"}));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!machine.layout().host_files().exists());
+        assert!(!on_disk(&machine, DATABASE_UNIT).exists());
+        first.stop();
+        drop(first);
+        machine.clear_calls();
+
+        // The agent that starts from the new link finds the binaries current and writes the files.
+        let second = serve(&machine, &cloud, &base).await;
+        tokio::time::timeout(Duration::from_secs(30), second.restart_requested())
+            .await
+            .expect("the agent leaves for its own unit, last");
+        // One reload, then the gateway; the agent's own unit is never restarted through systemd
+        // but by the agent leaving, and the database's unit and the mask need no restart.
+        assert_eq!(
+            systemd_calls(&machine),
+            ["daemon-reload", "restart pgcf-gateway.service"]
+        );
+        for (path, content, mode) in [
+            (AGENT_UNIT, "[Service]\n# agent 2\n", 0o644),
+            (GATEWAY_UNIT, "[Service]\n# gateway 2\n", 0o644),
+            (DATABASE_UNIT, "[Service]\n# database 2\n", 0o755),
+        ] {
+            use std::os::unix::fs::PermissionsExt;
+            let file = on_disk(&machine, path);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+        assert_eq!(
+            std::fs::read_link(on_disk(&machine, MASK)).unwrap(),
+            std::path::PathBuf::from("/dev/null")
+        );
+        // The reload came before the restart: the gateway runs the unit as the release wrote it.
+        assert_eq!(
+            machine
+                .running_definition("pgcf-gateway.service")
+                .as_deref(),
+            Some("[Service]\n# gateway 2\n")
+        );
+        // What was left to do is done, and the record holds the list.
+        let state = crate::hostfiles::State::load(&machine.layout().host_files());
+        assert!(!state.unfinished());
+        assert_eq!(state.release, "r1-order");
+        assert_eq!(state.files.len(), 4);
+        // The hello says the digest of what the disk holds, which is the release's.
+        let wanted = update::Release::parse(&cloud.with(|inner| inner.release.clone().unwrap()))
+            .unwrap()
+            .host_files_digest();
+        eventually(30, "the digest of the host files to be said", || {
+            said_host_files(&cloud).contains(&wanted)
+        })
+        .await;
+        second.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_release_that_changes_no_binary_gets_its_files_at_once_and_a_second_page_changes_nothing()
+     {
+        let Some((machine, _fixture, _root)) =
+            site("host-files-only", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        runs(&machine, "r1-files-only", &same(b"bin"));
+        let cloud = Cloud::start().await;
+        let host: [Host; 3] = [UNITS[0], UNITS[2], UNITS[3]];
+        let release = release_with(&cloud, "r1-files-only", &same(b"bin"), b"{}", &host);
+        let wanted = update::Release::parse(&release)
+            .unwrap()
+            .host_files_digest();
+        cloud.with(|inner| inner.release = Some(release));
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(30, "the digest of the host files to be said", || {
+            said_host_files(&cloud).contains(&wanted)
+        })
+        .await;
+        assert_eq!(
+            systemd_calls(&machine),
+            ["daemon-reload", "restart pgcf-gateway.service"]
+        );
+        assert_eq!(
+            machine
+                .running_definition("pgcf-gateway.service")
+                .as_deref(),
+            Some("[Service]\n# gateway 2\n")
+        );
+        // The same page again, and a full pull: the disk holds the list, so nothing is read from
+        // the API, written or told to systemd.
+        let requests = cloud.requests().len();
+        cloud.push(json!({"type": "desired"}));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            systemd_calls(&machine),
+            ["daemon-reload", "restart pgcf-gateway.service"]
+        );
+        assert!(
+            cloud.requests()[requests..]
+                .iter()
+                .all(|seen| !seen.path().contains("/host-files/")),
+            "{:?}",
+            cloud.requests()[requests..].to_vec()
+        );
+        // A file that was changed on the node is written again, and one change of a byte only.
+        std::fs::write(on_disk(&machine, DATABASE_UNIT), "[Service]\n# tampered\n").unwrap();
+        machine.clear_calls();
+        service.stop();
+        drop(service);
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(30, "the changed file to be written again", || {
+            std::fs::read_to_string(on_disk(&machine, DATABASE_UNIT)).unwrap()
+                == "[Service]\n# database 2\n"
+        })
+        .await;
+        // Only that file was fetched; nothing else is restarted for a file that needs no restart.
+        eventually(30, "the reload", || {
+            systemd_calls(&machine) == ["daemon-reload"]
+        })
+        .await;
+        service.stop();
+    }
+
+    /// A change to the page of a release that the key did not sign.
+    type Tamper = fn(&mut Value);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tampered_list_is_refused_before_anything_is_fetched_or_written() {
+        let Some((machine, _fixture, _root)) = site("host-files-forged", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r0", &same(b"old"));
+        let cloud = Cloud::start().await;
+        let mut files = same(b"old");
+        files[1].1 = b"new gateway";
+        // The key signed the units as they are; the page that reaches the node says other things.
+        let signed = release_with(&cloud, "r1-forged", &files, b"{}", &UNITS);
+        let tampered: [(&str, Tamper); 4] = [
+            ("apply", |release| {
+                release["os"]["host_files"][3]["apply"] = "restart_unit:ssh.service".into()
+            }),
+            ("digest", |release| {
+                release["os"]["host_files"][2]["sha256"] = "9".repeat(64).into()
+            }),
+            ("mode", |release| {
+                release["os"]["host_files"][2]["mode"] = "0755".into()
+            }),
+            ("file", |release| {
+                release["os"]["host_files"].as_array_mut().unwrap().pop();
+            }),
+        ];
+        let refusals = || {
+            crate::events::seen()
+                .iter()
+                .filter(|event| {
+                    event["event"] == "release_refused"
+                        && event["fields"]["release"] == "r1-forged"
+                        && event["fields"]["class"] == "release_signature_invalid"
+                })
+                .count()
+        };
+        let base = tempdir();
+        let mut service = None;
+        for (what, change) in tampered {
+            let before = refusals();
+            let mut page = signed.clone();
+            change(&mut page);
+            cloud.with(|inner| inner.release = Some(page));
+            if service.is_none() {
+                service = Some(serve(&machine, &cloud, &base).await);
+            } else {
+                cloud.push(json!({"type": "desired"}));
+            }
+            // Each change of the page is a release of its own to the agent, and is refused.
+            eventually(30, what, || refusals() > before).await;
+        }
+        let bin = machine.layout().state.join("bin");
+        assert_eq!(crate::update::current_release(&bin).as_deref(), Some("r0"));
+        // Nothing but the signature was read of the release.
+        assert!(
+            cloud
+                .requests()
+                .iter()
+                .all(|seen| !seen.path().starts_with("/files/r1-forged/")
+                    || seen.path().ends_with("/release.sig")),
+            "{:?}",
+            cloud.requests()
+        );
+        assert!(systemd_calls(&machine).is_empty(), "{:?}", machine.calls());
+        assert!(!machine.layout().host_files().exists());
+        assert!(!on_disk(&machine, DATABASE_UNIT).exists());
+        service.unwrap().stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reload_that_failed_is_not_forgotten_and_the_restarts_wait_for_it() {
+        let Some((machine, _fixture, _root)) = site("host-files-reload", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1-reload", &same(b"bin"));
+        let cloud = Cloud::start().await;
+        let release = release_with(&cloud, "r1-reload", &same(b"bin"), b"{}", &[UNITS[2]]);
+        cloud.with(|inner| inner.release = Some(release));
+        machine.fail_next_reload();
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(30, "the reload to fail", || {
+            systemd_calls(&machine) == ["daemon-reload"]
+        })
+        .await;
+        // The file is written and the record keeps what is left: the reload, and the restart that
+        // must not come before it, or the unit would restart with the definition it had.
+        let state = crate::hostfiles::State::load(&machine.layout().host_files());
+        assert!(state.reload);
+        assert_eq!(state.restarts, ["pgcf-gateway.service"]);
+        assert_eq!(machine.running_definition("pgcf-gateway.service"), None);
+        cloud.push(json!({"type": "desired"}));
+        eventually(30, "the restart to be done", || {
+            machine
+                .running_definition("pgcf-gateway.service")
+                .as_deref()
+                == Some("[Service]\n# gateway 2\n")
+        })
+        .await;
+        assert_eq!(
+            systemd_calls(&machine),
+            [
+                "daemon-reload",
+                "daemon-reload",
+                "restart pgcf-gateway.service"
+            ]
+        );
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_that_failed_is_not_forgotten_and_the_next_page_does_it() {
+        let Some((machine, _fixture, _root)) = site("host-files-restart", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1-restart", &same(b"bin"));
+        let cloud = Cloud::start().await;
+        let release = release_with(&cloud, "r1-restart", &same(b"bin"), b"{}", &[UNITS[2]]);
+        cloud.with(|inner| inner.release = Some(release));
+        machine.fail_next_restart();
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        // The file is written and systemd has read it, but the restart failed: the record keeps
+        // the unit, the event names the class, and the node does not claim to be done.
+        eventually(30, "the restart to fail", || {
+            crate::events::seen().iter().any(|event| {
+                event["event"] == "host_files_not_applied"
+                    && event["fields"]["release"] == "r1-restart"
+            })
+        })
+        .await;
+        let state = crate::hostfiles::State::load(&machine.layout().host_files());
+        assert_eq!(state.restarts, ["pgcf-gateway.service"]);
+        assert!(!state.reload);
+        assert_eq!(
+            std::fs::read_to_string(on_disk(&machine, GATEWAY_UNIT)).unwrap(),
+            "[Service]\n# gateway 2\n"
+        );
+        // The next page finishes it, without writing anything again.
+        cloud.push(json!({"type": "desired"}));
+        eventually(30, "the restart to be done", || {
+            machine
+                .running_definition("pgcf-gateway.service")
+                .as_deref()
+                == Some("[Service]\n# gateway 2\n")
+        })
+        .await;
+        assert_eq!(
+            systemd_calls(&machine),
+            [
+                "daemon-reload",
+                "restart pgcf-gateway.service",
+                "restart pgcf-gateway.service"
+            ]
+        );
+        assert!(!crate::hostfiles::State::load(&machine.layout().host_files()).unfinished());
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_file_that_waits_for_a_reboot_makes_the_maintenance_cycle_reboot_and_the_node_converges_after_it()
+     {
+        let Some((machine, _fixture, _root)) = site("host-files-reboot", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1-reboot", &same(b"bin"));
+        machine.set_packages(&[("bash", "5.2")]);
+        let cloud = Cloud::start().await;
+        let lock = json!({"packages": [
+            {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
+        ], "extra": []})
+        .to_string();
+        let host: [Host; 2] = [
+            UNITS[3],
+            (
+                SYSUSERS,
+                Some("u pgcf-gateway - \"PGCF gateway\" /nonexistent\n"),
+                "0644",
+                "reboot",
+            ),
+        ];
+        let release = release_with(&cloud, "r1-reboot", &same(b"bin"), lock.as_bytes(), &host);
+        let wanted = update::Release::parse(&release)
+            .unwrap()
+            .host_files_digest();
+        cloud.with(|inner| inner.release = Some(release));
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        // The files are written, and the node does not say that it holds the release's files: one
+        // of them takes effect at a boot.
+        eventually(30, "the files to be written", || {
+            on_disk(&machine, SYSUSERS).exists()
+        })
+        .await;
+        let boot = machine.boot().unwrap().id;
+        eventually(30, "the state to say what waits", || {
+            crate::hostfiles::State::load(&machine.layout().host_files()).reboot_pending(&boot)
+        })
+        .await;
+        let hello = crate::machine::os_report(&*machine).await.unwrap();
+        assert_ne!(hello["host_files_sha256"], wanted.as_str());
+        eventually(30, "the digest of the pending files to be said", || {
+            said_host_files(&cloud)
+                .contains(&hello["host_files_sha256"].as_str().unwrap().to_string())
+        })
+        .await;
+        assert!(!said_host_files(&cloud).contains(&wanted));
+        // The maintenance cycle has nothing to install, and reboots for the file all the same.
+        let operation = "op_rrrrrrrrrrrrrrrrrrrr";
+        cloud.with(|inner| {
+            inner.orders = vec![json!({"type": "maintenance", "operation": operation})]
+        });
+        cloud.push(json!({"type": "desired"}));
+        eventually(60, "the node to reboot", || {
+            machine.calls().contains(&"reboot".to_string())
+        })
+        .await;
+        assert!(
+            !machine.calls().contains(&"health_check".to_string()),
+            "{:?}",
+            machine.calls()
+        );
+        // The agent that starts after the boot finds nothing waiting, checks the node and answers;
+        // and the disk is the release's: the node says so.
+        service.stop();
+        drop(service);
+        let after = serve(&machine, &cloud, &base).await;
+        eventually(60, "the order to be done", || {
+            cloud
+                .acknowledged("/node/v1/observations")
+                .iter()
+                .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                .any(|order| order["operation"] == operation && order["status"] == "done")
+        })
+        .await;
+        assert_eq!(
+            machine
+                .calls()
+                .iter()
+                .filter(|call| *call == "reboot")
+                .count(),
+            1
+        );
+        eventually(30, "the release's digest to be said", || {
+            said_host_files(&cloud).last() == Some(&wanted)
+        })
+        .await;
+        after.stop();
     }
 
     /// The node reported refusing the release with this class (the event `release_refused`).

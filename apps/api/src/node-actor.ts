@@ -215,7 +215,8 @@ export class NodeActor extends DurableObject<Env> {
         `UPDATE nodes SET agent_version=?,reported_release_id=?,
          os_previous_observed_at=CASE WHEN os_boot_id IS ? THEN os_previous_observed_at
            ELSE COALESCE(MAX(last_observed_at,?),?,last_observed_at) END,
-         os_boot_id=?,os_booted_at=?,os_kernel_release=?,os_packages_sha256=?,updated_at=? WHERE id=? AND node_uid=?`,
+         os_boot_id=?,os_booted_at=?,os_kernel_release=?,os_packages_sha256=?,os_host_files_sha256=?,
+         updated_at=? WHERE id=? AND node_uid=?`,
       )
         .bind(
           parsed.data.agent_version,
@@ -229,6 +230,7 @@ export class NodeActor extends DurableObject<Env> {
           os.booted_at,
           os.kernel_release,
           os.packages_sha256,
+          os.host_files_sha256,
           new Date().toISOString(),
           link.node_id,
           link.node_uid,

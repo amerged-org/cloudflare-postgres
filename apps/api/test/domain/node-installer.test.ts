@@ -58,7 +58,7 @@ const settings = {
 };
 const hex = (letter: string) => letter.repeat(64);
 const spec = (id: string) => ({
-  version: 2,
+  version: 3,
   image: {
     url: "https://images.example.org/node-images/r1/pgcf-node.raw.zst",
     sha256: hex("1"),
@@ -89,6 +89,17 @@ const spec = (id: string) => ({
     },
     packages_sha256: hex("6"),
     kernel_release: "6.12.113+deb13-amd64",
+    host_files: [
+      {
+        path: "/usr/lib/systemd/system/pgcf-agent.service",
+        kind: "file",
+        mode: "0644",
+        sha256: hex("7"),
+        size_bytes: 900,
+        apply: "restart_unit:pgcf-agent.service",
+      },
+    ],
+    host_files_sha256: hex("8"),
   },
   signature: "e".repeat(128),
 });

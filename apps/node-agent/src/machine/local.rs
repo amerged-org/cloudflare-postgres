@@ -99,7 +99,28 @@ struct State {
     journal_damaged: bool,
     /// How long reading the page cache takes: a disk that is slow to list.
     cache_delay: Option<Duration>,
+    /// What systemd has loaded of each unit file, as of its last reload (or of the boot): the
+    /// definition (`None` for a mask) that the next start of the unit takes.
+    loaded: BTreeMap<String, Option<Vec<u8>>>,
+    /// The definition each unit runs with: that of its last restart.
+    running: BTreeMap<String, Vec<u8>>,
+    /// `daemon_reload` fails once.
+    reload_fails: bool,
+    /// `restart_service` fails once, as a job that ends with `failed`.
+    restart_fails: bool,
 }
+
+/// The units of the image that a release restarts, as the packages and the image leave them: the
+/// files `systemd` loaded at the boot. A test that changes one writes the new file below the
+/// machine's root and has the release do it.
+const IMAGE_UNITS: [&str; 6] = [
+    "pgcf-agent.service",
+    "pgcf-cloudflared.service",
+    "pgcf-gateway.service",
+    "ssh.service",
+    "systemd-journald.service",
+    "systemd-sysctl.service",
+];
 
 /// The kernel's boot ID of the node's `boots`th boot.
 fn boot_id(boots: u64) -> String {
@@ -124,6 +145,7 @@ impl Local {
             state: root.join("s"),
             run: root.join("r"),
             postgres_bin: bin,
+            host_root: root.join("h"),
             ..Layout::default()
         };
         let (uid, gid) = {
@@ -131,7 +153,26 @@ impl Local {
             let metadata = fs::metadata(&root).unwrap();
             (metadata.uid(), metadata.gid())
         };
-        Some(Self {
+        // The directories of the image's units and its configuration, and its own units in them.
+        for directory in crate::node_link::constant("HOST_FILE_DIRECTORIES")
+            .as_array()
+            .unwrap()
+        {
+            fs::create_dir_all(
+                layout
+                    .host_root
+                    .join(directory.as_str().unwrap().trim_start_matches('/')),
+            )
+            .unwrap();
+        }
+        for unit in IMAGE_UNITS {
+            fs::write(
+                layout.host_root.join("usr/lib/systemd/system").join(unit),
+                format!("[Service]\n# {unit} of the image\n"),
+            )
+            .unwrap();
+        }
+        let machine = Self {
             layout,
             user: testpg::current_user(),
             uid,
@@ -141,7 +182,59 @@ impl Local {
                 kernel_release: "6.12.111+deb13-amd64".into(),
                 ..State::default()
             }),
-        })
+        };
+        machine.load_units();
+        Some(machine)
+    }
+
+    /// The unit files below the root, as systemd's search path finds them: `/etc` before
+    /// `/usr/lib`. A mask (a link to `/dev/null`) is `None`; anything but a file or a mask is no
+    /// unit.
+    fn unit_files(&self) -> BTreeMap<String, Option<Vec<u8>>> {
+        let mut found = BTreeMap::new();
+        for directory in ["etc/systemd/system", "usr/lib/systemd/system"] {
+            let Ok(entries) = fs::read_dir(self.layout.host_root.join(directory)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !(name.ends_with(".service") || name.ends_with(".slice"))
+                    || found.contains_key(&name)
+                {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(meta) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    if fs::read_link(&path).is_ok_and(|to| to == Path::new("/dev/null")) {
+                        found.insert(name, None);
+                    }
+                } else if meta.is_file() {
+                    found.insert(name, fs::read(&path).ok());
+                }
+            }
+        }
+        found
+    }
+    /// What systemd does at a boot: it loads every unit file there is.
+    pub fn load_units(&self) {
+        let files = self.unit_files();
+        self.state().loaded = files;
+    }
+    /// The definition `unit` runs with: its file as it was loaded when it last restarted.
+    pub fn running_definition(&self, unit: &str) -> Option<String> {
+        self.state()
+            .running
+            .get(unit)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    }
+    pub fn fail_next_reload(&self) {
+        self.state().reload_fails = true;
+    }
+    pub fn fail_next_restart(&self) {
+        self.state().restart_fails = true;
     }
     pub fn with_layout(mut self, change: impl FnOnce(&mut Layout)) -> Self {
         change(&mut self.layout);
@@ -910,8 +1003,45 @@ impl Machine for Local {
         Ok(())
     }
 
+    /// `systemctl restart`: the unit starts with the definition systemd has loaded, which is its
+    /// file as of the last reload and not as it is now; a unit with no file, or a mask, cannot be
+    /// started.
     async fn restart_service(&self, unit: &str) -> Result<(), units::Error> {
-        self.state().calls.push(format!("restart {unit}"));
+        let files = self.unit_files();
+        let mut state = self.state();
+        state.calls.push(format!("restart {unit}"));
+        let job = |result: &str| units::Error::Job {
+            unit: unit.to_string(),
+            result: result.to_string(),
+        };
+        if std::mem::take(&mut state.restart_fails) {
+            return Err(job("failed"));
+        }
+        // systemd loads a unit it has not loaded yet when it is asked for it.
+        if !state.loaded.contains_key(unit)
+            && let Some(file) = files.get(unit)
+        {
+            state.loaded.insert(unit.to_string(), file.clone());
+        }
+        match state.loaded.get(unit).cloned() {
+            Some(Some(definition)) => {
+                state.running.insert(unit.to_string(), definition);
+                Ok(())
+            }
+            Some(None) => Err(job("masked")),
+            None => Err(job("not-found")),
+        }
+    }
+
+    /// `systemctl daemon-reload`: every unit file is read again, and no unit restarts.
+    async fn daemon_reload(&self) -> Result<(), units::Error> {
+        let files = self.unit_files();
+        let mut state = self.state();
+        state.calls.push("daemon-reload".into());
+        if std::mem::take(&mut state.reload_fails) {
+            return Err(units::Error::Unexpected("the reload failed"));
+        }
+        state.loaded = files;
         Ok(())
     }
 

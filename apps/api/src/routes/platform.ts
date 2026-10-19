@@ -256,7 +256,7 @@ export function registerPlatform(app: ApiApp): void {
       tags: ["Nodes"],
       summary: "Read a node's observed fleet inventory",
       description:
-        "`os` is the boot and operating system the node reported in its last hello: the boot ID and time, the kernel (`uname -r`) and the digest of its installed packages. `os_converged` says whether the kernel and the packages are those of the release of the node's region: false after a maintenance cycle that did not reach the node or when its packages drifted, null while the node has not reported or its region has no release.",
+        "`os` is the boot and operating system the node reported in its last hello: the boot ID and time, the kernel (`uname -r`), the digest of its installed packages and the digest of the host files it holds (the systemd units, masks and configuration of the image that a release changes in place, read from its disk; a file that waits for a reboot counts as not held yet). `os_converged` says whether the kernel, the packages and the host files are those of the release of the node's region: false after a maintenance cycle that did not reach the node, when its packages or a host file drifted, when a host file failed to be written, or while a host file waits for the maintenance cycle's reboot; null while the node has not reported or its region has no release.",
       request: { params: z.object({ id: NodeId }) },
       responses: response(NodeInventory, 200),
     },

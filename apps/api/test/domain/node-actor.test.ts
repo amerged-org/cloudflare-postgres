@@ -147,7 +147,7 @@ describe("the link of a node", () => {
     let socket = await said(old);
     expect(
       await env.DB.prepare(
-        "SELECT os_boot_id,os_booted_at,os_kernel_release,os_packages_sha256 FROM nodes WHERE id=?",
+        "SELECT os_boot_id,os_booted_at,os_kernel_release,os_packages_sha256,os_host_files_sha256 FROM nodes WHERE id=?",
       )
         .bind(f.node)
         .first(),
@@ -156,15 +156,19 @@ describe("the link of a node", () => {
       os_booted_at: old.booted_at,
       os_kernel_release: old.kernel_release,
       os_packages_sha256: old.packages_sha256,
+      os_host_files_sha256: old.host_files_sha256,
     });
     expect(await inventory()).toEqual({ os: old, os_converged: null });
 
     // The release names another kernel: not converged. A kernel that matches with other packages
-    // is not either; the release's kernel and packages together are.
+    // is not either, nor are the release's with other host files (a file that failed to be
+    // written, or one that waits for a reboot); the release's kernel, packages and host files
+    // together are.
     releases.push(await assignRelease(f));
     expect(await inventory()).toEqual({ os: old, os_converged: false });
     for (const [os, converged] of [
       [nodeOs({ packages_sha256: "e".repeat(64) }), false],
+      [nodeOs({ host_files_sha256: "e".repeat(64) }), false],
       [nodeOs(), true],
     ] as const) {
       socket.close(1000);

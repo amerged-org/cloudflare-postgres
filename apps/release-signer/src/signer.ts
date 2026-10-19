@@ -43,8 +43,11 @@ export interface Env {
   SIGNER_WORKFLOW?: string;
 }
 
-/** The manifest's facts are about 1 KB; a body beyond this is not read. */
-const MAX_BODY_BYTES = 8192;
+/**
+ * The manifest's facts are about 1 KB and each host file adds about 300 bytes, at most 64 of them:
+ * a body beyond this is not read.
+ */
+const MAX_BODY_BYTES = 32_768;
 
 function answer(status: number, body: string, type: string, extra = {}) {
   return new Response(body, {

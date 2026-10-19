@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import test from "node:test";
+import { readHostFiles } from "./host-files.ts";
 
 const image = new URL("mkosi.extra/", import.meta.url);
 const units = new URL("usr/lib/systemd/system/", image);
@@ -247,4 +248,40 @@ test("the journal is synced every 15 s: the minutes before a freeze reach the di
   const journald = readFileSync(new URL("usr/lib/systemd/journald.conf.d/pgcf.conf", image), "utf8");
   assert.deepEqual(assignments(journald, "SyncIntervalSec"), ["15s"]);
   assert.deepEqual(assignments(journald, "Storage"), ["persistent"]);
+});
+
+test("every host file takes effect the way it needs: a running service is restarted, the per-database template at its next start, a slice or a mask by the reload, boot-only files at the reboot", async () => {
+  const { files } = await readHostFiles();
+  const apply = new Map(files.map((file) => [file.path, file.apply]));
+  // A unit of the node's own services restarts itself: the new file is what the running process
+  // lacks. The agent's restart is last and is the agent leaving, which systemd answers with the
+  // new definition once it has been read again.
+  for (const service of ["pgcf-agent", "pgcf-gateway", "pgcf-cloudflared"])
+    assert.equal(apply.get(`/usr/lib/systemd/system/${service}.service`), `restart_unit:${service}.service`, service);
+  // A database's unit is never restarted for a file: it takes the new definition when it next
+  // starts, and a restart would stop a tenant's database.
+  assert.equal(apply.get("/usr/lib/systemd/system/pgcf-pg@.service"), "next_start");
+  for (const slice of ["pgcf.slice", "pgcfbackup.slice"])
+    assert.equal(apply.get(`/usr/lib/systemd/system/${slice}`), "daemon_reload", slice);
+  for (const module of ["loop", "dm_mod", "dm_verity"])
+    assert.equal(apply.get(`/etc/systemd/system/modprobe@${module}.service`), "daemon_reload", module);
+  // sshd reads its configuration at start; the others read theirs through the unit that applies it.
+  assert.equal(apply.get("/etc/ssh/sshd_config.d/10-pgcf.conf"), "restart_unit:ssh.service");
+  assert.equal(apply.get("/usr/lib/sysctl.d/90-pgcf.conf"), "restart_unit:systemd-sysctl.service");
+  assert.equal(apply.get("/usr/lib/systemd/journald.conf.d/pgcf.conf"), "restart_unit:systemd-journald.service");
+  // Users and directories are made at boot: those files wait for the maintenance cycle's reboot.
+  assert.equal(apply.get("/usr/lib/sysusers.d/pgcf.conf"), "reboot");
+  assert.equal(apply.get("/usr/lib/tmpfiles.d/pgcf.conf"), "reboot");
+});
+
+test("the image is the whole tree and a release's host files are read from that tree: a fresh image and an updated node hold the same files", async () => {
+  // One definition: the builder copies the whole directory, and mkosi adds no tree of its own over
+  // `mkosi.extra`, so what the registration lists is what the image holds.
+  const build = readFileSync(new URL("builder/build.sh", import.meta.url), "utf8");
+  assert.match(build, /cp -r --preserve=mode \/src "\$work\/src"/);
+  const conf = readFileSync(new URL("mkosi.conf", import.meta.url), "utf8");
+  assert.doesNotMatch(conf, /^(ExtraTrees|SkeletonTrees|BuildSources)=/m);
+  // The build summary states the digest of the list the tree gives, which the registration holds
+  // the checkout to (register-node-image.test.ts).
+  assert.match(readFileSync(new URL("node-image.ts", import.meta.url), "utf8"), /host_files_sha256: await hostFilesSha256\(/);
 });

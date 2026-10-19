@@ -12,7 +12,18 @@ import {
   RESERVED_ROLE_PREFIXES,
 } from "../src/ids.ts";
 import { MAINTENANCE_ROLE } from "../src/maintenance.ts";
-import { RELEASE_REFUSALS, RELEASE_SIGNATURE_FILE } from "../src/releases.ts";
+import {
+  HOST_FILE_APPLIES,
+  HOST_FILE_DIRECTORIES,
+  HOST_FILE_KINDS,
+  HOST_FILE_MAX_BYTES,
+  HOST_FILE_MODES,
+  HOST_FILE_UNITS,
+  HOST_FILES_MAX,
+  RELEASE_HOST_FILES_DIRECTORY,
+  RELEASE_REFUSALS,
+  RELEASE_SIGNATURE_FILE,
+} from "../src/releases.ts";
 import {
   archiveVectors,
   gatewayChannelVectors,
@@ -76,13 +87,21 @@ const files = {
       INSTALLER_CHECKPOINTS: link.INSTALLER_CHECKPOINTS,
       RELEASE_REFUSALS,
       RELEASE_SIGNATURE_FILE,
+      RELEASE_HOST_FILES_DIRECTORY,
+      HOST_FILE_DIRECTORIES,
+      HOST_FILE_KINDS,
+      HOST_FILE_MODES,
+      HOST_FILE_UNITS,
+      HOST_FILE_APPLIES,
+      HOST_FILES_MAX,
+      HOST_FILE_MAX_BYTES,
     },
   },
   "node-vectors.generated.json": {
     schemas: nodeSchemaVectors(),
     requests: await nodeRequestVectors(),
     packages: await packageVectors(),
-    releases: releaseVectors(),
+    releases: await releaseVectors(),
   },
   "node-local.generated.json": {
     version: 1,

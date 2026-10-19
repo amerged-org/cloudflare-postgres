@@ -146,6 +146,16 @@ const MANIFEST = signedReleaseManifest({
   os: {
     debian_snapshot: "20261016T000000Z",
     package_lock: { sha256: "5".repeat(64), size_bytes: 1000 },
+    host_files: [
+      {
+        path: "/usr/lib/systemd/system/pgcf-gateway.service",
+        kind: "file",
+        mode: "0644",
+        sha256: "6".repeat(64),
+        size_bytes: 1000,
+        apply: "restart_unit:pgcf-gateway.service",
+      },
+    ],
   },
 });
 
