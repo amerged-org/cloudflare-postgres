@@ -196,7 +196,7 @@ The owner's goal of 2026-10-16 stays word for word; only the vehicle changes. "L
 | Item | Definition |
 | --- | --- |
 | Metric | The first request of a cold database completes in under 1 s at p95 |
-| Request | Ordinary SaaS work in sequence: session lookup by key, a 50-row list page, a count, an insert, an update. Today it is the operator's `saas_bench2.py`; Stage 3 commits it to `scripts/e2e` so that every run uses the same request. Never `SELECT 1`, never create time |
+| Request | Ordinary SaaS work in sequence: session lookup by key, a 50-row list page, a count, an insert, an update. Today it is the operator's `saas_bench2.py`; Stage 3 commits it to `scripts/e2e` so that every run uses the same request. Never `SELECT 1`, never create time. The first request may be sent as one HTTP `/sql` transaction (owner decision D1, 2026-10-19); the bench reports the sequential WebSocket request and the batched HTTP request as two arms, and either arm may meet the gate |
 | Where measured | From a Cloudflare Worker; also reported from a laptop in Germany |
 | Which databases | Idle for at least one hour, some for at least 24 hours |
 | Which samples | Every cold first request counts, including those that waited for capacity. Waits are shown as a breakdown inside the p95 and never removed from it |
@@ -1759,6 +1759,7 @@ From the canary on, the EU1 stack is production.
 | 2026-10-16 | Binding product goal: cold under 1 s; only warm and cold |
 | 2026-10-17 | Decision A (remove the guard, simplify bloat). One release per batch; no "R1/R2" names. Per-database idle time 60–900 s. **Option C**, with no control server. Placement until 80 % of the 30-minute-average peak of active RAM or CPU; no count limit; storage, RAM and CPU per database through the admin API; thin-slice overbooking central. One image for every node, so patches and upgrades are identical everywhere; US1 (`pgcf-us1`) follows once EU1 works |
 | 2026-10-18 | D13 settled: the full systemd sandbox stays (own mount and network namespaces, `ProtectKernel*`); a few milliseconds above the node-path target of 150 ms are accepted without rework, and the target is measured in Stage 5, not a gate. Go: execute the plan, then the owner looks at everything again |
+| 2026-10-19 | D1: the first request after sleep may go as one HTTP `/sql` transaction and counts for the under-1-s gate (both arms are reported). D14 part a: only the measurement of whether and at what billed cost the DatabaseActor can be kept warm is approved (`docs/architecture/parallel-wake-ticket.md`); no keep-warm, no parallel wake ticket and no KV admission cache until its numbers and a costed go |
 
 ### 11.4 Design decisions taken in this plan
 

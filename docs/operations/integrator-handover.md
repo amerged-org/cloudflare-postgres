@@ -697,9 +697,13 @@ limit first. Counters are per Cloudflare location and eventually consistent.
 
 ### 3.7 HTTP query mode (`neon()`)
 
-**Not yet verified** against the live installation: the format below is checked by the actual
-`@neondatabase/serverless` 1.2.0 driver against the Edge and by the gateway's protocol tests, but
-no Dev latency has been measured.
+**Measured on the live installation (EU1, 2026-10-19):** the format below is checked by the actual
+`@neondatabase/serverless` 1.2.0 driver against the Edge and by the gateway's protocol tests. A
+SaaS page request of six statements as **one `transaction()` on a database that had slept one to two
+hours** took 472 to 784 ms (median 611 ms, 8 samples) from a Worker through a service binding to the
+Edge and 440 to 1,070 ms (median 648 ms, 6 samples) through the public hostname. The same request
+statement by statement over a WebSocket took a median of about 0.8 s (binding) and 1.0 to 1.1 s
+(public hostname). These are small samples, not a p95.
 
 `POST https://<host>/sql` serves the Neon driver's HTTP query mode: `neon()`, its
 `transaction()`, and `Pool.query()` with `poolQueryViaFetch`. One query or one transaction is one
@@ -746,7 +750,9 @@ statements in one burst (Neon puts the break-even at two to three queries).
 ### 3.8 Recommended patterns for Workers
 
 Estimates from the plan's measurements (15-42 ms per statement round trip from a Worker,
-0.47-0.53 s for an 8-statement request on an awake database); **none is measured on PGCF yet**.
+0.47-0.53 s for an 8-statement request on an awake database); only the batching gain is measured on
+PGCF so far (the first request after sleep as one HTTP transaction: about 0.2 s less through a
+service binding and about 0.4 s less through the public hostname, 3.7).
 
 | Pattern                          | How                                                                                                                               | Expected gain                                                                                                        | Cost                                                                                |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
