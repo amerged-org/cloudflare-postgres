@@ -148,9 +148,9 @@ pub fn volume_extend(config: &Config, id: &VolumeId, size_bytes: u64) -> Vec<Str
 pub fn volume_remove(config: &Config, id: &VolumeId) -> Vec<String> {
     words(["lvremove", "--quiet", "--yes", &volume_path(config, id)])
 }
-/// `--noflush`: without it the kernel first commits the pool's metadata if a transaction is open,
-/// so the 5 s poll would force a commit whenever it finds one. With it the status shows the last
-/// committed transaction ID, which the agent does not read, and the block counts it does read.
+/// `--noflush`: without it the kernel commits the pool's metadata before it answers each status
+/// call, so the 5 s poll would force a commit every time. The block counts the agent reads come
+/// from the in-core space maps either way.
 pub fn dm_status_pool() -> Vec<String> {
     words(["dmsetup", "status", "--noflush", "--target", "thin-pool"])
 }
