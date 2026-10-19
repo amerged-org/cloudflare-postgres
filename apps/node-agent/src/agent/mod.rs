@@ -16,7 +16,7 @@ mod metering;
 mod power;
 #[cfg(test)]
 mod real_gateway;
-mod report;
+pub(crate) mod report;
 #[cfg(test)]
 pub(crate) mod testing;
 
