@@ -215,9 +215,12 @@ pub fn source(request: &Request) -> Result<Source, Refused> {
 
 /// What a command did: its output when it ended with status 0, else why it did not (its status and
 /// what it printed, or that it could not be run, or that it did not end). Only the kind of an
-/// error that kept a program from starting is said.
+/// error that kept a program from starting is said. A journal probe that fails says its status and
+/// its stderr only: the lines it printed before it failed are the journal's whole fields, which
+/// the sanitizer has not reduced (`stdout_on_failure` is false for it).
 fn captured(
     program: &str,
+    stdout_on_failure: bool,
     ran: Result<io::Result<Output>, tokio::time::error::Elapsed>,
 ) -> (bool, String) {
     match ran {
@@ -229,7 +232,11 @@ fn captured(
             format!(
                 "{program} ended with {}\n{}{}",
                 output.status,
-                String::from_utf8_lossy(&output.stdout),
+                if stdout_on_failure {
+                    String::from_utf8_lossy(&output.stdout)
+                } else {
+                    "".into()
+                },
                 String::from_utf8_lossy(&output.stderr)
             ),
         ),
@@ -317,6 +324,7 @@ pub async fn run<M: Machine>(machine: &M, request: &Request) -> Value {
         Err(Refused(what)) => (false, format!("{what} is out of range\n")),
         Ok(Source::Command(argv)) => captured(
             argv.program,
+            !request.probe.journal(),
             tokio::time::timeout(TIMEOUT, machine.diagnostic(&argv)).await,
         ),
         Ok(Source::Proc) => pressure(machine),
@@ -681,8 +689,36 @@ mod tests {
             result["text"]
                 .as_str()
                 .unwrap()
-                .contains("Failed to find logical volume")
+                .contains(r#"Failed to find logical volume \"pgcf/pgcf_thinpool\""#)
         );
+    }
+
+    #[tokio::test]
+    async fn a_journal_probe_that_fails_after_printing_entries_sends_no_line_it_printed() {
+        let Some(machine) = Local::new("probe-damaged") else {
+            return;
+        };
+        machine.damage_journal();
+        for probe in [Probe::Journal, Probe::Kernel] {
+            let result = answer(&machine, &request(probe, 0, 3600, 200)).await;
+            assert_eq!(result["status"], "failed", "{probe:?}");
+            assert_eq!(result["entries"], json!([]));
+            // The status and what journalctl said of it, and none of the fields the boot report
+            // keeps on the node (the host name, the machine ID, command lines).
+            let text = result["text"].as_str().unwrap();
+            assert!(
+                text.starts_with("journalctl ended with exit status: 1\n"),
+                "{text}"
+            );
+            assert!(text.contains("Failed to iterate through journal: Bad message"));
+            for kept in ["_HOSTNAME", "_MACHINE_ID", "_CMDLINE", "80323333f9fd"] {
+                assert!(!text.contains(kept), "{probe:?} {kept}: {text}");
+            }
+        }
+        // A text probe's output is the administrator's answer when its tool fails.
+        machine.lose_pool();
+        let pool = answer(&machine, &request(Probe::Pool, 0, 3600, 200)).await;
+        assert!(pool["text"].as_str().unwrap().contains("\"log_message\""));
     }
 
     #[tokio::test]
@@ -705,19 +741,31 @@ mod tests {
             stderr: stderr.into(),
         };
         assert_eq!(
-            captured("ss", Ok(Ok(output(0, "tcp\n", "")))),
+            captured("ss", true, Ok(Ok(output(0, "tcp\n", "")))),
             (true, "tcp\n".to_string())
         );
         assert_eq!(
-            captured("lvs", Ok(Ok(output(5, "{}\n", "no pool\n")))),
+            captured("lvs", true, Ok(Ok(output(5, "{}\n", "no pool\n")))),
             (
                 false,
                 "lvs ended with exit status: 5\n{}\nno pool\n".to_string()
             )
         );
+        // A journal probe says its status and stderr, not the lines it printed before it failed.
+        assert_eq!(
+            captured(
+                "journalctl",
+                false,
+                Ok(Ok(output(1, "{\"_HOSTNAME\":\"h\"}\n", "Bad message\n")))
+            ),
+            (
+                false,
+                "journalctl ended with exit status: 1\nBad message\n".to_string()
+            )
+        );
         let missing = io::Error::new(io::ErrorKind::NotFound, "/usr/bin/ss: not found");
         assert_eq!(
-            captured("ss", Ok(Err(missing))),
+            captured("ss", true, Ok(Err(missing))),
             (false, "ss could not be run: NotFound\n".to_string())
         );
     }
@@ -733,7 +781,7 @@ mod tests {
                     stderr: vec![],
                 })
             });
-        let (ok, text) = captured("journalctl", late);
+        let (ok, text) = captured("journalctl", true, late);
         assert!(!ok);
         assert_eq!(text, "journalctl did not end within 30 seconds\n");
     }

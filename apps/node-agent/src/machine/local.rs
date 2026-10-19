@@ -76,6 +76,8 @@ struct State {
     kernel_release: String,
     /// The thin pool is gone: `lvs` cannot find it.
     pool_lost: bool,
+    /// A journal file is damaged: `journalctl` prints the entries it read, then fails.
+    journal_damaged: bool,
 }
 
 pub struct Local {
@@ -131,6 +133,10 @@ impl Local {
     /// The thin pool is gone, as on a node whose volume group lost it.
     pub fn lose_pool(&self) {
         self.state().pool_lost = true;
+    }
+    /// A journal file of the node was damaged by a crash.
+    pub fn damage_journal(&self) {
+        self.state().journal_damaged = true;
     }
     /// The Debian packages the node has.
     pub fn set_packages(&self, packages: &[(&str, &str)]) {
@@ -805,6 +811,7 @@ impl Machine for Local {
     /// outputs of the commands the probes build, as their exit status and streams.
     async fn diagnostic(&self, argv: &probe::Argv) -> io::Result<Output> {
         use std::os::unix::process::ExitStatusExt;
+        const DAMAGED_JOURNAL: &str = "Failed to iterate through journal: Bad message\n";
         let exited = |code: i32, stdout: &str, stderr: &str| Output {
             status: std::process::ExitStatus::from_raw(code << 8),
             stdout: stdout.into(),
@@ -826,6 +833,16 @@ impl Machine for Local {
                 1,
                 "",
                 "No journal boot entry found for the specified boot (-1).\n",
+            ),
+            "journalctl" if state.journal_damaged && has("-k") => exited(
+                1,
+                include_str!("../diagnostics/probe/kernel.jsonl"),
+                DAMAGED_JOURNAL,
+            ),
+            "journalctl" if state.journal_damaged => exited(
+                1,
+                include_str!("../diagnostics/probe/journal.jsonl"),
+                DAMAGED_JOURNAL,
             ),
             "journalctl" if has("-k") => {
                 exited(0, include_str!("../diagnostics/probe/kernel.jsonl"), "")

@@ -71,6 +71,10 @@ send it back over the link. The probes only read: each is a fixed command (no sh
 fixed files, built by the agent, and a request names the probe and three integers, never a
 command, a path or a unit. They need an admin API key; any other key is told 404.
 
+Do not ask a node whose agent is older than the build with probes (SEC-09). It refuses a desired
+page that carries a request, and takes no order from a full pull (maintenance, move, fence, a
+release, the one that would update it) until the request expires, ten minutes later.
+
 1. `POST /v1/nodes/{id}/diagnostics` with `{"probe":"<name>"}` and, for `journal` and `kernel`,
    `"boot"` (0 this boot, -1 the one before; default 0), `"since_seconds"` (60 to 86400; default
    3600; `journal` only) and `"lines"` (1 to 2000; default 200). It answers `202` with a
@@ -95,8 +99,10 @@ command, a path or a unit. They need an admin API key; any other key is told 404
 
 `journal` and `kernel` answer with `entries`, every other probe with `text`. `status` is `failed`
 when a command ended with a status other than 0, did not end in 30 seconds, or a file could not
-be read; `text` then holds the status and what the command printed (a node that has not rebooted
-answers `journal` or `kernel` with `boot` -1 as failed: `No journal boot entry found`).
+be read; `text` then holds the status and what the command printed, but of `journal` and `kernel`
+only the status and stderr, never the lines they printed before they failed (a node that has not
+rebooted answers `journal` or `kernel` with `boot` -1 as failed: `No journal boot entry found`;
+a damaged journal file fails them with `Failed to iterate through journal`).
 
 - **Loopback only.** `listeners` shows TCP listeners on loopback only (the gateway and
   cloudflared's metrics) and Unix sockets. A TCP or UDP socket on another address is an incident.
@@ -106,8 +112,9 @@ answers `journal` or `kernel` with `boot` -1 as failed: `No journal boot entry f
   `[truncated]`), go first. The lines of a database's unit (`pgcf-pg@…`) or of a backup job
   (`pgcf-job-…`), and the lines PID 1 writes about them, are never sent; in a text, every line
   that names one is left out. A kernel line that names a database's cgroup, such as an out of
-  memory kill, is kept: it holds the database's identifier and nothing of its data. At most eight
-  requests are open on a node; the agent runs each once and keeps the identifiers of the last 64.
+  memory kill, is kept: it holds the database's identifier and nothing of its data. A node's page
+  lists at most eight open requests at a time, the oldest first; later ones wait behind them and
+  may expire unanswered. The agent runs each once and keeps the identifiers of the last 64.
 - **Audit.** The row of the request (`node_diagnostic_requests`) holds the key that asked and
   the time; the agent logs `probe_answered` with the probe's name. Requests and results are kept
   for 30 days, and deleted by the next request for a probe after that.
