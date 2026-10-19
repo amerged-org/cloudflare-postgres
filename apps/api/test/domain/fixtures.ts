@@ -631,6 +631,18 @@ export const nodeOs = (change: Record<string, unknown> = {}) => ({
   ...RELEASE_OS,
   ...change,
 });
+/** A signature of the form the API stores for a version: another for each, made by no key. */
+export const signatureOf = async (version: string) => {
+  const digest = bytesToHex(
+    new Uint8Array(
+      await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(`signature/${version}`),
+      ),
+    ),
+  );
+  return digest + digest;
+};
 /** The spec of a release: a node image, its four binaries and the package lock. */
 export const releaseSpec = (version = "1.2.0") => ({
   version: 2,
@@ -654,6 +666,7 @@ export const releaseSpec = (version = "1.2.0") => ({
     package_lock: pinned("packages.lock.json"),
     ...RELEASE_OS,
   },
+  signature: "e".repeat(128),
 });
 /**
  * What the operator's tool does for a version: the six files of a release go into the archive
@@ -705,6 +718,7 @@ export async function stageRelease(
       package_lock: digests["packages.lock.json"],
       ...RELEASE_OS,
     },
+    signature: await signatureOf(version),
   };
 }
 /** Registers a release and assigns it to the region. */

@@ -20,7 +20,7 @@ use crate::{
     },
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs, io,
     num::NonZeroU32,
     path::Path,
@@ -36,12 +36,21 @@ struct Unit {
     crashed: bool,
     invocations: u64,
     invocation_id: Option<String>,
+    /// The volume the unit mounted when it started, from the agent's link: what it runs on until
+    /// it stops, whatever the agent has attached since.
+    volume: Option<VolumeId>,
 }
 
 #[derive(Default)]
 struct State {
     units: HashMap<String, Unit>,
     volumes: BTreeMap<VolumeId, u64>,
+    /// The volumes the agent has mounted in its mount namespace, each with its link for the
+    /// database's unit: what the agent's restart ends. A unit that runs keeps its own mount.
+    attached: BTreeSet<VolumeId>,
+    /// The volumes that a job (`MountImages=`) holds, in a namespace of its own, until it ends:
+    /// `hold_volume` and `release_volume`.
+    jobs: BTreeSet<VolumeId>,
     accounts: Vec<String>,
     limits: HashMap<String, Limits>,
     quotas: HashMap<String, Option<NonZeroU32>>,
@@ -63,6 +72,12 @@ struct State {
     start_delay: Option<Duration>,
     /// LVM, or systemd, cannot be read: what they hold is not known.
     volumes_unreadable: bool,
+    /// The next this many questions of `has_volume`, or of `unit`, fail as an unreadable LVM or
+    /// systemd does, and the questions asked: what a reconciliation that retries costs.
+    volume_reads_fail: u32,
+    unit_reads_fail: u32,
+    volume_reads: u64,
+    unit_reads: u64,
     /// Every volume must be repaired before its database starts again.
     needs_repair: bool,
     units_unreadable: bool,
@@ -243,6 +258,19 @@ impl Local {
     pub fn set_units_unreadable(&self, unreadable: bool) {
         self.state().units_unreadable = unreadable;
     }
+    /// LVM cannot be read for the next `count` questions, and can be after them.
+    pub fn fail_next_volume_reads(&self, count: u32) {
+        self.state().volume_reads_fail = count;
+    }
+    /// systemd cannot be read for the next `count` questions, and can be after them.
+    pub fn fail_next_unit_reads(&self, count: u32) {
+        self.state().unit_reads_fail = count;
+    }
+    /// How often `has_volume` was asked, and how often `unit` was.
+    pub fn reads(&self) -> (u64, u64) {
+        let state = self.state();
+        (state.volume_reads, state.unit_reads)
+    }
     /// A unit that exists and is stopped, as one is after a stop or a boot.
     pub fn add_stopped_unit(&self, database: &str) {
         self.state().units.insert(
@@ -252,8 +280,50 @@ impl Local {
                 crashed: false,
                 invocations: 0,
                 invocation_id: None,
+                volume: None,
             },
         );
+    }
+    /// The agent restarts: its mount namespace ends with it, and with it the mounts and the links
+    /// of every volume. The units run on, on the volumes they mounted themselves.
+    pub fn forget_mounts(&self) {
+        self.state().attached.clear();
+    }
+    /// A volume that the agent has mounted but whose link is gone (a failed rename, or a link
+    /// dropped by a pool failure that did not reach the volume's recovery).
+    pub fn lose_link(&self, id: &VolumeId) {
+        self.state().attached.remove(id);
+    }
+    /// A job holds the volume in a namespace of its own, as a barman job with `MountImages=`
+    /// does: the agent's unmount and removal of it are `Busy` until `release_volume`.
+    pub fn hold_volume(&self, id: &VolumeId) {
+        self.state().jobs.insert(id.clone());
+    }
+    pub fn release_volume(&self, id: &VolumeId) {
+        self.state().jobs.remove(id);
+    }
+    /// Whether a unit that runs or a job has the filesystem of the volume, in a mount namespace
+    /// of its own: what the node answers with `Busy` (lvm2: "in use"; the agent's unmount: ext4's
+    /// superblock outlives it), whether or not the agent has a mount of its own.
+    fn held(&self, id: &VolumeId) -> bool {
+        self.holders(id, |held| held == id)
+    }
+    /// Whether a unit that runs or a job has another generation of the volume's database: the
+    /// directory is the database's, so the next generation is not made or mounted then.
+    fn other_generation_held(&self, id: &VolumeId) -> bool {
+        self.holders(id, |held| held != id)
+    }
+    fn holders(&self, id: &VolumeId, wanted: impl Fn(&VolumeId) -> bool) -> bool {
+        let running = self.running(id.database());
+        let state = self.state();
+        let unit = state
+            .units
+            .get(id.database())
+            .filter(|_| running)
+            .and_then(|unit| unit.volume.as_ref());
+        unit.into_iter()
+            .chain(state.jobs.iter())
+            .any(|held| held.database() == id.database() && wanted(held))
     }
     pub fn has_account(&self, database: &str) -> bool {
         self.state().accounts.iter().any(|a| a == database)
@@ -331,6 +401,13 @@ impl Machine for Local {
         if state.no_room {
             return Err(storage::Error::NoRoom(NoRoom::Reserve));
         }
+        // A database has one directory, and a unit or a job that has another generation's
+        // filesystem keeps the next one from being made, whatever the agent has mounted.
+        drop(state);
+        if self.other_generation_held(id) {
+            return Err(storage::Error::OtherGeneration);
+        }
+        let mut state = self.state();
         // A database has one directory: the volume of another generation that is still mounted
         // there is in the way, as it is on the node.
         let live = self.layout.volume(id.database());
@@ -345,27 +422,80 @@ impl Machine for Local {
         }
         fs::create_dir_all(&live)?;
         state.volumes.insert(id.clone(), size_bytes);
+        state.attached.insert(id.clone());
         Ok(())
     }
     async fn has_volume(&self, id: &VolumeId) -> Result<bool, storage::Error> {
-        let state = self.state();
-        if state.volumes_unreadable {
+        let mut state = self.state();
+        state.volume_reads += 1;
+        if state.volumes_unreadable || state.volume_reads_fail > 0 {
+            state.volume_reads_fail = state.volume_reads_fail.saturating_sub(1);
             return Err(storage::Error::Unexpected("lvs"));
         }
         Ok(state.volumes.contains_key(id))
     }
+    fn attached(&self, id: &VolumeId) -> bool {
+        self.state().attached.contains(id)
+    }
+    async fn unit_volume(&self, database: &str) -> Result<Option<VolumeId>, storage::Error> {
+        if !self.running(database) {
+            return Ok(None);
+        }
+        let state = self.state();
+        match state
+            .units
+            .get(database)
+            .and_then(|unit| unit.volume.clone())
+        {
+            Some(volume) => Ok(Some(volume)),
+            None => Err(storage::Error::Unexpected(
+                "a running unit without its volume",
+            )),
+        }
+    }
     async fn mount_volumes(
         &self,
-        _current: &[VolumeId],
+        current: &[VolumeId],
     ) -> Result<Vec<(VolumeId, storage::Error)>, storage::Error> {
-        Ok(Vec::new())
+        let mut failures = Vec::new();
+        for id in current {
+            let other_held = self.other_generation_held(id);
+            let mut state = self.state();
+            state.calls.push(format!("mount {}", id.database()));
+            if !state.volumes.contains_key(id) {
+                continue;
+            }
+            if other_held {
+                failures.push((id.clone(), storage::Error::OtherGeneration));
+                continue;
+            }
+            // A database has one directory: the generation that is attached holds it.
+            if state
+                .attached
+                .iter()
+                .any(|other| other.database() == id.database() && other != id)
+            {
+                failures.push((id.clone(), storage::Error::OtherGeneration));
+                continue;
+            }
+            state.attached.insert(id.clone());
+        }
+        Ok(failures)
     }
     /// The volume is set aside beside its directory, as the unmounted logical volume is: its
     /// files are there for the generation, not for the database's directory.
     async fn unmount_volume(&self, id: &VolumeId) -> Result<(), storage::Error> {
-        self.state()
-            .calls
-            .push(format!("unmount {}", id.database()));
+        let held = self.held(id);
+        {
+            let mut state = self.state();
+            state.calls.push(format!("unmount {}", id.database()));
+            // The agent's own mount goes and the superblock stays: the node mounts the volume
+            // again where it was and answers `Busy`, with the link as it was.
+            if held {
+                return Err(storage::Error::Busy);
+            }
+            state.attached.remove(id);
+        }
         let live = self.layout.volume(id.database());
         let aside = self
             .layout
@@ -387,9 +517,15 @@ impl Machine for Local {
         }
     }
     async fn remove_volume(&self, id: &VolumeId, _removal: Removal) -> Result<(), storage::Error> {
+        let held = self.held(id);
         let mut state = self.state();
         state.calls.push(format!("remove {}", id.database()));
+        // lvm2 refuses a volume that a unit or a job has open: "in use".
+        if held {
+            return Err(storage::Error::Busy);
+        }
         state.volumes.remove(id);
+        state.attached.remove(id);
         let others = state
             .volumes
             .keys()
@@ -426,6 +562,10 @@ impl Machine for Local {
         self.state()
             .calls
             .push(format!("recover {}", id.database()));
+        // The repair detaches the volume first, which a holder refuses.
+        if self.held(id) {
+            return Err(storage::Error::Busy);
+        }
         Ok(())
     }
     async fn inventory(&self) -> Result<Inventory, storage::Error> {
@@ -440,7 +580,8 @@ impl Machine for Local {
                 formatted: true,
                 reserve_released: false,
                 suspect: false,
-                mount: Some(MountInfo {
+                fs_errors: false,
+                mount: state.attached.contains(id).then_some(MountInfo {
                     usage: FsUsage {
                         total_bytes: *size,
                         used_bytes: 100 << 20,
@@ -448,7 +589,6 @@ impl Machine for Local {
                         inodes_total: 1 << 20,
                         inodes_used: 1500,
                     },
-                    fs_errors: false,
                 }),
             })
             .collect();
@@ -542,7 +682,9 @@ impl Machine for Local {
 
     async fn unit(&self, database: &str) -> Result<UnitState, units::Error> {
         let mut state = self.state();
-        if state.units_unreadable {
+        state.unit_reads += 1;
+        if state.units_unreadable || state.unit_reads_fail > 0 {
+            state.unit_reads_fail = state.unit_reads_fail.saturating_sub(1);
             return Err(units::Error::NotReady("bus"));
         }
         let memory_max = state.limits.get(database).and_then(|limits| {
@@ -610,6 +752,21 @@ impl Machine for Local {
         if self.running(database) {
             return self.wait_started(database).await;
         }
+        // The unit asserts the agent's link, and mounts the volume the link names.
+        let attached = {
+            let state = self.state();
+            state
+                .attached
+                .iter()
+                .find(|volume| volume.database() == database)
+                .cloned()
+        };
+        let Some(attached) = attached else {
+            return Err(units::Error::Job {
+                unit: units::unit_name(database),
+                result: "assert".into(),
+            });
+        };
         let volume = self.layout.volume(database);
         if !self.layout.data(database).join("PG_VERSION").exists() {
             return Err(units::Error::Job {
@@ -642,7 +799,9 @@ impl Machine for Local {
                 crashed: false,
                 invocations: 0,
                 invocation_id: None,
+                volume: None,
             });
+            unit.volume = Some(attached);
             unit.invocations += 1;
             unit.crashed = false;
             unit.child = Some(child);

@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The units against a real systemd and a real PostgreSQL 18. They run as root on a Debian 13 host
-//! with systemd as PID 1, the image's `pgcf-pg@.service` and `pgcf.slice`, PGDG PostgreSQL 18 and
+//! with systemd as PID 1, the image's `pgcf-pg@.service`, `pgcf.slice` and the masks of
+//! `modprobe@loop`, `@dm_mod` and `@dm_verity`, a group `pgcf-gateway`, PGDG PostgreSQL 18 and
 //! `useradd`, with `--ignored`; the CI kernel step has no systemd and skips them. They create
-//! users, a tmpfs volume and a database, and remove them again.
+//! users, a device-mapper volume with an ext4 and a database, and remove them again.
+//!
+//! Run the test binary under `unshare --mount --propagation slave`: as the agent does under
+//! `PrivateMounts=yes`, it then mounts the volumes in a namespace of its own, which PID 1 and the
+//! executors of the units never see, and the units mount their volumes themselves from the link
+//! `/run/pgcf/dev/<id>` (`MountImages=`). A host without udev (a container) has no `/dev/dm-<n>`
+//! nodes, which systemd's image dissection needs: the lab makes them as udev does.
 use super::{
     ActiveState, DB_ROOT, Error, Units,
     limits::{Io, Limits},
@@ -38,14 +45,116 @@ fn lab() -> bool {
 }
 
 /// One database's volume, user and socket directory, and everything removed again.
-struct Database {
-    id: String,
-    uid: u32,
-    root: PathBuf,
+pub(crate) struct Database {
+    pub(crate) id: String,
+    pub(crate) uid: u32,
+    pub(crate) root: PathBuf,
     users_dir: PathBuf,
+    /// The volume: a loop device under an image file, a device-mapper device over it.
+    pub(crate) volume: Volume,
+}
+
+/// A block device for a database's filesystem, removed with the value.
+pub(crate) struct Volume {
+    image: PathBuf,
+    loop_device: String,
+    mapper: String,
+}
+impl Volume {
+    /// The device-mapper node a unit's link names, like a thin volume of the node.
+    pub(crate) fn device(&self) -> String {
+        format!("/dev/mapper/{}", self.mapper)
+    }
+    fn make(id: &str) -> Self {
+        let image = PathBuf::from(format!("/var/tmp/{id}.img"));
+        fs::File::create(&image)
+            .unwrap()
+            .set_len(128 << 20)
+            .unwrap();
+        let loop_device = String::from_utf8(
+            Command::new("losetup")
+                .args(["-f", "--show", image.to_str().unwrap()])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        if !Path::new(&loop_device).exists() {
+            let number = loop_device.trim_start_matches("/dev/loop");
+            run("mknod", &[&loop_device, "b", "7", number]);
+        }
+        let mapper = format!("pgcflab-{id}");
+        let sectors = (128u64 << 20) / 512;
+        run(
+            "dmsetup",
+            &[
+                "create",
+                "--noudevsync",
+                &mapper,
+                "--table",
+                &format!("0 {sectors} linear {loop_device} 0"),
+            ],
+        );
+        run("dmsetup", &["mknodes", &mapper]);
+        // What udev does on a node: the `/dev/dm-<minor>` node that systemd's dissection reads
+        // its device number through.
+        let info = Command::new("dmsetup")
+            .args(["info", "-c", "--noheadings", "-o", "major,minor", &mapper])
+            .output()
+            .unwrap();
+        let info = String::from_utf8(info.stdout).unwrap();
+        let (major, minor) = info.trim().split_once(':').unwrap();
+        let node = format!("/dev/dm-{minor}");
+        if !Path::new(&node).exists() {
+            run("mknod", &[&node, "b", major, minor]);
+        }
+        // Shorter than the device by the gap, as the agent makes every filesystem.
+        run(
+            "mkfs.ext4",
+            &[
+                "-F",
+                "-q",
+                &format!("/dev/mapper/{mapper}"),
+                &format!(
+                    "{}K",
+                    ((128u64 << 20) - crate::storage::FS_END_GAP_BYTES) / 1024
+                ),
+            ],
+        );
+        Self {
+            image,
+            loop_device,
+            mapper,
+        }
+    }
+}
+impl Drop for Volume {
+    fn drop(&mut self) {
+        quiet("dmsetup", &["remove", "--retry", &self.mapper]);
+        quiet("losetup", &["-d", &self.loop_device]);
+        let _ = fs::remove_file(&self.image);
+    }
+}
+
+/// The link of the agent: `/run/pgcf/dev/<id>`, in a directory of root's alone.
+fn link_path(id: &str) -> PathBuf {
+    Path::new(crate::units::DEVICE_LINKS).join(id)
+}
+fn link_to(id: &str, device: &str) {
+    use std::os::unix::fs::DirBuilderExt;
+    let directory = Path::new(crate::units::DEVICE_LINKS);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .unwrap();
+    let _ = fs::remove_file(link_path(id));
+    std::os::unix::fs::symlink(device, link_path(id)).unwrap();
 }
 impl Database {
-    fn new(n: u32) -> Self {
+    pub(crate) fn new(n: u32) -> Self {
         let id = format!("lab{n:017}");
         let users_dir = super::test_dir("lab-users");
         fs::create_dir_all(&users_dir).unwrap();
@@ -72,17 +181,20 @@ impl Database {
             ],
         );
         fs::create_dir_all(&root).unwrap();
+        let volume = Volume::make(&id);
+        // The agent's mount, in the agent's namespace; the unit mounts the volume again itself.
         run(
             "mount",
             &[
                 "-t",
-                "tmpfs",
+                "ext4",
                 "-o",
-                "size=512m,mode=0700",
-                "tmpfs",
+                "nosuid,nodev,noexec,noatime",
+                &volume.device(),
                 root.to_str().unwrap(),
             ],
         );
+        run("chmod", &["0700", root.to_str().unwrap()]);
         run("chown", &[&account, root.to_str().unwrap()]);
         let sockets = format!("/run/pgcf/{id}");
         fs::create_dir_all(&sockets).unwrap();
@@ -109,11 +221,13 @@ impl Database {
         let mut configuration = fs::read_to_string(root.join("data/postgresql.conf")).unwrap();
         configuration.push_str("\njit = off\n");
         fs::write(root.join("data/postgresql.conf"), configuration).unwrap();
+        link_to(&id, &volume.device());
         Self {
             id,
             uid,
             root,
             users_dir,
+            volume,
         }
     }
     fn unit(&self) -> String {
@@ -130,8 +244,9 @@ impl Drop for Database {
         let unit = self.unit();
         quiet("systemctl", &["stop", &unit]);
         quiet("systemctl", &["reset-failed", &unit]);
+        let _ = fs::remove_file(link_path(&self.id));
         quiet("umount", &[self.root.to_str().unwrap()]);
-        let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir(&self.root);
         let _ = fs::remove_dir_all(format!("/run/pgcf/{}", self.id));
         for directory in ["/etc/systemd/system.control", "/run/systemd/system.control"] {
             let _ = fs::remove_dir_all(format!("{directory}/{unit}.d"));
@@ -442,22 +557,32 @@ async fn a_start_that_fails_names_the_jobs_result() {
     }
     let database = Database::new(3);
     let units = Units::connect(DB_ROOT).await.unwrap();
-    // The image's unit asserts that the volume is mounted.
-    run("umount", &[database.root.to_str().unwrap()]);
-    let error = within(units.start(&database.id)).await.unwrap_err();
-    assert!(
-        matches!(&error, Error::Job { unit, result } if *unit == database.unit() && result == "assert"),
-        "{error:?}"
-    );
+    // The image's unit asserts that the agent's link exists: a volume the agent has not attached,
+    // or has taken away, is not started on, and nothing runs on its empty mount point.
+    let mut failed = Vec::new();
+    for link in ["none", "dangling"] {
+        let _ = fs::remove_file(link_path(&database.id));
+        if link == "dangling" {
+            std::os::unix::fs::symlink("/dev/mapper/pgcflab-gone", link_path(&database.id))
+                .unwrap();
+        }
+        let error = within(units.start(&database.id)).await.unwrap_err();
+        assert!(
+            matches!(&error, Error::Job { unit, result } if *unit == database.unit() && result == "assert"),
+            "{link}: {error:?}"
+        );
+        assert!(!units.state(&database.id).await.unwrap().active.awake());
+        failed.push(link);
+    }
+    assert_eq!(failed, ["none", "dangling"]);
     assert!(matches!(
         units.start("not a database").await,
         Err(Error::InvalidDatabase)
     ));
-    // Back on a volume for the guard's cleanup.
-    run(
-        "mount",
-        &["-t", "tmpfs", "tmpfs", database.root.to_str().unwrap()],
-    );
+    // The link back, and the unit starts again from it.
+    link_to(&database.id, &database.volume.device());
+    within(units.start(&database.id)).await.unwrap();
+    within(units.stop(&database.id)).await.unwrap();
 }
 
 #[tokio::test]
@@ -492,6 +617,372 @@ async fn write_limits_of_a_device_are_accepted() {
     let text = String::from_utf8(properties.stdout).unwrap();
     assert!(text.contains("16000000") && text.contains("1000"), "{text}");
 }
+
+/// Whether this process has a mount namespace of its own, as the agent has under
+/// `PrivateMounts=yes` (the module's note: run under `unshare --mount --propagation slave`).
+fn own_mount_namespace() -> bool {
+    let namespace = |pid: &str| fs::read_link(format!("/proc/{pid}/ns/mnt")).unwrap();
+    if namespace("self") != namespace("1") {
+        return true;
+    }
+    eprintln!("skipped: the test binary shares PID 1's mount namespace (unshare -m)");
+    false
+}
+/// The lines of a mount table whose mount point is `volume`.
+fn mount_lines(pid: &str, volume: &Path) -> Vec<String> {
+    fs::read_to_string(format!("/proc/{pid}/mountinfo"))
+        .unwrap()
+        .lines()
+        .filter(|line| line.split(' ').nth(4).map(Path::new) == Some(volume))
+        .map(String::from)
+        .collect()
+}
+
+/// systemd puts the devices that image dissection touches on a unit with `MountImages=` (unit.c,
+/// `unit_patch_contexts`), and the unit's `PrivateDevices=yes` closed policy and empty capability
+/// set keep the database's user from any of them: the policy is the image's `char-rtc` and these
+/// five, and nothing else.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
+async fn the_units_device_policy_is_the_image_s_closed_one_and_what_mount_images_adds() {
+    if !lab() {
+        return;
+    }
+    let database = Database::new(9);
+    let show = |property: &str| {
+        let output = Command::new("systemctl")
+            .args(["show", "-p", property, "--value", &database.unit()])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(show("DevicePolicy").trim(), "closed");
+    let mut allowed: Vec<String> = show("DeviceAllow")
+        .lines()
+        .map(String::from)
+        .filter(|line| !line.is_empty())
+        .collect();
+    allowed.sort();
+    assert_eq!(
+        allowed,
+        [
+            "/dev/loop-control rw",
+            "/dev/mapper/control rw",
+            "block-blkext rwm",
+            "block-device-mapper rwm",
+            "block-loop rwm",
+            "char-rtc r",
+        ]
+    );
+    // What neutralises it: no capability to make a device node, and a private /dev.
+    assert_eq!(show("CapabilityBoundingSet").trim(), "");
+    assert_eq!(show("PrivateDevices").trim(), "yes");
+    // The three oneshots that `MountImages=` pulls in are masked, so a start forks none of them.
+    for module in ["loop", "dm_mod", "dm_verity"] {
+        let output = Command::new("systemctl")
+            .args([
+                "show",
+                "-p",
+                "LoadState",
+                "--value",
+                &format!("modprobe@{module}.service"),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "masked",
+            "{module}"
+        );
+    }
+}
+
+/// The agent mounts the volume in its own namespace; PID 1 never sees it, and the unit mounts the
+/// same filesystem again, so that what either writes the other sees, the agent's resize and
+/// fstrim included, and the unit runs on when the agent's mount is gone.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
+async fn the_unit_and_the_agent_hold_one_filesystem_each_in_a_namespace_of_its_own() {
+    if !lab() || !own_mount_namespace() {
+        return;
+    }
+    let database = Database::new(8);
+    let id = database.id.as_str();
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    // The agent has the volume, PID 1 has not.
+    assert_eq!(mount_lines("self", &database.root).len(), 1);
+    assert!(mount_lines("1", &database.root).is_empty());
+    let started = within(units.start(id)).await.unwrap();
+    assert!(mount_lines("1", &database.root).is_empty());
+    let pid = started.main_pid.to_string();
+    let unit_mount = mount_lines(&pid, &database.root);
+    assert_eq!(unit_mount.len(), 1, "{unit_mount:?}");
+    assert!(
+        unit_mount[0].contains(" rw,nosuid,nodev,noexec,noatime "),
+        "{unit_mount:?}"
+    );
+    assert!(!unit_mount[0].contains(" ro,"), "{unit_mount:?}");
+    let seen_by_unit =
+        |name: &str| Path::new(&format!("/proc/{pid}/root/var/lib/pgcf/db/{id}")).join(name);
+
+    // One superblock: each side sees what the other writes at once.
+    fs::write(database.root.join("agent-wrote"), "a").unwrap();
+    assert_eq!(
+        fs::read_to_string(seen_by_unit("agent-wrote")).unwrap(),
+        "a"
+    );
+    fs::write(seen_by_unit("unit-wrote"), "u").unwrap();
+    assert_eq!(
+        fs::read_to_string(database.root.join("unit-wrote")).unwrap(),
+        "u"
+    );
+
+    // The agent grows the device and the filesystem while the unit runs: both see it.
+    let blocks = |path: &Path| {
+        let output = Command::new("stat")
+            .args(["-f", "-c", "%b", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let before = blocks(&database.root);
+    let bigger = 192u64 << 20;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&database.volume.image)
+        .unwrap()
+        .set_len(bigger)
+        .unwrap();
+    run("losetup", &["-c", &database.volume.loop_device]);
+    run("dmsetup", &["suspend", &database.volume.mapper]);
+    run(
+        "dmsetup",
+        &[
+            "reload",
+            &database.volume.mapper,
+            "--table",
+            &format!(
+                "0 {} linear {} 0",
+                bigger / 512,
+                database.volume.loop_device
+            ),
+        ],
+    );
+    run("dmsetup", &["resume", &database.volume.mapper]);
+    run(
+        "resize2fs",
+        &[
+            &database.volume.device(),
+            &format!("{}K", (bigger - crate::storage::FS_END_GAP_BYTES) / 1024),
+        ],
+    );
+    assert!(blocks(&database.root) > before);
+    assert_eq!(blocks(&database.root), blocks(&seen_by_unit("")));
+    // fstrim from the agent's namespace reaches the filesystem the unit has mounted as well.
+    run("fstrim", &[database.root.to_str().unwrap()]);
+
+    // The agent's namespace ends (an agent restart): the unit has its own mount and runs on.
+    run("umount", &[database.root.to_str().unwrap()]);
+    assert!(mount_lines("self", &database.root).is_empty());
+    assert_eq!(
+        units.state(id).await.unwrap().main_pid,
+        Some(started.main_pid)
+    );
+    assert!(std::os::unix::net::UnixStream::connect(&started.socket).is_ok());
+    assert!(Path::new(&format!("/proc/{pid}")).exists());
+    // A repair is refused while the unit holds the device: e2fsck takes the device exclusively.
+    let refused = Command::new("e2fsck")
+        .args(["-p", &database.volume.device()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        refused.status.code(),
+        Some(8),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    within(units.stop(id)).await.unwrap();
+    // The unit stopped: the device is free, and the filesystem is clean.
+    let repaired = Command::new("e2fsck")
+        .args(["-p", &database.volume.device()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        repaired.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    // The agent mounts it again as after its restart, and the data is there.
+    run(
+        "mount",
+        &[
+            "-t",
+            "ext4",
+            "-o",
+            "nosuid,nodev,noexec,noatime",
+            &database.volume.device(),
+            database.root.to_str().unwrap(),
+        ],
+    );
+    assert!(database.root.join("data/PG_VERSION").exists());
+    assert_eq!(
+        fs::read_to_string(database.root.join("agent-wrote")).unwrap(),
+        "a"
+    );
+}
+
+/// What a database's user sees and may do in the unit's sandbox, as the user: its own volume is
+/// writable and the other databases' directories are empty and not writable, nothing else is
+/// writable, it has no capability and no network. What the sandbox does not hide, the same as
+/// before the unit mounted its volume itself: the ids of the other databases in the device-mapper
+/// names of sysfs and in the cgroup tree, and what a neighbour that runs does.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
+async fn a_database_user_writes_its_own_volume_and_sees_the_neighbours_only_where_the_kernel_shows_them()
+ {
+    if !lab() || !own_mount_namespace() {
+        return;
+    }
+    let (own, other) = (Database::new(11), Database::new(12));
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    within(units.start(&other.id)).await.unwrap();
+    let dropin = format!("/run/systemd/system/{}.d", own.unit());
+    let _cleanup = scopeguard(|| {
+        let _ = fs::remove_dir_all(&dropin);
+        let _ = fs::remove_dir_all("/usr/local/lib/pgcf-lab");
+        let _ = fs::remove_dir("/srv/ww");
+        quiet("systemctl", &["daemon-reload"]);
+    });
+    // A world-writable directory of the root filesystem: the sandbox's read-only system keeps
+    // the user out of it.
+    fs::create_dir_all("/srv/ww").unwrap();
+    run("chmod", &["1777", "/srv/ww"]);
+    let script = Path::new("/usr/local/lib/pgcf-lab/probe.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    fs::write(script, PROBE).unwrap();
+    run("chmod", &["0755", script.to_str().unwrap()]);
+    fs::create_dir_all(&dropin).unwrap();
+    fs::write(
+        format!("{dropin}/probe.conf"),
+        format!(
+            "[Service]\nType=oneshot\nNotifyAccess=none\nExecStart=\nExecStart={} {} {}\nTimeoutStartSec=60\n",
+            script.display(),
+            own.id,
+            other.id
+        ),
+    )
+    .unwrap();
+    run("systemctl", &["daemon-reload"]);
+    let ended = Command::new("systemctl")
+        .args(["start", &own.unit()])
+        .output()
+        .unwrap();
+    assert!(
+        ended.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ended.stderr)
+    );
+    let report = fs::read_to_string(format!("/run/pgcf/{}/probe.txt", own.id)).unwrap();
+    let field = |name: &str| -> String {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("{name} in\n{report}"))
+            .to_string()
+    };
+    assert_eq!(field("uid"), own.uid.to_string());
+    // No capability, no network.
+    assert_eq!(field("cap_eff"), "0000000000000000");
+    assert_eq!(field("network").trim(), "lo");
+    // Its own volume: a mount of its own, read-write, nosuid, nodev, noexec and noatime.
+    assert_eq!(field("own_mounts"), "1");
+    assert_eq!(field("own_options"), "rw,nosuid,nodev,noexec,noatime");
+    assert_eq!(field("own_write"), "yes");
+    // No other volume in its mount table, and their directories are empty, not writable.
+    assert_eq!(field("volume_mounts"), "1");
+    assert_eq!(field("other_in_mountinfo"), "0");
+    assert_eq!(field("other_entries"), "0");
+    assert_eq!(field("other_write"), "no");
+    assert_eq!(field("list_volumes"), "no");
+    // The system is read-only, a world-writable directory included.
+    assert_eq!(field("system_write"), "no");
+    // The device policy of the unit allows the block devices that image dissection touches, and
+    // what keeps its user from them is this: a private /dev with the character nodes of any
+    // /dev and no block node, no capability to make one, and neither the device-mapper node of
+    // a volume nor the volume's own device to open, by number or by name.
+    assert_eq!(field("block_nodes"), "0");
+    assert!(
+        field("character_nodes").parse::<u32>().unwrap() > 0,
+        "{report}"
+    );
+    for attempt in [
+        "mknod_block",
+        "open_dm_node",
+        "open_own_device",
+        "open_other_device",
+    ] {
+        assert_eq!(field(attempt), "no", "{attempt}\n{report}");
+    }
+    // What stays visible, as before: the device-mapper names, and a neighbour's cgroup.
+    assert!(
+        field("dm_names").contains(&format!("pgcflab-{}", other.id)),
+        "{report}"
+    );
+    assert!(
+        field("cgroup_siblings").contains(&format!("pgcf-pg@{}.service", other.id)),
+        "{report}"
+    );
+    within(units.stop(&other.id)).await.unwrap();
+}
+
+/// Runs `cleanup` when dropped.
+struct Guard<F: FnMut()>(F);
+impl<F: FnMut()> Drop for Guard<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+fn scopeguard<F: FnMut()>(cleanup: F) -> Guard<F> {
+    Guard(cleanup)
+}
+
+/// The probe of the sandbox: `probe.sh <own id> <other id>`, run as the database's user in the
+/// unit's sandbox, writing what it found to its own socket directory.
+const PROBE: &str = r#"#!/bin/sh
+me=$1; other=$2
+t() { "$@" >/dev/null 2>&1 && echo yes || echo no; }
+mine=/var/lib/pgcf/db/$me
+cgroup=$(sed 's#^0::##' /proc/self/cgroup)
+{
+echo "uid=$(id -u)"
+echo "cap_eff=$(grep CapEff /proc/self/status | cut -f2)"
+echo "network=$(ls /sys/class/net | tr '\n' ' ')"
+echo "own_mounts=$(grep -c " $mine " /proc/self/mountinfo)"
+echo "own_options=$(awk -v p=$mine '$5==p {print $6}' /proc/self/mountinfo)"
+echo "own_write=$(t touch $mine/probe.tmp)"
+echo "volume_mounts=$(grep -c ' /var/lib/pgcf/db/' /proc/self/mountinfo)"
+echo "other_in_mountinfo=$(grep -c "$other" /proc/self/mountinfo)"
+echo "other_entries=$(ls -A /var/lib/pgcf/db/$other 2>/dev/null | wc -l)"
+echo "other_write=$(t touch /var/lib/pgcf/db/$other/probe.tmp)"
+echo "list_volumes=$(t ls /var/lib/pgcf/db)"
+echo "system_write=$(t touch /srv/ww/probe.tmp)"
+dm=$(cat "$(ls -d /sys/block/dm-* | head -1)/dev")
+echo "block_nodes=$(find /dev -type b 2>/dev/null | wc -l)"
+echo "character_nodes=$(find /dev -type c 2>/dev/null | wc -l)"
+echo "mknod_block=$(t mknod $mine/block-node b ${dm%:*} ${dm#*:})"
+echo "open_dm_node=$(t sh -c ": < /dev/dm-${dm#*:}")"
+echo "open_own_device=$(t sh -c ": < /dev/mapper/pgcflab-$me")"
+echo "open_other_device=$(t sh -c ": < /dev/mapper/pgcflab-$other")"
+echo "dm_names=$(cat /sys/block/dm-*/dm/name 2>/dev/null | tr '\n' ' ')"
+echo "cgroup_siblings=$(ls /sys/fs/cgroup$(dirname $cgroup) 2>/dev/null | tr '\n' ' ')"
+} > /run/pgcf/$me/probe.txt
+rm -f $mine/probe.tmp
+"#;
 
 /// Removes what `set_slice_memory` left on the image's slice, so the next run starts from it.
 struct Slice;

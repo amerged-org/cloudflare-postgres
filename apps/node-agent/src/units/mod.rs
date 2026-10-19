@@ -38,6 +38,10 @@ use zbus::{proxy::CacheProperties, zvariant::OwnedObjectPath};
 /// Where the database volumes are mounted: `<DB_ROOT>/<id>` holds the data directory `data`.
 pub const DB_ROOT: &str = "/var/lib/pgcf/db";
 
+/// The directory of the device links: `<DEVICE_LINKS>/<id>` is what `MountImages=` and
+/// `AssertPathExists=` of `pgcf-pg@.service` name (`storage::Config::device_links`).
+pub const DEVICE_LINKS: &str = "/run/pgcf/dev";
+
 /// The slice that holds every database unit (`Slice=` of `pgcf-pg@.service`).
 const SLICE: &str = "pgcf.slice";
 
@@ -531,7 +535,7 @@ impl Units {
 }
 
 #[cfg(test)]
-mod lab;
+pub(crate) mod lab;
 
 /// A fresh, private directory path below the temporary directory for a test, kept short because a
 /// Unix socket path must fit in `sun_path`. The test creates and removes it.

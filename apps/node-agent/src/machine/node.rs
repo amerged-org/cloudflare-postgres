@@ -92,6 +92,12 @@ impl Node {
             users: Mutex::new(users),
         })
     }
+    /// The agent's start, and only the agent's (not the check's, which runs `connect` too): the
+    /// device links of an earlier agent are dropped, because the namespace that held the volumes
+    /// they name is gone. Each volume gets its link back when it is attached.
+    pub async fn reset_device_links(&self) -> Result<(), storage::Error> {
+        self.storage(|storage| storage.reset_device_links()).await
+    }
     /// The user of the scratch database that `pgcf-agent check` makes, or finds: a system account
     /// of the system's own uid range. The agent's table of uids stays the running agent's alone;
     /// a second process, the check, never writes it.
@@ -132,6 +138,59 @@ impl Node {
         tokio::task::spawn_blocking(move || call(&storage))
             .await
             .map_err(|error| storage::Error::Io(io::Error::other(error)))?
+    }
+
+    /// The gateway's environment file and the Tunnel's token, each where its unit reads it, and
+    /// the two units started, or restarted when `restart`.
+    async fn apply_gateway_credentials(
+        &self,
+        node: &NodeIdentity,
+        credentials: &serde_json::Value,
+        restart: bool,
+    ) -> io::Result<()> {
+        use crate::link::file::{create_private_directory, sync_directory, write_private};
+        let directory = self.layout.state.join("credentials");
+        create_private_directory(&directory)?;
+        write_private(
+            &directory.join("gateway.env"),
+            gateway_environment(node, credentials)?.as_bytes(),
+        )?;
+        // The Tunnel token becomes an encrypted systemd credential: through a file, since a
+        // command line is public to the node's users.
+        let token = credentials["tunnel_token"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("no Tunnel token"))?;
+        let work = directory.join(".tunnel-token.work");
+        let _ = std::fs::remove_dir_all(&work);
+        create_private_directory(&work)?;
+        write_private(&work.join("token"), token.as_bytes())?;
+        let encrypted = run(
+            "systemd-creds",
+            &[
+                "encrypt",
+                "--with-key=host",
+                "--name=tunnel-token",
+                &work.join("token").to_string_lossy(),
+                &work.join("tunnel-token.cred").to_string_lossy(),
+            ],
+        )
+        .await;
+        let moved = encrypted.and_then(|()| {
+            std::fs::rename(
+                work.join("tunnel-token.cred"),
+                directory.join("tunnel-token.cred"),
+            )?;
+            sync_directory(&directory)
+        });
+        let _ = std::fs::remove_dir_all(&work);
+        moved?;
+        for unit in ["pgcf-gateway.service", "pgcf-cloudflared.service"] {
+            self.units
+                .start_service(unit, restart)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -218,6 +277,31 @@ impl Machine for Node {
     async fn has_volume(&self, id: &VolumeId) -> Result<bool, storage::Error> {
         let id = id.clone();
         self.storage(move |storage| storage.exists(&id)).await
+    }
+
+    fn attached(&self, id: &VolumeId) -> bool {
+        self.storage.attached(id)
+    }
+
+    async fn unit_volume(&self, database: &str) -> Result<Option<VolumeId>, storage::Error> {
+        let unit = self
+            .units
+            .state(database)
+            .await
+            .map_err(|_| storage::Error::Unexpected("the state of the database's unit"))?;
+        if !unit.active.awake() {
+            return Ok(None);
+        }
+        let pid = unit.main_pid.ok_or(storage::Error::Unexpected(
+            "a unit that runs without a main process",
+        ))?;
+        let database = database.to_string();
+        let volume = self
+            .storage(move |storage| storage.volume_mounted_by(pid, &database))
+            .await?;
+        volume.map(Some).ok_or(storage::Error::Unexpected(
+            "a unit that runs without its volume",
+        ))
     }
 
     async fn mount_volumes(
@@ -380,49 +464,23 @@ impl Machine for Node {
         credentials: &serde_json::Value,
         restart: bool,
     ) -> io::Result<()> {
-        use crate::link::file::{create_private_directory, sync_directory, write_private};
-        let directory = self.layout.state.join("credentials");
-        create_private_directory(&directory)?;
-        write_private(
-            &directory.join("gateway.env"),
-            gateway_environment(node, credentials)?.as_bytes(),
-        )?;
-        // The Tunnel token becomes an encrypted systemd credential: through a file, since a
-        // command line is public to the node's users.
-        let token = credentials["tunnel_token"]
-            .as_str()
-            .ok_or_else(|| io::Error::other("no Tunnel token"))?;
-        let work = directory.join(".tunnel-token.work");
-        let _ = std::fs::remove_dir_all(&work);
-        create_private_directory(&work)?;
-        write_private(&work.join("token"), token.as_bytes())?;
-        let encrypted = run(
-            "systemd-creds",
-            &[
-                "encrypt",
-                "--with-key=host",
-                "--name=tunnel-token",
-                &work.join("token").to_string_lossy(),
-                &work.join("tunnel-token.cred").to_string_lossy(),
-            ],
-        )
-        .await;
-        let moved = encrypted.and_then(|()| {
-            std::fs::rename(
-                work.join("tunnel-token.cred"),
-                directory.join("tunnel-token.cred"),
-            )?;
-            sync_directory(&directory)
-        });
-        let _ = std::fs::remove_dir_all(&work);
-        moved?;
-        for unit in ["pgcf-gateway.service", "pgcf-cloudflared.service"] {
-            self.units
-                .start_service(unit, restart)
-                .await
-                .map_err(|error| io::Error::other(error.to_string()))?;
+        // The shell's key first, so that a shell Cloudflare turned off is closed whatever fails
+        // below, and a failure here does not keep the gateway from starting: the error is
+        // returned at the end, the revision stays unapplied, and the next page reads the
+        // credentials again.
+        let shell = crate::shell_ca::apply(
+            &self.layout.ssh_user_ca,
+            crate::shell_ca::key_of(credentials),
+        );
+        if let Ok(change) = shell
+            && let Some(event) = change.event()
+        {
+            crate::timing::emit_event(serde_json::json!({ "event": event }));
         }
-        Ok(())
+        let gateway = self
+            .apply_gateway_credentials(node, credentials, restart)
+            .await;
+        gateway.and(shell.map(|_| ()))
     }
 
     async fn restart_service(&self, unit: &str) -> Result<(), units::Error> {
@@ -655,9 +713,11 @@ mod tests {
 #[cfg(test)]
 mod lab {
     //! The node's machine against a real systemd as PID 1, LVM on a loop device and PostgreSQL 18.
-    //! It runs as root in the lab with the node image's units (`pgcf-pg@.service`, `pgcf.slice`) and a
-    //! group `pgcf-gateway`, with `--ignored`; anywhere else it is skipped. It makes users, a volume
-    //! group and a database, and removes them again.
+    //! It runs as root in the lab with the node image's units (`pgcf-pg@.service`, `pgcf.slice`, the
+    //! masks of `modprobe@loop`, `@dm_mod` and `@dm_verity`) and a group `pgcf-gateway`, with
+    //! `--ignored`; anywhere else it is skipped. It makes users, a volume group and a database, and
+    //! removes them again. Like the units' lab it belongs under `unshare --mount --propagation
+    //! slave`, so that its mounts stay out of PID 1's namespace as the agent's do.
     use super::*;
     use crate::{
         machine::Machine,
@@ -683,6 +743,21 @@ mod lab {
         sh("systemctl", &["show", "-p", property, "--value", unit])
     }
 
+    /// What udev does on a node and a container does not: the `/dev/dm-<minor>` node of a
+    /// device-mapper device, which systemd's image dissection reads the device number through.
+    fn dm_node(device: &str) {
+        let name = device.trim_start_matches("/dev/mapper/");
+        let info = sh(
+            "dmsetup",
+            &["info", "-c", "--noheadings", "-o", "major,minor", name],
+        );
+        let (major, minor) = info.split_once(':').unwrap();
+        let node = format!("/dev/dm-{minor}");
+        if !Path::new(&node).exists() {
+            sh("mknod", &[&node, "b", major, minor]);
+        }
+    }
+
     /// The loop device, the volume group and the users, removed again however the test ends.
     struct Lab {
         disk: PathBuf,
@@ -696,6 +771,7 @@ mod lab {
             };
             run("systemctl", &["stop", &format!("pgcf-pg@{ID}.service")]);
             run("umount", &[&format!("/var/lib/pgcf/db/{ID}")]);
+            let _ = std::fs::remove_file(format!("/run/pgcf/dev/{ID}"));
             run("vgremove", &["-f", &self.group]);
             run("losetup", &["-d", &self.loop_device]);
             run("userdel", &[&format!("pgcf-{ID}")]);
@@ -761,6 +837,14 @@ mod lab {
             (metadata.uid(), metadata.mode() & 0o777)
         };
         assert_eq!(owner(&layout.volume(ID)), (account.uid, 0o700));
+        // The agent has attached the volume, so the unit has its link, and only the agent's
+        // namespace has the mount.
+        let link = layout.device_link(ID);
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from(node.device(&volume))
+        );
+        dm_node(&node.device(&volume));
         node.prepare_socket_directory(ID, &account).unwrap();
         assert_eq!(owner(&layout.socket_directory(ID)), (account.uid, 0o750));
         let data = layout.data(ID);
@@ -804,8 +888,50 @@ mod lab {
 
         // It starts as its user, answers the agent over the socket, takes a CPU quota that its
         // stop lifts again.
+        assert!(node.attached(&volume));
+        assert_eq!(node.unit_volume(ID).await.unwrap(), None);
         let started = node.start(ID).await.unwrap();
         assert_eq!(started.uid, account.uid);
+        // The unit has mounted the volume itself, and that mount is what tells which volume it
+        // serves, whatever the agent has mounted: the agent's namespace ending (its restart)
+        // leaves the unit, its mount and the answer as they are.
+        assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
+        sh("umount", &[&format!("/var/lib/pgcf/db/{ID}")]);
+        node.reset_device_links().await.unwrap();
+        assert!(!node.attached(&volume));
+        assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
+        // The restarted agent has no mount of the volume, and the unit has: what the agent's mount
+        // table says is free is held. It is not detached, repaired or removed from under the unit,
+        // and the next generation is neither made nor mounted over it.
+        let busy = |result: Result<(), storage::Error>| {
+            assert!(matches!(result, Err(storage::Error::Busy)), "{result:?}");
+        };
+        busy(node.unmount_volume(&volume).await);
+        busy(node.recover_volume(&volume, &policy).await);
+        let ordered = Removal::DatabaseDeleted {
+            storage_generation: 1,
+        };
+        busy(node.remove_volume(&volume, ordered).await);
+        assert!(node.has_volume(&volume).await.unwrap() && !node.attached(&volume));
+        let next = VolumeId::new(ID, 2).unwrap();
+        let refused = node.create_volume(&next, 1 << 30, &account, &policy).await;
+        assert!(
+            matches!(refused, Err(storage::Error::OtherGeneration)),
+            "{refused:?}"
+        );
+        assert!(!node.has_volume(&next).await.unwrap());
+        assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
+        // The agent's unmount of a volume that a unit holds is refused: it is mounted again.
+        assert!(
+            node.mount_volumes(std::slice::from_ref(&volume))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(node.attached(&volume));
+        let busy = node.unmount_volume(&volume).await.unwrap_err();
+        assert!(matches!(busy, storage::Error::Busy), "{busy:?}");
+        assert!(node.attached(&volume));
         node.set_cpu_quota(ID, NonZeroU32::new(250)).await.unwrap();
         assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "250ms");
         let session = postgres::agent(&socket).await.unwrap();
@@ -822,6 +948,7 @@ mod lab {
         node.stop(ID).await.unwrap();
         assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "infinity");
         assert!(!node.unit(ID).await.unwrap().active.awake());
+        assert_eq!(node.unit_volume(ID).await.unwrap(), None);
 
         // The volume grows online, is trimmed, unmounted and mounted again as after a boot.
         node.grow_volume(&volume, 2 << 30).await.unwrap();
@@ -842,6 +969,14 @@ mod lab {
             listed(node.inventory().await.unwrap()),
             Some((2 << 30, false))
         );
+        // A volume that is not attached has no link: no start on its empty directory.
+        assert!(!node.attached(&volume));
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        let refused = node.start(ID).await.unwrap_err();
+        assert!(
+            matches!(&refused, units::Error::Job { result, .. } if result == "assert"),
+            "{refused:?}"
+        );
         assert!(
             node.mount_volumes(std::slice::from_ref(&volume))
                 .await
@@ -849,6 +984,21 @@ mod lab {
                 .is_empty()
         );
         assert!(data.join("PG_VERSION").exists());
+        assert!(node.attached(&volume));
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from(node.device(&volume))
+        );
+        // The agent's start drops every link; the volume gets its own back when it is attached.
+        node.reset_device_links().await.unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert!(
+            node.mount_volumes(std::slice::from_ref(&volume))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(std::fs::symlink_metadata(&link).is_ok());
 
         // The memory all databases may hold together, and what the kernel reports.
         node.set_slice_memory(300).await.unwrap();

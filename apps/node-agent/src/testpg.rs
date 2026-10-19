@@ -23,7 +23,8 @@ use std::{
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// The `bin` directory of a PostgreSQL 18, if this machine has one.
+/// The `bin` directory of a PostgreSQL 18, if this machine has one. A machine without one skips
+/// the tests that need it, except in CI (`CI` is set there), where they must run.
 pub fn bin_directory() -> Option<PathBuf> {
     let found = [
         std::env::var_os("PGCF_TEST_POSTGRES_BINDIR").map(PathBuf::from),
@@ -33,7 +34,15 @@ pub fn bin_directory() -> Option<PathBuf> {
     .into_iter()
     .flatten()
     .find(|bin| bin.join("initdb").exists());
+    found_or_skip(found, std::env::var_os("CI").is_some())
+}
+
+fn found_or_skip(found: Option<PathBuf>, in_ci: bool) -> Option<PathBuf> {
     if found.is_none() {
+        assert!(
+            !in_ci,
+            "CI must have a PostgreSQL 18 (PGCF_TEST_POSTGRES_BINDIR): a skipped test has not run"
+        );
         eprintln!("skipped: no PostgreSQL 18 (PGCF_TEST_POSTGRES_BINDIR)");
     }
     found
@@ -315,6 +324,18 @@ impl Drop for Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test that skips for want of PostgreSQL has not run. CI installs the pinned PostgreSQL 18
+    /// (`PGCF_TEST_POSTGRES_BINDIR`), so there a missing one fails the run instead of passing it.
+    #[test]
+    fn a_missing_postgresql_skips_a_test_on_a_laptop_and_fails_it_in_ci() {
+        let bin = PathBuf::from("/usr/lib/postgresql/18/bin");
+        assert_eq!(found_or_skip(Some(bin.clone()), true), Some(bin.clone()));
+        assert_eq!(found_or_skip(Some(bin.clone()), false), Some(bin));
+        assert_eq!(found_or_skip(None, false), None);
+        let ci = std::panic::catch_unwind(|| found_or_skip(None, true));
+        assert!(ci.is_err(), "a skip in CI must fail");
+    }
 
     #[tokio::test]
     async fn a_cluster_that_was_killed_recovers_and_keeps_what_it_committed() {

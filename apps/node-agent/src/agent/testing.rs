@@ -129,6 +129,7 @@ pub(crate) fn timing() -> Timing {
         watch: Duration::from_millis(100),
         recovery_retry: Duration::from_millis(100),
         recovery_retry_maximum: Duration::from_millis(400),
+        adopt_wait: Duration::from_secs(5),
         report_retry: Duration::from_millis(10),
         report_retry_maximum: Duration::from_millis(40),
         settle: Duration::from_secs(10),
@@ -281,6 +282,9 @@ impl Rig {
         );
         let timing = self.core.timing.clone();
         drop(self);
+        // The agent's mount namespace ends with it: the volumes are mounted again by the next
+        // one, which the units that run do not wait for.
+        machine.forget_mounts();
         // The old sockets close with the old tasks.
         tokio::time::sleep(Duration::from_millis(50)).await;
         Self::boot(machine, fixture, root, running, timing).await

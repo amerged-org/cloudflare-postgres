@@ -387,7 +387,7 @@ export const DatabaseHealth = z
       status: z
         .enum(DISK_HEALTH_STATUSES)
         .describe(
-          "warning: at least 90 % of the allocated storage is used; unknown: no usage sample within 180 s, or the sample measured nothing.",
+          "warning: at least 90 % of the allocated storage is used; unknown: no usage sample within 180 s, or the sample measured nothing. The node reports every volume every minute; the control plane stores a sample of an awake database's volume every minute and one of a hibernated database's (which cannot grow) each quarter hour, so a hibernated database reads unknown between its samples.",
         ),
       used_ratio: z
         .number()

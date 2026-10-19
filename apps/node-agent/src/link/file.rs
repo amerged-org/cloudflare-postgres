@@ -28,6 +28,12 @@ pub(crate) fn sync_directory(directory: &Path) -> Result<()> {
 /// written and fsynced, renamed over `path`, and the directory is fsynced. A reader sees the old
 /// content or the new, never a part.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_file(path, bytes, 0o600)
+}
+
+/// [`write_private`] for a file that others may read: it has the mode `mode`, whatever the
+/// process's umask says, from the moment it is renamed over `path`.
+pub(crate) fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let directory = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
     let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
     let mut partial = name.to_os_string();
@@ -37,10 +43,10 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o600)
+        .mode(mode)
         .open(&partial)?;
     // A partial file a crash left behind keeps the mode it was created with.
-    file.set_permissions(Permissions::from_mode(0o600))?;
+    file.set_permissions(Permissions::from_mode(mode))?;
     file.write_all(bytes)?;
     file.sync_all()?;
     std::fs::rename(&partial, path)?;

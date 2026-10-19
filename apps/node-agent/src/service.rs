@@ -80,6 +80,28 @@ pub struct ServiceConfig {
     pub timing: Timing,
     /// The gateway's user and group, who alone may reach the agent's channel.
     pub gateway: Option<(u32, u32)>,
+    /// The key that signs releases (`update::RELEASE_KEY`, which the agent's build holds). A test
+    /// signs its releases with a key of its own; the binary has no other source for it.
+    pub release_key: [u8; 32],
+}
+
+/// The credentials the agent applied: their revision, and a digest of what the gateway and the
+/// Tunnel run on (the route keyring and the Tunnel token), kept instead of the secrets themselves.
+#[derive(Clone)]
+struct AppliedCredentials {
+    revision: u64,
+    secrets: [u8; 32],
+}
+
+/// The digest of the secrets of `NodeCredentials` that the gateway and the Tunnel run on. The
+/// revision and the shell's key are not among them: a change of those restarts nothing.
+fn gateway_secrets(credentials: &Value) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let secrets = json!({
+        "tunnel_token": credentials["tunnel_token"],
+        "route_keyring": credentials["route_keyring"],
+    });
+    Sha256::digest(secrets.to_string().as_bytes()).into()
 }
 
 pub struct Service<M: Machine> {
@@ -89,12 +111,16 @@ pub struct Service<M: Machine> {
     intervals: Intervals,
     /// The archive credentials read, by identifier.
     delivered: Mutex<HashSet<String>>,
-    /// The revision of the node's credentials the agent applied.
-    credentials_revision: Mutex<Option<u64>>,
+    /// The credentials the agent applied, if it has applied any since it started.
+    credentials: Mutex<Option<AppliedCredentials>>,
     cpu: Mutex<Option<CpuTimes>>,
     tasks: Mutex<JoinSet<()>>,
     /// The release of the newest page (plan 9.3).
     release: Mutex<Option<update::Release>>,
+    /// The key a release must be signed with, and the verdict on the release last checked: a
+    /// release is trusted only when this says so (`verified`).
+    release_key: [u8; 32],
+    verdict: Mutex<Option<(update::Release, Result<(), update::ReleaseRefusal>)>>,
     /// The probes an administrator asked for that the agent has answered or is running (SEC-09).
     probes: probe::Answered,
     /// A release is being installed.
@@ -184,10 +210,12 @@ impl<M: Machine> Service<M> {
             machine: machine.clone(),
             intervals: config.intervals,
             delivered: Mutex::new(HashSet::new()),
-            credentials_revision: Mutex::new(None),
+            credentials: Mutex::new(None),
             cpu: Mutex::new(None),
             tasks: Mutex::new(JoinSet::new()),
             release: Mutex::new(None),
+            release_key: config.release_key,
+            verdict: Mutex::new(None),
             probes: probe::Answered::load(layout.agent().join("probes-done")),
             updating: AtomicBool::new(false),
             restart: Notify::new(),
@@ -202,6 +230,10 @@ impl<M: Machine> Service<M> {
         service.spawn(async move {
             archive.serve(listener).await;
         });
+        // The agent's mounts of the volumes are made first: a start that was in flight when the
+        // agent began reads its database's `postmaster.pid` through them, and the namespace of the
+        // agent before is gone with its mounts.
+        service.boot(&page).await;
         // Starts that were in flight when the agent began end with their units' answers.
         for permit in resumed {
             let (machine, database) = (machine.clone(), permit.database().to_string());
@@ -212,8 +244,6 @@ impl<M: Machine> Service<M> {
                 }
             });
         }
-
-        service.boot(&page).await;
         service.pull_page(page).await;
         // The link stands: the previous boot's journal goes to Cloudflare, if there was a boot.
         let s = service.clone();
@@ -276,7 +306,10 @@ impl<M: Machine> Service<M> {
 
     /// What the first page of a boot does (plan 5.6 job 4, 4.3): the memory ceiling of all
     /// databases and the volumes of the page's databases mounted, and again what the agent
-    /// restored when it started (`restore_runtime`), now that the mounts are there.
+    /// restored when it started (`restore_runtime`), now that the mounts are there. The mounts
+    /// are the agent's own, in its mount namespace, which a restart of the agent ends: it makes
+    /// them all again, so a node serves no wake before they are made (databases that run are not
+    /// touched: their units have mounts of their own).
     async fn boot(&self, page: &Page) {
         let budget = self.core.policy().admission.admission.awake_budget_mib;
         let _ = self.machine.set_slice_memory(budget).await;
@@ -341,13 +374,19 @@ impl<M: Machine> Service<M> {
     }
 
     /// The Tunnel token and the route keyring, when the page names a newer revision than the one
-    /// applied: the gateway and the Tunnel start with them (plan 8).
+    /// applied: the gateway and the Tunnel start with them (plan 8). The revision also rises when
+    /// only the operator shell's state changed; the gateway and the Tunnel restart for a change of
+    /// their own secrets alone, because a restart ends every client connection of the node.
     async fn apply_credentials(&self, page: &Page) {
-        let applied = *self
-            .credentials_revision
+        let applied = self
+            .credentials
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if applied.is_some_and(|applied| applied >= page.credentials_revision) {
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if applied
+            .as_ref()
+            .is_some_and(|applied| applied.revision >= page.credentials_revision)
+        {
             return;
         }
         let credentials = match self.link.credentials().await {
@@ -360,16 +399,21 @@ impl<M: Machine> Service<M> {
             }
         };
         let revision = credentials["revision"].as_u64().unwrap_or(0);
+        let secrets = gateway_secrets(&credentials);
+        let restart = applied
+            .as_ref()
+            .is_some_and(|applied| applied.secrets != secrets);
         match self
             .machine
-            .apply_credentials(self.link.node(), &credentials, applied.is_some())
+            .apply_credentials(self.link.node(), &credentials, restart)
             .await
         {
             Ok(()) => {
                 *self
-                    .credentials_revision
+                    .credentials
                     .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(revision);
+                    .unwrap_or_else(PoisonError::into_inner) =
+                    Some(AppliedCredentials { revision, secrets });
             }
             Err(error) => crate::timing::emit_event(json!({
                 "event": "credentials_not_applied",
@@ -462,10 +506,72 @@ impl<M: Machine> Service<M> {
         });
     }
 
+    /// Whether the release key signed `release` (plan 8, 9.3): nothing of a release is downloaded,
+    /// staged or installed, and no package of its lock is planned, before this says so. The signature
+    /// is the file the API serves beside the binaries. The verdict on the release last checked is
+    /// kept, so that the signature is read once however many pages name the release. The error
+    /// names the class: a refusal of the contract (`RELEASE_REFUSALS`), reported once as the event
+    /// `release_refused`, or `signature_not_read` when the API could not be asked, which is not
+    /// kept and is tried again.
+    async fn verified(&self, release: &update::Release) -> Result<(), &'static str> {
+        if let Some((checked, verdict)) =
+            &*self.verdict.lock().unwrap_or_else(PoisonError::into_inner)
+            && checked == release
+        {
+            return verdict.map_err(update::ReleaseRefusal::code);
+        }
+        let verdict = match self.read_signature(release).await {
+            Ok(Some(signature)) => update::verify(&self.release_key, release, &signature),
+            Ok(None) => Err(update::ReleaseRefusal::SignatureMissing),
+            Err(error) => {
+                crate::timing::emit_event(json!({
+                    "event": "release_not_installed", "release": release.id,
+                    "class": crate::diagnostics::error_code(&error),
+                }));
+                return Err("signature_not_read");
+            }
+        };
+        if let Err(refusal) = verdict {
+            crate::timing::emit_event(json!({
+                "event": "release_refused", "release": release.id, "class": refusal.code(),
+            }));
+        }
+        *self.verdict.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((release.clone(), verdict));
+        verdict.map_err(update::ReleaseRefusal::code)
+    }
+
+    /// The signature the API serves for the release: `None` if it serves none (404, or no place to
+    /// ask for it).
+    async fn read_signature(&self, release: &update::Release) -> Result<Option<Vec<u8>>, Error> {
+        let Some(url) = release.signature_url() else {
+            return Ok(None);
+        };
+        match self
+            .link
+            .fetch_bytes(&url, update::SIGNATURE_MAX_BYTES)
+            .await
+        {
+            Ok(signature) => Ok(Some(signature)),
+            Err(error)
+                if error
+                    .downcast_ref::<crate::api::Refusal>()
+                    .is_some_and(|refusal| refusal.status == 404) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Installs the release's binaries, and restarts what runs one that changed: the gateway
     /// (its sessions reconnect) and then the agent, which exits and is started by systemd from the
-    /// new link. The databases keep running: they are units of their own.
+    /// new link. The databases keep running: they are units of their own. A release that the key
+    /// did not sign is not touched: the node keeps what it runs.
     async fn install(&self, release: &update::Release, bin: &std::path::Path) {
+        if self.verified(release).await.is_err() {
+            return;
+        }
         let link = self.link.clone();
         let switched = update::install_binaries(bin, release, |pinned, path| {
             let link = link.clone();
@@ -581,6 +687,8 @@ impl<M: Machine> Service<M> {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or("release_missing")?;
+        // The lock names what apt installs as root: the key must have signed the release first.
+        self.verified(&release).await?;
         let work = self.machine.layout().agent().join("packages");
         let outcome = self.install_packages(&release, &work).await;
         let _ = std::fs::remove_dir_all(&work);
@@ -761,10 +869,12 @@ impl<M: Machine> Service<M> {
             volumes_mounted: mounted,
             archive: self.core.archive_summary(),
             awake: &awake,
-            credentials_revision: *self
-                .credentials_revision
+            credentials_revision: self
+                .credentials
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner),
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .map(|applied| applied.revision),
         });
         if let Err(error) = self.link.post_samples(&sample).await {
             crate::timing::emit_event(json!({
@@ -871,6 +981,9 @@ mod tests {
         wake::Outcome,
     };
 
+    const SHELL_CA: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp";
+
     fn quick() -> Intervals {
         Intervals {
             sample: Duration::from_millis(300),
@@ -881,6 +994,51 @@ mod tests {
             batch: Duration::from_millis(50),
         }
     }
+    #[test]
+    fn a_change_of_the_shell_or_the_revision_alone_does_not_restart_the_gateway_and_a_change_of_its_secrets_does()
+     {
+        let credentials = |revision: u64, token: &str, key: &str, shell: Option<&str>| {
+            let mut credentials = json!({
+                "revision": revision,
+                "tunnel_token": token,
+                "route_keyring": {"active": "k1", "keys": {"k1": key}},
+            });
+            if let Some(shell) = shell {
+                credentials["shell_ca_public_key"] = shell.into();
+            }
+            credentials
+        };
+        let base = gateway_secrets(&credentials(3, "token-a", "key-a", None));
+        // The revision and the shell's key are not secrets of the gateway or the Tunnel.
+        assert_eq!(
+            base,
+            gateway_secrets(&credentials(4, "token-a", "key-a", None))
+        );
+        assert_eq!(
+            base,
+            gateway_secrets(&credentials(
+                5,
+                "token-a",
+                "key-a",
+                Some("ssh-ed25519 AAAA")
+            ))
+        );
+        // The Tunnel's token and any key of the route keyring are.
+        assert_ne!(
+            base,
+            gateway_secrets(&credentials(3, "token-b", "key-a", None))
+        );
+        assert_ne!(
+            base,
+            gateway_secrets(&credentials(3, "token-a", "key-b", None))
+        );
+        let rotated = json!({
+            "revision": 3, "tunnel_token": "token-a",
+            "route_keyring": {"active": "k2", "keys": {"k1": "key-a", "k2": "key-b"}},
+        });
+        assert_ne!(base, gateway_secrets(&rotated));
+    }
+
     fn observed(cloud: &crate::link::test_server::Cloud, id: &str, state: &str) -> bool {
         cloud
             .acknowledged("/node/v1/observations")
@@ -934,6 +1092,7 @@ mod tests {
                 intervals: quick(),
                 timing: timing(),
                 gateway: None,
+                release_key: test_release_key(),
             },
         )
         .await
@@ -971,6 +1130,48 @@ mod tests {
             )]
         );
         assert_eq!(machine.slice_memory_mib(), Some(9913));
+        // The operator shell is turned on: the revision rises and the credentials carry the CA's
+        // key, and the gateway and the Tunnel are not restarted. A new Tunnel token restarts them.
+        let applied = |revision: u64, restart: bool| {
+            (
+                "eu-dev".to_string(),
+                crate::link::test_server::NODE_ID.to_string(),
+                revision,
+                restart,
+            )
+        };
+        let mut credentials = crate::link::test_server::vector("NodeCredentials", "credentials");
+        credentials["revision"] = 4.into();
+        credentials["shell_ca_public_key"] = SHELL_CA.into();
+        cloud.with(|inner| inner.credentials = Some(credentials.clone()));
+        cloud.push(serde_json::json!({"type": "desired", "ids": [id]}));
+        eventually(30, "the credentials of the shell", || {
+            machine.credentials_applied().len() == 2
+        })
+        .await;
+        assert_eq!(machine.credentials_applied()[1], applied(4, false));
+        credentials["revision"] = 5.into();
+        credentials["tunnel_token"] = "eyJ".repeat(40).into();
+        cloud.with(|inner| inner.credentials = Some(credentials.clone()));
+        cloud.push(serde_json::json!({"type": "desired", "ids": [id]}));
+        eventually(30, "the credentials of a new Tunnel token", || {
+            machine.credentials_applied().len() == 3
+        })
+        .await;
+        assert_eq!(machine.credentials_applied()[2], applied(5, true));
+        // The shell turned off again: a revision and no key, and again nothing restarts.
+        credentials["revision"] = 6.into();
+        credentials
+            .as_object_mut()
+            .unwrap()
+            .remove("shell_ca_public_key");
+        cloud.with(|inner| inner.credentials = Some(credentials.clone()));
+        cloud.push(serde_json::json!({"type": "desired", "ids": [id]}));
+        eventually(30, "the credentials without the shell", || {
+            machine.credentials_applied().len() == 4
+        })
+        .await;
+        assert_eq!(machine.credentials_applied()[3], applied(6, false));
         // The database is served, and the meter says for how long.
         eventually(30, "the usage of the served database", || {
             cloud
@@ -1079,6 +1280,7 @@ mod tests {
             intervals: quick(),
             timing: timing(),
             gateway: None,
+            release_key: test_release_key(),
         };
         let db = new_entry_json();
         let id = db["id"].as_str().unwrap().to_string();
@@ -1152,8 +1354,43 @@ mod tests {
         let _ = std::fs::remove_file(bin.join("current"));
         std::os::unix::fs::symlink(bin.join(id), bin.join("current")).unwrap();
     }
+    /// A key pair for the signatures of a test; nothing of the private half is kept.
+    fn throwaway_key() -> ring::signature::Ed25519KeyPair {
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    }
+    /// The release key of the tests: made once for the test process, which the agents of the
+    /// tests are built with (`ServiceConfig::release_key`) and which signs the releases of
+    /// `release_of`.
+    fn test_key() -> &'static ring::signature::Ed25519KeyPair {
+        static KEY: std::sync::LazyLock<ring::signature::Ed25519KeyPair> =
+            std::sync::LazyLock::new(throwaway_key);
+        &KEY
+    }
+    fn test_release_key() -> [u8; 32] {
+        use ring::signature::KeyPair;
+        test_key().public_key().as_ref().try_into().unwrap()
+    }
+    /// The URL path under which the double serves the signature of `release` (a page's release).
+    fn signature_path(cloud: &Cloud, release: &Value) -> String {
+        let url = update::Release::parse(release)
+            .unwrap()
+            .signature_url()
+            .unwrap();
+        url.strip_prefix(&cloud.url("")).unwrap().to_string()
+    }
+    /// Serves the signature that `key` makes of the release, where the agent reads it.
+    fn sign_release(cloud: &Cloud, release: &Value, key: &ring::signature::Ed25519KeyPair) {
+        let manifest = update::Release::parse(release).unwrap().manifest();
+        cloud.serve_file(
+            &signature_path(cloud, release),
+            update::hex(key.sign(&manifest).as_ref()),
+        );
+    }
     /// The release `id` as the page names it: its binaries served by the double, and the package
-    /// lock, which is `lock` (served too).
+    /// lock, which is `lock` (served too), and its signature by the key of the tests.
     fn release_of(cloud: &Cloud, id: &str, files: &[(&str, &[u8])], lock: &[u8]) -> Value {
         let pin = |name: &str, bytes: &[u8]| {
             let url = cloud.serve_file(&format!("/files/{id}/{name}"), bytes.to_vec());
@@ -1163,11 +1400,13 @@ mod tests {
             .iter()
             .map(|(name, bytes)| (name.to_string(), pin(name, bytes)))
             .collect();
-        json!({
+        let release = json!({
             "id": id, "binaries": binaries,
             "os": {"image_version": "25", "debian_snapshot": "20261016T000000Z",
                    "package_lock": pin("packages.lock.json", lock)}
-        })
+        });
+        sign_release(cloud, &release, test_key());
+        release
     }
     const NAMES: [&str; 4] = [
         "pgcf-agent",
@@ -1209,6 +1448,7 @@ mod tests {
                 intervals: quick(),
                 timing: timing(),
                 gateway: None,
+                release_key: test_release_key(),
             },
         )
         .await
@@ -1480,6 +1720,138 @@ mod tests {
                 .calls()
                 .iter()
                 .all(|call| !call.contains("cloudflared")),
+            "{:?}",
+            machine.calls()
+        );
+        service.stop();
+    }
+
+    /// The node reported refusing the release with this class (the event `release_refused`).
+    fn refused(release: &str, class: &str) -> bool {
+        crate::events::seen().iter().any(|event| {
+            event["event"] == "release_refused"
+                && event["fields"]["release"] == release
+                && event["fields"]["class"] == class
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_release_the_key_did_not_sign_is_refused_with_its_class_and_nothing_of_it_is_downloaded()
+     {
+        let Some((machine, _fixture, _root)) =
+            site("update-unsigned", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        runs(&machine, "r0", &same(b"old"));
+        let cloud = Cloud::start().await;
+        let mut files = same(b"old");
+        files[0].1 = b"new agent";
+        files[1].1 = b"new gateway";
+        // The API serves no signature for the first release.
+        let unsigned = release_of(&cloud, "r1-unsigned", &files, b"{}");
+        cloud.with(|inner| {
+            inner.files.remove(&signature_path(&cloud, &unsigned));
+            inner.release = Some(unsigned);
+        });
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(30, "the release to be refused as unsigned", || {
+            refused("r1-unsigned", "release_signature_missing")
+        })
+        .await;
+
+        // A signature of another key is no better: a new page names the second release.
+        let forged = release_of(&cloud, "r2-forged", &files, b"{}");
+        sign_release(&cloud, &forged, &throwaway_key());
+        cloud.with(|inner| inner.release = Some(forged));
+        cloud.push(json!({"type": "desired"}));
+        eventually(30, "the release to be refused as forged", || {
+            refused("r2-forged", "release_signature_invalid")
+        })
+        .await;
+
+        // Nothing of either was downloaded or staged, and the node still runs what it ran.
+        let bin = machine.layout().state.join("bin");
+        for id in ["r1-unsigned", "r2-forged"] {
+            assert!(
+                cloud.requests().iter().all(|seen| !seen
+                    .path()
+                    .starts_with(&format!("/files/{id}/pgcf-"))
+                    && !seen.path().starts_with(&format!("/files/{id}/packages"))),
+                "{id}"
+            );
+            assert!(!bin.join(id).exists(), "{id}");
+        }
+        assert_eq!(crate::update::current_release(&bin).as_deref(), Some("r0"));
+        assert!(
+            machine.calls().iter().all(|call| !call.contains("restart")),
+            "{:?}",
+            machine.calls()
+        );
+
+        // A release that the key signed is installed on the same node: a refusal is not a stop.
+        let signed = release_of(&cloud, "r3-signed", &files, b"{}");
+        cloud.with(|inner| inner.release = Some(signed));
+        cloud.push(json!({"type": "desired"}));
+        eventually(30, "the signed release to be installed", || {
+            crate::update::current_release(&bin).as_deref() == Some("r3-signed")
+        })
+        .await;
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_maintenance_order_of_a_release_the_key_did_not_sign_installs_nothing_and_fails_with_the_class()
+     {
+        let Some((machine, _fixture, _root)) = site("maintenance-unsigned", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1", &same(b"bin"));
+        machine.set_packages(&[("bash", "5.1")]);
+        let cloud = Cloud::start().await;
+        let lock = json!({"packages": [
+            {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
+        ], "extra": []})
+        .to_string();
+        // The page names the release the node runs, so no install is tried, and its lock would
+        // put packages on the node as root: the signature is another key's.
+        let release = release_of(&cloud, "r1", &same(b"bin"), lock.as_bytes());
+        sign_release(&cloud, &release, &throwaway_key());
+        let operation = "op_mmmmmmmmmmmmmmmmmmmm";
+        cloud.with(|inner| {
+            inner.release = Some(release);
+            inner.orders = vec![json!({"type": "maintenance", "operation": operation})];
+        });
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(60, "the order to fail as unsigned", || {
+            cloud
+                .acknowledged("/node/v1/observations")
+                .iter()
+                .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                .any(|order| {
+                    order["operation"] == operation
+                        && order["status"] == "failed"
+                        && order["reason"] == "release_signature_invalid"
+                })
+        })
+        .await;
+        assert!(refused("r1", "release_signature_invalid"));
+        assert!(
+            cloud
+                .requests()
+                .iter()
+                .all(|seen| !seen.path().ends_with("packages.lock.json")),
+            "the lock is not even read"
+        );
+        assert!(
+            machine
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("install") && !call.starts_with("purge")),
             "{:?}",
             machine.calls()
         );
@@ -1987,6 +2359,7 @@ mod tests {
                 intervals: quick(),
                 timing: timing(),
                 gateway: None,
+                release_key: test_release_key(),
             },
         )
         .await

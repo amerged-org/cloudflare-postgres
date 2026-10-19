@@ -35,11 +35,11 @@ flowchart LR
 - [apps/api/wrangler.example.jsonc:11](../../../apps/api/wrangler.example.jsonc#L11)
 - [apps/api/wrangler.example.jsonc:13](../../../apps/api/wrangler.example.jsonc#L13)
 - [apps/api/wrangler.example.jsonc:24](../../../apps/api/wrangler.example.jsonc#L24)
-- [apps/api/wrangler.example.jsonc:61](../../../apps/api/wrangler.example.jsonc#L61)
-- [apps/api/wrangler.example.jsonc:62](../../../apps/api/wrangler.example.jsonc#L62)
 - [apps/api/wrangler.example.jsonc:65](../../../apps/api/wrangler.example.jsonc#L65)
-- [apps/api/wrangler.example.jsonc:82](../../../apps/api/wrangler.example.jsonc#L82)
-- [apps/api/wrangler.example.jsonc:87](../../../apps/api/wrangler.example.jsonc#L87)
-- [apps/api/wrangler.example.jsonc:89](../../../apps/api/wrangler.example.jsonc#L89)
+- [apps/api/wrangler.example.jsonc:66](../../../apps/api/wrangler.example.jsonc#L66)
+- [apps/api/wrangler.example.jsonc:69](../../../apps/api/wrangler.example.jsonc#L69)
+- [apps/api/wrangler.example.jsonc:86](../../../apps/api/wrangler.example.jsonc#L86)
+- [apps/api/wrangler.example.jsonc:91](../../../apps/api/wrangler.example.jsonc#L91)
+- [apps/api/wrangler.example.jsonc:93](../../../apps/api/wrangler.example.jsonc#L93)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

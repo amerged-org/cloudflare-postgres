@@ -42,6 +42,7 @@ function spec() {
       packages_sha256: "d".repeat(64),
       kernel_release: "6.12.113+deb13-amd64",
     },
+    signature: "5".repeat(128),
   };
 }
 
@@ -201,6 +202,7 @@ function registration() {
       packages_sha256: "6".repeat(64),
       kernel_release: "6.12.113+deb13-amd64",
     },
+    signature: "7".repeat(128),
   };
 }
 

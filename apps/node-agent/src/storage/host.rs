@@ -9,7 +9,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 // linux/mount.h
@@ -130,6 +130,91 @@ pub fn unmount(target: &Path) -> io::Result<()> {
     }
 }
 
+/// The directory of the device links (`Config::device_links`): the agent's alone, mode 0700. The
+/// unit and the jobs follow a link in it as root and mount whatever it names, so a directory
+/// another user can write would let that user mount any device into a tenant's sandbox. It is
+/// made if it is not there, and checked every time: a directory that another user owns, or that
+/// has another mode, is refused, not trusted. Its parent is made 0755 if missing, as the
+/// databases' socket directories live there too.
+pub fn ensure_link_directory(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if let Some(parent) = dir.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = std::fs::symlink_metadata(dir)?;
+    // SAFETY: geteuid has no arguments and cannot fail.
+    let agent = unsafe { libc::geteuid() };
+    if !metadata.is_dir()
+        || metadata.uid() != agent
+        || metadata.permissions().mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the device link directory is not the agent's alone",
+        ));
+    }
+    Ok(())
+}
+
+/// Where a link is staged before it takes its place: the same directory, so the rename is atomic.
+fn staged(link: &Path) -> PathBuf {
+    let mut name = link.file_name().unwrap_or_default().to_os_string();
+    name.push(".new");
+    link.with_file_name(name)
+}
+
+/// Makes `link` point to `target`, by rename: a reader sees the old link or the new one, never
+/// none. A link that already points there is left.
+pub fn install_link(link: &Path, target: &str) -> io::Result<()> {
+    if let Some(dir) = link.parent() {
+        ensure_link_directory(dir)?;
+    }
+    if link_names(link, target) {
+        return Ok(());
+    }
+    let staged = staged(link);
+    match std::fs::remove_file(&staged) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    std::os::unix::fs::symlink(target, &staged)?;
+    std::fs::rename(&staged, link)
+}
+
+/// Removes `link` while it points to `target`. A link to another volume, which another generation
+/// of the database owns, and no link at all, are left as they are.
+pub fn drop_link(link: &Path, target: &str) -> io::Result<()> {
+    match std::fs::read_link(link) {
+        Ok(current) if current == Path::new(target) => std::fs::remove_file(link),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `link` points to `target`.
+pub fn link_names(link: &Path, target: &str) -> bool {
+    std::fs::read_link(link).is_ok_and(|current| current == Path::new(target))
+}
+
+/// The agent's start: no link survives it. A link names a volume that the agent attached in its
+/// namespace, and that namespace is gone with the agent that had it.
+pub fn reset_links(dir: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    ensure_link_directory(dir)
+}
+
 pub fn fs_usage(path: &Path) -> io::Result<FsUsage> {
     let path = path_text(path)?;
     // SAFETY: statvfs is plain data; zero is a valid value to overwrite.
@@ -213,5 +298,83 @@ mod tests {
             .find(|line| line.split(' ').nth(4).map(Path::new) == Some(target.as_path()))
             .unwrap_or_else(|| panic!("{} is not in the mount table", target.display()));
         assert!(line.contains(" rw,nosuid,nodev,noexec,noatime "), "{line}");
+    }
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pgcf-links-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The directory of the links is made for the agent alone: the root executor follows what is
+    /// in it, so nobody else may add a link there.
+    #[test]
+    fn the_link_directory_is_private_to_the_agent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("dir").join("run/dev");
+        ensure_link_directory(&dir).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&dir), 0o700);
+        // Again: nothing changes, and a directory with another mode is refused, not trusted.
+        ensure_link_directory(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_link_directory(&dir).is_err());
+        std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_link_is_put_in_place_by_rename_and_replaced_by_rename() {
+        let dir = scratch("install").join("dev");
+        let link = dir.join("a1b2c3d4e5f6g7h8i9j0");
+        install_link(&link, "/dev/mapper/pgcf-db_a1b2c3d4e5f6g7h8i9j0_g1").unwrap();
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("/dev/mapper/pgcf-db_a1b2c3d4e5f6g7h8i9j0_g1")
+        );
+        // Another generation takes the link over without a moment in which there is none.
+        install_link(&link, "/dev/mapper/pgcf-db_a1b2c3d4e5f6g7h8i9j0_g2").unwrap();
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("/dev/mapper/pgcf-db_a1b2c3d4e5f6g7h8i9j0_g2")
+        );
+        // The directory holds the link and nothing of the rename.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["a1b2c3d4e5f6g7h8i9j0"]);
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    /// A volume drops only its own link: the link of another generation of the database stays.
+    #[test]
+    fn a_link_is_dropped_only_while_it_points_to_the_volume() {
+        let dir = scratch("drop").join("dev");
+        let link = dir.join("a1b2c3d4e5f6g7h8i9j0");
+        let (first, second) = ("/dev/mapper/pgcf-x_g1", "/dev/mapper/pgcf-x_g2");
+        install_link(&link, second).unwrap();
+        drop_link(&link, first).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new(second));
+        drop_link(&link, second).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        // No link is no error: it is what a volume that was never attached has.
+        drop_link(&link, second).unwrap();
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    /// Agent start: the namespace of the agent before is gone, so every link is stale.
+    #[test]
+    fn the_agents_start_drops_every_link_and_the_leftovers_of_a_rename() {
+        let dir = scratch("reset").join("dev");
+        install_link(&dir.join("aaaaaaaaaaaaaaaaaaaa"), "/dev/mapper/a").unwrap();
+        install_link(&dir.join("bbbbbbbbbbbbbbbbbbbb"), "/dev/mapper/b").unwrap();
+        std::os::unix::fs::symlink("/dev/mapper/c", dir.join("cccccccccccccccccccc.new")).unwrap();
+        reset_links(&dir).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 }

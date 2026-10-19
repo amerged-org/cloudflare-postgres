@@ -68,6 +68,64 @@ test("a database unit's system-call filter denies the kernel's second-stage prim
   }
 });
 
+test("a database unit mounts its own volume from the agent's link and refuses to start without it", () => {
+  const unit = readFileSync(new URL("pgcf-pg@.service", units), "utf8");
+  // The volume is in the agent's mount namespace only: PID 1's namespace is what every executor
+  // copies and re-reads, so a start would grow with the number of volumes mounted there.
+  assert.deepEqual(assignments(unit, "MountImages"), [
+    "/run/pgcf/dev/%i:/var/lib/pgcf/db/%i:root:nosuid,nodev,noexec,noatime",
+  ]);
+  // The link exists only while the agent has the volume attached: a dangling or missing link
+  // fails the start (an assertion, where a condition would skip it), and nothing runs on an empty
+  // directory.
+  assert.deepEqual(assignments(unit, "AssertPathExists"), ["/run/pgcf/dev/%i"]);
+  assert.doesNotMatch(unit, /^AssertPathIsMountPoint=/m, "there is no mount in PID 1's namespace to assert");
+  assert.doesNotMatch(unit, /^After=.*\.mount/m, "no mount unit exists for the volume");
+  // The volume is writable as the unit's own mount; listing it fails with ENOENT on the host.
+  assert.deepEqual(assignments(unit, "ReadWritePaths"), ["/run/pgcf/%i"]);
+  // A `ro` option makes the second mount of the superblock fail (226/NAMESPACE).
+  const [, , partition, options] = (assignments(unit, "MountImages")[0] ?? "").split(":");
+  assert.equal(partition, "root");
+  assert.ok(!(options ?? "").split(",").includes("ro"));
+  for (const option of ["nosuid", "nodev", "noexec", "noatime"]) {
+    assert.ok((options ?? "").split(",").includes(option), option);
+  }
+});
+
+test("MountImages= opens the device policy to block devices: a private /dev and no capability keep them out of a database's reach", () => {
+  const unit = readFileSync(new URL("pgcf-pg@.service", units), "utf8");
+  // systemd adds block-device-mapper, block-blkext and block-loop (rwm) and /dev/mapper/control and
+  // /dev/loop-control (rw) to the policy of a unit with MountImages=. The nodes of the devices are
+  // not in the unit's /dev, and without CAP_MKNOD (the bounding set is empty) the user cannot
+  // make one: these two directives are what the widening rests on.
+  assert.deepEqual(assignments(unit, "PrivateDevices"), ["yes"]);
+  assert.deepEqual(assignments(unit, "CapabilityBoundingSet"), [""]);
+  assert.deepEqual(assignments(unit, "NoNewPrivileges"), ["yes"]);
+  assert.deepEqual(assignments(unit, "ProtectSystem"), ["strict"]);
+  assert.deepEqual(assignments(unit, "DeviceAllow"), [], "the image adds no device of its own");
+});
+
+test("the agent runs in a mount namespace of its own: its volumes never reach PID 1 or the executors", () => {
+  const unit = readFileSync(new URL("pgcf-agent.service", units), "utf8");
+  assert.deepEqual(assignments(unit, "PrivateMounts"), ["yes"]);
+  // The agent alone mounts and unmounts volumes, trims and grows them; no other filesystem sandbox
+  // is set: the agent needs to see the node.
+  for (const key of ["ProtectSystem", "ProtectHome", "PrivateTmp", "ReadWritePaths", "ReadOnlyPaths", "InaccessiblePaths"]) {
+    assert.deepEqual(assignments(unit, key), [], key);
+  }
+});
+
+test("the three oneshots that MountImages= pulls into every start are masked: a start forks none of them", () => {
+  // modprobe@.service has no RemainAfterExit, so loop, dm_mod and dm_verity would run again for every
+  // database that starts (about 7 ms, three forks). dm_mod loads on its own when the device-mapper
+  // control node is opened.
+  for (const module of ["loop", "dm_mod", "dm_verity"]) {
+    const mask = new URL(`etc/systemd/system/modprobe@${module}.service`, image);
+    assert.equal(lstatSync(mask).isSymbolicLink(), true, module);
+    assert.equal(readlinkSync(mask), "/dev/null", module);
+  }
+});
+
 test("a database's private /dev/shm cannot run code, hold setuid files or hold device nodes", () => {
   const unit = readFileSync(new URL("pgcf-pg@.service", units), "utf8");
   const shm = assignments(unit, "TemporaryFileSystem").find((value) => value.startsWith("/dev/shm:"));
@@ -139,6 +197,50 @@ test("sshd takes user certificates only and the image ships no CA key: nothing l
   assert.equal(krl.length, 44);
   assert.equal(krl.subarray(0, 8).toString("latin1"), "SSHKRL\n\0");
   assert.equal(krl.readUInt32BE(8), 1);
+});
+
+test("the break-glass sshd grants a root shell to one certificate principal and nothing else: no forwarding, two tries, certificate and key id logged", () => {
+  const ssh = new URL("etc/ssh/", image);
+  const dropIns = readdirSync(new URL("sshd_config.d/", ssh));
+  assert.deepEqual(dropIns, ["10-pgcf.conf"], "no other drop-in can undo it");
+  assert.deepEqual(
+    readdirSync(ssh).sort(),
+    ["pgcf_revoked.krl", "principals", "sshd_config.d"],
+    "no CA key, no authorized key and no host key in the image",
+  );
+  assert.deepEqual(readdirSync(new URL("principals/", ssh)), ["root"], "no other user has a principals file");
+  assert.equal(existsSync(new URL("root/.ssh", image)), false, "no authorized_keys for root");
+  const conf = readFileSync(new URL("sshd_config.d/10-pgcf.conf", ssh), "utf8");
+  const directives = records(conf).map((fields) => [(fields[0] ?? "").toLowerCase(), fields.slice(1).join(" ")] as const);
+  const values = (keyword: string) => directives.filter(([name]) => name === keyword).map(([, value]) => value);
+  // A Match block would apply other values to some connections.
+  assert.deepEqual(values("match"), []);
+  // sshd takes the first value of a keyword: each is given once, so none is overridden below it.
+  for (const [keyword] of directives)
+    if (keyword !== "listenaddress") assert.equal(values(keyword).length, 1, `${keyword} is given once`);
+  const fixed = {
+    pubkeyauthentication: "yes",
+    permitrootlogin: "prohibit-password",
+    maxauthtries: "2",
+    maxsessions: "2",
+    x11forwarding: "no",
+    allowtcpforwarding: "no",
+    allowagentforwarding: "no",
+    permittunnel: "no",
+    disableforwarding: "yes",
+    gssapiauthentication: "no",
+    trustedusercakeys: "/etc/ssh/pgcf_user_ca.pub",
+    authorizedprincipalsfile: "/etc/ssh/principals/%u",
+    // The certificate's key id and the CA's fingerprint, which node-shell.ts fills, are in the journal.
+    loglevel: "VERBOSE",
+  };
+  for (const [keyword, value] of Object.entries(fixed)) assert.deepEqual(values(keyword), [value], keyword);
+  // Loopback only: the Tunnel's connector reaches it there, and nothing else does.
+  assert.deepEqual(values("listenaddress"), ["127.0.0.1", "::1"]);
+  assert.deepEqual(values("port"), []);
+  assert.deepEqual(values("gatewayports"), []);
+  // The one principal is the one the operator's helper signs for.
+  assert.deepEqual(records(readFileSync(new URL("principals/root", ssh), "utf8")), [["pgcf-break-glass"]]);
 });
 
 test("the journal is synced every 15 s: the minutes before a freeze reach the disk", () => {

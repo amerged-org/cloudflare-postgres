@@ -34,6 +34,7 @@ use crate::{
     layout::Layout,
     machine::Machine,
     state::{DatabaseState, Files},
+    storage::VolumeId,
     usage::Meter,
 };
 use pgcf_native_protocol::agent as protocol;
@@ -56,9 +57,15 @@ pub struct Timing {
     pub idle_poll: Duration,
     /// How often it reads the units to find those that ended without being asked.
     pub watch: Duration,
-    /// The wait before the first retry of a recovery, and the longest wait.
+    /// The wait before the first retry of a recovery, of a decision on a database that could not
+    /// read its facts, or of the wake of a resume order that the node could not decide yet, and
+    /// the longest wait.
     pub recovery_retry: Duration,
     pub recovery_retry_maximum: Duration,
+    /// How long a wake waits for the node's decision on a database it has not looked at in this
+    /// run, before it is refused with `wake_in_progress` and the gateway delivers it again (after
+    /// `REDELIVER_MS`, 3 s): shorter, so that a wait never overlaps its own redelivery.
+    pub adopt_wait: Duration,
     /// The wait before the first repeat of the boot report that Cloudflare could not take, and the
     /// longest wait.
     pub report_retry: Duration,
@@ -79,6 +86,7 @@ impl Default for Timing {
             watch: Duration::from_secs(1),
             recovery_retry: Duration::from_secs(1),
             recovery_retry_maximum: Duration::from_secs(30),
+            adopt_wait: Duration::from_secs(2),
             report_retry: Duration::from_secs(2),
             report_retry_maximum: Duration::from_secs(60),
             settle: Duration::from_secs(10),
@@ -157,6 +165,9 @@ pub(crate) struct View {
     pub backup_failed_ms: Option<i64>,
     /// The node has decided on this database in this run.
     pub adopted: bool,
+    /// A task runs the decision again, with growing waits, until the node has made it
+    /// (`retry_until_adopted`).
+    pub retrying: bool,
     /// The reconciliation of the entry: one runs, and runs again when the entry changed meanwhile.
     pub reconcile: Reconcile,
 }
@@ -185,6 +196,7 @@ impl View {
             awake_since_ms: None,
             backup_failed_ms: None,
             adopted: false,
+            retrying: false,
             reconcile: Reconcile::Idle,
         }
     }
@@ -208,6 +220,25 @@ impl Db {
     #[cfg(test)]
     pub fn state(&self) -> Option<DatabaseState> {
         self.view().state.clone()
+    }
+}
+
+/// The database as the barman jobs know it: its user, its directory (one for every generation),
+/// the device `device` of the storage generation `volume` that the job reads or writes (a restore
+/// writes the one it builds, whichever the database's link names), and its socket directory.
+pub(crate) fn job_database(
+    layout: &Layout,
+    device: &str,
+    volume: &VolumeId,
+    user: &str,
+) -> JobDatabase {
+    let id = volume.database();
+    JobDatabase {
+        id: id.to_string(),
+        user: user.to_string(),
+        volume: layout.volume(id),
+        device: device.into(),
+        socket_directory: layout.socket_directory(id),
     }
 }
 
@@ -345,6 +376,17 @@ impl<M: Machine> Core<M> {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+    /// Waits until the node has decided on the database, for at most `bound`; whether it has.
+    pub(crate) async fn adopted(&self, db: &Db, bound: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        while !db.view().adopted {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
     pub(crate) fn all(&self) -> Vec<Arc<Db>> {
         let mut dbs: Vec<_> = self
             .dbs
@@ -361,14 +403,10 @@ impl<M: Machine> Core<M> {
     pub(crate) fn files(&self, id: &str) -> Files {
         Files::new(self.layout().database_files(id))
     }
-    /// The database as the barman jobs know it.
-    pub(crate) fn job_database(&self, id: &str, user: &str) -> JobDatabase {
-        JobDatabase {
-            id: id.to_string(),
-            user: user.to_string(),
-            volume: self.layout().volume(id),
-            socket_directory: self.layout().socket_directory(id),
-        }
+    /// The database as the barman jobs know it, with the device of the storage generation
+    /// `volume` that they mount, which is the generation the job reads or writes.
+    pub(crate) fn job_database(&self, volume: &VolumeId, user: &str) -> JobDatabase {
+        job_database(self.layout(), &self.machine.device(volume), volume, user)
     }
 
     /// A credential Cloudflare delivered (`ArchiveCredential`): kept for the jobs and the archive

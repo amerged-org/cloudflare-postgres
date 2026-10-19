@@ -310,6 +310,7 @@ pub fn database(volume: &Path) -> Database {
         id: "abcdefghijklmnopqrst".into(),
         user: "pgcf-abcdefghijklmnopqrst".into(),
         volume: volume.into(),
+        device: "/dev/mapper/pgcf-db_abcdefghijklmnopqrst_g1".into(),
         socket_directory: volume.join("socket"),
     }
 }

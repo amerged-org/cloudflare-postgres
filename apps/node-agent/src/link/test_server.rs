@@ -53,6 +53,10 @@ pub fn vector(schema: &str, name: &str) -> Value {
 pub fn package_vectors() -> Vec<Value> {
     VECTORS["packages"].as_array().unwrap().clone()
 }
+/// The contract's examples of a release as the page names it, with the text its signature covers.
+pub fn release_vectors() -> Vec<Value> {
+    VECTORS["releases"].as_array().unwrap().clone()
+}
 /// A desired database of the contract's example page, under another identifier.
 pub fn database(id: &str) -> Value {
     let page = vector("NodeDesiredPage", "full-page");
@@ -136,6 +140,9 @@ pub struct Inner {
     pub files: std::collections::HashMap<String, Vec<u8>>,
     /// The release the pages name, where it is not the example's.
     pub release: Option<Value>,
+    /// The credentials a read returns, where they are not the example's; the pages name their
+    /// revision.
+    pub credentials: Option<Value>,
 }
 pub struct Cloud {
     pub origin: String,
@@ -204,6 +211,7 @@ impl Cloud {
             credential_paths: Default::default(),
             files: Default::default(),
             release: None,
+            credentials: None,
         }));
         let (commands, _) = broadcast::channel(16);
         let task = tokio::spawn({
@@ -480,7 +488,11 @@ fn desired(inner: &Inner, query: &[(String, String)]) -> Value {
     } else {
         inner.release.clone().unwrap_or(example["release"].clone())
     };
-    let mut page = json!({"node":node,"release":release,"policy":example["policy"],"credentials_revision":3,"orders":inner.orders,"databases":rows,"next":next});
+    let credentials_revision = inner
+        .credentials
+        .as_ref()
+        .map_or(json!(3), |credentials| credentials["revision"].clone());
+    let mut page = json!({"node":node,"release":release,"policy":example["policy"],"credentials_revision":credentials_revision,"orders":inner.orders,"databases":rows,"next":next});
     if !inner.diagnostics.is_empty() && !inner.fenced {
         page["diagnostics"] = inner.diagnostics.clone().into();
     }
@@ -508,7 +520,13 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
     if is("desired") && method == "GET" {
         answer(200, desired(inner, &query))
     } else if is("credentials") && method == "GET" {
-        answer(200, vector("NodeCredentials", "credentials"))
+        answer(
+            200,
+            inner
+                .credentials
+                .clone()
+                .unwrap_or_else(|| vector("NodeCredentials", "credentials")),
+        )
     } else if let Some(id) = path.strip_prefix(paths["archiveCredentials"].as_str().unwrap()) {
         let mut credential = vector("ArchiveCredential", "read-write");
         credential["id"] = id.into();

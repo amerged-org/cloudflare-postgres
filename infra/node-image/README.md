@@ -4,8 +4,8 @@ One Debian 13 ("trixie") disk image for every PGCF node: EU1, US1 and every late
 image release, so OS patches, PostgreSQL upgrades and agent releases are identical everywhere
 ([ULTRA plan](../../docs/architecture/cloudflare-convergence-and-serverless-plan.md) 5.4, 9.1,
 9.6). Nodes differ only in configuration that the installer and the agent write: network, hostname,
-enrollment seed, keys and credentials. These are the image's builder notes (plan Appendix C); the
-agent's own notes are in `apps/node-agent/README.md`.
+enrollment seed, keys and credentials. These are the image's builder notes; the agent's own notes
+are in [apps/node-agent/README.md](../../apps/node-agent/README.md).
 
 ## Pinned inputs
 
@@ -102,20 +102,27 @@ characters (CI uses `sha-<12 hex digits of the commit>`).
 Every push to `main` of this repository (not of a fork) whose `node-image` job passed keeps the
 release files for 7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`: `pgcf-node.raw.zst`,
 `pgcf-node.json`, `packages.lock.json`, the four binaries and a `SHA256SUMS` of these seven files.
-The uncompressed image (about 1.7 GB) is not part of it, and no credential is. The release is named
+The uncompressed image (about 1.7 GB) is not part of it, and no credential is. The job `sign-release`
+(which holds no key and runs only when `check` and `node-image` both passed: it has the signer Worker sign
+that release with the identity token of its run) keeps the signature as the artifact `pgcf-node-signature-<commit sha>-<run attempt>`, one file,
+`release.sig`: [release-signing.md](../../docs/operations/release-signing.md). The release is named
 `sha-<first 12 hex digits of the commit>`. The artifact belongs to the commit that built it, so the
-package lock comes from the artifact, not from the checkout. Only the `push` run carries it: a
-manually dispatched run of the same commit (the external probe, for one) uploads nothing, which is why
-the lookup below filters on `--event push`.
+package lock comes from the artifact, not from the checkout, and the registration runs from a checkout
+of exactly that commit: it checks the signature with the release key of its checkout
+(`apps/node-agent/release-signing.pub`), which must be the key the build's agent carries. Only the
+`push` run carries the artifacts: a manually dispatched run of the same commit (the external probe, for
+one) uploads nothing, which is why the lookup below filters on `--event push`.
 
 ```sh
 git fetch origin main && sha=$(git rev-parse origin/main)   # or any commit on main whose CI run passed
+git switch --detach "$sha"                                   # the registration needs this commit's release key
 run=$(gh run list --workflow ci.yml --branch main --event push --commit "$sha" --status success --json databaseId --jq '.[0].databaseId')
 # --pattern extracts each artifact into a directory named after it; a re-run adds one per attempt.
-gh run download "$run" --pattern "pgcf-node-release-$sha-*" --dir .local/node-release
+gh run download "$run" --pattern "pgcf-node-release-$sha-*" --pattern "pgcf-node-signature-$sha-*" --dir .local/node-release
 release=$(ls -d .local/node-release/pgcf-node-release-"$sha"-* | tail -n 1)
+signature=$(ls -d .local/node-release/pgcf-node-signature-"$sha"-* | tail -n 1)
 (cd "$release" && sha256sum --check SHA256SUMS)   # shasum -a 256 -c SHA256SUMS on macOS
-node scripts/operations/register-node-image.ts --image-dir "$release" --binaries "$release" --lock "$release/packages.lock.json"
+node scripts/operations/register-node-image.ts --image-dir "$release" --binaries "$release" --lock "$release/packages.lock.json" --signature "$signature/release.sig"
 ```
 
 The artifact expires after 7 days. Register within that time, or re-run all jobs of that CI run to
@@ -125,7 +132,10 @@ overwritten, so register one attempt and keep using it.
 ### Or build it locally
 
 When there is no artifact (it expired, or the release comes from a commit that is not on `main`),
-build the release yourself with the local Docker builder:
+build the release yourself with the local Docker builder. A local build is **not signed**: CI holds no
+key, the signer Worker holds it, and the Worker signs only for the job `sign-release` of a push to
+`main` (`.github/workflows/ci.yml`). The nodes refuse a release that is not signed, so the registration
+refuses it too: use this path for the lab and for `--dry-run`, and register only what CI built.
 
 ```sh
 # 1. The four binaries, built for linux/amd64 with the pinned Rust toolchain (CI does this too):
@@ -134,8 +144,8 @@ mkdir -p .local/node-image/binaries
 for binary in pgcf-agent pgcf-native-gateway pgcf-archive pgcf-wal-fetch; do install -m 0755 "target/release/$binary" .local/node-image/binaries/; done
 # 2. The image, with the local Docker builder (see Building above):
 node infra/node-image/node-image.ts build --binaries .local/node-image/binaries --release sha-0123456789ab
-# 3. Upload the six files and register the release:
-node scripts/operations/register-node-image.ts --image-dir .local/node-image/out --binaries .local/node-image/binaries
+# 3. Check the files (a registration needs the signature that only CI makes):
+node scripts/operations/register-node-image.ts --image-dir .local/node-image/out --binaries .local/node-image/binaries --dry-run
 ```
 
 Step 1 builds on Linux; on another host build in a linux/amd64 container with the same toolchain.
@@ -152,13 +162,19 @@ their values:
 | `PGCF_R2_ACCESS_KEY_ID`, `PGCF_R2_SECRET_ACCESS_KEY` | an R2 API token with object read and write on that bucket |
 | `PGCF_API_URL`, `PGCF_API_KEY` | the management API's origin and an administrator key |
 
-`--dry-run` reads the files, prints the manifest and stops before any network call.
+`--dry-run` reads the files, prints the manifest and stops before any network call; it reports whether
+the release is signed and whether its signature verifies, and refuses for neither.
+`--signature FILE` names the signature (default `<image-dir>/release.sig`), and `--release-key FILE`
+the public key it must verify with (default `apps/node-agent/release-signing.pub`, the key of the
+agents built from this checkout).
 
 What the script does, and what the API checks:
 
 - It refuses a build whose compressed image, package lock or any of the four binaries is not the
   one `pgcf-node.json` describes (so binaries rebuilt since the image was built are refused: build
   the image again), and a release name that is no version.
+- It reads the signature and checks it against the release key before it uploads a byte: a release
+  without a signature, or with one that does not verify, is refused, because every node would refuse it.
 - It uploads `pgcf-node.raw.zst`, `packages.lock.json` and the four binaries to
   `node-images/<version>/` with `x-amz-checksum-sha256`, so R2 itself verifies each digest. A file
   that is already there with the same content (size, md5 and the sha256 R2 reports for it) is
@@ -166,8 +182,10 @@ What the script does, and what the API checks:
   holds no sha256 for, because another tool stored it, is sent again with the checksum: the API
   refuses a file without it. One with another content stops the run, because a registered release
   is never overwritten.
-- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file. The API refuses
-  the registration unless the bucket holds every file at that size with that sha256, and it names
+- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file and the signature.
+  The API refuses a registration without a well-formed signature (64 bytes in hex; it holds no key,
+  so it stores and shows the signature and cannot check it). It refuses the registration
+  unless the bucket holds every file at that size with that sha256, and it names
   every URL of the stored, immutable spec itself, as `/node/v1/releases/<version>/<file>` on its
   own origin (`NODE_API_ORIGIN`). Nothing in the registration is a URL or a credential. The script
   prints the release id and spec sha256 of the answer, and fails if the stored spec is another
@@ -227,10 +245,10 @@ offers the previous kernel through the `.old` links. A one-shot boot of the prev
 | `pgcf-pg@<id>.service` | `pgcf-<id>` | One PostgreSQL per database, in `pgcf.slice`; started only by the agent |
 | `pgcf.slice` | | All databases; the agent sets the awake-database memory budget, 80 % of RAM until then |
 | `pgcfbackup.slice` | | barman-cloud jobs (transient units the agent starts); 512 MiB, CPU and IO weight 20; no dash in the name, because systemd nests `pgcf-backup.slice` inside `pgcf.slice` and the jobs would run under the databases' memory ceiling |
-| `pgcf-agent.service` | root | `pgcf-agent run`, `Type=notify`; host mount namespace (see below); creates `/run/pgcf/agent` |
+| `pgcf-agent.service` | root | `pgcf-agent run`, `Type=notify`; a mount namespace of its own, `PrivateMounts=yes` (see [The agent unit](#the-agent-unit)); creates `/run/pgcf/agent` |
 | `pgcf-gateway.service` | `pgcf-gateway` | `pgcf-native-gateway` in local mode on loopback; starts once `/var/lib/pgcf/credentials/gateway.env` exists |
 | `pgcf-cloudflared.service` | `pgcf-cloudflared` | The Tunnel; starts once `/var/lib/pgcf/credentials/tunnel-token.cred` exists |
-| `ssh.service` | root | Loopback only, user certificates only (no CA ships, so no login until a CA key is written; nothing writes one yet); host keys are created at first boot |
+| `ssh.service` | root | Loopback only, user certificates only (no CA ships, so no login until the agent writes the operator's CA key, which it does only while the shell is on); host keys are created at first boot |
 
 A preset allowlist ([10-pgcf.preset](mkosi.extra/usr/lib/systemd/system-preset/10-pgcf.preset))
 enables exactly these plus networkd, timesyncd, getty and LVM monitoring. Everything else a package
@@ -260,9 +278,34 @@ package from creating a default cluster.
   resets such a directory's group to the unit's own before every start, and no `ExecStartPre=`
   creates it, because that process costs about 35 ms on every start (measured on EU1 in the
   Stage 1 lab).
-- **Mount check:** `AssertPathIsMountPoint=/var/lib/pgcf/db/<id>`: a start on an unmounted volume
-  fails (`Condition…` would "succeed" with the unit inactive). `After=` the mount unit only orders
-  the stop before the unmount at shutdown; nothing ties the database's life to the mount.
+- **Volume and device link:** the unit mounts its own volume:
+  `MountImages=/run/pgcf/dev/<id>:/var/lib/pgcf/db/<id>:root:nosuid,nodev,noexec,noatime`, and
+  `AssertPathExists=/run/pgcf/dev/<id>` fails a start without the link (`Condition…` would "succeed"
+  with the unit inactive; a dangling link fails it too). `/run/pgcf/dev/<id>` is a symlink that the
+  agent keeps, and it exists only while the agent has the volume attached:
+  - It points to the device of the generation that is attached (`/dev/mapper/pgcf-db_<id>_g<n>`),
+    and the agent makes it by rename once it has mounted the volume in its own namespace.
+  - It is removed first of all before a volume is unmounted, repaired (`recover_volume`) or
+    removed, when the pool's failure marks a volume as suspect, and for every volume when the agent
+    starts. It is retargeted to the next generation only after that one is attached, and never made
+    for a volume that is not attached or is suspect. A unit that is running does not need it: it
+    keeps its own mount.
+  - `/run/pgcf/dev` is root's alone (mode 0700; the agent makes it and refuses a directory that
+    another user owns or has another mode), because the root executor follows what is in it and
+    mounts whatever it names into the unit's namespace. It is never a socket directory or a volume.
+  - The second mount of a filesystem that is mounted already costs next to nothing, and both mounts
+    are one superblock: what the agent writes while the database is stopped (its configuration),
+    and its resize and `fstrim` while it runs, are seen by both at once. The mount options stay
+    those of the agent's (no `ro`: a second mount of a read-write filesystem fails with it).
+  - There is no mount unit and no `After=…mount`: no volume is in PID 1's mount namespace. The
+    stop of a database before the node goes down is the unit's own, as the boot test shows.
+  - Why: systemd's executor copies PID 1's mount namespace for every unit it starts and reads
+    `/proc/self/mountinfo` about 64 times (`umount_recursive_full` and
+    `bind_remount_recursive_with_mountinfo`), so the start of a unit grew with every volume
+    mounted there. Lab (systemd 257.13, Debian 13, one container): the executor's handoff took 36
+    to 243 ms for 17 to 1,000 volumes mounted, and 35 to 40 ms for the same volumes in the agent's
+    namespace. EU1 measured 105 ms at 17 volumes and 245 ms at 164, about 1 ms per volume, which is
+    6.6 times the lab's slope; the live effect of the change is not measured yet.
 - **Stop and restart:** `KillMode=mixed`, `KillSignal=SIGINT` (fast shutdown), `TimeoutStopSec=30`,
   `Restart=no`: every start goes through the agent's admission.
 - **Limits:** `MemorySwapMax=0`, `TasksMax=64` and, until the agent applies the database's size, the
@@ -276,8 +319,9 @@ package from creating a default cluster.
 - **OOM:** `OOMPolicy=continue`, `OOMScoreAdjust=-900`, `PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj`,
   `PG_OOM_ADJUST_VALUE=0`: the postmaster is protected, backends are not.
 - **Sandbox:** `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
-  `ProtectSystem=strict` with only the data directory writable; `ProtectHome`, `PrivateTmp`,
-  `PrivateDevices`, a private `/dev/shm` of 64 MiB mounted `noexec,nosuid,nodev`
+  `ProtectSystem=strict` with only the unit's own volume (a mount of its own) and the socket
+  directory writable; `ProtectHome`, `PrivateTmp`, `PrivateDevices`, a private `/dev/shm` of 64 MiB
+  mounted `noexec,nosuid,nodev`
   (`TemporaryFileSystem`; a database's own size goes in a drop-in that applies at its next start);
   `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`,
   `ProtectProc=invisible`, `ProcSubset=pid`; `RestrictNamespaces`, `RestrictRealtime`,
@@ -287,16 +331,96 @@ package from creating a default cluster.
   `io_uring_setup/enter/register`, `userfaultfd`, the SysV message queues and semaphores `msg*` and
   `sem*`, the POSIX message queues `mq_*`; `shmget`, `shmat`, `shmdt` and `shmctl` stay; a forbidden
   call kills the process), `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`.
+- **Device policy:** with `PrivateDevices=yes` the policy is closed, and systemd adds to the policy of
+  every unit with `MountImages=` the devices that image dissection touches: `block-device-mapper`,
+  `block-blkext` and `block-loop` (`rwm`), `/dev/mapper/control` and `/dev/loop-control` (`rw`), next
+  to `ProtectClock`'s `char-rtc` (`r`), which the unit had. `systemctl show -p DeviceAllow` lists
+  exactly these six, and the boot test and the units' lab assert it. Nothing else widens it. It is
+  one layer less between a compromised postmaster and every other database's raw volume, and it
+  cannot be avoided while `MountImages=` is used. What neutralises it: the unit's private `/dev`
+  has no block device node (the user cannot open one), the empty `CapabilityBoundingSet=` rules out
+  `mknod`, `NoNewPrivileges=yes` keeps it so, and the device nodes are `root:disk 0660`. The units'
+  lab and the boot test check this as the unit's user: `find /dev -type b` lists nothing (and
+  `-type c` lists the character nodes, so the search sees what is there), `mknod` of a block node
+  fails, and neither a device-mapper node by its number nor the volume's device by its name can be
+  opened. The lab probe fails with 35 block nodes when `PrivateDevices=` is turned off.
+- **What a database's user sees of the others:** its mount table lists its own volume only (the
+  agent's mounts and the other units' are in namespaces of their own), the other databases'
+  directories under `/var/lib/pgcf/db` are empty directories it cannot write, and `/var/lib/pgcf/db`
+  cannot be listed. The ids of the other databases stay visible, as before and in both designs: in
+  `/etc/passwd`, under `/run/pgcf`, in `/sys/block/dm-*/dm/name` (every volume's name, so every id
+  and generation), in the cgroup tree (`/sys/fs/cgroup/pgcf.slice/pgcf-pg@<id>.service`) with a
+  neighbour's `memory.current` and `cgroup.procs`, and in `/sys/block/dm-*/stat` and
+  `/sys/fs/ext4/dm-*` (a neighbour's I/O and write counters). The isolation does not hide other
+  databases; it keeps their data and their volumes out of reach. A database's own tenant data
+  cannot make a volume made with the gap unmountable (every such filesystem ends 4 MiB before its
+  volume, see below); a volume made before the gap existed has no such protection until it grows
+  (see the rollout below).
 - **Not set:** `PrivatePIDs` and `PrivateIPC`, because PostgreSQL's `postmaster.pid` interlock needs
   them off (the lab showed a second unit on the same directory being refused); `unix_socket_group`,
   because PostgreSQL would call `chown`, which the filter kills.
 
 ### The agent unit
 
-The agent mounts the database volumes. It runs in the host mount namespace on purpose: any
-filesystem sandboxing option (`ProtectSystem`, `PrivateTmp`, `ReadWritePaths`, …) would give it a
-private mount namespace, and volumes it mounts there would be invisible to the database units. Its
-restart never stops a database, because the databases are independent units.
+The agent mounts the database volumes, in a mount namespace of its own: `PrivateMounts=yes`, and no
+other filesystem sandboxing option (the agent needs to see the node). PID 1 and the executors of
+the units never see its mounts, which is the point: a unit's start does not grow with the number of
+volumes (see Volume and device link above). Its mounts (attach, `fstrim`, `resize2fs`, `e2fsck`
+after it has unmounted, the configuration it writes, `pg_control` and `postmaster.pid` reads) work as
+before inside the namespace; the database units and the backup jobs mount their volumes themselves
+(`MountImages=`).
+
+- The namespace ends with the agent. An agent restart (a release, a crash) ends every mount it made
+  and drops every device link; it mounts every current volume again when it gets its first desired
+  page, one after the other under the storage lock, and serves no wake before it has. The
+  databases that run are not touched: a unit has its own mount, which does not depend on the
+  agent's. A restart also ends the page cache of the volumes of sleeping databases (their last
+  mount is gone), so the first wake after it reads from disk: the plan measured about 300 ms more
+  on a cold first request. What the restart costs on EU1 is not measured. In the lab (loop-backed
+  thin pool, 300 volumes of 32 MiB, one agent's namespace) the mounts of 50, 100 and 300 volumes
+  took 0.20, 0.26 and 0.86 s (about 3 ms each, with each attach reading the whole mount table
+  again), and unmounting 300 took 1.1 s; the agent waits for all of them before it serves a wake.
+  Until it is measured on EU1 (Open in the plan), the remedy, if it is needed, is to keep the
+  agent's namespace across restarts (bind it under `/run` and enter it before the runtime starts)
+  or to serve wakes while the mounts are made; neither is built.
+- What the agent decides never rests on its own mount table alone, because a unit or a job mounts
+  the volume in a namespace of its own, and the agent's own mounts end with its restart: whether a
+  unit may start is the link (`attached`); which generation a running unit serves is its own
+  `/proc/<pid>/mountinfo`; whether a volume may have lost writes while the pool took none is that
+  something has its device open (`lv_attr`); whether a volume is held, and whether ext4 recorded
+  an error on it, is its sysfs entry `/sys/fs/ext4/dm-<minor>`, which exists while a superblock
+  does, in any namespace.
+- **The rule for a held volume.** A volume is detached (`unmount_volume`, and the repair, which
+  detaches first) only while no filesystem of it is alive in any namespace, and a generation of a
+  database is made or mounted (`create_volume`, the boot's and a wake's attach) only while no
+  filesystem of another generation of the same database is. The answer is `Busy` for the volume
+  that is held and `OtherGeneration` for the next one, with or without a mount of the agent's own:
+  after an agent restart that left a unit running on the old generation, the page can name the new
+  generation, the boot mounts nothing of it, and a build of it is refused until the unit has
+  stopped (the build ends `build_failed`, the record of the old generation stays, and the next
+  pull releases it again). A start of the unit on the new generation could not have worked
+  either: systemd leaves a unit that runs as it is, and the database would go on running on the
+  old volume while the agent believed it ran on the new one. A removal asks lvm2, which refuses a
+  device that is open (`Busy`).
+- A shell on the node sees none of this: `findmnt`, `df`, `ls /var/lib/pgcf/db/<id>`, `e2fsck`
+  and `fstrim` from the break-glass shell see no volume. Run a command in the agent's namespace
+  with `nsenter --target "$(systemctl show --property=MainPID --value pgcf-agent.service)" --mount
+  -- <command>`. `pgcf-agent check` is run that way (the agent runs it from its own namespace
+  after an update); started from a shell it refuses to run, because it would mount the scratch
+  volume in PID 1's namespace, where it would stay.
+- `e2fsck` refuses while a unit or a job holds the device (it opens it exclusively); the agent
+  repairs a volume only after its unit has stopped. The agent's own unmount does not notice a
+  holder, because a mount of its own is not busy through another namespace's: after it, the agent
+  looks for ext4's sysfs entry of the device, which stays while a unit or a job holds the
+  filesystem, mounts the volume again, restores its link and answers `Busy` (the entry went 1 to
+  2 ms after a holder ended in the lab; the agent waits 250 ms for it). With no mount of its own
+  (after its restart) it looks at the entry before it does anything, and answers `Busy` the same
+  way. Removing a volume asks
+  lvm2, which refuses a device that a unit or a job still has open: `remove_volume` answers
+  `Busy` then, after the five seconds lvm2 itself waits, and the caller tries again. A repair
+  (`recover_volume`) detaches first, so it stops with `Busy` as well; between its two `e2fsck`
+  runs nothing can mount the device: no link for the unit, and a job starts only from a flow
+  that waits for the database's lock or at the request of the database's own processes.
 
 ### cloudflared
 
@@ -306,14 +430,19 @@ restart never stops a database, because the databases are independent units.
 both behind Cloudflare Access (`scripts/operations/setup-access.ts`, the operator installation
 runbook). The shell hostname, `pgcf-shell-<id>.<domain>`, is off until its Access application
 exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
+A change of that variable reaches a running node as a new credentials revision, so the node reads
+its credentials again within one pull and cloudflared keeps running: the Tunnel's ingress is
+remote configuration, and the agent restarts the gateway and cloudflared only when the Tunnel
+token or the route keyring changed.
 
 ## What the image expects from the agent
 
 - `/var/lib/pgcf/bin/current/pgcf-agent run` runs the agent and signals readiness with `READY=1`.
 - `pgcf-agent check` (plan 5.6 item 10) creates the scratch database on its first call and wakes
   the same database on later calls, queries it over its socket and exits 0 only when it answered;
-  its volume carries the tag `pgcf.db.<id>` like every database volume. The boot test runs it on
-  two boots and requires the same volume both times.
+  its volume carries the tag `pgcf.db.<id>` like every database volume. Run it in the agent's mount
+  namespace (see The agent unit). The boot test runs it that way on two boots and requires the same
+  volume both times.
 - At first boot the agent creates the volume group `pgcf` on `/dev/disk/by-partlabel/pgcf-lvm`
   with a large metadata area, and the thin pool `pgcf/pgcf_thinpool` over the whole partition.
   On this image's lvm2 2.03.31, `lvcreate --type thin-pool` refuses `--errorwhenfull`; the working
@@ -323,10 +452,28 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   leaves 31.05 GiB of pool data next to 1 GiB of metadata and its 1 GiB spare.
 - `/var/lib/pgcf/db` is mode 0711 (the agent creates it so, and tmpfiles resets it at every boot): a
   database reaches its own directory, but nobody can list this one. The IDs are not hidden: the
-  accounts `pgcf-<id>` are in `/etc/passwd`, `/run/pgcf` is 0755 and the mount table lists every
-  mount.
-- Each database's volume is mounted at `/var/lib/pgcf/db/<id>` (mode 0700, owner `pgcf-<id>`) with
-  the data directory `data` inside. The agent creates `/run/pgcf/<id>` (owner `pgcf-<id>`, group
+  accounts `pgcf-<id>` are in `/etc/passwd`, `/run/pgcf` is 0755, and sysfs and the cgroup tree show
+  every volume's name and every database's unit (see Sandbox); the mount table of a database's unit
+  lists its own volume only.
+- Every filesystem is made and grown with an explicit size that ends 4 MiB (`FS_END_GAP_BYTES`, one
+  extent) before the end of its volume: `mkfs.ext4 … <volume size - 4 MiB>K` and `resize2fs
+  <device> <new size - 4 MiB>K`; systemd never grows it, and a call that finds the filesystem at
+  the size or above leaves it (`dumpe2fs -h`), because resize2fs refuses to shrink one for ever.
+  The units and the jobs mount a volume through systemd's image dissection, whose libblkid
+  probers read the end of the device as root and refuse a device that carries a RAID or ZFS
+  signature there. The farthest end-of-device probe of libblkid 2.41 is `promise_raid`'s, 3087
+  sectors (1,580,544 bytes) from the end: the lab wrote a Promise signature there and `blkid -p`
+  called the ext4 device a RAID member; the others (UDF at 256 blocks of 4 KiB, ZFS within 768 KiB,
+  RAID superblocks within 128 KiB) are nearer. With the gap, data in a filesystem never reaches
+  those sectors, which nothing writes and a thin volume reads as zeros. A filesystem made before
+  the gap existed (every volume on EU1 today) fills its volume and has no protection until it
+  grows: a tenant that knew the prober could make such a volume refuse its mount, so its
+  database could neither start nor archive. That is accepted for Dev, where the databases are
+  recreated after the rollout; an older volume is otherwise shrunk offline while its database
+  sleeps (`e2fsck -f`, then `resize2fs <device> <volume size - 4 MiB>K`).
+- Each database's volume is mounted by the agent, in its namespace, at `/var/lib/pgcf/db/<id>` (mode
+  0700, owner `pgcf-<id>`) with the data directory `data` inside, and its unit mounts it again there
+  from the link `/run/pgcf/dev/<id>`. The agent creates `/run/pgcf/<id>` (owner `pgcf-<id>`, group
   `pgcf-gateway`, mode 0750) when it creates a database and again for every database when it
   starts, because `/run` is empty after a boot. It clears the database's `CPUQuota` (`CPUQuota=`)
   whenever the database stops and, when the agent itself starts, for every stopped `pgcf-pg@` unit:
@@ -343,6 +490,18 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   `current`. It restarts `pgcf-gateway` if the gateway's binary changed (the gateway is not drained
   first yet) and exits if its own changed, so that `Restart=always` starts the new one; the
   databases keep running. The previous release's directory stays, older ones go.
+- **The image's units and the agent's binary go together, in one order.** The units and the masks
+  (`pgcf-pg@.service`, `pgcf-agent.service`, the `modprobe@` masks) ship only with the image; a
+  release changes the binaries only. The new units mount the volume themselves from the link
+  `/run/pgcf/dev/<id>` and assert it; the agent makes the link. So: first a release whose agent
+  makes the link, which works on the old image (its agent unit has no private mount namespace, so
+  the volumes are in PID 1's, and the old database units assert the mount point, with none of
+  the gain in start time), then the new image on each node, which is a reinstall. The reverse is an outage: an agent from before the link on an image
+  with the new units makes no link, so every start of `pgcf-pg@` fails its assertion and no
+  database wakes. A node on the new image therefore never gets an older release: **never assign a
+  release older than the first one that makes the link to a region that has such a node.** Nothing
+  refuses it; the release assignment does not check the image (the maintenance cycle's `pgcf-agent
+  check` follows a package install, not a release move).
 - In the maintenance cycle (plan 9.3) it reads the release's package lock (the `packages.lock.json`
   of the image the release is built from), installs what differs from `dpkg` with
   `apt-get install --no-install-recommends --allow-downgrades -o Dpkg::Options::=--force-confold
@@ -373,15 +532,34 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   gateway and cloudflared's metrics listen on loopback only; PostgreSQL listens on no address.
 - **Operator shell.** [10-pgcf.conf](mkosi.extra/etc/ssh/sshd_config.d/10-pgcf.conf) makes sshd take
   one thing: a user certificate for root, signed by the CA in `/etc/ssh/pgcf_user_ca.pub` and
-  carrying the principal `pgcf-break-glass` (`/etc/ssh/principals/root`). The image ships no CA key,
-  so no login is possible until a CA's public key is written there; the installer does not write
-  one yet (plan 11.2). There are no passwords, no `authorized_keys`, two tries, a 20 s grace time,
-  two sessions and no forwarding of any kind; the log level is `VERBOSE`, and per-source penalties
-  stay at their default. sshd refuses every public key when `RevokedKeys` names a missing file, so
-  the image ships an empty key revocation list (`/etc/ssh/pgcf_revoked.krl`, the header only;
-  `ssh-keygen -k -u -f` adds to it).
-  A client offers only the certificate's key (`IdentitiesOnly=yes`), because two tries end after
-  the key and its certificate.
+  carrying the principal `pgcf-break-glass` (`/etc/ssh/principals/root`). There are no passwords, no
+  `authorized_keys`, two tries, a 20 s grace time, two sessions and no forwarding of any kind; the
+  log level is `VERBOSE`, which puts the certificate's key id and the CA's fingerprint in the
+  journal (`ssh.service`, which the boot report and the `journal` probe read), and per-source
+  penalties stay at their default. `units.test.ts` pins these values and that no other drop-in,
+  principals file or key is in the image.
+
+  The image ships no CA key, so no login is possible until a CA's public key is in the file. The
+  operator holds the CA (an Ed25519 key pair whose private half is on no Worker and in no
+  repository); its public key is the API Worker's variable `NODE_SSH_USER_CA_PUBLIC_KEY`, and the
+  node's credentials carry it (`shell_ca_public_key`) only while `NODE_SHELL_HOSTNAME` is `"true"`
+  and the variable is exactly one valid `ssh-ed25519` line. On every read of its credentials the
+  agent makes the file match: it writes it atomically (a temporary file in `/etc/ssh`, mode 0644,
+  owned by the agent's user, root, fsynced and renamed, with the directory fsynced) when the key is
+  there and differs, and removes it when the field is absent, and it logs `shell_ca_written` or
+  `shell_ca_removed`, never the key. It does this before it touches the gateway's credentials, so a
+  shell that was turned off is closed whatever else fails, and a failure to write the file is
+  retried with the next page. sshd needs no reload: it opens `TrustedUserCAKeys` for every
+  certificate it checks and `sshd -t` does not need the file, so the file appearing makes the next
+  login possible and its removal makes the next one fail (the boot test proves both without a
+  reload). The operator's side is `scripts/operations/node-shell.ts`: a throwaway key signed for 15
+  minutes, through `cloudflared access ssh` (docs/operations/operator-installation.md, "Using the
+  shell").
+
+  sshd refuses every public key when `RevokedKeys` names a missing file, so the image ships an empty
+  key revocation list (`/etc/ssh/pgcf_revoked.krl`, the header only; `ssh-keygen -k -u -f` adds to
+  it). A client offers only the certificate's key (`IdentitiesOnly=yes`), because two tries end
+  after the key and its certificate.
 - **No ssh socket.** With sshd installed, systemd 257's `systemd-ssh-generator` binds it to the Unix
   socket `/run/ssh-unix-local/socket` (mode 0666, which a database's user reaches, because its unit
   allows `AF_UNIX`) and to vsock. The image masks the generator (a link to `/dev/null` in
@@ -395,7 +573,7 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   1 GiB, at least 2 GiB free and 14 days on the 8 GiB root, and syncs to disk every 15 s instead of
   every five minutes, so that the minutes before a freeze are in the journal after the reboot.
   After every reboot the agent posts the last 1,000 lines of the previous boot from `pgcf-agent`,
-  `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, PID 1 and the kernel (`journalctl
+  `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, `ssh`, PID 1 and the kernel (`journalctl
   --boot=-1`, never the units of the databases or of the backup jobs, and an event line of the agent
   only as far as the observation report carries it), which the API keeps for 30 days, one report
   per boot, and an administrator reads at `GET /v1/nodes/{id}/diagnostics`. On request
@@ -452,9 +630,9 @@ database.
 The API side renders the userData from the registered release and serves the image and the progress route (`POST` of
 `{"checkpoint", "detail"}` with the Bearer token). It refuses the token once `rebooting` or `failed`
 has arrived, so a second run in rescue, for example after a reboot that leads back into rescue,
-stops at `started` before it touches the disk. Stage 1 left rescue through the API's
-`actions/restart`; whether the script's own reboot leaves rescue is recorded at the first install
-(Stage 4). If enrollment does not follow `rebooting`, AddNode restarts the instance through the API.
+stops at `started` before it touches the disk. If enrollment does not follow `rebooting`, AddNode
+restarts the instance through the API. EU1's live install enrolled the node 28.0 s after the
+`rebooting` checkpoint (plan 11.1).
 
 ## Boot test
 
@@ -467,5 +645,5 @@ The guest reports one line per check on the second serial port:
 
 | Boot | Checks |
 | --- | --- |
-| First | no failed unit; nothing listens outside loopback; the journal syncs every 15 s (`systemd-analyze cat-config`); no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; `sshd -t` passes and `sshd -T` reports the operator shell's values; a certificate from a throwaway CA is refused on 127.0.0.1 and ::1, accepted once that CA is installed and refused again when it is removed; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`, and the slice carries the image's 512 MiB `MemoryMax`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750 |
-| Second | no failed unit; loopback only; the journal syncs every 15 s; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |
+| First | no failed unit; nothing listens outside loopback; the journal syncs every 15 s (`systemd-analyze cat-config`); no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; `sshd -t` passes and `sshd -T` reports the operator shell's values; a certificate from a throwaway CA is refused on 127.0.0.1 and ::1, accepted once that CA is installed and refused again when it is removed; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`, and the slice carries the image's 512 MiB `MemoryMax`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check`, run in the agent's mount namespace, creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750; no volume is in PID 1's mount namespace and the agent's has the scratch volume; its filesystem ends at least 4 MiB before its volume; the database unit's `DeviceAllow` is `char-rtc r` and the five entries of `MountImages=` with a closed policy, a private `/dev` and no capability; the scratch database's user, inside its unit, finds no block node in `/dev`, cannot make one and cannot open a device-mapper node or its volume's device; a start of a unit without a link fails its assertion; the scratch database, started from its link, runs on across a restart of the agent, whose start has dropped every link, and stays awake into the reboot |
+| Second | no failed unit; loopback only; the journal syncs every 15 s; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database, with no volume in PID 1's mount namespace; the database that was awake at the reboot was stopped cleanly before the node went down, and neither PostgreSQL nor ext4 recovered anything at this start |

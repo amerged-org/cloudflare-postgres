@@ -536,6 +536,7 @@ mod tests {
                 id: "zyxwvutsrqponmlkjihg".into(),
                 user: "pgcf-zyxwvutsrqponmlkjihg".into(),
                 volume: neighbour_volume.clone(),
+                device: "/dev/mapper/pgcf-db_zyxwvutsrqponmlkjihg_g1".into(),
                 socket_directory: neighbour_volume.join("socket"),
             },
             uid: neighbour_uid,

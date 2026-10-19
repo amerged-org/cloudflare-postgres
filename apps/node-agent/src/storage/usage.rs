@@ -118,14 +118,17 @@ pub struct VolumeInfo {
     /// The pool took no writes while the volume was mounted: it may have lost some (the volume
     /// carries a tag for it). Only `recover_volume` mounts it again.
     pub suspect: bool,
+    /// ext4 recorded an error on the volume's filesystem, mounted anywhere on the node (the
+    /// agent's namespace, a unit's, a job's): a journal abort after a write failed, for example.
+    pub fs_errors: bool,
+    /// The agent's own mount of the volume, which space and inodes are read from; none after the
+    /// agent restarted, until it has mounted the volume again.
     pub mount: Option<MountInfo>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MountInfo {
     pub usage: FsUsage,
-    /// ext4 recorded an error on this mount: a journal abort after a write failed, for example.
-    pub fs_errors: bool,
 }
 
 impl VolumeInfo {
@@ -135,7 +138,7 @@ impl VolumeInfo {
     /// The volume needs the stop, unmount, repair and mount of `recover_volume` before its
     /// database starts again.
     pub fn needs_repair(&self) -> bool {
-        self.suspect || self.mount.is_some_and(|mount| mount.fs_errors)
+        self.suspect || self.fs_errors
     }
     /// One entry of the contract's `NodeVolumeReport`.
     pub fn to_contract(&self) -> Value {
@@ -315,27 +318,25 @@ mod tests {
     #[test]
     fn a_volume_needs_repair_when_the_pool_failed_under_it_or_ext4_recorded_an_error() {
         let id = VolumeId::new("a1b2c3d4e5f6g7h8i9j0", 1).unwrap();
-        let volume = |suspect: bool, mount: Option<MountInfo>| VolumeInfo {
+        let volume = |suspect: bool, fs_errors: bool, mounted: bool| VolumeInfo {
             id: id.clone(),
             size_bytes: 128 << 20,
             pool_used_bytes: 0,
             formatted: true,
             reserve_released: false,
             suspect,
-            mount,
+            fs_errors,
+            mount: mounted.then(|| MountInfo { usage: full() }),
         };
-        let mounted = |fs_errors: bool| {
-            Some(MountInfo {
-                usage: full(),
-                fs_errors,
-            })
-        };
-        assert!(!volume(false, mounted(false)).needs_repair());
-        assert!(!volume(false, None).needs_repair());
+        assert!(!volume(false, false, true).needs_repair());
+        assert!(!volume(false, false, false).needs_repair());
         // A volume the pool failed under has no recorded error, and may be unmounted since.
-        assert!(volume(true, mounted(false)).needs_repair());
-        assert!(volume(true, None).needs_repair());
-        assert!(volume(false, mounted(true)).needs_repair());
+        assert!(volume(true, false, true).needs_repair());
+        assert!(volume(true, false, false).needs_repair());
+        // ext4's error is the volume's, whether or not the agent has it mounted: a unit may be
+        // the only one that has.
+        assert!(volume(false, true, true).needs_repair());
+        assert!(volume(false, true, false).needs_repair());
     }
 
     #[test]
@@ -348,10 +349,8 @@ mod tests {
             formatted: true,
             reserve_released: false,
             suspect: false,
-            mount: Some(MountInfo {
-                usage: full(),
-                fs_errors: false,
-            }),
+            fs_errors: false,
+            mount: Some(MountInfo { usage: full() }),
         };
         let asleep_unmounted = VolumeInfo {
             mount: None,

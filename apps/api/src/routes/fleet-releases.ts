@@ -14,6 +14,7 @@ import {
   FleetReleaseVersion,
   RELEASE_FILE_PATH,
   RELEASE_IMAGE_FILE,
+  ReleaseSignature,
   FleetRegionReleaseUpdate,
   FleetRegionReleaseStatus,
   FleetNodeReleaseStatus,
@@ -99,7 +100,7 @@ export function registerFleetReleases(app: ApiApp): void {
       method: "put",
       path: "/v1/fleet/releases/{id}",
       description:
-        "Registers an immutable release: one node image with its binaries and package lock, the same for every node. The body holds the digest and size of each file the build produced; the files must already be in the archive bucket under `node-images/{id}/`, uploaded with their sha256 for R2 to verify, and the Worker names every URL of the stored spec itself. The id is the image version the node enrolls as. This records desired configuration; assigning it to a region makes the region's nodes pull it.",
+        "Registers an immutable release: one node image with its binaries and package lock, the same for every node. The body holds the digest and size of each file the build produced and the signature CI made of the release with the release key (64 bytes as 128 hex digits, required): the API holds no key, so it stores the signature and shows it as `spec.signature` and cannot check it, and a node refuses a release whose signature its agent's key does not verify. The files must already be in the archive bucket under `node-images/{id}/`, uploaded with their sha256 for R2 to verify, and the Worker names every URL of the stored spec itself. The id is the image version the node enrolls as. This records desired configuration; assigning it to a region makes the region's nodes pull it.",
       request: {
         headers,
         params: z.object({ id: FleetReleaseVersion }),
@@ -211,13 +212,22 @@ export function registerFleetReleases(app: ApiApp): void {
       ...delivery,
       method: "get",
       path: `${RELEASE_FILE_PATH}/{version}/{file}`,
-      description: `A binary (\`pgcf-agent\`, \`pgcf-native-gateway\`, \`pgcf-archive\`, \`pgcf-wal-fetch\`) or the \`packages.lock.json\` of a registered release, streamed from the archive bucket. The agent reads these without a credential and checks the size and sha256 its desired page pins; they are open artifacts. ${method}`,
+      description: `A binary (\`pgcf-agent\`, \`pgcf-native-gateway\`, \`pgcf-archive\`, \`pgcf-wal-fetch\`) or the \`packages.lock.json\` of a registered release, streamed from the archive bucket. The agent reads these without a credential and checks the size and sha256 its desired page pins; they are open artifacts. ${method} The name \`release.sig\` answers with the release's signature as 128 hex digits of text, from the stored spec, and no range applies to it: the agent checks it against the release key compiled into its binary before it installs anything of the release.`,
       request: {
         params: z.object({ version: z.string(), file: z.string() }),
       },
       responses: {
         ...errors,
         ...bytes,
+        // `release.sig` is no object of the bucket: the text of the stored signature, and no range.
+        200: {
+          description:
+            "The whole file; `release.sig` answers with the signature as 128 hex digits of text",
+          content: {
+            ...octets,
+            "text/plain": { schema: ReleaseSignature },
+          },
+        },
       },
     },
     async (c) =>

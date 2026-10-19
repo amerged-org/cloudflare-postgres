@@ -141,6 +141,10 @@
           },
           "required": ["active", "keys"],
           "additionalProperties": false
+        },
+        "shell_ca_public_key": {
+          "type": "string",
+          "pattern": "^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-P][A-Za-z0-9+/]{42}$"
         }
       },
       "required": ["revision", "tunnel_token", "route_keyring"],
@@ -1627,6 +1631,16 @@
                       "release_failed"
                     ]
                   },
+                  "stale": {
+                    "type": "string",
+                    "enum": [
+                      "no_entry",
+                      "generation",
+                      "operation",
+                      "route",
+                      "role"
+                    ]
+                  },
                   "phases_ms": {
                     "type": "object",
                     "properties": {
@@ -2347,6 +2361,11 @@
       "configured",
       "rebooting",
       "failed"
-    ]
+    ],
+    "RELEASE_REFUSALS": [
+      "release_signature_missing",
+      "release_signature_invalid"
+    ],
+    "RELEASE_SIGNATURE_FILE": "release.sig"
   }
 }

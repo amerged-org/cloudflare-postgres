@@ -25,6 +25,8 @@ pub mod sample;
 pub mod scram;
 pub mod service;
 pub mod settings;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod shell_ca;
 pub mod sleep;
 pub mod state;
 pub mod storage;

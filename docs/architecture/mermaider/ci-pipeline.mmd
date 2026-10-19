@@ -1,5 +1,8 @@
 flowchart LR
     n_a6e574012643["advisories<br/>if: github.event_name == 'schedule'<br/>|| (github.event_name ==<br/>'workflow_dispatch' #38;#38;<br/>inputs.advisori…"]
+    n_961dc845a911["sign-release<br/>if: github.event_name == 'push' #38;#38;<br/>github.ref == 'refs/heads/main' #38;#38;<br/>!github.event.repository.fork"]
     n_d92200072b60["external_probe<br/>if: github.event_name ==<br/>'workflow_dispatch' #38;#38;<br/>inputs.external_probe #38;#38; github.ref<br/>== 'refs/heads/…"]
     n_58381b3e9536["check<br/>if: github.event_name != 'schedule'<br/>#38;#38; (github.event_name !=<br/>'workflow_dispatch' ||<br/>!(inputs.extern…"]
     n_20a964d54b2b["node-image<br/>if: github.event_name != 'schedule'<br/>#38;#38; (github.event_name !=<br/>'workflow_dispatch' ||<br/>!(inputs.extern…"]
+    n_58381b3e9536 --> n_961dc845a911
+    n_20a964d54b2b --> n_961dc845a911

@@ -23,6 +23,9 @@ pub struct Layout {
     pub archive_command: String,
     /// The `restore_command` client of the image (plan 7.8).
     pub fetch_command: String,
+    /// The file of the CA public key that sshd trusts for the operator shell (plan 8): it exists
+    /// only while Cloudflare's credentials carry the key, and sshd refuses every login without it.
+    pub ssh_user_ca: PathBuf,
 }
 
 impl Default for Layout {
@@ -36,6 +39,7 @@ impl Default for Layout {
             systemd_executor: PathBuf::from("/usr/lib/systemd/systemd-executor"),
             archive_command: "/usr/libexec/pgcf/pgcf-archive".into(),
             fetch_command: crate::archive::recovery::WAL_FETCH_COMMAND.into(),
+            ssh_user_ca: PathBuf::from("/etc/ssh/pgcf_user_ca.pub"),
         }
     }
 }
@@ -45,9 +49,22 @@ impl Layout {
     pub fn volumes(&self) -> PathBuf {
         self.state.join("db")
     }
-    /// The mount point of a database's volume, the unit's `AssertPathIsMountPoint=`.
+    /// The mount point of a database's volume: the agent mounts the volume here in its own mount
+    /// namespace, and the unit mounts it again at the same path in its own (`MountImages=`).
     pub fn volume(&self, database: &str) -> PathBuf {
         self.volumes().join(database)
+    }
+    /// `/run/pgcf/dev`: the directory of the device links, root's alone (0700). The unit's
+    /// `MountImages=` and `AssertPathExists=` follow a link in it as root, so it is never a
+    /// directory a database's user can write.
+    pub fn device_links(&self) -> PathBuf {
+        self.run.join("dev")
+    }
+    /// The link a database's unit mounts its volume from (`MountImages=` of `pgcf-pg@.service`):
+    /// it points to the device of the generation the agent has attached, and exists only while it
+    /// has (`storage::Storage`).
+    pub fn device_link(&self, database: &str) -> PathBuf {
+        self.device_links().join(database)
     }
     /// The data directory the unit runs PostgreSQL on.
     pub fn data(&self, database: &str) -> PathBuf {
@@ -103,6 +120,13 @@ mod tests {
         assert_eq!(layout.volume("a"), PathBuf::from("/var/lib/pgcf/db/a"));
         assert_eq!(layout.data("a"), PathBuf::from("/var/lib/pgcf/db/a/data"));
         assert_eq!(layout.socket_directory("a"), PathBuf::from("/run/pgcf/a"));
+        assert_eq!(layout.device_links(), PathBuf::from("/run/pgcf/dev"));
+        assert_eq!(layout.device_link("a"), PathBuf::from("/run/pgcf/dev/a"));
+        // The storage's own configuration names the same directory: the unit reads the link there.
+        assert_eq!(
+            crate::storage::Config::default().device_links,
+            layout.device_links()
+        );
         assert_eq!(
             layout.gateway_socket(),
             PathBuf::from(pgcf_native_protocol::agent::GATEWAY_SOCKET)
