@@ -141,6 +141,50 @@ test("sshd takes user certificates only and the image ships no CA key: nothing l
   assert.equal(krl.readUInt32BE(8), 1);
 });
 
+test("the break-glass sshd grants a root shell to one certificate principal and nothing else: no forwarding, two tries, certificate and key id logged", () => {
+  const ssh = new URL("etc/ssh/", image);
+  const dropIns = readdirSync(new URL("sshd_config.d/", ssh));
+  assert.deepEqual(dropIns, ["10-pgcf.conf"], "no other drop-in can undo it");
+  assert.deepEqual(
+    readdirSync(ssh).sort(),
+    ["pgcf_revoked.krl", "principals", "sshd_config.d"],
+    "no CA key, no authorized key and no host key in the image",
+  );
+  assert.deepEqual(readdirSync(new URL("principals/", ssh)), ["root"], "no other user has a principals file");
+  assert.equal(existsSync(new URL("root/.ssh", image)), false, "no authorized_keys for root");
+  const conf = readFileSync(new URL("sshd_config.d/10-pgcf.conf", ssh), "utf8");
+  const directives = records(conf).map((fields) => [(fields[0] ?? "").toLowerCase(), fields.slice(1).join(" ")] as const);
+  const values = (keyword: string) => directives.filter(([name]) => name === keyword).map(([, value]) => value);
+  // A Match block would apply other values to some connections.
+  assert.deepEqual(values("match"), []);
+  // sshd takes the first value of a keyword: each is given once, so none is overridden below it.
+  for (const [keyword] of directives)
+    if (keyword !== "listenaddress") assert.equal(values(keyword).length, 1, `${keyword} is given once`);
+  const fixed = {
+    pubkeyauthentication: "yes",
+    permitrootlogin: "prohibit-password",
+    maxauthtries: "2",
+    maxsessions: "2",
+    x11forwarding: "no",
+    allowtcpforwarding: "no",
+    allowagentforwarding: "no",
+    permittunnel: "no",
+    disableforwarding: "yes",
+    gssapiauthentication: "no",
+    trustedusercakeys: "/etc/ssh/pgcf_user_ca.pub",
+    authorizedprincipalsfile: "/etc/ssh/principals/%u",
+    // The certificate's key id and the CA's fingerprint, which node-shell.ts fills, are in the journal.
+    loglevel: "VERBOSE",
+  };
+  for (const [keyword, value] of Object.entries(fixed)) assert.deepEqual(values(keyword), [value], keyword);
+  // Loopback only: the Tunnel's connector reaches it there, and nothing else does.
+  assert.deepEqual(values("listenaddress"), ["127.0.0.1", "::1"]);
+  assert.deepEqual(values("port"), []);
+  assert.deepEqual(values("gatewayports"), []);
+  // The one principal is the one the operator's helper signs for.
+  assert.deepEqual(records(readFileSync(new URL("principals/root", ssh), "utf8")), [["pgcf-break-glass"]]);
+});
+
 test("the journal is synced every 15 s: the minutes before a freeze reach the disk", () => {
   const journald = readFileSync(new URL("usr/lib/systemd/journald.conf.d/pgcf.conf", image), "utf8");
   assert.deepEqual(assignments(journald, "SyncIntervalSec"), ["15s"]);

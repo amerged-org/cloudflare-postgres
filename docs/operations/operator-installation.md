@@ -59,7 +59,18 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
   same read deletes a DNS record under the shell's former name, `pgcf-node-<id>-ssh.<domain>`,
   whatever the variable says. Leave it off until Cloudflare Access guards the shell (plan 8,
   [the section below](#cloudflare-access-for-node-gateways-and-shells)): without Access the
-  hostname is reachable by anyone who can run cloudflared.
+  hostname is reachable by anyone who can run cloudflared. A change of this variable or of the
+  next one reaches a running node by itself: the first desired page or credentials read built after
+  the deploy raises the node's credentials revision, so the node reads its credentials again within
+  one pull (at most a minute) without restarting its gateway or its Tunnel. While the deploy
+  spreads and two versions of the Worker serve at once, the revision may rise once more for each
+  change of hands; the last version to serve decides what the node holds.
+- `NODE_SSH_USER_CA_PUBLIC_KEY` is the public key of the CA that signs the shell's certificates:
+  exactly one line, `ssh-ed25519 AAAA...`, 80 characters, with no comment and no options before
+  it. The private key stays with the operator and is on no Worker ([Using the shell](#using-the-shell)).
+  Nodes get the key only while `NODE_SHELL_HOSTNAME` is `true`, and the agent removes it from the
+  node when it goes. A line that is not exactly that gives nodes no key: the shell hostname
+  exists and nobody can log in.
 - `CONTABO_ORDER_SSH_KEY_IDS` also names the keys the provider's rescue action wants beside the
   installer; the installer itself uses none.
 - `CONTABO_NODE_FIREWALL_ID` names the Contabo firewall every node sits behind (plan 8). AddNode
@@ -159,7 +170,7 @@ applications wins:
 | Application | Hostnames | Policy | Session |
 | --- | --- | --- | --- |
 | `pgcf node gateways` | `pgcf-node-*.<domain>` | `edge service token`: Service Auth for one service token, nothing else (no login, no email) | 24h |
-| `pgcf node shells` (only with `--shell`) | `pgcf-shell-*.<domain>` | `operators`: allow the named emails, through the one-time PIN identity provider if the organization has one | 1h |
+| `pgcf node shells` (only with `--shell`) | `pgcf-shell-*.<domain>` | `operators`: allow the named emails, through the one-time PIN identity provider if the organization has one; with `--shell-service-token` also `shell service token`: Service Auth for a second service token that is made for the shells alone (the Edge's is never on this application, and this one never on the gateways) | 1h; 15m for the token's policy |
 
 Both are self-hosted applications, hidden from the App Launcher, with HttpOnly cookies and no CORS
 headers. The gateways' application answers a request without credentials with 401, never with a
@@ -214,18 +225,26 @@ before any request):
    and exits non-zero. Changes take a moment to reach Cloudflare's edge: repeat once before
    treating the first answer as final. Then open a connection through the Edge as usual to see that
    the Edge still gets in.
-4. The shell, when an operator needs it. The application comes first, then the variable:
+4. The shell, when an operator needs it. The application comes first, then the variable. The
+   [Using the shell](#using-the-shell) section below has the whole order, with the CA:
 
    ```sh
    node scripts/operations/setup-access.ts apply --account <ACCOUNT_ID> --domain <NODE_GATEWAY_DOMAIN> \
-     --service-token <TOKEN_NAME> --shell --operator-email ops@example.org --operator-email dev@example.org
+     --service-token <TOKEN_NAME> --shell --operator-email ops@example.org --operator-email dev@example.org \
+     --shell-service-token <SHELL_TOKEN_NAME> --shell-token-file ~/.pgcf/shell-token.env
    ```
 
-   The list of emails is the whole list: running it with fewer emails removes the others. Then set
-   `NODE_SHELL_HOSTNAME` to `"true"` on the API Worker and deploy it; a node gets its
-   `pgcf-shell-<id>.<domain>` hostname on its next credentials read. Connect with
-   `ssh -o ProxyCommand="cloudflared access ssh --hostname %h" <user>@pgcf-shell-<id>.<domain>`;
-   `cloudflared` opens the Access login, which needs one of the named emails.
+   The list of emails is the whole list: running it with fewer emails removes the others.
+   `--shell-service-token` makes a second service token (720h) that only the shell application
+   lets in, with a Service Auth policy of 15 minutes, and writes its client id and secret to the
+   file, which must not exist yet and sit in a directory only you can enter (Cloudflare shows the
+   secret once, so the script makes the token only when it knows where the secret goes, and deletes
+   it again if the file cannot be written). A token that exists is used as it is and needs no file;
+   one that has expired or is disabled is refused: delete it in the dashboard and run again with a
+   new file. Without the flag the policy of the token is deleted again, as is any other policy
+   on the shell application. Then set `NODE_SHELL_HOSTNAME` to `"true"` on the API Worker and
+   deploy it; every node gets its `pgcf-shell-<id>.<domain>` hostname within a pull, and connects
+   with `scripts/operations/node-shell.ts`.
 
 **Renew or rotate the service token.** The two are different steps. A token lasts the duration it
 was made with (8760h) and stops working then: Access refuses the Edge at every `pgcf-node-*`
@@ -258,9 +277,110 @@ made, which also has a new expiry.
 
 **Roll back.** `apply --account <ACCOUNT_ID> --remove` deletes both applications and their
 policies (the same as deleting them in the dashboard under Access, Applications) and keeps the
-service token; the gateways have only their route token again. Turn `NODE_SHELL_HOSTNAME` off
+service tokens; the gateways have only their route token again. Turn `NODE_SHELL_HOSTNAME` off
 and deploy before the shell application goes, or the shell hostnames are open. `plan --remove`
 shows what would go.
+
+## Using the shell
+
+The shell is a real root shell on one node, reached through its Tunnel. It is for the
+fix-until-it-works loop, for Stage 5 acceptance tests that inject faults (`kill -9` of the
+postmaster, the agent and the gateway, a full pool or volume, no free inodes) and for an
+exceptional manual update. It is **off by default and fails closed**: three things must all hold
+before a login can succeed, and removing any one ends it.
+
+1. The API Worker's `NODE_SHELL_HOSTNAME` is `"true"`, so the node has the hostname, its DNS record
+   and its Tunnel ingress rule.
+2. The node holds your CA's public key in `/etc/ssh/pgcf_user_ca.pub`. The image ships none, sshd
+   refuses every key without the file, and the agent writes the file only while the node's
+   credentials carry the key (`NODE_SSH_USER_CA_PUBLIC_KEY`, valid, and the shell on), and removes
+   it as soon as they do not.
+3. Cloudflare Access lets the caller in (an operator's email, or the shell's own service token),
+   and the caller presents a certificate signed by your CA for the principal `pgcf-break-glass`,
+   valid for 15 minutes.
+
+**1. Make the CA, once.** On your own machine; the private key never goes into the repository, a
+Worker or a chat. Give it a passphrase (the helper below lets `ssh-keygen` ask for it on your terminal, and its prompt
+names the key file), and keep a
+copy with the encrypted operator backup. If you lose it, make a new CA and set its public key; no
+node keeps trusting the old one once the variable changes.
+
+```sh
+ssh-keygen -t ed25519 -C pgcf-shell-ca -f ~/.ssh/pgcf_shell_ca
+awk '{ print $1 " " $2 }' ~/.ssh/pgcf_shell_ca.pub   # the one line the Worker variable takes
+```
+
+**2. Set the key on the API Worker**, as the variable `NODE_SSH_USER_CA_PUBLIC_KEY` (a plain
+variable, because it is public), with `NODE_SHELL_HOSTNAME` still off. A comment after the key, a
+second line or an option before it make the whole line invalid, and nodes then get no key.
+
+**3. Apply Access** with the shell and its service token, as in step 4 of the
+[Cloudflare Access](#cloudflare-access-for-node-gateways-and-shells) section. Do it once; keep the
+file it writes (`PGCF_SHELL_ACCESS_CLIENT_ID` and `PGCF_SHELL_ACCESS_CLIENT_SECRET`, mode 0600).
+
+**4. Turn the shell on.** First make sure every node of the region runs an agent that has the
+shell CA: register the release that contains it, assign it to the region and wait until
+`GET /v1/nodes/{id}/release` says `converged` for each node
+([Node maintenance cycle](recovery.md#node-maintenance-cycle) step 1). An agent from before it
+refuses credentials that carry the key (`Cloudflare credentials invalid`), so it never applies
+them, and a node added from such a release never becomes ready; it also restarts the gateway and
+the Tunnel for every revision it does apply. Then set `NODE_SHELL_HOSTNAME` to `"true"` and deploy.
+Within one pull, a node reads its credentials again (its credentials revision rose), the API makes
+the hostname, and the agent writes the key file. Look in Workers Logs for a `node_event` line with the event
+`shell_ca_written` for the node (it carries no key material). The gateway and the Tunnel are not
+restarted for it.
+
+**5. Connect.** You need `ssh`, `ssh-keygen` and `cloudflared` on your machine.
+
+```sh
+set -a; . ~/.pgcf/shell-token.env; set +a
+export PGCF_SHELL_CA_KEY=~/.ssh/pgcf_shell_ca
+node scripts/operations/node-shell.ts --node <NODE_ID> --domain <NODE_GATEWAY_DOMAIN> --label <you>
+node scripts/operations/node-shell.ts --node <NODE_ID> --domain <NODE_GATEWAY_DOMAIN> --label <you> \
+  -- 'journalctl -u pgcf-agent -n 50 --no-pager'
+```
+
+The helper takes the CA key's path and the token from environment variables (their names are
+`--ca-key-env`, `--token-id-env` and `--token-secret-env` if you keep them under other names),
+never from arguments, and refuses a CA key file that group or others can read. It makes a
+throwaway key in a directory only you can enter, signs it with the CA (principal
+`pgcf-break-glass`, key id `pgcf-shell-<UTC date>-<label>`, 15 minutes, a terminal and nothing else:
+no forwarding), runs `ssh` through `cloudflared access ssh` with the token in its environment, and
+deletes the key when ssh ends. ssh trusts the node's host key on first use: after a reinstall,
+remove the old line from `~/.ssh/known_hosts`. Without `--` you get an interactive root shell; with
+it, one command (give it as one quoted string), and the exit status is ssh's. The one-time PIN
+login of `--operator-email` is the other way through Access, for an operator who has no token: use
+`ssh -o ProxyCommand="cloudflared access ssh --hostname %h"` with a certificate signed by hand.
+
+**6. Turn it off, and check that it is off.** Unset `NODE_SHELL_HOSTNAME` (or set it to anything
+but `true`) and deploy; turn it off before the Access application goes. Within one pull the node
+removes the hostname's ingress rule and DNS record (the API does that on the credentials read) and
+the agent removes `/etc/ssh/pgcf_user_ca.pub`. Check, from outside the node:
+
+- Workers Logs show the node's `node_event` with `shell_ca_removed`;
+- the node's next sample carries the new `credentials_revision`, which the desired page names;
+- `node-shell.ts` for the node no longer connects (the hostname does not resolve).
+
+A node that is off or stale does the same as soon as it reads its page again. Until then the key
+file stays, and with it the possibility of a login for whoever still reaches the hostname and holds
+a certificate: that is why the CA key must stay in your hands, and why the certificates last only
+15 minutes.
+
+**Audit.** sshd logs at `VERBOSE`: for each login the journal holds the line `Accepted certificate
+ID "pgcf-shell-<date>-<label>" (serial 0) signed by ED25519 CA SHA256:<fingerprint>` and the
+`Accepted publickey` line of the connection, so the operator's label and the CA are on record. An
+administrator reads them without a shell: the `journal` probe and the boot report include
+`ssh.service`
+([Looking at a node](recovery.md#looking-at-a-node)): `POST /v1/nodes/{id}/diagnostics` with
+`{"probe":"journal","since_seconds":3600,"lines":2000}`, then the entries whose `unit` is
+`ssh.service`. Compare the fingerprint with `ssh-keygen -l -f ~/.ssh/pgcf_shell_ca.pub`.
+
+**Rotate or revoke.** Another CA: make it as in step 1, set the new public key and deploy; the
+agent replaces the file within a pull (`shell_ca_written` again), and certificates of the old CA
+stop working. A single certificate needs no revocation, because it lasts 15 minutes; to stop
+everything now, turn the shell off. `/etc/ssh/pgcf_revoked.krl` stays the empty list the image
+ships. The shell service token lasts 720h; when it has expired the script says so, and a new one is
+made as in step 3.
 
 ## The region's node policy
 

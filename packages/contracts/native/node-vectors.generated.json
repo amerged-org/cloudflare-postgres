@@ -207,6 +207,171 @@
       }
     },
     {
+      "schema": "NodeCredentials",
+      "name": "shell-ca",
+      "valid": true,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-with-comment",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp operator@example.org"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-with-options",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "command=\"/bin/true\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-two-lines",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-trailing-newline",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp\n"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-leading-space",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": " ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-other-type",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-truncated",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8b"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-length-byte",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIQNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-empty",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": ""
+      }
+    },
+    {
+      "schema": "NodeCredentials",
+      "name": "shell-ca-null",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": null
+      }
+    },
+    {
       "schema": "ArchiveCredential",
       "name": "read-write",
       "valid": true,

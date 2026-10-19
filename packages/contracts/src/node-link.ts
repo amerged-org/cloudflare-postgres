@@ -389,15 +389,52 @@ export async function verifyNodeRequest(
 // ---------- Credentials ----------
 
 /**
- * GET /node/v1/credentials: what the gateway and the Tunnel need, after enrollment. The agent
- * reads it when the page's `credentials_revision` is above the revision it applied.
+ * The public key of the CA that signs the operator shell's user certificates (plan 8): exactly
+ * `ssh-ed25519 <base64>`, 80 characters, on one line. The pattern is the whole check: no options
+ * before the type, no comment after the key, no line break, no other key type. The blob is the
+ * encoding of the type name `ssh-ed25519` and a 32-byte key, so only the last 43 characters vary;
+ * the first of them holds the low two bits of the length byte 0x20, which are zero, and the top
+ * four bits of the key, so it is one of A to P.
+ */
+export const NODE_SHELL_CA_PUBLIC_KEY_PATTERN =
+  /^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-P][A-Za-z0-9+/]{42}$/;
+export const NodeShellCaPublicKey = z
+  .string()
+  .regex(NODE_SHELL_CA_PUBLIC_KEY_PATTERN);
+
+/**
+ * The CA public key an operator configured as the API Worker's `NODE_SSH_USER_CA_PUBLIC_KEY`, or
+ * null when the variable is unset or not exactly one valid key line. A variable that is not valid
+ * gives the node no key, so no login: it fails closed.
+ */
+export function nodeShellCaPublicKey(
+  variable: string | undefined,
+): string | null {
+  const parsed = NodeShellCaPublicKey.safeParse(variable);
+  return parsed.success ? parsed.data : null;
+}
+
+/**
+ * GET /node/v1/credentials: what the gateway, the Tunnel and the operator shell need, after
+ * enrollment. The agent reads it when the page's `credentials_revision` is above the revision it
+ * applied.
  */
 export const NodeCredentials = z.strictObject({
-  /** The revision these credentials hold; it only rises, with every change of either secret. */
+  /**
+   * The revision these credentials hold; it only rises, with every change of either secret and
+   * with every change of the shell's state (the shell hostname on or off, or another CA key).
+   */
   revision: Positive,
   tunnel_token: z.string().regex(/^[A-Za-z0-9+/=_-]{32,4096}$/),
   /** The node's route keyring for the gateway (`PGCF_ROUTE_KEY`). */
   route_keyring: RegionRouteKeyring,
+  /**
+   * The operator shell's CA public key. It is there only while the API's `NODE_SHELL_HOSTNAME` is
+   * `true` and its `NODE_SSH_USER_CA_PUBLIC_KEY` is valid. The agent writes it to the file sshd
+   * trusts (`/etc/ssh/pgcf_user_ca.pub`) and, when the field is absent, removes that file: sshd
+   * refuses every key without it.
+   */
+  shell_ca_public_key: NodeShellCaPublicKey.optional(),
 });
 export type NodeCredentials = z.infer<typeof NodeCredentials>;
 
@@ -930,10 +967,10 @@ export const NodeDesiredPage = z
     release: NodeRelease.nullable(),
     policy: NodePolicy,
     /**
-     * The revision of the node's credentials (Tunnel token and route keyring). The agent reads
-     * `NodeCredentials` when this is above the revision it applied, and reports the applied
-     * revision in every sample; the API makes a new route key active only after every node of
-     * the region reports a revision that holds it.
+     * The revision of the node's credentials (Tunnel token, route keyring and the operator
+     * shell's state). The agent reads `NodeCredentials` when this is above the revision it
+     * applied, and reports the applied revision in every sample; the API makes a new route key
+     * active only after every node of the region reports a revision that holds it.
      */
     credentials_revision: Positive,
     /** Every open order, on every page. */
@@ -1558,7 +1595,7 @@ export type NodeJournalEntry = z.infer<typeof NodeJournalEntry>;
  * names none), which is not the boot the agent stored when a report of a boot between them was lost;
  * null when the agent had stored none (it was just installed or updated). `entries` are the tail of
  * the previous boot's journal from the agent, the gateway, cloudflared,
- * networkd, PID 1 and the kernel, oldest first; they are empty when the node has no journal of the
+ * networkd, the operator shell's sshd, PID 1 and the kernel, oldest first; they are empty when the node has no journal of the
  * previous boot.
  */
 export const NodeBootReport = z

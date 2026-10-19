@@ -20,6 +20,7 @@ import { ensureArchiveCredentials } from "./archive-credentials.ts";
 import { moveTargets } from "./database-moves.ts";
 import { openNodeOrders } from "./lifecycle-orders.ts";
 import { openDiagnosticRequests } from "./node-diagnostics.ts";
+import { shellCredentialsRevision } from "./node-shell.ts";
 
 interface NodeRow {
   id: string;
@@ -27,6 +28,7 @@ interface NodeRow {
   hostname: string;
   region_id: string;
   credentials_revision: number;
+  shell_state: string;
 }
 interface DatabaseRow {
   id: string;
@@ -167,7 +169,7 @@ export async function nodeDesiredPage(
   query: NodeDesiredQuery,
 ): Promise<NodeDesiredPage> {
   const node = await env.DB.prepare(
-    "SELECT id,node_uid uid,hostname,region_id,credentials_revision FROM nodes WHERE id=? AND node_uid=?",
+    "SELECT id,node_uid uid,hostname,region_id,credentials_revision,shell_state FROM nodes WHERE id=? AND node_uid=?",
   )
     .bind(caller.id, caller.uid)
     .first<NodeRow>();
@@ -330,7 +332,7 @@ export async function nodeDesiredPage(
     node: identity,
     release: await pageRelease(env, node.region_id),
     policy,
-    credentials_revision: node.credentials_revision,
+    credentials_revision: await shellCredentialsRevision(env, node),
     orders,
     ...(diagnostics.length > 0 ? { diagnostics } : {}),
     databases,

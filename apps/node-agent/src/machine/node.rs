@@ -133,6 +133,59 @@ impl Node {
             .await
             .map_err(|error| storage::Error::Io(io::Error::other(error)))?
     }
+
+    /// The gateway's environment file and the Tunnel's token, each where its unit reads it, and
+    /// the two units started, or restarted when `restart`.
+    async fn apply_gateway_credentials(
+        &self,
+        node: &NodeIdentity,
+        credentials: &serde_json::Value,
+        restart: bool,
+    ) -> io::Result<()> {
+        use crate::link::file::{create_private_directory, sync_directory, write_private};
+        let directory = self.layout.state.join("credentials");
+        create_private_directory(&directory)?;
+        write_private(
+            &directory.join("gateway.env"),
+            gateway_environment(node, credentials)?.as_bytes(),
+        )?;
+        // The Tunnel token becomes an encrypted systemd credential: through a file, since a
+        // command line is public to the node's users.
+        let token = credentials["tunnel_token"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("no Tunnel token"))?;
+        let work = directory.join(".tunnel-token.work");
+        let _ = std::fs::remove_dir_all(&work);
+        create_private_directory(&work)?;
+        write_private(&work.join("token"), token.as_bytes())?;
+        let encrypted = run(
+            "systemd-creds",
+            &[
+                "encrypt",
+                "--with-key=host",
+                "--name=tunnel-token",
+                &work.join("token").to_string_lossy(),
+                &work.join("tunnel-token.cred").to_string_lossy(),
+            ],
+        )
+        .await;
+        let moved = encrypted.and_then(|()| {
+            std::fs::rename(
+                work.join("tunnel-token.cred"),
+                directory.join("tunnel-token.cred"),
+            )?;
+            sync_directory(&directory)
+        });
+        let _ = std::fs::remove_dir_all(&work);
+        moved?;
+        for unit in ["pgcf-gateway.service", "pgcf-cloudflared.service"] {
+            self.units
+                .start_service(unit, restart)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 impl Machine for Node {
@@ -380,49 +433,23 @@ impl Machine for Node {
         credentials: &serde_json::Value,
         restart: bool,
     ) -> io::Result<()> {
-        use crate::link::file::{create_private_directory, sync_directory, write_private};
-        let directory = self.layout.state.join("credentials");
-        create_private_directory(&directory)?;
-        write_private(
-            &directory.join("gateway.env"),
-            gateway_environment(node, credentials)?.as_bytes(),
-        )?;
-        // The Tunnel token becomes an encrypted systemd credential: through a file, since a
-        // command line is public to the node's users.
-        let token = credentials["tunnel_token"]
-            .as_str()
-            .ok_or_else(|| io::Error::other("no Tunnel token"))?;
-        let work = directory.join(".tunnel-token.work");
-        let _ = std::fs::remove_dir_all(&work);
-        create_private_directory(&work)?;
-        write_private(&work.join("token"), token.as_bytes())?;
-        let encrypted = run(
-            "systemd-creds",
-            &[
-                "encrypt",
-                "--with-key=host",
-                "--name=tunnel-token",
-                &work.join("token").to_string_lossy(),
-                &work.join("tunnel-token.cred").to_string_lossy(),
-            ],
-        )
-        .await;
-        let moved = encrypted.and_then(|()| {
-            std::fs::rename(
-                work.join("tunnel-token.cred"),
-                directory.join("tunnel-token.cred"),
-            )?;
-            sync_directory(&directory)
-        });
-        let _ = std::fs::remove_dir_all(&work);
-        moved?;
-        for unit in ["pgcf-gateway.service", "pgcf-cloudflared.service"] {
-            self.units
-                .start_service(unit, restart)
-                .await
-                .map_err(|error| io::Error::other(error.to_string()))?;
+        // The shell's key first, so that a shell Cloudflare turned off is closed whatever fails
+        // below, and a failure here does not keep the gateway from starting: the error is
+        // returned at the end, the revision stays unapplied, and the next page reads the
+        // credentials again.
+        let shell = crate::shell_ca::apply(
+            &self.layout.ssh_user_ca,
+            crate::shell_ca::key_of(credentials),
+        );
+        if let Ok(change) = shell
+            && let Some(event) = change.event()
+        {
+            crate::timing::emit_event(serde_json::json!({ "event": event }));
         }
-        Ok(())
+        let gateway = self
+            .apply_gateway_credentials(node, credentials, restart)
+            .await;
+        gateway.and(shell.map(|_| ()))
     }
 
     async fn restart_service(&self, unit: &str) -> Result<(), units::Error> {
