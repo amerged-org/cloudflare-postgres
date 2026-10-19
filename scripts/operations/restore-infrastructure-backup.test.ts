@@ -485,7 +485,7 @@ if (args[0] === "d1" && args[1] === "list") {
       firstInsert: text.indexOf("INSERT INTO"),
       lastCreate: text.lastIndexOf("CREATE TABLE"),
     };
-    if (state.hold) { save(); fs.writeFileSync(state.hold, String(process.pid)); setInterval(() => {}, 1000); return; }
+    if (state.hold) { save(); fs.writeFileSync(state.hold + ".tmp", String(process.pid)); fs.renameSync(state.hold + ".tmp", state.hold); setInterval(() => {}, 1000); return; }
     if (state.failImport) { save(); process.stderr.write("SQLITE_ERROR near " + text.toString("utf8", 0, 40) + "\\n"); process.exit(1); }
     db.exec("BEGIN;");
     try { db.exec(text.toString("utf8")); db.exec("COMMIT;"); }
@@ -842,6 +842,8 @@ test("a signal removes the decrypted SQL and stops wrangler, and the run ends wi
       assert.fail("timed out");
     },
     alive = (pid: number) => {
+      // kill(0, ...) addresses the caller's whole process group; it must never be reached.
+      if (!Number.isInteger(pid) || pid <= 0) return false;
       try {
         process.kill(pid, 0);
         return true;
@@ -881,13 +883,13 @@ test("a signal removes the decrypted SQL and stops wrangler, and the run ends wi
         ),
         exited = once(child, "exit");
       // Wrangler is inside the import: the decrypted SQL is on disk in the private directory.
-      await until(() =>
-        readFile(holding).then(
-          () => true,
-          () => false,
-        ),
-      );
-      pid = Number(await readFile(holding, "utf8"));
+      // The fake renames a finished file into place; the pattern also refuses an empty read.
+      await until(async () => {
+        const text = await readFile(holding, "utf8").catch(() => "");
+        if (!/^[1-9]\d*$/.test(text)) return false;
+        pid = Number(text);
+        return true;
+      });
       const names = await readdir(temporary);
       assert.equal(names.length, 1);
       const directory = names[0]!;

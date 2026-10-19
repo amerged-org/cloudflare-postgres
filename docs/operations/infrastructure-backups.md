@@ -145,7 +145,7 @@ Unknown:
 - The effect on a wake during the window: no wake arrived in any nightly window.
 - Whether a request during the window waits or is rejected: the code tolerates both.
 
-The raw samples this relies on are being reduced (pruned once their hourly rollup is final, none
+The raw samples this relies on are being reduced (pruned 24 h after their hour ends, none
 from idle databases), so read the derivation while they exist. Go-live gate G6 also needs a night
 with an awake database under writes and one wake during the export that shows no failed wake.
 
@@ -451,9 +451,12 @@ wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
 
 7. **Clean up.** Delete the scratch database by the same ID, from an empty directory (a name is
    looked up in a wrangler configuration first, and this step cannot be undone), then
-   `rm d1-control.pgcfenc receipt.json` and `unset PGCF_RESTORE_KEYS`:
+   `rm d1-control.pgcfenc receipt.json` and `unset PGCF_RESTORE_KEYS`. `--skip-confirmation`
+   removes the only prompt, which shows no more than the ID, so first read what the ID names and
+   delete only if `d1 info` answers `pgcf-restore-drill`:
 
    ```sh
+   (cd "$(mktemp -d)" && wrangler d1 info <scratch-database-id>)
    (cd "$(mktemp -d)" && wrangler d1 delete <scratch-database-id> --skip-confirmation)
    ```
 
