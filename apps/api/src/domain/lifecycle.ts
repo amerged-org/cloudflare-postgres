@@ -243,3 +243,107 @@ export async function recoverQuiescence(
       : null;
   });
 }
+
+/**
+ * Ends a resume the node could not carry out, and puts the database back as it was before it: a
+ * database that is to run and sleeps, with no operation left that wakes it, is one nothing wakes
+ * (a connection wakes only an idle sleeper, and the node runs a resume's order once). So the
+ * resume fails with the node's reason, and the database is suspended again at the next
+ * generation, as its last suspension was, manual or idle, by an operation the node's report of
+ * the sleep ends like any suspension. A node that starts the database late finds the newer
+ * generation suspended and puts it to sleep again. The compare-and-set is on the row the resume
+ * left; a later change of the database wins, and so does the end of this resume by another way.
+ */
+export async function recoverFailedResume(
+  env: Env,
+  expected: { databaseId: string; operation: string; revision: number },
+  reason: string,
+  now = new Date().toISOString(),
+): Promise<{
+  operation: string;
+  revision: number;
+  nodeId: string | null;
+} | null> {
+  const db = env.DB;
+  DatabaseId.parse(expected.databaseId);
+  OperationId.parse(expected.operation);
+  Timestamp.parse(now);
+  if (
+    !Number.isSafeInteger(expected.revision) ||
+    expected.revision < 1 ||
+    !/^[a-z0-9_]{1,64}$/.test(reason)
+  )
+    throw new Error("invalid_power_recovery");
+  const row = await db
+    .prepare(
+      `SELECT d.* FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation AND o.kind='database.resume' AND o.status IN('pending','running') WHERE d.id=? AND d.generation=? AND d.power_operation=? AND d.desired_state='running' AND d.deleted_at IS NULL`,
+    )
+    .bind(expected.databaseId, expected.revision, expected.operation)
+    .first<DatabaseRow>();
+  if (!row) return null;
+  // What it was before: the suspension that the resume undid.
+  const before = await db
+    .prepare(
+      `SELECT kind FROM operations WHERE database_id=? AND kind IN('database.suspend','database.hibernate') AND generation<? ORDER BY generation DESC,created_at DESC,id DESC LIMIT 1`,
+    )
+    .bind(row.id, row.generation)
+    .first<{ kind: "database.suspend" | "database.hibernate" }>();
+  const kind = before?.kind ?? "database.suspend";
+  return withAdmissionMutation(env, [row.id], async (mutation) => {
+    const guard = mutation.guard(row.id);
+    const operation = newOperationId();
+    const statements = [
+      db
+        .prepare(
+          `UPDATE databases SET desired_state='suspended',suspension_reason=?,power_operation=?,generation=generation+1,observed_state='provisioning',status_message=?,updated_at=? WHERE id=? AND generation=? AND updated_at=? AND desired_state='running' AND power_operation=?
+          AND observed_state=? AND observed_generation=? AND observed_power=? AND suspension_reason IS ? AND node_id IS ?
+          AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
+          AND EXISTS(SELECT 1 FROM operations o WHERE o.id=databases.power_operation AND o.database_id=databases.id AND o.project_id=databases.project_id
+            AND o.generation<=databases.generation AND o.kind='database.resume' AND o.status IN('pending','running'))
+          AND (${guard.sql})`,
+        )
+        .bind(
+          kind === "database.hibernate" ? "idle" : "manual",
+          operation,
+          `Resume failed: ${reason}`,
+          now,
+          row.id,
+          row.generation,
+          row.updated_at,
+          row.power_operation,
+          row.observed_state,
+          row.observed_generation,
+          row.observed_power,
+          row.suspension_reason ?? null,
+          row.node_id,
+          ...guard.bindings,
+        ),
+      db
+        .prepare(
+          `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,?,'pending',project_id,id,generation,?,? FROM databases WHERE changes()=1 AND id=? AND power_operation=? AND (${guard.sql})`,
+        )
+        .bind(operation, kind, now, now, row.id, operation, ...guard.bindings),
+      db
+        .prepare(
+          `UPDATE operations SET status='failed',error_code=?,error_message=?,updated_at=?,completed_at=? WHERE id=? AND database_id=? AND generation<=? AND status IN('pending','running') AND EXISTS(SELECT 1 FROM databases WHERE id=? AND power_operation=? AND generation=?) AND (${guard.sql})`,
+        )
+        .bind(
+          reason,
+          `The node could not start the database: ${reason}`,
+          now,
+          now,
+          row.power_operation,
+          row.id,
+          row.generation,
+          row.id,
+          operation,
+          row.generation + 1,
+          ...guard.bindings,
+        ),
+    ];
+    const result = await mutation.batch(statements);
+    return result[0]!.meta.changes === 1
+      ? { operation, revision: row.generation + 1, nodeId: row.node_id }
+      : null;
+  });
+}

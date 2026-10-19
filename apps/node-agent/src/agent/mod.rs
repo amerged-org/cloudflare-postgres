@@ -387,6 +387,20 @@ impl<M: Machine> Core<M> {
         }
         true
     }
+    /// Waits until the page's entry of the database is of `generation` or a later one, for at
+    /// most `bound`. The entry only moves forward (`accept`), and a pull brings it.
+    pub(crate) async fn page_reaches(&self, db: &Db, generation: u64, bound: Duration) {
+        let deadline = tokio::time::Instant::now() + bound;
+        while db
+            .view()
+            .entry
+            .as_ref()
+            .is_none_or(|entry| entry.generation < generation)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     pub(crate) fn all(&self) -> Vec<Arc<Db>> {
         let mut dbs: Vec<_> = self
             .dbs

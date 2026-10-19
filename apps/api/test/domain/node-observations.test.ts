@@ -4,6 +4,7 @@ import { DatabaseWithOperation, newOperationId } from "@pgcf/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
   instanceOf,
   nodeRequest,
@@ -571,16 +572,11 @@ describe("roles the node removed", () => {
 });
 
 describe("the results of a node's orders", () => {
-  it("fails the resume of a wake the node refused, with the reason", async () => {
-    const f = await fixture();
-    const db = await created(f);
-    await report(f, db.id, 1);
-    await suspend(f, db.id);
-    await report(f, db.id, 2, "asleep");
-    const resumed = DatabaseWithOperation.parse(
+  const resume = async (f: F, id: string) =>
+    DatabaseWithOperation.parse(
       await (
         await request(
-          `/v1/databases/${db.id}/resume`,
+          `/v1/databases/${id}/resume`,
           f.integrator,
           "POST",
           undefined,
@@ -588,24 +584,148 @@ describe("the results of a node's orders", () => {
         )
       ).json(),
     );
-    const result = await nodeRequest(f, "/node/v1/observations", {
+  const orderResult = (f: F, operation: string, reason: string) =>
+    nodeRequest(f, "/node/v1/observations", {
       method: "POST",
-      body: reportBody(
-        [],
-        [
-          {
-            operation: resumed.operation.id,
-            status: "failed",
-            reason: "no_room",
-          },
-        ],
-      ),
+      body: reportBody([], [{ operation, status: "failed", reason }]),
     });
+  const operation = (id: string) =>
+    env.DB.prepare(
+      "SELECT id,kind,status,generation FROM operations WHERE id=?",
+    )
+      .bind(id)
+      .first<{
+        id: string;
+        kind: string;
+        status: string;
+        generation: number;
+      }>();
+
+  it("fails the resume of a wake the node refused, with the reason, and suspends the database again", async () => {
+    const f = await fixture();
+    const db = await created(f);
+    await report(f, db.id, 1);
+    await suspend(f, db.id);
+    await report(f, db.id, 2, "asleep");
+    const resumed = await resume(f, db.id);
+    const result = await orderResult(f, resumed.operation.id, "no_room");
     expect(await result.json()).toEqual({ databases: [], orders: 1 });
     expect(await status(resumed.operation.id)).toEqual({
       status: "failed",
       error_code: "no_room",
     });
+    // The database is as it was before the resume: suspended by hand and asleep. A database that
+    // is to run, asleep, with an operation that has ended is one that nothing wakes.
+    const after = await row(db.id);
+    expect(after).toMatchObject({
+      desired_state: "suspended",
+      suspension_reason: "manual",
+      generation: 4,
+      observed_power: "hibernated",
+    });
+    const suspension = await operation(after!.power_operation as string);
+    expect(suspension).toMatchObject({
+      kind: "database.suspend",
+      status: "pending",
+      generation: 4,
+    });
+    const page = await desiredPage(f);
+    expect(page.databases.find((d) => d.id === db.id)).toMatchObject({
+      generation: 4,
+      desired_state: "suspended",
+      operation: suspension!.id,
+    });
+    expect(page.orders).toEqual([]);
+    // The node confirms the sleep of the new generation, which ends the suspension; the same
+    // report of the failure again changes nothing.
+    expect(await verdicts(await report(f, db.id, 4, "asleep"))).toEqual([
+      "accept",
+    ]);
+    expect((await operation(suspension!.id))!.status).toBe("succeeded");
+    expect(
+      await (await orderResult(f, resumed.operation.id, "no_room")).json(),
+    ).toEqual({ databases: [], orders: 0 });
+    expect(await row(db.id)).toMatchObject({ generation: 4 });
+    // A resume asked again is ordered again.
+    const again = await resume(f, db.id);
+    expect(again.database.generation).toBe(5);
+    expect((await desiredPage(f)).orders).toEqual([
+      {
+        type: "wake",
+        operation: again.operation.id,
+        database: db.id,
+        generation: 5,
+      },
+    ]);
+  });
+
+  it("gives an idle sleeper its hibernation back when its resume fails for a reason the node could have undone", async () => {
+    const f = await fixture();
+    const db = await created(f);
+    await report(f, db.id, 1);
+    await report(f, db.id, 1, "asleep");
+    expect(await row(db.id)).toMatchObject({
+      suspension_reason: "idle",
+      generation: 2,
+    });
+    const resumed = await resume(f, db.id);
+    expect(resumed.database.generation).toBe(3);
+    // A node whose page was behind refused the order as stale. The order is not run again by that
+    // node, so the resume ends here, and the database is a sleeper that wakes on connect again.
+    expect(
+      await (
+        await orderResult(f, resumed.operation.id, "desired_stale")
+      ).json(),
+    ).toEqual({ databases: [], orders: 1 });
+    expect(await status(resumed.operation.id)).toEqual({
+      status: "failed",
+      error_code: "desired_stale",
+    });
+    const after = await row(db.id);
+    expect(after).toMatchObject({
+      desired_state: "suspended",
+      suspension_reason: "idle",
+      generation: 4,
+    });
+    expect(await operation(after!.power_operation as string)).toMatchObject({
+      kind: "database.hibernate",
+      status: "pending",
+    });
+    expect(await verdicts(await report(f, db.id, 4, "asleep"))).toEqual([
+      "accept",
+    ]);
+    expect((await events(db.id)).at(-1)).toEqual({
+      kind: "hibernated",
+      generation: 4,
+    });
+    expect((await operation(after!.power_operation as string))!.status).toBe(
+      "succeeded",
+    );
+  });
+
+  it("leaves a database alone when the failure is late, another node's, or of a resume that ended", async () => {
+    const f = await fixture();
+    const db = await created(f);
+    await report(f, db.id, 1);
+    await suspend(f, db.id);
+    await report(f, db.id, 2, "asleep");
+    const resumed = await resume(f, db.id);
+    const before = await row(db.id);
+    // Another node's result names an operation that is not its own.
+    const other = await fixture();
+    expect(
+      await (await orderResult(other, resumed.operation.id, "no_room")).json(),
+    ).toEqual({ databases: [], orders: 0 });
+    expect(await row(db.id)).toEqual(before);
+    // The node started the database: the resume succeeded, and a late failure of it changes nothing.
+    expect(await verdicts(await report(f, db.id, 3))).toEqual(["accept"]);
+    expect((await status(resumed.operation.id))!.status).toBe("succeeded");
+    const ready = await row(db.id);
+    expect(
+      await (await orderResult(f, resumed.operation.id, "no_room")).json(),
+    ).toEqual({ databases: [], orders: 0 });
+    expect(await row(db.id)).toEqual(ready);
+    expect((await status(resumed.operation.id))!.status).toBe("succeeded");
     // A done wake is the ready report's to end.
     expect(
       await (

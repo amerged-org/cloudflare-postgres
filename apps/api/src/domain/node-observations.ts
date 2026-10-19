@@ -11,7 +11,7 @@ import {
 import { ApiError } from "../api-error.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { databaseActor } from "./database-actor-sync.ts";
-import { recoverQuiescence } from "./lifecycle.ts";
+import { recoverFailedResume, recoverQuiescence } from "./lifecycle.ts";
 import { powerTransitionStatements } from "./power-transition.ts";
 import { hintDatabases } from "./node-hints.ts";
 import { applyLifecycleObservations } from "./lifecycle-observations.ts";
@@ -31,6 +31,8 @@ import type { DatabaseRow } from "./rows.ts";
 const ADMISSION_PUBLISH_ANSWER_MS = 1000;
 /** How long a report of a wake the Actor claimed waits for D1 to commit the claim. */
 const CLAIM_WAIT_MS = 3000;
+/** How often a failed wake's recovery reads the row again when another writer won its compare-and-set. */
+const FAILED_WAKE_ATTEMPTS = 3;
 const FAILING = "failing";
 /**
  * How many databases of one report are taken at the same time. Each is independent (a report names
@@ -785,9 +787,11 @@ async function takeObservation(
 }
 
 /**
- * How a wake the node was ordered ended: a wake that failed ends the resume that asked. The other
- * orders keep their results with the lifecycle (`applyLifecycleObservations`); a fence is a lost
- * node and has no row.
+ * How a wake the node was ordered ended: a wake that failed ends the resume that asked, and the
+ * database is suspended again (`recoverFailedResume`), since the node runs an order once and a
+ * database that is to run and sleeps would otherwise be left for nothing to wake. The other orders
+ * keep their results with the lifecycle (`applyLifecycleObservations`); a fence is a lost node and
+ * has no row.
  */
 async function failedWake(
   env: Env,
@@ -795,22 +799,30 @@ async function failedWake(
   result: NodeOrderResult,
 ): Promise<number> {
   if (result.status !== "failed") return 0;
-  const now = new Date().toISOString();
-  const failed = await env.DB.prepare(
-    `UPDATE operations SET status='failed',error_code=?,error_message=?,updated_at=?,completed_at=?
-     WHERE id=? AND kind='database.resume' AND status IN('pending','running')
-       AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id=? AND d.power_operation=operations.id)`,
-  )
-    .bind(
-      result.reason ?? "wake_failed",
-      `The node could not start the database: ${result.reason ?? "unknown"}`,
-      now,
-      now,
-      result.operation,
-      node.id,
+  // The row is read again when another writer won the compare-and-set; the result comes once.
+  for (let attempt = 0; attempt < FAILED_WAKE_ATTEMPTS; attempt++) {
+    const row = await env.DB.prepare(
+      `SELECT d.id,d.generation FROM databases d JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.kind='database.resume' AND o.status IN('pending','running')
+       WHERE o.id=? AND d.node_id=? AND d.desired_state='running' AND d.deleted_at IS NULL`,
     )
-    .run();
-  return failed.meta.changes;
+      .bind(result.operation, node.id)
+      .first<{ id: string; generation: number }>();
+    if (row === null) return 0;
+    const recovered = await recoverFailedResume(
+      env,
+      {
+        databaseId: row.id,
+        operation: result.operation,
+        revision: row.generation,
+      },
+      result.reason ?? "wake_failed",
+    );
+    if (recovered) {
+      await hintDatabases(env, [row.id]).catch(() => 0);
+      return 1;
+    }
+  }
+  return 0;
 }
 
 interface Taken {
