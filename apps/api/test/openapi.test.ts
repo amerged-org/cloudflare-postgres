@@ -285,6 +285,20 @@ describe("actual generated API references in the Workers runtime", () => {
     );
   });
 
+  it("documents the text of a release's signature beside the bytes of its files", async () => {
+    const node = await document("/node/v1/openapi.json");
+    const file = operation(node, "/node/v1/releases/{version}/{file}", "get");
+    // The binaries and the lock are octets, and `release.sig` is 128 hex digits of text: both are 200s.
+    expect(file.responses["200"]!.content).toEqual(
+      expect.objectContaining({
+        "application/octet-stream": expect.anything(),
+        "text/plain": expect.anything(),
+      }),
+    );
+    // Only the files that come from the bucket answer a range; the image has its own route.
+    expect(file.responses["206"]!.content).not.toHaveProperty("text/plain");
+  });
+
   it("documents the role lifecycle: attributes, deletion, required keys and the operation kind", async () => {
     const doc = await document("/v1/openapi.json");
     const create = operation(doc, "/v1/databases/{id}/roles", "post");

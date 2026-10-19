@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  PLACEHOLDER_RELEASE_KEY,
   RELEASE_KEY_FILE,
   generateKeyPair,
   keygen,
@@ -96,6 +97,31 @@ test("the key pair is made for the owner: the public key goes to a file, the pri
   }
 });
 
+test("the placeholder key file is replaced by the first key without a flag, and a real key is never replaced by the same command again", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pgcf-keygen-"));
+  try {
+    const publicPath = join(root, "release-signing.pub");
+    const pipe = { isTTY: false, write: () => {} };
+    // The repository carries a placeholder that nobody holds the private half of: nothing is lost by
+    // replacing it, so the first key needs no flag.
+    await writeFile(publicPath, `${PLACEHOLDER_RELEASE_KEY}\n`);
+    await keygen(publicPath, pipe);
+    const first = await readFile(publicPath, "utf8");
+    assert.notEqual(first.trim(), PLACEHOLDER_RELEASE_KEY);
+    assert.match(first, /^[0-9a-f]{64}\n$/);
+    // Run again, the same command would overwrite the only copy of the private key (the secret cannot
+    // be read back): it refuses, and a key change is the rotation procedure that --replace stands for.
+    await assert.rejects(keygen(publicPath, pipe), /--replace/);
+    assert.equal(await readFile(publicPath, "utf8"), first);
+    // A file that holds anything else is no placeholder either.
+    await writeFile(publicPath, "not a key\n");
+    await assert.rejects(keygen(publicPath, pipe), /--replace/);
+    assert.equal(await readFile(publicPath, "utf8"), "not a key\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a release key file holds one public key as 64 lowercase hex digits", async () => {
   const root = await mkdtemp(join(tmpdir(), "pgcf-key-"));
   try {
@@ -125,6 +151,7 @@ test("a release key file holds one public key as 64 lowercase hex digits", async
 test("the key checked in for the agent is a well-formed public key, which the agent's build reads as a constant", async () => {
   const key = await readReleaseKey(RELEASE_KEY_FILE);
   assert.match(key, /^[0-9a-f]{64}$/);
+  assert.match(PLACEHOLDER_RELEASE_KEY, /^[0-9a-f]{64}$/);
   // Whoever holds no private half cannot make a signature that it verifies: a made-up one fails.
   assert.equal(verifyText(key, text, "0".repeat(128)), false);
 });

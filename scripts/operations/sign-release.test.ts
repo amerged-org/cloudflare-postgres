@@ -6,7 +6,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { signedReleaseManifest } from "../../packages/contracts/src/releases.ts";
 import type { Manifest } from "./register-node-image.ts";
-import { generateKeyPair, verifyText } from "./release-signing.ts";
+import {
+  PLACEHOLDER_RELEASE_KEY,
+  generateKeyPair,
+  verifyText,
+} from "./release-signing.ts";
 import { signBuild } from "./sign-release.ts";
 
 const digest = (letter: string, size_bytes: number) => ({
@@ -41,9 +45,12 @@ test("CI signs the manifest of the build with the key of its secret and keeps th
   const root = await mkdtemp(join(tmpdir(), "pgcf-sign-"));
   try {
     const key = generateKeyPair();
-    const signature = await signBuild(manifest, root, {
-      RELEASE_SIGNING_KEY: key.privateKey,
-    });
+    const signature = await signBuild(
+      manifest,
+      root,
+      { RELEASE_SIGNING_KEY: key.privateKey },
+      key.publicKey,
+    );
     const file = join(root, "release.sig");
     assert.equal(await readFile(file, "utf8"), `${signature}\n`);
     assert.equal((await stat(file)).mode & 0o777, 0o644);
@@ -60,9 +67,12 @@ test("CI signs the manifest of the build with the key of its secret and keeps th
     );
     // A secret that GitHub hands over with a trailing line feed is the same key.
     assert.equal(
-      await signBuild(manifest, root, {
-        RELEASE_SIGNING_KEY: `${key.privateKey}\n`,
-      }),
+      await signBuild(
+        manifest,
+        root,
+        { RELEASE_SIGNING_KEY: `${key.privateKey}\n` },
+        key.publicKey,
+      ),
       signature,
     );
   } finally {
@@ -73,9 +83,10 @@ test("CI signs the manifest of the build with the key of its secret and keeps th
 test("a build is not signed without the secret, and the failure says what to do and shows no key", async () => {
   const root = await mkdtemp(join(tmpdir(), "pgcf-sign-"));
   try {
+    const committed = generateKeyPair().publicKey;
     for (const environment of [{}, { RELEASE_SIGNING_KEY: "" }]) {
       await assert.rejects(
-        signBuild(manifest, root, environment),
+        signBuild(manifest, root, environment, committed),
         (error: Error) => {
           assert.match(error.message, /RELEASE_SIGNING_KEY is not set/);
           assert.match(error.message, /docs\/operations\/release-signing\.md/);
@@ -84,7 +95,12 @@ test("a build is not signed without the secret, and the failure says what to do 
       );
     }
     await assert.rejects(
-      signBuild(manifest, root, { RELEASE_SIGNING_KEY: "not-a-key-SECRET" }),
+      signBuild(
+        manifest,
+        root,
+        { RELEASE_SIGNING_KEY: "not-a-key-SECRET" },
+        committed,
+      ),
       (error: Error) => {
         assert.match(error.message, /RELEASE_SIGNING_KEY/);
         assert.doesNotMatch(error.message, /SECRET/);
@@ -93,6 +109,43 @@ test("a build is not signed without the secret, and the failure says what to do 
     );
     // Nothing was written for a build that could not be signed.
     await assert.rejects(stat(join(root, "release.sig")));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a build is not signed while the checked-in public key is the placeholder, even when the secret is set", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pgcf-sign-"));
+  try {
+    // The real private key may be in the secret before the commit that carries its public key has
+    // reached main: a build of the placeholder would be signed by a key that its agent does not trust.
+    const key = generateKeyPair();
+    await assert.rejects(
+      signBuild(
+        manifest,
+        root,
+        { RELEASE_SIGNING_KEY: key.privateKey },
+        PLACEHOLDER_RELEASE_KEY,
+      ),
+      (error: Error) => {
+        assert.match(error.message, /placeholder/);
+        assert.match(error.message, /docs\/operations\/release-signing\.md/);
+        assert.doesNotMatch(error.message, /PRIVATE|BEGIN/);
+        return true;
+      },
+    );
+    await assert.rejects(stat(join(root, "release.sig")));
+    // The same secret signs once the checked-in key is another one.
+    await signBuild(
+      manifest,
+      root,
+      { RELEASE_SIGNING_KEY: key.privateKey },
+      key.publicKey,
+    );
+    assert.match(
+      await readFile(join(root, "release.sig"), "utf8"),
+      /^[0-9a-f]{128}\n$/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

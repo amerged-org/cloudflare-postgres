@@ -14,6 +14,7 @@ import {
   FleetReleaseVersion,
   RELEASE_FILE_PATH,
   RELEASE_IMAGE_FILE,
+  ReleaseSignature,
   FleetRegionReleaseUpdate,
   FleetRegionReleaseStatus,
   FleetNodeReleaseStatus,
@@ -218,6 +219,15 @@ export function registerFleetReleases(app: ApiApp): void {
       responses: {
         ...errors,
         ...bytes,
+        // `release.sig` is no object of the bucket: the text of the stored signature, and no range.
+        200: {
+          description:
+            "The whole file; `release.sig` answers with the signature as 128 hex digits of text",
+          content: {
+            ...octets,
+            "text/plain": { schema: ReleaseSignature },
+          },
+        },
       },
     },
     async (c) =>

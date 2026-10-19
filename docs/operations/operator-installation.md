@@ -30,8 +30,9 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
 
 - The region has a release assigned (`PUT /v1/regions/{id}/release`). Its image is what the pull
   installer writes; AddNode waits until there is one. A release is registered only with the
-  signature that CI makes of it with the release key (the GitHub secret `RELEASE_SIGNING_KEY`), and
-  the nodes install nothing else: make the key once, as
+  signature that CI makes of it with the release key (the secret `RELEASE_SIGNING_KEY` of the GitHub
+  environment `release-signing`), and running nodes update to nothing else; the image of a new node is
+  not covered by it (release-signing.md, "What it does not cover"). Make the key once, as
   [release-signing.md](release-signing.md) says.
 - `NODE_API_ORIGIN` is this Worker's `https` origin, which the installed node enrolls at, and
   `NODE_DNS_SERVERS` a JSON array of one to three resolvers the node is installed with.

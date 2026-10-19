@@ -139,6 +139,6 @@ erDiagram
 - [apps/api/migrations/0073_node_diagnostics.sql:1](../../../apps/api/migrations/0073_node_diagnostics.sql#L1)
 - [apps/api/migrations/0074_node_diagnostic_requests.sql:1](../../../apps/api/migrations/0074_node_diagnostic_requests.sql#L1)
 - [apps/api/migrations/0075_maintenance_placement.sql:1](../../../apps/api/migrations/0075_maintenance_placement.sql#L1)
-- [apps/api/migrations/0076_release_signature.sql:1](../../../apps/api/migrations/0076_release_signature.sql#L1)
+- [apps/api/migrations/0077_release_signature.sql:1](../../../apps/api/migrations/0077_release_signature.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.
