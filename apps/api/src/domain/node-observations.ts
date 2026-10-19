@@ -32,6 +32,24 @@ const ADMISSION_PUBLISH_ANSWER_MS = 1000;
 /** How long a report of a wake the Actor claimed waits for D1 to commit the claim. */
 const CLAIM_WAIT_MS = 3000;
 const FAILING = "failing";
+/**
+ * How many databases of one report are taken at the same time. Each is independent (a report names
+ * each once) and waits mostly on D1 and on its own Actor, whose cold publish takes 250-1100 ms: 8
+ * in flight take a report in one publish time per 8 databases, not per database.
+ */
+const OBSERVATION_CONCURRENCY = 8;
+/**
+ * How long a report may keep starting databases. The agent gives up on a request after 20 s. A
+ * database started just before the budget ends still needs up to `CLAIM_WAIT_MS` and
+ * `ADMISSION_PUBLISH_ANSWER_MS` (12 + 3 + 1 s), and the orders and the lifecycle after it a few
+ * statements. A report with databases left unstarted is refused whole (503, retryable): the agent
+ * keeps a report that was not answered with a success and posts it again, and what was applied
+ * is applied again as the same.
+ */
+const OBSERVATION_BUDGET_MS = 12_000;
+/** A report is logged when it took this long, or named this many databases (plan 9.9). */
+const LOGGED_REPORT_MS = 2000;
+const LOGGED_REPORT_DATABASES = 50;
 
 interface Row extends DatabaseRow {
   operation: string;
@@ -790,6 +808,91 @@ async function failedWake(
   return failed.meta.changes;
 }
 
+interface Taken {
+  /** One verdict per database of the report, at the index the report names it. */
+  verdicts: ObservationVerdict[];
+  /** The databases of the report that were not started. */
+  deferred: number;
+  /** The longest one database took, in milliseconds. */
+  slowest: number;
+}
+
+/**
+ * Takes the databases of a report, `OBSERVATION_CONCURRENCY` at a time, none twice and none after
+ * the budget is spent. A failure of any stops the starts; the ones in flight finish, and the first
+ * failure is the report's.
+ */
+async function takeObservations(
+  env: Env,
+  node: NodeCaller,
+  report: NodeObservationReport,
+  started: number,
+  budgetMs: number,
+): Promise<Taken> {
+  const { databases } = report;
+  const taken: Taken = { verdicts: [], deferred: 0, slowest: 0 };
+  const state: { next: number; failure?: { cause: unknown } } = { next: 0 };
+  const worker = async () => {
+    while (
+      state.failure === undefined &&
+      state.next < databases.length &&
+      Date.now() - started < budgetMs
+    ) {
+      const index = state.next++,
+        at = Date.now();
+      try {
+        taken.verdicts[index] = await takeObservation(
+          env,
+          node,
+          report.observed_at,
+          databases[index]!,
+        );
+      } catch (cause) {
+        state.failure ??= { cause };
+        return;
+      }
+      taken.slowest = Math.max(taken.slowest, Date.now() - at);
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(OBSERVATION_CONCURRENCY, databases.length) },
+      worker,
+    ),
+  );
+  if (state.failure) throw state.failure.cause;
+  taken.deferred = databases.length - state.next;
+  return taken;
+}
+
+/** One line for a report that was large or slow: what it held and where its time went (plan 9.9). */
+function logReport(
+  node: NodeCaller,
+  report: NodeObservationReport,
+  taken: Taken,
+  started: number,
+): void {
+  const elapsed = Date.now() - started;
+  if (
+    elapsed < LOGGED_REPORT_MS &&
+    report.databases.length < LOGGED_REPORT_DATABASES
+  )
+    return;
+  const counts = { accept: 0, stale: 0, conflict: 0 };
+  for (const verdict of taken.verdicts) if (verdict) counts[verdict]++;
+  console.log(
+    JSON.stringify({
+      event: "node_observation_report",
+      node_id: node.id,
+      databases: report.databases.length,
+      ...counts,
+      deferred: taken.deferred,
+      elapsed_ms: elapsed,
+      slowest_ms: taken.slowest,
+    }),
+  );
+}
+
 /**
  * `POST /node/v1/observations` (plan 5.3): what a node reports of its databases and its orders,
  * and the events of its own log.
@@ -798,6 +901,7 @@ export async function nodeObservations(
   c: ApiContext,
   node: NodeCaller,
   raw: unknown,
+  budgetMs = OBSERVATION_BUDGET_MS,
 ): Promise<Response> {
   const parsed = NodeObservationReport.safeParse(raw);
   if (!parsed.success)
@@ -805,19 +909,25 @@ export async function nodeObservations(
   const report = parsed.data;
   if (Date.parse(report.observed_at) > Date.now() + 300_000)
     throw new ApiError("invalid_request", "Observation time is in the future");
-  const databases: { id: string; verdict: ObservationVerdict }[] = [];
+  const started = Date.now();
   // A fenced node's observations are read for the results of its orders only.
-  if (!node.fenced)
-    for (const observation of report.databases)
-      databases.push({
+  const taken: Taken = node.fenced
+    ? { verdicts: [], deferred: 0, slowest: 0 }
+    : await takeObservations(c.env, node, report, started, budgetMs);
+  if (taken.deferred > 0) {
+    logReport(node, report, taken, started);
+    throw new ApiError(
+      "capacity_exhausted",
+      "The report did not fit its time; send it again",
+      { reason: "not_ready" },
+    );
+  }
+  const databases = node.fenced
+    ? []
+    : report.databases.map((observation, index) => ({
         id: observation.id,
-        verdict: await takeObservation(
-          c.env,
-          node,
-          report.observed_at,
-          observation,
-        ),
-      });
+        verdict: taken.verdicts[index]!,
+      }));
   let orders = 0;
   for (const result of report.orders)
     orders += await failedWake(c.env, node, result);
@@ -838,5 +948,6 @@ export async function nodeObservations(
         ...(database_id === undefined ? {} : { database_id }),
       }),
     );
+  logReport(node, report, taken, started);
   return c.json({ databases, orders });
 }

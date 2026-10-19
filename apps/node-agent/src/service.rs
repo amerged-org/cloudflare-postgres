@@ -686,13 +686,21 @@ impl<M: Machine> Service<M> {
             tokio::time::sleep(self.intervals.batch).await;
             while let Some(report) = self.core.take_report(events) {
                 match self.link.post_observation(&report).await {
-                    Ok(()) => wait = self.intervals.batch,
+                    Ok(()) => {
+                        wait = self.intervals.batch;
+                        self.core.report_posted();
+                    }
                     Err(error) => {
                         crate::timing::emit_event(json!({
                             "event": "observation_not_posted",
                             "class": crate::diagnostics::error_code(&error),
+                            "databases": report["databases"].as_array().map_or(0, Vec::len),
+                            "status": error
+                                .downcast_ref::<crate::api::Refusal>()
+                                .map_or(0, |refusal| refusal.status),
                         }));
                         self.core.unsent(events, &report);
+                        self.core.report_failed(&error);
                         tokio::time::sleep(wait).await;
                         wait = (wait * 2).min(Duration::from_secs(30));
                         break;
