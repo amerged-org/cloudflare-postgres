@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // The release signer (docs/operations/release-signing.md): signs the manifest of a release for the
 // one workflow that may ask, and for nothing else. The private key is the Worker secret
-// RELEASE_SIGNING_KEY, which no person, no CI job and no other Worker can read: Cloudflare
-// secrets are write-only. The caller proves who it is with the identity token of its GitHub
-// Actions run (github-token.ts); what it asks to sign is the manifest's facts
+// RELEASE_SIGNING_KEY. Cloudflare secrets are write-only through the API and the dashboard, so no
+// person, no CI job and no other Worker can read it back; but this Worker's own code can, so
+// whoever can deploy a version of this Worker (an account member, or any API token with Workers
+// Scripts: Edit) can deploy code that returns it. The caller proves who it is with the identity
+// token of its GitHub Actions run (github-token.ts); what it asks to sign is the manifest's facts
 // (`ReleaseManifestFields`), from which the signer builds the text itself
 // (`signedReleaseManifest`), so that no caller can have another text signed.
 //
 // The signer keeps no state. Ed25519 signatures are deterministic: the same facts give the same
-// signature byte for byte, so asking twice reveals and changes nothing, and there is nothing to
-// count. Which content a release id may have is decided where it is registered: the API refuses
-// a second signature for a registered version and R2 never overwrites a file of one, and every
-// node checks each digest of its release against the signed text. What the signer itself ties
-// together is the release id and the commit: it signs only `sha-<12 digits of the token's
-// commit>`, the name CI gives the build of that commit.
+// signature byte for byte, and there is nothing to count. That also means that a valid token gets
+// ANY digests signed as the release `sha-<12 digits of its own commit>` until it expires: the
+// signer ties the release id to the commit and cannot know whether the digests are the build of
+// that commit. Which content a release id has is decided where it is registered: the API refuses
+// a second spec for a registered version (409 for whoever registers second) and R2 never
+// overwrites a file of one, and every node checks each digest of its release against the signed
+// text.
 import {
   RELEASE_SIGNING_SECRET,
   RELEASE_SIGN_PATH,
@@ -34,6 +37,8 @@ export interface Env {
   /** The secret `provision` sets, under the name the contract gives it: the key's PKCS#8 in base64. */
   [RELEASE_SIGNING_SECRET]?: string;
   SIGNER_REPOSITORY?: string;
+  SIGNER_REPOSITORY_ID?: string;
+  SIGNER_REPOSITORY_OWNER_ID?: string;
   SIGNER_REF?: string;
   SIGNER_WORKFLOW?: string;
 }
@@ -97,18 +102,31 @@ async function boundedText(
 
 function policyOf(env: Env, request: Request): Policy {
   const { SIGNER_REPOSITORY: repository, SIGNER_REF: ref } = env;
+  const { SIGNER_REPOSITORY_ID: repositoryId } = env;
+  const { SIGNER_REPOSITORY_OWNER_ID: repositoryOwnerId } = env;
   const workflow = env.SIGNER_WORKFLOW;
   if (
     !repository ||
+    !repositoryId ||
+    !repositoryOwnerId ||
     !ref ||
     !workflow ||
     !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+    !/^[0-9]{1,20}$/.test(repositoryId) ||
+    !/^[0-9]{1,20}$/.test(repositoryOwnerId) ||
     !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
     !/^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(workflow)
   )
     throw new Refusal(500, "signer_misconfigured");
   // The audience is the address the run reached this Worker at, which it asked GitHub for.
-  return { repository, ref, workflow, audience: new URL(request.url).origin };
+  return {
+    repository,
+    repositoryId,
+    repositoryOwnerId,
+    ref,
+    workflow,
+    audience: new URL(request.url).origin,
+  };
 }
 
 export function createSigner(runtime: Runtime) {

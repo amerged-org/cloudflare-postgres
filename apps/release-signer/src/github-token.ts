@@ -3,7 +3,9 @@
 // one workflow and that the run asks for with an audience of its own choosing. The signer accepts
 // it only when GitHub's key signed it, it names this signer as its audience, it is current, and
 // its claims say that it belongs to a push to the one ref of the one repository whose one workflow
-// file asked, on a runner GitHub hosts.
+// file asked, on a runner GitHub hosts. The repository and its owner are named twice, by name and
+// by GitHub's numeric id: a name is freed by a rename, a transfer or a deletion and can be taken by
+// someone else, an id never moves.
 import { base64urlToBytes } from "@pgcf/contracts";
 
 export const GITHUB_ISSUER = "https://token.actions.githubusercontent.com";
@@ -33,9 +35,12 @@ export class Refusal extends Error {
   }
 }
 
-/** The workflow that may ask: the three variables of the Worker. */
+/** The workflow that may ask: the variables of the Worker. */
 export interface Policy {
   repository: string;
+  /** GitHub's numeric ids of the repository and of its owner, as the token's claims spell them. */
+  repositoryId: string;
+  repositoryOwnerId: string;
   ref: string;
   workflow: string;
   /** The signer's own address, which the run asked GitHub to put in the token. */
@@ -169,7 +174,9 @@ export async function verifyGithubToken(
   const owner = policy.repository.slice(0, policy.repository.indexOf("/"));
   const expected: [string, string][] = [
     ["repository", policy.repository],
+    ["repository_id", policy.repositoryId],
     ["repository_owner", owner],
+    ["repository_owner_id", policy.repositoryOwnerId],
     ["ref", policy.ref],
     ["event_name", "push"],
     [

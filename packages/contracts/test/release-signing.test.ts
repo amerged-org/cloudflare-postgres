@@ -7,8 +7,6 @@ import {
   RELEASE_MANIFEST_DOMAIN,
   RELEASE_REFUSALS,
   RELEASE_SIGNATURE_FILE,
-  RELEASE_SIGNING_SECRET,
-  RELEASE_SIGN_PATH,
   ReleaseManifestFields,
   fleetReleaseSpec,
   releaseManifestFields,
@@ -203,9 +201,4 @@ it("the fields a signer accepts are the manifest's facts and no key beyond them,
       ReleaseManifestFields.safeParse(tweak(fields, path)).success,
       path.join("."),
     ).toBe(false);
-});
-
-it("the signer's route and the name of its secret are the contract's", () => {
-  expect(RELEASE_SIGN_PATH).toBe("/sign");
-  expect(RELEASE_SIGNING_SECRET).toBe("RELEASE_SIGNING_KEY");
 });

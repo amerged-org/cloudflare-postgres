@@ -3,7 +3,7 @@
   // The Worker that signs the release manifest of a CI run of main (docs/operations/release-signing.md).
   // This file is tracked, unlike the other Workers' configurations, because it holds nothing private:
   // no account id and no secret. The key is the secret RELEASE_SIGNING_KEY, which only
-  // `node scripts/operations/release-signing.ts provision` sets. An adopter's fork changes the three
+  // `node scripts/operations/release-signing.ts provision` sets. An adopter's fork changes the
   // variables below, which name the one workflow that may ask for a signature.
   "name": "pgcf-release-signer-dev",
   "main": "src/index.ts",
@@ -14,7 +14,12 @@
   "observability": { "enabled": true },
   "vars": {
     // The only repository, ref and workflow file whose GitHub Actions identity token the signer accepts.
+    // The repository and its owner are named by name and by GitHub's numeric id (public numbers; a
+    // fork reads its own with `gh api repos/OWNER/REPO --jq '.id, .owner.id'`): a name is freed by a
+    // rename, a transfer or a deletion and could be taken by someone else, an id never moves.
     "SIGNER_REPOSITORY": "amerged-org/cloudflare-postgres",
+    "SIGNER_REPOSITORY_ID": "1391286075",
+    "SIGNER_REPOSITORY_OWNER_ID": "329635351",
     "SIGNER_REF": "refs/heads/main",
     "SIGNER_WORKFLOW": ".github/workflows/ci.yml",
   },

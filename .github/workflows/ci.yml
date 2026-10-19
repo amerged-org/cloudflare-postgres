@@ -356,24 +356,30 @@ jobs:
         run: sudo rm -rf "$PGCF_NODE_IMAGE_WORK"
 
   # The nodes refuse a release that the release key did not sign. The key is the Worker secret of the
-  # signer (apps/release-signer): Cloudflare secrets cannot be read back, so no person, no job and no
-  # branch holds it. This job holds no secret at all. It proves who it is to the signer with the
-  # identity token of its own run (`id-token: write`, granted to this job and, for its attestation, to
-  # the dispatch-only `external_probe`, whose token the signer refuses because it says
-  # `workflow_dispatch`), which the signer accepts only from a push to main that runs this file on a
-  # GitHub-hosted runner (docs/operations/release-signing.md). It takes the release files from the
-  # artifact of `node-image` and runs no build script: the install below skips every dependency's
-  # scripts, and the only code that runs with the token's credential is scripts/operations/sign-release.ts.
-  # The job fails, it is never skipped, on a push to main while the signer cannot be reached or refuses,
-  # while RELEASE_SIGNER_URL is not set, and while the committed public key is still the placeholder.
+  # signer (apps/release-signer): no job and no branch holds it. This job holds no secret at all. It
+  # proves who it is to the signer with the identity token of its own run (`id-token: write`, granted to
+  # this job and, for its attestation, to the dispatch-only `external_probe`, whose token the signer
+  # refuses because it says `workflow_dispatch`), which the signer accepts only from a push to main that
+  # runs this file on a GitHub-hosted runner (docs/operations/release-signing.md). It needs `check` as
+  # well as `node-image`, so that a commit whose tests failed is never signed, and it takes the release
+  # files from the artifact of `node-image`.
+  #
+  # What this does NOT isolate: `id-token: write` puts the credential for the identity token in the
+  # environment of every step of this job, not only of sign-release.ts. The trust root is therefore this
+  # file on main, the pinned actions it uses, and the locked dependencies that `node-image` and this
+  # job run (this job installs them with --ignore-scripts and restores no cache another job wrote). A
+  # token that leaks can have any digests signed as the release of its own commit until it expires; what
+  # keeps such a release from being installed is that the owner registers the real build first.
+  # The job fails, it is never skipped for want of a signature, on a push to main while the signer cannot
+  # be reached or refuses, while RELEASE_SIGNER_URL is not set, and while the committed public key is
+  # still the placeholder. It does not run when `check` or `node-image` failed: that run is red already.
   sign-release:
-    needs: node-image
+    needs: [check, node-image]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.fork
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
-      actions: read
       id-token: write
     steps:
       - name: Check out the revision
@@ -389,7 +395,6 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
-          cache: pnpm
       - name: Validate the native CI toolchain
         run: node scripts/ci/toolchain.mjs check
       - name: Install dependencies without running their scripts

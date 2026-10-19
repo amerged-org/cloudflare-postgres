@@ -18,10 +18,13 @@
 //     it. --token-env and --account-env name the environment variables that hold the API token
 //     (Workers Scripts edit on the account) and the account id: a value never goes on the
 //     command line. --worker is the signer (default pgcf-release-signer-dev), which has to be
-//     deployed already. The command refuses while the Worker already holds the secret or FILE
-//     already holds a key other than the placeholder; --rotate overrides both, and the
-//     procedure that goes with it, which keeps the old key signing until every node trusts the
-//     new one, is in the runbook.
+//     deployed already. The command NEVER replaces a secret: it refuses while the Worker already
+//     holds RELEASE_SIGNING_KEY, whatever else is given, because a secret cannot be read back and
+//     the one the Worker holds may be the only copy of the key every node trusts. A new key goes to
+//     a Worker that holds none (the second signer of a rotation, or the new Worker after a loss).
+//     The command also refuses while FILE already holds a key other than the placeholder; --rotate
+//     lifts that one refusal, and the procedure that goes with it, which keeps the old key signing
+//     until every node trusts the new one, is in the runbook.
 //
 // The order of the steps leaves the previous key usable after a failure of any of them: the
 // files are read first, the secret is listed before it is set, the file is replaced only once
@@ -235,13 +238,11 @@ export async function provision(
     throw new Error(
       `${options.publicPath} holds a key that is not the placeholder: the nodes trust it, and nothing but the Worker secret holds its private half. Pass --rotate only for the key change that docs/operations/release-signing.md describes`,
     );
-  // 2. The Worker holds a key already: the one the nodes trust may be that one.
-  if (
-    (await secretNames(options, fetchImpl)).includes(RELEASE_SIGNING_SECRET) &&
-    !options.rotate
-  )
+  // 2. The Worker holds a key already: the one the nodes trust may be that one, and a secret
+  //    cannot be read back. Nothing lifts this refusal, --rotate included.
+  if ((await secretNames(options, fetchImpl)).includes(RELEASE_SIGNING_SECRET))
     throw new Error(
-      `the Worker ${options.worker} already holds the secret ${RELEASE_SIGNING_SECRET}, which cannot be read back: setting it again would lose the key the nodes may trust. Pass --rotate only for the key change that docs/operations/release-signing.md describes`,
+      `the Worker ${options.worker} already holds the secret ${RELEASE_SIGNING_SECRET}, which cannot be read back: this command never replaces it, because it may be the only copy of the key the nodes trust. Deploy another Worker under another name and pass it as --worker (docs/operations/release-signing.md), or, only if that key is lost, delete the secret first with: npx wrangler secret delete ${RELEASE_SIGNING_SECRET} --name ${options.worker}`,
     );
 
   // 3. The key exists only from here, in memory.
@@ -256,9 +257,10 @@ export async function provision(
       fetchImpl,
     );
   } catch {
-    // The answer did not arrive: the API may or may not have set the secret.
+    // The answer did not arrive: the API may or may not have set the secret. The Worker held none
+    // before (step 2), so deleting what may be there loses no key anyone trusts.
     throw new Error(
-      `the Cloudflare API did not answer the request that sets the secret, so it is not known whether the Worker now holds a new key. The new key's public half is ${publicKey}; the file ${options.publicPath} is unchanged`,
+      `the Cloudflare API did not answer the request that sets the secret, so it is not known whether the Worker now holds a new key. The new key's public half is ${publicKey}; the file ${options.publicPath} is unchanged. The Worker held no secret before this command: delete the one it may hold with \`npx wrangler secret delete ${RELEASE_SIGNING_SECRET} --name ${options.worker}\` and run the command again`,
     );
   }
   const body: unknown = await response.json().catch(() => null);

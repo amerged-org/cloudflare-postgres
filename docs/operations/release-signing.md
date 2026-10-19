@@ -18,11 +18,16 @@ that node boots their image, whose agent trusts their key. That is an open decis
 
 - **The key.** An Ed25519 key pair. The private half is the secret `RELEASE_SIGNING_KEY` of the signer, a
   Cloudflare Worker (`apps/release-signer`, deployed as `pgcf-release-signer-dev`). A Cloudflare secret
-  is write-only: no person, no CI job and no other Worker can read it back, and the key pair is made in
-  the memory of `provision` and never written to a disk, a log or a terminal, so there is no copy to
-  steal. The public half is the file `apps/node-agent/release-signing.pub` (64 lower-case hex digits),
-  which the agent's build reads as a constant. A node has no setting, file or flag that changes the key
-  it trusts.
+  is write-only through the API and the dashboard: no person, no CI job and no other Worker can read it
+  back, and the key pair is made in the memory of `provision` and never written to a disk, a log or a
+  terminal, so there is no copy to steal. **The signer's own code can read it**, because it is bound to
+  the Worker as `env.RELEASE_SIGNING_KEY`: whoever can deploy a version of that Worker (a member of the
+  Cloudflare account, or any API token with Workers Scripts: Edit) can deploy code that returns the key,
+  keep it for good, and redeploy the real code afterwards without a trace in the Worker's behaviour.
+  Edit access to Workers in the account is therefore access to the key (see "The trust root" and "If the
+  secret is lost or may have been disclosed"). The public half is the file
+  `apps/node-agent/release-signing.pub` (64 lower-case hex digits), which the agent's build reads as a
+  constant. A node has no setting, file or flag that changes the key it trusts.
 - **Why not a GitHub secret.** A repository secret is handed to every workflow run of the repository, so
   a pull request from a branch of the same repository, or a run dispatched from any branch, with an
   edited `ci.yml`, could print it; an environment secret needs a branch policy that has to be created
@@ -50,42 +55,62 @@ that node boots their image, whose agent trusts their key. That is an open decis
   | `aud` | the signer's own https origin, the address the run reached it at | `token_audience` |
   | `exp`, `nbf` | current, with a minute of skew | `token_expired`, `token_not_yet_valid` |
   | `repository`, `repository_owner` | the variable `SIGNER_REPOSITORY` and its owner | `claim_repository`, `claim_repository_owner` |
+  | `repository_id`, `repository_owner_id` | the variables `SIGNER_REPOSITORY_ID` and `SIGNER_REPOSITORY_OWNER_ID`, GitHub's numeric ids, which a rename, a transfer or a deletion of the name does not move | `claim_repository_id`, `claim_repository_owner_id` |
   | `ref` | the variable `SIGNER_REF` (`refs/heads/main`) | `claim_ref` |
   | `event_name` | `push` (not a pull request, not a dispatch) | `claim_event_name` |
   | `job_workflow_ref` | `<repository>/<SIGNER_WORKFLOW>@<ref>` (`.github/workflows/ci.yml`) | `claim_job_workflow_ref` |
   | `runner_environment` | `github-hosted` | `claim_runner_environment` |
   | `sha` | 40 hex digits, and the manifest's release id is `sha-<its first 12 digits>` | `claim_sha`, `release_not_of_commit` |
 
-  The three variables are in `apps/release-signer/wrangler.jsonc`, which holds no secret and no account
-  id and is tracked; a fork changes them. The signer validates the manifest's fields strictly (no key
+  The variables are in `apps/release-signer/wrangler.jsonc`, which holds no secret and no account id and
+  is tracked; a fork changes them (`gh api repos/OWNER/REPO --jq '.id, .owner.id'` prints the two ids).
+  The ids matter because a name can be freed and taken by someone else: whoever re-creates
+  `amerged-org/cloudflare-postgres` after a rename, a transfer or a deletion and pushes a `ci.yml` to its
+  `main` gets tokens with the right names and other ids, which the signer refuses. After a transfer or
+  rename of the repository the signer refuses everything until the variables are updated and the Worker
+  is deployed again. The signer validates the manifest's fields strictly (no key
   beyond them, every value against its pattern; `manifest_invalid`), builds the text itself with the
   domain line above, signs it with WebCrypto Ed25519 and answers with the signature as text, 128 hex
   digits and a line feed, which is the format that is stored. It signs nothing else. It logs the
   release id of what it signed and the code of every refusal, and no token, key or digest.
 - **The signer keeps no state, and needs none.** Ed25519 is deterministic: the same facts give the same
-  signature byte for byte, so asking twice reveals and changes nothing, and nothing has to be counted to
-  rate-limit it. Which content a release id may have is decided where it is registered: the API refuses
-  a second signature for a registered version, R2 never overwrites a file of one, and every node checks
-  each digest of its release against the signed text. What the signer ties together itself is the
-  release id and the commit: a run can have `sha-<its own commit>` signed and no other name. What it
-  cannot know is whether the digests belong to the build of that commit: that is the trust in the
-  workflow file on `main`, which is the next point.
-- **Who asks.** The job `sign-release` of `.github/workflows/ci.yml`. It `needs: node-image`, runs only
-  on a push to `main` of this repository (not of a fork), has `id-token: write` and holds no secret and
-  no environment, downloads the artifact of the release that `node-image` built, and runs
-  `scripts/operations/sign-release.ts sign`: it asks GitHub for an identity token for the signer's
-  address (the repository variable `RELEASE_SIGNER_URL`, an origin) as its audience, posts the manifest's
-  facts to the signer and keeps the answer as `release.sig` in the artifact
-  `pgcf-node-signature-<commit sha>-<run attempt>`. It installs dependencies with `--ignore-scripts`,
-  so that the only code that runs with the runner's token credential is that script. It **fails**, it is
-  never skipped, on a push to `main` when `RELEASE_SIGNER_URL` is not set, when the signer cannot be
-  reached or answers anything but 200 with a signature, and while `release-signing.pub` still holds
-  the placeholder key. `scripts/ci/release-signing-workflow.test.ts` fails if the job names a secret or
-  an environment, if `id-token: write` is granted to any job but this one and the dispatch-only
-  `external_probe` (which attests its report and whose token says `workflow_dispatch`, which the signer
-  refuses), or if a step could pass over the signing. A pull request, a run of another branch or a
-  dispatched run, even with an edited `ci.yml`, gets no signature: its token names another `ref`,
-  `event_name` or `job_workflow_ref`, and the signer does not accept it.
+  signature byte for byte, so asking twice with the same facts changes nothing. It does **not** limit
+  what one token can have signed: the same token gets a valid signature for different digests under the
+  same release id, and the signer cannot tell whether the digests are the build of that commit. What it
+  ties together is the release id and the commit: a token can have `sha-<its own commit>` signed and no
+  other name, with whatever digests it posts, until its `exp` plus the minute of skew. Which content a
+  release id has is decided where it is registered: the API refuses a second, different spec for a
+  registered version (409 for whoever registers second), R2 never overwrites a file of one, and every
+  node checks each digest of its release against the signed text. So a leaked token, or any code that
+  runs in the signing job, can have a signature made for digests of its own as the release of that
+  commit, and the signature can be used by whoever holds an administrator key and write access to the
+  bucket, the very threat the key exists for. Only the owner registering the real build first (the
+  API's 409 goes to whoever registers first, and the run's artifacts stay downloadable for 7 days) keeps
+  such a release from being installable. Trusting the digests is trusting the workflow file on `main`,
+  which is the next point.
+- **Who asks.** The job `sign-release` of `.github/workflows/ci.yml`. It `needs: [check, node-image]`,
+  so a commit whose tests failed (`check` runs `cargo test`, which includes the agent's verification
+  tests) or whose image did not build and boot is never signed; it runs only on a push to `main` of this
+  repository (not of a fork), has `id-token: write` and holds no secret and no environment, downloads
+  the artifact of the release that `node-image` built, and runs `scripts/operations/sign-release.ts
+  sign`: it asks GitHub for an identity token for the signer's address (the repository variable
+  `RELEASE_SIGNER_URL`, an origin) as its audience, posts the manifest's facts to the signer and keeps
+  the answer as `release.sig` in the artifact `pgcf-node-signature-<commit sha>-<run attempt>`. It
+  installs dependencies with `--ignore-scripts` and restores no cache that another job wrote. **That
+  does not keep other code away from the token's credential:** with `id-token: write`, the runner's
+  `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` are in the environment of every
+  step of the job (the actions it uses, `toolchain.mjs`, pnpm, the registration script's dry run and
+  every module `sign-release.ts` imports), and `node-image` runs the locked dependencies and produces the
+  bytes that get signed. See "The trust root". The job **fails** on a push to `main` when
+  `RELEASE_SIGNER_URL` is not set, when the signer cannot be reached or answers anything but 200 with a
+  signature, and while `release-signing.pub` still holds the placeholder key; it is not run, and the run
+  is red, when `check` or `node-image` failed. `scripts/ci/release-signing-workflow.test.ts` fails if
+  the job names a secret or an environment, drops a need, takes more permissions than the checkout and
+  the token, restores a cache, if `id-token: write` is granted to any job but this one and the
+  dispatch-only `external_probe` (which attests its report and whose token says `workflow_dispatch`,
+  which the signer refuses), or if a step could pass over the signing. A pull request, a run of another
+  branch or a dispatched run, even with an edited `ci.yml`, gets no signature: its token names another
+  `ref`, `event_name` or `job_workflow_ref`, and the signer does not accept it.
 - **Registration.** `register-node-image.ts` reads `release.sig`, checks it against
   `apps/node-agent/release-signing.pub` of **its own checkout** and stops before it uploads anything if
   it does not verify, so that no release that every node would refuse is ever registered. That key must
@@ -118,7 +143,8 @@ no step prints one.
 
    The Worker is `pgcf-release-signer-dev`, reachable at its `workers.dev` address (Wrangler prints it;
    it is also in the dashboard under Workers). It has no secret yet, so every request is refused. A
-   fork edits the three variables in `wrangler.jsonc` first.
+   fork edits the variables in `wrangler.jsonc` first (the repository, its numeric id and its owner's, the
+   ref and the workflow file).
 
 2. **Provision the key, once.** The command makes the key pair in memory, sets the private half as the
    Worker's secret through the Cloudflare API, and only after the API accepted it writes the public key
@@ -132,14 +158,18 @@ no step prints one.
    ```
 
    It prints the public key's fingerprint (the sha256 of its 32 bytes) and the next steps, and nothing
-   else about the key. It **refuses** while the Worker already holds the secret (it lists the secrets
-   by name) or the committed public key is not the placeholder, because the secret cannot be read back
-   and a second key would replace the one the nodes trust; `--rotate` overrides both and is the key
-   change below, never a second first key. A failure of any step leaves the previous state: nothing is
-   written to the file unless the API accepted the secret, and the file is replaced all at once. If the
-   file cannot be written after the secret was set, the error contains the public key to put there (it
-   is no secret); if the API's answer to the secret never arrives, the error says that it is not known
-   whether the Worker holds a new key and gives the public half, and the file is unchanged.
+   else about the key. It **never replaces a secret**: it refuses, whatever else is given, while the
+   Worker already holds `RELEASE_SIGNING_KEY` (it lists the secrets by name first), because the secret
+   cannot be read back and the one in the Worker may be the only copy of the key every node trusts. It
+   also refuses while the committed public key is not the placeholder; `--rotate` lifts only that second
+   refusal, for the key change below (to a Worker that holds no secret), never for a second first key.
+   A failure of any step leaves the previous state: nothing is written to the file unless the API
+   accepted the secret, and the file is replaced all at once. If the file cannot be written after the
+   secret was set, the error contains the public key to put there (it is no secret). If the API's answer
+   to the secret never arrives, the error says that it is not known whether the Worker holds a new key,
+   gives the public half, and leaves the file unchanged; the Worker held no secret before the command,
+   so delete the one it may hold with `npx wrangler secret delete RELEASE_SIGNING_KEY --name <worker>`
+   and run the command again.
 
 3. **Commit the public key and set the variable.** Commit the changed
    `apps/node-agent/release-signing.pub` on the branch that carries this design, and set the repository
@@ -183,8 +213,10 @@ in a second signer, and the cut-over is the repository variable.
    `cd apps/release-signer && npx wrangler deploy --name pgcf-release-signer-next`.
 2. `node scripts/operations/release-signing.ts provision --rotate --worker pgcf-release-signer-next
    --token-env … --account-env …` makes the new key in memory, sets it as the second signer's secret
-   and writes its public half to `release-signing.pub`. The old signer still holds the old key, and
-   the nodes trust it.
+   and writes its public half to `release-signing.pub`. **Keep the `--worker` flag:** the command
+   refuses a Worker that already holds the secret, whatever else is given, so run without it, it
+   stops at the live signer after listing its secrets and changes nothing. The old signer still holds
+   the old key, and the nodes trust it.
 3. Commit the changed `release-signing.pub` and merge. CI builds the release with the agent that trusts
    the new key, and `RELEASE_SIGNER_URL`, still the old signer's address, has it signed with the **old**
    key. The dry run reports that the signature does not verify with this checkout's key; that is the
@@ -202,24 +234,35 @@ in a second signer, and the cut-over is the repository variable.
    the fleet accepts under it.
 
 A node that missed the transition (it was offline) still trusts the old key and refuses the releases
-of the new one: reinstall it, as for a lost node. Rotating in place (`provision --rotate` against the
-same Worker) is a cut-over with no transition: the old key stops signing at once, and no running node
-accepts a release again until it is reinstalled.
+of the new one: reinstall it, as for a lost node. There is no rotating in place: `provision` never
+replaces a secret. Deleting the signer's secret by hand (`npx wrangler secret delete
+RELEASE_SIGNING_KEY --name <worker>`) and provisioning again is a cut-over with no transition: the
+old key stops signing at once, and no running node accepts a release again until it is reinstalled,
+which is the loss case below.
 
-## If the secret is lost
+## If the secret is lost or may have been disclosed
 
 **The secret cannot be recovered, and there is no backup, by design.** The key was never written
-anywhere, so nobody can leak it and nobody can restore it. If the Worker is deleted, the secret is
-removed or overwritten by mistake, or the Cloudflare account is lost, and no other signer holds the
+anywhere, so nobody can leak a copy and nobody can restore it. If the Worker is deleted, the secret
+is removed or overwritten by mistake, or the Cloudflare account is lost, and no other signer holds the
 key, no signature that a node accepts can be made any more: the nodes keep running, serve their
 databases and keep their data, but no release can reach them again, and **every node has to be
 reinstalled** from an image built with a new key's public half. Deploy a signer, run
-`provision --rotate` against it (the committed key is not the placeholder), commit the new public key,
-build and register the image, and reinstall every node (AddNode in recover mode, plan 9.2 and
-[recovery.md](recovery.md)); each database is restored from its archive. If the account is under
-someone else's control, treat the key as lost and do the same, and also delete the secret first
-(`npx wrangler secret delete RELEASE_SIGNING_KEY --name pgcf-release-signer-dev`) if you still can, and
-treat every release signed since the compromise as untrusted.
+`provision --rotate` against a Worker that holds no secret (a new Worker name, or after
+`npx wrangler secret delete RELEASE_SIGNING_KEY --name <worker>` for one whose secret is lost or
+wrong; `provision` never replaces a secret itself), commit the new public key, build and register the
+image, and reinstall every node (AddNode in recover mode, plan 9.2 and [recovery.md](recovery.md));
+each database is restored from its archive.
+
+**A key that may have been disclosed is a lost key, and the procedure is the same.** Whoever can
+deploy a version of the signer Worker can read the key out of it and keep it, and redeploying the real
+code afterwards does not undo that. So apply this procedure not only when the account is under someone
+else's control but to any suspected misuse of Workers edit access: an API token with Workers Scripts:
+Edit that leaked, a member of the account who should not have had that access, an unexplained version
+of the signer Worker in its deployment history. Delete the secret first if you still can (`npx wrangler
+secret delete RELEASE_SIGNING_KEY --name pgcf-release-signer-dev`) so that the old key signs nothing
+more through the Worker, and treat every release signed since the suspected misuse as untrusted: the
+holder of the key can also sign a transition release that carries their own key.
 
 ## What is and is not protected
 
@@ -240,12 +283,23 @@ treat every release signed since the compromise as untrusted.
 - **Which signed release is current.** The signature says what a release is, not that it is the newest.
   An administrator can still assign an older, signed release to a region. That is how a bad release is
   rolled back, so it stays possible.
-- **The trust root.** Whoever can push to `main`, or change `ci.yml` there, can have CI ask for a
-  signature of digests of their choosing; the signer authenticates the workflow, not the bytes. Whoever
-  can deploy the signer's code (the Cloudflare account) can deploy a signer that signs anything with the
-  secret it is bound to. Branch protection of `main`, who holds administrator rights on the repository
-  and who can deploy Workers in the account are the controls here. A token that leaks from a job is
-  valid for a few minutes and signs only the release of its own commit.
+- **The trust root.** Two things, and nothing smaller.
+  - *The workflow on `main`.* The signer authenticates the workflow, not the bytes. The identity token's
+    credential is in the environment of every step of `sign-release`, so what can sign is the file
+    `ci.yml` on `main`, the pinned actions it uses, and the locked dependencies that `node-image` (which
+    builds the bytes that are signed) and `sign-release` run. Whoever can push to `main`, change
+    `ci.yml` there, or get code into one of those dependencies can have digests of their choosing signed.
+    A token that leaks, or is taken by any code in that job, can have **any** digests signed as
+    `sha-<its own commit>` until its `exp` plus a minute of skew (a few minutes after it was issued);
+    only the owner registering the real build first, which the API's 409 enforces for the second
+    registrar, stops that release from being installable.
+  - *Workers edit access to the Cloudflare account.* Whoever can deploy a version of the signer Worker
+    (an account member, or any API token with Workers Scripts: Edit) can deploy code that returns
+    `env.RELEASE_SIGNING_KEY` and keeps the key permanently, or that signs anything. Redeploying the real
+    code does not undo a disclosure: see "If the secret is lost or may have been disclosed".
+
+  Branch protection of `main`, who holds administrator rights on the repository, the lockfile review, and
+  who holds Workers edit rights or API tokens in the account are the controls here.
 - **Binaries after install.** The agent checks digests when it downloads; an attacker who is already
   root on a node is outside this control.
 

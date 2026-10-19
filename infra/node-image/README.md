@@ -103,8 +103,8 @@ Every push to `main` of this repository (not of a fork) whose `node-image` job p
 release files for 7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`: `pgcf-node.raw.zst`,
 `pgcf-node.json`, `packages.lock.json`, the four binaries and a `SHA256SUMS` of these seven files.
 The uncompressed image (about 1.7 GB) is not part of it, and no credential is. The job `sign-release`
-(which holds no key: it has the signer Worker sign that release with the identity token of its run)
-keeps the signature as the artifact `pgcf-node-signature-<commit sha>-<run attempt>`, one file,
+(which holds no key and runs only when `check` and `node-image` both passed: it has the signer Worker sign
+that release with the identity token of its run) keeps the signature as the artifact `pgcf-node-signature-<commit sha>-<run attempt>`, one file,
 `release.sig`: [release-signing.md](../../docs/operations/release-signing.md). The release is named
 `sha-<first 12 hex digits of the commit>`. The artifact belongs to the commit that built it, so the
 package lock comes from the artifact, not from the checkout, and the registration runs from a checkout
@@ -132,8 +132,9 @@ overwritten, so register one attempt and keep using it.
 ### Or build it locally
 
 When there is no artifact (it expired, or the release comes from a commit that is not on `main`),
-build the release yourself with the local Docker builder. A local build is **not signed**, because
-only CI holds the release key, and the nodes refuse a release that is not signed, so the registration
+build the release yourself with the local Docker builder. A local build is **not signed**: CI holds no
+key, the signer Worker holds it, and the Worker signs only for the job `sign-release` of a push to
+`main` (`.github/workflows/ci.yml`). The nodes refuse a release that is not signed, so the registration
 refuses it too: use this path for the lab and for `--dry-run`, and register only what CI built.
 
 ```sh

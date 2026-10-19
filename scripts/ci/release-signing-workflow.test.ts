@@ -34,16 +34,23 @@ test("the signing job holds no secret: it proves itself to the signer with its r
   assert.doesNotMatch(job, /secrets\./);
   assert.doesNotMatch(job, /^ {4}environment:/m);
   assert.doesNotMatch(job, /GH_TOKEN|github\.token/);
-  assert.match(job, /^ {4}needs: node-image$/m);
+  // A commit whose `check` job failed (cargo test runs the agent's signature tests there) is not
+  // signed, and neither is one whose image did not build and boot.
+  assert.match(job, /^ {4}needs: \[check, node-image\]$/m);
   assert.match(
     job,
     /^ {4}if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' && !github\.event\.repository\.fork$/m,
   );
-  // The checkout, the download of this run's artifact and the identity token, and nothing else.
+  // The checkout and the identity token, and nothing else: the download of this run's artifact by
+  // id takes no token of the job (the step names no `github-token`), so it needs no `actions: read`.
   assert.match(
     job,
-    /^ {4}permissions:\n {6}contents: read\n {6}actions: read\n {6}id-token: write\n {4}steps:/m,
+    /^ {4}permissions:\n {6}contents: read\n {6}id-token: write\n {4}steps:/m,
   );
+  assert.doesNotMatch(job, /github-token/);
+  // Every step of this job can read the runner's credential for the identity token, so it imports no
+  // cache that another job wrote: it installs from the registry against the lockfile's digests.
+  assert.doesNotMatch(job, /^ *cache:/m);
   // The signer's address is a variable of the repository (an origin; it is no secret) that only the
   // signing step reads.
   assert.equal(workflow.match(/vars\.RELEASE_SIGNER_URL/g)?.length, 1);
@@ -111,6 +118,10 @@ test("what the signer requires of a caller is what this workflow is: the one fil
   // The signer's variables name the workflow file and the ref that the job runs at.
   assert.match(signer, /"SIGNER_WORKFLOW": "\.github\/workflows\/ci\.yml"/);
   assert.match(signer, /"SIGNER_REF": "refs\/heads\/main"/);
+  // The repository and its owner are named by GitHub's numeric ids too, which a rename, a transfer
+  // or a deletion of the name does not move; without them the signer answers 500 to every request.
+  assert.match(signer, /"SIGNER_REPOSITORY_ID": "[0-9]+"/);
+  assert.match(signer, /"SIGNER_REPOSITORY_OWNER_ID": "[0-9]+"/);
   assert.match(jobs["sign-release"]!, /github\.ref == 'refs\/heads\/main'/);
   // The signer signs only `sha-<first 12 digits of the commit>`, the name this job's build gives its release.
   assert.match(jobs["node-image"]!, /--release "sha-\$\{GITHUB_SHA::12\}"/);

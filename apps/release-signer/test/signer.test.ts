@@ -155,18 +155,23 @@ describe("what it signs", () => {
   });
 
   it("makes the same signature of the same facts every time, so that it keeps no state to refuse another", async () => {
-    // Ed25519 is deterministic: asking again for the same release gets the same bytes, and the
-    // signer cannot be made to sign two contents for one release by asking twice, because it has
-    // no state in which "once" could be counted. What decides which content a release id may
-    // have is the API, which refuses a second signature for a registered version, and the nodes,
-    // which check every digest against the signed text.
+    // Ed25519 is deterministic: asking again for the same facts gets the same bytes. The signer has
+    // no state in which "once" could be counted, so the same token also gets a valid signature of
+    // DIFFERENT digests under the same release id: it ties the id to the commit and cannot know
+    // whether the digests are the build of that commit. What makes one content the release is where
+    // it is registered: the API's 409 goes to whoever registers a release id first, and the nodes
+    // check every digest against the signed text.
     const h = harness();
     const first = await (await h.post()).text();
     const second = await (await h.post()).text();
     expect(second).toBe(first);
     const other = fields();
     other.binaries["pgcf-agent"] = digest("9", 11_000_000);
-    expect(await (await h.post({ body: other })).text()).not.toBe(first);
+    const token = await github.mint(claims(T0));
+    const same = await (await h.post({ token })).text();
+    const different = await (await h.post({ token, body: other })).text();
+    expect(different).toMatch(/^[0-9a-f]{128}\n$/);
+    expect(different).not.toBe(same);
   });
 
   it("signs only the release of the commit the token names", async () => {
@@ -285,6 +290,39 @@ describe("who may ask", () => {
       { repository_owner: "other-org" },
       403,
       "claim_repository_owner",
+    ],
+    // Names are freed by a rename, a transfer or a deletion, and whoever then takes the name of
+    // the repository gets a token with the right names and other ids: GitHub's numeric ids do not
+    // move with a name.
+    [
+      "the repository's name under another repository id",
+      { repository_id: "999999" },
+      403,
+      "claim_repository_id",
+    ],
+    [
+      "the owner's name under another owner id",
+      { repository_owner_id: "999999" },
+      403,
+      "claim_repository_owner_id",
+    ],
+    [
+      "no repository id",
+      { repository_id: undefined },
+      403,
+      "claim_repository_id",
+    ],
+    [
+      "no owner id",
+      { repository_owner_id: undefined },
+      403,
+      "claim_repository_owner_id",
+    ],
+    [
+      "the repository id as a number",
+      { repository_id: 424242 },
+      403,
+      "claim_repository_id",
     ],
     ["another ref", { ref: "refs/heads/feature" }, 403, "claim_ref"],
     ["a pull request's ref", { ref: "refs/pull/7/merge" }, 403, "claim_ref"],
@@ -561,6 +599,11 @@ describe("its own configuration", () => {
       env({ RELEASE_SIGNING_KEY: btoa("not pkcs8 at all, but base64") }),
       env({ SIGNER_REPOSITORY: undefined }),
       env({ SIGNER_REPOSITORY: "no-slash" }),
+      env({ SIGNER_REPOSITORY_ID: undefined }),
+      env({ SIGNER_REPOSITORY_ID: "" }),
+      env({ SIGNER_REPOSITORY_ID: "example-repo" }),
+      env({ SIGNER_REPOSITORY_OWNER_ID: undefined }),
+      env({ SIGNER_REPOSITORY_OWNER_ID: "0x2a" }),
       env({ SIGNER_REF: "main" }),
       env({ SIGNER_WORKFLOW: "ci.yml" }),
       env({ SIGNER_WORKFLOW: undefined }),

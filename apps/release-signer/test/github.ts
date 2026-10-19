@@ -13,6 +13,9 @@ export const SIGNER_URL = `${SIGNER_ORIGIN}/sign`;
 /** What the signer's variables say in `wrangler.jsonc`, in the tests. */
 export const POLICY_VARS = {
   SIGNER_REPOSITORY: "example-org/example-repo",
+  // GitHub's immutable numeric ids of that repository and its owner, as the token's claims give them.
+  SIGNER_REPOSITORY_ID: "424242",
+  SIGNER_REPOSITORY_OWNER_ID: "737373",
   SIGNER_REF: "refs/heads/main",
   SIGNER_WORKFLOW: ".github/workflows/ci.yml",
 };
@@ -79,7 +82,9 @@ export function claims(
     aud: SIGNER_ORIGIN,
     sub: `repo:${POLICY_VARS.SIGNER_REPOSITORY}:ref:${POLICY_VARS.SIGNER_REF}`,
     repository: POLICY_VARS.SIGNER_REPOSITORY,
+    repository_id: POLICY_VARS.SIGNER_REPOSITORY_ID,
     repository_owner: owner,
+    repository_owner_id: POLICY_VARS.SIGNER_REPOSITORY_OWNER_ID,
     ref: POLICY_VARS.SIGNER_REF,
     sha: COMMIT,
     event_name: "push",

@@ -238,26 +238,52 @@ test("a secret the API did not accept leaves the key file as it was", async () =
   }
 });
 
-test("it refuses while the Worker already holds the secret, and while the checkout already holds a real key, unless it is told to rotate", async () => {
+test("it never replaces a secret the Worker holds, with or without --rotate, and --rotate only lifts the refusal for a real key in the checkout", async () => {
   const held = await checkout();
   const hasSecret = await cloudflare(held.publicPath, {
     secrets: ["RELEASE_SIGNING_KEY", "OTHER"],
   });
+  const heldReal = await checkout(generateKeyPair().publicKey);
+  const hasSecretAndKey = await cloudflare(heldReal.publicPath, {
+    secrets: ["RELEASE_SIGNING_KEY"],
+  });
   const real = await checkout(generateKeyPair().publicKey);
   const noSecret = await cloudflare(real.publicPath);
   try {
-    // The secret exists: nothing is generated, set or written.
+    // The secret exists: nothing is generated, set or written, and the secret cannot be read back,
+    // so the message says what to do instead. --rotate does not change that: the runbook's
+    // rotation command without its --worker flag points at the signer the nodes trust.
+    for (const rotate of [false, true])
+      await assert.rejects(
+        provision(options(hasSecret.apiBase, held.publicPath, { rotate })),
+        /already holds the secret RELEASE_SIGNING_KEY.*never replaces.*another Worker.*secret delete/s,
+      );
+    // The dangerous case: a real key in the checkout, the Worker that signs it, and --rotate. It is
+    // refused after the one request that lists the secrets: no PUT, and the file as it was.
+    const keyBefore = await readFile(heldReal.publicPath, "utf8");
     await assert.rejects(
-      provision(options(hasSecret.apiBase, held.publicPath)),
-      /already holds the secret RELEASE_SIGNING_KEY.*--rotate/s,
+      provision(
+        options(hasSecretAndKey.apiBase, heldReal.publicPath, { rotate: true }),
+      ),
+      /already holds the secret RELEASE_SIGNING_KEY/,
+    );
+    assert.equal(await readFile(heldReal.publicPath, "utf8"), keyBefore);
+    assert.deepEqual(
+      hasSecretAndKey.seen.map(({ method }) => method),
+      ["GET"],
     );
     assert.deepEqual(
       hasSecret.seen.map(({ method }) => method),
-      ["GET"],
+      ["GET", "GET"],
     );
     assert.equal(
       await readFile(held.publicPath, "utf8"),
       `${PLACEHOLDER_RELEASE_KEY}\n`,
+    );
+    assert.equal(
+      hasSecret.secrets.size,
+      2,
+      "the secrets of the Worker are as they were",
     );
     // The checkout holds a real key: refused before the API is asked anything.
     const before = await readFile(real.publicPath, "utf8");
@@ -267,24 +293,58 @@ test("it refuses while the Worker already holds the secret, and while the checko
     );
     assert.deepEqual(noSecret.seen, []);
     assert.equal(await readFile(real.publicPath, "utf8"), before);
-    // With --rotate both are replaced: the secret by one PUT and then the file.
+    // With --rotate, against a Worker that holds no secret (the second signer of a rotation, or the
+    // new one after a loss), the secret is set by one PUT and then the file is replaced.
     const rotated = await provision(
-      options(hasSecret.apiBase, held.publicPath, { rotate: true }),
-    );
-    assert.deepEqual(
-      hasSecret.seen.map(({ method }) => method),
-      ["GET", "GET", "PUT"],
-    );
-    assert.equal(await readReleaseKey(held.publicPath), rotated.publicKey);
-    await provision(
       options(noSecret.apiBase, real.publicPath, { rotate: true }),
     );
+    assert.deepEqual(
+      noSecret.seen.map(({ method }) => method),
+      ["GET", "PUT"],
+    );
     assert.notEqual(await readFile(real.publicPath, "utf8"), before);
+    assert.equal(await readReleaseKey(real.publicPath), rotated.publicKey);
   } finally {
     await hasSecret.close();
+    await hasSecretAndKey.close();
     await noSecret.close();
     await rm(held.root, { recursive: true, force: true });
+    await rm(heldReal.root, { recursive: true, force: true });
     await rm(real.root, { recursive: true, force: true });
+  }
+});
+
+test("an answer to the request that sets the secret that never arrives leaves the file as it was and says how to go on without the secret", async () => {
+  const { root, publicPath } = await checkout();
+  const api = await cloudflare(publicPath, {
+    put: (request) => {
+      request.socket.destroy();
+      return true;
+    },
+  });
+  try {
+    await assert.rejects(
+      provision(options(api.apiBase, publicPath)),
+      (error: Error) => {
+        assert.match(error.message, /not known whether the Worker now holds/);
+        // The Worker held no secret before this command, so deleting what may be there loses no key.
+        assert.match(
+          error.message,
+          /npx wrangler secret delete RELEASE_SIGNING_KEY --name pgcf-release-signer-test/,
+        );
+        assert.match(error.message, /[0-9a-f]{64}/);
+        const sent = (JSON.parse(api.seen[1]!.body) as { text: string }).text;
+        assert.equal(error.message.includes(sent), false);
+        return true;
+      },
+    );
+    assert.equal(
+      await readFile(publicPath, "utf8"),
+      `${PLACEHOLDER_RELEASE_KEY}\n`,
+    );
+  } finally {
+    await api.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 
