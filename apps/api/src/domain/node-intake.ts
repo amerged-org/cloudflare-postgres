@@ -13,15 +13,16 @@ import type { NodeCaller } from "./node-auth.ts";
 import { recordUsageSamples } from "./usage.ts";
 
 const MINUTE_MS = 60_000;
-/** A database's storage is sampled for billing and disk health once in this long. */
-const STORAGE_SAMPLE_MS = 15 * MINUTE_MS;
+/** A hibernated database cannot grow, so its storage is sampled once in each span of this many minutes. */
+const HIBERNATED_SAMPLE_MINUTES = 15;
 /** The volumes written by one statement. */
 const VOLUME_CHUNK = 200;
 
 /**
  * `POST /node/v1/volumes` (plan 4.3): every thin volume of the node, orphans included, replaces
  * the node's previous report. The volumes of live databases also become the storage samples that
- * disk health and the usage rollup read, one per database and quarter hour.
+ * disk health and the usage rollup read: one per database and minute, except that a hibernated
+ * database cannot grow and is sampled once in each quarter hour, from its first report of it.
  */
 export async function nodeVolumes(
   c: ApiContext,
@@ -77,26 +78,48 @@ async function storageSamples(
   report: NodeVolumeReport,
 ): Promise<void> {
   const db = c.env.DB,
-    at = Date.parse(report.observed_at),
-    sequence = Math.floor(at / STORAGE_SAMPLE_MS);
+    // The minute is the sample's identity: a second report of the same minute adds nothing.
+    sequence = Math.floor(Date.parse(report.observed_at) / MINUTE_MS),
+    quarter = sequence - (sequence % HIBERNATED_SAMPLE_MINUTES);
   const live = await db
     .prepare(
-      `SELECT id,storage_generation FROM databases WHERE node_id=? AND deleted_at IS NULL AND desired_state<>'deleted'
+      `SELECT id,storage_generation,observed_power FROM databases WHERE node_id=? AND deleted_at IS NULL AND desired_state<>'deleted'
        AND id IN(SELECT value FROM json_each(?))`,
     )
     .bind(node.id, JSON.stringify(report.volumes.map((v) => v.database)))
-    .all<{ id: string; storage_generation: number }>();
+    .all<{
+      id: string;
+      storage_generation: number;
+      observed_power: "awake" | "hibernated";
+    }>();
   const generations = new Map(
     live.results.map((row) => [row.id, row.storage_generation]),
   );
+  const hibernated = new Set(
+    live.results
+      .filter((row) => row.observed_power === "hibernated")
+      .map((row) => row.id),
+  );
+  // What the quarter hour already holds: a database that can grow needs a sample of this minute, a
+  // hibernated one any sample of the quarter hour, whichever report took it.
   const taken = await db
     .prepare(
-      `SELECT database_id FROM usage_samples WHERE source='agent' AND producer_id=? AND sequence=?
-       AND database_id IN(SELECT value FROM json_each(?))`,
+      `SELECT database_id,MAX(sequence=?) AS this_minute FROM usage_samples WHERE source='agent' AND producer_id=?
+       AND sequence BETWEEN ? AND ? AND database_id IN(SELECT value FROM json_each(?)) GROUP BY database_id`,
     )
-    .bind(node.uid, sequence, JSON.stringify([...generations.keys()]))
-    .all<{ database_id: string }>();
-  const done = new Set(taken.results.map((row) => row.database_id));
+    .bind(
+      sequence,
+      node.uid,
+      quarter,
+      quarter + HIBERNATED_SAMPLE_MINUTES - 1,
+      JSON.stringify([...generations.keys()]),
+    )
+    .all<{ database_id: string; this_minute: number }>();
+  const done = new Set(
+    taken.results
+      .filter((row) => hibernated.has(row.database_id) || row.this_minute === 1)
+      .map((row) => row.database_id),
+  );
   const samples: UsageSample[] = [];
   for (const volume of report.volumes)
     if (

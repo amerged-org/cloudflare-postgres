@@ -90,10 +90,16 @@ export const InfraCronHeartbeat = z.strictObject({
 export type InfraCronHeartbeat = z.infer<typeof InfraCronHeartbeat>;
 export const InfraAlert = z.strictObject({
   version: z.literal(1),
-  event_id: z.uuid(),
+  event_id: z
+    .uuid()
+    .describe(
+      "Identifier of the error, not of the delivery: a version 8 UUID (RFC 9562) made from the SHA-256 of region_id, kind and the sorted subjects: node_ids, database_ids, the nodes of thin_storage or, for control_cron_step_failing, the steps of cron.failing_steps with at least 5 consecutive failures. The same error has the same event_id every time it occurs, also after it cleared and came back; another set of subjects is another error with another event_id. A retry repeats event_id, occurred_at and the body; a recurrence has the same event_id and a new occurred_at.",
+    ),
   kind: InfraAlertKind,
   region_id: RegionId,
-  occurred_at: Timestamp,
+  occurred_at: Timestamp.describe(
+    "When the episode of this notification started; it differs between two episodes of the same event_id.",
+  ),
   regional_ram_utilization_ppm: Ppm.nullable(),
   allocated_nodes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   max_nodes: z
@@ -147,9 +153,11 @@ export const InfraAlertStatus = z.strictObject({
     .uuid()
     .nullable()
     .describe(
-      "ID of the current or last episode; the Idempotency-Key of its notification.",
+      "event_id of the current or last episode: the identifier of the error, which is the same every time the same error occurs. The Idempotency-Key of its notification is event_id and occurred_at joined by a colon.",
     ),
-  occurred_at: Timestamp.nullable().describe("When that episode started."),
+  occurred_at: Timestamp.nullable().describe(
+    "When that episode started; two episodes of the same event_id differ in it.",
+  ),
   delivered_at: Timestamp.nullable().describe(
     "When the alert webhook or the Resend API accepted the notification with a 2xx status; this is not inbox delivery. null while undelivered, including without a configured destination.",
   ),

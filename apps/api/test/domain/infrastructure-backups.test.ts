@@ -520,11 +520,10 @@ it("first failed run is failing without an older success; stale grace expires an
     url: "https://api.resend.com/emails",
     body: { to: ["operator@example.com"], from: "alerts@example.com" },
   });
-  expect(sent[0]!.key).toBe(
-    (await infrastructureAlertStatus(env.DB, f.region)).find(
-      (a) => a.kind === "infrastructure_backup_failed",
-    )!.event_id,
-  );
+  const failed = (await infrastructureAlertStatus(env.DB, f.region)).find(
+    (a) => a.kind === "infrastructure_backup_failed",
+  )!;
+  expect(sent[0]!.key).toBe(`${failed.event_id}:${failed.occurred_at}`);
   await env.DB.prepare("DELETE FROM infrastructure_backup_runs").run();
   expect(
     await infrastructureBackupHealth(env, at + 37 * 3600000),

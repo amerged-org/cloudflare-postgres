@@ -155,12 +155,29 @@ only when every listed node is fresh and below the threshold, or lost.
 The existing authenticated infrastructure webhook remains supported and takes
 precedence when configured. Without a webhook or both email addresses plus the
 Resend secret, alarms remain visible through the API and no notification is sent.
-Delivery uses the durable event UUID as the idempotency key, a five-second deadline,
-and a minimum one-minute retry interval. A continuously active episode retains its
-UUID and payload. Recovering clears the episode; a new failure creates a new UUID.
-Webhook receivers must deduplicate this identifier durably. Email delivery follows
-Resend's idempotency retention; an unresolved delivery must be investigated through
-the API and the operator's mail account.
+Delivery uses a five-second deadline and a minimum one-minute retry interval. The event UUID
+(`event_id`) names the error, not the delivery: it is a version 8 UUID (RFC 9562; a name-based
+UUID from SHA-256 is no version 5, which is SHA-1) made from the first 16 bytes of the SHA-256 of
+the lines `pgcf.infrastructure-alert.v1`, the region, the kind and the sorted subjects, with the
+version and variant bits set. The subjects are the IDs of the nodes or databases the event lists
+or, for `control_cron_step_failing`, the names of the steps in `cron.failing_steps` with at least
+five consecutive failures (a step that failed once is not part of the error); every other kind
+has the ID of region and kind alone. The same error therefore has the same `event_id` every
+time, also after it cleared and came back, and another set of subjects, another failing step
+or another region is another error with another ID. The cron kinds are raised in every region,
+so one cron stall is announced once per region, each with its own ID. A continuously active episode keeps
+its UUID and payload, and a retry sends both unchanged. Recovering clears the episode; the
+same failure later reopens the same row with the same UUID, a new `occurred_at` (the start of
+the new episode) and a fresh delivery.
+
+The `Idempotency-Key` is `<event_id>:<occurred_at>`: one value for an episode and all its
+retries, a new one for a recurrence. Resend keeps an idempotency key for 24 hours and refuses a
+different body under a key it knows, so the key of a recurrence has to differ. Webhook receivers
+must deduplicate the pair `event_id` and `occurred_at` (or the key together with the exact body)
+durably: a known pair is a retry, to acknowledge and ignore; a known `event_id` with a new
+`occurred_at` is a recurrence of the same error, to handle as a new occurrence of the incident
+that ID names (reopen it, notify again). Email delivery follows Resend's idempotency retention;
+an unresolved delivery must be investigated through the API and the operator's mail account.
 
 ## Alert kinds and runbook actions
 
@@ -170,7 +187,8 @@ action below (`INFRA_ALERT_ACTIONS` in `packages/contracts`), and
 heartbeat. An unknown measurement never starts an episode and never clears an active
 one: a missing or stale sample, an unknown archive or backup state and a node that has not
 reported keep things as they are. A new episode is delivered once and retried with the
-same event ID while it stays active; a cleared episode sends nothing.
+same event ID and body while it stays active; a cleared episode sends nothing. A recurrence of
+the same error has the same event ID and a new `occurred_at`.
 
 | Kind | Fires when | Rule | Action |
 | --- | --- | --- | --- |
@@ -187,7 +205,7 @@ same event ID while it stays active; a cleared episode sends nothing.
 | `thin_storage_blocked` | a node's newest sample says its thin pool has no room, or a node that holds databases has no sample of its pool within 180 s | fixed | With `thin_pool_no_room`, free space by deleting databases on the node; with `thin_pool_unobserved`, fix the node's samples |
 | `regional_node_capacity_refusals` | a node refused 5 or more wakes for awake capacity (`57P03` "node at awake capacity") in the last 10 minutes | fixed | Move the node's most active databases to another node, or add a node |
 | `regional_node_pool_closed` | a node's newest sample closes its thin pool for placement: data at 80 % or more, metadata at 50 % or more, or the storage sold (its reported volumes plus the databases it has not finished) at 4 times its data | fixed | Nothing is created or restored there; running databases keep running. Free space by deleting databases on the node, or add a node |
-| `database_volume_warning` | a database volume's space or inodes are at least 80 % used and below 90 % | fixed; the volume's newest report of at most 180 s | Raise its storage with `PUT /v1/databases/{id}/resources`, or have the integrator free space |
+| `database_volume_warning` | a database volume's space or inodes are at least 80 % used and below 90 % | fixed; the volume's newest report of at most 180 s (the node posts one every 60 s) | Raise its storage with `PUT /v1/databases/{id}/resources`, or have the integrator free space |
 | `database_volume_critical` | a database volume's space or inodes are at least 90 % used | fixed; same report | Raise its storage now: a full volume stops the database |
 | `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed; the episode lists the nodes in `node_ids` | If you did not retry the install, treat the token as leaked: read the `node_enrollment_refused` log and reinstall the node, which issues new tokens |
 | `node_unexpected_reboot` | a node sent the journal of its previous boot after a reboot, and no maintenance order of it was open when its last sample of the previous boot arrived, or closed after it, within the last 24 h | fixed; the episode lists the nodes in `node_ids`; a report of an agent that knew no earlier boot claims no reboot | List `GET /v1/nodes/{id}/diagnostics` for the report with `expected_reboot` false, then read it at `GET /v1/nodes/{id}/diagnostics/{diagnostic_id}`: the kernel, agent, gateway, cloudflared, networkd and PID 1 lines of the boot that ended show whether it panicked, ran out of memory or lost power |
@@ -219,11 +237,25 @@ Rules of the database and Thin storage kinds:
   at most 180 s old, so neither the room rule nor this alert sees the pool fill. Running databases
   are never stopped for storage; a pool that does fill fails the write and PostgreSQL stops without
   acknowledging it ([recovery](recovery.md#thin-storage-admission-and-recovery)).
+- **Database volumes.** `database_volume_warning` and `database_volume_critical` read the node's
+  newest volume report (posted every 60 s, at most 180 s old), not the stored storage sample, so
+  a crossing is seen at the next report and the next minute run raises it. A volume that crosses
+  both 80 % and 90 % between two reports raises only the critical alert; the warning is for
+  growth slower than the report interval. The stored samples, one per minute for a database
+  that can grow and one in each quarter hour (from its first report of it) for a hibernated one, feed `health.disk`, `storage` and
+  the usage rollup, not these alerts.
 - **Subjects.** An episode lists at most 64 databases (longest-standing first) or nodes,
   16 for Thin storage (by ID). A subject that fails and is not listed yet replaces the
   episode with a new event that lists the current subjects (this also holds for
   `regional_node_stale`, so a lost node does not hide a node that goes stale later); a
   listed subject that recovers and fails again adds none.
+  The event ID is derived from the subjects that are listed, so a replacement has a new ID and
+  a subject that merely recovers leaves the ID of the announced set. When more subjects fail
+  than are listed, the ID is that of the listed ones; a listed subject that recovers lets the
+  next one in the listing order enter, and a subject that sorts before the listed ones displaces
+  the last: each is a new set, announced with a new ID, and a set that comes back has its
+  earlier ID again with a new `occurred_at`. Subjects an active episode still names but cannot
+  yet judge (`unresolved`) are neither listed nor part of the ID.
 - **Unknown backup health.** `infrastructure_backup_failed` and
   `infrastructure_backup_stale` keep an active episode while an artifact's health is
   unknown (for example its custody could not be read) and while the backup health cannot
@@ -294,7 +326,7 @@ fields that have a default). `delivered_at` in
 `infrastructure_alert_delivery_failed` with the HTTP status or a `timeout`/`transport`
 reason: 401 is usually an invalid API key, 403 or 422 a sender that is not on a verified
 domain or is malformed, and 429 Resend's rate limit; the episode is retried with the same
-event ID at least 60 s later.
+event ID, start and body at least 60 s later.
 
 ## Offline recovery custody
 

@@ -109,7 +109,8 @@ export const WAKE_AGAIN_REASON = "wake_in_progress" satisfies WakeReason;
  * How a wake ticket is stale, which the agent names in the `stale` of the wake event of a
  * `desired_stale` refusal (the answer to the gateway stays `desired_stale`): the node holds no
  * entry for the database; the ticket's generation is not the next one, the entry's own wake or a
- * claim's; it is the entry's generation with another operation; the route revision changed since
+ * claim's, or it is above the entry of a suspended database (a page that has not caught up with a
+ * resume); it is the entry's generation with another operation; the route revision changed since
  * the Edge signed it, other than by the claim of the ticket's own wake (which may raise it more
  * than once); the roles changed.
  */

@@ -3,7 +3,7 @@ import { DatabaseId, RegionId } from "@pgcf/contracts";
 import type { Env } from "./env.ts";
 import { reconcileDatabaseActors } from "./domain/database-actor-sync.ts";
 import { recoverAdmissionMutations } from "./domain/admission-mutations.ts";
-import { recoverQuiescence } from "./domain/lifecycle.ts";
+import { recoverFailedResume, recoverQuiescence } from "./domain/lifecycle.ts";
 import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
 import { hintNode } from "./domain/node-hints.ts";
@@ -29,6 +29,20 @@ import { armCronWatchdog } from "./cron-watchdog.ts";
 
 /** Time one run may spend sending alert notifications; the rest wait for the next minute. */
 export const ALERT_DELIVERY_BUDGET_MS = 20_000;
+
+/**
+ * The power operations that the power timeout undoes itself, so that the generic operation sweep
+ * leaves them to it: a suspension of a database that D1 does not know asleep (it may still run,
+ * and the database goes back to running), and a resume of one it knows asleep (the database goes
+ * back to sleep). The two statements share this text, so that every timed-out power operation is
+ * taken by exactly one of them. A suspension of a database that D1 knows asleep needs no undo: the
+ * sleep it asks for is what is known, so the sweep only fails the operation, and the database stays
+ * suspended. Undoing it would turn it into a resume and make a cycle with the resume's revert for
+ * as long as no node reports on the database.
+ */
+const undoneByPowerTimeout = (database: string, operation: string) =>
+  `((${database}.desired_state='suspended' AND ${database}.observed_power<>'hibernated' AND ${operation}.kind IN('database.suspend','database.hibernate'))
+        OR (${database}.desired_state='running' AND ${database}.observed_power='hibernated' AND ${operation}.kind='database.resume'))`;
 
 const noUsage: UsageCronResult = {
   databases: 0,
@@ -136,28 +150,40 @@ export async function runCron(
       if (powerCursor.cursor !== null) DatabaseId.parse(powerCursor.cursor);
       // Eight compensations leave room for the existing Actor and usage pages in D1's statement budget.
       const expiredPower = await env.DB.prepare(
-        `SELECT d.id,d.generation,d.power_operation FROM databases d
+        `SELECT d.id,d.generation,d.power_operation,o.kind FROM databases d
       JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
       JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.project_id=d.project_id
-      WHERE d.id>? AND d.desired_state='suspended' AND d.deleted_at IS NULL
-      AND o.kind IN('database.suspend','database.hibernate') AND o.generation<=d.generation
-      AND o.status IN('pending','running') AND o.updated_at<? ORDER BY d.id LIMIT 9`,
+      WHERE d.id>? AND d.deleted_at IS NULL AND o.generation<=d.generation
+      AND o.status IN('pending','running') AND o.updated_at<?
+      AND ${undoneByPowerTimeout("d", "o")}
+      ORDER BY d.id LIMIT 9`,
       )
         .bind(powerCursor.cursor ?? "", cutoff)
-        .all<{ id: string; generation: number; power_operation: string }>();
+        .all<{
+          id: string;
+          generation: number;
+          power_operation: string;
+          kind: string;
+        }>();
       let recovered = 0;
       const nodes = new Map<string, Set<string>>();
       for (const row of expiredPower.results.slice(0, 8)) {
-        const recovery = await recoverQuiescence(
-          env,
-          {
-            databaseId: row.id,
-            operation: row.power_operation,
-            revision: row.generation,
-          },
-          "timeout",
-          timestamp,
-        );
+        // A suspension the node did not prove is undone; a resume it did not carry out, of a
+        // database that sleeps, puts the database back to sleep (nothing else would wake it).
+        const expected = {
+          databaseId: row.id,
+          operation: row.power_operation,
+          revision: row.generation,
+        };
+        const recovery =
+          row.kind === "database.resume"
+            ? await recoverFailedResume(
+                env,
+                expected,
+                "operation_timeout",
+                timestamp,
+              )
+            : await recoverQuiescence(env, expected, "timeout", timestamp);
         if (recovery) {
           recovered++;
           if (recovery.nodeId !== null) {
@@ -183,8 +209,8 @@ export async function runCron(
       AND NOT EXISTS(SELECT 1 FROM databases u WHERE u.id=operations.database_id AND u.node_id IS NULL AND u.desired_state='running' AND u.deleted_at IS NULL AND operations.kind IN('database.create','database.restore'))
       AND NOT EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
         WHERE d.power_operation=operations.id AND d.id=operations.database_id AND d.project_id=operations.project_id
-        AND d.desired_state='suspended' AND d.deleted_at IS NULL AND operations.generation<=d.generation
-        AND operations.kind IN('database.suspend','database.hibernate'))`,
+        AND d.deleted_at IS NULL AND operations.generation<=d.generation
+        AND ${undoneByPowerTimeout("d", "operations")})`,
     )
       .bind(timestamp, timestamp, cutoff)
       .run();
