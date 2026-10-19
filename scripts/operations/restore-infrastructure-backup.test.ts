@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   chmod,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -11,8 +12,9 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
+import { once } from "node:events";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { promisify } from "node:util";
@@ -54,6 +56,7 @@ const DUMP = Buffer.from(
       { length: 4000 },
       (_, i) => `INSERT INTO "databases" VALUES('d${i}','eu1');`,
     ),
+    "CREATE INDEX databases_region ON databases (region_id);",
     "",
   ].join("\n"),
 );
@@ -382,7 +385,9 @@ const OUT_OF_ORDER = [
 test("puts every CREATE TABLE ahead of the data, whatever the quoting and chunking, without changing a byte of any statement", async () => {
   const { dir, done } = await workspace();
   try {
-    // The import runs as one transaction, which is what `defer_foreign_keys` is for.
+    // The dump is loaded as one transaction, which is what `defer_foreign_keys` is for. That the
+    // provider's import runs the file as one transaction is not verified: the restore drill is
+    // where it is first tried (docs/operations/infrastructure-backups.md).
     const load = (db: DatabaseSync, sql: string) =>
       db.exec(`BEGIN;\n${sql}\nCOMMIT;`);
     const raw = new DatabaseSync(":memory:");
@@ -449,10 +454,13 @@ test("puts every CREATE TABLE ahead of the data, whatever the quoting and chunki
 });
 
 // A wrangler that speaks the forms the real one prints for `d1 list --json` and `d1 execute
-// --json`, and records what it was asked and what the file it was given looked like at that time.
+// --json`, runs what it is given in a real SQLite database per D1 database (a file is loaded as
+// one transaction, and a failure rolls it back), and records what it was asked and what the file it
+// was given looked like at that time. With `hold` set it stops inside the import, as a slow one does.
 const FAKE_WRANGLER = `#!/usr/bin/env node
 const fs = require("node:fs");
-const crypto = require("node:crypto");
+const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
 const args = process.argv.slice(2);
 const statePath = process.env.FAKE_WRANGLER_STATE;
 const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
@@ -465,22 +473,26 @@ if (args[0] === "d1" && args[1] === "list") {
 } else if (args[0] === "d1" && args[1] === "execute") {
   const database = state.databases.find((db) => db.uuid === args[2]);
   if (!database) { save(); process.stderr.write("Couldn't find a D1 DB with name or binding\\n"); process.exit(1); }
+  const db = new DatabaseSync(path.join(path.dirname(statePath), database.uuid + ".sqlite"));
   if (flag("--file")) {
     const file = flag("--file");
     const text = fs.readFileSync(file);
     record.file = {
       mode: fs.statSync(file).mode & 0o777,
-      directoryMode: fs.statSync(require("node:path").dirname(file)).mode & 0o777,
-      directory: fs.realpathSync(require("node:path").dirname(file)),
+      directoryMode: fs.statSync(path.dirname(file)).mode & 0o777,
+      directory: fs.realpathSync(path.dirname(file)),
       bytes: text.length,
       firstInsert: text.indexOf("INSERT INTO"),
       lastCreate: text.lastIndexOf("CREATE TABLE"),
     };
+    if (state.hold) { save(); fs.writeFileSync(state.hold, String(process.pid)); setInterval(() => {}, 1000); return; }
     if (state.failImport) { save(); process.stderr.write("SQLITE_ERROR near " + text.toString("utf8", 0, 40) + "\\n"); process.exit(1); }
-    state.tables[database.uuid] = (text.toString("utf8").match(/^CREATE TABLE /gm) || []).length;
+    db.exec("BEGIN;");
+    try { db.exec(text.toString("utf8")); db.exec("COMMIT;"); }
+    catch (error) { db.exec("ROLLBACK;"); save(); process.stderr.write(String(error.message) + "\\n"); process.exit(1); }
     out([{ results: [{ "Total queries executed": text.toString("utf8").split("\\n").length, "Rows read": 0, "Rows written": 4003, "Database size (MB)": "0.31" }], success: true, finalBookmark: "00000001-00000002-0000000a-abc", meta: { duration: 12.5 } }]);
   } else {
-    out([{ results: [{ n: state.tables[database.uuid] }], success: true, meta: { duration: 0.2 } }]);
+    out([{ results: db.prepare(flag("--command")).all().map((row) => ({ ...row })), success: true, meta: { duration: 0.2 } }]);
   }
 } else {
   save(); process.stderr.write("unexpected command\\n"); process.exit(2);
@@ -491,8 +503,11 @@ async function wranglerFixture(
   dir: string,
   overrides: {
     databases?: { uuid: string; name: string }[];
-    tables?: Record<string, number>;
+    /** SQL that a database already holds, by its ID. */
+    existing?: Record<string, string>;
     failImport?: boolean;
+    /** A file the fake writes its process ID to, and then never answers. */
+    hold?: string;
   } = {},
 ) {
   const wrangler = join(dir, "wrangler"),
@@ -505,8 +520,8 @@ async function wranglerFixture(
       { uuid: LIVE_DATABASE, name: "pgcf-control" },
       { uuid: SCRATCH_DATABASE, name: "pgcf-restore-drill" },
     ],
-    tables: overrides.tables ?? { [LIVE_DATABASE]: 140, [SCRATCH_DATABASE]: 0 },
     failImport: overrides.failImport ?? false,
+    hold: overrides.hold,
     calls: [] as {
       args: string[];
       cwd: string;
@@ -521,6 +536,13 @@ async function wranglerFixture(
       };
     }[],
   };
+  for (const { uuid } of state.databases) {
+    // Every fixture starts from the databases it names, whatever an earlier one left in `dir`.
+    await rm(join(dir, `${uuid}.sqlite`), { force: true });
+    const sqlite = new DatabaseSync(join(dir, `${uuid}.sqlite`));
+    sqlite.exec(overrides.existing?.[uuid] ?? "");
+    sqlite.close();
+  }
   await writeFile(statePath, JSON.stringify(state));
   return {
     wrangler,
@@ -558,6 +580,7 @@ test("imports into an empty scratch database through a private file, by its ID, 
       { environment: fixture.environment, log: (line) => lines.push(line) },
     );
     assert.equal(result.database_id, SCRATCH_DATABASE);
+    // The dump has two tables and an index; what is counted is the tables, as it is printed.
     assert.equal(result.tables, 2);
     const calls = await fixture.calls(),
       imported = calls.find((call) => call.file)!;
@@ -596,7 +619,14 @@ test("imports into an empty scratch database through a private file, by its ID, 
     assert.ok(!printed.includes("bucket-secret-name"));
     assert.ok(!printed.includes("INSERT INTO"));
     assert.ok(!printed.includes(JSON.parse(KEYRING).keys.v2));
-    assert.match(printed, /2 tables/);
+    assert.match(printed, /imported: 2 tables/);
+    // What the runbook has the operator write into the plan is printed (day, byte counts, hashes),
+    // and the live control database's ID is not: the artifact names it, and nothing needs it shown.
+    assert.ok(printed.includes("day 2026-10-20"));
+    assert.ok(printed.includes(`${DUMP.length} bytes, sha256 ${sha256(DUMP)}`));
+    assert.ok(printed.includes(`sha256 ${result.artifact.encrypted_sha256}`));
+    assert.ok(printed.includes("receipt: not given"));
+    assert.ok(!printed.includes(LIVE_DATABASE));
   } finally {
     await done();
   }
@@ -629,11 +659,20 @@ test("never imports into the database the artifact was exported from, into one w
     const live = await go("pgcf-control");
     await assert.rejects(live.outcome, refused("live_database"));
     assert.ok(!(await live.fixture.calls()).some((call) => call.file));
-    // A database that is not empty, even when it is not the one exported.
+    // A database that is not empty, even when it is not the one exported: it counts what is there
+    // (two tables and an index) and says so.
     const full = await go("pgcf-restore-drill", {
-      tables: { [LIVE_DATABASE]: 140, [SCRATCH_DATABASE]: 3 },
+      existing: {
+        [SCRATCH_DATABASE]:
+          "CREATE TABLE a (x); CREATE TABLE b (x); CREATE INDEX a_x ON a (x);",
+      },
     });
-    await assert.rejects(full.outcome, refused("database_not_empty"));
+    await assert.rejects(
+      full.outcome,
+      (error) =>
+        refused("database_not_empty")(error) &&
+        /already has 3 schema objects/.test((error as Error).message),
+    );
     assert.ok(!(await full.fixture.calls()).some((call) => call.file));
     // A name that resolves to nothing, and one that resolves to two.
     await assert.rejects(
@@ -789,5 +828,82 @@ test("the command line decrypts a file with a key from the environment and print
     ]);
   } finally {
     await done();
+  }
+});
+
+test("a signal removes the decrypted SQL and stops wrangler, and the run ends with the signal's exit code", async () => {
+  const script = new URL("./restore-infrastructure-backup.ts", import.meta.url)
+      .pathname,
+    until = async (condition: () => boolean | Promise<boolean>) => {
+      for (let tries = 0; tries < 500; tries++) {
+        if (await condition()) return;
+        await new Promise((done) => setTimeout(done, 20));
+      }
+      assert.fail("timed out");
+    },
+    alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    const { dir, done } = await workspace(),
+      holding = join(dir, "holding"),
+      temporary = join(dir, "tmp");
+    let pid: number | undefined;
+    try {
+      await mkdir(temporary);
+      const fixture = await wranglerFixture(dir, { hold: holding }),
+        child = spawn(
+          process.execPath,
+          [
+            script,
+            "import",
+            "--input",
+            await inputFile(dir),
+            "--database",
+            "pgcf-restore-drill",
+            "--keys-env",
+            "PGCF_TEST_KEYS",
+            "--wrangler",
+            fixture.wrangler,
+          ],
+          {
+            env: { ...fixture.environment, TMPDIR: temporary } as Record<
+              string,
+              string
+            >,
+            stdio: ["ignore", "ignore", "ignore"],
+          },
+        ),
+        exited = once(child, "exit");
+      // Wrangler is inside the import: the decrypted SQL is on disk in the private directory.
+      await until(() =>
+        readFile(holding).then(
+          () => true,
+          () => false,
+        ),
+      );
+      pid = Number(await readFile(holding, "utf8"));
+      const names = await readdir(temporary);
+      assert.equal(names.length, 1);
+      const directory = names[0]!;
+      assert.ok(directory.startsWith("pgcf-restore-"));
+      assert.deepEqual(await readdir(join(temporary, directory)), [
+        "ordered.sql",
+      ]);
+      child.kill(signal);
+      const [code, killedBy] = await exited;
+      assert.equal(killedBy, null, `${signal} ended the process by default`);
+      assert.equal(code, 128 + constants.signals[signal]);
+      assert.deepEqual(await readdir(temporary), [], "the SQL stays");
+      await until(() => !alive(pid!));
+    } finally {
+      if (pid !== undefined && alive(pid)) process.kill(pid, "SIGKILL");
+      await done();
+    }
   }
 });

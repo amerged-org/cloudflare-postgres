@@ -78,7 +78,9 @@ export function computeUsageHour(
       metrics.awake_seconds = null;
       for (const key of resourceMetrics) metrics[key] = null;
     } else if (provisioned) {
-      active.push([cursor, until]);
+      // Only awake time needs gateway coverage: a sleeping database emits no row, and an asleep
+      // span without one is a measured zero, not a gap.
+      if (awake) active.push([cursor, until]);
       if (metrics.provisioned_seconds !== null)
         metrics.provisioned_seconds += seconds;
       if (metrics.awake_seconds !== null && awake)

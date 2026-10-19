@@ -29,15 +29,17 @@
 //
 // Nothing of the SQL is printed, and neither is wrangler's text about the import, which can quote
 // it: a failed import reports wrangler's exit code; decrypt to a file and run wrangler by hand to
-// read its message.
-import { execFile } from "node:child_process";
+// read its message. The output holds no database ID except the scratch database's own.
+// SIGINT, SIGTERM and SIGHUP stop wrangler, remove the decrypted SQL and end the run with exit
+// code 128 plus the signal's number; a run killed with SIGKILL leaves its files behind.
+import { execFile, type ChildProcess } from "node:child_process";
 import {
   createDecipheriv,
   createHash,
   hkdfSync,
   type DecipherGCM,
 } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, rmSync } from "node:fs";
 import {
   link,
   mkdtemp,
@@ -47,7 +49,7 @@ import {
   stat,
   type FileHandle,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { base64urlToBytes } from "../../packages/contracts/src/encoding.ts";
@@ -67,6 +69,30 @@ const MAGIC = Buffer.from("PGCFINF1"),
 const USAGE =
   "usage: restore-infrastructure-backup.ts decrypt --input FILE --output FILE --keys-env NAME [--receipt FILE]\n" +
   "       restore-infrastructure-backup.ts import --input FILE --database NAME --keys-env NAME [--receipt FILE] [--wrangler COMMAND]";
+
+/**
+ * What holds decrypted SQL while the tool runs: a signal must remove it before the process ends,
+ * and a `finally` block does not run when it does. Only a path this run created is registered.
+ */
+const plaintextPaths = new Set<string>();
+/** The wrangler processes of this run, which a signal stops too. */
+const children = new Set<ChildProcess>();
+
+/**
+ * Ends the run on SIGINT, SIGTERM or SIGHUP (Ctrl-C, a kill, a closed terminal): stops wrangler,
+ * removes the decrypted SQL and exits with the signal's conventional code. SIGKILL cannot be caught;
+ * a run killed that way leaves its files for the operator to delete (see the runbook).
+ */
+function removePlaintextOnSignal(): void {
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const)
+    process.once(signal, () => {
+      for (const child of children) child.kill();
+      for (const path of plaintextPaths)
+        rmSync(path, { recursive: true, force: true });
+      console.error(`${signal}: stopped; the temporary SQL is removed`);
+      process.exit(128 + constants.signals[signal]);
+    });
+}
 
 export type RestoreErrorCode =
   | "usage"
@@ -421,6 +447,7 @@ export async function decryptArtifact(options: {
       },
     );
     partialCreated = true;
+    plaintextPaths.add(partial);
     const encrypted = createHash("sha256").update(header.prefix),
       plaintext = createHash("sha256");
     let plaintextBytes = 0;
@@ -483,7 +510,10 @@ export async function decryptArtifact(options: {
     await out?.close().catch(() => {});
     await input.close().catch(() => {});
     // Only a partial file this call created is removed.
-    if (partialCreated) await rm(partial, { force: true });
+    if (partialCreated) {
+      await rm(partial, { force: true });
+      plaintextPaths.delete(partial);
+    }
   }
 }
 const AUTHENTICATION_FAILED =
@@ -685,7 +715,10 @@ export interface ImportDependencies {
   log: (line: string) => void;
 }
 
-const TABLE_COUNT = String.raw`SELECT COUNT(*) AS n FROM sqlite_schema WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\' AND name NOT LIKE '\_cf\_%' ESCAPE '\'`;
+// What D1 keeps for itself (`sqlite_*`, `_cf_*`) is not the database's. A scratch database must hold
+// no object of any kind before an import; what an import made is counted as tables.
+const SCHEMA_OBJECTS = String.raw`SELECT COUNT(*) AS n FROM sqlite_schema WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\' AND name NOT LIKE '\_cf\_%' ESCAPE '\'`,
+  TABLES = `${SCHEMA_OBJECTS} AND type = 'table'`;
 
 async function wranglerRun(
   command: string,
@@ -698,7 +731,7 @@ async function wranglerRun(
   },
 ): Promise<unknown> {
   const { stdout } = await new Promise<{ stdout: string }>((done, fail) => {
-    execFile(
+    const child = execFile(
       command,
       args,
       {
@@ -709,6 +742,7 @@ async function wranglerRun(
         encoding: "utf8",
       },
       (error, out, err) => {
+        children.delete(child);
         if (!error) return done({ stdout: out });
         const status =
           typeof (error as { code?: unknown }).code === "number"
@@ -728,6 +762,7 @@ async function wranglerRun(
         );
       },
     );
+    children.add(child);
   });
   try {
     return JSON.parse(stdout);
@@ -744,16 +779,17 @@ const first = (value: unknown): Record<string, unknown> | undefined =>
     ? (value[0] as Record<string, unknown>)
     : undefined;
 
-/** The number of user tables of a D1 database, from a query by its ID. */
-async function tableCount(
+/** The count a query (`SCHEMA_OBJECTS` or `TABLES`) gives for a D1 database, asked by its ID. */
+async function count(
   wrangler: string,
   id: string,
+  query: string,
   context: Parameters<typeof wranglerRun>[2],
 ) {
   const answer = first(
       await wranglerRun(
         wrangler,
-        ["d1", "execute", id, "--remote", "--json", "--command", TABLE_COUNT],
+        ["d1", "execute", id, "--remote", "--json", "--command", query],
         context,
       ),
     ),
@@ -764,7 +800,7 @@ async function tableCount(
   if (answer?.success !== true || typeof n !== "number")
     throw new RestoreError(
       "wrangler_failed",
-      "wrangler d1 execute did not answer the table count",
+      "wrangler d1 execute did not answer a count",
     );
   return n;
 }
@@ -798,6 +834,7 @@ export async function importArtifact(
       timeoutMs: 2 * 60 * 1000,
       stderrIsSafe: true,
     };
+  plaintextPaths.add(directory);
   try {
     const databases = await wranglerRun(
         wrangler,
@@ -822,11 +859,11 @@ export async function importArtifact(
         "live_database",
         `"${options.database}" is the database this artifact was exported from; a restore drill needs a new, empty scratch database`,
       );
-    const before = await tableCount(wrangler, id, context);
+    const before = await count(wrangler, id, SCHEMA_OBJECTS, context);
     if (before !== 0)
       throw new RestoreError(
         "database_not_empty",
-        `"${options.database}" already has ${before} tables; import only into a new, empty scratch database`,
+        `"${options.database}" already has ${before} schema objects; import only into a new, empty scratch database`,
       );
     const sql = join(directory, "restore.sql"),
       artifact = await decryptArtifact({
@@ -835,9 +872,8 @@ export async function importArtifact(
         keyring: options.keyring,
         receipt: options.receipt,
       });
-    log(
-      `verified artifact ${artifact.artifact_id} of run ${artifact.run_id}: ${artifact.plaintext_bytes} bytes of SQL, key version ${artifact.kid}`,
-    );
+    for (const line of artifactLines(artifact)) log(line);
+    log(`receipt: ${options.receipt === undefined ? "not given" : "matched"}`);
     const ordered = join(directory, "ordered.sql"),
       order = await schemaFirst(sql, ordered);
     await rm(sql);
@@ -873,7 +909,7 @@ export async function importArtifact(
       );
     const number = (value: unknown) =>
         typeof value === "number" ? value : undefined,
-      tables = await tableCount(wrangler, id, context);
+      tables = await count(wrangler, id, TABLES, context);
     if (tables === 0)
       throw new RestoreError(
         "wrangler_failed",
@@ -892,10 +928,20 @@ export async function importArtifact(
     return result;
   } finally {
     await rm(directory, { recursive: true, force: true });
+    plaintextPaths.delete(directory);
   }
 }
 
 // ---------- The command ----------
+
+/** What the tool says about a verified artifact: no database ID, and nothing of the content. */
+function artifactLines(result: DecryptResult): string[] {
+  return [
+    `verified artifact ${result.artifact_id} of run ${result.run_id} (day ${result.day}, region ${result.region_id}, key version ${result.kid})`,
+    `plaintext: ${result.plaintext_bytes} bytes, sha256 ${result.plaintext_sha256}`,
+    `encrypted: ${result.encrypted_bytes} bytes, sha256 ${result.encrypted_sha256}`,
+  ];
+}
 
 async function readReceipt(path: string | undefined): Promise<unknown> {
   if (path === undefined) return undefined;
@@ -918,12 +964,10 @@ async function main(
     receipt = await readReceipt(options.receipt),
     log = (line: string) => console.log(line);
   if (options.mode === "import") {
-    const result = await importArtifact(
+    await importArtifact(
       { ...options, keyring, receipt },
       { environment, log },
     );
-    log(`receipt: ${receipt === undefined ? "not given" : "matched"}`);
-    log(`source database of the artifact: ${result.artifact.source_id}`);
     return;
   }
   const result = await decryptArtifact({
@@ -932,21 +976,13 @@ async function main(
     keyring,
     receipt,
   });
-  log(
-    `verified artifact ${result.artifact_id} of run ${result.run_id} (day ${result.day}, region ${result.region_id}, key version ${result.kid})`,
-  );
-  log(`source database: ${result.source_id}`);
-  log(
-    `plaintext: ${result.plaintext_bytes} bytes, sha256 ${result.plaintext_sha256}`,
-  );
-  log(
-    `encrypted: ${result.encrypted_bytes} bytes, sha256 ${result.encrypted_sha256}`,
-  );
+  for (const line of artifactLines(result)) log(line);
   log(`receipt: ${receipt === undefined ? "not given" : "matched"}`);
   log(`wrote ${options.output} (mode 0600)`);
 }
 
 if (import.meta.main) {
+  removePlaintextOnSignal();
   main(process.argv.slice(2), process.env).catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : "failed");
     process.exitCode = 1;
