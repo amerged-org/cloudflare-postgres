@@ -139,6 +139,53 @@ it("carries the CA key of the operator shell only while NODE_SHELL_HOSTNAME is t
     expect(await ask("true", broken)).toBeUndefined();
 });
 
+const shellStateOf = (node: string) =>
+  env.DB.prepare(
+    "SELECT credentials_revision r,shell_state s FROM nodes WHERE id=?",
+  )
+    .bind(node)
+    .first<{ r: number; s: string }>();
+
+it("names a revision that matches its own shell state, so that a Worker version the page has not caught up with cannot leave a node with a key D1 says is gone", async () => {
+  const f = await fixture(0);
+  await accountRegion(f.region);
+  vi.stubGlobal("fetch", cloudflare().fetcher);
+  const ask = async (bindings: Record<string, string | undefined>) => {
+    const response = await nodeRequest(f, CREDENTIALS, {
+      bindings: { ...configured, ...bindings },
+    });
+    expect(response.status).toBe(200);
+    return (await response.json()) as {
+      revision: number;
+      shell_ca_public_key?: string;
+    };
+  };
+  const on = {
+    NODE_SHELL_HOSTNAME: "true",
+    NODE_SSH_USER_CA_PUBLIC_KEY: SHELL_CA,
+  };
+  // D1 holds the shell on at revision 5: the page of a Worker version that had the variables set.
+  await env.DB.prepare(
+    "UPDATE nodes SET credentials_revision=5,shell_state=? WHERE id=?",
+  )
+    .bind(`on ${SHELL_CA}`, f.node)
+    .run();
+  // The same version reads the credentials: nothing changes, the key comes with revision 5.
+  const same = await ask(on);
+  expect(same).toMatchObject({ revision: 5, shell_ca_public_key: SHELL_CA });
+  expect(await shellStateOf(f.node)).toEqual({ r: 5, s: `on ${SHELL_CA}` });
+  // A version with the shell off reads them before any page of it has been built: no key, and a
+  // revision above the one that held it, so that the node removes the file it applied at 5.
+  const off = await ask({});
+  expect(off.shell_ca_public_key).toBeUndefined();
+  expect(off.revision).toBe(6);
+  expect(await shellStateOf(f.node)).toEqual({ r: 6, s: "off" });
+  // The reverse: D1 says off, and a version with the shell on hands the key out at a new revision.
+  const back = await ask(on);
+  expect(back).toMatchObject({ revision: 7, shell_ca_public_key: SHELL_CA });
+  expect(await shellStateOf(f.node)).toEqual({ r: 7, s: `on ${SHELL_CA}` });
+});
+
 it("answers a node whose Tunnel cannot be made with a failure, and writes no gateway", async () => {
   const f = await fixture(0);
   // No Cloudflare configuration at all, then an account the region's endpoint does not name.

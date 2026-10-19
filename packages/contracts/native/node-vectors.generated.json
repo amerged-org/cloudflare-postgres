@@ -328,6 +328,21 @@
     },
     {
       "schema": "NodeCredentials",
+      "name": "shell-ca-length-byte",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "revision": 3,
+        "tunnel_token": "eyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "route_keyring": {
+          "active": "k1",
+          "keys": { "k1": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk" }
+        },
+        "shell_ca_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIQNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp"
+      }
+    },
+    {
+      "schema": "NodeCredentials",
       "name": "shell-ca-empty",
       "valid": false,
       "refinement": false,

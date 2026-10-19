@@ -28,11 +28,11 @@
 // label, and 15 minutes (one minute earlier at the start, for clock skew), with no permission but
 // a terminal; ssh then goes through `cloudflared access ssh`, which presents the service token
 // through its environment (never a command line), as root. The directory is deleted when ssh ends,
-// however it ends. Without a certificate nothing logs in, and this one is useless after 15 minutes.
+// however it ends, and a signal ends what runs and the directory goes too. Without a certificate nothing logs in, and this one is useless after 15 minutes.
 //
 // The node's host key is made at its first boot, so ssh trusts it on first use
 // (StrictHostKeyChecking=accept-new, in your known_hosts): after a reinstall, remove the old line.
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -241,12 +241,14 @@ function variable(
 async function keygen(
   program: string,
   args: string[],
+  track: (child: ChildProcess) => void,
   { hide = [], terminal = false }: { hide?: string[]; terminal?: boolean } = {},
 ): Promise<void> {
   const child = spawn(program, args, {
     stdio: [terminal ? "inherit" : "ignore", "ignore", "pipe"],
     windowsHide: true,
   });
+  track(child);
   let said = "";
   child.stderr.on("data", (chunk: Buffer) => {
     if (said.length < 1 << 14) said += chunk.toString("utf8");
@@ -278,24 +280,34 @@ export async function run(
   const tokenId = variable(environment, options.tokenIdEnv, CREDENTIAL);
   const tokenSecret = variable(environment, options.tokenSecretEnv, CREDENTIAL);
   const directory = await mkdtemp(join(p.tmpdir, "pgcf-shell-"));
+  // A signal for this process ends the child that runs, and the directory still goes below. One
+  // that comes between two children ends the next one as it starts, so that it is never lost.
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  let running: ChildProcess | undefined;
+  let signalled: NodeJS.Signals | undefined;
+  const track = (child: ChildProcess) => {
+    running = child;
+    if (signalled !== undefined) child.kill(signalled);
+  };
+  const forward = (signal: NodeJS.Signals) => {
+    signalled = signal;
+    running?.kill(signal);
+  };
+  for (const signal of signals) process.on(signal, forward);
   try {
     const key = join(directory, "id");
-    await keygen(p.sshKeygen, [
-      "-q",
-      "-t",
-      "ed25519",
-      "-N",
-      "",
-      "-C",
-      "",
-      "-f",
-      key,
-    ]);
+    await keygen(
+      p.sshKeygen,
+      ["-q", "-t", "ed25519", "-N", "", "-C", "", "-f", key],
+      track,
+    );
     const keyId = certificateKeyId(options.label, p.now());
-    await keygen(p.sshKeygen, signingArguments(caKey, keyId, `${key}.pub`), {
-      hide: [caKey],
-      terminal: true,
-    });
+    await keygen(
+      p.sshKeygen,
+      signingArguments(caKey, keyId, `${key}.pub`),
+      track,
+      { hide: [caKey], terminal: true },
+    );
     process.stderr.write(
       `node-shell: certificate ${keyId} valid 15 minutes; connecting to ${shellHostname(options)}\n`,
     );
@@ -313,21 +325,15 @@ export async function run(
       sshArguments(options, { key, certificate: `${key}-cert.pub` }, p),
       { stdio: "inherit", env: childEnvironment },
     );
-    // A signal for this process ends ssh, and the directory still goes below.
-    const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
-    const forward = (signal: NodeJS.Signals) => ssh.kill(signal);
-    for (const signal of signals) process.on(signal, forward);
-    try {
-      return await new Promise<number>((done, fail) => {
-        ssh.once("error", fail);
-        ssh.once("close", (code, signal) =>
-          done(code ?? (signal === null ? 1 : 128)),
-        );
-      });
-    } finally {
-      for (const signal of signals) process.off(signal, forward);
-    }
+    track(ssh);
+    return await new Promise<number>((done, fail) => {
+      ssh.once("error", fail);
+      ssh.once("close", (code, signal) =>
+        done(code ?? (signal === null ? 1 : 128)),
+      );
+    });
   } finally {
+    for (const signal of signals) process.off(signal, forward);
     await rm(directory, { recursive: true, force: true });
   }
 }

@@ -31,10 +31,15 @@ export function nodeShell(
 }
 
 /**
- * The credentials revision a node's page names. A node reads its credentials again only when the
- * revision rises, and a change of the shell's variables changes nothing in D1, so the first page
- * built after the change records the new state and raises the revision once. A request that finds
- * the state already moved reads the revision the other one wrote.
+ * The credentials revision that goes with this Worker version's view of the shell, for the node's
+ * page and for the credentials a node reads. A node reads its credentials again only when the
+ * revision rises, and a change of the shell's variables changes nothing in D1, so the first
+ * request after the change records the new state in D1 and raises the revision once. D1's state
+ * and revision are one row, written in one statement, and the content a request hands out comes
+ * from the variables it was given: so the revision a request names always belongs to D1 holding
+ * the state of that content. While two Worker versions serve at once, each request writes the
+ * state it has and the revision rises with every change of hands, which ends when the deploy has
+ * spread: whichever version is left holds the last revision, with its own content.
  */
 export async function shellCredentialsRevision(
   env: Env,
@@ -47,17 +52,12 @@ export async function shellCredentialsRevision(
 ): Promise<number> {
   const { state } = nodeShell(env);
   if (node.shell_state === state) return node.credentials_revision;
-  const raised = await env.DB.prepare(
-    `UPDATE nodes SET credentials_revision=credentials_revision+1,shell_state=?,updated_at=?
-     WHERE id=? AND node_uid=? AND shell_state=? RETURNING credentials_revision`,
+  const held = await env.DB.prepare(
+    `UPDATE nodes SET credentials_revision=credentials_revision+(shell_state IS NOT ?1),
+       updated_at=CASE WHEN shell_state IS NOT ?1 THEN ?2 ELSE updated_at END,shell_state=?1
+     WHERE id=?3 AND node_uid=?4 RETURNING credentials_revision`,
   )
-    .bind(state, new Date().toISOString(), node.id, node.uid, node.shell_state)
+    .bind(state, new Date().toISOString(), node.id, node.uid)
     .first<{ credentials_revision: number }>();
-  if (raised !== null) return raised.credentials_revision;
-  const current = await env.DB.prepare(
-    "SELECT credentials_revision FROM nodes WHERE id=? AND node_uid=?",
-  )
-    .bind(node.id, node.uid)
-    .first<{ credentials_revision: number }>();
-  return current?.credentials_revision ?? node.credentials_revision;
+  return held?.credentials_revision ?? node.credentials_revision;
 }

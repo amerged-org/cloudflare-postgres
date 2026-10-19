@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
 import type { Env } from "../../src/env.ts";
 import { fenceOperation } from "../../src/domain/node-desired.ts";
+import { shellCredentialsRevision } from "../../src/domain/node-shell.ts";
 import {
   assignRelease,
   cleanupFixtures,
@@ -107,6 +108,44 @@ describe("the desired page of a node", () => {
         .bind(f.node)
         .first<number>("r"),
     ).toBe(5);
+  });
+
+  it("names the revision at which D1 holds its own state even when the row moved since the node was read", async () => {
+    const f = await fixture();
+    await setNodePolicy(f);
+    const row = {
+      id: f.node,
+      uid: "",
+      credentials_revision: 1,
+      shell_state: "off",
+    };
+    row.uid = (await env.DB.prepare("SELECT node_uid u FROM nodes WHERE id=?")
+      .bind(f.node)
+      .first<string>("u"))!;
+    const other = SHELL_CA.replace("AAAAIDNc", "AAAAIDNd");
+    // Another Worker version wrote its state, a key this one does not have, after this one read.
+    await env.DB.prepare(
+      "UPDATE nodes SET credentials_revision=2,shell_state=? WHERE id=?",
+    )
+      .bind(`on ${other}`, f.node)
+      .run();
+    const mine: Env = {
+      ...env,
+      NODE_SHELL_HOSTNAME: "true",
+      NODE_SSH_USER_CA_PUBLIC_KEY: SHELL_CA,
+    };
+    // The revision 2 names the other key: this version's key needs a revision of its own.
+    expect(await shellCredentialsRevision(mine, row)).toBe(3);
+    const held = () =>
+      env.DB.prepare(
+        "SELECT credentials_revision r,shell_state s FROM nodes WHERE id=?",
+      )
+        .bind(f.node)
+        .first<{ r: number; s: string }>();
+    expect(await held()).toEqual({ r: 3, s: `on ${SHELL_CA}` });
+    // A read that finds D1 already holding its state takes that revision and raises nothing.
+    expect(await shellCredentialsRevision(mine, row)).toBe(3);
+    expect(await held()).toEqual({ r: 3, s: `on ${SHELL_CA}` });
   });
 
   it("leaves the credentials revision of a fenced node alone", async () => {

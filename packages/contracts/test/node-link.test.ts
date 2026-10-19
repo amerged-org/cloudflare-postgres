@@ -1263,6 +1263,9 @@ describe("credentials and the node's policy", () => {
       key.slice(0, -1),
       `${key}A`,
       key.replace("AAAAC3NzaC1lZDI1NTE5", "AAAAB3NzaC1yc2EAAAADAQAB"),
+      // The 32-byte length of the key is 0x20: the character after it holds two bits that are zero
+      // and the top four bits of the key, so it is one of A to P and never a Q.
+      key.replace("AAAAIDNc", "AAAAIQNc"),
     ]) {
       expect(nodeShellCaPublicKey(broken)).toBeNull();
       if (broken !== undefined)

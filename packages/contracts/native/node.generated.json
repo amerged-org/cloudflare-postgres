@@ -144,7 +144,7 @@
         },
         "shell_ca_public_key": {
           "type": "string",
-          "pattern": "^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}$"
+          "pattern": "^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-P][A-Za-z0-9+/]{42}$"
         }
       },
       "required": ["revision", "tunnel_token", "route_keyring"],

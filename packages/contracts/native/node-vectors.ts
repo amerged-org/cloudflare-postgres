@@ -593,6 +593,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
         ["shell-ca-leading-space", ` ${shellCa}`],
         ["shell-ca-other-type", shellCa.replace("ssh-ed25519", "ssh-rsa")],
         ["shell-ca-truncated", shellCa.slice(0, -1)],
+        ["shell-ca-length-byte", shellCa.replace("AAAAIDNc", "AAAAIQNc")],
         ["shell-ca-empty", ""],
       ] satisfies [string, string][]
     ).map(([name, key]): Case => [

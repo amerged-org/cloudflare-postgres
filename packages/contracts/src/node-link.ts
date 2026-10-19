@@ -392,10 +392,12 @@ export async function verifyNodeRequest(
  * The public key of the CA that signs the operator shell's user certificates (plan 8): exactly
  * `ssh-ed25519 <base64>`, 80 characters, on one line. The pattern is the whole check: no options
  * before the type, no comment after the key, no line break, no other key type. The blob is the
- * encoding of the type name `ssh-ed25519` and a 32-byte key, so only the last 43 characters vary.
+ * encoding of the type name `ssh-ed25519` and a 32-byte key, so only the last 43 characters vary;
+ * the first of them holds the low two bits of the length byte 0x20, which are zero, and the top
+ * four bits of the key, so it is one of A to P.
  */
 export const NODE_SHELL_CA_PUBLIC_KEY_PATTERN =
-  /^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}$/;
+  /^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-P][A-Za-z0-9+/]{42}$/;
 export const NodeShellCaPublicKey = z
   .string()
   .regex(NODE_SHELL_CA_PUBLIC_KEY_PATTERN);

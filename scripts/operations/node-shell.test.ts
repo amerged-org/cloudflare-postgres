@@ -376,6 +376,63 @@ test("the directory of the throwaway key goes however ssh ends, and when signing
   assert.deepEqual(await readdir(scratch), []);
 });
 
+test("a signal while the CA key is asked for or while ssh-keygen signs ends the signing, and the directory with the throwaway key is gone", async (t) => {
+  const where = await directory(t),
+    scratch = join(where, "scratch"),
+    bin = join(where, "bin"),
+    asked = join(where, "asked");
+  await mkdir(scratch, { mode: 0o700 });
+  await mkdir(bin);
+  const ca = authority(where, "ca");
+  const real = execFileSync("sh", ["-c", "command -v ssh-keygen"])
+    .toString()
+    .trim();
+  // Making the key is the real ssh-keygen; signing waits, as it does at a passphrase prompt.
+  await writeFile(
+    join(bin, "ssh-keygen"),
+    `#!/bin/sh
+for argument in "$@"; do
+  [ "$argument" = "-s" ] && { : > "${asked}"; exec sleep 60; }
+done
+exec "${real}" "$@"
+`,
+    { mode: 0o755 },
+  );
+  // ssh must not start once a signal has come.
+  const started = join(where, "ssh-started");
+  await writeFile(join(bin, "ssh"), `#!/bin/sh\n: > "${started}"\n`, {
+    mode: 0o755,
+  });
+  const script = join(import.meta.dirname, "node-shell.ts");
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+    await rm(asked, { force: true });
+    const child = spawn(
+      process.execPath,
+      [script, "--node", NODE, "--domain", DOMAIN, "--label", "sebastian"],
+      {
+        stdio: "ignore",
+        env: {
+          ...process.env,
+          ...ENVIRONMENT(ca.key),
+          PATH: `${bin}:${process.env.PATH}`,
+          TMPDIR: scratch,
+        },
+      },
+    );
+    const ended = new Promise<number | null>((done) =>
+      child.once("close", (code) => done(code)),
+    );
+    for (let attempt = 0; attempt < 200 && !existsSync(asked); attempt++)
+      await new Promise((done) => setTimeout(done, 50));
+    assert.ok(existsSync(asked), "signing started");
+    assert.equal((await readdir(scratch)).length, 1, "the key is there");
+    child.kill(signal);
+    assert.equal(await ended, 1, `${signal} ends the command`);
+    assert.deepEqual(await readdir(scratch), [], `${signal} leaves no key`);
+  }
+  assert.equal(existsSync(started), false, "ssh was not started");
+});
+
 test("nothing starts without the three variables, and a CA key that others can read is refused before a key is made", async (t) => {
   const where = await directory(t),
     scratch = join(where, "scratch");

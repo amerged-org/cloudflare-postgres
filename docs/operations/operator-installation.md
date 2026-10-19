@@ -44,9 +44,11 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
   whatever the variable says. Leave it off until Cloudflare Access guards the shell (plan 8,
   [the section below](#cloudflare-access-for-node-gateways-and-shells)): without Access the
   hostname is reachable by anyone who can run cloudflared. A change of this variable or of the
-  next one reaches a running node by itself: the first desired page built after the deploy raises
-  the node's credentials revision once, so the node reads its credentials again within one pull
-  (at most a minute) without restarting its gateway or its Tunnel.
+  next one reaches a running node by itself: the first desired page or credentials read built after
+  the deploy raises the node's credentials revision, so the node reads its credentials again within
+  one pull (at most a minute) without restarting its gateway or its Tunnel. While the deploy
+  spreads and two versions of the Worker serve at once, the revision may rise once more for each
+  change of hands; the last version to serve decides what the node holds.
 - `NODE_SSH_USER_CA_PUBLIC_KEY` is the public key of the CA that signs the shell's certificates:
   exactly one line, `ssh-ed25519 AAAA...`, 80 characters, with no comment and no options before
   it. The private key stays with the operator and is on no Worker ([Using the shell](#using-the-shell)).
@@ -299,9 +301,15 @@ second line or an option before it make the whole line invalid, and nodes then g
 [Cloudflare Access](#cloudflare-access-for-node-gateways-and-shells) section. Do it once; keep the
 file it writes (`PGCF_SHELL_ACCESS_CLIENT_ID` and `PGCF_SHELL_ACCESS_CLIENT_SECRET`, mode 0600).
 
-**4. Turn the shell on.** Set `NODE_SHELL_HOSTNAME` to `"true"` and deploy. Within one pull, a node
-reads its credentials again (its credentials revision rose once), the API makes the hostname, and
-the agent writes the key file. Look in Workers Logs for a `node_event` line with the event
+**4. Turn the shell on.** First make sure every node of the region runs an agent that has the
+shell CA: register the release that contains it, assign it to the region and wait until
+`GET /v1/nodes/{id}/release` says `converged` for each node
+([Node maintenance cycle](recovery.md#node-maintenance-cycle) step 1). An agent from before it
+refuses credentials that carry the key (`Cloudflare credentials invalid`), so it never applies
+them, and a node added from such a release never becomes ready; it also restarts the gateway and
+the Tunnel for every revision it does apply. Then set `NODE_SHELL_HOSTNAME` to `"true"` and deploy.
+Within one pull, a node reads its credentials again (its credentials revision rose), the API makes
+the hostname, and the agent writes the key file. Look in Workers Logs for a `node_event` line with the event
 `shell_ca_written` for the node (it carries no key material). The gateway and the Tunnel are not
 restarted for it.
 
