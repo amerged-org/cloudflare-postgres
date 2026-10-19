@@ -42,6 +42,9 @@ const WAKE_FALLBACK_READ_MS = 1000;
 const GATE_LOG_MS = 1000;
 /** A wake claim whose commit lost its row to a concurrent write is read and tried again this often. */
 const WAKE_CLAIM_RETRIES = 2;
+/** Actors constructed and admissions taken by this isolate; only for the actor_admit line. */
+let isolateActors = 0;
+let isolateAdmissions = 0;
 /**
  * A wake ticket of a sleeping database (pool design 2026-10-16): the operation and generation its
  * claim commits in D1, and the route revision and role hash the Edge signs into route v5 with it.
@@ -54,6 +57,15 @@ interface WakeTicket {
   role_revision_hash: string;
   state: "pending" | "claimed" | "refused";
   issued_at: number;
+}
+/**
+ * How one admitWake was answered, for the actor_admit line: from the snapshot of an awake database,
+ * with a wake ticket (`reused` when it is one an earlier connect issued), through ensureAwake, or
+ * refused by the Actor's own state.
+ */
+interface AdmissionTrace {
+  path: "snapshot" | "ticket" | "ensure_awake" | "refused";
+  reused: boolean | null;
 }
 /**
  * A role the actor may admit: live in D1, with the time its credential stops being accepted.
@@ -178,7 +190,19 @@ function verifiedTarget(
 }
 
 export class DatabaseActor extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    isolateActors++;
+  }
   private hasSchema: boolean | undefined;
+  /**
+   * The tables of the admission path this instance knows to exist. A read never creates one: SQLite
+   * counts CREATE TABLE IF NOT EXISTS as a write even when the table is there, and the Actor's
+   * answer then waits for a commit. Only the write that needs the table creates it.
+   */
+  private tables = new Set<string>();
+  /** Whether this instance has taken an admitWake yet; only for the actor_admit line. */
+  private admitted = false;
   private waiters = new Map<
     string,
     { deadline: number; resolve: (ready: boolean) => void; owner: object }
@@ -202,14 +226,13 @@ export class DatabaseActor extends DurableObject<Env> {
   private admissionState() {
     const presence = this.presence();
     if (!presence) return undefined;
-    this.ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS database_snapshot(singleton INTEGER PRIMARY KEY CHECK(singleton=1),snapshot TEXT,barrier TEXT)",
-    );
-    const row = this.ctx.storage.sql
-      .exec<{ snapshot: string | null; barrier: string | null }>(
-        "SELECT snapshot,barrier FROM database_snapshot WHERE singleton=1",
-      )
-      .toArray()[0];
+    const row = this.hasTable("database_snapshot")
+      ? this.ctx.storage.sql
+          .exec<{ snapshot: string | null; barrier: string | null }>(
+            "SELECT snapshot,barrier FROM database_snapshot WHERE singleton=1",
+          )
+          .toArray()[0]
+      : undefined;
     // The snapshot is a cache of what D1 holds. One written by an earlier release that this release
     // cannot read is no snapshot: the Actor falls back to D1 and the next publish replaces it.
     const stored = row?.snapshot
@@ -227,6 +250,10 @@ export class DatabaseActor extends DurableObject<Env> {
     snapshot: DatabaseAdmissionSnapshot | undefined,
     barrier: PersistedAdmissionMutationIntent | undefined,
   ) {
+    this.createTable(
+      "database_snapshot",
+      "CREATE TABLE IF NOT EXISTS database_snapshot(singleton INTEGER PRIMARY KEY CHECK(singleton=1),snapshot TEXT,barrier TEXT)",
+    );
     this.ctx.storage.sql.exec(
       "INSERT INTO database_snapshot(singleton,snapshot,barrier) VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET snapshot=excluded.snapshot,barrier=excluded.barrier",
       snapshot ? JSON.stringify(snapshot) : null,
@@ -445,6 +472,25 @@ export class DatabaseActor extends DurableObject<Env> {
       },
     };
   }
+  /** Whether the table exists, read once per instance with a statement SQLite counts as a read. */
+  private hasTable(name: string): boolean {
+    if (this.tables.has(name)) return true;
+    const found =
+      this.ctx.storage.sql
+        .exec<{ count: number }>(
+          "SELECT count(*) count FROM sqlite_master WHERE type='table' AND name=?",
+          name,
+        )
+        .toArray()[0]!.count === 1;
+    if (found) this.tables.add(name);
+    return found;
+  }
+  /** Creates the table on a write path, once per instance. */
+  private createTable(name: string, statement: string): void {
+    if (this.tables.has(name)) return;
+    this.ctx.storage.sql.exec(statement);
+    this.tables.add(name);
+  }
   private initializeSchema(): void {
     if (this.hasSchema) return;
     this.ctx.storage.sql.exec(
@@ -603,8 +649,27 @@ export class DatabaseActor extends DurableObject<Env> {
     user: unknown,
     options?: { deadline?: number; waiterId?: string },
   ): Promise<DatabaseWakeAdmission> {
-    const result = await this.#admitWake(databaseId, user, options);
+    // Counted on arrival, so concurrent calls do not all find the instance or the isolate fresh.
+    const freshInstance = !this.admitted,
+      freshIsolate = ++isolateAdmissions === 1;
+    this.admitted = true;
+    const trace: AdmissionTrace = { path: "refused", reused: null };
+    const result = await this.#admitWake(databaseId, user, options, trace);
     if (!result.ok) this.refused("admit_wake", databaseId, result.sqlstate);
+    // The waiter is the Edge's connection id, so this line joins its conn_admission.
+    console.log(
+      JSON.stringify({
+        event: "actor_admit",
+        database_id: typeof databaseId === "string" ? databaseId : null,
+        waiter_id: options?.waiterId ?? null,
+        path: trace.path,
+        reused: trace.reused,
+        fresh_instance: freshInstance,
+        fresh_isolate: freshIsolate,
+        isolate_actors: isolateActors,
+        at_ms: Date.now(),
+      }),
+    );
     return result;
   }
   /** One log line per refused admission with what the actor knew, so a refusal says why. */
@@ -642,7 +707,8 @@ export class DatabaseActor extends DurableObject<Env> {
   async #admitWake(
     databaseId: unknown,
     user: unknown,
-    options?: { deadline?: number; waiterId?: string },
+    options: { deadline?: number; waiterId?: string } | undefined,
+    trace: AdmissionTrace,
   ): Promise<DatabaseWakeAdmission> {
     const id = DatabaseId.safeParse(databaseId),
       role = RoleName.safeParse(user);
@@ -652,8 +718,10 @@ export class DatabaseActor extends DurableObject<Env> {
     try {
       const read = this.admissionState();
       const snapshot = read?.snapshot;
-      if (snapshot?.wakeable === undefined)
+      if (snapshot?.wakeable === undefined) {
+        trace.path = "ensure_awake";
         return await this.ensureAwake(id.data, role.data, options);
+      }
       const failure = this.earlyAdmission(id.data, role.data, read!.presence);
       if (failure) return failure;
       const state = read!;
@@ -662,7 +730,10 @@ export class DatabaseActor extends DurableObject<Env> {
           return { ok: false, sqlstate: "57P03" };
       } else {
         const admitted = this.snapshotAdmission(role.data, state);
-        if (admitted?.ok) return admitted;
+        if (admitted?.ok) {
+          trace.path = "snapshot";
+          return admitted;
+        }
       }
       const current = state.snapshot!;
       if (current.deleted) return { ok: false, sqlstate: "3D000" };
@@ -679,8 +750,10 @@ export class DatabaseActor extends DurableObject<Env> {
         // Not an idle sleeper and not admissible yet: resuming, being created, restarting at a
         // generation the controller has not reported, or suspended by hand. ensureAwake waits
         // for a start in progress and refuses the rest, as before the pool.
-        if (!current.wakeable)
+        if (!current.wakeable) {
+          trace.path = "ensure_awake";
           return await this.ensureAwake(id.data, role.data, options);
+        }
         ticket = {
           operation: newOperationId(),
           generation: current.generation + 1,
@@ -691,6 +764,8 @@ export class DatabaseActor extends DurableObject<Env> {
         };
         this.saveTicket(ticket);
       }
+      trace.path = "ticket";
+      trace.reused = reused;
       if (ticket!.state === "pending")
         this.startClaim(id.data, role.data, ticket!);
       console.log(
@@ -716,13 +791,12 @@ export class DatabaseActor extends DurableObject<Env> {
         },
       };
     } catch {
+      trace.path = "refused";
       return { ok: false, sqlstate: "08006" };
     }
   }
   private storedTicket(): WakeTicket | undefined {
-    this.ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS database_ticket(singleton INTEGER PRIMARY KEY CHECK(singleton=1),operation TEXT NOT NULL,generation INTEGER NOT NULL,route_revision INTEGER NOT NULL,role_revision_hash TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN('pending','claimed','refused')),issued_at INTEGER NOT NULL)",
-    );
+    if (!this.hasTable("database_ticket")) return undefined;
     return this.ctx.storage.sql
       .exec<{
         operation: string;
@@ -737,7 +811,10 @@ export class DatabaseActor extends DurableObject<Env> {
       .toArray()[0];
   }
   private saveTicket(ticket: WakeTicket): void {
-    this.storedTicket();
+    this.createTable(
+      "database_ticket",
+      "CREATE TABLE IF NOT EXISTS database_ticket(singleton INTEGER PRIMARY KEY CHECK(singleton=1),operation TEXT NOT NULL,generation INTEGER NOT NULL,route_revision INTEGER NOT NULL,role_revision_hash TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN('pending','claimed','refused')),issued_at INTEGER NOT NULL)",
+    );
     this.ctx.storage.sql.exec(
       "INSERT INTO database_ticket(singleton,operation,generation,route_revision,role_revision_hash,state,issued_at) VALUES(1,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET operation=excluded.operation,generation=excluded.generation,route_revision=excluded.route_revision,role_revision_hash=excluded.role_revision_hash,state=excluded.state,issued_at=excluded.issued_at",
       ticket.operation,
