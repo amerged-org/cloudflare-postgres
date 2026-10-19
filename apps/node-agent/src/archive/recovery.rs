@@ -18,6 +18,14 @@ pub const SETTINGS_FILE: &str = "pgcf-recovery.conf";
 /// PostgreSQL starts archive recovery when this file exists, and removes it when it promotes.
 pub const SIGNAL_FILE: &str = "recovery.signal";
 
+/// PostgreSQL's defaults for the two settings that a recovery with hot standby compares with the
+/// source's, from its control file and the parameter changes in its WAL, and aborts on when its
+/// own are lower ("recovery aborted because of insufficient parameter settings"). A small database
+/// runs fewer (`settings::postgresql_conf`), and the source may be a larger class or a database of
+/// an earlier release, so the recovery runs with the most the agent ever writes. The file goes
+/// when the recovery is over, and the next start is the database's own.
+const SOURCE_LIMITS: &str = "max_worker_processes = 8\nmax_wal_senders = 10\n";
+
 /// The recovery settings: fetch through the archive socket, follow the latest timeline, and for a
 /// point in time (`target_time`, a contract timestamp) stop there and promote. Without a target
 /// the recovery ends where the archive does, and PostgreSQL promotes. `None` for a time that is
@@ -31,8 +39,9 @@ pub fn settings(fetch_command: &str, target_time: Option<&str>) -> Option<String
     if !plain_path {
         return None;
     }
-    let mut settings =
-        format!("restore_command = '{fetch_command} %f %p'\nrecovery_target_timeline = 'latest'\n");
+    let mut settings = format!(
+        "restore_command = '{fetch_command} %f %p'\nrecovery_target_timeline = 'latest'\n{SOURCE_LIMITS}"
+    );
     if let Some(time) = target_time {
         let contract_timestamp = time.len() == 24
             && time.ends_with('Z')
@@ -132,11 +141,11 @@ mod tests {
     fn recovery_fetches_through_the_socket_and_stops_where_the_order_says() {
         assert_eq!(
             settings(WAL_FETCH_COMMAND, None).unwrap(),
-            "restore_command = '/usr/libexec/pgcf/pgcf-wal-fetch %f %p'\nrecovery_target_timeline = 'latest'\n"
+            "restore_command = '/usr/libexec/pgcf/pgcf-wal-fetch %f %p'\nrecovery_target_timeline = 'latest'\nmax_worker_processes = 8\nmax_wal_senders = 10\n"
         );
         assert_eq!(
             settings(WAL_FETCH_COMMAND, Some("2026-10-17T22:53:45.664Z")).unwrap(),
-            "restore_command = '/usr/libexec/pgcf/pgcf-wal-fetch %f %p'\nrecovery_target_timeline = 'latest'\nrecovery_target_time = '2026-10-17 22:53:45.664+00'\nrecovery_target_action = 'promote'\n"
+            "restore_command = '/usr/libexec/pgcf/pgcf-wal-fetch %f %p'\nrecovery_target_timeline = 'latest'\nmax_worker_processes = 8\nmax_wal_senders = 10\nrecovery_target_time = '2026-10-17 22:53:45.664+00'\nrecovery_target_action = 'promote'\n"
         );
         for bad in [
             "",
@@ -324,6 +333,106 @@ mod tests {
             verify_restored(&backup(), None, &restored(false, id, 1)),
             Err("no_recovery_point")
         );
+    }
+
+    /// PostgreSQL 18 aborts an archive recovery with hot standby whose `max_worker_processes` or
+    /// `max_wal_senders` is below the values its source's control file records (checked against a
+    /// real server). A small database runs fewer than the defaults, so the restore of a larger
+    /// class's backup and archive, here a cold copy of its cluster and the WAL it archived
+    /// afterwards, must run with at least those, and the promoted database runs on as the agent
+    /// configured it once the settings are removed.
+    #[tokio::test]
+    async fn a_small_database_recovers_the_backup_and_archive_of_a_larger_one() {
+        use crate::testpg::{self, Cluster};
+        use std::{os::unix::fs::PermissionsExt, process::Command, time::Duration};
+        let root = testpg::directory("recover");
+        let store = root.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let script = |name: &str, body: String| {
+            let path = root.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let archive = script(
+            "archive.sh",
+            format!("cp \"$1\" '{}'/\"$(basename \"$1\")\"", store.display()),
+        );
+        let fetch = script(
+            "fetch.sh",
+            format!("cp '{}'/\"$1\" \"$2\"", store.display()),
+        );
+        let Some(source) = Cluster::with_archive("recover-source", Some(&archive)) else {
+            return;
+        };
+        // A 1 GiB database keeps the defaults of the settings this test is about.
+        source.configure(1024, archive.to_str());
+        source.start();
+        let session = source.agent().await;
+        session
+            .batch("CREATE TABLE t AS SELECT generate_series(1, 100) AS a")
+            .await
+            .unwrap();
+        drop(session);
+        source.stop();
+
+        // The backup: the stopped cluster, copied into the small database's directory.
+        let target = Cluster::create("recover-target").unwrap();
+        std::fs::remove_dir_all(target.data()).unwrap();
+        let copied = Command::new("cp")
+            .arg("-R")
+            .arg(source.data())
+            .arg(target.data())
+            .status()
+            .unwrap();
+        assert!(copied.success());
+
+        // The source goes on and archives what the restore replays.
+        source.start();
+        let session = source.agent().await;
+        session
+            .batch("INSERT INTO t SELECT generate_series(101, 200)")
+            .await
+            .unwrap();
+        let rows = session
+            .query("SELECT pg_walfile_name(pg_switch_wal())", &[])
+            .await
+            .unwrap();
+        let segment: String = rows[0].get(0);
+        drop(session);
+        let started = std::time::Instant::now();
+        while !store.join(&segment).exists() {
+            assert!(started.elapsed() < Duration::from_secs(30), "{segment}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        source.stop();
+
+        // The restore: the agent's files of the small database, and the recovery settings.
+        target.configure(256, None);
+        let data = target.data();
+        let owner = std::fs::metadata(&data).unwrap();
+        let text = settings(fetch.to_str().unwrap(), None).unwrap();
+        prepare(&data, &text, owner.uid(), owner.gid()).unwrap();
+        target.start();
+        let session = target.agent().await;
+        let rows = session.query("SELECT count(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 200);
+        drop(session);
+
+        // Recovery is over: the settings go, and the next start is the small database's own.
+        target.stop();
+        finish(
+            &data,
+            &spool_directory(&target.volume(), "op_cccccccccccccccccccc"),
+        )
+        .unwrap();
+        target.start();
+        let session = target.agent().await;
+        for (name, value) in [("max_worker_processes", "2"), ("max_wal_senders", "0")] {
+            let rows = session.query(&format!("SHOW {name}"), &[]).await.unwrap();
+            assert_eq!(rows[0].get::<_, String>(0), value, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

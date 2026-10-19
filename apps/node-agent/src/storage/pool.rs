@@ -54,8 +54,8 @@ impl PoolSample {
     }
 }
 
-/// Reads the pool of `group`/`pool` from `dmsetup status --target thin-pool` and `dmsetup table
-/// --target thin-pool`.
+/// Reads the pool of `group`/`pool` from `dmsetup status --noflush --target thin-pool` and
+/// `dmsetup table --target thin-pool`.
 pub fn parse_pool(
     group: &str,
     pool: &str,

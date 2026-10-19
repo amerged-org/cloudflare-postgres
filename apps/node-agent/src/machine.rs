@@ -14,7 +14,13 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap, future::Future, io, num::NonZeroU32, path::PathBuf, process::Output,
+    collections::BTreeMap,
+    future::Future,
+    io,
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+    process::{Output, Stdio},
+    time::Duration,
 };
 
 /// What a boot loses, restored when the agent starts and before any page comes (plan 5.6 job 4,
@@ -53,6 +59,73 @@ pub async fn os_report<M: Machine>(machine: &M) -> Result<Value, crate::Error> {
         "kernel_release": boot.kernel_release,
         "packages_sha256": update::packages_digest(&installed),
     }))
+}
+
+/// How long the warm-up of the start path may take before the agent stops waiting for it.
+pub const WARM_BOUND: Duration = Duration::from_secs(30);
+
+/// After a boot the page cache is empty, and the first wake of a database would read what its
+/// start runs from the disk: the helper systemd runs for every unit, `postgres`, and the libraries
+/// that `postgres` loads. The kernel is asked to read the first two ahead, and `postgres -V` is
+/// run once, which makes the loader map the libraries and touch the pages it needs; its answer is
+/// dropped. Every step runs even when an earlier one failed, and the first failure is returned.
+/// Past `bound` the warm-up is given up and `postgres` killed. The agent runs this in a task of
+/// its own: a node that cannot warm its start path starts all the same.
+pub async fn warm_start_path<M: Machine>(machine: &M, bound: Duration) -> io::Result<()> {
+    let layout = machine.layout();
+    let postgres = layout.postgres_bin.join("postgres");
+    let steps = async {
+        let server = read_ahead(postgres.clone()).await;
+        let executor = read_ahead(layout.systemd_executor.clone()).await;
+        let version = postgres_version(&postgres).await;
+        server.and(executor).and(version)
+    };
+    tokio::time::timeout(bound, steps)
+        .await
+        .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+}
+
+/// Advises the kernel to read `path` into the page cache (`POSIX_FADV_WILLNEED`). The reading is
+/// the kernel's, in the background, and skipped when memory is short.
+async fn read_ahead(path: PathBuf) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || advise_will_need(&std::fs::File::open(path)?))
+        .await
+        .map_err(io::Error::other)?
+}
+#[cfg(target_os = "linux")]
+fn advise_will_need(file: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a plain syscall on a descriptor that is open; length 0 means to the end of the
+    // file. It returns the error number itself, not -1.
+    let error = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED) };
+    match error {
+        0 => Ok(()),
+        error => Err(io::Error::from_raw_os_error(error)),
+    }
+}
+/// A laptop's tests have no such call; they run the other steps.
+#[cfg(not(target_os = "linux"))]
+fn advise_will_need(_file: &std::fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+/// `postgres -V`, killed when the future is dropped.
+async fn postgres_version(program: &Path) -> io::Result<()> {
+    let status = tokio::process::Command::new(program)
+        .arg("-V")
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("postgres -V failed"))
+    }
 }
 
 /// The gateway's environment file (`EnvironmentFile=` of `pgcf-gateway.service`): the node's
@@ -353,7 +426,7 @@ pub struct CpuTimes {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{local::Local, *};
     use serde_json::json;
 
     fn node() -> NodeIdentity {
@@ -520,6 +593,112 @@ mod tests {
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
             0o750
         );
+    }
+
+    /// A machine whose `postgres` records its arguments in the returned file, and with `stays`
+    /// its process ID too, and then becomes a `sleep`; the executor of systemd is a file of the
+    /// test. `None` where there is no PostgreSQL 18 (the tests skip).
+    fn fake_start_path(label: &str, stays: bool) -> Option<(Local, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt;
+        let machine = Local::new(label)?;
+        let directory = crate::testpg::directory(label);
+        let bin = directory.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = directory.join("marker");
+        let stay = if stays {
+            format!("echo $$ >> '{}'\nexec sleep 60\n", marker.display())
+        } else {
+            String::new()
+        };
+        let program = bin.join("postgres");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\necho \"$@\" > '{}'\n{stay}", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let executor = directory.join("systemd-executor");
+        std::fs::write(&executor, vec![0u8; 1 << 20]).unwrap();
+        let machine = machine.with_layout(|layout| {
+            layout.postgres_bin = bin;
+            layout.systemd_executor = executor;
+        });
+        Some((machine, marker))
+    }
+
+    /// After a boot the page cache is empty. The agent asks `postgres` for its version, which
+    /// makes the loader read the server's libraries, and has the kernel read the server and the
+    /// executor of systemd ahead, so that the first wake finds them in memory.
+    #[tokio::test]
+    async fn the_agent_asks_postgres_for_its_version_and_reads_the_start_path_ahead() {
+        let Some((machine, marker)) = fake_start_path("warm", false) else {
+            return;
+        };
+        warm_start_path(&machine, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "-V\n");
+
+        // A file that is not there is that step's failure, and the other steps still run.
+        let Some((machine, marker)) = fake_start_path("warm-missing", false) else {
+            return;
+        };
+        let machine = machine.with_layout(|layout| {
+            layout.systemd_executor = layout.systemd_executor.with_file_name("missing");
+        });
+        let error = warm_start_path(&machine, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "-V\n");
+    }
+
+    /// Advice for a file that is there, and the error of one that is not; no machine is needed.
+    #[tokio::test]
+    async fn the_kernel_is_advised_to_read_a_file_that_is_there() {
+        let file = crate::testpg::directory("read-ahead").join("file");
+        std::fs::write(&file, vec![0u8; 1 << 20]).unwrap();
+        read_ahead(file.clone()).await.unwrap();
+        let error = read_ahead(file.with_file_name("missing"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A start path that does not answer is waited for as long as the bound, and its process
+    /// does not outlive it.
+    #[tokio::test]
+    async fn a_warm_up_that_does_not_finish_ends_at_its_bound_and_leaves_no_process() {
+        let Some((machine, marker)) = fake_start_path("warm-stuck", true) else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let warm =
+            tokio::spawn(async move { warm_start_path(&machine, Duration::from_secs(3)).await });
+        // The process is running once it has written its ID, the second line.
+        let pid = loop {
+            let text = std::fs::read_to_string(&marker).unwrap_or_default();
+            if let Some(pid) = text.lines().nth(1) {
+                break pid.to_string();
+            }
+            assert!(started.elapsed() < Duration::from_secs(3), "it never ran");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let error = warm.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        for _ in 0..100 {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .output()
+                .unwrap()
+                .status
+                .success();
+            if !alive {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the process {pid} of the warm-up is still running");
     }
 
     #[test]

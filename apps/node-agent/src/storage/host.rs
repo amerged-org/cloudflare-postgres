@@ -21,6 +21,13 @@ const FSMOUNT_CLOEXEC: libc::c_uint = 0x1;
 const MOUNT_ATTR_NOSUID: libc::c_uint = 0x2;
 const MOUNT_ATTR_NODEV: libc::c_uint = 0x4;
 const MOUNT_ATTR_NOEXEC: libc::c_uint = 0x8;
+const MOUNT_ATTR_NOATIME: libc::c_uint = 0x10;
+/// What every mount of a volume has: nosuid, nodev and noexec, as the database's user can leave
+/// anything in its volume, and noatime, so that no read writes an inode (with the default
+/// relatime the first read after a write does, through the ext4 journal). PostgreSQL does not use
+/// access times.
+const VOLUME_MOUNT_ATTRIBUTES: libc::c_uint =
+    MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC | MOUNT_ATTR_NOATIME;
 
 fn path_text(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
@@ -80,7 +87,7 @@ pub(crate) fn detached(fstype: &str, source: Option<&str>) -> io::Result<OwnedFd
             libc::SYS_fsmount,
             context.as_raw_fd(),
             FSMOUNT_CLOEXEC,
-            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+            VOLUME_MOUNT_ATTRIBUTES,
         )
     })
 }
@@ -106,8 +113,8 @@ fn attach(mount: OwnedFd, target: &Path) -> io::Result<()> {
 }
 
 /// Mounts the ext4 on `device` at `target`: fsopen, fsconfig and fsmount as the attach path
-/// does, then move_mount to the volume's directory. The mount is nosuid, nodev and noexec, and
-/// has no `discard` (plan Appendix C): space returns to the pool through `fstrim`.
+/// does, then move_mount to the volume's directory. The mount is nosuid, nodev, noexec and
+/// noatime, and has no `discard` (plan Appendix C): space returns to the pool through `fstrim`.
 pub fn mount_ext4(device: &str, target: &Path) -> io::Result<()> {
     attach(detached("ext4", Some(device))?, target)
 }
@@ -162,4 +169,49 @@ pub fn ext4_errors(minor: u32) -> io::Result<u64> {
         .trim()
         .parse()
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The kernel's `MOUNT_ATTR_*` values (`linux/mount.h`, uapi): the constants above are the
+    /// ABI, so a wrong one mounts with other attributes without any error.
+    #[test]
+    fn a_volume_is_mounted_nosuid_nodev_noexec_and_without_access_times() {
+        assert_eq!(MOUNT_ATTR_NOSUID, 0x0000_0002);
+        assert_eq!(MOUNT_ATTR_NODEV, 0x0000_0004);
+        assert_eq!(MOUNT_ATTR_NOEXEC, 0x0000_0008);
+        assert_eq!(MOUNT_ATTR_NOATIME, 0x0000_0010);
+        assert_eq!(
+            VOLUME_MOUNT_ATTRIBUTES,
+            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC | MOUNT_ATTR_NOATIME
+        );
+    }
+
+    /// The kernel takes the attributes and lists them. A tmpfs stands in for a volume's ext4: the
+    /// calls that mount it are the same. It needs `CAP_SYS_ADMIN`, which the kernel step of CI
+    /// has; elsewhere the test says so and passes.
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN to mount (the kernel step)"]
+    fn the_kernel_lists_a_mounted_volume_as_nosuid_nodev_noexec_and_noatime() {
+        let target = std::env::temp_dir().join(format!("pgcf-host-{}", std::process::id()));
+        std::fs::create_dir_all(&target).unwrap();
+        let mount = match detached("tmpfs", None) {
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                eprintln!("skipped: no CAP_SYS_ADMIN");
+                return;
+            }
+            mount => mount.unwrap(),
+        };
+        attach(mount, &target).unwrap();
+        let table = mount_table().unwrap();
+        unmount(&target).unwrap();
+        std::fs::remove_dir(&target).unwrap();
+        let line = table
+            .lines()
+            .find(|line| line.split(' ').nth(4).map(Path::new) == Some(target.as_path()))
+            .unwrap_or_else(|| panic!("{} is not in the mount table", target.display()));
+        assert!(line.contains(" rw,nosuid,nodev,noexec,noatime "), "{line}");
+    }
 }

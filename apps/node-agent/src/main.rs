@@ -20,7 +20,7 @@ mod linux {
         diagnostics::error_code,
         layout::Layout,
         link::{Link, LinkConfig, LinkEvents, Paths, Timing as LinkTiming, Transport},
-        machine::{Node, os_report, restore_runtime},
+        machine::{Node, WARM_BOUND, os_report, restore_runtime, warm_start_path},
         notify::notify,
         release,
         sample::uptime_seconds,
@@ -83,6 +83,16 @@ mod linux {
         let node = Arc::new(Node::connect(layout.clone(), storage::Config::default()).await?);
         // What a boot lost is back before the agent is ready, link or no link.
         restore_runtime(&*node).await;
+        // After a boot the first wake would read its start path from the disk: have it cached in
+        // the background, while the agent gets ready.
+        let warm = node.clone();
+        tokio::spawn(async move {
+            if let Err(error) = warm_start_path(&*warm, WARM_BOUND).await {
+                emit_event(json!({
+                    "event": "start_path_not_warmed", "class": error_code(&error.into()),
+                }));
+            }
+        });
         let mut terminate = signal(SignalKind::terminate())?;
         let mut interrupt = signal(SignalKind::interrupt())?;
         notify("READY=1")?;
