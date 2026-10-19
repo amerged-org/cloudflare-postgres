@@ -675,7 +675,7 @@ impl<M: Machine> Service<M> {
     /// rules are older than the release (a unit it has no name for, a way to take effect it does
     /// not know) installs the binaries, which may carry the agent that knows them, and refuses the
     /// files with the class of the rule, once. Then the files are written, systemd is told what
-    /// that needs (one reload, the tools of sysusers and tmpfiles, the restarts with the agent's
+    /// that needs (the tools of sysusers and tmpfiles, one reload, the restarts with the agent's
     /// own last), and the digest of what the disk holds is reported. What differs on the disk is
     /// written, nothing else: a second call, and a call after a crash at any point, ends in the
     /// same state. The agent's own unit stands in `/run` until the agent that runs it has read its
@@ -831,11 +831,13 @@ impl<M: Machine> Service<M> {
     }
 
     /// What systemd has to be told after host files were written, in the order the record keeps:
-    /// one reload, then the tools on the files that say so (the users and directories a unit may
-    /// need), then each unit that runs one that changed, the agent's own last, by leaving. Each
-    /// step is taken out of the record when it is done, so a failure or a crash between two of
-    /// them is picked up by the next call, and a later step never runs before an earlier one: the
-    /// restarts wait for the reload and for the tools. One unit that fails to restart does not
+    /// the tools on the files that say so (the users and directories a unit may need), then one
+    /// reload, then each unit that runs one that changed, the agent's own last, by leaving. The
+    /// tools come first because a unit with `Restart=always` that crashes after the reload comes
+    /// back under its new definition at once, and its user and directories must be there by then.
+    /// Each step is taken out of the record when it is done, so a failure or a crash between two
+    /// of them is picked up by the next call, and a later step never runs before an earlier one:
+    /// the reload and the restarts wait for the tools. One unit that fails to restart does not
     /// keep the others from it: each is tried, the failures stay in the record, and the next try
     /// waits (`Retry`), so that a page does not repeat a restart that has just failed. What a boot
     /// has already done is dropped (`State::begin`).
@@ -857,13 +859,6 @@ impl<M: Machine> Service<M> {
         if !state.reload && state.runs.is_empty() && state.restarts.is_empty() {
             return Ok(());
         }
-        if state.reload {
-            if let Err(error) = self.machine.daemon_reload().await {
-                return failed(class(error.into()));
-            }
-            state.reload = false;
-            saved(&state)?;
-        }
         let mut failure = None;
         for run in state.runs.clone() {
             let result = match run.tool {
@@ -882,6 +877,13 @@ impl<M: Machine> Service<M> {
         }
         if let Some(failure) = failure {
             return failed(failure);
+        }
+        if state.reload {
+            if let Err(error) = self.machine.daemon_reload().await {
+                return failed(class(error.into()));
+            }
+            state.reload = false;
+            saved(&state)?;
         }
         let (units, agent) = hostfiles::restart_order(&state);
         for unit in units {
@@ -2609,8 +2611,7 @@ mod tests {
     const BASH_LOCK: &str = r#"{"packages": [{"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}], "extra": []}"#;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn users_and_directories_are_made_by_their_tools_after_the_reload_and_before_the_restarts()
-     {
+    async fn users_and_directories_are_made_by_their_tools_before_the_reload_and_the_restarts() {
         let Some((machine, _fixture, _root)) = site("host-files-tools", &|root| {
             root.join("r/agent/archive.sock")
         }) else {
@@ -2654,14 +2655,15 @@ mod tests {
             said_host_files(&cloud).contains(&wanted)
         })
         .await;
-        // The reload first, then the tools (users before directories, which may name them), then
-        // the restart of the unit that may need them.
+        // The tools first (users before directories, which may name them), so that a unit that
+        // crashes and comes back under the new definition once it is loaded finds its user and
+        // its directory; then the reload, then the restart of the unit that may need them.
         assert_eq!(
             host_calls(&machine),
             [
-                "daemon-reload".to_string(),
                 format!("sysusers {SYSUSERS}"),
                 format!("tmpfiles {TMPFILES}"),
+                "daemon-reload".to_string(),
                 "restart pgcf-gateway.service".to_string(),
             ]
         );
@@ -2696,7 +2698,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_run_that_failed_holds_the_restarts_back_until_it_has_been_done() {
+    async fn a_run_that_failed_holds_the_reload_and_the_restarts_back_until_it_has_been_done() {
         let Some((machine, _fixture, _root)) =
             site("host-files-run", &|root| root.join("r/agent/archive.sock"))
         else {
@@ -2721,22 +2723,21 @@ mod tests {
         machine.fail_next_run();
         let base = tempdir();
         let service = serve(&machine, &cloud, &base).await;
-        eventually(30, "the run to fail", || host_calls(&machine).len() == 2).await;
-        // The unit that may need the user is not restarted before the user exists, and the node
-        // does not claim to hold the files.
-        assert_eq!(
-            host_calls(&machine),
-            ["daemon-reload".to_string(), format!("sysusers {SYSUSERS}")]
-        );
+        eventually(30, "the run to fail", || !host_calls(&machine).is_empty()).await;
+        // No unit is loaded under its new definition before the user exists (a unit that crashes
+        // in between would come back under it), nor restarted, and the node does not claim to
+        // hold the files.
+        assert_eq!(host_calls(&machine), [format!("sysusers {SYSUSERS}")]);
         let boot = machine.boot().unwrap().id;
         let state = crate::hostfiles::State::load(&machine.layout().host_files());
+        assert!(state.reload);
         assert_eq!(state.restarts, ["pgcf-gateway.service"]);
         assert_eq!(state.runs.len(), 1);
         assert!(machine.created_users().is_empty());
         let said = crate::machine::os_report(&*machine).await.unwrap();
         assert_ne!(said["host_files_sha256"], wanted.as_str());
         assert!(state.unfinished(&boot));
-        // A page after the wait does the run and then the restart; the reload is not repeated.
+        // A page after the wait does the run, and then the reload and the restart.
         tokio::time::sleep(Duration::from_millis(700)).await;
         cloud.push(json!({"type": "desired"}));
         eventually(30, "the restart to be done", || {
@@ -2749,9 +2750,9 @@ mod tests {
         assert_eq!(
             host_calls(&machine),
             [
+                format!("sysusers {SYSUSERS}"),
+                format!("sysusers {SYSUSERS}"),
                 "daemon-reload".to_string(),
-                format!("sysusers {SYSUSERS}"),
-                format!("sysusers {SYSUSERS}"),
                 "restart pgcf-gateway.service".to_string(),
             ]
         );

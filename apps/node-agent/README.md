@@ -191,8 +191,8 @@ Worker. The concurrency and memory limits of the jobs come from the policy.
   list to its own rules just before it writes (a list they do not allow is refused for its files,
   once, and the binaries are installed all the same), and the files that differ are written
   atomically below `/` (hidden file, `fsync`, rename, `fsync` of the directory) in the allow-listed
-  directories only, never through a link. systemd reads its units again once, `systemd-sysusers`
-  and `systemd-tmpfiles --create` run on the files that say so, and what changed is restarted, the
+  directories only, never through a link. `systemd-sysusers` and `systemd-tmpfiles --create` run on
+  the files that say so, systemd reads its units again once, and what changed is restarted, the
   agent's own unit last (the agent leaves); a failure is tried again after a growing wait and keeps
   no other unit from its restart. The agent's own unit is written to `/run/systemd/system` first,
   and the agent that runs it moves it to its place after it has read its first page: a node whose

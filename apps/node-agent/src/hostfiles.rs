@@ -18,9 +18,9 @@
 //! covers every path that may have been changed, and the next start applies the list again. How a
 //! file takes effect is recorded the same way before it is written (`State::reload`,
 //! `State::runs`, `State::restarts`), so a crash between the write and the restart still ends in
-//! the restart. The caller (`service`) does the systemd side: one reload, then the runs of
-//! `systemd-sysusers` and `systemd-tmpfiles` on the files that say so, then the restarts, the
-//! agent's own last.
+//! the restart. The caller (`service`) does the systemd side: the runs of `systemd-sysusers` and
+//! `systemd-tmpfiles` on the files that say so, then one reload, then the restarts, the agent's
+//! own last.
 //!
 //! The agent's own unit is the one file that is not trusted when it is written: a unit that cannot
 //! start leaves the node with no link, no wake and no archive until someone with a shell reaches
@@ -584,11 +584,13 @@ pub struct State {
     /// systemd has to read its units again.
     #[serde(default)]
     pub reload: bool,
-    /// Units to restart once it has; the agent's own is last.
+    /// Units to restart once the tools have run and it has; the agent's own is last.
     #[serde(default)]
     pub restarts: Vec<String>,
-    /// Tools to run once it has, before any restart. A boot does not do these (systemd makes users
-    /// at a boot only when /usr is newer than /etc/.updated), so they stay until they have run.
+    /// Tools to run before the reload and any restart, so that a unit that comes back under its
+    /// new definition finds its user and directories. A boot does not do these (systemd makes
+    /// users at a boot only when /usr is newer than /etc/.updated), so they stay until they have
+    /// run.
     #[serde(default)]
     pub runs: Vec<Run>,
 }

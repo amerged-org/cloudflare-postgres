@@ -275,9 +275,9 @@ Everything in `mkosi.extra` is one or the other, and the build stops at a file t
 4. Each node's agent installs the binaries first, and then writes the files that differ: if the
    agent's own binary changed, the agent that runs after its restart writes them. It holds the
    signed list to its own rules just before it writes (a list its rules do not allow is refused for
-   its files only, the binaries are installed all the same), reads systemd's units again once, runs
-   `systemd-sysusers` and `systemd-tmpfiles --create` on the files that say so (`sysusers`,
-   `tmpfiles`), and then restarts what changed (the gateway, cloudflared, ssh, journald,
+   its files only, the binaries are installed all the same), runs `systemd-sysusers` and
+   `systemd-tmpfiles --create` on the files that say so (`sysusers`, `tmpfiles`), reads systemd's
+   units again once, and then restarts what changed (the gateway, cloudflared, ssh, journald,
    systemd-sysctl; the agent's own last). The agent's own unit is first written to
    `/run/systemd/system`, which systemd reads before `/usr/lib/systemd/system` and which a boot
    empties; the agent that runs it moves it to its place once it has read its first page, and a
@@ -285,8 +285,8 @@ Everything in `mkosi.extra` is one or the other, and the build stops at a file t
    ([recovery](../../docs/operations/recovery.md#the-agent-does-not-come-back-after-a-release)).
    What a running per-database unit (`pgcf-pg@.service`, `next_start`) takes from the new template
    is measured on Debian 13's systemd 257 (the lab test `a_reload_changes_what_the_next_stop_does_and_a_start_what_a_running_instance_is_made_of`):
-   the reload loads the file, so the stop settings (`KillMode=`, `KillSignal=`, `TimeoutStopSec=`,
-   `ExecStop=`) are those of the instance's next stop and `systemctl show` already reports the new
+   the reload loads the file, so `KillSignal=`, `TimeoutStopSec=` and `ExecStop=` (the stop
+   settings the lab measured) are those of the instance's next stop and `systemctl show` already reports the new
    resource settings, but the running process, its exec and namespace settings (`ExecStart=`,
    `MountImages=`, `PrivateMounts=`, `User=`) and the limits its cgroup enforces (`MemoryMax=`,
    `TasksMax=`, `CPUWeight=`) stay as they were until the database's next start. A failed reload,
@@ -320,8 +320,10 @@ the maintenance cycle), and nothing but the author of the change checks them:
   takes the new one, and a node holds both until every database has slept. Do not assign such a
   release to a region that has running nodes; V4h's change reached EU1 with a reinstall.
 
-The agent runs the `sysusers` and `tmpfiles` files of a release before any restart in the same
-release, so a unit may need the users and directories that the release makes.
+The agent runs the `sysusers` and `tmpfiles` files of a release before it reads systemd's units
+again and before any restart in the same release, so a unit may need the users and directories
+that the release makes, and a unit with `Restart=always` that crashes after the reload comes back
+under its new definition with them in place.
 
 ## Units
 
@@ -602,8 +604,8 @@ token or the route keyring changed.
   a target alone and removes a path that an earlier list named and this one drops, whether the
   agent wrote it or the image brought it (it keeps `agent/host-files.json` with the paths it owns
   and what is left to tell systemd, saved before the first write, and restarts the unit that a
-  dropped file applied to). Then one `daemon-reload`, then the runs of `systemd-sysusers` and
-  `systemd-tmpfiles --create` on the files that say so, then the restarts in name order, the
+  dropped file applied to). Then the runs of `systemd-sysusers` and `systemd-tmpfiles --create` on
+  the files that say so, then one `daemon-reload`, then the restarts in name order, the
   agent's own last, each taken out of the record when done; a restart that fails does not keep the
   others from theirs, and what failed is tried again after a growing wait. A reload and restarts
   that a boot has made moot are dropped with the boot id. The agent's own unit is written to

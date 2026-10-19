@@ -382,6 +382,54 @@ everything now, turn the shell off. `/etc/ssh/pgcf_revoked.krl` stays the empty 
 ships. The shell service token lasts 720h; when it has expired the script says so, and a new one is
 made as in step 3.
 
+### Replacing the agent by hand: a node whose agent predates host files
+
+An agent of a build before host files cannot read the page of a release that carries them, and the API refuses its hello, which
+lacks `os.host_files_sha256`, so no release can reach it: once, its binary is replaced through the
+shell. EU1 is such a node (it runs the agent of main `bb85de7d`). A node enrolled from an image that
+holds the first agent that writes host files needs none of this, and no code supports it: Dev runs
+the newest release only. The databases keep running throughout (their units do not depend on the
+agent, and a restart of the agent never stops one).
+
+1. **While the node is still linked,** check that the shell reaches it (steps 1 to 4 above;
+   `node-shell.ts ... -- true` exits 0): after step 2 it is the only way in. Assign nothing to the
+   region.
+2. **Deploy the API of the commit.** Migration `0079` removes the registered releases and their
+   assignments, and the API refuses the old agent's hello from then on: the node loses its link
+   (`GET /v1/nodes/{id}` says `observation.state` `stale`; staleness alone never declares a node
+   lost).
+3. **Register the release** built and signed from that commit, from a checkout of exactly that
+   commit ([release-signing.md](release-signing.md)), and do not assign it.
+   `GET /v1/fleet/releases/{id}` shows `spec.binaries["pgcf-agent"]`: its `url`, `sha256` and
+   `size_bytes`. Download the file from that `url` and check its sha256 on your machine against the
+   spec's.
+4. **Stream it into a temporary file** beside the binary the agent runs from, through the shell's
+   stdin (`current` links to the release's directory, so the temporary file and the target are on
+   one filesystem and the rename is atomic):
+
+   ```sh
+   node scripts/operations/node-shell.ts --node <NODE_ID> --domain <NODE_GATEWAY_DOMAIN> --label <you> \
+     -- 'cat > "$(readlink -f /var/lib/pgcf/bin/current)/.pgcf-agent.part"' < pgcf-agent
+   ```
+
+5. **Check it on the node, install it and restart the agent,** in one command that stops at the
+   first failed check (`<SHA256>` and `<SIZE_BYTES>` are the spec's):
+
+   ```sh
+   node scripts/operations/node-shell.ts --node <NODE_ID> --domain <NODE_GATEWAY_DOMAIN> --label <you> \
+     -- 'set -e; cd "$(readlink -f /var/lib/pgcf/bin/current)"; [ "$(sha256sum .pgcf-agent.part | cut -d" " -f1)" = <SHA256> ]; [ "$(stat -c %s .pgcf-agent.part)" = <SIZE_BYTES> ]; chmod 0755 .pgcf-agent.part; mv -f .pgcf-agent.part pgcf-agent; sync; systemctl restart pgcf-agent.service'
+   ```
+
+   The rename replaces the agent's path atomically and the running process keeps its old file until
+   the restart. If a check fails nothing was installed: remove the temporary file
+   (`-- 'rm -f "$(readlink -f /var/lib/pgcf/bin/current)/.pgcf-agent.part"'`) and stream it again.
+
+6. **The release path takes over.** The new agent's hello is accepted (`observation.state`
+   `current`). Assign the release to the region (`PUT /v1/regions/{id}/release`): the agent runs the
+   release's own agent binary already, so it installs the other three binaries and writes the host
+   files itself without restarting; read `GET /v1/nodes/{id}/release` (`converged`) and
+   `GET /v1/nodes/{id}` (`os_converged` true) as in [changing a unit or a configuration file](#changing-a-unit-or-a-configuration-file-no-new-image).
+
 ## The region's node policy
 
 The rules a region's nodes decide by when they act alone (plan 4.3 to 4.7 and 7.5) are the region's
@@ -489,7 +537,9 @@ and actual delivery are separate evidence. The alert kinds and their runbook act
    A node that does not enroll after the installer's reboot is restarted once through the API.
 5. A new release reaches a running node without a reboot: assign it to the region and the node pulls
    its binaries and writes its host files (plan 9.3; the section below). Packages and kernels change
-   only in the [maintenance cycle](recovery.md#node-maintenance-cycle), one node at a time.
+   only in the [maintenance cycle](recovery.md#node-maintenance-cycle), one node at a time. A node
+   whose agent predates host files (EU1 today) first has its agent
+   [replaced by hand](#replacing-the-agent-by-hand-a-node-whose-agent-predates-host-files), once.
 
 Verify an install as described under [the node firewall](#the-node-firewall) and
 [Cloudflare Access](#cloudflare-access-for-node-gateways-and-shells).
@@ -511,9 +561,9 @@ of the image is a host file: it ships with the signed release, so a change needs
    files and their digest.
 3. Each node writes the files that differ after its binaries (a release that changes the agent is
    installed by the old agent, and the new one writes the files after its restart), holding the
-   signed list to its own rules first. It reads systemd's units again once, runs `systemd-sysusers`
-   and `systemd-tmpfiles --create` on the files that say so (`sysusers`, `tmpfiles`: no reboot is
-   needed for a user or a directory), and restarts what changed: the gateway, cloudflared, ssh,
+   signed list to its own rules first. It runs `systemd-sysusers` and `systemd-tmpfiles --create` on
+   the files that say so (`sysusers`, `tmpfiles`: no reboot is needed for a user or a directory),
+   reads systemd's units again once, and restarts what changed: the gateway, cloudflared, ssh,
    journald and systemd-sysctl by name, the agent last. The agent's own unit is written to
    `/run/systemd/system` first and moves to its place when the agent that runs it has read its
    first page. A running per-database unit is not restarted: its stop settings (`KillSignal=`,
