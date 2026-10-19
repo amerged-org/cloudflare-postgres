@@ -384,11 +384,24 @@ before inside the namespace; the database units and the backup jobs mount their 
   agent's namespace across restarts (bind it under `/run` and enter it before the runtime starts)
   or to serve wakes while the mounts are made; neither is built.
 - What the agent decides never rests on its own mount table alone, because a unit or a job mounts
-  the volume in a namespace of its own: whether a unit may start is the link (`attached`); which
-  generation a running unit serves is its own `/proc/<pid>/mountinfo`; whether a volume may have
-  lost writes while the pool took none is that something has its device open (`lv_attr`), and
-  whether ext4 recorded an error is its sysfs entry `/sys/fs/ext4/dm-<minor>`, which exists while
-  a superblock does, in any namespace.
+  the volume in a namespace of its own, and the agent's own mounts end with its restart: whether a
+  unit may start is the link (`attached`); which generation a running unit serves is its own
+  `/proc/<pid>/mountinfo`; whether a volume may have lost writes while the pool took none is that
+  something has its device open (`lv_attr`); whether a volume is held, and whether ext4 recorded
+  an error on it, is its sysfs entry `/sys/fs/ext4/dm-<minor>`, which exists while a superblock
+  does, in any namespace.
+- **The rule for a held volume.** A volume is detached (`unmount_volume`, and the repair, which
+  detaches first) only while no filesystem of it is alive in any namespace, and a generation of a
+  database is made or mounted (`create_volume`, the boot's and a wake's attach) only while no
+  filesystem of another generation of the same database is. The answer is `Busy` for the volume
+  that is held and `OtherGeneration` for the next one, with or without a mount of the agent's own:
+  after an agent restart that left a unit running on the old generation, the page can name the new
+  generation, the boot mounts nothing of it, and a build of it is refused until the unit has
+  stopped (the build ends `build_failed`, the record of the old generation stays, and the next
+  pull releases it again). A start of the unit on the new generation could not have worked
+  either: systemd leaves a unit that runs as it is, and the database would go on running on the
+  old volume while the agent believed it ran on the new one. A removal asks lvm2, which refuses a
+  device that is open (`Busy`).
 - A shell on the node sees none of this: `findmnt`, `df`, `ls /var/lib/pgcf/db/<id>`, `e2fsck`
   and `fstrim` from the break-glass shell see no volume. Run a command in the agent's namespace
   with `nsenter --target "$(systemctl show --property=MainPID --value pgcf-agent.service)" --mount
@@ -400,7 +413,9 @@ before inside the namespace; the database units and the backup jobs mount their 
   holder, because a mount of its own is not busy through another namespace's: after it, the agent
   looks for ext4's sysfs entry of the device, which stays while a unit or a job holds the
   filesystem, mounts the volume again, restores its link and answers `Busy` (the entry went 1 to
-  2 ms after a holder ended in the lab; the agent waits 250 ms for it). Removing a volume asks
+  2 ms after a holder ended in the lab; the agent waits 250 ms for it). With no mount of its own
+  (after its restart) it looks at the entry before it does anything, and answers `Busy` the same
+  way. Removing a volume asks
   lvm2, which refuses a device that a unit or a job still has open: `remove_volume` answers
   `Busy` then, after the five seconds lvm2 itself waits, and the caller tries again. A repair
   (`recover_volume`) detaches first, so it stops with `Busy` as well; between its two `e2fsck`

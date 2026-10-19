@@ -142,8 +142,10 @@ a damaged journal file fails them with `Failed to iterate through journal`).
   --target "$(systemctl show --property=MainPID --value pgcf-agent.service)" --mount -- <command>`,
   and `pgcf-agent check` the same way (it refuses to run in PID 1's namespace). `e2fsck` refuses a
   volume that a unit or a job still holds open, and so does `lvremove`; the agent's own unmount
-  mounts the volume again and answers `Busy` while one holds it. Never write into the volume of
-  a database that runs.
+  mounts the volume again and answers `Busy` while one holds it, and after an agent restart, which
+  ends the agent's own mounts, it answers `Busy` for a volume that only a unit holds, and refuses
+  to make or mount the next generation of that database (`OtherGeneration`). Never write into the
+  volume of a database that runs.
 - **Limits.** A result is at most 1 MiB; the oldest entries, or the end of a text (marked
   `[truncated]`), go first. The lines of a database's unit (`pgcf-pg@…`) or of a backup job
   (`pgcf-job-…`), and the lines PID 1 writes about them, are never sent; in a text, every line

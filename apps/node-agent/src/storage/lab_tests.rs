@@ -893,6 +893,96 @@ fn an_unmount_under_a_unit_that_holds_the_filesystem_is_busy_and_leaves_the_volu
     assert!(!lab.mounted(&a) && lab.link(&a).is_none());
 }
 
+/// The agent restarts while a unit runs on the old generation of its database: the agent's mounts
+/// and links are gone with its namespace, and the agent has no mount of the volume. Its own mount
+/// table says the volume is free; the kernel says a unit holds it. Every operation that needs the
+/// volume or the database's directory asks the kernel: nothing is detached, repaired, removed or
+/// built over a filesystem a unit has, and what a boot mounts is the generation the page names
+/// only once the old one is let go. The unit's data is untouched throughout.
+#[test]
+fn after_an_agents_restart_the_old_generation_that_only_a_unit_holds_is_held_for_every_operation() {
+    let lab = Lab::open(1024);
+    let (g1, g2) = (id(ID, 1), id(ID, 2));
+    lab.create(&g1, 128);
+    assert!(lab.tenant_dd(&g1, "data", 1024, "/dev/urandom"));
+    let data = fs::read(lab.dir_of(&g1).join("data")).unwrap();
+    lab.storage.unmount_volume(&g1).unwrap();
+    // The next generation exists (its create finished earlier) and is not mounted.
+    lab.create(&g2, 128);
+    lab.storage.unmount_volume(&g2).unwrap();
+    lab.storage.mount_volume(&g1).unwrap();
+    let unit = lab.unit_holding(&g1);
+    // The restart: the agent's namespace is gone, and the agent's start drops every link.
+    sh("umount", &[lab.dir_of(&g1).to_str().unwrap()]);
+    lab.storage.reset_device_links().unwrap();
+    assert!(!lab.mounted(&g1) && lab.link(&g1).is_none());
+
+    // The boot mounts what the page names, which is the next generation, and it is refused while
+    // the unit has the old one: a start on it would be a start of a unit that runs.
+    let failures = lab.storage.mount_all(slice::from_ref(&g2)).unwrap();
+    assert!(
+        matches!(&failures[..], [(failed, Error::OtherGeneration)] if *failed == g2),
+        "{failures:?}"
+    );
+    assert!(!lab.mounted(&g2) && !lab.storage.attached(&g2));
+    assert!(matches!(
+        lab.storage.mount_volume(&g2),
+        Err(Error::OtherGeneration)
+    ));
+    // A third generation is not made over it either.
+    let g3 = id(ID, 3);
+    let result = lab.storage.create_volume(&g3, 128 << 20, &policy());
+    assert!(matches!(result, Err(Error::OtherGeneration)), "{result:?}");
+    assert!(lab.lv(&g3).is_none());
+    // The old generation is not detached, repaired or removed from under its unit.
+    let result = lab.storage.unmount_volume(&g1);
+    assert!(matches!(result, Err(Error::Busy)), "{result:?}");
+    let result = lab.storage.recover_volume(&g1, &policy());
+    assert!(matches!(result, Err(Error::Busy)), "{result:?}");
+    let order = Removal::Superseded {
+        storage_generation: 1,
+        remove_volume: true,
+    };
+    let result = lab.storage.remove_volume(&g1, order);
+    assert!(matches!(result, Err(Error::Busy)), "{result:?}");
+    assert!(lab.lv(&g1).is_some());
+    // Nothing of that gave the unit's volume a link, a mount of the agent's or a tag.
+    assert!(lab.link(&g1).is_none() && !lab.mounted(&g1));
+    assert!(!lab.lv(&g1).unwrap().has_tag(commands::SUSPECT_TAG));
+
+    // The unit's own view of the volume is as it was: nothing was repaired, mounted over or taken.
+    let at_the_unit = format!(
+        "/proc/{}/root{}/data",
+        unit.0.id(),
+        lab.dir
+            .join(format!("unit-{}-mount", g1.database()))
+            .display()
+    );
+    assert_eq!(fs::read(at_the_unit).unwrap(), data);
+
+    // The unit stops. Its namespace goes, and the superblock a moment after: the next generation
+    // is mounted, and the old one can be removed.
+    drop(unit);
+    let mut result = lab.storage.unmount_volume(&g1);
+    for _ in 0..40 {
+        if result.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        result = lab.storage.unmount_volume(&g1);
+    }
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        lab.storage
+            .mount_all(slice::from_ref(&g2))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(lab.linked_to_the_mounted_volume(&g2));
+    lab.storage.remove_volume(&g1, order).unwrap();
+    assert!(lab.lv(&g1).is_none() && lab.mounted(&g2));
+}
+
 #[test]
 fn a_full_volume_gets_its_reserve_freed_after_its_database_failed_and_back_on_growth_or_when_use_drops()
  {

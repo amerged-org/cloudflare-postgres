@@ -2126,6 +2126,45 @@ mod tests {
         assert_eq!(db.phase(), Phase::Unproven);
     }
 
+    /// The repair detaches the volume first, which a job that holds it refuses: the recovery
+    /// waits and tries again, starts nothing meanwhile, and goes on once the job has ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recovery_that_meets_a_volume_a_job_holds_tries_again_until_it_is_let_go() {
+        let Some(rig) = Rig::new("recover-held").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let volume = crate::storage::VolumeId::new(&entry.id, 1).unwrap();
+        rig.machine.hold_volume(&volume);
+        rig.machine.set_needs_repair(true);
+        rig.machine.clear_calls();
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(result.reason.as_deref(), Some("volume_suspended"));
+        let recoveries = |machine: &crate::machine::local::Local| {
+            machine
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("recover "))
+                .count()
+        };
+        eventually(10, "the recovery to meet the job again", || {
+            recoveries(&rig.machine) >= 3
+        })
+        .await;
+        assert_eq!(db.phase(), Phase::Unproven);
+        assert!(
+            !rig.machine.running(&entry.id),
+            "nothing is started meanwhile"
+        );
+
+        rig.machine.release_volume(&volume);
+        eventually(60, "the recovery to prove the database", || {
+            db.phase() == Phase::Asleep
+        })
+        .await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_wake_that_comes_while_the_database_goes_to_sleep_starts_it_again() {
         let Some(rig) = Rig::new("wake-quiesce").await else {

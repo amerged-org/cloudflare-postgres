@@ -900,6 +900,27 @@ mod lab {
         node.reset_device_links().await.unwrap();
         assert!(!node.attached(&volume));
         assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
+        // The restarted agent has no mount of the volume, and the unit has: what the agent's mount
+        // table says is free is held. It is not detached, repaired or removed from under the unit,
+        // and the next generation is neither made nor mounted over it.
+        let busy = |result: Result<(), storage::Error>| {
+            assert!(matches!(result, Err(storage::Error::Busy)), "{result:?}");
+        };
+        busy(node.unmount_volume(&volume).await);
+        busy(node.recover_volume(&volume, &policy).await);
+        let ordered = Removal::DatabaseDeleted {
+            storage_generation: 1,
+        };
+        busy(node.remove_volume(&volume, ordered).await);
+        assert!(node.has_volume(&volume).await.unwrap() && !node.attached(&volume));
+        let next = VolumeId::new(ID, 2).unwrap();
+        let refused = node.create_volume(&next, 1 << 30, &account, &policy).await;
+        assert!(
+            matches!(refused, Err(storage::Error::OtherGeneration)),
+            "{refused:?}"
+        );
+        assert!(!node.has_volume(&next).await.unwrap());
+        assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
         // The agent's unmount of a volume that a unit holds is refused: it is mounted again.
         assert!(
             node.mount_volumes(std::slice::from_ref(&volume))

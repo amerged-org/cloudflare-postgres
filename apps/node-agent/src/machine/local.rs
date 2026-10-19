@@ -48,6 +48,9 @@ struct State {
     /// The volumes the agent has mounted in its mount namespace, each with its link for the
     /// database's unit: what the agent's restart ends. A unit that runs keeps its own mount.
     attached: BTreeSet<VolumeId>,
+    /// The volumes that a job (`MountImages=`) holds, in a namespace of its own, until it ends:
+    /// `hold_volume` and `release_volume`.
+    jobs: BTreeSet<VolumeId>,
     accounts: Vec<String>,
     limits: HashMap<String, Limits>,
     quotas: HashMap<String, Option<NonZeroU32>>,
@@ -291,6 +294,37 @@ impl Local {
     pub fn lose_link(&self, id: &VolumeId) {
         self.state().attached.remove(id);
     }
+    /// A job holds the volume in a namespace of its own, as a barman job with `MountImages=`
+    /// does: the agent's unmount and removal of it are `Busy` until `release_volume`.
+    pub fn hold_volume(&self, id: &VolumeId) {
+        self.state().jobs.insert(id.clone());
+    }
+    pub fn release_volume(&self, id: &VolumeId) {
+        self.state().jobs.remove(id);
+    }
+    /// Whether a unit that runs or a job has the filesystem of the volume, in a mount namespace
+    /// of its own: what the node answers with `Busy` (lvm2: "in use"; the agent's unmount: ext4's
+    /// superblock outlives it), whether or not the agent has a mount of its own.
+    fn held(&self, id: &VolumeId) -> bool {
+        self.holders(id, |held| held == id)
+    }
+    /// Whether a unit that runs or a job has another generation of the volume's database: the
+    /// directory is the database's, so the next generation is not made or mounted then.
+    fn other_generation_held(&self, id: &VolumeId) -> bool {
+        self.holders(id, |held| held != id)
+    }
+    fn holders(&self, id: &VolumeId, wanted: impl Fn(&VolumeId) -> bool) -> bool {
+        let running = self.running(id.database());
+        let state = self.state();
+        let unit = state
+            .units
+            .get(id.database())
+            .filter(|_| running)
+            .and_then(|unit| unit.volume.as_ref());
+        unit.into_iter()
+            .chain(state.jobs.iter())
+            .any(|held| held.database() == id.database() && wanted(held))
+    }
     pub fn has_account(&self, database: &str) -> bool {
         self.state().accounts.iter().any(|a| a == database)
     }
@@ -367,6 +401,13 @@ impl Machine for Local {
         if state.no_room {
             return Err(storage::Error::NoRoom(NoRoom::Reserve));
         }
+        // A database has one directory, and a unit or a job that has another generation's
+        // filesystem keeps the next one from being made, whatever the agent has mounted.
+        drop(state);
+        if self.other_generation_held(id) {
+            return Err(storage::Error::OtherGeneration);
+        }
+        let mut state = self.state();
         // A database has one directory: the volume of another generation that is still mounted
         // there is in the way, as it is on the node.
         let live = self.layout.volume(id.database());
@@ -416,11 +457,16 @@ impl Machine for Local {
         &self,
         current: &[VolumeId],
     ) -> Result<Vec<(VolumeId, storage::Error)>, storage::Error> {
-        let mut state = self.state();
         let mut failures = Vec::new();
         for id in current {
+            let other_held = self.other_generation_held(id);
+            let mut state = self.state();
             state.calls.push(format!("mount {}", id.database()));
             if !state.volumes.contains_key(id) {
+                continue;
+            }
+            if other_held {
+                failures.push((id.clone(), storage::Error::OtherGeneration));
                 continue;
             }
             // A database has one directory: the generation that is attached holds it.
@@ -439,9 +485,15 @@ impl Machine for Local {
     /// The volume is set aside beside its directory, as the unmounted logical volume is: its
     /// files are there for the generation, not for the database's directory.
     async fn unmount_volume(&self, id: &VolumeId) -> Result<(), storage::Error> {
+        let held = self.held(id);
         {
             let mut state = self.state();
             state.calls.push(format!("unmount {}", id.database()));
+            // The agent's own mount goes and the superblock stays: the node mounts the volume
+            // again where it was and answers `Busy`, with the link as it was.
+            if held {
+                return Err(storage::Error::Busy);
+            }
             state.attached.remove(id);
         }
         let live = self.layout.volume(id.database());
@@ -465,8 +517,13 @@ impl Machine for Local {
         }
     }
     async fn remove_volume(&self, id: &VolumeId, _removal: Removal) -> Result<(), storage::Error> {
+        let held = self.held(id);
         let mut state = self.state();
         state.calls.push(format!("remove {}", id.database()));
+        // lvm2 refuses a volume that a unit or a job has open: "in use".
+        if held {
+            return Err(storage::Error::Busy);
+        }
         state.volumes.remove(id);
         state.attached.remove(id);
         let others = state
@@ -505,6 +562,10 @@ impl Machine for Local {
         self.state()
             .calls
             .push(format!("recover {}", id.database()));
+        // The repair detaches the volume first, which a holder refuses.
+        if self.held(id) {
+            return Err(storage::Error::Busy);
+        }
         Ok(())
     }
     async fn inventory(&self) -> Result<Inventory, storage::Error> {

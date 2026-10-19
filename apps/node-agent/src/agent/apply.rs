@@ -338,7 +338,6 @@ impl<M: Machine> Core<M> {
         match step {
             Step::Nothing => {}
             Step::Build => {
-                self.release_previous_generation(&entry).await;
                 let _ = self.build(db, &entry).await;
             }
             Step::Delete => self.delete(db, &entry).await,
@@ -458,14 +457,31 @@ impl<M: Machine> Core<M> {
     /// generation's unit is stopped (it sleeps, or the move would not have begun) and its volume
     /// is unmounted, as a database has one directory. The volume stays until its removal is
     /// ordered.
-    async fn release_previous_generation(&self, entry: &Entry) {
+    ///
+    /// `false` when the old generation is still held: the unmount asks the kernel, so a unit or a
+    /// job that has the old volume in a namespace of its own, and an agent that restarted since
+    /// and has no mount of it, are `Busy`. The next generation is not built then, and nothing
+    /// else is touched: the record of the old generation stays as it is, so that the next try
+    /// releases it again, and the build goes on once nothing holds it. A unit that runs is not
+    /// stopped here: only an order stops what runs.
+    pub(super) async fn release_previous_generation(&self, entry: &Entry) -> bool {
         let held = self.files(&entry.id).load().ok().flatten();
         let Some(held) = held.filter(|state| state.storage_generation < entry.storage_generation)
         else {
-            return;
+            return true;
         };
-        if let Ok(previous) = crate::storage::VolumeId::new(&entry.id, held.storage_generation) {
-            let _ = self.machine.unmount_volume(&previous).await;
+        let Ok(previous) = crate::storage::VolumeId::new(&entry.id, held.storage_generation) else {
+            return true;
+        };
+        match self.machine.unmount_volume(&previous).await {
+            Ok(()) => true,
+            Err(error) => {
+                crate::timing::emit_event(json!({
+                    "event": "generation_not_released", "database_id": entry.id,
+                    "class": crate::diagnostics::error_code(&error.into()),
+                }));
+                false
+            }
         }
     }
 
@@ -2224,6 +2240,134 @@ mod tests {
             handle.phase(),
             Phase::Ready,
             "the generation the page serves is not retired"
+        );
+    }
+
+    /// The agent restarted while the unit of the source generation runs (the move protocol proves
+    /// its sleep first, so this is the defense behind it): the unit has the volume in a namespace
+    /// of its own, the agent has no mount of it, and its mount table says the directory is free.
+    /// The kernel says it is not: the target generation is not built, the unit and its volume are
+    /// left as they are, the record of the generation they serve stays, and the build goes on at
+    /// the next pull once the unit has stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_move_target_is_not_built_while_the_unit_of_the_source_runs_after_an_agent_restart() {
+        let Some(rig) = Rig::new("move-held").await else {
+            return;
+        };
+        let (mut db, id, source_state) = source(&rig).await;
+        let record = source_state.record.clone().unwrap();
+        let backup = source_state.backup.clone().unwrap();
+        let old_path = db["archive"]["path"].as_str().unwrap().to_string();
+        let new_path = format!("s3://pgcf-eu/eu-dev/{id}/g2-op_hhhhhhhhhhhhhhhhhhhh");
+        // The unit of the source runs, and the agent that has the volume restarts.
+        rig.machine.start(&id).await.unwrap();
+        let rig = rig.restart().await;
+        assert!(rig.machine.running(&id));
+        assert!(
+            !rig.machine
+                .attached(&crate::storage::VolumeId::new(&id, 1).unwrap())
+        );
+        rig.deliver(&old_path, "read_only");
+        rig.deliver(&new_path, "read_write");
+
+        db["storage_generation"] = json!(2);
+        db["generation"] = json!(7);
+        db["operation"] = json!("op_hhhhhhhhhhhhhhhhhhhh");
+        db["archive"]["path"] = json!(new_path);
+        db["origin"] = json!({"kind": "move", "source": {
+            "database_id": id, "path": old_path, "backup_id": backup.backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"},
+            "end": record}});
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "the build to be refused", || {
+            handle.phase() == Phase::Error
+        })
+        .await;
+        assert_eq!(handle.view().error, Some("build_failed"));
+        assert!(rig.machine.running(&id), "the unit is not touched");
+        assert_eq!(
+            rig.machine
+                .volumes()
+                .iter()
+                .map(|(volume, _)| volume.generation())
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(
+            rig.core
+                .files(&id)
+                .load()
+                .unwrap()
+                .unwrap()
+                .storage_generation,
+            1,
+            "the record still names the generation that is to be released"
+        );
+
+        // The unit sleeps: the next pull releases the old generation and builds the new one.
+        rig.machine.stop(&id).await.unwrap();
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(120, "the move", || {
+            handle
+                .state()
+                .as_ref()
+                .is_some_and(|state| state.storage_generation == 2)
+                && matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(
+            handle.phase(),
+            Phase::Ready,
+            "{:?} {:?}",
+            handle.view().error,
+            rig.machine.calls()
+        );
+        assert_eq!(rig.machine.volumes().len(), 2);
+    }
+
+    /// A job that holds the volume of a superseded generation keeps the volume: the order ends
+    /// `volume_not_removed` (the API sends it again), and one that comes after the job removes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_superseded_volume_that_a_job_holds_is_kept_and_reported_and_goes_with_a_later_order()
+    {
+        let Some(rig) = Rig::new("superseded-held").await else {
+            return;
+        };
+        let (_, handle) = rig.create().await;
+        let id = handle.id.clone();
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+        let volume = crate::storage::VolumeId::new(&id, 1).unwrap();
+        rig.machine.hold_volume(&volume);
+        let order = |operation: &str| Order::Superseded {
+            operation: operation.into(),
+            database: id.clone(),
+            storage_generation: 1,
+            remove_volume: true,
+        };
+        rig.core
+            .apply(&Rig::page(vec![], vec![order("op_ssssssssssssssssssss")]))
+            .await;
+        eventually(30, "the first order", || {
+            rig.core.pending_order("op_ssssssssssssssssssss").is_some()
+        })
+        .await;
+        let first = rig.core.pending_order("op_ssssssssssssssssssss").unwrap();
+        assert_eq!(first["reason"], "volume_not_removed", "{first}");
+        assert_eq!(rig.machine.volumes().len(), 1);
+
+        rig.machine.release_volume(&volume);
+        rig.core
+            .apply(&Rig::page(vec![], vec![order("op_tttttttttttttttttttt")]))
+            .await;
+        eventually(30, "the volume to go", || rig.machine.volumes().is_empty()).await;
+        eventually(30, "the second order", || {
+            rig.core.pending_order("op_tttttttttttttttttttt").is_some()
+        })
+        .await;
+        assert_eq!(
+            rig.core.pending_order("op_tttttttttttttttttttt").unwrap()["status"],
+            "done"
         );
     }
 

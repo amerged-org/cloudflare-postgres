@@ -29,8 +29,8 @@ use std::{
 /// A volume is a whole number of extents; the volume group is made with lvm2's 4 MiB.
 const EXTENT_BYTES: u64 = 4 << 20;
 
-/// How long `detach` looks for the superblock of a volume it has unmounted before it takes the
-/// volume to be held by a unit or a job, and how often it looks.
+/// How long a volume's filesystem may stay alive after its last holder went (or after the agent's
+/// own unmount) before a unit or a job is taken to still hold it, and how often `detach` looks.
 const SUPERBLOCK_RELEASE_WAIT: Duration = Duration::from_millis(250);
 const SUPERBLOCK_POLL: Duration = Duration::from_millis(10);
 
@@ -391,22 +391,67 @@ impl<R: CommandRunner> Storage<R> {
         })
     }
 
-    /// Whether ext4 recorded an error on the volume's filesystem, wherever it is mounted: ext4's
-    /// entry for the device (`/sys/fs/ext4/dm-<minor>`) exists while a superblock does, in any
-    /// mount namespace, the agent's own or a unit's or a job's. A device with no filesystem
-    /// mounted has no entry and no error to count.
-    fn fs_errors(&self, id: &VolumeId) -> Result<bool, Error> {
+    /// ext4's count of errors on the volume's filesystem, from its entry for the device
+    /// (`/sys/fs/ext4/dm-<minor>`), which exists while a superblock does, in any mount namespace:
+    /// the agent's own, a unit's or a job's. `None` when no filesystem of the volume is alive (no
+    /// device, or no entry). This is what says that a volume is held, and the agent's own mount
+    /// table never does: after an agent's restart it lists none of what the units have.
+    fn ext4_entry(&self, id: &VolumeId) -> Result<Option<u64>, Error> {
         let absent = |error: io::Error| match error.kind() {
-            ErrorKind::NotFound => Ok(false),
+            ErrorKind::NotFound => Ok(None),
             _ => Err(Error::from(error)),
         };
         match (self.kernel.minor)(&commands::device(&self.config, id)) {
             Ok(minor) => match (self.kernel.ext4_errors)(minor) {
-                Ok(errors) => Ok(errors > 0),
+                Ok(errors) => Ok(Some(errors)),
                 Err(error) => absent(error),
             },
             Err(error) => absent(error),
         }
+    }
+
+    /// Whether ext4 recorded an error on the volume's filesystem, wherever it is mounted. A device
+    /// with no filesystem mounted has no error to count.
+    fn fs_errors(&self, id: &VolumeId) -> Result<bool, Error> {
+        Ok(self.ext4_entry(id)?.is_some_and(|errors| errors > 0))
+    }
+
+    /// Whether a filesystem of the volume is still alive a moment after the agent's own mount of
+    /// it went or never was: a unit or a job holds it in a namespace of its own. A holder that has
+    /// just ended leaves its namespace, and the superblock with it, a moment after (lab: 1 to 2
+    /// ms, 20 runs), which the wait covers many times over.
+    fn held(&self, id: &VolumeId) -> Result<bool, Error> {
+        let ended = Instant::now() + SUPERBLOCK_RELEASE_WAIT;
+        loop {
+            match self.ext4_entry(id)? {
+                None => return Ok(false),
+                Some(_) if Instant::now() >= ended => return Ok(true),
+                Some(_) => std::thread::sleep(SUPERBLOCK_POLL),
+            }
+        }
+    }
+
+    /// The directory is the database's, one generation at a time: refuses with `OtherGeneration`
+    /// while a filesystem of another generation of `id`'s database is alive, whoever holds it. The
+    /// agent's mount table does not tell, since after its restart a unit that runs has the old
+    /// generation and the agent has none of its own, and a unit that is started on the next
+    /// generation while the old one runs is not started at all: systemd leaves it running.
+    fn ensure_no_other_generation_alive(
+        &self,
+        id: &VolumeId,
+        lvs: &[LogicalVolume],
+    ) -> Result<(), Error> {
+        // By name first: a boot attaches every volume, and a database nearly always has one.
+        let prefix = format!("db_{}_g", id.database());
+        for lv in lvs.iter().filter(|lv| lv.name.starts_with(&prefix)) {
+            let Some(other) = VolumeId::from_lv_name(&lv.name) else {
+                continue;
+            };
+            if other != *id && self.owned(lv, &other).is_ok() && self.held(&other)? {
+                return Err(Error::OtherGeneration);
+            }
+        }
+        Ok(())
     }
 
     /// What the recent list and the kernel say of the volume, without a process: whether it is
@@ -500,6 +545,7 @@ impl<R: CommandRunner> Storage<R> {
             return Err(self.occupied(id, top));
         }
         let lvs = self.read_lvs()?;
+        self.ensure_no_other_generation_alive(id, &lvs)?;
         let sample = self.sample_pool(&guard)?;
         pool::room(Some(&sample), Instant::now(), policy).map_err(Error::NoRoom)?;
         let (formatted, suspect) = match self.volume(&lvs, id) {
@@ -525,15 +571,16 @@ impl<R: CommandRunner> Storage<R> {
                 FS_TAG,
             ))?;
         }
-        self.attach(id, suspect)
+        self.attach(id, suspect, &lvs)
     }
 
     /// Mounts the formatted volume at its directory with mode 0700, unless it is, and then gives
     /// the database's unit its link. The directory is the database's, so a filesystem of another
     /// volume on it, another generation's included, refuses the mount. A volume tagged as suspect
     /// is not mounted: `recover_volume` repairs it first; one that is mounted and suspect keeps
-    /// its mount and has no link.
-    fn attach(&self, id: &VolumeId, suspect: bool) -> Result<(), Error> {
+    /// its mount and has no link. A filesystem of another generation that a unit or a job holds
+    /// refuses it too (`ensure_no_other_generation_alive`), `lvs` being what lvm2 lists now.
+    fn attach(&self, id: &VolumeId, suspect: bool, lvs: &[LogicalVolume]) -> Result<(), Error> {
         let (dir, device) = (self.mount_dir(id), commands::device(&self.config, id));
         // The table is read now: an earlier attach of the same call has changed it.
         if let Some(top) = self.top_mount(id, &self.mounts()?) {
@@ -549,6 +596,7 @@ impl<R: CommandRunner> Storage<R> {
         if suspect {
             return Err(Error::NeedsRepair);
         }
+        self.ensure_no_other_generation_alive(id, lvs)?;
         // Traversable but not listable: a database reaches its own directory only.
         fs::DirBuilder::new()
             .recursive(true)
@@ -601,7 +649,7 @@ impl<R: CommandRunner> Storage<R> {
         if size_bytes > current {
             self.within_cap(&sample, &lvs, size_bytes - current)?;
         }
-        self.attach(id, false)?;
+        self.attach(id, false, &lvs)?;
         if size_bytes > current {
             self.run(commands::volume_extend(&self.config, id, size_bytes))?;
         }
@@ -628,7 +676,7 @@ impl<R: CommandRunner> Storage<R> {
         let _guard = self.lock();
         let lvs = self.read_lvs()?;
         let suspect = self.formatted(&lvs, id)?.has_tag(SUSPECT_TAG);
-        self.attach(id, suspect)
+        self.attach(id, suspect, &lvs)
     }
 
     /// After a boot, and after an agent's restart, which ends its mount namespace and with it every
@@ -651,7 +699,7 @@ impl<R: CommandRunner> Storage<R> {
                     continue;
                 }
             };
-            if let Err(error) = self.attach(id, lv.has_tag(SUSPECT_TAG)) {
+            if let Err(error) = self.attach(id, lv.has_tag(SUSPECT_TAG), &lvs) {
                 failures.push((id.clone(), error));
             }
         }
@@ -662,18 +710,22 @@ impl<R: CommandRunner> Storage<R> {
     /// unit can be started on a volume that is going. What is on top at its directory must be that
     /// filesystem; `umount` would take whatever is on top.
     ///
-    /// A unit or a job mounts the volume in a namespace of its own, and the agent's unmount does
-    /// not see that mount (a mount of its own is not busy because of it): the agent's mount goes
-    /// and the superblock stays. So the unmount is followed by a look at ext4's entry for the
-    /// device, which exists as long as a superblock does, in any namespace. If it stays, the
-    /// volume is held: it is mounted again, as it was, and the call is `Busy`. A holder that has
-    /// just ended leaves its namespace, and the superblock with it, a moment after (lab: 1 to 2
-    /// ms, 20 runs), which the wait covers many times over.
+    /// A unit or a job mounts the volume in a namespace of its own, and the agent's mount table
+    /// does not list that mount: after the agent's restart it lists none of the volumes, and a
+    /// mount of its own is not busy because of another namespace's. So the answer comes from the
+    /// kernel: ext4's entry for the device exists as long as any namespace has the superblock
+    /// (`held`). The volume is detached when the entry is gone after the agent's own unmount, or
+    /// was not there to begin with. If it stays, the volume is held: the agent mounts it again
+    /// where it had unmounted it, and the call is `Busy`.
     fn detach(&self, id: &VolumeId) -> Result<(), Error> {
         self.drop_link(id)?;
         let mounts = self.mounts()?;
         let Some(own) = self.mount_of(id, &mounts) else {
-            return Ok(());
+            return if self.held(id)? {
+                Err(Error::Busy)
+            } else {
+                Ok(())
+            };
         };
         if self.top_mount(id, &mounts) != Some(own) {
             return Err(Error::Unexpected(
@@ -685,26 +737,11 @@ impl<R: CommandRunner> Storage<R> {
             Some(libc::EBUSY) => Error::Busy,
             _ => error.into(),
         })?;
-        if self.superblock_outlives_unmount(id)? {
+        if self.held(id)? {
             host::mount_ext4(&commands::device(&self.config, id), &self.mount_dir(id))?;
             return Err(Error::Busy);
         }
         Ok(())
-    }
-
-    /// Whether the device's filesystem is still alive a moment after the agent's last mount of it
-    /// went: another namespace holds it.
-    fn superblock_outlives_unmount(&self, id: &VolumeId) -> Result<bool, Error> {
-        let minor = (self.kernel.minor)(&commands::device(&self.config, id))?;
-        let ended = Instant::now() + SUPERBLOCK_RELEASE_WAIT;
-        loop {
-            match (self.kernel.ext4_errors)(minor) {
-                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-                Err(error) => return Err(error.into()),
-                Ok(_) if Instant::now() >= ended => return Ok(true),
-                Ok(_) => std::thread::sleep(SUPERBLOCK_POLL),
-            }
-        }
     }
 
     pub fn unmount_volume(&self, id: &VolumeId) -> Result<(), Error> {
@@ -875,7 +912,7 @@ impl<R: CommandRunner> Storage<R> {
         if suspect {
             self.run(commands::volume_delete_tag(&self.config, id, SUSPECT_TAG))?;
         }
-        self.attach(id, false)
+        self.attach(id, false, &lvs)
     }
 }
 
@@ -928,6 +965,14 @@ mod tests {
         storage.runner.0.store(true, Ordering::Relaxed);
         assert!(matches!(storage.poll_pool(), Err(Error::Command { .. })));
         assert_eq!(storage.room(&policy), Err(NoRoom::Unobserved));
+    }
+
+    fn policy() -> Policy {
+        Policy {
+            reserve_bytes: 1 << 20,
+            metadata_no_room_percent: 75,
+            sample_max_age: Duration::from_secs(10),
+        }
     }
 
     const LVS: &str = include_str!("fixtures/lvs-volumes.json");
@@ -1078,15 +1123,19 @@ mod tests {
 
     /// A unit mounts its volume itself, so which generation it serves is in its own mount table:
     /// the device number of the mount at the database's directory names the volume.
-    #[test]
-    fn the_generation_a_unit_serves_is_the_volume_whose_device_number_it_has_mounted() {
-        let two_generations = LVS
-            .replace("db_k1l2m3n4o5p6q7r8s9t0_g12", "db_a1b2c3d4e5f6g7h8i9j0_g2")
+    /// The recorded list with a second, formatted generation of the listed database in the place
+    /// of the other database's volume.
+    fn two_generations() -> String {
+        LVS.replace("db_k1l2m3n4o5p6q7r8s9t0_g12", "db_a1b2c3d4e5f6g7h8i9j0_g2")
             .replace(
                 "pgcf.db.k1l2m3n4o5p6q7r8s9t0,pgcf.gen.12",
                 "pgcf.db.a1b2c3d4e5f6g7h8i9j0,pgcf.fs,pgcf.gen.2",
-            );
-        let mut storage = Storage::new(Listed::new(&two_generations), Config::default());
+            )
+    }
+
+    #[test]
+    fn the_generation_a_unit_serves_is_the_volume_whose_device_number_it_has_mounted() {
+        let mut storage = Storage::new(Listed::new(&two_generations()), Config::default());
         storage.kernel = Kernel {
             minor: |device| match device {
                 device if device.ends_with("_g1") => Ok(7),
@@ -1116,6 +1165,85 @@ mod tests {
         );
         // A device that is no volume of the database is no answer, and no guess.
         assert!(serves(&[mount(11, &at)]).is_err());
+    }
+
+    /// A storage whose kernel has a filesystem alive on the first generation's device only: the
+    /// other devices have no entry in ext4's sysfs, as a volume nothing has mounted has none.
+    fn storage_with_the_first_generation_alive(lvs: &str) -> Storage<Listed> {
+        let mut storage = Storage::new(Listed::new(lvs), Config::default());
+        storage.kernel = Kernel {
+            minor: |device| {
+                if device.ends_with("_g1") {
+                    Ok(7)
+                } else {
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                }
+            },
+            ext4_errors: |_| Ok(0),
+        };
+        storage
+    }
+
+    /// After the agent's restart nothing in its mount table is a volume: a unit or a job has the
+    /// filesystem, in a namespace of its own. The detach asks the kernel, whose ext4 entry for the
+    /// device exists while any namespace has the superblock, and a held volume is `Busy`.
+    #[test]
+    fn a_volume_that_only_a_unit_holds_is_not_detached_and_one_that_nothing_holds_is() {
+        let id = listed_volume();
+        assert!(matches!(
+            clean_storage().unmount_volume(&id),
+            Err(Error::Busy)
+        ));
+        // No filesystem of the volume is alive: nothing to detach, and it is done.
+        let free = storage_with(LVS, |_| Err(io::Error::from(io::ErrorKind::NotFound)));
+        free.unmount_volume(&id).unwrap();
+        // A volume with no device (it was removed) is no holder either.
+        let mut gone = clean_storage();
+        gone.kernel.minor = |_| Err(io::Error::from(io::ErrorKind::NotFound));
+        gone.unmount_volume(&id).unwrap();
+        // An entry that cannot be read is no answer, and no "free".
+        let unreadable = storage_with(LVS, |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert!(matches!(unreadable.unmount_volume(&id), Err(Error::Io(_))));
+    }
+
+    /// The next generation is not made while the filesystem of an earlier one is alive in any
+    /// namespace, whether or not the agent's own table lists it: the unit that has it would run
+    /// on, and a start of its unit on the new generation would be a start of a unit that runs.
+    #[test]
+    fn the_next_generation_is_refused_before_anything_is_made_while_another_is_alive() {
+        let next = VolumeId::new(LISTED, 2).unwrap();
+        let storage = storage_with_the_first_generation_alive(LVS);
+        let result = storage.create_volume(&next, 128 << 20, &policy());
+        assert!(matches!(result, Err(Error::OtherGeneration)), "{result:?}");
+        for program in ["lvcreate", "mkfs.ext4", "dmsetup"] {
+            assert_eq!(storage.runner.ran(program), 0, "{program}");
+        }
+        // Once nothing has the first generation, the create goes on to the pool: the recorded
+        // runner has no pool to read, which is another answer.
+        let free = storage_with(LVS, |_| Err(io::Error::from(io::ErrorKind::NotFound)));
+        let result = free.create_volume(&next, 128 << 20, &policy());
+        assert!(!matches!(result, Err(Error::OtherGeneration)), "{result:?}");
+        assert!(free.runner.ran("dmsetup") > 0);
+    }
+
+    /// The same for every mount of a generation at the database's directory: a boot's, a wake's
+    /// and a recovery's attach.
+    #[test]
+    fn a_generation_is_not_attached_while_the_filesystem_of_another_is_alive() {
+        let storage = storage_with_the_first_generation_alive(&two_generations());
+        let second = VolumeId::new(LISTED, 2).unwrap();
+        let failures = storage.mount_all(slice::from_ref(&second)).unwrap();
+        assert!(
+            matches!(&failures[..], [(failed, Error::OtherGeneration)] if *failed == second),
+            "{failures:?}"
+        );
+        assert!(matches!(
+            storage.mount_volume(&second),
+            Err(Error::OtherGeneration)
+        ));
+        assert!(!storage.attached(&second));
     }
 
     #[test]

@@ -368,10 +368,18 @@ impl<M: Machine> Core<M> {
             view.writer = None;
             view.adopted = true;
         });
-        let built = match origin {
-            Origin::Create => self.build_create(db, entry).await,
-            Origin::Restore(source) => self.build_restored(db, entry, &source, None).await,
-            Origin::Move(source, end) => self.build_restored(db, entry, &source, Some(end)).await,
+        // Before anything is written: the record of the generation that is released stays what
+        // it is until it has been, so that a build that was refused is released again.
+        let built = if !self.release_previous_generation(entry).await {
+            Err("build_failed")
+        } else {
+            match origin {
+                Origin::Create => self.build_create(db, entry).await,
+                Origin::Restore(source) => self.build_restored(db, entry, &source, None).await,
+                Origin::Move(source, end) => {
+                    self.build_restored(db, entry, &source, Some(end)).await
+                }
+            }
         };
         match built {
             Ok(()) => Ok(()),
