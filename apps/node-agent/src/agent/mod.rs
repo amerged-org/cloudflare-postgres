@@ -56,8 +56,9 @@ pub struct Timing {
     pub idle_poll: Duration,
     /// How often it reads the units to find those that ended without being asked.
     pub watch: Duration,
-    /// The wait before the first retry of a recovery, or of a decision on a database that could not
-    /// read its facts, and the longest wait.
+    /// The wait before the first retry of a recovery, of a decision on a database that could not
+    /// read its facts, or of the wake of a resume order that the node could not decide yet, and
+    /// the longest wait.
     pub recovery_retry: Duration,
     pub recovery_retry_maximum: Duration,
     /// How long a wake waits for the node's decision on a database it has not looked at in this

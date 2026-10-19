@@ -110,7 +110,8 @@ export const WAKE_AGAIN_REASON = "wake_in_progress" satisfies WakeReason;
  * `desired_stale` refusal (the answer to the gateway stays `desired_stale`): the node holds no
  * entry for the database; the ticket's generation is not the next one, the entry's own wake or a
  * claim's; it is the entry's generation with another operation; the route revision changed since
- * the Edge signed it; the roles changed.
+ * the Edge signed it, other than by the claim of the ticket's own wake (which may raise it more
+ * than once); the roles changed.
  */
 export const WAKE_STALE = [
   "no_entry",

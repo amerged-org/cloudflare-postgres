@@ -73,7 +73,8 @@ pub(crate) enum Stale {
     Generation,
     /// The ticket's generation is the entry's, with another operation.
     Operation,
-    /// The route revision changed since the Edge signed the ticket.
+    /// The route revision changed since the Edge signed the ticket, other than by the claim of
+    /// the ticket's own wake.
     Route,
     /// The roles changed since the Edge signed the ticket.
     Role,
@@ -93,10 +94,16 @@ impl Stale {
 /// Whether the entry of the page still stands for a wake ticket. The ticket is of the next
 /// generation (the claim is not in the page yet), or it is the entry's own wake (the claim is in
 /// the page), or the node released it before the page named it (`claimed`). Its roles are the
-/// entry's, and so is its route revision, with one exception: the Actor signs the revision from
-/// before its claim, and the claim raises it by one (`withAdmissionMutation`), so the page that
-/// carries the claim is one revision above the ticket of that very wake. The gateway delivers the
-/// ticket again after 3 s, by when the hint has brought that page.
+/// entry's, and so is its route revision, with one exception: the entry's own wake. The Actor
+/// signs the revision from before its claim, and every attempt of the claim raises it
+/// (`withAdmissionMutation` commits its epoch row also when the business write lost its
+/// compare-and-set and the claim is made again, up to three times), as does any other mutation of
+/// the database between the ticket and its claim. The page that carries the claim therefore holds
+/// the ticket's revision or a later one, and the gateway's `wake_state` takes the same. That is
+/// safe, because `same` proves this ticket's own claim committed (its operation is inserted only
+/// at the generation after the one it read, and the page names the newest operation at or below
+/// the generation); a move, a suspend, a resume or a change of roles advances the generation or
+/// the roles, and those stay checked. A ticket above the entry's revision is stale.
 fn ticket_matches(request: &WakeRequest, entry: &Entry, claimed: bool) -> Result<(), Stale> {
     let next = request.generation == entry.generation + 1;
     let same = request.generation == entry.generation && request.operation == entry.operation;
@@ -107,8 +114,12 @@ fn ticket_matches(request: &WakeRequest, entry: &Entry, claimed: bool) -> Result
             Stale::Generation
         });
     }
-    let claim_raised = same && request.route_revision + 1 == entry.route_revision;
-    if request.route_revision != entry.route_revision && !claim_raised {
+    let route = if same {
+        request.route_revision <= entry.route_revision
+    } else {
+        request.route_revision == entry.route_revision
+    };
+    if !route {
         return Err(Stale::Route);
     }
     if request.role_revision_hash != entry.role_hash() {
@@ -1448,6 +1459,12 @@ mod tests {
             operation: "op_aaaaaaaaaaaaaaaaaaaa".into(),
             ..after.clone()
         };
+        // Every attempt of the claim raises the revision, also one that lost its compare-and-set
+        // and is made again, and so does any other mutation of the database in between.
+        let lagging = Entry {
+            route_revision: r + 3,
+            ..after.clone()
+        };
         let signed =
             |entry: &Entry, generation: u64, route: u64| ticket_for(entry, generation, wake, route);
         type Row<'a> = (&'a str, &'a Entry, WakeRequest, bool, Result<(), Stale>);
@@ -1485,7 +1502,14 @@ mod tests {
                 &after,
                 signed(&after, g + 1, r - 1),
                 false,
-                Err(Stale::Route),
+                Ok(()),
+            ),
+            (
+                "after the claim and two claim attempts that lost their compare-and-set: three above",
+                &lagging,
+                signed(&lagging, g + 1, r),
+                false,
+                Ok(()),
             ),
             (
                 "after the claim: a ticket above the entry's route",
@@ -2002,11 +2026,12 @@ mod tests {
             tokio::spawn(async move { core.wake(&ticket).await })
         };
         eventually(10, "the start to begin", || db.phase() == Phase::Starting).await;
-        // D1 committed the claim, which raised the route revision by one, and the hint brought the
-        // page of the ticket's generation and operation.
+        // D1 committed the claim and the hint brought the page of the ticket's generation and
+        // operation. The claim took three attempts, two of which lost their compare-and-set to a
+        // periodic report, and each raised the route revision.
         json["generation"] = ticket.generation.into();
         json["operation"] = ticket.operation.clone().into();
-        json["route_revision"] = (entry.route_revision + 1).into();
+        json["route_revision"] = (entry.route_revision + 3).into();
         rig.core.apply(&Rig::page(vec![json], vec![])).await;
         let again = rig.core.wake(&ticket).await;
         assert_eq!(
