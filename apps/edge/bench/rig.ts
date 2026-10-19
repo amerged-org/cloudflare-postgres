@@ -106,7 +106,11 @@ async function startPostgres(directory: string, password: string | undefined) {
   };
 }
 
-/** The loopback shim: `/pg` bridges WebSocket frames to PostgreSQL, `/sql` runs a request. */
+/**
+ * The loopback shim: `/pg` bridges WebSocket frames to PostgreSQL, `/sql` runs a request in the
+ * database "postgres" and answers as the gateway does: the result of a statement, or for a
+ * transaction (a request that carries `transaction`) `{"results":[...]}` of all its statements.
+ */
 async function startShim(postgres: number, password: string | undefined) {
   const pool = new pg.Pool({
     host: "127.0.0.1",
@@ -117,6 +121,27 @@ async function startShim(postgres: number, password: string | undefined) {
     max: 4,
   });
   const raw = { getTypeParser: () => (value: string) => value };
+  const answer = async (
+    session: pg.Pool | pg.PoolClient,
+    { query, params }: { query: string; params: string[] },
+  ) => {
+    const result = await session.query({
+      text: query,
+      values: params,
+      rowMode: "array",
+      types: raw,
+    });
+    return {
+      fields: result.fields.map((field) => ({
+        name: field.name,
+        dataTypeID: field.dataTypeID,
+      })),
+      command: result.command,
+      rowCount: result.rowCount,
+      rows: result.rows,
+      rowAsArray: true,
+    };
+  };
   const http = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -124,28 +149,42 @@ async function startShim(postgres: number, password: string | undefined) {
       void (async () => {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
           queries: { query: string; params: string[] }[];
+          transaction?: object;
         };
-        const results = [];
-        for (const { query, params } of body.queries) {
-          const result = await pool.query({
-            text: query,
-            values: params,
-            rowMode: "array",
-            types: raw,
-          });
-          results.push({
-            fields: result.fields.map((field) => ({
-              name: field.name,
-              dataTypeID: field.dataTypeID,
-            })),
-            command: result.command,
-            rowCount: result.rowCount,
-            rows: result.rows,
-            rowAsArray: true,
-          });
+        let answered: unknown;
+        try {
+          if (body.transaction === undefined)
+            answered = await answer(pool, body.queries[0]!);
+          else {
+            const session = await pool.connect();
+            try {
+              await session.query("BEGIN");
+              const results = [];
+              for (const query of body.queries)
+                results.push(await answer(session, query));
+              await session.query("COMMIT");
+              answered = { results };
+            } catch (error) {
+              await session.query("ROLLBACK");
+              throw error;
+            } finally {
+              session.release();
+            }
+          }
+        } catch (error) {
+          const failure = error as { message: string; code?: string };
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              message: failure.message,
+              code: failure.code,
+              severity: "ERROR",
+            }),
+          );
+          return;
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(results[0]));
+        res.end(JSON.stringify(answered));
       })();
     });
   });

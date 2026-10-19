@@ -6,6 +6,9 @@
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "workers_dev": true,
   "observability": { "enabled": false },
+  // A service binding to the Edge Worker, which `saas-bench healthz` compares with the public
+  // hostname. Delete the line to time the public hostname alone.
+  "services": [{ "binding": "EDGE", "service": "<EDGE_WORKER>" }],
   "vars": {
     "API_URL": "https://pgcf-api.example.invalid",
     "ENDPOINT_HOST": "pgcf-edge.example.invalid",

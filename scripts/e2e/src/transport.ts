@@ -24,6 +24,7 @@ export function safeProbeError(error: unknown): {
       [
         "Error",
         "DatabaseError",
+        "NeonDbError",
         "TypeError",
         "AbortError",
         "TimeoutError",

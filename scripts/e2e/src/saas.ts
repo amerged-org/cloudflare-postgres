@@ -13,6 +13,11 @@
  *   5. update   a task marked done, then COMMIT.
  * Statements 4 and 5 carry the transaction's BEGIN and COMMIT in their own message, so the
  * transaction costs no round trip of its own and the request keeps the plan's five.
+ *
+ * Three arms send that request (`ARMS`): `ws` as above, over a WebSocket, five round trips;
+ * `http-batch`, over the Edge's `POST /sql`, as one `transaction()` of the five statements (it
+ * supplies the BEGIN and COMMIT), one round trip; `http-auth-then-batch`, the session lookup as a
+ * query of its own and the other four as one `transaction()`, two round trips.
  */
 import { isDatabaseId } from "@pgcf/contracts/ids";
 import { safeProbeError } from "./transport.ts";
@@ -102,15 +107,12 @@ function generator(seed: number, call: number): () => number {
   };
 }
 
-/**
- * The request of call number `call` of a run seeded `seed`: its keys differ from every other
- * call's, so no call is served from the cache a neighbour warmed. Every interpolated value is an
- * integer this function computed.
- */
-export function buildRequest(
+/** The five statements of call number `call`; `transaction` puts the BEGIN and COMMIT into messages 4 and 5. */
+function statementsOf(
   seed: number,
   call: number,
   scale: number,
+  transaction: boolean,
 ): Statement[] {
   const n = datasetSize(scale);
   const random = generator(seed, call);
@@ -137,23 +139,77 @@ export function buildRequest(
     },
     {
       name: "insert",
-      sql: `BEGIN; INSERT INTO tasks(project_id, assignee_id, status, title, body, created_at, updated_at) VALUES (${project}, ${user}, 'open', 'bench', 'x', now(), now()) RETURNING id`,
+      sql: `${transaction ? "BEGIN; " : ""}INSERT INTO tasks(project_id, assignee_id, status, title, body, created_at, updated_at) VALUES (${project}, ${user}, 'open', 'bench', 'x', now(), now()) RETURNING id`,
       rows: 1,
     },
     {
       name: "update",
-      sql: `UPDATE tasks SET status = 'done', updated_at = now() WHERE id = ${task}; COMMIT`,
+      sql: `UPDATE tasks SET status = 'done', updated_at = now() WHERE id = ${task}${transaction ? "; COMMIT" : ""}`,
       rows: 0,
     },
   ];
 }
 
+/**
+ * The request of call number `call` of a run seeded `seed`: its keys differ from every other
+ * call's, so no call is served from the cache a neighbour warmed. Every interpolated value is an
+ * integer this function computed.
+ */
+export function buildRequest(
+  seed: number,
+  call: number,
+  scale: number,
+): Statement[] {
+  return statementsOf(seed, call, scale, true);
+}
+
+/** The same request for `transaction()` over HTTP, which supplies the BEGIN and COMMIT itself. */
+export function buildBatch(
+  seed: number,
+  call: number,
+  scale: number,
+): Statement[] {
+  return statementsOf(seed, call, scale, false);
+}
+
+export const ARMS = ["ws", "http-batch", "http-auth-then-batch"] as const;
+export type Arm = (typeof ARMS)[number];
+
+/** The statements one round trip carries. */
+export type Trip = readonly Statement[];
+
+/** The round trips `arm` makes for call number `call`, in order. */
+export function buildTrips(
+  arm: Arm,
+  seed: number,
+  call: number,
+  scale: number,
+): Trip[] {
+  if (arm === "ws")
+    return buildRequest(seed, call, scale).map((statement) => [statement]);
+  const batch = buildBatch(seed, call, scale);
+  return arm === "http-batch" ? [batch] : [batch.slice(0, 1), batch.slice(1)];
+}
+
+/** The arm database number `index` (from 0) takes in round `round` (from 1): the arms take turns. */
+export function armFor(
+  arms: readonly Arm[],
+  index: number,
+  round: number,
+): Arm {
+  return arms[(index + round - 1) % arms.length]!;
+}
+
 /** One open session: a statement's last result as its row count. */
 export interface Session {
   query(sql: string): Promise<number>;
+  /** A session over HTTP: the statements as one transaction in one request, each one's row count. */
+  transaction?(sqls: readonly string[]): Promise<number[]>;
   end(): Promise<void>;
   /** On the clock of the call: when the WebSocket opened, if the session can tell. */
   readonly socketOpenedAt?: number;
+  /** A session over HTTP opens no connection before its first request, so it has no connect time. */
+  readonly connectionless?: true;
 }
 
 /** What a call measured. Times are milliseconds from the start of the call, rounded to 0.1. */
@@ -167,11 +223,12 @@ export interface Timed {
   first_answer_ms?: number;
   /** Until the last statement's result: the plan's metric. */
   request_ms?: number;
-  /** Each statement's own round trip, in the order of `STATEMENT_NAMES`. */
+  /** Each round trip's own time, in order: a statement's on a WebSocket, a transaction's over HTTP. */
   statements_ms: number[];
   /**
    * Where a failed call stopped: the check that the database was asleep (made by the driver, not
-   * by the call), the connection, or the statement that failed.
+   * by the call), the connection, or the statement that failed (the first of a transaction whose
+   * statement the driver cannot name).
    */
   failed_at?: "cold_check" | "connect" | StatementName;
   error?: {
@@ -181,6 +238,8 @@ export interface Timed {
   };
   /** Set by the driver: the follow-up requests after this call that failed. */
   followup_failures?: number;
+  /** Set by the probe Worker: the Cloudflare location it ran in, null when the runtime does not say. */
+  colo?: string | null;
 }
 
 class UnexpectedResult extends Error {
@@ -191,12 +250,16 @@ class UnexpectedResult extends Error {
   }
 }
 
-const tenth = (value: number) => Math.round(value * 10) / 10;
+export const tenth = (value: number) => Math.round(value * 10) / 10;
 
-/** Opens a session and runs `statements` on it in order; a failure ends the call and is recorded. */
+/**
+ * Opens a session and sends `trips` on it in order, each one a single round trip; a failure ends
+ * the call and is recorded. The request ends with the last answer, so a call of one round trip has
+ * its first answer as its whole request.
+ */
 export async function timeCall(
   open: () => Promise<Session>,
-  statements: readonly Statement[],
+  trips: readonly Trip[],
   now: () => number = () => performance.now(),
 ): Promise<Timed> {
   const started = now();
@@ -205,19 +268,26 @@ export async function timeCall(
   let at: "connect" | StatementName = "connect";
   try {
     session = await open();
-    timed.connect_ms = tenth(now() - started);
+    if (!session.connectionless) timed.connect_ms = tenth(now() - started);
     if (session.socketOpenedAt !== undefined)
       timed.ws_open_ms = tenth(session.socketOpenedAt - started);
-    for (const statement of statements) {
-      at = statement.name;
+    let last = started;
+    for (const trip of trips) {
+      at = trip[0]!.name;
       const sent = now();
-      const rows = await session.query(statement.sql);
-      const answered = now();
-      timed.statements_ms.push(tenth(answered - sent));
-      timed.first_answer_ms ??= tenth(answered - started);
-      if (rows !== statement.rows) throw new UnexpectedResult();
+      const rows =
+        trip.length === 1
+          ? [await session.query(trip[0]!.sql)]
+          : await session.transaction!(trip.map((statement) => statement.sql));
+      last = now();
+      timed.statements_ms.push(tenth(last - sent));
+      timed.first_answer_ms ??= tenth(last - started);
+      for (const [index, statement] of trip.entries()) {
+        at = statement.name;
+        if (rows[index] !== statement.rows) throw new UnexpectedResult();
+      }
     }
-    timed.request_ms = tenth(now() - started);
+    timed.request_ms = tenth(last - started);
     timed.ok = true;
   } catch (error) {
     timed.failed_at = at;
@@ -298,6 +368,96 @@ export function summarize(calls: readonly Timed[]): Summary {
   };
 }
 
+/** log(e^a + e^b) without leaving the range a double can hold. */
+const logAdd = (a: number, b: number) =>
+  Math.max(a, b) + Math.log1p(Math.exp(-Math.abs(a - b)));
+
+/**
+ * The most misses (requests over the gate, or failed) that `n` cold samples may have and still
+ * show a p95 under it with 95 % confidence, or null when `n` is too small for any: the largest
+ * `k` for which a binomial(n, 0.05) has at most 5 % chance of `k` or fewer. Distribution-free:
+ * 59 samples allow 0 misses, 93 allow 1 and 124 allow 2.
+ */
+export function allowedMisses(n: number): number | null {
+  const limit = Math.log(0.05);
+  const ratio = Math.log(0.05 / 0.95);
+  // The log of P(X = k), built term by term, and of P(X <= k).
+  let term = n * Math.log(0.95);
+  let cumulative = term;
+  if (cumulative > limit) return null;
+  for (let k = 0; k < n; k++) {
+    term += Math.log((n - k) / (k + 1)) + ratio;
+    const next = logAdd(cumulative, term);
+    if (next > limit) return k;
+    cumulative = next;
+  }
+  return n;
+}
+
+export interface Verdict {
+  /** Cold samples of the arm, a failed or skipped call among them. */
+  n: number;
+  /** Misses: the calls that failed and the requests that did not finish under the gate. */
+  over_1s: number;
+  allowed_over_1s: number | null;
+  /** `met`: the whole request's p95 is under the gate with 95 % confidence; `too_few`: no result could show it. */
+  result: "met" | "not_met" | "too_few";
+}
+
+export interface ArmSummary extends Summary {
+  verdict: Verdict;
+}
+
+/** The summary of one arm's cold samples, with the verdict of the distribution-free rule on the whole request. */
+export function summarizeArm(calls: readonly Timed[]): ArmSummary {
+  const over = calls.filter(
+    (call) => !(call.ok && call.request_ms! < GATE_MS),
+  ).length;
+  const allowed = allowedMisses(calls.length);
+  return {
+    ...summarize(calls),
+    verdict: {
+      n: calls.length,
+      over_1s: over,
+      allowed_over_1s: allowed,
+      result:
+        allowed === null ? "too_few" : over <= allowed ? "met" : "not_met",
+    },
+  };
+}
+
+/** One GET of `/healthz`: until the answer was read, its status, and the location in the `cf-ray` header. */
+export interface GetTiming {
+  ms: number;
+  status: number;
+  ray_colo: string | null;
+}
+
+/** What the probe Worker answers for `mode=healthz`: two back-to-back GETs on each path. */
+export interface HealthzSample {
+  colo: string | null;
+  public: GetTiming[];
+  /** Null when the Worker has no service binding to the Edge. */
+  binding: GetTiming[] | null;
+}
+
+/** The p50 and p95 of the first and of the second GET on each path; a sample that failed is null. */
+export function summarizeHealthz(samples: readonly (HealthzSample | null)[]) {
+  const done = samples.filter(
+    (sample): sample is HealthzSample => sample !== null,
+  );
+  const column = (path: "public" | "binding", call: 0 | 1) => {
+    const values = done.flatMap((sample) => sample[path]?.[call]?.ms ?? []);
+    return { p50: percentile(values, 0.5), p95: percentile(values, 0.95) };
+  };
+  return {
+    samples: samples.length,
+    failures: samples.length - done.length,
+    public: { first: column("public", 0), second: column("public", 1) },
+    binding: { first: column("binding", 0), second: column("binding", 1) },
+  };
+}
+
 /** A command line or environment that cannot be used; its message names the flag or variable, never a value. */
 export class UsageError extends Error {}
 
@@ -308,6 +468,7 @@ export type Command =
   | {
       command: "call";
       database: string;
+      arms: Arm[];
       via: Via;
       seed: number;
       scale: number;
@@ -317,6 +478,7 @@ export type Command =
   | {
       command: "run";
       databases: string[];
+      arms: Arm[];
       via: Via;
       seed: number;
       scale: number;
@@ -324,17 +486,24 @@ export type Command =
       followups: number;
       rounds: number;
       parallel: boolean;
-    };
+    }
+  | { command: "healthz"; samples: number; idleS: number };
 
 export const USAGE = `usage:
-  saas-bench setup --database <id> [--scale <n>]
-  saas-bench call  --database <id> [--idle-s <s>] [--followups <n>] [--via local|probe] [--seed <n>] [--scale <n>]
-  saas-bench run   --databases <id,id,...> --rounds <n> --idle-s <s> [--followups <n>] [--parallel] [--via local|probe] [--seed <n>] [--scale <n>]`;
+  saas-bench setup   --database <id> [--scale <n>]
+  saas-bench call    --database <id> [--idle-s <s>] [--followups <n>] [--mode ${ARMS.join("|")}] [--via local|probe] [--seed <n>] [--scale <n>]
+  saas-bench run     --databases <id,id,...> --rounds <n> --idle-s <s> [--mode <arm,arm,...>] [--followups <n>] [--parallel] [--via local|probe] [--seed <n>] [--scale <n>]
+  saas-bench healthz [--samples <n>] [--idle-s <s>]`;
 
 /** Reads the command line; throws a message, never a credential, for a line that does not parse. */
 export function parseCommand(argv: readonly string[]): Command {
   const [command, ...rest] = argv;
-  if (command !== "setup" && command !== "call" && command !== "run")
+  if (
+    command !== "setup" &&
+    command !== "call" &&
+    command !== "run" &&
+    command !== "healthz"
+  )
     throw new UsageError(USAGE);
   const options = new Map<string, string | true>();
   for (let index = 0; index < rest.length; index++) {
@@ -354,17 +523,19 @@ export function parseCommand(argv: readonly string[]): Command {
   }
   const known: Record<string, readonly string[]> = {
     setup: ["database", "scale"],
-    call: ["database", "idle-s", "followups", "via", "seed", "scale"],
+    call: ["database", "idle-s", "followups", "mode", "via", "seed", "scale"],
     run: [
       "databases",
       "rounds",
       "idle-s",
       "followups",
+      "mode",
       "parallel",
       "via",
       "seed",
       "scale",
     ],
+    healthz: ["samples", "idle-s"],
   };
   for (const name of options.keys())
     if (!known[command]!.includes(name))
@@ -407,34 +578,62 @@ export function parseCommand(argv: readonly string[]): Command {
       throw new UsageError("--via must be local or probe");
     return raw;
   };
+  const arms = (): Arm[] => {
+    const raw = options.get("mode") ?? "ws";
+    const list = typeof raw === "string" ? raw.split(",") : [];
+    if (
+      !list.every((arm): arm is Arm =>
+        (ARMS as readonly string[]).includes(arm),
+      ) ||
+      new Set(list).size !== list.length
+    )
+      throw new UsageError(`--mode needs distinct arms of ${ARMS.join(", ")}`);
+    return list;
+  };
   if (command === "setup")
     return {
       command,
       database: database("database", options.get("database")),
       scale,
     };
+  if (command === "healthz")
+    return {
+      command,
+      samples: integer("samples", 30, 1),
+      idleS: integer("idle-s", 0, 0),
+    };
   const common = {
+    arms: arms(),
     via: via(),
     seed: integer("seed", 1, 0),
     scale,
     idleS: integer("idle-s", command === "call" ? 0 : null, 0),
     followups: integer("followups", 0, 0),
   };
-  if (command === "call")
+  if (command === "call") {
+    if (common.arms.length !== 1)
+      throw new UsageError("--mode takes one arm for a call");
     return {
       command,
       database: database("database", options.get("database")),
       ...common,
     };
+  }
   const list = options.get("databases");
   const databases = typeof list === "string" ? list.split(",") : [];
   if (databases.length === 0 || new Set(databases).size !== databases.length)
     throw new UsageError("--databases needs distinct database ids");
   for (const id of databases) database("databases", id);
+  const rounds = integer("rounds", null, 1);
+  // Each database takes each arm equally often only over whole turns of the arms.
+  if (rounds % common.arms.length !== 0)
+    throw new UsageError(
+      "--rounds must be a multiple of the number of --mode arms",
+    );
   return {
     command,
     databases,
-    rounds: integer("rounds", null, 1),
+    rounds,
     parallel: options.get("parallel") === true,
     ...common,
   };
