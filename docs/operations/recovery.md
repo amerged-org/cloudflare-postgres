@@ -180,12 +180,13 @@ with the owner's go for a reboot. The endpoints require an admin API key.
    `Idempotency-Key` and `{"expected_node_uid":"<verified UID>"}`. It answers 202 with the
    operation and a `Location`. Placement on the node is closed, and the node holds new wakes
    with `57P03`, puts every awake database to sleep with the proof, installs the packages of the
-   lock and purges the installed packages the lock no longer names (never a kernel image or an
-   essential package), reboots if the kernel or core libraries changed, runs its check and
-   reports. Repeating the request while the cycle is open returns the same operation. Until the
-   cycle ends the capacity cron of the region buys no node for the shortage that the closed
-   placement causes: `GET /v1/regions/{id}/capacity-decision` says `maintenance`. A `failed`
-   cycle leaves placement closed and the cron buys again, as it does for any closed node.
+   lock and reboots if the kernel or core libraries changed. It purges the installed packages the
+   lock no longer names (never a kernel image, an essential or protected package) when nothing
+   needs a reboot, or, after a reboot, in the cycle it runs for the open order once it is up; then
+   it runs its check and reports. Repeating the request while the cycle is open returns the same
+   operation. Until the cycle ends the capacity cron buys no node in the region at all, whatever
+   the shortage: `GET /v1/regions/{id}/capacity-decision` says `maintenance`. A `failed` cycle
+   leaves placement closed and the cron buys again, as it does for any closed node.
 3. Poll `GET /v1/nodes/{id}/maintenance/{operation}`. `open` becomes `done` or `failed`; a
    `failed` cycle names the class of the failure in `result_reason` (such as `power_busy` or
    `power_archive` for a database that did not sleep with the proof, `release_missing`,

@@ -517,7 +517,8 @@ impl<M: Machine> Service<M> {
                 }
                 match outcome {
                     // The node reboots: the page lists the order until it is answered, and the
-                    // agent that starts after the boot finds the packages in place.
+                    // agent that starts after the boot finds the packages in place, purges what
+                    // the lock dropped, checks the node and answers.
                     Ok(true) => {}
                     Ok(false) => match self.machine.health_check().await {
                         Ok(()) => self.core.report_order(&operation, Ok(())),
@@ -570,8 +571,9 @@ impl<M: Machine> Service<M> {
     }
 
     /// Brings the packages to the lock of the release (plan 9.3): what the node lacks or has in
-    /// another version is installed, what the lock no longer names is purged, and `true` is
-    /// returned if the node reboots for it.
+    /// another version is installed, and `true` is returned if the node reboots for it. What the
+    /// lock no longer names is purged by the cycle that has nothing to install, so after the boot
+    /// where there is one.
     async fn cycle(&self) -> Result<bool, &'static str> {
         let release = self
             .release
@@ -601,18 +603,13 @@ impl<M: Machine> Service<M> {
             .ok()
             .and_then(|bytes| update::Lock::parse(&bytes))
             .ok_or("lock_not_read")?;
-        let installed = self
+        let mut installed = self
             .machine
             .installed_packages()
             .await
             .map_err(|_| "packages_not_read")?;
         let plan = update::plan(&lock, &installed);
-        let installing = !(plan.versions.is_empty() && plan.files.is_empty());
-        let mut stale = update::purgeable(&lock, &installed);
-        if !installing && stale.is_empty() {
-            return Ok(false);
-        }
-        if installing {
+        if !(plan.versions.is_empty() && plan.files.is_empty()) {
             let mut files = Vec::new();
             for package in &plan.files {
                 let path = work.join(format!("{}.deb", package.name));
@@ -631,26 +628,28 @@ impl<M: Machine> Service<M> {
                 .install_packages(&release.debian_snapshot, &plan.versions, &files)
                 .await
                 .map_err(|_| "packages_not_installed")?;
+            // Nothing that can fail comes between the install of a kernel and its boot: the order
+            // stays open, and the cycle that runs after the boot finds nothing to install, purges,
+            // checks and answers.
+            if plan.reboot {
+                self.machine.reboot().await.map_err(|_| "reboot_failed")?;
+                return Ok(true);
+            }
             // Apt may have replaced or removed packages: the purge follows what is installed now.
-            stale = update::purgeable(
-                &lock,
-                &self
-                    .machine
-                    .installed_packages()
-                    .await
-                    .map_err(|_| "packages_not_read")?,
-            );
+            installed = self
+                .machine
+                .installed_packages()
+                .await
+                .map_err(|_| "packages_not_read")?;
         }
+        let stale = update::purgeable(&lock, &installed);
         if !stale.is_empty() {
             self.machine
                 .purge_packages(&stale)
                 .await
                 .map_err(|_| "packages_not_installed")?;
         }
-        if plan.reboot {
-            self.machine.reboot().await.map_err(|_| "reboot_failed")?;
-        }
-        Ok(plan.reboot)
+        Ok(false)
     }
 
     // ---- the gateway brings the wakes
@@ -1703,6 +1702,107 @@ mod tests {
             cloud.with(|inner| inner.hellos.iter().any(|hello| hello["os"] == said))
         })
         .await;
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_kernel_reboots_the_node_before_a_purge_that_dpkg_may_refuse() {
+        let Some((machine, _fixture, _root)) = site("maintenance-purge-refused", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1", &same(b"bin"));
+        // The node runs lock A with the kernel 6.12.111; lock B has the kernel 6.12.113 and drops
+        // `libdropped1`, and dpkg refuses to purge it once.
+        machine.set_packages(&[
+            ("bash", "5.2"),
+            ("libdropped1", "1.0"),
+            ("linux-image-6.12.111+deb13-amd64", "6.12.111-1"),
+        ]);
+        machine.fail_next_purge();
+        let cloud = Cloud::start().await;
+        let lock = json!({
+            "packages": [
+                {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
+                {"name": "linux-image-6.12.113+deb13-amd64", "version": "6.12.113-1", "architecture": "amd64", "url": "https://snapshot.example/k.deb", "size": 10, "sha256": "c".repeat(64)},
+            ],
+            "extra": [],
+        })
+        .to_string();
+        let release = release_of(&cloud, "r1", &same(b"bin"), lock.as_bytes());
+        let order = |operation: &str| {
+            cloud.with(|inner| {
+                inner.release = Some(release.clone());
+                inner.orders = vec![json!({"type": "maintenance", "operation": operation})];
+            })
+        };
+        let answer = |operation: &str| {
+            cloud
+                .acknowledged("/node/v1/observations")
+                .iter()
+                .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                .find(|order| order["operation"] == operation)
+        };
+        order("op_rrrrrrrrrrrrrrrrrrrr");
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        // The kernel is installed and the node reboots: nothing that can fail comes between.
+        eventually(60, "the node to reboot", || {
+            machine.calls().contains(&"reboot".to_string())
+        })
+        .await;
+        service.stop();
+        let calls = machine.calls();
+        assert!(
+            calls.iter().all(|call| !call.starts_with("purge")),
+            "{calls:?}"
+        );
+        assert_eq!(
+            machine.boot().unwrap().kernel_release,
+            "6.12.113+deb13-amd64"
+        );
+
+        // After the boot the order is still open. Nothing is left to install; the purge is
+        // refused, and the order fails with the node on the new kernel.
+        machine.clear_calls();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(60, "the order to fail", || {
+            answer("op_rrrrrrrrrrrrrrrrrrrr").is_some()
+        })
+        .await;
+        let failed = answer("op_rrrrrrrrrrrrrrrrrrrr").unwrap();
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_eq!(failed["reason"], "packages_not_installed", "{failed}");
+        let calls = machine.calls();
+        assert!(
+            calls.contains(&"purge libdropped1".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.starts_with("install") && call != "reboot"),
+            "{calls:?}"
+        );
+        service.stop();
+
+        // The order is submitted again: the purge goes through and the node answers done.
+        machine.clear_calls();
+        order("op_ssssssssssssssssssss");
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(60, "the order to be done", || {
+            answer("op_ssssssssssssssssssss").is_some()
+        })
+        .await;
+        assert_eq!(answer("op_ssssssssssssssssssss").unwrap()["status"], "done");
+        assert!(
+            !machine
+                .installed_packages()
+                .await
+                .unwrap()
+                .contains_key("libdropped1")
+        );
         service.stop();
     }
 

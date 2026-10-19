@@ -57,6 +57,8 @@ struct State {
     start_fails: bool,
     /// `reboot` fails once, and the node keeps running.
     reboot_fails: bool,
+    /// `purge_packages` fails once, as dpkg does for a package that others depend on.
+    purge_fails: bool,
     /// How long the next start takes before the postmaster begins.
     start_delay: Option<Duration>,
     /// LVM, or systemd, cannot be read: what they hold is not known.
@@ -222,6 +224,9 @@ impl Local {
     }
     pub fn fail_next_reboot(&self) {
         self.state().reboot_fails = true;
+    }
+    pub fn fail_next_purge(&self) {
+        self.state().purge_fails = true;
     }
     pub fn set_volumes_unreadable(&self, unreadable: bool) {
         self.state().volumes_unreadable = unreadable;
@@ -776,6 +781,11 @@ impl Machine for Local {
     async fn purge_packages(&self, names: &[String]) -> io::Result<()> {
         let mut state = self.state();
         state.calls.push(format!("purge {}", names.join(" ")));
+        if std::mem::take(&mut state.purge_fails) {
+            return Err(io::Error::other(
+                "dpkg --purge ended with exit status: 1: dependency problems - not removing",
+            ));
+        }
         for name in names {
             state.packages.remove(name);
         }

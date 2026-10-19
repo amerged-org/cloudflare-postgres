@@ -24,18 +24,18 @@ const PROBE_EXPIRY_MS = NODE_PROBE_EXPIRY_SECONDS * 1000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 interface NodeRow {
-  last_observed_at: string | null;
   os_boot_id: string | null;
   os_previous_observed_at: string | null;
 }
 
 /**
  * Whether a maintenance order of the node was open when its last sample of the previous boot
- * arrived, or closed after it: an order the node's own reboot belongs to. Until this boot's hello
- * is stored, the node's newest sample is that sample. The hello keeps it when it stores the new
- * boot (`os_previous_observed_at`): the newest sample the node's actor holds, which D1 may not have yet, because from then on the newest sample can be this boot's. An
- * order made after it, while the node was down, is not the reason for the reboot, and a node that
- * never sampled has no order.
+ * arrived, or closed after it: an order the node's own reboot belongs to. The hello of the new boot
+ * stores that sample (`os_previous_observed_at`): the newest sample the node's actor holds, which
+ * D1 may not have yet. A report whose boot has no hello stored yet is refused for the agent to
+ * send again: D1's `last_observed_at` can be a minute older than that sample, and a verdict from
+ * it can say that no order was open when one was. An order made after the sample, while the node
+ * was down, is not the reason for the reboot, and a node that never sampled has no order.
  */
 async function rebootWasAsked(
   db: D1Database,
@@ -43,15 +43,16 @@ async function rebootWasAsked(
   bootId: string,
 ): Promise<boolean> {
   const node = await db
-    .prepare(
-      "SELECT last_observed_at,os_boot_id,os_previous_observed_at FROM nodes WHERE id=?",
-    )
+    .prepare("SELECT os_boot_id,os_previous_observed_at FROM nodes WHERE id=?")
     .bind(nodeId)
     .first<NodeRow>();
-  const at =
-    node?.os_boot_id === bootId
-      ? node.os_previous_observed_at
-      : (node?.last_observed_at ?? null);
+  if (node?.os_boot_id !== bootId)
+    throw new ApiError(
+      "capacity_exhausted",
+      "The hello of this boot is not stored yet; send the report again",
+      { reason: "not_ready" },
+    );
+  const at = node.os_previous_observed_at;
   if (at === null) return false;
   const open = await db
     .prepare(
@@ -68,7 +69,9 @@ async function rebootWasAsked(
  * when its boot ID changed. The report is stored whole, once for a boot: the agent sends it again
  * when the answer was lost, and that send is answered with the stored report's id and verdict. An
  * unexpected reboot (no maintenance order asked for it) is what the `node_unexpected_reboot` alert
- * reads; a report of an agent that knew no earlier boot claims no reboot at all.
+ * reads; a report of an agent that knew no earlier boot claims no reboot at all. A report that
+ * reaches the API before the hello of its boot is stored (the agent does not order the two) is
+ * refused as not ready, and the agent sends it again.
  */
 export async function nodeBootReport(
   c: ApiContext,

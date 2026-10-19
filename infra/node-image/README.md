@@ -352,12 +352,15 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   Then it purges the installed packages the lock does not name, with `dpkg --purge`, so that the
   node has the lock's packages and no others and its hello says the release's digest. Never a kernel
   image (Debian keeps the previous one for the boot menu, and the digest leaves idle ones out),
-  never a package that `dpkg-query` marks essential, never a name that is not a package name, and
-  nothing at all for a lock that names no kernel image. Dpkg refuses a package that an installed
-  package depends on; the cycle then fails with `packages_not_installed`.
-  The node reboots if a kernel image, `libc6`, `systemd`, `libsystemd0` or `udev` changed. After
-  the packages, or after the boot, it runs `pgcf-agent check` of the installed release and answers
-  the order.
+  never a package that `dpkg-query` marks essential or protected (Debian marks `login`, `libgcc-s1`
+  and `systemd-sysv` protected), never a name that is not a package name, and nothing at all for a
+  lock that names no kernel image. Dpkg refuses a package that an installed package depends on; the
+  cycle then fails with `packages_not_installed`.
+  The node reboots if a kernel image, `libc6`, `systemd`, `libsystemd0` or `udev` changed, right
+  after the install and before any purge: the agent runs the cycle again for the open order once it
+  is up, finds nothing to install, purges, and a refused purge then fails the order on the new
+  kernel. After the purge, or after the boot, it runs `pgcf-agent check` of the installed release
+  and answers the order.
 
 ## Security
 

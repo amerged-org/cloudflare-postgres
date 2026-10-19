@@ -492,7 +492,7 @@ impl Machine for Node {
             return Err(io::Error::other(format!("{name:?} is not a package name")));
         }
         let output = tokio::process::Command::new("dpkg-query")
-            .args(["-W", "-f", "${Package}\t${Essential}\n"])
+            .args(["-W", "-f", "${Package}\t${Essential}\t${Protected}\n"])
             .args(names)
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
@@ -501,7 +501,7 @@ impl Machine for Node {
         if !output.status.success() {
             return Err(io::Error::other("dpkg-query failed"));
         }
-        let names = crate::update::without_essential(
+        let names = crate::update::without_protected(
             names.to_vec(),
             &String::from_utf8_lossy(&output.stdout),
         );

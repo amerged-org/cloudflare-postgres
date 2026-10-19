@@ -275,19 +275,22 @@ pub fn purgeable(lock: &Lock, installed: &BTreeMap<String, String>) -> Vec<Strin
         .collect()
 }
 
-/// `names` without the packages `dpkg-query -W -f '${Package}\t${Essential}\n'` says are essential:
-/// dpkg refuses to remove them, and removing one would end the node.
-pub fn without_essential(names: Vec<String>, dpkg: &str) -> Vec<String> {
-    let essential: std::collections::BTreeSet<&str> = dpkg
+/// `names` without the packages that `dpkg-query -W -f '${Package}\t${Essential}\t${Protected}\n'`
+/// says are essential or protected: dpkg refuses to remove them (Debian marks `login`, `libgcc-s1`
+/// and `systemd-sysv` protected without making them essential), and removing one would end the
+/// node.
+pub fn without_protected(names: Vec<String>, dpkg: &str) -> Vec<String> {
+    let refused: std::collections::BTreeSet<&str> = dpkg
         .lines()
         .filter_map(|line| {
-            let (name, essential) = line.split_once('\t')?;
-            (essential.trim() == "yes").then_some(name)
+            let mut fields = line.split('\t');
+            let name = fields.next()?;
+            fields.any(|field| field.trim() == "yes").then_some(name)
         })
         .collect();
     names
         .into_iter()
-        .filter(|name| !essential.contains(name.as_str()))
+        .filter(|name| !refused.contains(name.as_str()))
         .collect()
 }
 
@@ -501,11 +504,15 @@ mod tests {
     }
 
     #[test]
-    fn dpkg_says_which_packages_are_essential_and_those_are_never_purged() {
-        let names: Vec<String> = ["libdropped1", "bash", "netbase"].map(String::from).into();
-        // `dpkg-query -W -f '${Package}\t${Essential}\n'`: the field is empty for most packages.
-        let output = "libdropped1\t\nbash\tyes\nnetbase\t\n";
-        assert_eq!(without_essential(names, output), ["libdropped1", "netbase"]);
+    fn dpkg_says_which_packages_are_essential_or_protected_and_those_are_never_purged() {
+        let names: Vec<String> = ["libdropped1", "bash", "netbase", "login", "libgcc-s1"]
+            .map(String::from)
+            .into();
+        // `dpkg-query -W -f '${Package}\t${Essential}\t${Protected}\n'`: a field is empty or "no"
+        // for most packages. Debian marks `login` and `libgcc-s1` protected, not essential.
+        let output =
+            "libdropped1\t\t\nbash\tyes\tno\nnetbase\tno\t\nlogin\tno\tyes\nlibgcc-s1\t\tyes\n";
+        assert_eq!(without_protected(names, output), ["libdropped1", "netbase"]);
     }
 
     #[test]

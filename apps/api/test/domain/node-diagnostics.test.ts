@@ -20,7 +20,7 @@ import {
   nodeSample,
   request,
 } from "./fixtures.ts";
-import { nextMessage, openLink } from "./node-fixtures.ts";
+import { heldLink, nextMessage, openLink } from "./node-fixtures.ts";
 
 afterEach(cleanupFixtures);
 
@@ -67,10 +67,10 @@ const maintenance = (f: F, created: string, closed: string | null = null) =>
     )
     .run();
 /**
- * The node's agent, started at `bootedAt` on the boot `BOOT`: its hello says so over the link, and
- * its first sample, a minute old, is stored. The link stays open for the caller to close.
+ * The agent of the node says hello over a new link, on the boot `BOOT` unless the change names
+ * another, and the link stays open for the caller to close.
  */
-async function started(f: F, bootedAt: string) {
+async function greeted(f: F, change: Record<string, unknown> = {}) {
   const socket = await openLink(f, false);
   const welcome = nextMessage(socket);
   socket.send(
@@ -79,10 +79,30 @@ async function started(f: F, bootedAt: string) {
       protocol: 1,
       agent_version: "0.1.0",
       release_id: null,
-      os: nodeOs({ boot_id: BOOT, booted_at: bootedAt }),
+      os: nodeOs({ boot_id: BOOT, ...change }),
     }),
   );
   await welcome;
+  return socket;
+}
+const observedAt = (f: F) =>
+  env.DB.prepare("SELECT last_observed_at FROM nodes WHERE id=?")
+    .bind(f.node)
+    .first<string | null>("last_observed_at");
+/** Waits until `done` holds, up to two seconds. */
+async function until(done: () => Promise<boolean>) {
+  for (let i = 0; i < 400; i++) {
+    if (await done()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("not_reached");
+}
+/**
+ * The node's agent, started at `bootedAt` on the boot `BOOT`: its hello says so over the link, and
+ * its first sample, a minute old, is stored. The link stays open for the caller to close.
+ */
+async function started(f: F, bootedAt: string) {
+  const socket = await greeted(f, { booted_at: bootedAt });
   const observed = ago(MINUTE);
   socket.send(
     JSON.stringify({
@@ -90,16 +110,8 @@ async function started(f: F, bootedAt: string) {
       sample: nodeSample(Date.parse(observed)),
     }),
   );
-  for (let i = 0; i < 400; i++) {
-    const row = await env.DB.prepare(
-      "SELECT last_observed_at FROM nodes WHERE id=?",
-    )
-      .bind(f.node)
-      .first<{ last_observed_at: string }>();
-    if (row!.last_observed_at === observed) return socket;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error("sample_not_stored");
+  await until(async () => (await observedAt(f)) === observed);
+  return socket;
 }
 const stored = (f: F) =>
   env.DB.prepare(
@@ -114,8 +126,21 @@ const stored = (f: F) =>
       body: string;
     }>()
     .then((rows) => rows.results);
-const reboot = async (f: F, body: unknown = report()) =>
-  (await send(f, body)).json<{ id: string; expected_reboot: boolean | null }>();
+/**
+ * The agent's report of a reboot. Its hello of the new boot has reached the API first, as the API
+ * requires (the agent sends the report again until it has).
+ */
+const reboot = async (f: F, body: ReturnType<typeof report> = report()) => {
+  const stored = await env.DB.prepare("SELECT os_boot_id FROM nodes WHERE id=?")
+    .bind(f.node)
+    .first<string | null>("os_boot_id");
+  if (stored !== body.boot_id)
+    (await greeted(f, { boot_id: body.boot_id })).close(1000);
+  return (await send(f, body)).json<{
+    id: string;
+    expected_reboot: boolean | null;
+  }>();
+};
 const episode = async (f: F) => {
   await runCron(env, Date.now());
   const row = await env.DB.prepare(
@@ -135,6 +160,7 @@ describe("a boot report whose reboot nobody asked for", () => {
   it("is kept and raises node_unexpected_reboot for the node", async () => {
     const f = await fixture();
     await sampled(f, ago(2 * MINUTE));
+    (await greeted(f)).close(1000);
     const answer = await send(f, report());
     expect(answer.status).toBe(200);
     expect(await answer.json()).toEqual({
@@ -213,6 +239,51 @@ describe("a boot report whose reboot nobody asked for", () => {
     expect((await reboot(f)).expected_reboot).toBe(true);
     socket.close(1000);
   });
+
+  it("waits for the hello of its boot, and is then judged by the newest sample the actor holds", async () => {
+    const f = await fixture();
+    // Both samples fall into one minute that has a few seconds to run, so that D1 holds the first
+    // until the minute's alarm: from 4 s to 40 s into a minute, or wait for the next one's 5 s.
+    const phase = Date.now() % MINUTE;
+    if (phase < 4_000 || phase > MINUTE - 20_000)
+      await new Promise((resolve) =>
+        setTimeout(resolve, (5_000 - phase + MINUTE) % MINUTE),
+      );
+    const now = Date.now(),
+      iso = (at: number) => new Date(at).toISOString();
+    const sample = (at: number) =>
+      JSON.stringify({ type: "sample", sample: nodeSample(at) });
+    // The previous boot samples, an order is made, and the node samples again before it goes down.
+    const before = await greeted(f, { boot_id: PREVIOUS });
+    before.send(sample(now - 3_000));
+    await until(async () => (await observedAt(f)) === iso(now - 3_000));
+    // The actor opens the node after it writes the first sample; later samples wait for the alarm.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await maintenance(f, iso(now - 2_000));
+    before.send(sample(now - 1_000));
+    await until(
+      async () =>
+        (await heldLink(f.node)).sample?.observed_at === iso(now - 1_000),
+    );
+    expect(await observedAt(f)).toBe(iso(now - 3_000));
+    before.close(1000);
+
+    // The report is at the API before the hello of the new boot: the newest sample is not in D1
+    // yet, so it is sent again.
+    const early = await send(f, report());
+    expect(early.status).toBe(503);
+    expect(early.headers.get("Retry-After")).toBe("5");
+    expect(await early.json()).toMatchObject({
+      error: { code: "capacity_exhausted", details: { reason: "not_ready" } },
+    });
+    expect(await stored(f)).toEqual([]);
+
+    // The hello stores the sample the actor holds as the end of the previous boot: the order was
+    // open at it.
+    (await greeted(f)).close(1000);
+    expect((await reboot(f)).expected_reboot).toBe(true);
+    expect(await episode(f)).toBeNull();
+  }, 60_000);
 
   it("is not blamed on an order made while the node was down, also when this boot has said hello and sampled, or its agent restarted", async () => {
     const f = await fixture();

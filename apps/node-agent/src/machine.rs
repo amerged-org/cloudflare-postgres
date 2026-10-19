@@ -257,7 +257,7 @@ pub trait Machine: Send + Sync + 'static {
         files: &[PathBuf],
     ) -> impl Future<Output = io::Result<()>> + Send;
     /// Purges these packages (`update::purgeable`) with dpkg, which refuses one that an installed
-    /// package depends on. A package that is essential is left alone. The names have been checked
+    /// package depends on. A package that is essential or protected is left alone. The names have been checked
     /// as package names: they are words of a command line.
     fn purge_packages(&self, names: &[String]) -> impl Future<Output = io::Result<()>> + Send;
     /// Reboots the node. The databases are asleep with their proofs when this is called.
