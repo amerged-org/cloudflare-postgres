@@ -2,7 +2,6 @@
 import { DatabaseId } from "@pgcf/contracts";
 import { DatabasePresence } from "../database-actor.ts";
 import type { ApiContext, Env } from "../env.ts";
-import { eachBounded } from "./bounded.ts";
 
 /**
  * The DatabaseActor of a database. A new object is created at the installation's configured
@@ -94,6 +93,9 @@ export async function reconcileDatabaseActors(
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200)
     throw new Error("invalid_actor_page_limit");
   const until = Date.now() + budgetMs;
+  // Not a static import: a ticket claim loads this module (`actor-admission-imports.test.ts` pins
+  // how little else it loads), and only the cron reads a page.
+  const { eachBounded } = await import("./bounded.ts");
   const page = await env.DB.prepare(
     `SELECT id FROM databases ${after ? "WHERE id>?" : ""} ORDER BY id LIMIT ?`,
   )

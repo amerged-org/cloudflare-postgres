@@ -26,6 +26,8 @@ rm -rf "$work"
 mkdir -p "$work"
 # Copy the definition without host ownership or extended attributes.
 cp -r --preserve=mode /src "$work/src"
+# The modes of the tree are the ones the list of host files states, not the checkout's umask's.
+bash /src/builder/normalize-modes.sh "$work/src/mkosi.extra"
 
 mkosi_args=(
   --directory="$work/src"

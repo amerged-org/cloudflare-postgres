@@ -142,5 +142,6 @@ erDiagram
 - [apps/api/migrations/0076_admin_accountability.sql:1](../../../apps/api/migrations/0076_admin_accountability.sql#L1)
 - [apps/api/migrations/0077_release_signature.sql:1](../../../apps/api/migrations/0077_release_signature.sql#L1)
 - [apps/api/migrations/0078_node_shell_state.sql:1](../../../apps/api/migrations/0078_node_shell_state.sql#L1)
+- [apps/api/migrations/0079_release_host_files.sql:1](../../../apps/api/migrations/0079_release_host_files.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

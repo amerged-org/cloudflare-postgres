@@ -219,6 +219,36 @@ it("gives a node the columns of its hello and drops the releases that state no O
     expect(() => report(column, value), column).toThrow(/CHECK/);
 });
 
+it("gives a node the column of the host files it holds and drops the releases that state none", () => {
+  populate();
+  for (const name of migrations.filter((v) => v >= "0063" && v < "0079"))
+    apply(name);
+  run(
+    "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES('old','{}',?,?)",
+    "b".repeat(64),
+    NOW,
+  );
+  run(
+    "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES('eu-test','old',1,?)",
+    NOW,
+  );
+  apply("0079_release_host_files.sql");
+  // The node's row and what it reported stay; a release without host files cannot be read as a
+  // spec any more and goes with the assignments that name it.
+  const count = (table: string) =>
+    db.prepare(`SELECT count(*) n FROM ${table}`).get();
+  expect(count("fleet_releases")).toEqual({ n: 0 });
+  expect(count("fleet_region_releases")).toEqual({ n: 0 });
+  expect(
+    db.prepare("SELECT os_host_files_sha256 FROM nodes WHERE id=?").get(node),
+  ).toEqual({ os_host_files_sha256: null });
+  const report = (value: string) =>
+    run("UPDATE nodes SET os_host_files_sha256=? WHERE id=?", value, node);
+  report("a".repeat(64));
+  for (const value of ["A".repeat(64), "a".repeat(63), "a".repeat(65)])
+    expect(() => report(value)).toThrow(/CHECK/);
+});
+
 it("keeps a boot report per node, bounded, and widens the alert kinds with the unexpected reboot", () => {
   populate();
   for (const name of migrations.filter((v) => v >= "0063" && v < "0073"))

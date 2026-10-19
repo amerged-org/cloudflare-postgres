@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub(crate) mod events;
 pub mod fence;
 pub mod gateway;
+pub mod hostfiles;
 pub mod layout;
 pub mod link;
 pub mod machine;

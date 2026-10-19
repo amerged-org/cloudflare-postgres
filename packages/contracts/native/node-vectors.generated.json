@@ -478,7 +478,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -940,7 +950,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -1200,7 +1220,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -1295,7 +1325,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -1439,7 +1479,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -1528,7 +1578,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -1616,7 +1676,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -1704,7 +1774,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -2011,7 +2091,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -2317,7 +2407,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -2623,7 +2723,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -2968,7 +3078,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -3276,7 +3396,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -3400,7 +3530,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -3524,7 +3664,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -3643,7 +3793,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -3955,7 +4115,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -4262,7 +4432,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -4386,7 +4566,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -4510,7 +4700,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -4634,7 +4834,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -4771,7 +4981,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -4908,7 +5128,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -5041,7 +5271,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -5174,7 +5414,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -5308,7 +5558,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -5434,7 +5694,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -5566,7 +5836,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -5710,7 +5990,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -5827,7 +6117,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -5950,7 +6250,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -6070,7 +6380,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -6185,7 +6505,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -6308,7 +6638,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -6431,7 +6771,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -6554,7 +6904,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -6678,7 +7038,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -6811,7 +7181,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -6935,7 +7315,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -7103,7 +7493,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -7402,7 +7802,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -7696,7 +8106,17 @@
               "url": "https://releases.example/packages.lock.json",
               "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "size_bytes": 2000
-            }
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
           }
         },
         "policy": {
@@ -10489,7 +10909,8 @@
           "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
           "booted_at": "2026-10-17T12:00:00.000Z",
           "kernel_release": "6.12.111+deb13-amd64",
-          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "host_files_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         }
       }
     },
@@ -10540,7 +10961,8 @@
           "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
           "booted_at": "2026-10-17T12:00:00.000Z",
           "kernel_release": "6.12.111+deb13-amd64",
-          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "host_files_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         }
       }
     },
@@ -10570,7 +10992,8 @@
           "boot_id": "boot",
           "booted_at": "2026-10-17T12:00:00.000Z",
           "kernel_release": "6.12.111+deb13-amd64",
-          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "host_files_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         }
       }
     },
@@ -10772,10 +11195,66 @@
             "url": "https://releases.example/packages.lock.json",
             "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
             "size_bytes": 90000
-          }
+          },
+          "host_files": [
+            {
+              "path": "/etc/ssh/sshd_config.d/10-pgcf.conf",
+              "kind": "file",
+              "mode": "0644",
+              "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+              "size_bytes": 1500,
+              "apply": "restart_unit:ssh.service"
+            },
+            {
+              "path": "/etc/systemd/system/modprobe@loop.service",
+              "kind": "symlink-to-dev-null",
+              "apply": "daemon_reload"
+            },
+            {
+              "path": "/usr/lib/sysctl.d/90-pgcf.conf",
+              "kind": "file",
+              "mode": "0644",
+              "sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+              "size_bytes": 800,
+              "apply": "restart_unit:systemd-sysctl.service"
+            },
+            {
+              "path": "/usr/lib/systemd/system/pgcf-agent.service",
+              "kind": "file",
+              "mode": "0644",
+              "sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+              "size_bytes": 1100,
+              "apply": "restart_unit:pgcf-agent.service"
+            },
+            {
+              "path": "/usr/lib/systemd/system/pgcf-pg@.service",
+              "kind": "file",
+              "mode": "0644",
+              "sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+              "size_bytes": 4300,
+              "apply": "next_start"
+            },
+            {
+              "path": "/usr/lib/sysusers.d/pgcf.conf",
+              "kind": "file",
+              "mode": "0755",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 300,
+              "apply": "sysusers"
+            },
+            {
+              "path": "/usr/lib/tmpfiles.d/pgcf.conf",
+              "kind": "file",
+              "mode": "0644",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 400,
+              "apply": "tmpfiles"
+            }
+          ]
         }
       },
-      "manifest": "pgcf-release-manifest/v1\nrelease=sha-0123456789ab\nbinary.pgcf-agent=1111111111111111111111111111111111111111111111111111111111111111:11000000\nbinary.pgcf-native-gateway=2222222222222222222222222222222222222222222222222222222222222222:12000000\nbinary.pgcf-archive=3333333333333333333333333333333333333333333333333333333333333333:5000000\nbinary.pgcf-wal-fetch=4444444444444444444444444444444444444444444444444444444444444444:5100000\nos.debian_snapshot=20261016T000000Z\nos.package_lock=5555555555555555555555555555555555555555555555555555555555555555:90000\n"
+      "manifest": "pgcf-release-manifest/v2\nrelease=sha-0123456789ab\nbinary.pgcf-agent=1111111111111111111111111111111111111111111111111111111111111111:11000000\nbinary.pgcf-native-gateway=2222222222222222222222222222222222222222222222222222222222222222:12000000\nbinary.pgcf-archive=3333333333333333333333333333333333333333333333333333333333333333:5000000\nbinary.pgcf-wal-fetch=4444444444444444444444444444444444444444444444444444444444444444:5100000\nos.debian_snapshot=20261016T000000Z\nos.package_lock=5555555555555555555555555555555555555555555555555555555555555555:90000\nos.host_file=/etc/ssh/sshd_config.d/10-pgcf.conf file 0644 6666666666666666666666666666666666666666666666666666666666666666:1500 restart_unit:ssh.service\nos.host_file=/etc/systemd/system/modprobe@loop.service symlink-to-dev-null - - daemon_reload\nos.host_file=/usr/lib/sysctl.d/90-pgcf.conf file 0644 7777777777777777777777777777777777777777777777777777777777777777:800 restart_unit:systemd-sysctl.service\nos.host_file=/usr/lib/systemd/system/pgcf-agent.service file 0644 8888888888888888888888888888888888888888888888888888888888888888:1100 restart_unit:pgcf-agent.service\nos.host_file=/usr/lib/systemd/system/pgcf-pg@.service file 0644 9999999999999999999999999999999999999999999999999999999999999999:4300 next_start\nos.host_file=/usr/lib/sysusers.d/pgcf.conf file 0755 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:300 sysusers\nos.host_file=/usr/lib/tmpfiles.d/pgcf.conf file 0644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:400 tmpfiles\n",
+      "host_files_sha256": "a1daf09a59b5ee45c6b7d69aefee21e22b8fc0df2c91440112c165bb60ed1b66"
     }
   ]
 }

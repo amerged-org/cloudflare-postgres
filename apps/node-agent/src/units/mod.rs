@@ -523,6 +523,14 @@ impl Units {
         self.job(name, kind).await.map(drop)
     }
 
+    /// Has systemd read its unit files again (`systemctl daemon-reload`): what a release wrote
+    /// becomes the definition a unit starts with, and its stop settings are those of its next
+    /// stop. A unit that runs keeps its process, its exec and namespace settings and the limits of
+    /// its cgroup until it restarts (measured by the lab test of the host files).
+    pub async fn reload(&self) -> Result<(), Error> {
+        Ok(self.manager.reload().await?)
+    }
+
     /// Sets the CPU quota of a database's unit until the next boot, or lifts it with `None`.
     pub async fn set_cpu_quota(
         &self,

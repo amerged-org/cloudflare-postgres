@@ -11,6 +11,7 @@ import type { Env } from "../../src/env.ts";
 import { fenceOperation } from "../../src/domain/node-desired.ts";
 import { shellCredentialsRevision } from "../../src/domain/node-shell.ts";
 import {
+  HOST_FILES,
   assignRelease,
   cleanupFixtures,
   fixture,
@@ -497,6 +498,11 @@ describe("the release and the orders on a node's page", () => {
     ]);
     // The image only installs a node; no node reads it.
     expect(JSON.stringify(page)).not.toContain("raw.zst");
+    // The host files are on the page, to be signed over and written, and what a node is expected
+    // to report back of them is not: that stays with the API, as the packages' digest does.
+    expect(page.release!.os.host_files).toEqual(HOST_FILES);
+    expect(JSON.stringify(page)).not.toContain("host_files_sha256");
+    expect(JSON.stringify(page)).not.toContain("https://releases.invalid/host");
   });
 
   it("orders a wake for a pending resume and ends it when the operation does", async () => {

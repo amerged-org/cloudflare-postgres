@@ -39,6 +39,17 @@ const manifest: Manifest = {
       package_lock: digest("5", 90_000),
       packages_sha256: "6".repeat(64),
       kernel_release: "6.12.113+deb13-amd64",
+      host_files: [
+        {
+          path: "/usr/lib/systemd/system/pgcf-gateway.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "7".repeat(64),
+          size_bytes: 1200,
+          apply: "restart_unit:pgcf-gateway.service",
+        },
+      ],
+      host_files_sha256: "8".repeat(64),
     },
   },
   uploads: [],
@@ -131,8 +142,9 @@ test("CI asks the signer for the signature of the manifest's facts with its iden
     assert.equal(asked.searchParams.get("audience"), s.origin);
     assert.equal(asked.searchParams.get("api-version"), "2.0");
     assert.equal(tokenRequest!.authorization, `bearer ${OIDC_REQUEST_TOKEN}`);
-    // The signer got the token as the bearer credential and the facts as JSON: the release id and
-    // every digest of the manifest, and nothing of the image or the kernel.
+    // The signer got the token as the bearer credential and the facts as JSON: the release id,
+    // every digest of the manifest and the host files with how each takes effect, and nothing of
+    // the image or the kernel.
     assert.equal(signRequest!.method, "POST");
     assert.equal(signRequest!.authorization, `Bearer ${IDENTITY_TOKEN}`);
     assert.equal(signRequest!.contentType, "application/json");
@@ -142,6 +154,7 @@ test("CI asks the signer for the signature of the manifest's facts with its iden
       os: {
         debian_snapshot: manifest.registration.os.debian_snapshot,
         package_lock: manifest.registration.os.package_lock,
+        host_files: manifest.registration.os.host_files,
       },
     });
     // The signature is the file's, in the format the registration reads.

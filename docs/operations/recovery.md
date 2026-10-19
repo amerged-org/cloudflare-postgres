@@ -234,7 +234,10 @@ with the owner's go for a reboot. Starting a cycle requires an `admin` API key; 
    `Idempotency-Key` and `{"expected_node_uid":"<verified UID>"}`. It answers 202 with the
    operation and a `Location`. Placement on the node is closed, and the node holds new wakes
    with `57P03`, puts every awake database to sleep with the proof, installs the packages of the
-   lock and reboots if the kernel or core libraries changed. It purges the installed packages the
+   lock and reboots if the kernel or core libraries changed (the release's host files are not
+   part of the cycle: they are written when the release is assigned, users and directories
+   included, [changing a unit without a new image](operator-installation.md#changing-a-unit-or-a-configuration-file-no-new-image)).
+   It purges the installed packages the
    lock no longer names (never a kernel image, an essential or protected package) when nothing
    needs a reboot, or, after a reboot, in the cycle it runs for the open order once it is up; then
    it runs its check and reports. Repeating the request while the cycle is open returns the same
@@ -245,7 +248,7 @@ with the owner's go for a reboot. Starting a cycle requires an `admin` API key; 
    `failed` cycle names the class of the failure in `result_reason` (such as `power_busy` or
    `power_archive` for a database that did not sleep with the proof, `release_missing`,
    `release_signature_missing` or `release_signature_invalid` for a release the node does not trust
-   (its agent checks the release key's signature before it reads the lock, and reports the event
+   (its agent checks the release key's signature before it reads the lock and reports the event
    `release_refused`; [release-signing.md](release-signing.md)), `signature_not_read`,
    `lock_not_read`, `packages_not_read`, `packages_not_installed`, `reboot_failed` or
    `check_failed`; `packages_not_installed` also names a purge that dpkg refused).
@@ -263,3 +266,32 @@ A lost or fenced node is refused with 409. A node that loses its link in the mid
 keeps the order open until its agent answers after the reboot; staleness alone never declares it
 lost (plan 9.4). Debian keeps the previous kernel; a bad kernel is recovered from the boot menu
 over VNC or with a one-shot GRUB entry (plan 9.3).
+
+## The agent does not come back after a release
+
+A node that took a release and then stops reporting (no sample, no link, wakes not answered) may
+have an agent that cannot start. Nothing on the node restarts it for good: `pgcf-agent.service`
+has `Restart=always` and `StartLimitIntervalSec=0`, so systemd starts it again every second, and
+with no agent there is no link, no wake and no WAL archiving (the archive socket is the agent's).
+Two causes are known, and both are a release that broke a rule of the
+[node image README](../../infra/node-image/README.md#changing-a-unit-or-a-configuration-file-without-a-new-image):
+the new `pgcf-agent.service` cannot start (a path, a user, a directory, a package of the new lock
+that the maintenance cycle has not installed yet), or the new binary needs a unit it has not got
+(the binary is switched first and starts under the unit of the release before).
+
+1. Look at the node first ([below](#looking-at-a-node)) and confirm that the newest sample is old
+   and the node is not lost: a node that is merely slow is not this. Do not mark it lost.
+2. The agent's new unit is not in `/usr/lib/systemd/system` yet: the agent writes it to
+   `/run/systemd/system` and moves it to its place only after the agent that runs it has read its
+   first page. So the unit of the image is the last good one, and a restart restores it. With the
+   operator shell on (it is off by default): `rm -f /run/systemd/system/pgcf-agent.service`,
+   `systemctl daemon-reload`, `systemctl restart pgcf-agent`.
+3. Without a shell, restart the instance from the Contabo panel or its API: a restart, never a
+   reinstall (the volumes stay). A boot empties `/run`, so the node runs the unit of the image.
+4. The restarted agent reads the page of the region's release, which is the one that broke the
+   node, and writes the new unit to `/run` again. Before the restart, assign the region the
+   release it had before (`PUT /v1/regions/{id}/release`), so that the page the agent reads is
+   that release's: the agent installs its binaries and writes its files, and the node is back on
+   what it had. A release that could not start must not stay assigned.
+5. Fix the release (a unit that starts under the previous one, or two releases) and register it
+   again; check `GET /v1/nodes/{id}` for `os_converged` and the event `agent_unit_promoted`.

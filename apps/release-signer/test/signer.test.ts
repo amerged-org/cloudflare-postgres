@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bytesToBase64url, signedReleaseManifest } from "@pgcf/contracts";
+import {
+  bytesToBase64url,
+  signedReleaseManifest,
+  type HostFile,
+} from "@pgcf/contracts";
 import worker from "../src/index.ts";
 import { createSigner, type Env } from "../src/signer.ts";
 import {
@@ -34,6 +38,21 @@ const fields = (id = RELEASE_ID) => ({
   os: {
     debian_snapshot: "20261016T000000Z",
     package_lock: digest("5", 90_000),
+    host_files: [
+      {
+        path: "/etc/systemd/system/modprobe@loop.service",
+        kind: "symlink-to-dev-null",
+        apply: "daemon_reload",
+      },
+      {
+        path: "/usr/lib/systemd/system/pgcf-gateway.service",
+        kind: "file",
+        mode: "0644",
+        sha256: "6".repeat(64),
+        size_bytes: 1200,
+        apply: "restart_unit:pgcf-gateway.service",
+      },
+    ] as HostFile[],
   },
 });
 /** A copy of `value` with the value at `path` set to `to`, or removed when `to` is undefined. */
@@ -47,7 +66,7 @@ function tweak(value: object, path: string[], to?: unknown): unknown {
 }
 /** The text the agent verifies, written out here and not built by the contract's function. */
 const MANIFEST = [
-  "pgcf-release-manifest/v1",
+  "pgcf-release-manifest/v2",
   `release=${RELEASE_ID}`,
   `binary.pgcf-agent=${"1".repeat(64)}:11000000`,
   `binary.pgcf-native-gateway=${"2".repeat(64)}:12000000`,
@@ -55,6 +74,8 @@ const MANIFEST = [
   `binary.pgcf-wal-fetch=${"4".repeat(64)}:5100000`,
   "os.debian_snapshot=20261016T000000Z",
   `os.package_lock=${"5".repeat(64)}:90000`,
+  "os.host_file=/etc/systemd/system/modprobe@loop.service symlink-to-dev-null - - daemon_reload",
+  `os.host_file=/usr/lib/systemd/system/pgcf-gateway.service file 0644 ${"6".repeat(64)}:1200 restart_unit:pgcf-gateway.service`,
   "",
 ].join("\n");
 
@@ -147,7 +168,7 @@ describe("what it signs", () => {
     expect(signedReleaseManifest(fields())).toBe(MANIFEST);
     // Not the signature of anything else: the domain line is part of what is signed.
     expect(
-      await verifies(MANIFEST.replace("pgcf-release-manifest/v1\n", "")),
+      await verifies(MANIFEST.replace("pgcf-release-manifest/v2\n", "")),
     ).toBe(false);
     expect(
       await verifies(MANIFEST.replace("1".repeat(64), "9".repeat(64))),
@@ -202,6 +223,25 @@ describe("what it signs", () => {
       tweak(fields(), ["binaries", "pgcf-agent", "sha256"], "A".repeat(64)),
       tweak(fields(), ["binaries", "pgcf-archive", "size_bytes"], 1.5),
       tweak(fields(), ["os", "debian_snapshot"], "20261016\nT000000Z"),
+      // The host files are signed as they are given, and only as the contract allows them: a path
+      // outside the allow-list, a mode, a way to take effect or an order it does not know, a
+      // list with nothing in it and a field beyond the facts are all refused before any signing.
+      tweak(fields(), ["os", "host_files"]),
+      tweak(fields(), ["os", "host_files"], []),
+      tweak(fields(), ["os", "host_files", "1", "path"], "/etc/passwd"),
+      tweak(fields(), ["os", "host_files", "1", "mode"], "0777"),
+      tweak(
+        fields(),
+        ["os", "host_files", "1", "apply"],
+        "restart_unit:sshd.service",
+      ),
+      tweak(fields(), ["os", "host_files", "1", "url"], "https://x.example/f"),
+      tweak(fields(), ["os", "host_files", "0", "mode"], "0644"),
+      tweak(
+        fields(),
+        ["os", "host_files"],
+        [fields().os.host_files[1], fields().os.host_files[0]],
+      ),
       [],
       null,
       "text",
@@ -219,10 +259,11 @@ describe("what it signs", () => {
       status: 400,
       error: "manifest_invalid",
     });
-    // A body of the right shape but too large is not read to its end.
+    // A body of the right shape but too large is not read to its end: the bound is a release with
+    // all of the host files the contract allows, and a little more.
     expect(
       await refusal(
-        await h.post({ raw: JSON.stringify(fields()) + " ".repeat(20_000) }),
+        await h.post({ raw: JSON.stringify(fields()) + " ".repeat(40_000) }),
       ),
     ).toEqual({ status: 413, error: "body_too_large" });
     expect(await refusal(await h.post({ contentType: "text/plain" }))).toEqual({

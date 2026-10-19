@@ -13,7 +13,9 @@ import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/p
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { hostFilesSha256 } from "../../packages/contracts/src/releases.ts";
 import { digestBinaries } from "./binaries.ts";
+import { readHostFiles } from "./host-files.ts";
 import {
   aptListName,
   behindLock,
@@ -238,6 +240,9 @@ async function buildImage(work: string, binaries: string, release: string): Prom
   if (!releasePattern.test(release)) throw new Error("invalid release name");
   // Before the download and the build: a missing binary fails now, and the summary pins these files.
   const binaryDigests = await digestBinaries(binaries);
+  // The tree that goes into the image is also what a release lists as its host files: a file the
+  // tables do not name stops the build here, and the summary pins the digest of the list.
+  const { files: hostFiles } = await readHostFiles();
   const lock = await fetchLocked(work);
   const out = join(work, "out");
   await rm(out, { recursive: true, force: true });
@@ -264,6 +269,7 @@ async function buildImage(work: string, binaries: string, release: string): Prom
     raw: { sha256: await sha256File(raw), size: (await stat(raw)).size },
     zst: { sha256: await sha256File(zst), size: (await stat(zst)).size },
     binaries: binaryDigests,
+    host_files_sha256: await hostFilesSha256(hostFiles),
   };
   await writeFile(join(out, "pgcf-node.json"), `${JSON.stringify(summary, null, 2)}\n`);
   await writeFile(

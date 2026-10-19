@@ -99,6 +99,42 @@ struct State {
     journal_damaged: bool,
     /// How long reading the page cache takes: a disk that is slow to list.
     cache_delay: Option<Duration>,
+    /// What systemd has loaded of each unit file, as of its last reload (or of the boot): the
+    /// definition (`None` for a mask) that the next start of the unit takes.
+    loaded: BTreeMap<String, Option<Vec<u8>>>,
+    /// The definition each unit runs with: that of its last restart.
+    running: BTreeMap<String, Vec<u8>>,
+    /// `daemon_reload` fails once.
+    reload_fails: bool,
+    /// `restart_service` fails once, as a job that ends with `failed`.
+    restart_fails: bool,
+    /// `restart_service` fails for this unit every time, as a unit that cannot start.
+    restart_fails_for: BTreeSet<String>,
+    /// The users `systemd-sysusers` made, and the directories (with their mode) `systemd-tmpfiles`
+    /// made.
+    users: BTreeSet<String>,
+    directories: BTreeMap<String, String>,
+    /// The next `run_sysusers` or `run_tmpfiles` fails, as the tools do with exit status 1.
+    run_fails: bool,
+}
+
+/// The units of the image that a release restarts, as the packages and the image leave them: the
+/// files `systemd` loaded at the boot. A test that changes one writes the new file below the
+/// machine's root and has the release do it.
+const IMAGE_UNITS: [&str; 6] = [
+    "pgcf-agent.service",
+    "pgcf-cloudflared.service",
+    "pgcf-gateway.service",
+    "ssh.service",
+    "systemd-journald.service",
+    "systemd-sysctl.service",
+];
+
+/// A tool of systemd that ended with exit status 1, as `run` of the node reports it.
+fn tool_failed(program: &str, file: &str) -> io::Error {
+    io::Error::other(format!(
+        "{program} ended with exit status: 1: Failed to read '{file}'"
+    ))
 }
 
 /// The kernel's boot ID of the node's `boots`th boot.
@@ -124,6 +160,7 @@ impl Local {
             state: root.join("s"),
             run: root.join("r"),
             postgres_bin: bin,
+            host_root: root.join("h"),
             ..Layout::default()
         };
         let (uid, gid) = {
@@ -131,7 +168,28 @@ impl Local {
             let metadata = fs::metadata(&root).unwrap();
             (metadata.uid(), metadata.gid())
         };
-        Some(Self {
+        // The directories of the image's units and its configuration, and its own units in them.
+        for directory in crate::node_link::constant("HOST_FILE_DIRECTORIES")
+            .as_array()
+            .unwrap()
+        {
+            fs::create_dir_all(
+                layout
+                    .host_root
+                    .join(directory.as_str().unwrap().trim_start_matches('/')),
+            )
+            .unwrap();
+        }
+        // `/run/systemd` is there at every boot; its `system` directory is made when a unit needs it.
+        fs::create_dir_all(layout.host_root.join("run/systemd")).unwrap();
+        for unit in IMAGE_UNITS {
+            fs::write(
+                layout.host_root.join("usr/lib/systemd/system").join(unit),
+                format!("[Service]\n# {unit} of the image\n"),
+            )
+            .unwrap();
+        }
+        let machine = Self {
             layout,
             user: testpg::current_user(),
             uid,
@@ -141,7 +199,96 @@ impl Local {
                 kernel_release: "6.12.111+deb13-amd64".into(),
                 ..State::default()
             }),
-        })
+        };
+        machine.load_units();
+        Some(machine)
+    }
+
+    /// The unit files below the root, as systemd's search path finds them: `/etc` before
+    /// `/usr/lib`. A mask (a link to `/dev/null`) is `None`; anything but a file or a mask is no
+    /// unit.
+    fn unit_files(&self) -> BTreeMap<String, Option<Vec<u8>>> {
+        let mut found = BTreeMap::new();
+        // systemd's search path: the administrator's directory, then the runtime one, then the
+        // vendor's (a boot empties the runtime one).
+        for directory in [
+            "etc/systemd/system",
+            "run/systemd/system",
+            "usr/lib/systemd/system",
+        ] {
+            let Ok(entries) = fs::read_dir(self.layout.host_root.join(directory)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !(name.ends_with(".service") || name.ends_with(".slice"))
+                    || found.contains_key(&name)
+                {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(meta) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    if fs::read_link(&path).is_ok_and(|to| to == Path::new("/dev/null")) {
+                        found.insert(name, None);
+                    }
+                } else if meta.is_file() {
+                    found.insert(name, fs::read(&path).ok());
+                }
+            }
+        }
+        found
+    }
+    /// What systemd does at a boot: it loads every unit file there is.
+    pub fn load_units(&self) {
+        let files = self.unit_files();
+        self.state().loaded = files;
+    }
+    /// The file a tool of systemd (`sysusers`, `tmpfiles`) is asked to read, below the machine's
+    /// root. The call is kept, and a tool that was told to fail does.
+    fn config_file(&self, tool: &str, file: &str) -> io::Result<String> {
+        let mut state = self.state();
+        state.calls.push(format!("{tool} {file}"));
+        if std::mem::take(&mut state.run_fails) {
+            return Err(tool_failed(&format!("systemd-{tool}"), file));
+        }
+        drop(state);
+        fs::read_to_string(self.layout.host_root.join(file.trim_start_matches('/')))
+            .map_err(|_| tool_failed(&format!("systemd-{tool}"), file))
+    }
+    /// The definition `unit` runs with: its file as it was loaded when it last restarted.
+    pub fn running_definition(&self, unit: &str) -> Option<String> {
+        self.state()
+            .running
+            .get(unit)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    }
+    pub fn fail_next_reload(&self) {
+        self.state().reload_fails = true;
+    }
+    pub fn fail_next_restart(&self) {
+        self.state().restart_fails = true;
+    }
+    /// Every restart of `unit` fails, as a unit does that cannot start.
+    pub fn fail_restarts_of(&self, unit: &str) {
+        self.state().restart_fails_for.insert(unit.to_string());
+    }
+    /// Restarts of `unit` work again.
+    pub fn mend_restarts_of(&self, unit: &str) {
+        self.state().restart_fails_for.remove(unit);
+    }
+    pub fn fail_next_run(&self) {
+        self.state().run_fails = true;
+    }
+    /// The users `systemd-sysusers` made.
+    pub fn created_users(&self) -> Vec<String> {
+        self.state().users.iter().cloned().collect()
+    }
+    /// The directories `systemd-tmpfiles` made, with the mode the file gave them.
+    pub fn created_directories(&self) -> BTreeMap<String, String> {
+        self.state().directories.clone()
     }
     pub fn with_layout(mut self, change: impl FnOnce(&mut Layout)) -> Self {
         change(&mut self.layout);
@@ -910,8 +1057,92 @@ impl Machine for Local {
         Ok(())
     }
 
+    /// `systemctl restart`: the unit starts with the definition systemd has loaded, which is its
+    /// file as of the last reload and not as it is now; a unit with no file, or a mask, cannot be
+    /// started.
     async fn restart_service(&self, unit: &str) -> Result<(), units::Error> {
-        self.state().calls.push(format!("restart {unit}"));
+        let files = self.unit_files();
+        let mut state = self.state();
+        state.calls.push(format!("restart {unit}"));
+        let job = |result: &str| units::Error::Job {
+            unit: unit.to_string(),
+            result: result.to_string(),
+        };
+        if std::mem::take(&mut state.restart_fails) || state.restart_fails_for.contains(unit) {
+            return Err(job("failed"));
+        }
+        // systemd loads a unit it has not loaded yet when it is asked for it.
+        if !state.loaded.contains_key(unit)
+            && let Some(file) = files.get(unit)
+        {
+            state.loaded.insert(unit.to_string(), file.clone());
+        }
+        match state.loaded.get(unit).cloned() {
+            Some(Some(definition)) => {
+                state.running.insert(unit.to_string(), definition);
+                Ok(())
+            }
+            Some(None) => Err(job("masked")),
+            None => Err(job("not-found")),
+        }
+    }
+
+    /// `systemctl daemon-reload`: every unit file is read again, and no unit restarts.
+    async fn daemon_reload(&self) -> Result<(), units::Error> {
+        let files = self.unit_files();
+        let mut state = self.state();
+        state.calls.push("daemon-reload".into());
+        if std::mem::take(&mut state.reload_fails) {
+            return Err(units::Error::Unexpected("the reload failed"));
+        }
+        state.loaded = files;
+        Ok(())
+    }
+
+    /// `systemd-sysusers <file>`: reads the file as given and makes the users and groups it lists;
+    /// a file it cannot read or parse is exit status 1, and a user that exists stays as it is.
+    async fn run_sysusers(&self, file: &str) -> io::Result<()> {
+        let text = self.config_file("sysusers", file)?;
+        let mut users = Vec::new();
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                ["u" | "g" | "m", name, ..] => users.push((*name).to_string()),
+                _ => return Err(tool_failed("systemd-sysusers", file)),
+            }
+        }
+        self.state().users.extend(users);
+        Ok(())
+    }
+
+    /// `systemd-tmpfiles --create <file>`: makes the directories (`d`) it lists with the mode it
+    /// gives, and leaves one that exists as it is; another type of line is not modelled and a
+    /// line that is none is exit status 1.
+    async fn run_tmpfiles(&self, file: &str) -> io::Result<()> {
+        let text = self.config_file("tmpfiles", file)?;
+        let mut directories = Vec::new();
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                ["d", path, mode, ..] => {
+                    directories.push(((*path).to_string(), (*mode).to_string()))
+                }
+                [kind, _, ..] if kind.len() == 1 => {}
+                _ => return Err(tool_failed("systemd-tmpfiles", file)),
+            }
+        }
+        let mut state = self.state();
+        for (path, mode) in directories {
+            state.directories.entry(path).or_insert(mode);
+        }
         Ok(())
     }
 
@@ -970,6 +1201,18 @@ impl Machine for Local {
             ));
         }
         state.boots += 1;
+        // A boot empties /run, which holds the units of the runtime directory, and systemd reads
+        // every unit file again and starts the units with them.
+        let runtime = self.layout.host_root.join("run/systemd/system");
+        let _ = fs::remove_dir_all(&runtime);
+        drop(state);
+        let files = self.unit_files();
+        let mut state = self.state();
+        state.running = files
+            .iter()
+            .filter_map(|(unit, definition)| Some((unit.clone(), definition.clone()?)))
+            .collect();
+        state.loaded = files;
         // GRUB boots the highest version, which is not the last name: 6.12.99 is below 6.12.113.
         let numbers = |abi: &str| -> Vec<u64> {
             abi.split(|c: char| !c.is_ascii_digit())

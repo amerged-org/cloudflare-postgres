@@ -10,6 +10,8 @@ import {
   RELEASE_FILES,
   bytesToHex,
   hashApiKey,
+  hostFileObjectKey,
+  hostFilesSha256,
   newApiKey,
   newApiKeyId,
   newNodeId,
@@ -20,6 +22,7 @@ import {
   releaseObjectKey,
   signNodeRequest,
   type FleetReleaseRegistration,
+  type HostFile,
   type NodeKey,
   type ReleaseFile,
 } from "@pgcf/contracts";
@@ -620,10 +623,43 @@ const pinned = (name: string) => ({
   sha256: "a".repeat(64),
   size_bytes: 4096,
 });
+const sha256Of = async (bytes: Uint8Array) =>
+  bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+/** The host files of the fixtures' releases: a mask and two files, ascending by path, and the bytes of each file. */
+export const HOST_FILE_BODIES = {
+  gateway: new TextEncoder().encode("[Service]\n# gateway\n"),
+  database: new TextEncoder().encode("[Service]\n# database\n"),
+};
+/** The digest of the gateway unit's bytes: the object a test leaves out or replaces. */
+export const GATEWAY_UNIT_SHA256 = await sha256Of(HOST_FILE_BODIES.gateway);
+export const HOST_FILES: HostFile[] = [
+  {
+    path: "/etc/systemd/system/modprobe@loop.service",
+    kind: "symlink-to-dev-null",
+    apply: "daemon_reload",
+  },
+  {
+    path: "/usr/lib/systemd/system/pgcf-gateway.service",
+    kind: "file",
+    mode: "0644",
+    sha256: GATEWAY_UNIT_SHA256,
+    size_bytes: HOST_FILE_BODIES.gateway.byteLength,
+    apply: "restart_unit:pgcf-gateway.service",
+  },
+  {
+    path: "/usr/lib/systemd/system/pgcf-pg@.service",
+    kind: "file",
+    mode: "0644",
+    sha256: await sha256Of(HOST_FILE_BODIES.database),
+    size_bytes: HOST_FILE_BODIES.database.byteLength,
+    apply: "next_start",
+  },
+];
 /** What a node that runs the fixtures' releases reports of its operating system. */
 export const RELEASE_OS = {
   kernel_release: "6.12.113+deb13-amd64",
   packages_sha256: "d".repeat(64),
+  host_files_sha256: await hostFilesSha256(HOST_FILES),
 };
 /** The boot and operating system in a node's hello: those of the fixtures' releases unless changed. */
 export const nodeOs = (change: Record<string, unknown> = {}) => ({
@@ -646,7 +682,7 @@ export const signatureOf = async (version: string) => {
 };
 /** The spec of a release: a node image, its four binaries and the package lock. */
 export const releaseSpec = (version = "1.2.0") => ({
-  version: 2,
+  version: 3,
   image: {
     url: `https://${["releases", "invalid"].join(".")}/pgcf-node-${version}.raw.zst`,
     sha256: "b".repeat(64),
@@ -665,6 +701,7 @@ export const releaseSpec = (version = "1.2.0") => ({
     image_version: version,
     debian_snapshot: "20261015T000000Z",
     package_lock: pinned("packages.lock.json"),
+    host_files: HOST_FILES,
     ...RELEASE_OS,
   },
   signature: "e".repeat(128),
@@ -680,6 +717,8 @@ export async function stageRelease(
   options: {
     skip?: readonly ReleaseFile[];
     bodies?: Partial<Record<ReleaseFile, Uint8Array>>;
+    /** Host files (by path) whose object is left out of the bucket. */
+    skipHostFiles?: readonly string[];
   } = {},
 ): Promise<FleetReleaseRegistration> {
   const text = new TextEncoder();
@@ -696,6 +735,17 @@ export async function stageRelease(
     if (options.skip?.includes(file)) continue;
     const key = releaseObjectKey(version, file);
     await env.ARCHIVE.put(key, body, { sha256 });
+    stagedObjects.push(key);
+  }
+  for (const file of HOST_FILES) {
+    if (file.kind !== "file" || options.skipHostFiles?.includes(file.path))
+      continue;
+    const body =
+      file.path === HOST_FILES[1]!.path
+        ? HOST_FILE_BODIES.gateway
+        : HOST_FILE_BODIES.database;
+    const key = hostFileObjectKey(version, file.sha256);
+    await env.ARCHIVE.put(key, body, { sha256: file.sha256 });
     stagedObjects.push(key);
   }
   return {
@@ -717,6 +767,7 @@ export async function stageRelease(
     os: {
       debian_snapshot: "20261015T000000Z",
       package_lock: digests["packages.lock.json"],
+      host_files: structuredClone(HOST_FILES),
       ...RELEASE_OS,
     },
     signature: await signatureOf(version),

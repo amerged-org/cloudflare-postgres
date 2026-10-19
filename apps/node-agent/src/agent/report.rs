@@ -851,6 +851,51 @@ mod tests {
         assert!(rig.core.take_report(&events).is_none());
     }
 
+    /// The result of an order is not an observation and is never held: a failed resume, whose
+    /// database the API holds as it is, still goes out in a report of its own, and goes out again
+    /// when the answer to it was lost (the API ends the order once, and a result it did not take is
+    /// the only way the resume ends).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_order_result_goes_out_when_every_database_is_held_and_again_after_a_lost_answer() {
+        let Some(rig) = Rig::new("report-orders").await else {
+            return;
+        };
+        let events = Events::new(Duration::from_secs(60));
+        let id = crate::link::test_server::database_id(1);
+        let a = asleep(&id);
+        rig.core.queue_observation(a.clone());
+        let first = rig.core.take_report(&events).unwrap();
+        rig.core.report_posted(&first, std::slice::from_ref(&id));
+
+        // The API holds the database, and the node's resume of it failed.
+        rig.core.queue_observation(a.clone());
+        rig.core
+            .report_order("op_rrrrrrrrrrrrrrrrrrrr", Err("wake_failed"));
+        let second = rig.core.take_report(&events).unwrap();
+        assert_eq!(second["databases"], json!([]));
+        assert_eq!(
+            second["orders"],
+            json!([{"operation": "op_rrrrrrrrrrrrrrrrrrrr", "status": "failed", "reason": "wake_failed"}])
+        );
+        assert!(contract_valid("NodeObservationReport", &second));
+
+        // The answer was lost: the result is queued again, and nothing else is.
+        rig.core.unsent(&events, &second);
+        let third = rig.core.take_report(&events).unwrap();
+        assert_eq!(third["orders"], second["orders"]);
+        assert_eq!(third["databases"], json!([]));
+        // A report that failed with the API's 409 (the recovery of the resume changed under it) is
+        // the same: the result is not dropped by the failure.
+        rig.core.unsent(&events, &third);
+        let fourth = rig.core.take_report(&events).unwrap();
+        assert_eq!(fourth["orders"], second["orders"]);
+
+        // Answered, it is gone, and the database is still held.
+        rig.core.report_posted(&fourth, &[]);
+        rig.core.queue_observation(a);
+        assert!(rig.core.take_report(&events).is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_pull_of_what_the_api_holds_says_nothing_what_changed_goes_at_once_and_a_restart_says_everything_once()
      {

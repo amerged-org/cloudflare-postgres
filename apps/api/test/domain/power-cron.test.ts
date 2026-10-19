@@ -158,3 +158,195 @@ it("pages timeout recovery and leaves the remaining owned suspension pending", a
     ).first(),
   ).toEqual({ database_id: null });
 }, 30_000);
+
+/** A database that sleeps by hand, resumed, whose resume the node never carried out. */
+async function resuming() {
+  const f = await fixture();
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  const id = created.database.id;
+  await report(f, id, 1);
+  await request(`/v1/databases/${id}/suspend`, f.integrator, "POST");
+  await report(f, id, 2, "asleep");
+  const result = DatabaseWithOperation.parse(
+    await (
+      await request(`/v1/databases/${id}/resume`, f.integrator, "POST")
+    ).json(),
+  );
+  await env.DB.prepare("UPDATE operations SET updated_at=? WHERE id=?")
+    .bind(new Date(Date.now() - 21 * 60_000).toISOString(), result.operation.id)
+    .run();
+  return { ...f, id, operation: result.operation.id };
+}
+type Resuming = Awaited<ReturnType<typeof resuming>>;
+const state = (id: string) =>
+  env.DB.prepare(
+    "SELECT desired_state,suspension_reason,generation,observed_power FROM databases WHERE id=?",
+  )
+    .bind(id)
+    .first();
+const outcome = (operation: string) =>
+  env.DB.prepare("SELECT status,error_code FROM operations WHERE id=?")
+    .bind(operation)
+    .first();
+
+it("suspends a sleeping database again when its resume timed out, in pages like any power timeout", async () => {
+  const cohort: Resuming[] = [];
+  for (let i = 0; i < 9; i++) cohort.push(await resuming());
+  expect((await runCron(env)).failed).toBe(8);
+  const reverted: Resuming[] = [];
+  const waiting: Resuming[] = [];
+  for (const f of cohort) {
+    const { desired_state } = (await state(f.id))!;
+    (desired_state === "suspended" ? reverted : waiting).push(f);
+  }
+  expect(reverted).toHaveLength(8);
+  // The ninth is not swept before its turn: its resume is still the operation that owns it.
+  expect(waiting).toHaveLength(1);
+  expect(await outcome(waiting[0]!.operation)).toEqual({
+    status: "pending",
+    error_code: null,
+  });
+  for (const f of reverted) {
+    expect(await outcome(f.operation)).toEqual({
+      status: "failed",
+      error_code: "operation_timeout",
+    });
+    expect(await state(f.id)).toEqual({
+      desired_state: "suspended",
+      suspension_reason: "manual",
+      generation: 4,
+      observed_power: "hibernated",
+    });
+  }
+  expect((await runCron(env)).failed).toBe(1);
+  expect(await state(waiting[0]!.id)).toEqual({
+    desired_state: "suspended",
+    suspension_reason: "manual",
+    generation: 4,
+    observed_power: "hibernated",
+  });
+}, 30_000);
+
+it("only fails the timed-out resume of a database that runs", async () => {
+  const f = await fixture();
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  await report(f, created.database.id, 1);
+  await request(
+    `/v1/databases/${created.database.id}/suspend`,
+    f.integrator,
+    "POST",
+  );
+  await report(f, created.database.id, 2, "ready", { refusal: "power_busy" });
+  const made = await env.DB.prepare(
+    "SELECT power_operation FROM databases WHERE id=?",
+  )
+    .bind(created.database.id)
+    .first<{ power_operation: string }>();
+  await env.DB.prepare("UPDATE operations SET updated_at=? WHERE id=?")
+    .bind(
+      new Date(Date.now() - 21 * 60_000).toISOString(),
+      made!.power_operation,
+    )
+    .run();
+  expect((await runCron(env)).failed).toBe(1);
+  expect(await outcome(made!.power_operation)).toEqual({
+    status: "failed",
+    error_code: "operation_timeout",
+  });
+  expect(await state(created.database.id)).toEqual({
+    desired_state: "running",
+    suspension_reason: null,
+    generation: 3,
+    observed_power: "awake",
+  });
+});
+
+const operationsOf = async (id: string) =>
+  (
+    await env.DB.prepare(
+      "SELECT id,kind,status,error_code FROM operations WHERE database_id=? ORDER BY generation,id",
+    )
+      .bind(id)
+      .all()
+  ).results;
+const epochOf = (id: string) =>
+  env.DB.prepare(
+    "SELECT admission_revision,route_revision,mutation_id FROM database_admission_epochs WHERE database_id=?",
+  )
+    .bind(id)
+    .first();
+/** What 21 quiet minutes do to the operations the database still waits for. */
+const quiet = (id: string) =>
+  env.DB.prepare(
+    "UPDATE operations SET updated_at=? WHERE database_id=? AND status IN('pending','running')",
+  )
+    .bind(new Date(Date.now() - 21 * 60_000).toISOString(), id)
+    .run();
+
+it("reverts a timed-out resume once and then stops changing while the node never reports", async () => {
+  const f = await resuming();
+  // The resume times out and the database is suspended again: the one revert.
+  expect((await runCron(env)).failed).toBe(1);
+  const asleep = {
+    desired_state: "suspended",
+    suspension_reason: "manual",
+    generation: 4,
+    observed_power: "hibernated",
+  };
+  expect(await state(f.id)).toEqual(asleep);
+  const operations = await operationsOf(f.id);
+  const epoch = await epochOf(f.id);
+  // The suspension it left is not proven either, but D1 knows the database asleep: nothing to
+  // undo, so the suspension only fails and the database stays suspended, round after round.
+  for (let round = 0; round < 4; round++) {
+    await quiet(f.id);
+    await runCron(env);
+    expect(await state(f.id)).toEqual(asleep);
+    expect(await operationsOf(f.id)).toHaveLength(operations.length);
+    expect(await epochOf(f.id)).toEqual(epoch);
+  }
+  const final = await operationsOf(f.id);
+  expect(final.at(-1)).toMatchObject({
+    kind: "database.suspend",
+    status: "failed",
+    error_code: "operation_timeout",
+  });
+  expect(
+    final.some((o) => o.status === "pending" || o.status === "running"),
+  ).toBe(false);
+  expect((await runCron(env)).failed).toBe(0);
+});
+
+it("keeps a hand-suspended idle sleeper suspended when the node never proves the suspension", async () => {
+  const f = await fixture();
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  const id = created.database.id;
+  await report(f, id, 1);
+  await report(f, id, 1, "asleep");
+  const suspend = DatabaseWithOperation.parse(
+    await (
+      await request(`/v1/databases/${id}/suspend`, f.integrator, "POST")
+    ).json(),
+  );
+  expect(await state(id)).toMatchObject({
+    desired_state: "suspended",
+    suspension_reason: "manual",
+    observed_power: "hibernated",
+  });
+  const generation = (await state(id))!.generation;
+  const operations = await operationsOf(id);
+  const epoch = await epochOf(id);
+  await quiet(id);
+  expect((await runCron(env)).failed).toBe(1);
+  expect(await outcome(suspend.operation.id)).toEqual({
+    status: "failed",
+    error_code: "operation_timeout",
+  });
+  expect(await state(id)).toMatchObject({
+    desired_state: "suspended",
+    suspension_reason: "manual",
+    generation,
+  });
+  expect(await operationsOf(id)).toHaveLength(operations.length);
+  expect(await epochOf(id)).toEqual(epoch);
+});

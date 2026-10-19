@@ -5,12 +5,16 @@ import {
   RELEASE_FILES,
   RELEASE_SIGNATURE_FILE,
   releaseFileUrl,
+  releaseHostFileUrl,
   type ReleaseFile,
 } from "@pgcf/contracts/releases";
 import { parseByteRange } from "../../src/domain/release-files.ts";
 import { issueNodeInstall } from "../../src/domain/node-install.ts";
 import {
   API_ORIGIN,
+  GATEWAY_UNIT_SHA256,
+  HOST_FILES,
+  HOST_FILE_BODIES,
   cleanupFixtures,
   fixture,
   rawRequest,
@@ -81,6 +85,45 @@ describe("the files every node reads", () => {
       String(r.body("pgcf-agent").byteLength),
     );
     expect(response.headers.get("ETag")).toMatch(/^"[0-9a-f]+"$/);
+  });
+
+  it("serves a host file of a registered release by its digest, to anyone, and no digest the release does not list", async () => {
+    const r = await registered();
+    const path = (sha256: string, release = r.version) =>
+      new URL(releaseHostFileUrl(API_ORIGIN, release, sha256)).pathname;
+    const response = await get(path(GATEWAY_UNIT_SHA256));
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(
+      HOST_FILE_BODIES.gateway,
+    );
+    expect(response.headers.get("Accept-Ranges")).toBe("bytes");
+    expect(response.headers.get("Content-Length")).toBe(
+      String(HOST_FILE_BODIES.gateway.byteLength),
+    );
+    expect((await get(path(GATEWAY_UNIT_SHA256), {}, "HEAD")).status).toBe(200);
+    // Only the digests of the release's own list: an object under another digest, a digest that is
+    // no digest and another release's are not found, however the bucket is laid out.
+    const gateway = HOST_FILES[1] as { sha256: string };
+    expect(gateway.sha256).toBe(GATEWAY_UNIT_SHA256);
+    await env.ARCHIVE.put(
+      `node-images/${r.version}/host-files/${"9".repeat(64)}`,
+      "x",
+    );
+    const raw = (segment: string) =>
+      `/node/v1/releases/${r.version}/host-files/${segment}`;
+    for (const missing of [
+      path("9".repeat(64)),
+      raw("A".repeat(64)),
+      raw("0".repeat(63)),
+      path(GATEWAY_UNIT_SHA256, "release-files-unknown"),
+      `/node/v1/releases/${r.version}/host-files/`,
+      `/node/v1/releases/${r.version}/host-files/..%2Fpgcf-agent`,
+      `/node/v1/releases/${r.version}/host-files/${GATEWAY_UNIT_SHA256}/x`,
+    ])
+      expect((await get(missing)).status, missing).toBe(404);
+    await env.ARCHIVE.delete(
+      `node-images/${r.version}/host-files/${"9".repeat(64)}`,
+    );
   });
 
   it("serves the signature of a registered release from its stored spec, to anyone, as the agent reads it without a credential", async () => {

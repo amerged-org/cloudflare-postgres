@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Registers a built node image release (ULTRA plan 9.1 step 5, 9.2): uploads the six files of the
-// release to the archive bucket's `node-images/<version>/` prefix and registers their digests with
-// the management API. Every node installs from, and updates to, what is registered.
+// release, and its host files (each by its digest, under `host-files/`), to the archive bucket's
+// `node-images/<version>/` prefix and registers their digests with the management API. Every node
+// installs from, and updates to, what is registered.
 //
 //   node scripts/operations/register-node-image.ts --image-dir DIR --binaries DIR [--lock FILE]
-//     [--signature FILE] [--release-key FILE] [--dry-run]
+//     [--tree DIR] [--signature FILE] [--release-key FILE] [--dry-run]
 //
 //   --image-dir    the `out` directory of `node infra/node-image/node-image.ts build`:
 //                  pgcf-node.raw.zst and pgcf-node.json. The release name is the one the image was
@@ -12,6 +13,10 @@
 //   --binaries     the directory the build took pgcf-agent, pgcf-native-gateway, pgcf-archive and
 //                  pgcf-wal-fetch from; they must be the files the image was built with.
 //   --lock         the package lock the image was built from (default infra/node-image/packages.lock.json).
+//   --tree         the image's tree, whose host files the release carries (default
+//                  infra/node-image/mkosi.extra of this checkout, which must be the commit that was
+//                  built: the build summary states the digest of its host files, and a tree that
+//                  differs is refused).
 //   --signature    the signature CI made of the release (default DIR/release.sig, where CI puts it,
 //                  docs/operations/release-signing.md). A registration without one is refused.
 //   --release-key  the public key the signature must verify with: the key the agents that are
@@ -45,6 +50,7 @@ import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { isDeepStrictEqual, parseArgs } from "node:util";
 import { API_KEY_PATTERN } from "../../packages/contracts/src/auth.ts";
+import { readHostFiles } from "../../infra/node-image/host-files.ts";
 import {
   FleetRelease,
   FleetReleaseRegistration,
@@ -54,6 +60,8 @@ import {
   RELEASE_LOCK_FILE,
   RELEASE_SIGNATURE_FILE,
   ReleaseSignature,
+  hostFileObjectKey,
+  hostFilesSha256,
   packagesSha256,
   releaseObjectKey,
   signedReleaseManifest,
@@ -101,6 +109,8 @@ export interface BuildSummary {
     (typeof RELEASE_BINARY_FILES)[number],
     { sha256: string; size: number }
   >;
+  /** `hostFilesSha256` of the host files of the tree the image was built from. */
+  host_files_sha256: string;
 }
 const sha256Pattern = /^[0-9a-f]{64}$/;
 const isDigest = (value: unknown): value is { sha256: string; size: number } =>
@@ -130,14 +140,18 @@ export function parseBuildSummary(text: string): BuildSummary {
     !isDigest(summary.zst) ||
     typeof summary.binaries !== "object" ||
     summary.binaries === null ||
-    !RELEASE_BINARY_FILES.every((file) => isDigest(summary.binaries?.[file]))
+    !RELEASE_BINARY_FILES.every((file) => isDigest(summary.binaries?.[file])) ||
+    typeof summary.host_files_sha256 !== "string" ||
+    !sha256Pattern.test(summary.host_files_sha256)
   )
     throw new Error("the build summary is not what node-image.ts build writes");
   return summary as BuildSummary;
 }
 
+/** The label of an upload that is one of a release's host files rather than one of its six files. */
+export const HOST_FILE_UPLOAD = "host-file";
 export interface Upload {
-  file: ReleaseFile;
+  file: ReleaseFile | typeof HOST_FILE_UPLOAD;
   key: string;
   path: string;
   digest: FileDigest;
@@ -208,6 +222,7 @@ export async function releaseManifest(options: {
   imageDir: string;
   binariesDir: string;
   lockPath?: string;
+  tree?: string;
 }): Promise<Manifest> {
   const summary = parseBuildSummary(
     await readFile(join(options.imageDir, "pgcf-node.json"), "utf8"),
@@ -262,6 +277,31 @@ export async function releaseManifest(options: {
     )
       throw new Error(`${file} is not the one the image was built with`);
   }
+  // The host files are the tree's, as the image was built from it: the digest the build stated is
+  // the digest of the list this checkout gives, or the files a node takes from this release would
+  // not be the files of the image.
+  const hostFiles = await readHostFiles(options.tree);
+  const hostFilesDigest = await hostFilesSha256(hostFiles.files);
+  if (hostFilesDigest !== summary.host_files_sha256)
+    throw new Error(
+      "the host files of this tree are not the ones the image was built with: check out the commit that was built",
+    );
+  for (const [sha256, path] of hostFiles.sources) {
+    let digest: FileDigest;
+    try {
+      digest = await digestFile(path);
+    } catch {
+      throw new Error(`a host file is missing at ${path}`);
+    }
+    if (digest.sha256 !== sha256)
+      throw new Error(`a host file changed while it was read: ${path}`);
+    uploads.push({
+      file: HOST_FILE_UPLOAD,
+      key: hostFileObjectKey(version.data, sha256),
+      path,
+      digest,
+    });
+  }
   return {
     version: version.data,
     registration: FleetReleaseRegistration.omit({ signature: true }).parse({
@@ -275,6 +315,8 @@ export async function releaseManifest(options: {
         debian_snapshot: summary.debian_snapshot,
         package_lock: lock,
         ...lockFacts,
+        host_files: hostFiles.files,
+        host_files_sha256: hostFilesDigest,
       },
     }),
     uploads,
@@ -491,6 +533,8 @@ const registeredPins = (spec: FleetReleaseSpec): FleetReleaseRegistration => ({
     package_lock: pin(spec.os.package_lock),
     packages_sha256: spec.os.packages_sha256,
     kernel_release: spec.os.kernel_release,
+    host_files: spec.os.host_files,
+    host_files_sha256: spec.os.host_files_sha256,
   },
 });
 
@@ -607,6 +651,7 @@ async function main(
       "image-dir": { type: "string" },
       binaries: { type: "string" },
       lock: { type: "string" },
+      tree: { type: "string" },
       signature: { type: "string" },
       "release-key": { type: "string" },
       "dry-run": { type: "boolean", default: false },
@@ -614,7 +659,7 @@ async function main(
   });
   if (!values["image-dir"] || !values.binaries)
     throw new Error(
-      "usage: register-node-image.ts --image-dir DIR --binaries DIR [--lock FILE] [--signature FILE] [--release-key FILE] [--dry-run]",
+      "usage: register-node-image.ts --image-dir DIR --binaries DIR [--lock FILE] [--tree DIR] [--signature FILE] [--release-key FILE] [--dry-run]",
     );
   // The credentials come first, so a missing one fails before gigabytes are read.
   const credentials = values["dry-run"]
@@ -625,10 +670,14 @@ async function main(
     imageDir: resolve(values["image-dir"]),
     binariesDir: resolve(values.binaries),
     ...(values.lock ? { lockPath: resolve(values.lock) } : {}),
+    ...(values.tree ? { tree: resolve(values.tree) } : {}),
   });
   console.log(`release ${manifest.version}`);
   console.log(
     `  kernel ${manifest.registration.os.kernel_release}  packages sha256 ${manifest.registration.os.packages_sha256}`,
+  );
+  console.log(
+    `  ${manifest.registration.os.host_files.length} host files  sha256 ${manifest.registration.os.host_files_sha256}`,
   );
   for (const { key, digest } of manifest.uploads)
     console.log(

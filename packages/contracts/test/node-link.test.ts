@@ -110,6 +110,16 @@ const page = {
         sha256: "b".repeat(64),
         size_bytes: 2000,
       },
+      host_files: [
+        {
+          path: "/usr/lib/systemd/system/pgcf-agent.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "c".repeat(64),
+          size_bytes: 900,
+          apply: "restart_unit:pgcf-agent.service",
+        },
+      ],
     },
   },
   policy: {
@@ -806,6 +816,7 @@ describe("what a node reports", () => {
       booted_at: now,
       kernel_release: "6.12.111+deb13-amd64",
       packages_sha256: "a".repeat(64),
+      host_files_sha256: "b".repeat(64),
     };
     const hello = {
       type: "hello",
@@ -829,6 +840,8 @@ describe("what a node reports", () => {
       { kernel_release: "6.12 amd64" },
       { packages_sha256: "A".repeat(64) },
       { packages_sha256: "a".repeat(63) },
+      { host_files_sha256: "B".repeat(64) },
+      { host_files_sha256: "b".repeat(63) },
       { extra: 1 },
     ])
       expect(

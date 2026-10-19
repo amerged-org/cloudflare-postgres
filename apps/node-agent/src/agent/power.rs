@@ -69,7 +69,8 @@ impl StartFailure {
 pub(crate) enum Stale {
     /// The node holds no entry for the database.
     NoEntry,
-    /// The ticket's generation is neither the next one, nor the entry's, nor a claim's.
+    /// The ticket's generation is neither the next one, nor the entry's, nor a claim's; or it is
+    /// above the entry of a suspended database, which is a page that has not caught up.
     Generation,
     /// The ticket's generation is the entry's, with another operation.
     Operation,
@@ -491,6 +492,15 @@ impl<M: Machine> Core<M> {
             }
             match entry.desired {
                 Desired::Deleted => return Err(("deleted", None)),
+                // The entry is a manual suspension. A connection of its generation, or an older
+                // one, is a connection to a suspended database. A request of a later generation
+                // is not: D1 moved on (a resume, for one) and the page the node holds has not
+                // caught up, so the entry says nothing of what D1 wants now. That is stale, which
+                // `obey_wake` waits out, and never final; nothing starts from an entry that is
+                // behind.
+                Desired::Suspended if request.generation > entry.generation => {
+                    return Err(("desired_stale", Some(Stale::Generation)));
+                }
                 Desired::Suspended => return Err(("suspended", None)),
                 Desired::Running => {}
             }
@@ -1976,13 +1986,23 @@ mod tests {
         rig.core.maintenance.store(true, Ordering::Relaxed);
         assert_eq!(refused(rig.core.wake(&ticket).await), reason("maintenance"));
         rig.core.maintenance.store(false, Ordering::Relaxed);
-        for (desired, wanted) in [
-            (Desired::Suspended, "suspended"),
-            (Desired::Deleted, "deleted"),
-        ] {
-            with(&|view| view.entry.as_mut().unwrap().desired = desired);
-            assert_eq!(refused(rig.core.wake(&ticket).await), reason(wanted));
-        }
+        // A connection of the generation of a manual suspension, or of an older one, is a
+        // connection to a suspended database. A request of a later generation is not: D1 moved on
+        // (a resume, say) and the page the node holds has not caught up, so it says nothing of
+        // what D1 wants now and is stale, never `suspended`.
+        with(&|view| view.entry.as_mut().unwrap().desired = Desired::Suspended);
+        let mut current = ticket.clone();
+        current.generation = entry.generation;
+        assert_eq!(refused(rig.core.wake(&current).await), reason("suspended"));
+        let mut older = ticket.clone();
+        older.generation = entry.generation - 1;
+        assert_eq!(refused(rig.core.wake(&older).await), reason("suspended"));
+        assert_eq!(
+            refused(rig.core.wake(&ticket).await),
+            reason("desired_stale")
+        );
+        with(&|view| view.entry.as_mut().unwrap().desired = Desired::Deleted);
+        assert_eq!(refused(rig.core.wake(&ticket).await), reason("deleted"));
         with(&|view| view.entry.as_mut().unwrap().desired = Desired::Running);
         rig.core
             .fences
@@ -2072,6 +2092,18 @@ mod tests {
             assert_eq!(wake["reason"], "desired_stale");
             assert_eq!(wake["stale"], stale);
         }
+        // A ticket that is ahead of the entry of a suspended database is stale by its generation.
+        rig.core.set(&db, |view| {
+            view.entry.as_mut().unwrap().desired = Desired::Suspended
+        });
+        let result = rig.core.wake(&ticket()).await;
+        assert_eq!(result.reason.as_deref(), Some("desired_stale"));
+        let events = rig.core.take_events();
+        let wake = events.iter().find(|e| e["type"] == "wake").unwrap();
+        assert_eq!(wake["stale"], "generation");
+        rig.core.set(&db, |view| {
+            view.entry.as_mut().unwrap().desired = Desired::Running
+        });
         // A refusal for another reason names no way of being stale.
         rig.core.maintenance.store(true, Ordering::Relaxed);
         assert_eq!(

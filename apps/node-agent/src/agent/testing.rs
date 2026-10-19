@@ -132,6 +132,8 @@ pub(crate) fn timing() -> Timing {
         adopt_wait: Duration::from_secs(5),
         report_retry: Duration::from_millis(10),
         report_retry_maximum: Duration::from_millis(40),
+        host_files_retry: Duration::from_millis(500),
+        host_files_retry_maximum: Duration::from_millis(2000),
         settle: Duration::from_secs(10),
         detail: Duration::from_millis(100),
     }
