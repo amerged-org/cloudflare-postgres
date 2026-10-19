@@ -65,38 +65,31 @@ pub const SIGNATURE_MAX_BYTES: usize = 256;
 /// The first line of the signed manifest (`RELEASE_MANIFEST_DOMAIN`).
 const MANIFEST_DOMAIN: &str = "pgcf-release-manifest/v2\n";
 
-/// Why a node does not trust a release; the codes are the contract's `RELEASE_REFUSALS`.
+/// Why a node does not trust a release; the codes are the contract's `RELEASE_REFUSALS`. The
+/// refusals of a release's host files (`hostfiles::Refusal`) are no part of this: they are the
+/// verdict of the agent that writes the files, not of the signature, so that an agent whose rules
+/// are older than the release still installs its binaries (`service::host_files`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReleaseRefusal {
-    /// The API has no signature for the release.
+    /// No signature was served for the release.
     SignatureMissing,
     /// What it has is not the release key's signature of the release's manifest.
     SignatureInvalid,
-    /// The signed host files break the agent's own rules (`hostfiles::check`).
-    HostFiles(hostfiles::Refusal),
 }
 impl ReleaseRefusal {
-    pub const ALL: [Self; 6] = [
-        Self::SignatureMissing,
-        Self::SignatureInvalid,
-        Self::HostFiles(hostfiles::Refusal::Path),
-        Self::HostFiles(hostfiles::Refusal::Mode),
-        Self::HostFiles(hostfiles::Refusal::Apply),
-        Self::HostFiles(hostfiles::Refusal::Invalid),
-    ];
+    pub const ALL: [Self; 2] = [Self::SignatureMissing, Self::SignatureInvalid];
     pub const fn code(self) -> &'static str {
         match self {
             Self::SignatureMissing => "release_signature_missing",
             Self::SignatureInvalid => "release_signature_invalid",
-            Self::HostFiles(refusal) => refusal.code(),
         }
     }
 }
 
 /// Whether `signature`, the text the API serves, is the signature of `key` over the manifest of
-/// `release`: 128 lower-case hex symbols, which whitespace may surround. A release that the key
-/// signed is then held to the agent's own rules for its host files, as the last check before
-/// anything is written as root.
+/// `release`: 128 lower-case hex symbols, which whitespace may surround. That is all it says: a
+/// release the key signed may still carry host files that this agent's own rules refuse, and that
+/// is decided where the files are written (`hostfiles::check`), after the binaries are in place.
 pub fn verify(key: &[u8; 32], release: &Release, signature: &[u8]) -> Result<(), ReleaseRefusal> {
     let text = std::str::from_utf8(signature)
         .map_err(|_| ReleaseRefusal::SignatureInvalid)?
@@ -107,8 +100,7 @@ pub fn verify(key: &[u8; 32], release: &Release, signature: &[u8]) -> Result<(),
     let bytes = unhex(text).ok_or(ReleaseRefusal::SignatureInvalid)?;
     UnparsedPublicKey::new(&ED25519, key)
         .verify(&release.manifest(), &bytes)
-        .map_err(|_| ReleaseRefusal::SignatureInvalid)?;
-    hostfiles::check(&release.host_files).map_err(ReleaseRefusal::HostFiles)
+        .map_err(|_| ReleaseRefusal::SignatureInvalid)
 }
 /// The bytes of lower-case hex symbols; `None` for anything else, an odd count included.
 fn unhex(text: &str) -> Option<Vec<u8>> {
@@ -846,7 +838,7 @@ mod tests {
             // The host files: how a file takes effect, its digest, its size, its mode, its path,
             // the files that are there and the order they are in.
             |r| r.host_files[0].apply = "next_start".into(),
-            |r| r.host_files[2].apply = "reboot".into(),
+            |r| r.host_files[2].apply = "tmpfiles".into(),
             |r| r.host_files[2].sha256 = "9".repeat(64),
             |r| r.host_files[2].size_bytes += 1,
             |r| r.host_files[5].mode = "0644".into(),
@@ -882,42 +874,31 @@ mod tests {
     }
 
     #[test]
-    fn a_signed_release_whose_host_files_break_the_agents_rules_is_refused_by_the_rule() {
-        use hostfiles::Refusal;
+    fn the_signature_says_nothing_of_the_agents_rules_for_host_files() {
+        // The key signed these lists as they are, and each breaks a rule of this agent: a later
+        // release may allow them. The signature still holds, so that the binaries are installed,
+        // and the agent that writes the files holds them to its own rules (`hostfiles::check`).
         let (key, release) = (throwaway(), vector_release());
         type Bend = fn(&mut Release);
-        let cases: [(Bend, Refusal); 6] = [
-            (
-                |r| r.host_files[0].path = "/etc/passwd".into(),
-                Refusal::Path,
-            ),
-            (
-                |r| r.host_files[0].path = "/etc/ssh/sshd_config.d/../x".into(),
-                Refusal::Path,
-            ),
-            (|r| r.host_files[0].mode = "0600".into(), Refusal::Mode),
-            (
-                |r| r.host_files[0].apply = "restart_unit:sshd.service".into(),
-                Refusal::Apply,
-            ),
-            (|r| r.host_files.swap(0, 1), Refusal::Invalid),
-            (|r| r.host_files.clear(), Refusal::Invalid),
+        let bends: [Bend; 5] = [
+            |r| r.host_files[0].path = "/etc/passwd".into(),
+            |r| r.host_files[0].mode = "0600".into(),
+            |r| r.host_files[0].apply = "restart_unit:sshd.service".into(),
+            |r| r.host_files[0].apply = "a_way_to_take_effect_that_is_new".into(),
+            |r| r.host_files.clear(),
         ];
-        for (change, class) in cases {
+        for bend in bends {
             let mut other = release.clone();
-            change(&mut other);
-            // The key signed this very text: the signature holds, and the agent's rule does not.
+            bend(&mut other);
             let signature = signed(&key, &other.manifest());
-            assert_eq!(
-                verify(&public(&key), &other, &signature),
-                Err(ReleaseRefusal::HostFiles(class)),
-                "{class:?}"
+            assert_eq!(verify(&public(&key), &other, &signature), Ok(()));
+            assert_ne!(
+                hostfiles::check(&other.host_files),
+                Ok(()),
+                "{:?}",
+                other.host_files
             );
         }
-        assert_eq!(
-            verify(&public(&key), &release, &signed(&key, &release.manifest())),
-            Ok(())
-        );
     }
 
     #[test]
@@ -966,7 +947,12 @@ mod tests {
     #[test]
     fn the_refusal_classes_and_the_signature_file_are_the_contracts() {
         use crate::node_link::constant;
-        let ours: Vec<&str> = ReleaseRefusal::ALL.iter().map(|r| r.code()).collect();
+        // The signature's classes, then those of the agent's own rules for the host files.
+        let ours: Vec<&str> = ReleaseRefusal::ALL
+            .iter()
+            .map(|r| r.code())
+            .chain(hostfiles::Refusal::ALL.iter().map(|r| r.code()))
+            .collect();
         let theirs: Vec<&str> = constant("RELEASE_REFUSALS")
             .as_array()
             .unwrap()

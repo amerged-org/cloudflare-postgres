@@ -524,8 +524,9 @@ impl Units {
     }
 
     /// Has systemd read its unit files again (`systemctl daemon-reload`): what a release wrote
-    /// becomes the definition a unit starts with. The units that run keep running with the
-    /// definition they started with until they restart.
+    /// becomes the definition a unit starts with, and its stop settings are those of its next
+    /// stop. A unit that runs keeps its process, its exec and namespace settings and the limits of
+    /// its cgroup until it restarts (measured by the lab test of the host files).
     pub async fn reload(&self) -> Result<(), Error> {
         Ok(self.manager.reload().await?)
     }

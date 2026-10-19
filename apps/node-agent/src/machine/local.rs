@@ -108,6 +108,14 @@ struct State {
     reload_fails: bool,
     /// `restart_service` fails once, as a job that ends with `failed`.
     restart_fails: bool,
+    /// `restart_service` fails for this unit every time, as a unit that cannot start.
+    restart_fails_for: BTreeSet<String>,
+    /// The users `systemd-sysusers` made, and the directories (with their mode) `systemd-tmpfiles`
+    /// made.
+    users: BTreeSet<String>,
+    directories: BTreeMap<String, String>,
+    /// The next `run_sysusers` or `run_tmpfiles` fails, as the tools do with exit status 1.
+    run_fails: bool,
 }
 
 /// The units of the image that a release restarts, as the packages and the image leave them: the
@@ -121,6 +129,13 @@ const IMAGE_UNITS: [&str; 6] = [
     "systemd-journald.service",
     "systemd-sysctl.service",
 ];
+
+/// A tool of systemd that ended with exit status 1, as `run` of the node reports it.
+fn tool_failed(program: &str, file: &str) -> io::Error {
+    io::Error::other(format!(
+        "{program} ended with exit status: 1: Failed to read '{file}'"
+    ))
+}
 
 /// The kernel's boot ID of the node's `boots`th boot.
 fn boot_id(boots: u64) -> String {
@@ -165,6 +180,8 @@ impl Local {
             )
             .unwrap();
         }
+        // `/run/systemd` is there at every boot; its `system` directory is made when a unit needs it.
+        fs::create_dir_all(layout.host_root.join("run/systemd")).unwrap();
         for unit in IMAGE_UNITS {
             fs::write(
                 layout.host_root.join("usr/lib/systemd/system").join(unit),
@@ -192,7 +209,13 @@ impl Local {
     /// unit.
     fn unit_files(&self) -> BTreeMap<String, Option<Vec<u8>>> {
         let mut found = BTreeMap::new();
-        for directory in ["etc/systemd/system", "usr/lib/systemd/system"] {
+        // systemd's search path: the administrator's directory, then the runtime one, then the
+        // vendor's (a boot empties the runtime one).
+        for directory in [
+            "etc/systemd/system",
+            "run/systemd/system",
+            "usr/lib/systemd/system",
+        ] {
             let Ok(entries) = fs::read_dir(self.layout.host_root.join(directory)) else {
                 continue;
             };
@@ -223,6 +246,18 @@ impl Local {
         let files = self.unit_files();
         self.state().loaded = files;
     }
+    /// The file a tool of systemd (`sysusers`, `tmpfiles`) is asked to read, below the machine's
+    /// root. The call is kept, and a tool that was told to fail does.
+    fn config_file(&self, tool: &str, file: &str) -> io::Result<String> {
+        let mut state = self.state();
+        state.calls.push(format!("{tool} {file}"));
+        if std::mem::take(&mut state.run_fails) {
+            return Err(tool_failed(&format!("systemd-{tool}"), file));
+        }
+        drop(state);
+        fs::read_to_string(self.layout.host_root.join(file.trim_start_matches('/')))
+            .map_err(|_| tool_failed(&format!("systemd-{tool}"), file))
+    }
     /// The definition `unit` runs with: its file as it was loaded when it last restarted.
     pub fn running_definition(&self, unit: &str) -> Option<String> {
         self.state()
@@ -235,6 +270,25 @@ impl Local {
     }
     pub fn fail_next_restart(&self) {
         self.state().restart_fails = true;
+    }
+    /// Every restart of `unit` fails, as a unit does that cannot start.
+    pub fn fail_restarts_of(&self, unit: &str) {
+        self.state().restart_fails_for.insert(unit.to_string());
+    }
+    /// Restarts of `unit` work again.
+    pub fn mend_restarts_of(&self, unit: &str) {
+        self.state().restart_fails_for.remove(unit);
+    }
+    pub fn fail_next_run(&self) {
+        self.state().run_fails = true;
+    }
+    /// The users `systemd-sysusers` made.
+    pub fn created_users(&self) -> Vec<String> {
+        self.state().users.iter().cloned().collect()
+    }
+    /// The directories `systemd-tmpfiles` made, with the mode the file gave them.
+    pub fn created_directories(&self) -> BTreeMap<String, String> {
+        self.state().directories.clone()
     }
     pub fn with_layout(mut self, change: impl FnOnce(&mut Layout)) -> Self {
         change(&mut self.layout);
@@ -1014,7 +1068,7 @@ impl Machine for Local {
             unit: unit.to_string(),
             result: result.to_string(),
         };
-        if std::mem::take(&mut state.restart_fails) {
+        if std::mem::take(&mut state.restart_fails) || state.restart_fails_for.contains(unit) {
             return Err(job("failed"));
         }
         // systemd loads a unit it has not loaded yet when it is asked for it.
@@ -1042,6 +1096,53 @@ impl Machine for Local {
             return Err(units::Error::Unexpected("the reload failed"));
         }
         state.loaded = files;
+        Ok(())
+    }
+
+    /// `systemd-sysusers <file>`: reads the file as given and makes the users and groups it lists;
+    /// a file it cannot read or parse is exit status 1, and a user that exists stays as it is.
+    async fn run_sysusers(&self, file: &str) -> io::Result<()> {
+        let text = self.config_file("sysusers", file)?;
+        let mut users = Vec::new();
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                ["u" | "g" | "m", name, ..] => users.push((*name).to_string()),
+                _ => return Err(tool_failed("systemd-sysusers", file)),
+            }
+        }
+        self.state().users.extend(users);
+        Ok(())
+    }
+
+    /// `systemd-tmpfiles --create <file>`: makes the directories (`d`) it lists with the mode it
+    /// gives, and leaves one that exists as it is; another type of line is not modelled and a
+    /// line that is none is exit status 1.
+    async fn run_tmpfiles(&self, file: &str) -> io::Result<()> {
+        let text = self.config_file("tmpfiles", file)?;
+        let mut directories = Vec::new();
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                ["d", path, mode, ..] => {
+                    directories.push(((*path).to_string(), (*mode).to_string()))
+                }
+                [kind, _, ..] if kind.len() == 1 => {}
+                _ => return Err(tool_failed("systemd-tmpfiles", file)),
+            }
+        }
+        let mut state = self.state();
+        for (path, mode) in directories {
+            state.directories.entry(path).or_insert(mode);
+        }
         Ok(())
     }
 
@@ -1100,6 +1201,18 @@ impl Machine for Local {
             ));
         }
         state.boots += 1;
+        // A boot empties /run, which holds the units of the runtime directory, and systemd reads
+        // every unit file again and starts the units with them.
+        let runtime = self.layout.host_root.join("run/systemd/system");
+        let _ = fs::remove_dir_all(&runtime);
+        drop(state);
+        let files = self.unit_files();
+        let mut state = self.state();
+        state.running = files
+            .iter()
+            .filter_map(|(unit, definition)| Some((unit.clone(), definition.clone()?)))
+            .collect();
+        state.loaded = files;
         // GRUB boots the highest version, which is not the last name: 6.12.99 is below 6.12.113.
         let numbers = |abi: &str| -> Vec<u64> {
             abi.split(|c: char| !c.is_ascii_digit())

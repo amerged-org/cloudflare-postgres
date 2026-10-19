@@ -491,6 +491,14 @@ impl Machine for Node {
         self.units.reload().await
     }
 
+    async fn run_sysusers(&self, file: &str) -> io::Result<()> {
+        run("systemd-sysusers", &[file]).await
+    }
+
+    async fn run_tmpfiles(&self, file: &str) -> io::Result<()> {
+        run("systemd-tmpfiles", &["--create", file]).await
+    }
+
     async fn installed_packages(&self) -> io::Result<BTreeMap<String, String>> {
         let output = tokio::process::Command::new("dpkg-query")
             .args(["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n"])

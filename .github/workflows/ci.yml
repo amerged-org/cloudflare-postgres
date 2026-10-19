@@ -292,7 +292,7 @@ jobs:
       - name: Check and test the image tooling and the installer
         run: |
           pnpm exec tsc -p infra/node-image/tsconfig.json
-          bash -n infra/node-image/builder/build.sh infra/node-image/installer/install.sh infra/node-image/boot-test/guest.sh
+          bash -n infra/node-image/builder/build.sh infra/node-image/builder/normalize-modes.sh infra/node-image/installer/install.sh infra/node-image/boot-test/guest.sh
           node --test infra/node-image/*.test.ts infra/node-image/installer/*.test.ts
       - name: Build the node binaries with the pinned Rust toolchain
         run: |

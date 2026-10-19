@@ -183,19 +183,24 @@ Worker. The concurrency and memory limits of the jobs come from the policy.
 - **Updates** (`update.rs`). A release the page names changes the four binaries without a reboot:
   they are downloaded into the release's directory, checked against the pinned size and sha256, and
   only then does `current` move. A maintenance order installs the release's package lock through
-  apt, reboots when a kernel or core library changed (or a host file that takes effect at a boot was
-  written), runs `pgcf-agent check` and answers. The exact steps are in the
+  apt, reboots when a kernel or core library changed, runs `pgcf-agent check` and answers. The exact steps are in the
   [node image README](../../infra/node-image/README.md#what-the-image-expects-from-the-agent).
 - **Host files** (`hostfiles.rs`). The image's systemd units and masks and its sshd, journald,
   sysctl, tmpfiles, sysusers and modprobe configuration ship with the release too, after its
-  binaries and written by the agent that runs the release's own binary: the files that differ are
-  written atomically below `/` (hidden file, `fsync`, rename, `fsync` of the directory) in the
-  allow-listed directories only, never through a link, systemd reads its units again once, and what
-  changed is restarted, the agent's own unit last (the agent leaves). `agent/host-files.json` records
-  the paths the agent may touch and what is left to do before the first write, so a crash at any point
-  is finished by the next start. The hello reports the digest of what the disk holds
-  (`os.host_files_sha256`); a file that takes effect at a boot counts as not held until the boot has
-  changed. See the [node image README](../../infra/node-image/README.md#what-ships-with-the-image-what-with-a-release).
+  binaries and written by the agent that runs the release's own binary. The agent holds the signed
+  list to its own rules just before it writes (a list they do not allow is refused for its files,
+  once, and the binaries are installed all the same), and the files that differ are written
+  atomically below `/` (hidden file, `fsync`, rename, `fsync` of the directory) in the allow-listed
+  directories only, never through a link. systemd reads its units again once, `systemd-sysusers`
+  and `systemd-tmpfiles --create` run on the files that say so, and what changed is restarted, the
+  agent's own unit last (the agent leaves); a failure is tried again after a growing wait and keeps
+  no other unit from its restart. The agent's own unit is written to `/run/systemd/system` first,
+  and the agent that runs it moves it to its place after it has read its first page: a node whose
+  new unit cannot start is restarted from the API and runs the unit it had. `agent/host-files.json`
+  records the paths the agent may touch and what is left to do before the first write, so a crash
+  at any point is finished by the next start. The hello reports the digest of what the disk holds
+  (`os.host_files_sha256`), which is the release's only when systemd has been told everything. See
+  the [node image README](../../infra/node-image/README.md#what-ships-with-the-image-what-with-a-release).
 - **Events and logs** (`timing.rs`, `events.rs`). The agent logs one JSON line per event to stderr
   and names a failure by its class, never by an error's text, which can carry an address or a path.
   The lines also travel in the next observation report, reduced to the contract's fields.

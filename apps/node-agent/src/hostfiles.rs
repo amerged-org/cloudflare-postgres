@@ -17,9 +17,17 @@
 //! `State::owned` is written before the first file, so a crash at any point leaves a record that
 //! covers every path that may have been changed, and the next start applies the list again. How a
 //! file takes effect is recorded the same way before it is written (`State::reload`,
-//! `State::restarts`, `State::reboot`), so a crash between the write and the restart still ends
-//! in the restart. The caller (`service`) does the systemd side: one reload, the restarts, the
+//! `State::runs`, `State::restarts`), so a crash between the write and the restart still ends in
+//! the restart. The caller (`service`) does the systemd side: one reload, then the runs of
+//! `systemd-sysusers` and `systemd-tmpfiles` on the files that say so, then the restarts, the
 //! agent's own last.
+//!
+//! The agent's own unit is the one file that is not trusted when it is written: a unit that cannot
+//! start leaves the node with no link, no wake and no archive until someone with a shell reaches
+//! it, so the new unit is written to `/run/systemd/system`, which systemd reads before
+//! `/usr/lib/systemd/system` and which a boot empties. The agent that starts under it moves it to
+//! its place only once it has run far enough to read the first page (`promote`); a node that
+//! cannot start it is restarted from the API and runs the unit it had.
 use crate::{link::file::write_private, node_link::constant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,7 +70,7 @@ pub struct HostFile {
     pub sha256: String,
     #[serde(default)]
     pub size_bytes: u64,
-    /// `daemon_reload`, `next_start`, `reboot` or `restart_unit:<unit>`.
+    /// `daemon_reload`, `next_start`, `sysusers`, `tmpfiles` or `restart_unit:<unit>`.
     pub apply: String,
 }
 
@@ -71,7 +79,10 @@ pub struct HostFile {
 pub enum Apply<'a> {
     DaemonReload,
     NextStart,
-    Reboot,
+    /// `systemd-sysusers <file>`.
+    Sysusers,
+    /// `systemd-tmpfiles --create <file>`.
+    Tmpfiles,
     RestartUnit(&'a str),
 }
 
@@ -88,7 +99,8 @@ impl HostFile {
         match self.apply.as_str() {
             "daemon_reload" => Some(Apply::DaemonReload),
             "next_start" => Some(Apply::NextStart),
-            "reboot" => Some(Apply::Reboot),
+            "sysusers" => Some(Apply::Sysusers),
+            "tmpfiles" => Some(Apply::Tmpfiles),
             other => other.strip_prefix("restart_unit:").map(Apply::RestartUnit),
         }
     }
@@ -496,7 +508,8 @@ pub fn place(
     crash(Step::DirectorySynced)
 }
 
-/// Removes a file or a mask the agent wrote; a directory or anything else is left alone.
+/// Removes a file or a mask; a directory or anything else is left alone. The caller names only a
+/// path an earlier list named, which the agent wrote or the image brought: both are the list's.
 fn remove(root: &Path, path: &str) -> io::Result<bool> {
     let (directory, name) = match open_parent(root, path, false) {
         Ok(parent) => parent,
@@ -514,13 +527,44 @@ fn remove(root: &Path, path: &str) -> io::Result<bool> {
     }
 }
 
+// ---- the agent's own unit
+
+/// Where systemd reads units that last until the next boot. It reads this directory before the
+/// image's (`/usr/lib/systemd/system`), so a unit here wins over the file of the same name there.
+pub const RUNTIME_UNITS: &str = "/run/systemd/system";
+
+/// The agent's unit as the image keeps it, which the list names.
+fn agent_unit_path() -> String {
+    format!("/usr/lib/systemd/system/{AGENT_UNIT}")
+}
+/// Where the new agent unit stands until the agent that runs it has proven itself.
+pub fn runtime_agent_unit() -> String {
+    format!("{RUNTIME_UNITS}/{AGENT_UNIT}")
+}
+/// Whether `file` is the agent's own unit in the image's directory: the one file that is written
+/// to the runtime directory first and moves to its place with `promote`.
+fn staged(file: &HostFile) -> bool {
+    file.kind == Kind::File && file.path == agent_unit_path()
+}
+
 // ---- what the agent keeps
 
-/// The files that take effect at a reboot and were written during the boot `boot_id`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Pending {
-    pub boot_id: String,
-    pub paths: Vec<String>,
+/// A tool of systemd that the agent runs on a file, once the units are read again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Tool {
+    /// `systemd-sysusers <file>`: the users and groups the file lists.
+    #[serde(rename = "sysusers")]
+    Sysusers,
+    /// `systemd-tmpfiles --create <file>`: the directories and files it lists.
+    #[serde(rename = "tmpfiles")]
+    Tmpfiles,
+}
+
+/// A run of a tool on a file. The users come before the directories that may name them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Run {
+    pub tool: Tool,
+    pub path: String,
 }
 
 /// What the agent records of its host files, in `agent/host-files.json` (0600).
@@ -533,15 +577,20 @@ pub struct State {
     pub owned: Vec<String>,
     /// The list last applied whole.
     pub files: Vec<HostFile>,
+    /// The boot during which `reload` and `restarts` were recorded: a boot reads every unit again
+    /// and starts each with its file, so what is left of them for an earlier boot is moot.
+    #[serde(default)]
+    pub boot_id: String,
     /// systemd has to read its units again.
     #[serde(default)]
     pub reload: bool,
     /// Units to restart once it has; the agent's own is last.
     #[serde(default)]
     pub restarts: Vec<String>,
-    /// Files that wait for a reboot.
+    /// Tools to run once it has, before any restart. A boot does not do these (systemd makes users
+    /// at a boot only when /usr is newer than /etc/.updated), so they stay until they have run.
     #[serde(default)]
-    pub reboot: Option<Pending>,
+    pub runs: Vec<Run>,
 }
 
 impl State {
@@ -557,24 +606,21 @@ impl State {
         write_private(path, &serde_json::to_vec(self).map_err(io::Error::other)?)
     }
 
-    /// Whether `path` is a file that waits for the reboot of the boot `boot_id`.
-    fn waits(&self, path: &str, boot_id: &str) -> bool {
-        self.reboot.as_ref().is_some_and(|pending| {
-            pending.boot_id == boot_id && pending.paths.iter().any(|p| p == path)
-        })
+    /// Enters the boot `boot_id`: a reload and restarts of an earlier boot are dropped, because
+    /// the boot read every unit again and started each with its file.
+    pub fn begin(&mut self, boot_id: &str) {
+        if self.boot_id != boot_id {
+            self.reload = false;
+            self.restarts.clear();
+            self.boot_id = boot_id.to_string();
+        }
     }
 
-    /// Whether a file written during this boot waits for a reboot: the maintenance cycle reboots
-    /// for it.
-    pub fn reboot_pending(&self, boot_id: &str) -> bool {
-        self.reboot
-            .as_ref()
-            .is_some_and(|pending| pending.boot_id == boot_id && !pending.paths.is_empty())
-    }
-
-    /// Whether systemd has still to be told what an earlier apply began.
-    pub fn unfinished(&self) -> bool {
-        self.reload || !self.restarts.is_empty()
+    /// Whether systemd has still to be told what an earlier apply began, in the boot `boot_id`.
+    /// The node does not hold its release's files meanwhile: it runs the old definition.
+    pub fn unfinished(&self, boot_id: &str) -> bool {
+        !self.runs.is_empty()
+            || (self.boot_id == boot_id && (self.reload || !self.restarts.is_empty()))
     }
 }
 
@@ -585,21 +631,38 @@ pub struct Plan {
     pub writes: Vec<HostFile>,
     /// The paths of files the agent wrote for a list before and this one drops.
     pub removals: Vec<String>,
+    /// The agent's unit stands in the runtime directory as the list has it and the image's file is
+    /// another: the agent that runs it moves it with `promote`, once it has proven itself.
+    pub staged: Option<HostFile>,
+    /// A copy of the agent's unit in the runtime directory that the image's file has made of no
+    /// use, or that is not the list's: removed, which a reload then makes known.
+    pub unstage: bool,
 }
 impl Plan {
     pub fn is_empty(&self) -> bool {
-        self.writes.is_empty() && self.removals.is_empty()
+        self.writes.is_empty() && self.removals.is_empty() && !self.unstage
     }
 }
 
 /// Compares the disk with the list: every file whose installed content, mode, owner or kind
 /// differs is a write, and every path the agent owns that the list no longer names and that still
-/// holds a file or a mask is a removal.
+/// holds a file or a mask is a removal. The agent's own unit counts as held where it stands in the
+/// runtime directory (`Plan::staged`); it is a write to that directory when it stands nowhere.
 pub fn plan(root: &Path, state: &State, files: &[HostFile]) -> io::Result<Plan> {
     let mut plan = Plan::default();
     for file in files {
-        if !holds(&inspect(root, &file.path)?, file) {
-            plan.writes.push(file.clone());
+        let image = holds(&inspect(root, &file.path)?, file);
+        if !staged(file) {
+            if !image {
+                plan.writes.push(file.clone());
+            }
+            continue;
+        }
+        let runtime = inspect(root, &runtime_agent_unit())?;
+        match (image, holds(&runtime, file), runtime != Installed::Absent) {
+            (true, _, present) => plan.unstage |= present,
+            (false, true, _) => plan.staged = Some(file.clone()),
+            (false, false, _) => plan.writes.push(file.clone()),
         }
     }
     let named: BTreeSet<&str> = files.iter().map(|file| file.path.as_str()).collect();
@@ -624,7 +687,7 @@ pub struct Applied {
 }
 
 /// Where and when an apply happens: the root the files are below (`/` on a node), the file the
-/// agent keeps its record in, and the boot, which says what still waits for a reboot.
+/// agent keeps its record in, and the boot, which says what of the record still counts.
 #[derive(Clone, Copy, Debug)]
 pub struct Target<'a> {
     pub root: &'a Path,
@@ -634,9 +697,10 @@ pub struct Target<'a> {
 
 /// Applies the list: the record of what may change and of how each change takes effect is saved
 /// first, then each file is written (`bytes` holds the content of every file with content that
-/// `plan` found missing, by digest), then what the list dropped is removed, then the list is
-/// recorded as applied. `crash` is told after each step of each file, and after each removal as
-/// `Step::DirectorySynced`. A failure stops the apply where it is; calling it again finishes it.
+/// `plan` found missing, by digest; the agent's own unit goes to the runtime directory), then what
+/// the list dropped is removed, then the list is recorded as applied. `crash` is told after each
+/// step of each file, and after each removal as `Step::DirectorySynced`. A failure stops the apply
+/// where it is; calling it again finishes it.
 pub fn apply(
     target: &Target,
     release: &str,
@@ -651,6 +715,7 @@ pub fn apply(
         boot_id,
     } = *target;
     let mut state = State::load(state_path);
+    state.begin(boot_id);
     // Before the first file: every path that may change, and how each change takes effect, so
     // that a crash anywhere in the writes leaves the work to the next start.
     let mut owned: BTreeSet<String> = state.owned.iter().cloned().collect();
@@ -660,28 +725,46 @@ pub fn apply(
         state.reload = true;
     }
     let mut restarts: BTreeSet<String> = state.restarts.iter().cloned().collect();
-    let mut waiting: BTreeSet<String> = state
-        .reboot
-        .iter()
-        .filter(|pending| pending.boot_id == boot_id)
-        .flat_map(|pending| pending.paths.iter().cloned())
-        .collect();
+    let mut runs: BTreeSet<Run> = state.runs.iter().cloned().collect();
     for file in &plan.writes {
         match file.apply() {
             Some(Apply::RestartUnit(unit)) => {
                 restarts.insert(unit.to_string());
             }
-            Some(Apply::Reboot) => {
-                waiting.insert(file.path.clone());
+            Some(Apply::Sysusers) => {
+                runs.insert(Run {
+                    tool: Tool::Sysusers,
+                    path: file.path.clone(),
+                });
+            }
+            Some(Apply::Tmpfiles) => {
+                runs.insert(Run {
+                    tool: Tool::Tmpfiles,
+                    path: file.path.clone(),
+                });
             }
             _ => {}
         }
     }
+    // A file the list drops is gone from the disk, and what runs on it keeps the setting it had
+    // until it restarts: the way the dropped file took effect is the one it was applied with.
+    for path in &plan.removals {
+        if let Some(Apply::RestartUnit(unit)) = state
+            .files
+            .iter()
+            .find(|file| file.path == *path)
+            .and_then(HostFile::apply)
+        {
+            restarts.insert(unit.to_string());
+        }
+    }
+    // A copy of the agent's unit that goes was the definition the running agent started with: it
+    // restarts to run the unit of the image.
+    if plan.unstage {
+        restarts.insert(AGENT_UNIT.to_string());
+    }
     state.restarts = restarts.into_iter().collect();
-    state.reboot = (!waiting.is_empty()).then(|| Pending {
-        boot_id: boot_id.to_string(),
-        paths: waiting.into_iter().collect(),
-    });
+    state.runs = runs.into_iter().collect();
     state.save(state_path)?;
 
     for file in &plan.writes {
@@ -692,10 +775,22 @@ pub fn apply(
                 .ok_or_else(|| io::Error::other("the bytes of a host file are missing"))?,
             Kind::Mask => &[],
         };
-        place(root, file, content, crash)?;
+        if staged(file) {
+            let runtime = HostFile {
+                path: runtime_agent_unit(),
+                ..file.clone()
+            };
+            place(root, &runtime, content, crash)?;
+        } else {
+            place(root, file, content, crash)?;
+        }
     }
     for path in &plan.removals {
         remove(root, path)?;
+        crash(Step::DirectorySynced)?;
+    }
+    if plan.unstage {
+        remove(root, &runtime_agent_unit())?;
         crash(Step::DirectorySynced)?;
     }
 
@@ -709,40 +804,83 @@ pub fn apply(
     })
 }
 
+/// The bytes of the file at `path` below `root`, read without following a link, no more than a
+/// host file may hold.
+fn read_file(root: &Path, path: &str) -> io::Result<Vec<u8>> {
+    let (directory, name) = open_parent(root, path, false)?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: a plain syscall with a NUL-terminated name.
+    let fd = check_call(unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) })?;
+    let mut bytes = Vec::new();
+    fs::File::from(owned(fd))
+        .take(largest() + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Moves the agent's unit from the runtime directory to its place in the image's, once the agent
+/// that runs the runtime copy has read its first page: the unit started, so it may stay through a
+/// boot. The reload that follows (recorded first) makes systemd read the file of the image and let
+/// go of the copy; the definition is the same, so nothing restarts. A crash between the steps is
+/// finished by the next call (`plan`), and the runtime copy goes last.
+pub fn promote(
+    target: &Target,
+    file: &HostFile,
+    crash: &mut dyn FnMut(Step) -> io::Result<()>,
+) -> io::Result<()> {
+    let Target {
+        root,
+        state: state_path,
+        boot_id,
+    } = *target;
+    let bytes = read_file(root, &runtime_agent_unit())?;
+    if crate::update::hex(&Sha256::digest(&bytes)) != file.sha256 {
+        return Err(io::Error::other(
+            "the agent's unit in the runtime directory is not the one of the list",
+        ));
+    }
+    let mut state = State::load(state_path);
+    state.begin(boot_id);
+    state.reload = true;
+    state.save(state_path)?;
+    place(root, file, &bytes, crash)?;
+    remove(root, &runtime_agent_unit())?;
+    crash(Step::DirectorySynced)
+}
+
 /// What the node reports in its hello (`NodeOs::host_files_sha256`): the digest of the facts of
-/// the files of the last applied list, read from the disk now, a file that waits for a reboot
-/// counted as not there yet. It is the contract's digest of the release's list exactly when the
-/// disk holds that list and nothing waits for a reboot. A node that has applied nothing reports
-/// the digest of no file at all.
+/// the files of the last applied list, read from the disk now. It is the contract's digest of the
+/// release's list exactly when the disk holds that list and systemd has been told everything of
+/// it: while a reload, a restart or a run is still to do, the digest is another. A node that has
+/// applied nothing reports the digest of no file at all.
 pub fn observed_digest(root: &Path, state: &State, boot_id: &str) -> String {
     let mut digest = Sha256::new();
     for file in &state.files {
         let mut line = String::new();
-        if state.waits(&file.path, boot_id) {
-            let _ = write!(line, "{} pending", file.path);
-        } else {
-            match inspect(root, &file.path) {
-                Ok(Installed::File {
-                    mode,
-                    sha256,
-                    size_bytes,
-                    ..
-                }) => {
-                    let _ = write!(line, "{} file {mode:04o} {sha256}:{size_bytes}", file.path);
-                }
-                Ok(Installed::Mask) => {
-                    let _ = write!(line, "{} symlink-to-dev-null - -", file.path);
-                }
-                Ok(Installed::Absent) => {
-                    let _ = write!(line, "{} absent", file.path);
-                }
-                Ok(Installed::Other) | Err(_) => {
-                    let _ = write!(line, "{} unreadable", file.path);
-                }
+        match inspect(root, &file.path) {
+            Ok(Installed::File {
+                mode,
+                sha256,
+                size_bytes,
+                ..
+            }) => {
+                let _ = write!(line, "{} file {mode:04o} {sha256}:{size_bytes}", file.path);
+            }
+            Ok(Installed::Mask) => {
+                let _ = write!(line, "{} symlink-to-dev-null - -", file.path);
+            }
+            Ok(Installed::Absent) => {
+                let _ = write!(line, "{} absent", file.path);
+            }
+            Ok(Installed::Other) | Err(_) => {
+                let _ = write!(line, "{} unreadable", file.path);
             }
         }
         digest.update(line.as_bytes());
         digest.update(b"\n");
+    }
+    if state.unfinished(boot_id) {
+        digest.update(b"unfinished\n");
     }
     crate::update::hex(&digest.finalize())
 }

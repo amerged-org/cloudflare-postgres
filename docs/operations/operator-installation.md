@@ -510,23 +510,41 @@ of the image is a host file: it ships with the signed release, so a change needs
    commit and assign it to the region, as for any release. The dry run prints the number of host
    files and their digest.
 3. Each node writes the files that differ after its binaries (a release that changes the agent is
-   installed by the old agent, and the new one writes the files after its restart), reads systemd's
-   units again once and restarts what changed: the gateway, cloudflared, ssh, journald and
-   systemd-sysctl by name, the agent last. A per-database unit takes the new file at each database's
-   next start and a running database is not touched.
+   installed by the old agent, and the new one writes the files after its restart), holding the
+   signed list to its own rules first. It reads systemd's units again once, runs `systemd-sysusers`
+   and `systemd-tmpfiles --create` on the files that say so (`sysusers`, `tmpfiles`: no reboot is
+   needed for a user or a directory), and restarts what changed: the gateway, cloudflared, ssh,
+   journald and systemd-sysctl by name, the agent last. The agent's own unit is written to
+   `/run/systemd/system` first and moves to its place when the agent that runs it has read its
+   first page. A running per-database unit is not restarted: its stop settings (`KillSignal=`,
+   `TimeoutStopSec=`, `ExecStop=`) are those of the new file at its next stop, and its process, its
+   exec and namespace settings (`ExecStart=`, `MountImages=`, `PrivateMounts=`, `User=`) and the
+   limits its cgroup enforces (`MemoryMax=`, `TasksMax=`, `CPUWeight=`, though `systemctl show`
+   already reports the new ones) stay as they were until the database's next start.
 4. Read the result with `GET /v1/nodes/{id}`: `os.host_files_sha256` equals the release's
-   `spec.os.host_files_sha256` and `os_converged` is true. A file that takes effect only at a boot
-   (`reboot`: sysusers, tmpfiles) leaves `os_converged` false until the
-   [maintenance cycle](recovery.md#node-maintenance-cycle) has run: it reboots the node for such a file
-   even when it has nothing to install, and the node is converged after the boot. The node's events
-   (`host_files_applied`, `host_files_not_applied`, `release_refused`) carry a class and never a file's
-   contents. The classes of a refusal are `host_file_path_refused`, `host_file_mode_refused`,
-   `host_file_apply_refused` and `host_files_invalid`; a file that could not be read, written or told
-   to systemd is `host_files_not_applied`, tried again with the next page.
+   `spec.os.host_files_sha256` and `os_converged` is true once systemd has been told everything (a
+   reload, a run or a restart that failed keeps `os_converged` false and is tried again after a
+   growing wait, 5 s up to 5 min). The node's events (`host_files_applied`,
+   `host_files_not_applied`, `agent_unit_promoted`, `release_refused`) carry a class and never a
+   file's contents. The classes of a refusal are `host_file_path_refused`,
+   `host_file_mode_refused`, `host_file_apply_refused` and `host_files_invalid`: they are the
+   agent's own rules, and a node whose agent is older than the release refuses the files of a
+   release that widens them (once, with the class) while it installs the binaries, which may carry
+   the agent that knows them; a file that could not be read, written or told to systemd is
+   `host_files_not_applied`.
 
-A change that moves what systemd mounts or in which mount namespace (the V4h change of the volumes)
-is not delivered this way: it needs every database asleep with its proof and its volumes unmounted
-in one step, and no hook exists for it; it reaches a node with an image.
+Rules for the author of a change (the node image README
+[states them](../../infra/node-image/README.md#changing-a-unit-or-a-configuration-file-without-a-new-image)):
+a new agent starts under the previous agent unit, a host file works with the packages of the
+release before (otherwise ship it in two releases), and a unit may need the users and directories
+that the same release makes. A node whose new agent unit cannot start is recovered as in
+[recovery](recovery.md#the-agent-does-not-come-back-after-a-release).
+
+A release that changes `MountImages=` or `PrivateMounts=` in these files (the V4h change of the
+volumes) is written to every running node, and nothing refuses it or checks it: the running
+databases keep the topology they started with, each database's next start takes the new one, and
+a node that holds both until every database has slept is in a state nothing has measured. Do not
+assign such a release to a region that has running nodes; the change reaches EU1 with a reinstall.
 
 ## API-only resource profiles and regional configuration
 

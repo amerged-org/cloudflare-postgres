@@ -162,7 +162,7 @@ describe("the link of a node", () => {
 
     // The release names another kernel: not converged. A kernel that matches with other packages
     // is not either, nor are the release's with other host files (a file that failed to be
-    // written, or one that waits for a reboot); the release's kernel, packages and host files
+    // written, or one that systemd has not been told of yet); the release's kernel, packages and host files
     // together are.
     releases.push(await assignRelease(f));
     expect(await inventory()).toEqual({ os: old, os_converged: false });

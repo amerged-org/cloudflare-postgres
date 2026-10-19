@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { dirname } from "node:path";
 import test from "node:test";
 import { readHostFiles } from "./host-files.ts";
 
@@ -250,7 +251,7 @@ test("the journal is synced every 15 s: the minutes before a freeze reach the di
   assert.deepEqual(assignments(journald, "Storage"), ["persistent"]);
 });
 
-test("every host file takes effect the way it needs: a running service is restarted, the per-database template at its next start, a slice or a mask by the reload, boot-only files at the reboot", async () => {
+test("every host file takes effect the way it needs: a running service is restarted, the per-database template at its next start, a slice or a mask by the reload, users and directories through their tools", async () => {
   const { files } = await readHostFiles();
   const apply = new Map(files.map((file) => [file.path, file.apply]));
   // A unit of the node's own services restarts itself: the new file is what the running process
@@ -269,19 +270,18 @@ test("every host file takes effect the way it needs: a running service is restar
   assert.equal(apply.get("/etc/ssh/sshd_config.d/10-pgcf.conf"), "restart_unit:ssh.service");
   assert.equal(apply.get("/usr/lib/sysctl.d/90-pgcf.conf"), "restart_unit:systemd-sysctl.service");
   assert.equal(apply.get("/usr/lib/systemd/journald.conf.d/pgcf.conf"), "restart_unit:systemd-journald.service");
-  // Users and directories are made at boot: those files wait for the maintenance cycle's reboot.
-  assert.equal(apply.get("/usr/lib/sysusers.d/pgcf.conf"), "reboot");
-  assert.equal(apply.get("/usr/lib/tmpfiles.d/pgcf.conf"), "reboot");
+  // Users and directories are made by the tool that reads the file, at once. A reboot would not
+  // make a user: systemd-sysusers.service runs at a boot only when /usr is newer than
+  // /etc/.updated, and a changed file in /usr/lib/sysusers.d does not change /usr.
+  for (const [path, how] of apply) {
+    if (dirname(path).endsWith("/sysusers.d")) assert.equal(how, "sysusers", path);
+    if (dirname(path).endsWith("/tmpfiles.d")) assert.equal(how, "tmpfiles", path);
+  }
+  assert.equal(apply.get("/usr/lib/sysusers.d/pgcf.conf"), "sysusers");
+  assert.equal(apply.get("/usr/lib/tmpfiles.d/pgcf.conf"), "tmpfiles");
 });
 
-test("the image is the whole tree and a release's host files are read from that tree: a fresh image and an updated node hold the same files", async () => {
-  // One definition: the builder copies the whole directory, and mkosi adds no tree of its own over
-  // `mkosi.extra`, so what the registration lists is what the image holds.
-  const build = readFileSync(new URL("builder/build.sh", import.meta.url), "utf8");
-  assert.match(build, /cp -r --preserve=mode \/src "\$work\/src"/);
+test("mkosi adds no tree of its own over mkosi.extra: what the registration lists is what the image holds", () => {
   const conf = readFileSync(new URL("mkosi.conf", import.meta.url), "utf8");
   assert.doesNotMatch(conf, /^(ExtraTrees|SkeletonTrees|BuildSources)=/m);
-  // The build summary states the digest of the list the tree gives, which the registration holds
-  // the checkout to (register-node-image.test.ts).
-  assert.match(readFileSync(new URL("node-image.ts", import.meta.url), "utf8"), /host_files_sha256: await hostFilesSha256\(/);
 });

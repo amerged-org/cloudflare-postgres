@@ -358,8 +358,7 @@
                       "additionalProperties": false
                     },
                     "host_files": {
-                      "minItems": 1,
-                      "maxItems": 64,
+                      "maxItems": 1024,
                       "type": "array",
                       "items": {
                         "oneOf": [
@@ -368,35 +367,29 @@
                             "properties": {
                               "path": {
                                 "type": "string",
-                                "pattern": "^(?:\\/etc\\/modprobe\\.d|\\/etc\\/ssh\\/sshd_config\\.d|\\/etc\\/sysctl\\.d|\\/etc\\/sysusers\\.d|\\/etc\\/systemd\\/journald\\.conf\\.d|\\/etc\\/systemd\\/system|\\/etc\\/tmpfiles\\.d|\\/usr\\/lib\\/sysctl\\.d|\\/usr\\/lib\\/sysusers\\.d|\\/usr\\/lib\\/systemd\\/journald\\.conf\\.d|\\/usr\\/lib\\/systemd\\/system|\\/usr\\/lib\\/tmpfiles\\.d)\\/[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}$"
+                                "minLength": 1,
+                                "maxLength": 256
                               },
                               "kind": { "type": "string", "const": "file" },
                               "mode": {
                                 "type": "string",
-                                "enum": ["0644", "0755"]
+                                "minLength": 1,
+                                "maxLength": 8
                               },
                               "sha256": {
                                 "type": "string",
-                                "pattern": "^[0-9a-f]{64}$"
+                                "minLength": 1,
+                                "maxLength": 128
                               },
                               "size_bytes": {
                                 "type": "integer",
                                 "minimum": 0,
-                                "maximum": 1048576
+                                "maximum": 9007199254740991
                               },
                               "apply": {
                                 "type": "string",
-                                "enum": [
-                                  "daemon_reload",
-                                  "next_start",
-                                  "reboot",
-                                  "restart_unit:pgcf-agent.service",
-                                  "restart_unit:pgcf-cloudflared.service",
-                                  "restart_unit:pgcf-gateway.service",
-                                  "restart_unit:ssh.service",
-                                  "restart_unit:systemd-journald.service",
-                                  "restart_unit:systemd-sysctl.service"
-                                ]
+                                "minLength": 1,
+                                "maxLength": 128
                               }
                             },
                             "required": [
@@ -414,7 +407,8 @@
                             "properties": {
                               "path": {
                                 "type": "string",
-                                "pattern": "^(?:\\/etc\\/modprobe\\.d|\\/etc\\/ssh\\/sshd_config\\.d|\\/etc\\/sysctl\\.d|\\/etc\\/sysusers\\.d|\\/etc\\/systemd\\/journald\\.conf\\.d|\\/etc\\/systemd\\/system|\\/etc\\/tmpfiles\\.d|\\/usr\\/lib\\/sysctl\\.d|\\/usr\\/lib\\/sysusers\\.d|\\/usr\\/lib\\/systemd\\/journald\\.conf\\.d|\\/usr\\/lib\\/systemd\\/system|\\/usr\\/lib\\/tmpfiles\\.d)\\/[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}$"
+                                "minLength": 1,
+                                "maxLength": 256
                               },
                               "kind": {
                                 "type": "string",
@@ -422,17 +416,8 @@
                               },
                               "apply": {
                                 "type": "string",
-                                "enum": [
-                                  "daemon_reload",
-                                  "next_start",
-                                  "reboot",
-                                  "restart_unit:pgcf-agent.service",
-                                  "restart_unit:pgcf-cloudflared.service",
-                                  "restart_unit:pgcf-gateway.service",
-                                  "restart_unit:ssh.service",
-                                  "restart_unit:systemd-journald.service",
-                                  "restart_unit:systemd-sysctl.service"
-                                ]
+                                "minLength": 1,
+                                "maxLength": 128
                               }
                             },
                             "required": ["path", "kind", "apply"],
@@ -2489,7 +2474,8 @@
     "HOST_FILE_APPLIES": [
       "daemon_reload",
       "next_start",
-      "reboot",
+      "sysusers",
+      "tmpfiles",
       "restart_unit:pgcf-agent.service",
       "restart_unit:pgcf-cloudflared.service",
       "restart_unit:pgcf-gateway.service",

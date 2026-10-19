@@ -1024,3 +1024,157 @@ async fn the_awake_budget_is_the_memory_ceiling_of_the_database_slice() {
     );
     within(units.stop(&database.id)).await.unwrap();
 }
+
+/// What `systemctl show` says of one property of a unit.
+fn show(unit: &str, property: &str) -> String {
+    let output = Command::new("systemctl")
+        .args(["show", "-p", property, "--value", unit])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// The command line of a process, which says which `ExecStart=` it was started with. A start job
+/// of `Type=simple` ends when the process is forked, and until it has executed its command its
+/// name is `(name)`: this waits for the command.
+async fn command_line(pid: &str) -> String {
+    let mut line = String::new();
+    for _ in 0..100 {
+        line = fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        if !line.starts_with('(') && !line.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    line
+}
+
+const LAB_TEMPLATE: &str = "/run/systemd/system/pgcf-labhf@.service";
+const LAB_STOP_MARKER: &str = "/run/pgcf-labhf-stopped";
+
+fn lab_template(version: u32) -> String {
+    match version {
+        1 => "[Service]\nExecStart=/bin/sleep 1000\nMemoryMax=64M\nTimeoutStopSec=30\nKillSignal=SIGTERM\n".to_string(),
+        _ => format!(
+            "[Service]\nExecStart=/bin/sleep 2000\nMemoryMax=96M\nTimeoutStopSec=45\nKillSignal=SIGINT\nExecStop=/bin/sh -c 'echo stopped > {LAB_STOP_MARKER}'\n"
+        ),
+    }
+}
+
+/// The memory ceiling the kernel enforces on the unit's cgroup, which is what the unit started with
+/// and not what `systemctl show` says once the file changed.
+fn cgroup_memory_max(unit: &str) -> String {
+    let file = format!("/sys/fs/cgroup{}/memory.max", show(unit, "ControlGroup"));
+    fs::read_to_string(file).unwrap().trim().to_string()
+}
+
+/// What a release's host file does to a template instance that runs (plan 9.3, `next_start`): the
+/// D-Bus `Reload` the agent makes after it wrote the file, and what a start takes after it. Measured
+/// on Debian 13's systemd 257: the reload gives the loaded unit the new file (its properties and,
+/// at its next stop, its `ExecStop=`, `KillSignal=` and `TimeoutStopSec=`), and the running process
+/// and its cgroup limits are left as they were until the unit starts again.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1 and root (lab)"]
+async fn a_reload_changes_what_the_next_stop_does_and_a_start_what_a_running_instance_is_made_of() {
+    if !lab() {
+        return;
+    }
+    let unit = "pgcf-labhf@a.service";
+    let _clean = scopeguard(|| {
+        quiet("systemctl", &["stop", unit]);
+        let _ = fs::remove_file(LAB_TEMPLATE);
+        let _ = fs::remove_file(LAB_STOP_MARKER);
+        quiet("systemctl", &["daemon-reload"]);
+    });
+    let _ = fs::remove_file(LAB_STOP_MARKER);
+    fs::write(LAB_TEMPLATE, lab_template(1)).unwrap();
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    within(units.reload()).await.unwrap();
+    within(units.start_service(unit, false)).await.unwrap();
+    let pid = show(unit, "MainPID");
+    assert_ne!(pid, "0");
+    assert_eq!(command_line(&pid).await, "/bin/sleep 1000");
+    let bytes = |mib: u64| (mib << 20).to_string();
+    assert_eq!(show(unit, "MemoryMax"), bytes(64));
+    assert_eq!(cgroup_memory_max(unit), bytes(64));
+
+    // The file changes on disk.
+    fs::write(LAB_TEMPLATE, lab_template(2)).unwrap();
+
+    // After the reload the instance is the same process and keeps the cgroup limit it started
+    // with, though the unit now reports the new one; its stop settings are the file's.
+    within(units.reload()).await.unwrap();
+    assert_eq!(show(unit, "MainPID"), pid);
+    assert_eq!(command_line(&pid).await, "/bin/sleep 1000");
+    assert_eq!(show(unit, "MemoryMax"), bytes(96));
+    assert_eq!(cgroup_memory_max(unit), bytes(64));
+    assert_eq!(show(unit, "TimeoutStopUSec"), "45s");
+    assert_eq!(show(unit, "KillSignal"), "2");
+
+    // The next stop of that very instance runs the `ExecStop=` the file added.
+    assert!(!Path::new(LAB_STOP_MARKER).exists());
+    run("systemctl", &["stop", unit]);
+    assert!(Path::new(LAB_STOP_MARKER).exists());
+
+    // The next start takes the exec settings and the cgroup limits of the file.
+    within(units.start_service(unit, false)).await.unwrap();
+    let started = show(unit, "MainPID");
+    assert_ne!(started, pid);
+    assert_eq!(command_line(&started).await, "/bin/sleep 2000");
+    assert_eq!(cgroup_memory_max(unit), bytes(96));
+}
+
+/// The agent's own new unit stands in `/run/systemd/system` until the agent that runs it moves it
+/// to its place (`hostfiles::promote`): systemd reads it before the image's file, and a boot, which
+/// empties `/run`, leaves the image's file as the unit that runs.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1 and root (lab)"]
+async fn a_unit_in_the_runtime_directory_wins_over_the_images_and_leaves_with_its_file() {
+    if !lab() {
+        return;
+    }
+    let unit = "pgcf-labhf-stage.service";
+    let image = format!("/usr/lib/systemd/system/{unit}");
+    let runtime = format!("/run/systemd/system/{unit}");
+    let _clean = scopeguard(|| {
+        let _ = fs::remove_file(&image);
+        let _ = fs::remove_file(&runtime);
+        quiet("systemctl", &["daemon-reload"]);
+    });
+    let body = |description: &str| {
+        format!("[Unit]\nDescription={description}\n[Service]\nType=oneshot\nExecStart=/bin/true\n")
+    };
+    fs::write(&image, body("last good")).unwrap();
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    within(units.reload()).await.unwrap();
+    assert_eq!(show(unit, "FragmentPath"), image);
+    assert_eq!(show(unit, "Description"), "last good");
+
+    // The agent stages the new unit and reads the units again: the copy in /run is the unit.
+    fs::write(&runtime, body("new")).unwrap();
+    within(units.reload()).await.unwrap();
+    assert_eq!(show(unit, "FragmentPath"), runtime);
+    assert_eq!(show(unit, "Description"), "new");
+
+    // A boot empties /run: the image's file is what systemd reads, the last good unit.
+    fs::remove_file(&runtime).unwrap();
+    within(units.reload()).await.unwrap();
+    assert_eq!(show(unit, "FragmentPath"), image);
+    assert_eq!(show(unit, "Description"), "last good");
+
+    // The promotion: the file of the image is written, the copy goes, one reload reads the file.
+    fs::write(&runtime, body("new")).unwrap();
+    within(units.reload()).await.unwrap();
+    fs::write(&image, body("new")).unwrap();
+    fs::remove_file(&runtime).unwrap();
+    within(units.reload()).await.unwrap();
+    assert_eq!(show(unit, "FragmentPath"), image);
+    assert_eq!(show(unit, "Description"), "new");
+}

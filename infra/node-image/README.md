@@ -256,7 +256,7 @@ reaches every running node, signed by CI (plan 9.3), and carries more than binar
 | The Debian packages of the lock, in a maintenance cycle | The partition layout and first-boot partitioning (`mkosi.repart`, `usr/lib/repart.d`), `fstab` |
 | **The host files**: the systemd units and masks (`/usr/lib/systemd/system`, `/etc/systemd/system`) and the sshd, journald, sysctl, tmpfiles, sysusers and modprobe configuration (the allow-listed directories of [host-files.ts](host-files.ts)) | The firewall (`nftables.conf`), sshd's data files (`pgcf_revoked.krl`, `principals/`), the generator mask `systemd-ssh-generator`, the presets (which units are enabled), the links `/usr/libexec/pgcf/*`, `mkosi.skeleton` (package configuration at install) |
 | | The initial boot and cloud-init, the installer and the installer's userData |
-| | The first agent that can write host files (an agent of an earlier build refuses a page whose release lists them), and any change of the mount topology (a change that moves volumes between mount namespaces needs every database asleep and its volumes unmounted in one step; no hook exists for it) |
+| | The first agent that can write host files (an agent of an earlier build refuses a page whose release lists them), and a change of the mount topology (see the rules below: nothing refuses it, and it must not reach a running node) |
 
 Everything in `mkosi.extra` is one or the other, and the build stops at a file that is neither:
 `HOST_FILE_APPLY` in [host-files.ts](host-files.ts) says how each host file takes effect, and
@@ -273,18 +273,55 @@ Everything in `mkosi.extra` is one or the other, and the build stops at a file t
 3. Register the signed build (`register-node-image.ts`, from a checkout of the commit that was
    built) and assign it to the region (`PUT /v1/regions/<region>/release`).
 4. Each node's agent installs the binaries first, and then writes the files that differ: if the
-   agent's own binary changed, the agent that runs after its restart writes them. It reads systemd's
-   units again once and restarts what changed (the gateway, cloudflared, ssh, journald,
-   systemd-sysctl; the agent's own last). A per-database unit (`pgcf-pg@.service`, `next_start`)
-   takes the new file at each database's next start, and a database that runs keeps its old
-   definition until it sleeps. A file marked `reboot` (sysusers, tmpfiles) waits for the next
-   maintenance cycle, which reboots for it even when there is nothing to install.
+   agent's own binary changed, the agent that runs after its restart writes them. It holds the
+   signed list to its own rules just before it writes (a list its rules do not allow is refused for
+   its files only, the binaries are installed all the same), reads systemd's units again once, runs
+   `systemd-sysusers` and `systemd-tmpfiles --create` on the files that say so (`sysusers`,
+   `tmpfiles`), and then restarts what changed (the gateway, cloudflared, ssh, journald,
+   systemd-sysctl; the agent's own last). The agent's own unit is first written to
+   `/run/systemd/system`, which systemd reads before `/usr/lib/systemd/system` and which a boot
+   empties; the agent that runs it moves it to its place once it has read its first page, and a
+   node whose new unit cannot start is restarted from the API (Contabo) and runs the unit it had
+   ([recovery](../../docs/operations/recovery.md#the-agent-does-not-come-back-after-a-release)).
+   What a running per-database unit (`pgcf-pg@.service`, `next_start`) takes from the new template
+   is measured on Debian 13's systemd 257 (the lab test `a_reload_changes_what_the_next_stop_does_and_a_start_what_a_running_instance_is_made_of`):
+   the reload loads the file, so the stop settings (`KillMode=`, `KillSignal=`, `TimeoutStopSec=`,
+   `ExecStop=`) are those of the instance's next stop and `systemctl show` already reports the new
+   resource settings, but the running process, its exec and namespace settings (`ExecStart=`,
+   `MountImages=`, `PrivateMounts=`, `User=`) and the limits its cgroup enforces (`MemoryMax=`,
+   `TasksMax=`, `CPUWeight=`) stay as they were until the database's next start. A failed reload,
+   run or restart stays in the record and is tried again with a growing wait (5 s up to 5 min),
+   not with every page; one unit that fails to restart does not keep the others from theirs, and
+   the node does not report the release's files as held until all of it is done.
 5. Check `GET /v1/nodes/{id}`: `os.host_files_sha256` is the release's `spec.os.host_files_sha256`
-   and `os_converged` is true (after the cycle, if a file waits for a reboot). A refused or failed
-   apply is a node event with a class and no contents: `release_refused` with
-   `host_file_path_refused`, `host_file_mode_refused`, `host_file_apply_refused` or
-   `host_files_invalid` when the signed list breaks the agent's own rules, and
-   `host_files_not_applied` for a file that could not be read, written or told to systemd.
+   and `os_converged` is true. A refused or failed apply is a node event with a class and no
+   contents: `release_refused` with `host_file_path_refused`, `host_file_mode_refused`,
+   `host_file_apply_refused` or `host_files_invalid` when the signed list breaks the agent's own
+   rules (once per release), `host_files_not_applied` for a file that could not be read, written
+   or told to systemd, and `agent_unit_promoted` when the agent's new unit has moved to its place.
+
+Three rules keep a release safe on a node that already runs. They hold because the order of an
+update is fixed (the binaries first, the host files after them, the packages of the lock only in
+the maintenance cycle), and nothing but the author of the change checks them:
+
+- **A new agent starts under the previous agent unit.** The binary is switched before the unit is
+  written, so the new `pgcf-agent` first runs under the unit of the release before. A binary that
+  needs its new unit (a path, a user, a directory, a socket activation, a changed `Type=`) would
+  crash-loop and never write that unit. Ship such a change in two releases: the first is an agent
+  that runs under both units, the second changes the unit.
+- **A host file works with the packages of the release before.** The files land before the
+  packages of the lock, which wait for the maintenance cycle. A flag of cloudflared or an option of
+  sshd that only the new lock's version understands fails at its restart, and the tunnel or sshd is
+  down until the cycle. Ship such a change in two releases: the lock first (a cycle), the file
+  after.
+- **A change of the mount topology must not reach a running node.** A release that changes
+  `MountImages=` or `PrivateMounts=` in these files is written to every running node, and nothing
+  refuses it: the running databases keep the topology they started with, the next start of each
+  takes the new one, and a node holds both until every database has slept. Do not assign such a
+  release to a region that has running nodes; V4h's change reached EU1 with a reinstall.
+
+The agent runs the `sysusers` and `tmpfiles` files of a release before any restart in the same
+release, so a unit may need the users and directories that the release makes.
 
 ## Units
 
@@ -554,16 +591,25 @@ token or the route keyring changed.
   a region that has such a node.** Nothing refuses it; the release assignment does not check the
   image (the maintenance cycle's `pgcf-agent check` follows a package install, not a release move).
 - **Host files** (`hostfiles.rs`, plan 9.3). After the binaries of a release are in place and the
-  signature and the agent's own rules held, the agent compares each file of the release's list with
-  the disk (digest, size, mode, kind, owner) and writes what differs: a hidden file beside the target
-  is written, synced and renamed over it, and the directory is synced, so a crash leaves the old
-  unit or the new one and never a torn one. It never follows a link (a directory on the way is
-  opened with `O_NOFOLLOW` component by component, and a link at the target is replaced), makes no
-  directory but the last allow-listed one, leaves a directory at a target alone and removes only a
-  file it wrote for an earlier list that this one drops (it keeps `agent/host-files.json` with the
-  paths it owns and what is left to tell systemd, saved before the first write). Then one
-  `daemon-reload`, then the restarts in name order, the agent's own last, each taken out of the
-  record when done. It reports the digest of the facts it reads from the disk in its hello.
+  signature held, the agent holds the signed list to its own rules (a list its rules do not allow
+  is refused for its files, once, with the class of the rule: the binaries are installed all the
+  same, because the rules are the agent's and the release may carry the agent that knows them), then
+  compares each file of the list with the disk (digest, size, mode, kind, owner) and writes what
+  differs: a hidden file beside the target is written, synced and renamed over it, and the directory
+  is synced, so a crash leaves the old unit or the new one and never a torn one. It never follows a
+  link (a directory on the way is opened with `O_NOFOLLOW` component by component, and a link at
+  the target is replaced), makes no directory but the last allow-listed one, leaves a directory at
+  a target alone and removes a path that an earlier list named and this one drops, whether the
+  agent wrote it or the image brought it (it keeps `agent/host-files.json` with the paths it owns
+  and what is left to tell systemd, saved before the first write, and restarts the unit that a
+  dropped file applied to). Then one `daemon-reload`, then the runs of `systemd-sysusers` and
+  `systemd-tmpfiles --create` on the files that say so, then the restarts in name order, the
+  agent's own last, each taken out of the record when done; a restart that fails does not keep the
+  others from theirs, and what failed is tried again after a growing wait. A reload and restarts
+  that a boot has made moot are dropped with the boot id. The agent's own unit is written to
+  `/run/systemd/system` and moved to its place by the agent that runs it, after its first page. It
+  reports the digest of the facts it reads from the disk in its hello, which is the release's
+  only when systemd has been told everything.
 - In the maintenance cycle (plan 9.3) it reads the release's package lock (the `packages.lock.json`
   of the image the release is built from), installs what differs from `dpkg` with
   `apt-get install --no-install-recommends --allow-downgrades -o Dpkg::Options::=--force-confold

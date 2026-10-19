@@ -83,7 +83,8 @@ it("a host file is a file of a fixed mode or a mask, in an allow-listed director
   expect(HOST_FILE_APPLIES).toEqual([
     "daemon_reload",
     "next_start",
-    "reboot",
+    "sysusers",
+    "tmpfiles",
     "restart_unit:pgcf-agent.service",
     "restart_unit:pgcf-cloudflared.service",
     "restart_unit:pgcf-gateway.service",
@@ -206,7 +207,7 @@ it("a signature covers every part of every host file and the list's length", () 
   const signed = signedReleaseManifest(release());
   const changes: ((value: ReturnType<typeof release>) => void)[] = [
     (value) => (value.os.host_files[0]!.apply = "next_start"),
-    (value) => (value.os.host_files[1]!.apply = "reboot"),
+    (value) => (value.os.host_files[1]!.apply = "next_start"),
     (value) => (value.os.host_files[1]!.sha256 = "9".repeat(64)),
     (value) => (value.os.host_files[1]!.size_bytes! += 1),
     (value) => (value.os.host_files[2]!.mode = "0644"),
@@ -267,7 +268,7 @@ it("the digest a node reports is one fixed text of the facts, which leaves out h
     ).join(""),
   );
   const other = list();
-  other[0]!.apply = "reboot";
+  other[0]!.apply = "next_start";
   expect(await hostFilesSha256(other as HostFile[])).toBe(digest);
   other[1] = { ...unit, size_bytes: 1201 };
   expect(await hostFilesSha256(other as HostFile[])).not.toBe(digest);
@@ -339,6 +340,87 @@ it("a release registers its host files and the digest a node reports, and the sp
     expect(
       FleetReleaseRegistration.safeParse(change(registered())).success,
     ).toBe(false);
+});
+
+it("the page states the shape of the host files and no rule: what the contract may later allow never makes an older node refuse the whole page", () => {
+  const spec = fleetReleaseSpec(
+    "https://api.example.org",
+    "v1",
+    FleetReleaseRegistration.parse(registered()),
+  );
+  const { packages_sha256, kernel_release, host_files_sha256, ...installed } =
+    spec.os;
+  void [packages_sha256, kernel_release, host_files_sha256];
+  const page = (host_files: unknown) => ({
+    id: "v1",
+    binaries: spec.binaries,
+    os: { ...installed, host_files },
+  });
+  // A directory, a unit to restart, a way to take effect, a mode, a size, a digest and a count that
+  // a later contract allows and this agent does not: the page still reads, and the agent's own
+  // rules refuse the files (`hostfiles::check`) once the binaries are in place.
+  const later: unknown[] = [
+    { ...unit, path: "/etc/udev/rules.d/90-pgcf.rules" },
+    { ...unit, apply: "restart_unit:new.service" },
+    { ...unit, apply: "a_new_way_to_take_effect" },
+    { ...unit, mode: "0600" },
+    { ...unit, size_bytes: 5_000_000 },
+    { ...unit, sha256: "a".repeat(128) },
+    { ...mask, apply: "restart_unit:new.service" },
+  ];
+  for (const file of later) {
+    expect(HostFiles.safeParse([file]).success, JSON.stringify(file)).toBe(
+      false,
+    );
+    expect(
+      NodeRelease.safeParse(page([file])).success,
+      JSON.stringify(file),
+    ).toBe(true);
+  }
+  expect(NodeRelease.safeParse(page([])).success).toBe(true);
+  expect(
+    NodeRelease.safeParse(
+      page(
+        Array.from({ length: 3 * HOST_FILES_MAX }, (_, index) => ({
+          ...unit,
+          path: `/etc/sysctl.d/${String(index).padStart(3, "0")}.conf`,
+        })),
+      ),
+    ).success,
+  ).toBe(true);
+  // The shape is still checked: a kind the facts line has no form for, a field the manifest has no
+  // place for, a missing or mistyped value, an unbounded text and an unbounded list.
+  const broken: unknown[] = [
+    { ...unit, kind: "directory" },
+    { ...unit, owner: "root" },
+    { ...mask, mode: "0644" },
+    { ...unit, apply: undefined },
+    { ...unit, apply: 7 },
+    { ...unit, path: undefined },
+    { ...unit, path: `/etc/sysctl.d/${"a".repeat(300)}` },
+    { ...unit, apply: "a".repeat(300) },
+    { ...unit, mode: undefined },
+    { ...unit, size_bytes: -1 },
+    { ...unit, size_bytes: "12" },
+    "a path",
+    null,
+  ];
+  for (const file of broken)
+    expect(
+      NodeRelease.safeParse(page([file])).success,
+      JSON.stringify(file),
+    ).toBe(false);
+  expect(NodeRelease.safeParse(page(undefined)).success).toBe(false);
+  expect(
+    NodeRelease.safeParse(
+      page(
+        Array.from({ length: 100 * HOST_FILES_MAX }, (_, index) => ({
+          ...unit,
+          path: `/etc/sysctl.d/${index}.conf`,
+        })),
+      ),
+    ).success,
+  ).toBe(false);
 });
 
 it("the hello of a node reports the digest of the host files it holds", () => {

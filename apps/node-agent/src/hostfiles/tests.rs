@@ -69,10 +69,10 @@ fn hidden_files(root: &Path, directory: &str) -> Vec<String> {
     names
 }
 
-/// The list and the bytes of a release that changes three units, a mask and a file that waits for
-/// a reboot, ascending by path.
+/// The list and the bytes of a release that changes two units, a mask and a file of users,
+/// ascending by path.
 fn release() -> (Vec<HostFile>, HashMap<String, Vec<u8>>) {
-    let sysusers = host(SYSUSERS, "u pgcf-gateway\n", "0644", "reboot");
+    let sysusers = host(SYSUSERS, "u pgcf-gateway\n", "0644", "sysusers");
     let gateway = host(
         GATEWAY,
         "[Service]\n# gateway 2\n",
@@ -121,7 +121,7 @@ fn the_page_of_the_contract_is_read_and_its_lines_are_the_manifests() {
         .iter()
         .map(|file| HostFile::parse(file).unwrap())
         .collect();
-    assert_eq!(files.len(), 6);
+    assert_eq!(files.len(), 7);
     assert_eq!(check(&files), Ok(()));
     // One line a file in the text the release key signs, in the list's order, after the lock.
     let manifest = vector["manifest"].as_str().unwrap();
@@ -150,7 +150,16 @@ fn the_page_of_the_contract_is_read_and_its_lines_are_the_manifests() {
     );
     // Every kind, mode and way to take effect of the vector is one the agent knows.
     assert!(files.iter().any(|file| file.kind == Kind::Mask));
-    assert!(files.iter().any(|file| file.apply() == Some(Apply::Reboot)));
+    assert!(
+        files
+            .iter()
+            .any(|file| file.apply() == Some(Apply::Sysusers))
+    );
+    assert!(
+        files
+            .iter()
+            .any(|file| file.apply() == Some(Apply::Tmpfiles))
+    );
     assert!(
         files
             .iter()
@@ -168,9 +177,9 @@ fn the_page_of_the_contract_is_read_and_its_lines_are_the_manifests() {
     );
     // A page of any other shape is no host file.
     for broken in [
-        serde_json::json!({"path": "/etc/sysctl.d/a.conf", "kind": "link", "apply": "reboot"}),
-        serde_json::json!({"path": "/etc/sysctl.d/a.conf", "kind": "file", "apply": "reboot", "url": "https://x.example/a"}),
-        serde_json::json!({"kind": "file", "apply": "reboot"}),
+        serde_json::json!({"path": "/etc/sysctl.d/a.conf", "kind": "link", "apply": "daemon_reload"}),
+        serde_json::json!({"path": "/etc/sysctl.d/a.conf", "kind": "file", "apply": "daemon_reload", "url": "https://x.example/a"}),
+        serde_json::json!({"kind": "file", "apply": "daemon_reload"}),
         serde_json::json!("a path"),
         Value::Null,
     ] {
@@ -251,6 +260,8 @@ fn the_agents_own_rules_refuse_what_is_not_a_plain_file_of_an_allowed_directory(
         "restart_unit:postgresql.service",
         "restart_unit:pgcf-pg@a.service",
         "DAEMON_RELOAD",
+        // Not a way to take effect: a boot does not make a user for a file that changed.
+        "reboot",
     ] {
         let mut file = good(GATEWAY);
         file.apply = apply.into();
@@ -329,10 +340,14 @@ fn a_file_is_written_whole_with_its_mode_and_a_second_apply_changes_nothing() {
         list.iter().map(|f| f.path.clone()).collect::<Vec<_>>()
     );
     assert!(saved.reload);
+    assert_eq!(saved.boot_id, "boot-1");
     assert_eq!(saved.restarts, ["pgcf-gateway.service"]);
     assert_eq!(
-        saved.reboot.as_ref().map(|p| p.paths.clone()),
-        Some(vec![SYSUSERS.to_string()])
+        saved.runs,
+        [Run {
+            tool: Tool::Sysusers,
+            path: SYSUSERS.to_string()
+        }]
     );
     assert_eq!(
         fs::metadata(&state).unwrap().permissions().mode() & 0o777,
@@ -594,8 +609,11 @@ fn a_crash_between_two_files_is_recorded_before_and_finished_by_the_next_apply()
     assert!(mid.reload);
     assert_eq!(mid.restarts, ["pgcf-gateway.service"]);
     assert_eq!(
-        mid.reboot.as_ref().map(|p| p.paths.clone()),
-        Some(vec![SYSUSERS.to_string()])
+        mid.runs,
+        [Run {
+            tool: Tool::Sysusers,
+            path: SYSUSERS.to_string()
+        }]
     );
     // The list is not recorded as applied: the node does not claim what it does not hold.
     assert_eq!(mid.files, Vec::<HostFile>::new());
@@ -621,7 +639,7 @@ fn a_crash_between_two_files_is_recorded_before_and_finished_by_the_next_apply()
 }
 
 #[test]
-fn what_a_release_drops_is_removed_when_the_agent_wrote_it_and_nothing_else() {
+fn what_a_release_drops_is_removed_when_an_earlier_list_named_it_and_nothing_else() {
     let (root, files) = (root(), release());
     let state = root.join("host-files.json");
     let (list, bytes) = &files;
@@ -655,31 +673,287 @@ fn what_a_release_drops_is_removed_when_the_agent_wrote_it_and_nothing_else() {
     assert_eq!(plan(&root, &saved, &next).unwrap(), Plan::default());
 }
 
-#[test]
-fn a_file_that_waits_for_a_reboot_is_not_held_until_the_boot_has_changed() {
+/// The state of a node that applied `list` in the boot `boot`, and what the disk holds.
+fn applied(boot: &str) -> (TempDir, PathBuf, Vec<HostFile>) {
     let (root, files) = (root(), release());
     let state = root.join("host-files.json");
-    let (list, bytes) = &files;
-    apply_all(&root, &state, list, bytes, "boot-1", &mut never).unwrap();
-    let saved = State::load(&state);
-    assert!(saved.reboot_pending("boot-1"));
-    assert!(!saved.reboot_pending("boot-2"));
-    // The files are on the disk, but one of them takes effect only at a boot: the node reports the
-    // digest of what is in effect, which is not the release's.
-    let theirs = list_digest(list);
+    apply_all(&root, &state, &files.0, &files.1, boot, &mut never).unwrap();
+    (root, state, files.0)
+}
+
+#[test]
+fn the_node_does_not_claim_the_list_while_systemd_has_still_to_be_told_of_it() {
+    let (root, state, list) = applied("boot-1");
+    let mut saved = State::load(&state);
+    let theirs = list_digest(&list);
+    // The files are on the disk, but the reload, the restart and the run are still to do: the
+    // definitions that run are the old ones, so the digest is not the release's, in this boot and
+    // for each of the three.
+    assert!(saved.unfinished("boot-1"));
     assert_ne!(observed_digest(&root, &saved, "boot-1"), theirs);
-    // After the reboot the same disk is the release's.
+    saved.reload = false;
+    assert_ne!(observed_digest(&root, &saved, "boot-1"), theirs);
+    saved.restarts.clear();
+    assert_ne!(observed_digest(&root, &saved, "boot-1"), theirs);
+    // Everything is done: the same disk is the release's.
+    saved.runs.clear();
+    assert!(!saved.unfinished("boot-1"));
+    assert_eq!(observed_digest(&root, &saved, "boot-1"), theirs);
+    // A reload that failed and a restart that did not happen stay in the record, and a next start
+    // of the agent in the same boot still reports the old definition as running.
+    let again = State::load(&state);
+    assert_ne!(observed_digest(&root, &again, "boot-1"), theirs);
+}
+
+#[test]
+fn a_boot_makes_the_reload_and_the_restarts_of_an_earlier_boot_moot_and_not_the_runs() {
+    let (root, state, list) = applied("boot-1");
+    let theirs = list_digest(&list);
+    let mut saved = State::load(&state);
+    // After a reboot systemd has read every unit and started each with its file: the reload and
+    // the restarts are of no use, and the node is not held back by them. A boot does not run
+    // systemd-sysusers for a file that changed, so that run is still owed.
+    assert!(!saved.runs.is_empty());
+    assert!(saved.unfinished("boot-2"));
+    assert_ne!(observed_digest(&root, &saved, "boot-2"), theirs);
+    saved.begin("boot-2");
+    assert!(!saved.reload && saved.restarts.is_empty());
+    assert_eq!(saved.boot_id, "boot-2");
+    assert!(!saved.runs.is_empty());
+    saved.runs.clear();
+    assert!(!saved.unfinished("boot-2"));
     assert_eq!(observed_digest(&root, &saved, "boot-2"), theirs);
-    // A list without such a file is held at once.
-    let plain = vec![list[0].clone(), list[1].clone(), list[2].clone()];
-    let root = self::root();
-    let state = root.join("host-files.json");
-    apply_all(&root, &state, &plain, bytes, "boot-1", &mut never).unwrap();
-    assert!(!State::load(&state).reboot_pending("boot-1"));
-    assert_eq!(
-        observed_digest(&root, &State::load(&state), "boot-1"),
-        list_digest(&plain)
+    // The same boot again changes nothing.
+    let mut same = State {
+        reload: true,
+        restarts: vec![GATEWAY_UNIT_NAME.into()],
+        boot_id: "boot-3".into(),
+        ..State::default()
+    };
+    same.begin("boot-3");
+    assert!(same.reload && !same.restarts.is_empty());
+    // An apply in a new boot drops what the old one left before it records its own.
+    let (root, state, list) = applied("boot-1");
+    let bytes = release().1;
+    let changed = {
+        let mut changed = list.clone();
+        changed[1] = host(GATEWAY, "[Service]\n# gateway 3\n", "0644", "daemon_reload");
+        changed
+    };
+    let mut more = bytes.clone();
+    more.insert(
+        changed[1].sha256.clone(),
+        b"[Service]\n# gateway 3\n".to_vec(),
     );
+    apply_all(&root, &state, &changed, &more, "boot-2", &mut never).unwrap();
+    let saved = State::load(&state);
+    assert_eq!(saved.boot_id, "boot-2");
+    assert!(saved.reload);
+    assert!(saved.restarts.is_empty(), "{:?}", saved.restarts);
+}
+
+const GATEWAY_UNIT_NAME: &str = "pgcf-gateway.service";
+
+#[test]
+fn a_dropped_file_restarts_the_unit_it_was_applied_with_and_a_dropped_template_nothing() {
+    let (root, state, list) = applied("boot-1");
+    // The service finished what the first apply began.
+    let mut saved = State::load(&state);
+    saved.reload = false;
+    saved.restarts.clear();
+    saved.runs.clear();
+    saved.save(&state).unwrap();
+    // The next release drops the gateway's unit, which a running service still holds the old
+    // definition of, and the template, which a database takes at its next start.
+    let next = vec![list[0].clone(), list[3].clone()];
+    let bytes = HashMap::new();
+    let planned = plan(&root, &State::load(&state), &next).unwrap();
+    assert_eq!(planned.removals, [GATEWAY, DATABASE]);
+    apply_all(&root, &state, &next, &bytes, "boot-1", &mut never).unwrap();
+    let after = State::load(&state);
+    assert!(after.reload);
+    assert_eq!(after.restarts, [GATEWAY_UNIT_NAME]);
+}
+
+// ---- the agent's own unit
+
+const AGENT: &str = "/usr/lib/systemd/system/pgcf-agent.service";
+const RUNTIME: &str = "/run/systemd/system/pgcf-agent.service";
+
+/// A node whose `/run/systemd` exists, the image's agent unit in place, and a release that changes
+/// that unit and the gateway's.
+fn with_agent_unit() -> (TempDir, PathBuf, Vec<HostFile>, HashMap<String, Vec<u8>>) {
+    let root = root();
+    fs::create_dir_all(at(&root, "/run/systemd")).unwrap();
+    fs::write(at(&root, AGENT), "[Service]\n# agent 1\n").unwrap();
+    fs::set_permissions(at(&root, AGENT), fs::Permissions::from_mode(0o644)).unwrap();
+    let agent = host(
+        AGENT,
+        "[Service]\n# agent 2\n",
+        "0644",
+        "restart_unit:pgcf-agent.service",
+    );
+    let gateway = host(
+        GATEWAY,
+        "[Service]\n# gateway 2\n",
+        "0644",
+        "restart_unit:pgcf-gateway.service",
+    );
+    let list = vec![agent.clone(), gateway.clone()];
+    let bytes = contents(&[
+        (&agent, "[Service]\n# agent 2\n"),
+        (&gateway, "[Service]\n# gateway 2\n"),
+    ]);
+    let state = root.join("host-files.json");
+    (root, state, list, bytes)
+}
+
+#[test]
+fn the_agents_own_unit_is_written_to_the_runtime_directory_and_the_image_keeps_the_last_good_one() {
+    let (root, state, list, bytes) = with_agent_unit();
+    let applied = apply_all(&root, &state, &list, &bytes, "boot-1", &mut never).unwrap();
+    assert_eq!(applied.written, 2);
+    // The gateway's unit is in its place; the agent's own is in /run, and the image's file is the
+    // one the agent ran with until now.
+    assert_eq!(read(&root, GATEWAY), "[Service]\n# gateway 2\n");
+    assert_eq!(read(&root, RUNTIME), "[Service]\n# agent 2\n");
+    assert_eq!(read(&root, AGENT), "[Service]\n# agent 1\n");
+    assert_eq!(mode_of(&root, RUNTIME), 0o644);
+    assert_eq!(
+        hidden_files(&root, "/run/systemd/system"),
+        Vec::<String>::new()
+    );
+    // The agent leaves for it, last.
+    let saved = State::load(&state);
+    assert_eq!(
+        restart_order(&saved),
+        (vec![GATEWAY_UNIT_NAME.to_string()], true)
+    );
+    // The next look finds nothing to write: the unit stands where it was written, and waits to be
+    // promoted. The node does not say it holds the list.
+    let planned = plan(&root, &saved, &list).unwrap();
+    assert_eq!(
+        planned.staged.as_ref().map(|f| f.path.as_str()),
+        Some(AGENT)
+    );
+    assert!(planned.writes.is_empty() && planned.is_empty());
+    assert_ne!(
+        observed_digest(
+            &root,
+            &State {
+                reload: false,
+                restarts: vec![],
+                runs: vec![],
+                ..saved
+            },
+            "boot-1"
+        ),
+        list_digest(&list)
+    );
+}
+
+#[test]
+fn the_agent_unit_moves_to_its_place_only_when_promoted_and_a_crash_in_between_is_finished() {
+    for crashed in [
+        None,
+        Some(Step::Created),
+        Some(Step::Renamed),
+        Some(Step::DirectorySynced),
+    ] {
+        let (root, state, list, bytes) = with_agent_unit();
+        apply_all(&root, &state, &list, &bytes, "boot-1", &mut never).unwrap();
+        let target = Target {
+            root: &root,
+            state: &state,
+            boot_id: "boot-1",
+        };
+        let agent = list[0].clone();
+        let mut crash = |at_step: Step| {
+            if Some(at_step) == crashed {
+                Err(io::Error::other("the power went"))
+            } else {
+                Ok(())
+            }
+        };
+        let result = promote(&target, &agent, &mut crash);
+        assert_eq!(result.is_err(), crashed.is_some(), "{crashed:?}");
+        // The reload that follows is recorded before the unit moves.
+        assert!(State::load(&state).reload);
+        // Whatever happened, the next look finishes it: while the image's file is the old one the
+        // unit is staged, once it is the new one the copy in /run has no use and goes.
+        let saved = State::load(&state);
+        let planned = plan(&root, &saved, &list).unwrap();
+        let moved = read(&root, AGENT) == "[Service]\n# agent 2\n";
+        assert_eq!(planned.staged.is_some(), !moved, "{crashed:?}");
+        assert_eq!(
+            planned.unstage,
+            moved && at(&root, RUNTIME).exists(),
+            "{crashed:?}"
+        );
+        if moved {
+            apply_all(&root, &state, &list, &HashMap::new(), "boot-1", &mut never).unwrap();
+        } else {
+            promote(&target, &agent, &mut never).unwrap();
+        }
+        assert_eq!(read(&root, AGENT), "[Service]\n# agent 2\n");
+        assert_eq!(mode_of(&root, AGENT), 0o644);
+        assert!(!at(&root, RUNTIME).exists(), "{crashed:?}");
+        assert_eq!(
+            plan(&root, &State::load(&state), &list).unwrap(),
+            Plan::default()
+        );
+        // Everything left is the reload, which the caller does: then the node holds the list.
+        let mut done = State::load(&state);
+        done.reload = false;
+        done.restarts.clear();
+        done.runs.clear();
+        assert_eq!(observed_digest(&root, &done, "boot-1"), list_digest(&list));
+    }
+}
+
+#[test]
+fn a_boot_empties_the_runtime_directory_and_the_agent_stages_the_unit_again() {
+    let (root, state, list, bytes) = with_agent_unit();
+    apply_all(&root, &state, &list, &bytes, "boot-1", &mut never).unwrap();
+    // The new unit could not start; the node was restarted. The boot emptied /run, so the unit the
+    // image has is the one that runs, and the agent, with the binary of the release, plans the
+    // write of the new unit again: the release has to be replaced to keep the node on the old one.
+    fs::remove_file(at(&root, RUNTIME)).unwrap();
+    let saved = State::load(&state);
+    let planned = plan(&root, &saved, &list).unwrap();
+    assert_eq!(
+        planned
+            .writes
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>(),
+        [AGENT]
+    );
+    assert!(planned.staged.is_none());
+    // A copy that is not the list's is written over, and one the image's file made of no use goes.
+    fs::write(at(&root, RUNTIME), "[Service]\n# agent 0\n").unwrap();
+    let planned = plan(&root, &saved, &list).unwrap();
+    assert_eq!(planned.writes.len(), 1);
+    fs::write(at(&root, AGENT), "[Service]\n# agent 2\n").unwrap();
+    let planned = plan(&root, &saved, &list).unwrap();
+    assert!(planned.writes.is_empty() && planned.staged.is_none());
+    assert!(planned.unstage && !planned.is_empty());
+    apply_all(&root, &state, &list, &HashMap::new(), "boot-1", &mut never).unwrap();
+    assert!(!at(&root, RUNTIME).exists());
+    assert_eq!(read(&root, AGENT), "[Service]\n# agent 2\n");
+    // The agent that started with the copy restarts to run the unit of the image.
+    assert!(restart_order(&State::load(&state)).1);
+    // A copy that is not the list's is never promoted.
+    let (root, state, list, bytes) = with_agent_unit();
+    apply_all(&root, &state, &list, &bytes, "boot-1", &mut never).unwrap();
+    fs::write(at(&root, RUNTIME), "[Service]\n# tampered\n").unwrap();
+    let target = Target {
+        root: &root,
+        state: &state,
+        boot_id: "boot-1",
+    };
+    assert!(promote(&target, &list[0], &mut never).is_err());
+    assert_eq!(read(&root, AGENT), "[Service]\n# agent 1\n");
 }
 
 #[test]
@@ -691,7 +965,11 @@ fn what_a_node_reports_is_read_from_its_disk_and_is_the_lists_only_while_the_dis
     let none = observed_digest(&root, &State::load(&state), "boot-2");
     assert_eq!(none, crate::update::hex(&Sha256::digest(b"")));
     apply_all(&root, &state, list, bytes, "boot-1", &mut never).unwrap();
-    let held = State::load(&state);
+    // The service has told systemd everything the apply began.
+    let mut held = State::load(&state);
+    held.reload = false;
+    held.restarts.clear();
+    held.runs.clear();
     let theirs = list_digest(list);
     assert_eq!(observed_digest(&root, &held, "boot-2"), theirs);
     // A byte, a mode, a file gone, a mask replaced by a file, a directory in the way: each shows.
@@ -739,8 +1017,14 @@ fn units_are_restarted_in_one_order_with_the_agents_own_last() {
         )
     );
     assert_eq!(restart_order(&State::default()), (vec![], false));
-    assert!(state.unfinished());
-    assert!(!State::default().unfinished());
+    // They are owed in the boot they were recorded in.
+    let state = State {
+        boot_id: "boot-1".into(),
+        ..state
+    };
+    assert!(state.unfinished("boot-1"));
+    assert!(!state.unfinished("boot-2"));
+    assert!(!State::default().unfinished(""));
 }
 
 #[test]

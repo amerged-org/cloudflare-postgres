@@ -70,6 +70,10 @@ pub struct Timing {
     /// longest wait.
     pub report_retry: Duration,
     pub report_retry_maximum: Duration,
+    /// The wait before the first repeat of what a release's host files left for systemd (a reload,
+    /// a run of a tool, a restart) after it failed, and the longest wait.
+    pub host_files_retry: Duration,
+    pub host_files_retry_maximum: Duration,
     /// How long a starting agent waits for its decisions on the databases of the first page before
     /// it serves the gateway, whose sessions end on a database the table does not show running.
     pub settle: Duration,
@@ -89,6 +93,8 @@ impl Default for Timing {
             adopt_wait: Duration::from_secs(2),
             report_retry: Duration::from_secs(2),
             report_retry_maximum: Duration::from_secs(60),
+            host_files_retry: Duration::from_secs(5),
+            host_files_retry_maximum: Duration::from_secs(300),
             settle: Duration::from_secs(10),
             detail: Duration::from_secs(2),
         }

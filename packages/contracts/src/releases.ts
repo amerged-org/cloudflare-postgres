@@ -74,19 +74,29 @@ export const HOST_FILE_UNITS = [
 /**
  * How a file takes effect once it is written and systemd has read its units again: `daemon_reload`
  * alone is enough; `restart_unit:<unit>` restarts a running unit; `next_start` is for a unit that
- * runs per database and takes the new file when it next starts; `reboot` is for what the system
- * reads only at boot. The update path never reboots: such a file waits for the release's
- * maintenance cycle, and the node is not converged until it has run.
+ * runs per database and is never restarted for a file: it takes the new file when it next starts
+ * (its stop settings already at its next stop); `sysusers` runs
+ * `systemd-sysusers <file>` and `tmpfiles` runs `systemd-tmpfiles --create <file>`, once the
+ * reload is done and before any restart. Both are idempotent, as the postinst of a package runs
+ * them, and neither waits for a boot: systemd-sysusers.service runs at a boot only when /usr is
+ * newer than /etc/.updated, which a file in /usr/lib/sysusers.d does not make it.
  */
 export const HOST_FILE_APPLIES = [
   "daemon_reload",
   "next_start",
-  "reboot",
+  "sysusers",
+  "tmpfiles",
   ...HOST_FILE_UNITS.map((unit) => `restart_unit:${unit}` as const),
 ] as const;
 /** What a release may carry. */
 export const HOST_FILES_MAX = 64;
 export const HOST_FILE_MAX_BYTES = 1_048_576;
+/**
+ * The most a node's page may list. It bounds the page and is no rule: the rule is `HOST_FILES_MAX`,
+ * which the agent holds the signed list to (`host_files_invalid`), so that a later release may
+ * raise it without an older agent refusing every page.
+ */
+export const HOST_FILES_PAGE_MAX = 1024;
 /** The directory beside a release's files that holds its host files, each named by its sha256. */
 export const RELEASE_HOST_FILES_DIRECTORY = "host-files";
 
@@ -127,6 +137,35 @@ export const HostFiles = z
 export type HostFiles = z.infer<typeof HostFiles>;
 
 /**
+ * A host file as a node's page states it: the shape and no rule. The page is what every agent
+ * reads, whichever build it is, and a rule of this contract that a later release widens (a
+ * directory, a unit to restart, a way to take effect, a mode, a size, the count) must not make an
+ * older agent refuse the whole page, because no order, no database change, no binary and no
+ * maintenance would then reach the node until it is reinstalled. The release key signs the list as
+ * it is, and the agent holds it to its own rules (`hostfiles::check`) just before it writes,
+ * refusing the files with the classes of `RELEASE_REFUSALS` while still installing the binaries,
+ * which may carry the agent that knows the new rule. Only the kinds are fixed: the facts line of a
+ * kind is a format, and a new kind changes the signed text.
+ */
+const PageText = (max: number) => z.string().min(1).max(max);
+export const NodeHostFile = z.discriminatedUnion("kind", [
+  z.strictObject({
+    path: PageText(256),
+    kind: z.literal("file"),
+    mode: PageText(8),
+    sha256: PageText(128),
+    size_bytes: z.number().int().min(0),
+    apply: PageText(128),
+  }),
+  z.strictObject({
+    path: PageText(256),
+    kind: z.literal("symlink-to-dev-null"),
+    apply: PageText(128),
+  }),
+]);
+export const NodeHostFiles = z.array(NodeHostFile).max(HOST_FILES_PAGE_MAX);
+
+/**
  * What a node can tell of a host file by looking at it: the path, the kind, the mode and the
  * digest and size of its bytes (`-` for a mask, which has none). How it takes effect is not a fact
  * of the file.
@@ -142,7 +181,8 @@ export const hostFileLine = (file: HostFile): string =>
 /**
  * What a node that holds a release's host files reports in its hello: sha256 over the facts of
  * each file, one line each ended by a line feed, in the list's order. A node that holds anything
- * else, or a file that waits for a reboot, reports another digest.
+ * else, or on which systemd has still to be told of a file (a reload, a run, a restart), reports
+ * another digest.
  */
 export async function hostFilesSha256(
   files: readonly HostFile[],

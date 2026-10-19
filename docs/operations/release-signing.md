@@ -42,7 +42,10 @@ that node boots their image, whose agent trusts their key. That is an open decis
   mask), one `name=value` line each, every line ended by a line feed. The lock in turn pins every
   package and every download (cloudflared) a maintenance cycle installs, so the signature reaches
   all of them, and the host file lines pin every systemd unit, mask and configuration file the
-  agent writes as root, with how each takes effect. v2 is the host files' version of the format;
+  agent writes as root, with how each takes effect. The signature says nothing of the agent's own
+  rules for the list (directories, modes, units, ways to take effect, the count): the agent holds
+  the list to them when it writes the files, and an agent whose rules are older than the release
+  installs its binaries and refuses the files. v2 is the host files' version of the format;
   a release signed as v1 does not verify with an agent that reads v2, and none is in the field. The contract is
   `signedReleaseManifest` in `packages/contracts/src/releases.ts`; the agent builds the same text of its
   desired page, and a shared vector keeps the two equal. The image is not in it.

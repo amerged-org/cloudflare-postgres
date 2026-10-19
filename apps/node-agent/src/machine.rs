@@ -362,6 +362,13 @@ pub trait Machine: Send + Sync + 'static {
     /// Has systemd read its unit files again (`systemctl daemon-reload`), once a release has
     /// written host files (`hostfiles`). No unit restarts for it.
     fn daemon_reload(&self) -> impl Future<Output = Result<(), units::Error>> + Send;
+    /// Runs `systemd-sysusers <file>`: makes the users and groups the file lists, as the postinst
+    /// of a package does. It changes nothing for a user that exists. A boot does not do this for a
+    /// file that changed (systemd-sysusers.service runs at a boot only when /usr is newer than
+    /// /etc/.updated, which a file in /usr/lib/sysusers.d does not make it).
+    fn run_sysusers(&self, file: &str) -> impl Future<Output = io::Result<()>> + Send;
+    /// Runs `systemd-tmpfiles --create <file>`: makes the directories and files the file lists.
+    fn run_tmpfiles(&self, file: &str) -> impl Future<Output = io::Result<()>> + Send;
     /// The installed Debian packages and their versions.
     fn installed_packages(
         &self,

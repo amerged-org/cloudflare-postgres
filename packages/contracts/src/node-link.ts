@@ -38,6 +38,7 @@ import {
   FleetReleaseOs,
   ImageVersion,
   KernelRelease,
+  NodeHostFiles,
 } from "./releases.ts";
 import { USAGE_HOUR_MS } from "./usage.ts";
 import {
@@ -671,7 +672,8 @@ export const NodeRelease = z.strictObject({
     packages_sha256: true,
     kernel_release: true,
     host_files_sha256: true,
-  }),
+    host_files: true,
+  }).extend({ host_files: NodeHostFiles }),
 });
 export type NodeRelease = z.infer<typeof NodeRelease>;
 
@@ -1701,7 +1703,7 @@ export type NodeProbeDiagnostic = z.infer<typeof NodeProbeDiagnostic>;
  * The boot and the operating system a node reports in its hello: the kernel's boot ID and the
  * time of the boot (a reboot is a new ID), `uname -r`, `packagesSha256` of the packages dpkg
  * reports as installed, and `hostFilesSha256` of the host files the node holds, read from its
- * disk, with a file that waits for a reboot counted as not there yet. The API compares the last
+ * disk, which is the release's only once systemd has been told of every file. The API compares the last
  * three with the release of the node's region.
  */
 export const NodeOs = z.strictObject({

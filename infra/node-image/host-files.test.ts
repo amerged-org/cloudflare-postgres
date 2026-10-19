@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
@@ -71,7 +72,7 @@ test("a tree change changes the list: a byte, a mode, a mask's presence and a ne
   void _mask;
   assert.notEqual(await digest(without, undefined, { [unit]: "next_start" }), first);
   assert.notEqual(
-    await digest({ ...base, "/etc/sysctl.d/90-x.conf": "a = 1\n" }, undefined, { ...apply, "/etc/sysctl.d/90-x.conf": "reboot" }),
+    await digest({ ...base, "/etc/sysctl.d/90-x.conf": "a = 1\n" }, undefined, { ...apply, "/etc/sysctl.d/90-x.conf": "daemon_reload" }),
     first,
   );
 });
@@ -79,7 +80,7 @@ test("a tree change changes the list: a byte, a mode, a mask's presence and a ne
 test("a mode is the execute bit and nothing else: 0644 or 0755, whatever the checkout's umask made of it", async () => {
   const { files } = await readHostFiles(
     treeOf({ [unit]: "a", "/etc/sysctl.d/90-x.conf": "b", "/etc/sysctl.d/91-y.conf": "c" }, { [unit]: 0o700, "/etc/sysctl.d/91-y.conf": 0o775 }),
-    tables({ [unit]: "next_start", "/etc/sysctl.d/90-x.conf": "reboot", "/etc/sysctl.d/91-y.conf": "reboot" }),
+    tables({ [unit]: "next_start", "/etc/sysctl.d/90-x.conf": "daemon_reload", "/etc/sysctl.d/91-y.conf": "daemon_reload" }),
   );
   assert.deepEqual(
     files.map((file) => [file.path, file.kind === "file" ? file.mode : undefined]),
@@ -110,7 +111,7 @@ test("a file the tables do not decide on stops the registration: a new unit is a
   // A file in an allow-listed directory is a host file: it cannot be declared the image's alone.
   await assert.rejects(readHostFiles(treeOf({ [unit]: "x" }), tables({ [unit]: "next_start" }, { [unit]: "no" })), /both/);
   // A row for a file the tree does not hold is a row nobody reads.
-  await assert.rejects(readHostFiles(treeOf({ [unit]: "x" }), tables({ [unit]: "next_start", "/etc/sysctl.d/gone.conf": "reboot" })), /gone\.conf.*not in the tree/s);
+  await assert.rejects(readHostFiles(treeOf({ [unit]: "x" }), tables({ [unit]: "next_start", "/etc/sysctl.d/gone.conf": "daemon_reload" })), /gone\.conf.*not in the tree/s);
   await assert.rejects(readHostFiles(treeOf({ [unit]: "x" }), tables({ [unit]: "next_start" }, { "/etc/gone": "is not there at all" })), /\/etc\/gone.*not in the tree/s);
 });
 
@@ -128,4 +129,34 @@ test("a link is a host file only as a mask of /dev/null, and a file is read whol
     /1048576/,
   );
   await assert.rejects(readHostFiles(treeOf({}), tables({})), /no host file/);
+});
+
+test("the builder gives the image the modes the list states, whatever umask the checkout was made under", async () => {
+  // A checkout under umask 002 (0664, 0775) or a stray 0600 and 0777: the list says 0644 and 0755.
+  const files = {
+    [unit]: "[Service]\n",
+    "/usr/lib/systemd/system/pgcf-y@.service": "[Service]\n# y\n",
+    "/etc/sysctl.d/90-x.conf": "a = 1\n",
+    "/etc/systemd/system/m.service": "-> /dev/null",
+  };
+  const tree = treeOf(files, {
+    [unit]: 0o664,
+    "/usr/lib/systemd/system/pgcf-y@.service": 0o775,
+    "/etc/sysctl.d/90-x.conf": 0o600,
+  });
+  chmodSync(join(tree, "etc/sysctl.d"), 0o777);
+  const apply = { [unit]: "next_start", "/usr/lib/systemd/system/pgcf-y@.service": "next_start", "/etc/sysctl.d/90-x.conf": "daemon_reload", "/etc/systemd/system/m.service": "daemon_reload" };
+  const stated = (await readHostFiles(tree, tables(apply))).files;
+  execFileSync("bash", [join(import.meta.dirname, "builder/normalize-modes.sh"), tree]);
+  // What is on the disk now is what the list stated before and states after: nothing is left that
+  // a node would rewrite at its first start.
+  for (const file of stated) {
+    if (file.kind !== "file") continue;
+    assert.equal((lstatSync(join(tree, file.path)).mode & 0o777).toString(8).padStart(4, "0"), file.mode, file.path);
+  }
+  assert.deepEqual((await readHostFiles(tree, tables(apply))).files, stated);
+  // A directory is 0755, and a mask is still the link to /dev/null, which a chmod would follow.
+  assert.equal(lstatSync(join(tree, "etc/sysctl.d")).mode & 0o777, 0o755);
+  assert.equal(readlinkSync(join(tree, "etc/systemd/system/m.service")), "/dev/null");
+  await assert.rejects(async () => execFileSync("bash", [join(import.meta.dirname, "builder/normalize-modes.sh")], { stdio: "pipe" }));
 });

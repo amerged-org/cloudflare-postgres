@@ -316,8 +316,9 @@ export type NodeFleet = {
  * Where a node stands against its region's release. A node follows the release of its region:
  * its page names it, and the agent's hello names the release it runs and the operating system
  * it boots. The OS is the release's when the kernel, the installed packages and the host files
- * are: a host file that waits for a reboot is not counted as held, so such a release is not
- * converged until the maintenance cycle has rebooted the node.
+ * are: while systemd has still to be told of a host file (a reload, a run of its tool or a
+ * restart that failed or is still to come), the node does not report the release's digest, so
+ * the release is not converged until it has.
  */
 function nodeReleaseStatus(row: NodeReleaseRow, now = Date.now()): NodeFleet {
   const seen =

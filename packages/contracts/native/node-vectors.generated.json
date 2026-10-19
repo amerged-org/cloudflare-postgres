@@ -11182,13 +11182,21 @@
               "mode": "0755",
               "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               "size_bytes": 300,
-              "apply": "reboot"
+              "apply": "sysusers"
+            },
+            {
+              "path": "/usr/lib/tmpfiles.d/pgcf.conf",
+              "kind": "file",
+              "mode": "0644",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 400,
+              "apply": "tmpfiles"
             }
           ]
         }
       },
-      "manifest": "pgcf-release-manifest/v2\nrelease=sha-0123456789ab\nbinary.pgcf-agent=1111111111111111111111111111111111111111111111111111111111111111:11000000\nbinary.pgcf-native-gateway=2222222222222222222222222222222222222222222222222222222222222222:12000000\nbinary.pgcf-archive=3333333333333333333333333333333333333333333333333333333333333333:5000000\nbinary.pgcf-wal-fetch=4444444444444444444444444444444444444444444444444444444444444444:5100000\nos.debian_snapshot=20261016T000000Z\nos.package_lock=5555555555555555555555555555555555555555555555555555555555555555:90000\nos.host_file=/etc/ssh/sshd_config.d/10-pgcf.conf file 0644 6666666666666666666666666666666666666666666666666666666666666666:1500 restart_unit:ssh.service\nos.host_file=/etc/systemd/system/modprobe@loop.service symlink-to-dev-null - - daemon_reload\nos.host_file=/usr/lib/sysctl.d/90-pgcf.conf file 0644 7777777777777777777777777777777777777777777777777777777777777777:800 restart_unit:systemd-sysctl.service\nos.host_file=/usr/lib/systemd/system/pgcf-agent.service file 0644 8888888888888888888888888888888888888888888888888888888888888888:1100 restart_unit:pgcf-agent.service\nos.host_file=/usr/lib/systemd/system/pgcf-pg@.service file 0644 9999999999999999999999999999999999999999999999999999999999999999:4300 next_start\nos.host_file=/usr/lib/sysusers.d/pgcf.conf file 0755 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:300 reboot\n",
-      "host_files_sha256": "5bc1ab090242840be2bd7c51cb5189a27c5b0244487a88837ad5b19146c142dc"
+      "manifest": "pgcf-release-manifest/v2\nrelease=sha-0123456789ab\nbinary.pgcf-agent=1111111111111111111111111111111111111111111111111111111111111111:11000000\nbinary.pgcf-native-gateway=2222222222222222222222222222222222222222222222222222222222222222:12000000\nbinary.pgcf-archive=3333333333333333333333333333333333333333333333333333333333333333:5000000\nbinary.pgcf-wal-fetch=4444444444444444444444444444444444444444444444444444444444444444:5100000\nos.debian_snapshot=20261016T000000Z\nos.package_lock=5555555555555555555555555555555555555555555555555555555555555555:90000\nos.host_file=/etc/ssh/sshd_config.d/10-pgcf.conf file 0644 6666666666666666666666666666666666666666666666666666666666666666:1500 restart_unit:ssh.service\nos.host_file=/etc/systemd/system/modprobe@loop.service symlink-to-dev-null - - daemon_reload\nos.host_file=/usr/lib/sysctl.d/90-pgcf.conf file 0644 7777777777777777777777777777777777777777777777777777777777777777:800 restart_unit:systemd-sysctl.service\nos.host_file=/usr/lib/systemd/system/pgcf-agent.service file 0644 8888888888888888888888888888888888888888888888888888888888888888:1100 restart_unit:pgcf-agent.service\nos.host_file=/usr/lib/systemd/system/pgcf-pg@.service file 0644 9999999999999999999999999999999999999999999999999999999999999999:4300 next_start\nos.host_file=/usr/lib/sysusers.d/pgcf.conf file 0755 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:300 sysusers\nos.host_file=/usr/lib/tmpfiles.d/pgcf.conf file 0644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:400 tmpfiles\n",
+      "host_files_sha256": "a1daf09a59b5ee45c6b7d69aefee21e22b8fc0df2c91440112c165bb60ed1b66"
     }
   ]
 }
