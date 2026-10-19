@@ -1060,6 +1060,7 @@ Nodes never delete anything in R2.
 3. It writes the recovery settings:
    - a `restore_command` through `pgcf-wal-fetch`, which runs `barman-cloud-wal-restore -p 4` with a spool directory per operation. It never uses the shared default, where two restores could receive each other's WAL;
    - `recovery_target_time`, if this is a PITR;
+   - `max_worker_processes = 8` and `max_wal_senders = 10` until the settings are removed: a recovery with hot standby aborts when these are below the values of its source's control file and WAL (checked against PostgreSQL 18.6), and a small database runs fewer (Appendix C);
    - `hot_standby = off` until promotion: a target class with a lower `max_connections` than the source otherwise aborts recovery (Stage 1);
    - promote at the target, follow the latest timeline, and archive to the new path.
 4. Start, replay and promote. Then check that:
@@ -1926,8 +1927,10 @@ Key external references:
 | `work_mem` | 2 MB (`hash_mem_multiplier` 2) | 4 MB |
 | `maintenance_work_mem` | 16 MB | 64 MB |
 | `max_connections` | From the class (25 suggested) | From the class (50 suggested) |
-| `autovacuum_max_workers`, `io_workers` | 1, 1 | Default |
-| `max_parallel_workers_per_gather` | 0 | Default |
+| `autovacuum_max_workers`, `autovacuum_worker_slots`, `io_workers` | 1, 2, 1 | Default |
+| `max_parallel_workers_per_gather`, `max_parallel_maintenance_workers` | 0, 0 | Default |
+| `max_worker_processes` | 2 | Default (8) |
+| `max_logical_replication_workers`, `max_wal_senders`, `max_replication_slots` | 0, 0, 0 | Default |
 
 Worst case for 256 MiB (*estimate*): 32 + 25 × (2 + 4) + 16 + 15 ≈ 215 MiB.
 

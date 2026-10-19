@@ -13,10 +13,27 @@ pub use crate::archive::job::BACKUP_ROLE;
 /// Up to this size a database runs the settings of the small column of the plan's table.
 const SMALL_DATABASE_MEMORY_MIB: u64 = 512;
 
+/// What a small database runs besides the memory settings (plan Appendix C): one autovacuum worker
+/// out of two slots, one I/O worker, no parallel query or parallel maintenance, two background
+/// worker slots, and no replication of any kind. Nothing replicates: `pg_hba.conf` refuses
+/// replication connections and barman's base backup uses the backup API, so no WAL sender, slot
+/// or logical worker (and no logical replication launcher process) is ever needed. A recovery
+/// compares `max_worker_processes` and `max_wal_senders` with the source's, so a restore runs with
+/// more (`archive::recovery::settings`).
+const SMALL_DATABASE_SETTINGS: &str = "\
+autovacuum_max_workers = 1\n\
+autovacuum_worker_slots = 2\n\
+io_workers = 1\n\
+max_parallel_workers_per_gather = 0\n\
+max_parallel_maintenance_workers = 0\n\
+max_worker_processes = 2\n\
+max_logical_replication_workers = 0\n\
+max_wal_senders = 0\n\
+max_replication_slots = 0\n";
+
 /// What PostgreSQL's memory settings are for a database of `memory_mib` (plan Appendix C): the
 /// shared buffers stay small because shared memory cannot be reclaimed without swap, and the page
-/// cache does the caching. A small database (up to 512 MiB) also runs one autovacuum worker and one
-/// I/O worker and no parallel query.
+/// cache does the caching. A small database (up to 512 MiB) also runs `SMALL_DATABASE_SETTINGS`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tuning {
     pub shared_buffers_mib: u64,
@@ -112,9 +129,7 @@ pub fn postgresql_conf(settings: &Settings) -> Option<String> {
         },
     );
     if tuning.small {
-        conf.push_str(
-            "autovacuum_max_workers = 1\nio_workers = 1\nmax_parallel_workers_per_gather = 0\n",
-        );
+        conf.push_str(SMALL_DATABASE_SETTINGS);
     }
     conf.push_str(&format!(
         "include_if_exists = '{}'\n",
@@ -221,8 +236,14 @@ mod tests {
             "min_wal_size = 32MB",
             "max_wal_size = 256MB",
             "autovacuum_max_workers = 1",
+            "autovacuum_worker_slots = 2",
             "io_workers = 1",
             "max_parallel_workers_per_gather = 0",
+            "max_parallel_maintenance_workers = 0",
+            "max_worker_processes = 2",
+            "max_logical_replication_workers = 0",
+            "max_wal_senders = 0",
+            "max_replication_slots = 0",
             "include_if_exists = 'pgcf-recovery.conf'",
         ] {
             assert!(text.lines().any(|l| l == line), "{line}\n{text}");
@@ -236,12 +257,81 @@ mod tests {
         let large = conf(1024, 100);
         for absent in [
             "autovacuum_max_workers",
+            "autovacuum_worker_slots",
             "io_workers",
             "max_parallel_workers_per_gather",
+            "max_parallel_maintenance_workers",
+            "max_worker_processes",
+            "max_logical_replication_workers",
+            "max_wal_senders",
+            "max_replication_slots",
         ] {
             assert!(!large.contains(absent), "{absent}");
         }
         assert!(large.contains("max_wal_size = 25600MB"));
+    }
+
+    /// The whole file of a 256 MiB and of a 1 GiB class, as PostgreSQL 18 reads it. The small
+    /// class trims what it never uses (no replication, no logical workers, two background
+    /// workers, two autovacuum slots, no parallel maintenance); a larger class keeps the defaults.
+    #[test]
+    fn the_rendered_configuration_of_a_small_and_a_larger_class_is_pinned() {
+        let sync = if cfg!(target_os = "linux") {
+            "recovery_init_sync_method = syncfs\n"
+        } else {
+            ""
+        };
+        let head = |connections: u32, shared: u32, cache: u32, work: u32, maintenance: u32| {
+            format!(
+                "# Written by pgcf-agent for every start of the database. Do not edit.\n\
+                 listen_addresses = ''\n\
+                 unix_socket_directories = '/run/pgcf/abcdefghij0123456789'\n\
+                 max_connections = {connections}\n\
+                 shared_buffers = {shared}MB\n\
+                 effective_cache_size = {cache}MB\n\
+                 work_mem = {work}MB\n\
+                 maintenance_work_mem = {maintenance}MB\n\
+                 huge_pages = off\n\
+                 jit = off\n\
+                 wal_level = replica\n\
+                 archive_mode = on\n\
+                 archive_command = '/usr/libexec/pgcf/pgcf-archive %p'\n\
+                 archive_timeout = 60s\n\
+                 {sync}\
+                 wal_init_zero = off\n\
+                 wal_recycle = on\n\
+                 min_wal_size = 32MB\n"
+            )
+        };
+        let tail = "include_if_exists = 'pgcf-recovery.conf'\n";
+        let small = format!(
+            "{}max_wal_size = 256MB\n\
+             password_encryption = scram-sha-256\n\
+             log_line_prefix = '%m [%p] %q%u@%d '\n\
+             autovacuum_max_workers = 1\n\
+             autovacuum_worker_slots = 2\n\
+             io_workers = 1\n\
+             max_parallel_workers_per_gather = 0\n\
+             max_parallel_maintenance_workers = 0\n\
+             max_worker_processes = 2\n\
+             max_logical_replication_workers = 0\n\
+             max_wal_senders = 0\n\
+             max_replication_slots = 0\n\
+             {tail}",
+            head(25, 32, 192, 2, 16)
+        );
+        assert_eq!(conf(256, 1), small);
+        let larger = format!(
+            "{}max_wal_size = 25600MB\n\
+             password_encryption = scram-sha-256\n\
+             log_line_prefix = '%m [%p] %q%u@%d '\n\
+             {tail}",
+            head(25, 128, 768, 4, 64)
+        );
+        assert_eq!(conf(1024, 100), larger);
+        // The class boundary is the plan's: 512 MiB is small, one more is not.
+        assert!(conf(512, 1).contains("max_wal_senders = 0"));
+        assert!(!conf(513, 1).contains("max_wal_senders"));
     }
 
     #[test]
