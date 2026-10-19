@@ -8,6 +8,18 @@ import {
 import { isDatabaseId, isRoleName } from "@pgcf/contracts";
 import { connect } from "cloudflare:sockets";
 import { credentialOccurrences } from "../src/audit.ts";
+import {
+  ARMS,
+  buildTrips,
+  tenth,
+  timeCall,
+  type Arm,
+  type GetTiming,
+  type HealthzSample,
+  type Session,
+  type Timed,
+} from "../src/saas.ts";
+import { openHttp, openWebSocket } from "../src/saas-session.ts";
 import { safeProbeError, workerScanUnsupported } from "../src/transport.ts";
 import { runActive } from "../src/run-expiry.ts";
 import { isTraceMarker } from "../src/trace-marker.ts";
@@ -19,6 +31,8 @@ interface Env {
   API_URL: string;
   ENDPOINT_HOST: string;
   RUN_EXPIRES_AT?: string;
+  /** A service binding to the Edge Worker, for the `/saas-bench` healthz timing; none without it. */
+  EDGE?: { fetch(input: string): Promise<Response> };
 }
 
 function response(body: unknown, status = 200): Response {
@@ -344,6 +358,101 @@ async function exercise(
   }
 }
 
+/** The call of the SaaS benchmark a request asks for. */
+export interface BenchQuery {
+  arm: Arm;
+  database: string;
+  seed: number;
+  call: number;
+  scale: number;
+}
+
+/** A whole number from a query, or -1. */
+const whole = (value: string | null) =>
+  /^[0-9]{1,9}$/.test(value ?? "") ? Number(value) : -1;
+
+export function benchQuery(query: URLSearchParams): BenchQuery {
+  const arm = ARMS.find((candidate) => candidate === query.get("mode"));
+  const database = query.get("database") ?? "";
+  const seed = whole(query.get("seed"));
+  const call = whole(query.get("call"));
+  const scale = Number(query.get("scale"));
+  if (
+    arm === undefined ||
+    !isDatabaseId(database) ||
+    seed < 0 ||
+    call < 0 ||
+    !(scale > 0 && scale <= 10)
+  )
+    throw new Error("invalid_bench_request");
+  return { arm, database, seed, call, scale };
+}
+
+/** A session of `arm` as the Worker opens it: the runtime's WebSocket, or its `fetch`. */
+function openArm(arm: Arm, uri: string): Promise<Session> {
+  return arm === "ws"
+    ? openWebSocket(uri, (address) => new WebSocket(address))
+    : Promise.resolve(openHttp(uri));
+}
+
+/**
+ * One call of the benchmark's request by the arm asked for: what `saas-bench` records on the
+ * laptop, the time the socket opened included, and the Cloudflare location this Worker ran in.
+ */
+export async function benchCall(
+  asked: BenchQuery,
+  uri: string,
+  colo: string | null,
+  open: (arm: Arm, uri: string) => Promise<Session> = openArm,
+): Promise<Timed> {
+  const timed = await timeCall(
+    () => open(asked.arm, uri),
+    buildTrips(asked.arm, asked.seed, asked.call, asked.scale),
+  );
+  return { ...timed, colo };
+}
+
+/** The Cloudflare location in a `cf-ray` header (`<ray>-<IATA code>`), if it has one. */
+const rayColo = (reply: Response) =>
+  /-([A-Z]{3})$/.exec(reply.headers.get("cf-ray") ?? "")?.[1] ?? null;
+
+/**
+ * Two back-to-back GETs of `/healthz` on each path the Edge can be reached by: its public hostname
+ * and a service binding. The Edge answers without admission. Odd calls start with the binding, so
+ * that an effect of the order cancels over the samples.
+ */
+export async function healthzCall(
+  call: number,
+  colo: string | null,
+  paths: {
+    public: () => Promise<Response>;
+    binding: (() => Promise<Response>) | null;
+  },
+): Promise<HealthzSample> {
+  const twice = async (send: () => Promise<Response>) => {
+    const gets: GetTiming[] = [];
+    for (let n = 0; n < 2; n++) {
+      const started = performance.now();
+      const reply = await send();
+      await reply.arrayBuffer();
+      gets.push({
+        ms: tenth(performance.now() - started),
+        status: reply.status,
+        ray_colo: rayColo(reply),
+      });
+    }
+    return gets;
+  };
+  const sample: HealthzSample = { colo, public: [], binding: null };
+  for (const path of call % 2 === 0
+    ? (["public", "binding"] as const)
+    : (["binding", "public"] as const)) {
+    if (path === "public") sample.public = await twice(paths.public);
+    else if (paths.binding) sample.binding = await twice(paths.binding);
+  }
+  return sample;
+}
+
 async function scan(
   host: string,
   ports: number[],
@@ -422,6 +531,25 @@ export default {
           ports: number[];
         };
         return response(await scan(input.host, input.ports));
+      }
+      if (path === "/saas-bench") {
+        const query = new URL(request.url).searchParams;
+        const colo = (request as { cf?: { colo?: string } }).cf?.colo ?? null;
+        if (query.get("mode") === "healthz") {
+          const call = whole(query.get("call"));
+          if (call < 0) throw new Error("invalid_bench_request");
+          const healthz = `https://${env.ENDPOINT_HOST}/healthz`;
+          return response(
+            await healthzCall(call, colo, {
+              public: () =>
+                fetch(healthz, { signal: AbortSignal.timeout(10_000) }),
+              binding: env.EDGE ? () => env.EDGE!.fetch(healthz) : null,
+            }),
+          );
+        }
+        const asked = benchQuery(query);
+        const uri = await connection({ ...env, DATABASE_ID: asked.database });
+        return response(await benchCall(asked, uri, colo));
       }
       if (path === "/refusal") {
         await rejects(
@@ -505,6 +633,8 @@ export default {
     } catch (error: unknown) {
       if (error instanceof Error && error.message === "invalid_trace_marker")
         return response({ code: "invalid_trace_marker" }, 400);
+      if (error instanceof Error && error.message === "invalid_bench_request")
+        return response({ code: "invalid_bench_request" }, 400);
       if (error instanceof Error && error.message === "worker_scan_unavailable")
         return response({ code: "worker_scan_unavailable" }, 503);
       return response({ code: "probe_failed" }, 500);
