@@ -759,13 +759,21 @@ impl<M: Machine> Service<M> {
             tokio::time::sleep(self.intervals.batch).await;
             while let Some(report) = self.core.take_report(events) {
                 match self.link.post_observation(&report).await {
-                    Ok(()) => wait = self.intervals.batch,
+                    Ok(()) => {
+                        wait = self.intervals.batch;
+                        self.core.report_posted();
+                    }
                     Err(error) => {
                         crate::timing::emit_event(json!({
                             "event": "observation_not_posted",
                             "class": crate::diagnostics::error_code(&error),
+                            "databases": report["databases"].as_array().map_or(0, Vec::len),
+                            "status": error
+                                .downcast_ref::<crate::api::Refusal>()
+                                .map_or(0, |refusal| refusal.status),
                         }));
                         self.core.unsent(events, &report);
+                        self.core.report_failed(&error);
                         tokio::time::sleep(wait).await;
                         wait = (wait * 2).min(Duration::from_secs(30));
                         break;
@@ -1389,6 +1397,76 @@ mod tests {
         })
         .await;
         second.stop();
+    }
+
+    /// `count` asleep observations of the contract's example, each under an identifier of its own.
+    fn asleep_observations(count: usize) -> Vec<Value> {
+        use crate::link::test_server::{database_id, vector};
+        let example = vector("NodeObservationReport", "asleep")["databases"][0].clone();
+        (0..count)
+            .map(|index| {
+                let mut observation = example.clone();
+                observation["id"] = database_id(index).into();
+                observation
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_report_loop_posts_half_the_batch_after_a_refused_report_and_a_whole_one_after_an_accepted_report()
+     {
+        let Some((machine, _fixture, _root)) =
+            site("report-batches", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        let path = crate::node_link::constant("NODE_API_PATHS")["observations"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The reports that name databases, in the order they were posted: how many each named, and
+        // how Cloudflare answered it.
+        let posted = || -> Vec<(usize, u16)> {
+            cloud
+                .requests()
+                .into_iter()
+                .filter(|seen| seen.path() == path)
+                .filter_map(|seen| {
+                    let named = seen.body["databases"].as_array().map_or(0, Vec::len);
+                    (named > 0).then_some((named, seen.status))
+                })
+                .collect()
+        };
+        // Cloudflare refuses the first report of databases, as when it ran out of time on it.
+        cloud.with(|inner| inner.observation_failures = 1);
+        for observation in asleep_observations(100) {
+            service.core().queue_observation(observation);
+        }
+        eventually(30, "every observation to be accepted", || {
+            posted()
+                .iter()
+                .filter(|(_, status)| *status == 200)
+                .map(|(named, _)| named)
+                .sum::<usize>()
+                == 100
+        })
+        .await;
+        // The refused report held a whole batch and went back whole; the one after it was half as
+        // large; the accepted one restored the batch, and the last report held what was left.
+        let batch = crate::agent::report::DATABASES_PER_REPORT;
+        assert_eq!(
+            posted(),
+            [
+                (batch, 503),
+                (batch / 2, 200),
+                (batch, 200),
+                (100 - batch / 2 - batch, 200)
+            ]
+        );
+        service.stop();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

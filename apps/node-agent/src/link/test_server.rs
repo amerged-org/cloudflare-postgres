@@ -122,6 +122,9 @@ pub struct Inner {
     pub probe_failures: usize,
     /// The same for the next this many boot reports.
     pub boot_failures: usize,
+    /// The next this many observation reports that name databases are answered 503: the ones that
+    /// carry events alone are not counted, as the node posts those on its own account.
+    pub observation_failures: usize,
     /// The node uid the desired pages name; the enrolled node's own unless a test changes it.
     pub page_uid: String,
     /// The pages never advance their cursor.
@@ -195,6 +198,7 @@ impl Cloud {
             diagnostics: vec![],
             probe_failures: 0,
             boot_failures: 0,
+            observation_failures: 0,
             page_uid: NODE_UID.into(),
             stuck: false,
             silent_welcome: false,
@@ -586,11 +590,17 @@ async fn serve(
         let diagnostic = request.method == "POST"
             && request.target == constant("NODE_API_PATHS")["diagnostics"].as_str().unwrap();
         let probe = diagnostic && body["kind"] == "probe";
+        let observed = request.method == "POST"
+            && request.target == constant("NODE_API_PATHS")["observations"].as_str().unwrap()
+            && body["databases"].as_array().is_some_and(|d| !d.is_empty());
         let failure = if probe && inner.probe_failures > 0 {
             inner.probe_failures -= 1;
             Some(Failure::Status(503))
         } else if diagnostic && !probe && inner.boot_failures > 0 {
             inner.boot_failures -= 1;
+            Some(Failure::Status(503))
+        } else if observed && inner.observation_failures > 0 {
+            inner.observation_failures -= 1;
             Some(Failure::Status(503))
         } else if request.method == "POST" {
             inner.failures.pop_front()
