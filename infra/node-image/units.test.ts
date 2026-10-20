@@ -138,6 +138,25 @@ test("a database's private /dev/shm cannot run code, hold setuid files or hold d
   }
 });
 
+test("a database unit shares no IPC namespace and no writable directory with another unit: /run/lock, /dev/mqueue and /dev/pts are out of reach", () => {
+  const unit = readFileSync(new URL("pgcf-pg@.service", units), "utf8");
+  // /run/lock (a 5 MiB tmpfs) and /dev/mqueue (the host's queues) are mode 1777 and mounted
+  // read-write in every unit: a place where one tenant leaves what another reads, and files that
+  // outlive the unit in a node-wide tmpfs (LVM keeps its lock directory there). /dev/pts is the
+  // host's devpts, bound into the private /dev: its ptmx gave one user 3072 of the node's 4096
+  // ptys, and its listing showed every unit's.
+  // PrivateIPC= gives the unit its SysV namespace and a mqueue instance of its own (measured on
+  // systemd 257.13). The inaccessible /dev/mqueue keeps the queues out of reach for open(2) as well:
+  // the filter denies mq_open, and a file created in the directory is the same queue.
+  assert.deepEqual(assignments(unit, "PrivateIPC"), ["yes"]);
+  const inaccessible = assignments(unit, "InaccessiblePaths").flatMap((line) => line.split(/\s+/));
+  assert.deepEqual(inaccessible.sort(), ["-/dev/mqueue", "-/dev/pts", "-/run/lock"]);
+  // PostgreSQL's pid interlock stays: a second unit on a data directory finds the first postmaster
+  // with kill(pid, 0) only while the units share the PID namespace. The segment half of the interlock
+  // is blind across IPC namespaces, so this half is what refuses the second postmaster.
+  assert.deepEqual(assignments(unit, "PrivatePIDs"), []);
+});
+
 test("the kernel refuses io_uring and line-discipline autoload: a database's user gets no module surface", () => {
   const sysctl = new Map(
     readFileSync(new URL("usr/lib/sysctl.d/90-pgcf.conf", image), "utf8")

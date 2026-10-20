@@ -472,6 +472,116 @@ database_user_reaches_no_block_device() {
 	esac
 }
 
+# Plan 8: nothing a database's user can write is shared with another unit. /run/lock (a tmpfs for the
+# whole node) and /dev/mqueue (the host's queues) are mode 1777 and were mounted read-write in every
+# unit, so one tenant could leave there what another reads, and files outlived the unit in a tmpfs
+# that LVM keeps its locks in. As the user of the running scratch database, in the mount and IPC
+# namespaces of its unit and with no capability:
+# - its own volume is writable (the probe works), /run/lock, /dev/mqueue and /dev/pts refuse a file
+#   and a listing, it cannot allocate a pty, and what the host keeps in /tmp, /var/tmp and
+#   /dev/shm is not there;
+# - a SysV segment of the host is not in its IPC namespace, and the segment PostgreSQL made is there
+#   and not in the host's;
+# - every directory and regular file it can write is its own: its volume, its socket directory, the
+#   private /tmp, /var/tmp and /dev/shm and its own cgroup's pressure files. Sockets (the journal's,
+#   systemd's and D-Bus's service endpoints; each service checks its caller), the character devices
+#   of the private /dev (null, zero, full, random, urandom, tty) and symbolic links hold no data.
+database_user_shares_nothing_writable() {
+	local id=pgcfcheckscratch0000 pid uid gid own marker place segment owners listing leftover result=0
+	pid=$(systemctl show --property=MainPID --value "pgcf-pg@$id.service")
+	[ "${pid:-0}" -gt 0 ] || {
+		echo "the scratch database does not run"
+		return 1
+	}
+	uid=$(stat -c %u "/proc/$pid")
+	gid=$(stat -c %g "/proc/$pid")
+	own=/var/lib/pgcf/db/$id
+	marker=pgcf-boot-test-host-marker
+	as_user() {
+		nsenter --target "$pid" --mount --ipc -- setpriv --reuid="$uid" --regid="$gid" --clear-groups \
+			--bounding-set=-all --inh-caps=-all --no-new-privs -- "$@"
+	}
+	as_user sh -c 'touch "$1/probe" && rm "$1/probe"' sh "$own" || {
+		echo "the user cannot write its own volume: the probes prove nothing"
+		return 1
+	}
+	for place in /run/lock /dev/mqueue /dev/pts; do
+		if as_user sh -c 'touch "$1/probe" 2>&1 && rm "$1/probe"' sh "$place" >/dev/null; then
+			echo "the user created a file in $place"
+			result=1
+		fi
+		listing=$(as_user ls -A "$place" 2>&1)
+		grep -q 'Permission denied' <<<"$listing" || {
+			echo "$place is not refused: $listing"
+			result=1
+		}
+	done
+	if as_user sh -c ': <>/dev/ptmx' 2>/dev/null; then
+		echo "the user allocated a pty from the host's devpts"
+		result=1
+	fi
+	for place in /tmp /var/tmp /dev/shm; do
+		touch "$place/$marker"
+		if as_user test -e "$place/$marker"; then
+			echo "the host's $place is visible in the unit"
+			result=1
+		fi
+		rm -f "$place/$marker"
+	done
+	if [ "$(readlink "/proc/$pid/ns/ipc")" = "$(readlink /proc/1/ns/ipc)" ]; then
+		echo "the unit is in PID 1's IPC namespace"
+		result=1
+	fi
+	segment=$(ipcmk --shmem 4096 | awk '{ print $NF }')
+	if [ -z "$segment" ] || nsenter --target "$pid" --ipc -- awk -v id="$segment" 'NR > 1 && $2 == id { found = 1 } END { exit !found }' /proc/sysvipc/shm; then
+		echo "the host's SysV segment ${segment:-?} is visible in the unit"
+		result=1
+	fi
+	[ -z "$segment" ] || ipcrm --shmem-id "$segment"
+	owners=$(nsenter --target "$pid" --ipc -- awk 'NR > 1 { print $8 }' /proc/sysvipc/shm | sort -u)
+	[ "$owners" = "$uid" ] || {
+		echo "the unit's SysV segments belong to: ${owners:-nobody}"
+		result=1
+	}
+	if awk -v uid="$uid" 'NR > 1 && $8 == uid { found = 1 } END { exit !found }' /proc/sysvipc/shm; then
+		echo "the database's SysV segment is in the host's IPC namespace"
+		result=1
+	fi
+	# /efi is an automount of the ESP (mode 0700 for root): the search must not mount it.
+	leftover=$(as_user find / \( -path /proc -o -path /efi -o -path "$own" \) -prune -o \( -type d -o -type f \) -writable -print 2>/dev/null |
+		grep -vE "^(/dev/shm|/tmp|/var/tmp)(/|$)|^/run/pgcf/$id(/|$)|^/sys/fs/cgroup/pgcf\.slice/pgcf-pg@$id\.service/")
+	[ -z "$leftover" ] || {
+		echo "writable and not the unit's own: $leftover"
+		result=1
+	}
+	[ "$result" = 0 ]
+}
+
+# PrivateIPC= leaves the pid half of PostgreSQL's interlock (a postmaster.pid whose process is alive
+# is refused with kill(pid, 0), which reaches it because the units share the PID namespace) and
+# blinds the shared-memory half: a segment of another IPC namespace is not found. A second unit on
+# a running database's directory is one more postmaster of the same user in an IPC namespace of its
+# own, and it must be refused at once.
+database_second_postmaster_is_refused() {
+	local id=pgcfcheckscratch0000 pid uid gid output status
+	pid=$(systemctl show --property=MainPID --value "pgcf-pg@$id.service")
+	[ "${pid:-0}" -gt 0 ] || {
+		echo "the scratch database does not run"
+		return 1
+	}
+	uid=$(stat -c %u "/proc/$pid")
+	gid=$(stat -c %g "/proc/$pid")
+	output=$(nsenter --target "$pid" --mount -- unshare --ipc -- setpriv --reuid="$uid" --regid="$gid" --clear-groups -- \
+		timeout 30 /usr/lib/postgresql/18/bin/postgres -D "/var/lib/pgcf/db/$id/data" \
+		-c listen_addresses= -c "unix_socket_directories=/run/pgcf/$id" 2>&1)
+	status=$?
+	{ [ "$status" = 1 ] && grep -q 'lock file "postmaster.pid" already exists' <<<"$output"; } || {
+		echo "a second postmaster ended with $status: $output"
+		return 1
+	}
+	[ "$(systemctl is-active "pgcf-pg@$id.service")" = active ]
+}
+
 # After the reboot with that database awake: the unit stopped on its own, cleanly, before the node
 # went down, and neither PostgreSQL nor ext4 had anything to recover at this start.
 scratch_database_was_stopped_cleanly() {
@@ -522,6 +632,8 @@ if [ "$phase" = 1 ]; then
 	check database_unit_needs_the_link database_unit_needs_the_link
 	check scratch_database_runs_across_an_agent_restart scratch_database_runs_across_an_agent_restart
 	check database_user_reaches_no_block_device database_user_reaches_no_block_device
+	check database_user_shares_nothing_writable database_user_shares_nothing_writable
+	check database_second_postmaster_is_refused database_second_postmaster_is_refused
 else
 	check scratch_database_was_stopped_cleanly scratch_database_was_stopped_cleanly
 fi

@@ -417,11 +417,48 @@ package from creating a default cluster.
   `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`,
   `ProtectProc=invisible`, `ProcSubset=pid`; `RestrictNamespaces`, `RestrictRealtime`,
   `RestrictSUIDSGID`, `LockPersonality`, `NoNewPrivileges`, an empty `CapabilityBoundingSet`,
-  `RemoveIPC`; `SystemCallFilter=@system-service` minus `@privileged @resources` and minus what
+  `RemoveIPC`, `PrivateIPC` and `InaccessiblePaths=-/run/lock -/dev/mqueue -/dev/pts` (below);
+  `SystemCallFilter=@system-service` minus `@privileged @resources` and minus what
   kernel exploits use as a second stage and PostgreSQL does not need (`@keyring`,
   `io_uring_setup/enter/register`, `userfaultfd`, the SysV message queues and semaphores `msg*` and
   `sem*`, the POSIX message queues `mq_*`; `shmget`, `shmat`, `shmdt` and `shmctl` stay; a forbidden
   call kills the process), `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`.
+- **Nothing writable is shared with another unit** (`PrivateIPC=yes` and `InaccessiblePaths=-/run/lock
+  -/dev/mqueue -/dev/pts`). Found on EU1 by the node lab, 2026-10-20: inside the full directive set a
+  database's user could create files in `/run/lock` (a 5 MiB tmpfs of the whole node, mode 1777) and
+  in `/dev/mqueue` (the host's queues, mode 1777). The enumeration of what the user can write, made
+  in the lab for this change, found a third: `/dev/pts` is the host's devpts, bound into the private
+  `/dev`, and one user allocated 3072 of the kernel's 4096 ptys from it (the listing shows every
+  unit's). Every unit shared them: a place where one tenant leaves what another reads, files that
+  outlive the unit in a tmpfs that LVM keeps its lock directory in, and a pty table one tenant can
+  fill. PostgreSQL uses none of them. Measured on systemd 257.13 (Debian 13, privileged
+  container with systemd as PID 1, the repository's unit with the volume bound from a directory):
+  `PrivateIPC=yes` gives the unit a new IPC namespace and a mqueue instance of its own (a different
+  `st_dev`, a file made in one is not in the other) but leaves the directory writable, so
+  `/dev/mqueue` is inaccessible as well: the filter denies `mq_open`, and creating a file in the
+  directory makes the same queue. The inaccessible directories answer `EACCES`, and `/var/lock`, a link
+  to `/run/lock`, with them. PostgreSQL 18.6 starts and serves in the unit (DDL, DML, a parallel query
+  through dynamic shared memory in the private `/dev/shm`, a clean stop and a start after it): its SysV
+  segment (56 bytes) is in the unit's namespace and in no other, and semaphores are the unnamed POSIX
+  ones in shared memory. `RemoveIPC=yes` stays: it removes the objects of the user in the host's
+  namespace, where a job of the same user could leave some. Cost: fork to handoff 32.0 against
+  31.4 ms and 29.3 against 28.9 ms at p50 in two runs of 40 interleaved pairs each on the laptop's
+  Docker VM (arm64), so about 0.5 ms; EU1 is measured by the acceptance in the plan (11.2).
+  **What a database's user can still write**, enumerated inside the running unit as that user
+  (`find / -writable`, symbolic links resolved): its own volume, its socket directory and the lock file
+  in it, the private `/tmp`, `/var/tmp` and `/dev/shm`, and the pressure file of its own cgroup (systemd
+  hands it to the unit's user); the character devices of the private `/dev` (`null`, `zero`, `full`,
+  `random`, `urandom`, `tty`), which hold nothing; and the sockets of services that check their
+  caller: the journal's (`dev-log`, `socket`, `stdout`), systemd's notify socket (only the main process
+  of a unit with `NotifyAccess=main` counts) and its varlink sockets, and D-Bus's system bus socket,
+  where the bus policy and polkit refuse a change. The backup jobs (`archive/job.rs`) run as the
+  database's user with a smaller set and still see the host's `/run/lock` and `/dev/mqueue`; they run
+  the node's barman, not a tenant's code, so they are not closed here. The boot test enumerates the
+  directories and regular files a database's user can write and fails on any other than the unit's
+  own. journald's `SplitMode=uid` keeps a `user-<uid>.journal` file with a read ACL for each database
+  uid, and the unit's user can read its own (the lab shows it); with one fixed uid per database that
+  is the database's own log, and it is why a uid used by two databases would need `SplitMode=none`
+  first (plan, section 8).
 - **Device policy:** with `PrivateDevices=yes` the policy is closed, and systemd adds to the policy of
   every unit with `MountImages=` the devices that image dissection touches: `block-device-mapper`,
   `block-blkext` and `block-loop` (`rwm`), `/dev/mapper/control` and `/dev/loop-control` (`rw`), next
@@ -447,9 +484,16 @@ package from creating a default cluster.
   cannot make a volume made with the gap unmountable (every such filesystem ends 4 MiB before its
   volume, see below); a volume made before the gap existed has no such protection until it grows
   (see the rollout below).
-- **Not set:** `PrivatePIDs` and `PrivateIPC`, because PostgreSQL's `postmaster.pid` interlock needs
-  them off (the lab showed a second unit on the same directory being refused); `unix_socket_group`,
-  because PostgreSQL would call `chown`, which the filter kills.
+- **Not set:** `PrivatePIDs`, because PostgreSQL's `postmaster.pid` interlock needs the units to
+  share the PID namespace: a second postmaster on a running database's directory finds the first
+  with `kill(pid, 0)`. `PrivateIPC` is set although the other half of the interlock, the check of the
+  SysV segment named in `postmaster.pid`, cannot reach across IPC namespaces (a segment of another
+  namespace is not found, so it counts as gone); the pid half refuses a second postmaster of the same
+  user at once ("lock file postmaster.pid already exists", measured in the lab and asserted by the boot
+  test). It would not refuse one of another user: `kill` answers `EPERM`, which PostgreSQL reads as a
+  stale file, and the segment of another user as foreign. A database has one user, so the agent's one
+  writer per database is what stops a second start today. `unix_socket_group`, because PostgreSQL
+  would call `chown`, which the filter kills.
 
 ### The agent unit
 
@@ -774,5 +818,5 @@ The guest reports one line per check on the second serial port:
 
 | Boot | Checks |
 | --- | --- |
-| First | no failed unit; nothing listens outside loopback; the journal syncs every 15 s (`systemd-analyze cat-config`); no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; `sshd -t` passes and `sshd -T` reports the operator shell's values; a certificate from a throwaway CA is refused on 127.0.0.1 and ::1, accepted once that CA is installed and refused again when it is removed; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`, and the slice carries the image's 512 MiB `MemoryMax`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check`, run in the agent's mount namespace, creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750; no volume is in PID 1's mount namespace and the agent's has the scratch volume; its filesystem ends at least 4 MiB before its volume; the database unit's `DeviceAllow` is `char-rtc r` and the five entries of `MountImages=` with a closed policy, a private `/dev` and no capability; the scratch database's user, inside its unit, finds no block node in `/dev`, cannot make one and cannot open a device-mapper node or its volume's device; a start of a unit without a link fails its assertion; the scratch database, started from its link, runs on across a restart of the agent, whose start has dropped every link, and stays awake into the reboot |
+| First | no failed unit; nothing listens outside loopback; the journal syncs every 15 s (`systemd-analyze cat-config`); no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; `sshd -t` passes and `sshd -T` reports the operator shell's values; a certificate from a throwaway CA is refused on 127.0.0.1 and ::1, accepted once that CA is installed and refused again when it is removed; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`, and the slice carries the image's 512 MiB `MemoryMax`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check`, run in the agent's mount namespace, creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750; no volume is in PID 1's mount namespace and the agent's has the scratch volume; its filesystem ends at least 4 MiB before its volume; the database unit's `DeviceAllow` is `char-rtc r` and the five entries of `MountImages=` with a closed policy, a private `/dev` and no capability; the scratch database's user, inside its unit, finds no block node in `/dev`, cannot make one and cannot open a device-mapper node or its volume's device; as that user, inside the unit, `/run/lock`, `/dev/mqueue` and `/dev/pts` refuse a file and a listing, no pty can be allocated, the host's markers in `/tmp`, `/var/tmp` and `/dev/shm` and the host's SysV segment are not there, the unit is not in PID 1's IPC namespace, PostgreSQL's own segment is in the unit's namespace and not in the host's, every directory and regular file the user can write is the unit's own, and a second postmaster of the same user in an IPC namespace of its own on the directory is refused with "lock file postmaster.pid already exists"; a start of a unit without a link fails its assertion; the scratch database, started from its link, runs on across a restart of the agent, whose start has dropped every link, and stays awake into the reboot |
 | Second | no failed unit; loopback only; the journal syncs every 15 s; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database, with no volume in PID 1's mount namespace; the database that was awake at the reboot was stopped cleanly before the node went down, and neither PostgreSQL nor ext4 recovered anything at this start |

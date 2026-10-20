@@ -65,6 +65,19 @@ PrivateTmp=yes
 PrivateDevices=yes
 # PostgreSQL maps its segments here read-write only; nothing in it may run, carry setuid or be a device.
 TemporaryFileSystem=/dev/shm:size=64M,mode=1777,noexec,nosuid,nodev
+# Nothing writable is shared with another unit. The unit has its own IPC namespace (its own SysV
+# segments and its own POSIX queue mount: PostgreSQL's segment is in it, and no other unit's is).
+# Three places stay outside the unit's view. /run/lock is a tmpfs for the whole node and
+# /dev/mqueue is mode 1777: both were mounted read-write in every unit, a place where one
+# database's user leaves what another reads, and files that outlive the unit. /dev/pts is the
+# host's devpts, which PrivateDevices= binds into the private /dev: its ptmx gave one user 3072
+# of the node's 4096 ptys, and its listing showed the ptys of every unit. PostgreSQL uses none of
+# them. The filter below denies mq_open, but creating a file in /dev/mqueue makes the same queue,
+# so the directory is out of reach as well. The PID namespace stays shared, because the pid half of
+# PostgreSQL's interlock (a second postmaster on the directory finds the first with kill(pid, 0))
+# needs it; the segment half does not reach across IPC namespaces.
+PrivateIPC=yes
+InaccessiblePaths=-/run/lock -/dev/mqueue -/dev/pts
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
