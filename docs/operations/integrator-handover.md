@@ -846,7 +846,10 @@ times the pool's data. Chunks are zeroed before reuse, so space freed by one dat
 readable by another.
 
 - **The pool.** Placement closes a node's pool at 80 % of its data, 50 % of its metadata or the
-  cap: nothing new is created or restored there, and running databases keep running. A node whose
+  cap, and the node itself at 1,000 volumes (the technical bound, a limit of the LVM metadata
+  area, not a sales limit): nothing new is created, restored or moved there, a resize still
+  works, and running databases keep running. A region whose nodes are all closed holds a new
+  database as "Waiting for verified regional capacity" until a node is added. A node whose
   pool has no room refuses every create, restore and wake with `57P03` and the DETAIL "storage". A
   pool that does fill fails writes at once, with no commit acknowledged without durable WAL; the
   affected databases stop, and the node recovers them by itself once space is back.

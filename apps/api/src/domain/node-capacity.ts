@@ -150,6 +150,7 @@ export async function runNodeCapacity(
     .first<{
       max_nodes: number | null;
       autoscale_enabled: number;
+      purchases_enabled: number;
       order_config: string | null;
       adopt_instance_ids: string;
     }>();
@@ -271,6 +272,10 @@ export async function runNodeCapacity(
     }
   }
   if (request === null && policy.order_config !== null) {
+    // An order that purchases_enabled does not let through is not reserved either: it would hold a
+    // slot and be dispatched the moment purchases are turned on, for a shortage long gone.
+    if (!policy.purchases_enabled)
+      return { ...result, action: "purchases_disabled" };
     const order = NodeOrderConfiguration.parse(JSON.parse(policy.order_config));
     request = { region_id: regionId, mode: "order", order };
     // One purchase attempt per hour of continued shortage.

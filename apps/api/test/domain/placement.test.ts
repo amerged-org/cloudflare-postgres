@@ -54,6 +54,7 @@ function node(overrides: Partial<PlacementNode> = {}): PlacementNode {
     pool_metadata_total_bytes: OPEN_POOL.metadataTotal,
     pool_metadata_used_bytes: OPEN_POOL.metadataUsed,
     pool_nominal_bytes: OPEN_POOL.nominal,
+    volumes_total: 0,
     ram_peak_ppm: 0,
     cpu_peak_ppm: 0,
     ram_now_ppm: 0,

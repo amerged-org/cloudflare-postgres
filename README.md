@@ -43,8 +43,8 @@ Placement follows the
 [ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#48-placement-in-cloudflare):
 a node takes new databases until its active RAM or its CPU load reaches 80 %, each measured as the
 highest 30-minute average of the last seven days, and among the nodes that qualify the fullest
-wins. A node whose thin pool placement has closed (data at 80 %, metadata at 50 % or the sold
-storage at four times its data) takes none. Each start is admitted by the node itself, from its own
+wins. A node whose thin pool placement has closed (data at 80 %, metadata at 50 %, the sold
+storage at four times its data, or 1,000 volumes) takes none. Each start is admitted by the node itself, from its own
 free RAM and pool. No lease expiry, stale sample or missing observation stops a running database:
 besides its own idle sleep and the node's early sleep, only explicit orders (suspend, delete, move,
 maintenance) do. A database that no node can host is accepted and waits as "Waiting for verified regional

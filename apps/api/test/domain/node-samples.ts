@@ -37,6 +37,8 @@ export interface SampleSeed {
   /** Null is a pool that the node could not read. */
   pool?: PoolSeed | null;
   room?: boolean;
+  /** Thin volumes on the node (default 0); none of them is mounted. */
+  volumes?: number;
   /** Wakes the node refused for awake capacity in this sample's minute. */
   refusals?: number;
 }
@@ -54,6 +56,7 @@ const figures = (seed: SampleSeed) => {
     busy: Math.floor((cores * 1000 * (seed.cpuPpm ?? 0)) / 1e6),
     pool: seed.pool === undefined ? OPEN_POOL : seed.pool,
     room: seed.room !== false,
+    volumes: seed.volumes ?? 0,
   };
 };
 
@@ -77,7 +80,7 @@ function sampleJson(seed: SampleSeed): string {
             nominal_bytes: f.pool.nominal,
           },
     room: f.room,
-    volumes: { total: 0, mounted: 0 },
+    volumes: { total: f.volumes, mounted: 0 },
     archive: { ready_files: null, oldest_ready_seconds: null },
     awake: [],
     awake_memory_mib: 0,
