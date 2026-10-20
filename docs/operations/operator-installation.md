@@ -149,46 +149,53 @@ No secret and no other binding is needed. Deploy the API Worker with the migrati
 minute cron afterwards arms the warmers, and their first visit comes one interval later.
 
 **Cost.** Each visit is one Durable Object request, so the cost is proportional to the number of
-databases and to the visit rate, and it is charged for sleeping databases as well. Per 1,000
-databases and 30 days at an interval of 8 s (the Durable Object figures are estimated from the
-measured ones of plan 11.1 at the pricing page of 2026-10-18, not from an invoice):
+databases and to the visit rate, and it is charged for sleeping databases as well. Per month of 30
+days at an interval of 8 s, for 170, 300 and 1,000 databases, with one warmer for every 250
+databases (1, 2 and 4 warmers). The Durable Object figures are estimated from the measured ones of
+plan 11.1 at the pricing page of 2026-10-18, not from an invoice. Figures are in USD.
 
-| Item | Per 1,000 databases and month | Basis |
-| --- | --- | --- |
-| DatabaseActor requests | 324 million, USD 48.6 | USD 0.15 per million; the measured figures at 10 s and 5 s are USD 43.6 and USD 83.8 in all, and at 30 s USD 16.3 with a tail of 250 to 317 ms at p95 |
-| DatabaseActor duration | about USD 5 | billed only while an actor runs a call, not while it is loaded |
-| The warmers | about USD 4 (about USD 1 per shard) | an alarm, one row written and about a second of duration every cycle: 324,000 cycles a shard |
-| D1 rows read | about 170 million, USD 0.17 gross | see "D1 reads"; inside the 25 billion rows a month the plan includes |
-| Workers Logs, if each visit is one invocation event | up to 324 million events, up to USD 194 | not measured, see "Workers Logs"; the cycle lines add 324,000 events a shard |
+| Item | 170 databases | 300 databases | 1,000 databases | Basis |
+| --- | --- | --- | --- | --- |
+| DatabaseActor requests | 8.3 (55 million) | 14.6 (97 million) | 48.6 (324 million) | 324,000 visits for each database and month at USD 0.15 per million; the measured figures at 10 s and 5 s are USD 43.6 and USD 83.8 per 1,000 databases in all, and at 30 s USD 16.3 with a tail of 250 to 317 ms at p95 |
+| DatabaseActor duration | 0.9 | 1.5 | 5.0 | about USD 5 per 1,000 databases; billed only while an actor runs a call, not while it is loaded |
+| The warmers | 1.0 | 2.0 | 4.0 | about USD 1 for each warmer: an alarm, one row written and about a second of duration every cycle, 324,000 cycles a warmer |
+| D1 rows read | 0.03 (28 million) | 0.05 (50 million) | 0.17 (167 million) | 167,400 rows for each live database and month, see "D1 reads"; inside the 25 billion rows a month the plan includes |
+| **Total without Workers Logs** | **about 10** | **about 18** | **about 58** | the sum of the four lines above (10.23, 18.15 and 57.77), rounded |
+| Workers Logs, if invocation logs are on | 33.4 (55.7 million events) | 59.1 (98.5 million events) | 196.0 (326.6 million events) | not measured, see "Workers Logs": one event for each visit and two for each warmer cycle (the alarm's invocation and the `actor_warm_cycle` line), 648,000 a warmer and month; USD 0.60 per million events |
+| **Total with Workers Logs** | **up to about 44** | **up to about 77** | **up to about 254** | the sum of the two totals (43.63, 77.25 and 253.77), rounded |
 
 All figures are gross: the first million requests, 400,000 GB-s, 50 million rows written, 25 billion
-rows read and 20 million log events a month of the account's plan are not subtracted. Without the
-log line the total is about USD 54 per 1,000 databases (USD 10 for 170, USD 18 for 300); with it, up
-to about USD 248 (USD 43 for 170) until the log setting below is decided.
+rows read and 20 million log events a month of the account's plan are not subtracted. Each total is
+the sum of the lines above it, so the three columns agree with each other. Without the log events the
+cost is about USD 58 per 1,000 databases (USD 10 for 170, USD 18 for 300, warmers included); with
+them, up to about USD 254 (USD 44 for 170, USD 77 for 300) until the log setting below is decided.
 
 **D1 reads.** The cron's count reads two rows for each live database (the database and its
 project) every minute. Each warmer reads only its own range of the primary key's index, in one query
 of about 250 rows, every 64 s (it keeps the list for 60 s and a cycle comes every 8 s); a deleted
 database is read as well, one row, because deleted rows stay in D1. All warmers together therefore
-read each row once, not once for each warmer, and rows read a month are about 43,200 x 2 x L +
-40,500 x (2 x L + X) for L live and X deleted databases: 170 million for 1,000 live databases
-(USD 0.17 gross at USD 0.001 per million) and 10.4 billion for 50,000 live and 50,000 deleted ones,
-against the 25 billion a month the plan includes. D1 sees one query per warmer and minute (about 200
-for 50,000 databases) and one for the cron. Measured on the D1 of the tests: 8 databases, one of
-them deleted, read 15 rows (2 for each live database, 1 for the deleted one), the same with 2, 3 or
-5 warmers (at most one row more for each statement, the first key beyond a range). The production
-meter may count differently: read `rows_read` of the `SELECT d.id` statement in D1's analytics after
-the deploy and put it into this model.
+read each row once, not once for each warmer, and rows read a month are 43,200 x 2 x L +
+40,500 x (2 x L + X) for L live and X deleted databases (the first term is the cron's count alone,
+the second the warmers' lists; together 167,400 rows for each live database): 167 million for 1,000
+live databases (USD 0.17 gross at USD 0.001 per million) and 10.4 billion for 50,000 live and
+50,000 deleted ones, against the 25 billion a month the plan includes. D1 sees one query per
+warmer and minute (about 200 for 50,000 databases) and one for the cron. Measured on the D1 of the
+tests: 8 databases, one of them deleted, read 15 rows (2 for each live database, 1 for the deleted
+one), the same with 2, 3 or 5 warmers (at most one row more for each statement, the first key
+beyond a range). The production meter may count differently: read `rows_read` of the `SELECT d.id`
+statement in D1's analytics after the deploy and put it into this model.
 
 **Workers Logs.** The API Worker's Workers Logs hold request lines such as
 `POST /node/v1/observations` (the plan reads them), so its invocation logs are on, and Cloudflare's
 documentation lists RPC and alarm calls among the invocations that each produce one invocation log.
-If so, every visit is one billed event and every warmer alarm another: 324 million events per 1,000
-databases and month at 8 s, which is USD 194 at USD 0.60 per million events beyond the 20 million a
-month the plan includes (shared with every other log of the account), and 55 million events (USD 33
+If so, every visit is one billed event, every warmer alarm another and every `actor_warm_cycle`
+line a third: for 1,000 databases and a month at 8 s that is 324 million events for the visits and
+2.6 million for the four warmers (648,000 each: 324,000 alarms and 324,000 cycle lines), 326.6
+million in all, which is USD 196 gross at USD 0.60 per million events (USD 184 if nothing else of
+the account uses the 20 million events a month the plan includes), and 55.7 million events (USD 33
 gross, USD 21 if nothing else uses the 20 million included events) for 170 databases. From 1
 December 2026 Cloudflare bills logs by ingested volume instead (USD 0.25 per GB beyond 50 GB a
-month): USD 81 per 1,000 databases and month for every kilobyte an event holds. This is inferred
+month): USD 82 gross per 1,000 databases and month for every kilobyte an event holds. This is inferred
 from the documentation (pages read 2026-10-20), not measured: the account's log usage and the size
 of an event were not read. Before the costed go for the deploy:
 
