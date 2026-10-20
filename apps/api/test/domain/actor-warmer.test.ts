@@ -15,12 +15,16 @@ import {
   type MockInstance,
 } from "vitest";
 import {
+  ACTOR_WARM_CONCURRENCY,
   ACTOR_WARM_LEASE_MS,
-  ARM_TIMEOUT_MS,
   ACTOR_WARM_LIST_TTL_MS,
+  ACTOR_WARM_VISIT_PLAN_MS,
+  ARM_TIMEOUT_MS,
   actorWarmRange,
+  actorWarmShardSize,
   actorWarmer,
   armActorWarmers,
+  reportPlacement,
   warmCycle,
 } from "../../src/domain/actor-warm.ts";
 import { runCron } from "../../src/cron.ts";
@@ -35,19 +39,57 @@ const on = (change: Partial<Record<keyof Env, unknown>> = {}) =>
     ...change,
   }) as Env;
 const SHARDS_TO_CLEAN = 4;
+/** A warmer by its object name, as the cron names it today (`v2:<shard>`) and as the first release did (`shard-<shard>`). */
+const warmerNamed = (name: string) =>
+  env.ACTOR_WARMER.get(env.ACTOR_WARMER.idFromName(name));
 async function reset() {
-  for (let shard = 0; shard < SHARDS_TO_CLEAN; shard++)
-    await runInDurableObject(
+  const warmers = [
+    ...Array.from({ length: SHARDS_TO_CLEAN }, (_unused, shard) =>
       actorWarmer(env, shard),
-      async (instance, state) => {
-        await state.storage.deleteAlarm();
-        await state.storage.deleteAll();
-        Reflect.set(instance, "config", undefined);
-        Reflect.set(instance, "cache", {});
-      },
-    );
+    ),
+    warmerNamed("shard-0"),
+  ];
+  for (const warmer of warmers)
+    await runInDurableObject(warmer, async (instance, state) => {
+      await state.storage.deleteAlarm();
+      await state.storage.deleteAll();
+      Reflect.set(instance, "config", undefined);
+      Reflect.set(instance, "cache", {});
+    });
 }
 beforeEach(reset);
+
+// The warmer asks Cloudflare's trace endpoint once which colo it runs in. The endpoint answers
+// with the caller's address and more; the tests give it an answer of the same shape and let every
+// other request through.
+const TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace";
+const TRACE_BODY = [
+  "fl=0f0",
+  "h=www.cloudflare.com",
+  "ip=2001:db8::7",
+  "ts=1760000000.123",
+  "visit_scheme=https",
+  "uag=workerd",
+  "colo=AMS",
+  "sliver=none",
+  "http=http/2",
+  "loc=NL",
+  "",
+].join("\n");
+let traceFetch: MockInstance;
+function answerTrace(answer: () => Response | Promise<Response>): MockInstance {
+  const real = globalThis.fetch;
+  return vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementation((input, init) =>
+      String(input) === TRACE_URL
+        ? Promise.resolve(answer())
+        : real(input, init),
+    );
+}
+beforeEach(() => {
+  traceFetch = answerTrace(() => new Response(TRACE_BODY));
+});
 afterEach(async () => {
   vi.restoreAllMocks();
   await reset();
@@ -224,6 +266,9 @@ it("a cycle visits every database of its shard once, and no other, within the in
     interval_ms: INTERVAL,
     overrun: false,
     list_error: null,
+    concurrency: ACTOR_WARM_CONCURRENCY,
+    visit_p50_ms: expect.any(Number),
+    visit_max_ms: expect.any(Number),
   });
 });
 
@@ -315,7 +360,12 @@ it("keeps visiting the last list it read when D1 cannot be read, and visits noth
   visits.visited.length = 0;
   const none = await warmCycle(env, target, {}, at);
   expect(visits.visited).toEqual([]);
-  expect(none).toMatchObject({ databases: 0, list_error: "d1_unavailable" });
+  expect(none).toMatchObject({
+    databases: 0,
+    list_error: "d1_unavailable",
+    visit_p50_ms: null,
+    visit_max_ms: null,
+  });
 });
 
 const ONE_SHARD = { shard: 0, shards: 1, interval_ms: INTERVAL };
@@ -647,4 +697,250 @@ it("an alarm after the lease ran out visits nothing, sets no alarm, forgets its 
   expect(await alarmOf(0)).toBeNull();
   expect(await configOf(0)).toBeUndefined();
   expect(cycleLines(log)).toEqual([{ event: "actor_warm_stopped", shard: 0 }]);
+});
+
+it("never has more visits in flight than the six connections a Durable Object may hold open at once", async () => {
+  const ids = await databases(8);
+  let inFlight = 0,
+    peak = 0;
+  const visits = await recordVisits(ids[0]!, () => {
+    peak = Math.max(peak, ++inFlight);
+    return new Promise<void>((resolve) =>
+      setTimeout(() => {
+        inFlight--;
+        resolve();
+      }, 60),
+    );
+  });
+  const result = await warmCycle(env, ONE_SHARD, {}, Date.now());
+  expect(peak).toBe(6);
+  expect(ACTOR_WARM_CONCURRENCY).toBe(6);
+  expect(visits.visited).toHaveLength(8);
+  expect(result).toMatchObject({ visited: 8, failed: 0, concurrency: 6 });
+});
+
+it("logs the median and the longest visit of the cycle, a failed visit included", async () => {
+  const ids = await databases(3);
+  const delays = [40, 160, 400];
+  const visits = await recordVisits(
+    ids[0]!,
+    (database) =>
+      new Promise<void>((resolve) =>
+        setTimeout(resolve, delays[ids.indexOf(database)]!),
+      ),
+  );
+  visits.know(ids);
+  const log = vi.spyOn(console, "log");
+  const result = await warmCycle(env, ONE_SHARD, {}, Date.now());
+  expect(result.visit_p50_ms).toBeGreaterThanOrEqual(150);
+  expect(result.visit_p50_ms).toBeLessThan(380);
+  expect(result.visit_max_ms).toBeGreaterThanOrEqual(390);
+  expect(result.visit_max_ms).toBeLessThan(1000);
+  expect(cycleLines(log)[0]).toMatchObject({
+    visit_p50_ms: result.visit_p50_ms,
+    visit_max_ms: result.visit_max_ms,
+  });
+  // A visit that gives up at its timeout is a visit of that length, not a missing one.
+  const hung = await recordVisits(ids[0]!, (database) =>
+    database === ids[2]
+      ? new Promise<void>((resolve) => setTimeout(resolve, 1500))
+      : undefined,
+  );
+  hung.know(ids);
+  const timedOut = await warmCycle(env, ONE_SHARD, {}, Date.now(), {
+    visitTimeoutMs: 200,
+  });
+  expect(timedOut).toMatchObject({ visited: 2, failed: 1 });
+  expect(timedOut.visit_max_ms).toBeGreaterThanOrEqual(190);
+  expect(timedOut.visit_max_ms).toBeLessThan(700);
+});
+
+it("names each warmer by the name version and its shard, so that a warmer created without a location hint is replaced by one created with it", async () => {
+  await databases(1);
+  const idFromName = vi.spyOn(
+    Object.getPrototypeOf(env.ACTOR_WARMER),
+    "idFromName",
+  );
+  await armActorWarmers(on(), 1000);
+  const named = idFromName.mock.calls
+    .map((call) => String(call[0]))
+    .filter((name) => /^(v\d+:|shard-)/.test(name));
+  expect(named).toEqual(["v2:0"]);
+  const alarm = (name: string) =>
+    runInDurableObject(warmerNamed(name), (_i, state) =>
+      state.storage.getAlarm(),
+    );
+  expect(await alarm("v2:0")).not.toBeNull();
+  expect(await alarm("shard-0")).toBeNull();
+});
+
+it("places a warmer with ACTOR_WARMER_LOCATION_HINT when the actors have no hint, and with the actors' hint when they have one", async () => {
+  await databases(1);
+  const get = vi.spyOn(Object.getPrototypeOf(env.ACTOR_WARMER), "get");
+  const warmerKey = env.ACTOR_WARMER.idFromName("v2:0").toString();
+  const hintsOfWarmer = () =>
+    get.mock.calls
+      .filter((call) => (call[0] as DurableObjectId).toString() === warmerKey)
+      .map((call) => call[1]);
+  await armActorWarmers(on({ ACTOR_WARMER_LOCATION_HINT: "weur" }), 1000);
+  expect(hintsOfWarmer()).toEqual([{ locationHint: "weur" }]);
+  get.mockClear();
+  await armActorWarmers(
+    on({
+      DATABASE_ACTOR_LOCATION_HINT: "enam",
+      ACTOR_WARMER_LOCATION_HINT: "weur",
+    }),
+    1000,
+  );
+  expect(hintsOfWarmer()).toEqual([{ locationHint: "enam" }]);
+  get.mockClear();
+  await armActorWarmers(on(), 1000);
+  expect(hintsOfWarmer()).toEqual([undefined]);
+});
+
+it("a warmer of the earlier name is not renewed by the cron and stops itself, leaving no alarm and nothing stored", async () => {
+  const ids = await databases(1);
+  const earlier = warmerNamed("shard-0");
+  await earlier.arm({ shard: 0, shards: 1, interval_ms: INTERVAL }, 5000);
+  const read = () =>
+    runInDurableObject(earlier, async (_i, state) => ({
+      alarm: await state.storage.getAlarm(),
+      config: await state.storage.get<{ lease_until: number }>("config"),
+    }));
+  const before = await read();
+  expect(before.alarm).not.toBeNull();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  // The cron arms the warmer of the current name and does not touch the earlier one.
+  await armActorWarmers(on(), 1000);
+  expect(await read()).toEqual(before);
+  expect(await alarmOf(0)).not.toBeNull();
+  // Its lease runs out: the next alarm visits nothing, sets no alarm and stores nothing.
+  await runInDurableObject(earlier, async (instance, state) => {
+    await state.storage.put("config", {
+      ...before.config,
+      lease_until: Date.now() - 1,
+    });
+    Reflect.set(instance, "config", undefined);
+  });
+  const visits = await recordVisits(ids[0]!);
+  const log = vi.spyOn(console, "log");
+  expect(await runDurableObjectAlarm(earlier)).toBe(true);
+  expect(visits.visited).toEqual([]);
+  expect(cycleLines(log)).toEqual([{ event: "actor_warm_stopped", shard: 0 }]);
+  expect(await read()).toEqual({ alarm: null, config: undefined });
+  expect(
+    await runInDurableObject(
+      earlier,
+      async (_i, state) => (await state.storage.list()).size,
+    ),
+  ).toBe(0);
+});
+
+it("says once per warmer object which colo it runs in, and logs nothing else the trace tells", async () => {
+  await databases(1);
+  await armActorWarmers(on(), 1000);
+  const log = vi.spyOn(console, "log");
+  expect(await runDurableObjectAlarm(actorWarmer(env, 0))).toBe(true);
+  expect(await runDurableObjectAlarm(actorWarmer(env, 0))).toBe(true);
+  const lines = cycleLines(log);
+  expect(lines.map((line) => line.event)).toEqual([
+    "actor_warmer_placed",
+    "actor_warm_cycle",
+    "actor_warm_cycle",
+  ]);
+  expect(lines[0]).toEqual({
+    event: "actor_warmer_placed",
+    shard: 0,
+    shards: 1,
+    colo: "AMS",
+    location_hint: null,
+  });
+  expect(
+    traceFetch.mock.calls.filter((c) => String(c[0]) === TRACE_URL),
+  ).toHaveLength(1);
+  // The trace holds the caller's address; none of it reaches a log line.
+  expect(JSON.stringify(log.mock.calls)).not.toContain("2001:db8");
+});
+
+it("reports the hint it was placed with, and no colo when the trace cannot be read or has none, without delaying or ending anything", async () => {
+  const log = vi.spyOn(console, "log");
+  const of = (shard: number) => ({ shard, shards: 6 });
+  await reportPlacement(
+    on({
+      DATABASE_ACTOR_LOCATION_HINT: "enam",
+      ACTOR_WARMER_LOCATION_HINT: "weur",
+    }),
+    of(2),
+    {},
+  );
+  traceFetch.mockImplementation(() => Promise.reject(new Error("offline")));
+  await reportPlacement(on({ ACTOR_WARMER_LOCATION_HINT: "weur" }), of(3), {});
+  traceFetch.mockImplementation(() =>
+    Promise.resolve(new Response("fl=0f0\ncolo=ams\nloc=NL\n")),
+  );
+  await reportPlacement(on(), of(4), {});
+  const placed = (shard: number, colo: string | null, hint: string | null) => ({
+    event: "actor_warmer_placed",
+    shard,
+    shards: 6,
+    colo,
+    location_hint: hint,
+  });
+  expect(cycleLines(log)).toEqual([
+    placed(2, "AMS", "enam"),
+    placed(3, null, "weur"),
+    placed(4, null, null),
+  ]);
+  // A cache that has reported once reports no more, whatever the answer.
+  const cache = {};
+  await reportPlacement(on(), of(0), cache);
+  await reportPlacement(on(), of(0), cache);
+  expect(cycleLines(log)).toHaveLength(4);
+  // And a trace that never answers is given up on, so the first cycle is not held for long.
+  traceFetch.mockImplementation(
+    (_url, init) =>
+      new Promise((_resolve, reject) =>
+        (init as RequestInit).signal!.addEventListener("abort", () =>
+          reject(new Error("aborted")),
+        ),
+      ),
+  );
+  const started = Date.now();
+  await reportPlacement(on(), of(5), {});
+  expect(Date.now() - started).toBeLessThan(3500);
+  expect(cycleLines(log).at(-1)).toMatchObject({ shard: 5, colo: null });
+});
+
+it("sizes a shard so that a cycle of it takes at most half the interval at the planned visit time with six visits in flight", () => {
+  expect(ACTOR_WARM_VISIT_PLAN_MS).toBe(300);
+  expect(actorWarmShardSize(8000)).toBe(78);
+  for (const interval of [1000, 5000, 8000, 10_000, 300_000]) {
+    const size = actorWarmShardSize(interval);
+    const rounds = size / ACTOR_WARM_CONCURRENCY;
+    expect(Number.isInteger(rounds)).toBe(true);
+    // The estimate of a cycle of an average shard fits half the interval, and is the largest that does.
+    expect(rounds * ACTOR_WARM_VISIT_PLAN_MS).toBeLessThanOrEqual(interval / 2);
+    expect((rounds + 1) * ACTOR_WARM_VISIT_PLAN_MS).toBeGreaterThan(
+      interval / 2,
+    );
+  }
+});
+
+it("arms one warmer for every shard of the size the interval allows", async () => {
+  // At 1 s a shard is 6 databases, so 11 databases are two shards; at the old fixed 250 they were one.
+  await databases(11);
+  const live = (await env.DB.prepare(
+    "SELECT count(*) n FROM databases WHERE deleted_at IS NULL",
+  ).first<{ n: number }>())!.n;
+  expect(live).toBe(11);
+  const fast = on({ DATABASE_ACTOR_WARM_INTERVAL_MS: "1000" });
+  expect(actorWarmShardSize(1000)).toBe(6);
+  expect(await armActorWarmers(fast)).toEqual({ shards: 2 });
+  expect(await configOf(1)).toEqual({
+    shard: 1,
+    shards: 2,
+    interval_ms: 1000,
+    lease_until: expect.any(Number),
+  });
+  expect(await alarmOf(2)).toBeNull();
 });

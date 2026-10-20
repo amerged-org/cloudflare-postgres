@@ -9,18 +9,30 @@
 //   time waiting for the actors; its own CPU is the creation of the stubs and the calls, well under
 //   a second for a shard.
 // - An invocation may make up to 10,000 subrequests (1,000 on the older plans, which this stays
-//   under too). A cycle makes one call per database of its shard (`ACTOR_WARM_SHARD_SIZE` is 250
-//   on average; a random range of the ID space holds that many, give or take 6 % at one
-//   standard deviation)
-//   and, when it reads its list, one D1 query per 1,000 databases of its own range, once per
-//   `ACTOR_WARM_LIST_TTL_MS`. D1 therefore sees about one query of about 250 rows per warmer and
-//   minute, and every row of `databases` is read by one warmer only.
-// - The six-connection limit is listed for fetch, KV, R2 and the like, not for calls to Durable
-//   Objects; the cron already runs 8 at a time (`ACTOR_RECONCILE_CONCURRENCY`), and a cycle runs
-//   `ACTOR_WARM_CONCURRENCY`. If the runtime did queue calls beyond six, the visits would wait,
-//   not fail: a shard of 250 warm actors (about 50 ms a visit) would take about two seconds, which
-//   the cycle line shows as `cycle_ms`, and `overrun` says when a cycle outlasts its interval.
-//   A shard of cold actors (up to 600 ms a visit) takes about 10 s once, after a deploy.
+//   under too). A cycle makes one call per database of its shard (`actorWarmShardSize` is 78 at
+//   the default interval, give or take 11 % at one standard deviation for a random range of the ID
+//   space) and, when it reads its list, one D1 query per 1,000 databases of its own range, once
+//   per `ACTOR_WARM_LIST_TTL_MS`. D1 therefore sees about one query of about 78 rows per warmer
+//   and minute, and every row of `databases` is read by one warmer only.
+// - Six simultaneous outgoing connections for each request, alarm and message. The Durable Objects
+//   limits page lists "Simultaneous outgoing connections/request: 6 (same as Workers)" for every
+//   Durable Object (https://developers.cloudflare.com/durable-objects/platform/limits/, read
+//   2026-10-20). The Workers limits page (https://developers.cloudflare.com/workers/platform/limits/,
+//   read 2026-10-20) says a seventh connection waiting for response headers is queued until one of
+//   the six gets them, and lists fetch, KV, Cache, R2, Queues and TCP among those that count, not
+//   calls to Durable Object stubs. The design relies on the first page: a cycle keeps six calls in
+//   flight (`ACTOR_WARM_CONCURRENCY`). If the second page is the whole truth and stubs are not
+//   counted, six is only slower than the runtime allows, and the shard size, which assumes six,
+//   still holds. The first design kept 16 in flight: no faster if the limit applies, and every
+//   visit's time then included its wait in the queue.
+// - The live Dev API Worker (2026-10-20, 167 databases, one warmer, 16 in flight) took a median of
+//   9.0 s a cycle (6.7 to 15.2 s), about 300 ms for each visit at six in flight, where 50 ms were
+//   expected. Whether that is the warmer's distance to the actors (the minute cron created it
+//   wherever that invocation ran, with a location hint only if DATABASE_ACTOR_LOCATION_HINT was
+//   set) or something else is read from the new fields of the cycle line (`visit_p50_ms`,
+//   `visit_max_ms`, `concurrency`) and from the colo of the line `actor_warmer_placed`. Until a read
+//   says otherwise a shard is sized for those 300 ms (`ACTOR_WARM_VISIT_PLAN_MS`):
+//   `actorWarmShardSize`.
 import type { ActorWarmerShape } from "../actor-warmer.ts";
 import type { Env } from "../env.ts";
 import { cronErrorCode } from "./cron-health.ts";
@@ -30,10 +42,22 @@ import { databaseActor } from "./database-actor-sync.ts";
 export const ACTOR_WARM_INTERVAL_MS = 8_000;
 const ACTOR_WARM_MIN_INTERVAL_MS = 1_000;
 const ACTOR_WARM_MAX_INTERVAL_MS = 300_000;
-/** The databases one warmer visits, on average: the cron arms one warmer for each. */
-export const ACTOR_WARM_SHARD_SIZE = 250;
-/** Visits in flight at once in one cycle. */
-export const ACTOR_WARM_CONCURRENCY = 16;
+/**
+ * Visits in flight at once in one cycle: the six simultaneous outgoing connections a Durable
+ * Object has for one invocation (see the header). If the limit applies, more would wait in the
+ * runtime's queue and the wait would show as the time of the visits.
+ */
+export const ACTOR_WARM_CONCURRENCY = 6;
+/**
+ * The time one visit is planned to take, in milliseconds: what the live cycles of 2026-10-20
+ * implied (167 visits, six in flight, a median cycle of 9.0 s). Lower it to the `visit_p50_ms` of the cycle
+ * lines once the warmers are placed near the actors and a read shows it; the shards then grow.
+ */
+export const ACTOR_WARM_VISIT_PLAN_MS = 300;
+/** A cycle of an average shard should take at most this share of the interval; the rest is margin for a shard larger than average and for a slow visit. */
+const ACTOR_WARM_CYCLE_SHARE = 0.5;
+/** The name of the warmer objects: raise it to have every warmer created again (a location hint places only a new object); the warmers of the earlier name are not armed any more and stop when their lease runs out. */
+export const ACTOR_WARMER_NAME_VERSION = "v2";
 /** A visit that takes longer is counted as failed; the cycle goes on. */
 export const ACTOR_WARM_VISIT_TIMEOUT_MS = 3_000;
 /** How long a warmer keeps the list of its databases before it reads D1 again. */
@@ -50,6 +74,8 @@ const LIVE =
 /** The warmer's list of its databases, kept between its cycles while the object is in memory. */
 export interface WarmCache {
   list?: { shard: number; shards: number; at: number; ids: string[] };
+  /** The warmer has logged where it runs (`reportPlacement`). */
+  placed?: true;
 }
 export interface WarmCycle {
   shard: number;
@@ -61,6 +87,11 @@ export interface WarmCycle {
   interval_ms: number;
   overrun: boolean;
   list_error: string | null;
+  /** Visits in flight at once. */
+  concurrency: number;
+  /** The median and the longest time of a visit of this cycle in milliseconds (a failed one counts with the time it took), or null for a cycle that visited nothing. */
+  visit_p50_ms: number | null;
+  visit_max_ms: number | null;
 }
 
 /** The interval in milliseconds from `DATABASE_ACTOR_WARM_INTERVAL_MS`: 0 is off, unset is 8 s. */
@@ -76,6 +107,20 @@ export function actorWarmInterval(value: string | undefined): number {
   )
     throw new Error("invalid_actor_warm_interval");
   return interval;
+}
+
+/**
+ * The databases one warmer visits, on average, for `interval` milliseconds between two visits:
+ * as many rounds of `ACTOR_WARM_CONCURRENCY` visits as fit `ACTOR_WARM_CYCLE_SHARE` of the
+ * interval at `ACTOR_WARM_VISIT_PLAN_MS` for a visit (78 at 8 s). A shard is a random range of the
+ * ID space and holds this many give or take its square root, so a shard of twice the average
+ * still ends its cycle within the interval.
+ */
+export function actorWarmShardSize(interval: number): number {
+  const rounds = Math.floor(
+    (interval * ACTOR_WARM_CYCLE_SHARE) / ACTOR_WARM_VISIT_PLAN_MS,
+  );
+  return rounds * ACTOR_WARM_CONCURRENCY;
 }
 
 /** The ids that sort first among the lowercase letters and digits of a database ID (digits before letters, as bytes sort). */
@@ -113,17 +158,72 @@ export function actorWarmRange(
   };
 }
 
-/** The warmer of a shard, placed with the location hint of the actors it visits. */
+/**
+ * Where a new warmer is placed: with the hint of the actors it visits, so that a visit does not
+ * cross an ocean; else with `ACTOR_WARMER_LOCATION_HINT`, which the operator sets to where the
+ * actors live when the installation gives the actors no hint (they were then created near
+ * whoever called them first).
+ */
+function warmerLocationHint(
+  env: Pick<Env, "DATABASE_ACTOR_LOCATION_HINT" | "ACTOR_WARMER_LOCATION_HINT">,
+): string | undefined {
+  return (
+    env.DATABASE_ACTOR_LOCATION_HINT ||
+    env.ACTOR_WARMER_LOCATION_HINT ||
+    undefined
+  );
+}
+
+/** The warmer of a shard, placed with `warmerLocationHint` when it is created. */
 export function actorWarmer(
-  env: Pick<Env, "ACTOR_WARMER" | "DATABASE_ACTOR_LOCATION_HINT">,
+  env: Pick<
+    Env,
+    | "ACTOR_WARMER"
+    | "DATABASE_ACTOR_LOCATION_HINT"
+    | "ACTOR_WARMER_LOCATION_HINT"
+  >,
   shard: number,
 ) {
   const warmers = env.ACTOR_WARMER;
   if (!warmers) throw new Error("actor_warmer_binding_missing");
-  const hint = env.DATABASE_ACTOR_LOCATION_HINT;
+  const hint = warmerLocationHint(env);
   return warmers.get(
-    warmers.idFromName(`shard-${shard}`),
+    warmers.idFromName(`${ACTOR_WARMER_NAME_VERSION}:${shard}`),
     hint ? { locationHint: hint as DurableObjectLocationHint } : undefined,
+  );
+}
+
+const TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace";
+const TRACE_TIMEOUT_MS = 2_000;
+
+/**
+ * Logs, once for each warmer object in memory, the colo it runs in (`actor_warmer_placed`) and the
+ * location hint it was asked for: the warmer's distance to the actors is one of the two things
+ * that decide how long a visit takes. The colo is the three-letter `colo` of Cloudflare's trace
+ * for this request; nothing else of the trace (it holds the caller's address) is read into a log.
+ * Never throws and gives up after `TRACE_TIMEOUT_MS`; `colo` is null when it is not known.
+ */
+export async function reportPlacement(
+  env: Pick<Env, "DATABASE_ACTOR_LOCATION_HINT" | "ACTOR_WARMER_LOCATION_HINT">,
+  { shard, shards }: Pick<ActorWarmerShape, "shard" | "shards">,
+  cache: WarmCache,
+): Promise<void> {
+  if (cache.placed) return;
+  cache.placed = true;
+  const colo = await fetch(TRACE_URL, {
+    signal: AbortSignal.timeout(TRACE_TIMEOUT_MS),
+  })
+    .then((response) => response.text())
+    .then((trace) => /^colo=([A-Z]{3})$/m.exec(trace)?.[1] ?? null)
+    .catch(() => null);
+  console.log(
+    JSON.stringify({
+      event: "actor_warmer_placed",
+      shard,
+      shards,
+      colo,
+      location_hint: warmerLocationHint(env) ?? null,
+    }),
   );
 }
 
@@ -205,6 +305,7 @@ export async function warmCycle(
   let next = 0,
     visited = 0,
     failed = 0;
+  const timings: number[] = [];
   await Promise.all(
     Array.from(
       {
@@ -214,17 +315,22 @@ export async function warmCycle(
         ),
       },
       async () => {
-        for (let index = next++; index < ids.length; index = next++)
+        for (let index = next++; index < ids.length; index = next++) {
+          const began = Date.now();
           try {
             await within(timeout, databaseActor(env, ids[index]!).warm());
             visited++;
           } catch {
             failed++;
+          } finally {
+            timings.push(Date.now() - began);
           }
+        }
       },
     ),
   );
   const cycle_ms = Date.now() - started;
+  timings.sort((a, b) => a - b);
   const result: WarmCycle = {
     shard: target.shard,
     shards: target.shards,
@@ -235,6 +341,9 @@ export async function warmCycle(
     interval_ms: target.interval_ms,
     overrun: cycle_ms > target.interval_ms,
     list_error: listError,
+    concurrency: limits.concurrency ?? ACTOR_WARM_CONCURRENCY,
+    visit_p50_ms: timings[Math.floor(timings.length / 2)] ?? null,
+    visit_max_ms: timings.at(-1) ?? null,
   };
   console.log(JSON.stringify({ event: "actor_warm_cycle", ...result }));
   return result;
@@ -249,7 +358,7 @@ export async function warmCycle(
  */
 export async function armActorWarmers(
   env: Env,
-  shardSize = ACTOR_WARM_SHARD_SIZE,
+  shardSize?: number,
 ): Promise<{ shards: number }> {
   const interval = actorWarmInterval(env.DATABASE_ACTOR_WARM_INTERVAL_MS);
   if (interval === 0) return { shards: 0 };
@@ -257,7 +366,9 @@ export async function armActorWarmers(
   const live = await env.DB.prepare(`SELECT count(*) n ${LIVE}`).first<number>(
     "n",
   );
-  const shards = Math.ceil((live ?? 0) / shardSize);
+  const shards = Math.ceil(
+    (live ?? 0) / (shardSize ?? actorWarmShardSize(interval)),
+  );
   const armed = await Promise.allSettled(
     Array.from({ length: shards }, (_unused, shard) =>
       within(

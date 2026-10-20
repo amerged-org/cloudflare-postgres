@@ -41,6 +41,12 @@ export type Env = Cloudflare.Env & {
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
   DATABASE_ACTOR_LOCATION_HINT?: string;
   /**
+   * Durable Object location hint for new ActorWarmer objects when DATABASE_ACTOR_LOCATION_HINT is
+   * not set: where the DatabaseActors live (`weur` for Dev), so that a visit does not cross an
+   * ocean. It places only a new object; `ACTOR_WARMER_NAME_VERSION` makes new ones.
+   */
+  ACTOR_WARMER_LOCATION_HINT?: string;
+  /**
    * Milliseconds between two visits of each DatabaseActor, which keep its isolate loaded: unset is
    * 8000, 0 turns the keep-warm off, any other value is 1000 to 300000 (`domain/actor-warm.ts`).
    */

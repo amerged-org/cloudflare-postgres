@@ -20,7 +20,9 @@ interface ActorWarmerConfig extends ActorWarmerShape {
  * for the DatabaseActor"). Each alarm of this object visits the actors of its shard with a no-op
  * call (`DatabaseActor.warm`) and sets the next alarm first, so that a failing or slow cycle
  * cannot end the loop. The loop belongs to the minute cron's lease: `arm` renews it, and a warmer
- * the cron no longer arms (the interval is 0, or the shards became fewer) stops itself.
+ * the cron no longer arms (the interval is 0, the shards became fewer, or its name is an earlier
+ * version, `ACTOR_WARMER_NAME_VERSION`) stops itself. Its first cycle logs the colo it runs in
+ * (`reportPlacement`), because a visit is as fast as the warmer is near the actors.
  *
  * Like every Durable Object class, this one is evaluated by each cold object of the Worker, so it
  * imports no more than a Durable Object needs; the cycle loads with the first alarm.
@@ -59,7 +61,9 @@ export class ActorWarmer extends DurableObject<Env> {
     // Scheduled first: whatever the cycle does, the loop goes on.
     await this.ctx.storage.setAlarm(started + config.interval_ms);
     try {
-      const { warmCycle } = await import("./domain/actor-warm.ts");
+      const { reportPlacement, warmCycle } =
+        await import("./domain/actor-warm.ts");
+      await reportPlacement(this.env, config, this.cache);
       await warmCycle(this.env, config, this.cache, started);
     } catch (error) {
       console.error(

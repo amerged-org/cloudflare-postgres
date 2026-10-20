@@ -51,6 +51,11 @@
     // Durable Object location hint for new DatabaseActor objects, near the database regions and D1.
     // Set the same value on the Edge Worker. An existing object never moves.
     "DATABASE_ACTOR_LOCATION_HINT": "weur",
+    // Location hint for new ActorWarmer objects, used only when DATABASE_ACTOR_LOCATION_HINT is not
+    // set: put it where the DatabaseActors live, or each visit crosses an ocean and a cycle outlasts
+    // its interval. The warmers are named "v2:<shard>", so a hint set later places new warmers; the
+    // ones of the earlier name stop within the lease (docs/operations/operator-installation.md).
+    // "ACTOR_WARMER_LOCATION_HINT": "weur",
     // Milliseconds between two visits of each DatabaseActor by the ActorWarmer objects, which keep its
     // isolate loaded so that the first admission after a quiet period is not a cold start: any value
     // from 1000 to 300000, 0 turns the keep-warm off, unset means 8000. A visit every 10 s or faster
