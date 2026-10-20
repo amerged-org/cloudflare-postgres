@@ -99,8 +99,9 @@ gateway holds**, so no check tells you beforehand that every gateway has the new
 restarts of a running gateway are a release that changes the gateway's binary and a reboot that is
 due anyway (a maintenance cycle in its announced window; never a reboot made for this purpose, which
 needs the owner's go and, from the canary on, an announced window, plan 9.3). A gateway restart
-ends every open client session: the release restarts the gateway without draining it first, the
-gateway refuses new work, drops what is left after at most 30 seconds, and clients reconnect. A
+ends every open client session: the gateway stops accepting (its socket is systemd's, so a
+connection that arrives meanwhile waits for the next gateway), closes the idle sessions at once,
+gives a busy one 10 seconds, and clients reconnect. A
 release that changes both the agent and the gateway restarts the gateway before the agent has
 written the new file, so the gateway needs a later release or reboot of its own. To rotate: add the
 new key beside the old one with the old one still active, deploy the API and the Edge, let every

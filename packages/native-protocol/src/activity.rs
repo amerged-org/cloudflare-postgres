@@ -159,6 +159,11 @@ impl PostgresActivity {
             _ => {}
         });
     }
+    /// Whether a message of PostgreSQL's has been seen in part: nothing may be inserted into the
+    /// stream towards the client until the rest of it has gone.
+    pub fn backend_partial(&self) -> bool {
+        self.backend.partial()
+    }
     pub fn busy(&self) -> bool {
         let state = &self.state;
         state.uncertain

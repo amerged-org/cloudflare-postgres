@@ -9,8 +9,10 @@ records those.
 
 `PGCF_REGION_ID`, `PGCF_NODE_ID`, the node's derived `PGCF_ROUTE_KEY`, `PGCF_GATEWAY_PORT`,
 `PGCF_GATEWAY_MEMORY_BYTES`, `PGCF_GATEWAY_DATABASE_MEMORY_BYTES` and `PGCF_AGENT_SOCKET`
-(default `/run/pgcf/agent/gateway.sock`). The gateway listens on `127.0.0.1:PGCF_GATEWAY_PORT` only, for
-cloudflared. It holds no provider credentials and no PostgreSQL credentials of its own.
+(default `/run/pgcf/agent/gateway.sock`). The gateway listens on loopback only, for cloudflared. On a
+node it serves the socket that `pgcf-gateway.socket` holds and passes to it as descriptor 3
+(`LISTEN_PID`, `LISTEN_FDS`; a socket that is not on loopback is refused, and `PGCF_GATEWAY_PORT` is
+not read); started by hand it binds `127.0.0.1:PGCF_GATEWAY_PORT` itself. It holds no provider credentials and no PostgreSQL credentials of its own.
 
 ## The agent's table
 
@@ -62,6 +64,31 @@ archive socket.
   ordinary messages support the existing 32 MiB limit and outbound frames are at most 64 KiB.
   Authenticated activity history preserves unknown/partial values and never invents zero usage.
 - There is no PostgreSQL write retry, credential replay or query replay after transport handoff.
+
+## Restart and drain
+
+A release that changes the gateway's binary, a change of its credentials and a reboot stop the
+gateway with SIGTERM. It drains:
+
+- It stops accepting. The listening socket is systemd's, so a connection that arrives until the next
+  gateway starts waits in the socket's queue and is accepted by that one: nothing is refused or reset.
+  (A gateway that bound its own socket loses that queue with its process.) The connections that
+  waited meet the new gateway at once; those beyond the 128 whose request is being read wait for a
+  slot in the socket instead of being accepted and reset.
+- Work that was accepted before and is read after the drain began is refused with a defined error:
+  HTTP 503 `gateway_draining` for a WebSocket upgrade, `08006` "gateway restarting" for HTTP SQL and
+  for a held wake. `/healthz` answers `draining` (200) and `/readyz` 503.
+- A session that is not busy is closed at once with WebSocket close code 1012 "gateway restarting".
+  A busy one (a transaction open, a statement running, COPY, half a message) keeps its time and is
+  closed the same way as soon as it is idle, so a transaction that commits is kept.
+- A session that is still busy after `DRAIN_BOUND` (10 s) gets a FATAL `57P01` (unless half a message
+  of PostgreSQL's is on its way) and the close; an HTTP SQL request that is still running then is
+  answered `08007` (its outcome is unknown and it is not retried) if its statements were sent, else
+  `08006`. Its PostgreSQL session ends, which rolls its transaction back.
+- The process exits when the last session has ended. For a new connection the gap is therefore the
+  longest busy session, at most `DRAIN_BOUND` plus the start of the next gateway, inside the
+  integrators' retry rule (1, 2, 4 and 8 s). `tests/drain.rs` holds each of these against a real
+  PostgreSQL, and the gap against the real binary with the socket passed as systemd passes it.
 
 ## Wakes
 
