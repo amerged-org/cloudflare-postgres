@@ -592,6 +592,21 @@ impl Fixture {
     async fn release(&self, generation: u64) {
         self.release_at(generation, ROUTE_REVISION).await;
     }
+    /// The page that carries Cloudflare's claim of a wake reaches the agent after it released the
+    /// unit: the entry of the same unit, generation and operation under a later route revision,
+    /// published as the channel publishes it (`local::apply`: the entry, then the sessions are told
+    /// what the database does).
+    async fn claimed(&self, generation: u64, operation: &str) {
+        self.gateway.table.write().await.update(Database {
+            route_revision: ROUTE_REVISION + 1,
+            ..entry(Mode::Running, generation, operation, Some(&self.unit))
+        });
+        self.gateway
+            .sessions
+            .lock()
+            .unwrap()
+            .signal(DATABASE, Action::Running);
+    }
     async fn stop(self) {
         let _ = self.stop.send(true);
         for task in self.tasks {
@@ -958,6 +973,55 @@ async fn a_unit_replaced_after_admission_is_never_written_to() {
             .await
             .is_err()
     );
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_connection_that_is_starting_up_follows_an_entry_that_leaves_its_unit_running() {
+    let mut fixture = Fixture::new().await;
+    // Admitted on the running unit; its StartupMessage is yet to come.
+    let mut client = fixture.connect(920).await;
+    fixture.claimed(1, &operation()).await;
+    fixture.login(&mut client).await;
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_held_wake_released_before_the_claim_reaches_the_agent_goes_on_to_its_login() {
+    let fixture = Fixture::scram(false, Double::Scram(PASSWORD)).await;
+    let mut client = fixture.upgrade(&wake_token(1508, 2)).await.unwrap();
+    // The connection waits for the end of a password it began to pipeline: it is released and
+    // reserved by then.
+    let password = password_message(PASSWORD.as_bytes());
+    client
+        .send(Message::Binary(
+            [startup("app"), password[..3].to_vec()].concat().into(),
+        ))
+        .await
+        .unwrap();
+    fixture.release(2).await;
+    timeout(Duration::from_secs(5), async {
+        while fixture
+            .gateway
+            .sessions
+            .lock()
+            .unwrap()
+            .counts(DATABASE)
+            .connections
+            != 1
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the wake is released to a session");
+    fixture.claimed(2, &wake_operation()).await;
+    client
+        .send(Message::Binary(password[3..].to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+    assert_eq!(next_message(&mut client).await, authenticated());
+    client.close(None).await.unwrap();
     fixture.stop().await;
 }
 #[tokio::test]

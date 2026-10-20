@@ -24,8 +24,8 @@ use crate::{
     budget::{Lease, WireBudget},
     http::{self, HttpHead},
     local,
-    sessions::Action,
-    transport::{self, Blocked, Epoch, Gateway, SessionLease, WakeState},
+    sessions::{self, Action},
+    transport::{self, Blocked, Gateway, SessionLease, WakeState},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use pgcf_native_protocol::{
@@ -268,8 +268,6 @@ struct Backend {
     postgres: UnixStream,
     database: String,
     user: String,
-    /// The table epoch the session was admitted at.
-    epoch: Epoch,
     /// What PostgreSQL proved; none when it asked for no password, and then it is not pooled.
     verifier: Option<Verifier>,
     authenticated: Instant,
@@ -384,26 +382,17 @@ async fn handle(
             (claims, Some(unit))
         }
     };
-    let (target, epoch) = attempt!(current(gateway, &claims, released.as_deref()).await);
+    let target = attempt!(current(gateway, &claims, released.as_deref()).await);
     // Admitted without a hold: the database was running when the request arrived.
     stages.wake_path.get_or_insert("warm");
-    let mut backend = match checkout(gateway, &claims, &target, epoch, &request.password).await {
+    let mut backend = match checkout(gateway, &claims, &target, &request.password).await {
         Checkout::Taken(backend) => {
             stages.pooled = true;
             *backend
         }
-        Checkout::Missed(known) => attempt!(
-            open(
-                gateway,
-                &claims,
-                &target,
-                epoch,
-                &request.password,
-                known,
-                stages
-            )
-            .await
-        ),
+        Checkout::Missed(known) => {
+            attempt!(open(gateway, &claims, &target, &request.password, known, stages).await)
+        }
     };
     {
         let id = &backend.lease.id;
@@ -683,13 +672,12 @@ async fn wake(
         }
     }
 }
-/// The unit the route was admitted on, if the agent's table still shows it, and the table epoch
-/// it is admitted at.
+/// The unit the route was admitted on, if the agent's table still shows it.
 async fn current(
     gateway: &Gateway,
     claims: &Route,
     released: Option<&str>,
-) -> Result<(Writer, Epoch), Refused> {
+) -> Result<Writer, Refused> {
     gateway.admit(claims, released).await.map_err(not_accepting)
 }
 
@@ -700,14 +688,13 @@ enum Checkout {
     /// login uses when PostgreSQL asks for the same salt and iterations.
     Missed(Option<Salted>),
 }
-/// An idle session of the route's database and role on the same writer and table epoch whose
-/// verifier the password matches. Only the newest session's verifier is derived, once: the
+/// An idle session of the route's database and role on the same writer whose verifier the
+/// password matches. Only the newest session's verifier is derived, once: the
 /// sessions of one role share it unless its password was rotated.
 async fn checkout(
     gateway: &Gateway,
     claims: &Route,
     target: &Writer,
-    epoch: Epoch,
     password: &Password,
 ) -> Checkout {
     let key = (claims.db.clone(), claims.user.clone());
@@ -747,8 +734,7 @@ async fn checkout(
         let Ok(backend) = taken.await else {
             continue;
         };
-        if backend.epoch == epoch
-            && backend.lease.target == *target
+        if backend.lease.target == *target
             && backend.authenticated.elapsed() < LIFETIME
             && gateway.permits(&claims.db, &backend.lease.target).await
         {
@@ -763,7 +749,6 @@ async fn open(
     gateway: &Arc<Gateway>,
     claims: &Route,
     target: &Writer,
-    epoch: Epoch,
     password: &Password,
     known: Option<Salted>,
     stages: &mut Stages,
@@ -777,7 +762,7 @@ async fn open(
         .map_err(|_| capacity())?;
     // The route was checked against this writer; a replacement is never dialled.
     gateway
-        .dialable(database, Some(epoch), target)
+        .dialable(database, target, true)
         .await
         .map_err(not_accepting)?;
     gateway
@@ -804,7 +789,6 @@ async fn open(
         postgres,
         database: database.clone(),
         user: claims.user.clone(),
-        epoch,
         verifier: None,
         authenticated: Instant::now(),
         _memory: memory,
@@ -897,8 +881,8 @@ async fn authenticate(
     }
     Err(protocol())
 }
-/// Writes to PostgreSQL only while the agent's table still admits the session's database at the
-/// epoch it was admitted at on its writer, holding the table for the bounded write.
+/// Writes to PostgreSQL only while the agent's table still admits new work for the session's
+/// database on its writer, holding the table for the bounded write.
 async fn write_guarded(
     gateway: &Gateway,
     backend: &mut Backend,
@@ -908,11 +892,10 @@ async fn write_guarded(
         lease,
         postgres,
         database,
-        epoch,
         ..
     } = backend;
     gateway
-        .write_admitted(database, *epoch, &lease.target, postgres, bytes)
+        .write_admitted(database, &lease.target, postgres, bytes)
         .await
         .map_err(|blocked| match blocked {
             Blocked::Fenced | Blocked::TargetChanged => Guard::Fenced,
@@ -1180,14 +1163,7 @@ async fn execute(
     }
 }
 async fn retired(actions: &mut watch::Receiver<Action>) {
-    loop {
-        if *actions.borrow_and_update() == Action::Retire {
-            return;
-        }
-        if actions.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
+    sessions::until(actions, |action| action == Action::Retire).await;
 }
 async fn results(
     postgres: &mut UnixStream,

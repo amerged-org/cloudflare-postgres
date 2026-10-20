@@ -13,6 +13,20 @@ pub enum Action {
     CloseIdle,
     CloseAuthentication,
 }
+/// Resolves once the latest action the session was told is one `stops` names. The action is the
+/// database's present state, not a count of changes: an entry published again for the unit that
+/// runs, which tells the session to run, stops nothing.
+pub async fn until(actions: &mut watch::Receiver<Action>, stops: fn(Action) -> bool) {
+    loop {
+        if stops(*actions.borrow_and_update()) {
+            return;
+        }
+        if actions.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 pub struct Session {
     pub database: String,
     pub authenticated: bool,

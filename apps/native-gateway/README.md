@@ -42,11 +42,16 @@ archive socket.
   and authentication bytes pass through unchanged; database and role must match the token before
   any byte reaches PostgreSQL. The dial begins with the admission, so it overlaps the client's own
   round trips.
-- Per-database epochs of the table avoid interrupting unrelated startup work. While a database
-  quiesces, no client byte reaches PostgreSQL: it waits, and runs once the database runs again.
-  Quiescence includes partial WebSocket and PostgreSQL messages, authentication, outstanding
-  queries, transactions and COPY. A unit that changes (another PID, socket or invocation ID)
-  closes its sessions with 1012 and is never written to.
+- A connection or request is admitted on the database's running unit and keeps that admission for
+  as long as the table shows the database running on that unit. An entry the agent publishes again
+  for the same unit, such as the page that carries Cloudflare's claim of a wake moving the route
+  revision, interrupts nothing, and a wake that was released is admitted under the revision of its
+  release or a later one. While a database quiesces, no client byte reaches PostgreSQL: it waits,
+  and runs once the database runs again; an HTTP request that finds the database quiescing,
+  asleep or retired before its first statement answers `57P03` with nothing written to
+  PostgreSQL. Quiescence includes partial WebSocket and PostgreSQL messages, authentication,
+  outstanding queries, transactions and COPY. A unit that changes (another PID, socket or
+  invocation ID) closes its sessions with 1012 and is never written to.
 - Masked-frame lengths reserve memory before decoder allocation. Fragment and decoded-message
   charges remain owned until forwarding or closure. Startup buffering is bounded separately;
   ordinary messages support the existing 32 MiB limit and outbound frames are at most 64 KiB.

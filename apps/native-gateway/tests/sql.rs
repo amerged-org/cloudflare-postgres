@@ -258,6 +258,7 @@ async fn postgres_session(
     mut stream: UnixStream,
     journal: Journal,
     authentication: Authentication,
+    mut gate: watch::Receiver<bool>,
 ) -> Result<(), Failure> {
     let length = stream.read_u32().await? as usize;
     let mut startup = vec![0; length - 4];
@@ -270,6 +271,9 @@ async fn postgres_session(
         .map(|pair| format!("{}={}", pair[0], pair[1]))
         .collect();
     journal.push(format!("startup:{}", pairs.join(" ")));
+    // A PostgreSQL that is slow to log in: the test closes the gate and opens it when it wants
+    // the login to go on.
+    gate.wait_for(|open| *open).await?;
     let accepted = match authentication {
         Authentication::Scram => scram(&mut stream).await?,
         Authentication::Cleartext => {
@@ -465,6 +469,8 @@ struct Fixture {
     journal: Journal,
     /// How the double authenticates the sessions it accepts next.
     authentication: Arc<Mutex<Authentication>>,
+    /// While it is closed, the double does not answer a StartupMessage.
+    gate: watch::Sender<bool>,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     _directory: Directory,
@@ -506,6 +512,7 @@ impl Fixture {
         let counted = calls.clone();
         let authentication = Arc::new(Mutex::new(Authentication::Scram));
         let asks = authentication.clone();
+        let (gate, open) = watch::channel(true);
         let mut shutdown = receiver.clone();
         let upstream_task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
@@ -515,8 +522,8 @@ impl Fixture {
                     accepted = upstream.accept() => {
                         let (stream, _) = accepted.unwrap();
                         counted.fetch_add(1, Ordering::SeqCst);
-                        let (journal, authentication) = (recorder.clone(), *asks.lock().unwrap());
-                        tasks.spawn(async move { let _ = postgres_session(stream, journal, authentication).await; });
+                        let (journal, authentication, open) = (recorder.clone(), *asks.lock().unwrap(), open.clone());
+                        tasks.spawn(async move { let _ = postgres_session(stream, journal, authentication, open).await; });
                     }
                 }
             }
@@ -548,6 +555,7 @@ impl Fixture {
             calls,
             journal,
             authentication,
+            gate,
             stop,
             tasks: vec![upstream_task, gateway_task],
             _directory: directory,
@@ -936,6 +944,90 @@ async fn a_wake_ticket_is_held_without_a_dial_until_the_table_releases_the_unit(
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["rows"], json!([["woken"]]));
     assert_eq!(fixture.gateway.wakes.held(DATABASE), 0);
+    fixture.stop().await;
+}
+/// Waits until the gateway has admitted a request on the unit and written its StartupMessage to
+/// PostgreSQL, which holds the login at its closed gate.
+async fn logging_in(fixture: &Fixture) {
+    timeout(Duration::from_secs(5), async {
+        while fixture
+            .journal
+            .count("startup:user=app database=aaaaaaaaaaaaaaaaaaaa client_encoding=UTF8")
+            != 1
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the request reached PostgreSQL");
+}
+#[tokio::test]
+async fn a_cold_request_goes_on_when_the_claim_of_its_wake_reaches_the_table_during_its_login() {
+    // The agent releases the wake under the route revision it knows. Cloudflare's claim of the
+    // wake runs beside the request and commits a later revision, and the page that carries it
+    // reaches the agent while PostgreSQL is still logging the request in. The unit, its
+    // generation and its operation are the same: the entry the agent publishes names nothing
+    // the request was admitted on differently.
+    let fixture = Fixture::with(Mode::Sleeping).await;
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["woken"]))], None);
+    let answer = tokio::spawn(async move {
+        post(port, &wake_token(26, 2), request.to_string().as_bytes()).await
+    });
+    timeout(Duration::from_secs(5), async {
+        while fixture.gateway.wakes.held(DATABASE) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.gate.send(false).unwrap();
+    release(&fixture, 2).await;
+    logging_in(&fixture).await;
+    fixture.gateway.table.write().await.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 2, &wake_operation(), &fixture.unit)
+    });
+    fixture.gate.send(true).unwrap();
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["rows"], json!([["woken"]]));
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_request_whose_database_stops_admitting_during_its_login_writes_no_statement() {
+    // The sleep proof begins between the request's admission and its first statement: the
+    // statement waits for nothing and never reaches PostgreSQL.
+    let fixture = Fixture::new().await;
+    fixture.gate.send(false).unwrap();
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["late"]))], None);
+    let answer =
+        tokio::spawn(async move { post(port, &route(27), request.to_string().as_bytes()).await });
+    logging_in(&fixture).await;
+    fixture.gateway.table.write().await.update(entry(
+        Mode::Quiesce,
+        1,
+        &operation(),
+        &fixture.unit,
+    ));
+    fixture.gate.send(true).unwrap();
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(
+        (status, &answer["code"]),
+        (400, &json!("57P03")),
+        "{answer}"
+    );
+    fixture.idle(0).await;
+    assert!(
+        fixture
+            .journal
+            .entries()
+            .iter()
+            .all(|entry| !entry.starts_with("parse:") && !entry.starts_with("bind:")),
+        "{:?}",
+        fixture.journal.entries()
+    );
     fixture.stop().await;
 }
 #[tokio::test]

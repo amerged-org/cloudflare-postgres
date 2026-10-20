@@ -2244,6 +2244,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_page_with_the_claim_of_a_released_wake_moves_only_the_route_revision_of_its_entry()
+    {
+        let Some(rig) = Rig::new("wake-claim-entry").await else {
+            return;
+        };
+        let mut json = rig.entry_json();
+        let (entry, db) = rig.create_from(&json).await;
+        json.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let ticket = Rig::ticket(&entry);
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        // The node released the wake before the page named it: the claimed generation and
+        // operation on the entry's route revision.
+        let released = rig.gateway.get(&entry.id).unwrap();
+        assert_eq!(
+            (
+                released.mode,
+                released.generation,
+                released.operation.as_str(),
+                released.route_revision
+            ),
+            (
+                Mode::Running,
+                ticket.generation,
+                ticket.operation.as_str(),
+                entry.route_revision
+            )
+        );
+        // D1 commits the claim beside the request and hints the node, which pulls the page: the
+        // same generation and operation under the revision the claim committed. The gateway's
+        // entry changes in the route revision and nowhere else, so that a request admitted on the
+        // released unit is still on the unit the table names.
+        json["generation"] = ticket.generation.into();
+        json["operation"] = ticket.operation.clone().into();
+        json["route_revision"] = (entry.route_revision + 1).into();
+        rig.core.apply(&Rig::page(vec![json], vec![])).await;
+        assert_eq!(
+            rig.gateway.get(&entry.id).unwrap(),
+            pgcf_native_protocol::agent::Database {
+                route_revision: entry.route_revision + 1,
+                ..released
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_start_that_outlasts_its_wake_and_then_fails_leaves_the_database_wakeable() {
         let timing = crate::agent::Timing {
             wake_start: Duration::from_millis(300),
