@@ -24,7 +24,7 @@ export function opened(schema: unknown): unknown {
 /**
  * The schema of each node document by name. A property with a default is optional for the node
  * (the schema of its input), which is how a property starts: the node and the API both leave it
- * out, and it is made required only in the release after every node knows it.
+ * out. Plan 9.3, "Changing the page", says when it may be made required.
  */
 export function nodeJsonSchemas() {
   const received = new Set<string>(nodeReceives);

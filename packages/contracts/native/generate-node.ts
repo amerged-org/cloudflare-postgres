@@ -77,6 +77,10 @@ const files = {
       MAINTENANCE_ROLE,
       RESERVED_ROLE_NAMES: [...RESERVED_ROLE_NAMES],
       RESERVED_ROLE_PREFIXES,
+      // What a present role names and a removal never does: the node refuses a role that is both.
+      PRESENT_ROLE_PROPERTIES: Object.keys(link.DesiredRole.shape).filter(
+        (property) => property !== "name",
+      ),
       ADMISSION_STARTS: link.ADMISSION_STARTS,
       NODE_DATABASE_STATES: link.NODE_DATABASE_STATES,
       NODE_DATABASE_ERRORS: link.NODE_DATABASE_ERRORS,

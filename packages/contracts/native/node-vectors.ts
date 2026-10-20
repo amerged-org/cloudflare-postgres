@@ -1149,6 +1149,29 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       false,
       true,
     ],
+    // A role is present or removed, never both: the schema the node holds is open, so that a
+    // present role that also says `state: "absent"` matches either variant, and the removal drops
+    // the role (`roles_valid`).
+    [
+      "role-both-present-and-removed",
+      withDatabase({ roles: [owner, { ...reader, state: "absent" }] }),
+      false,
+      true,
+    ],
+    [
+      "removal-with-a-property-of-a-present-role",
+      withDatabase({
+        roles: [owner, { name: "report", state: "absent", bypass_rls: false }],
+      }),
+      false,
+      true,
+    ],
+    [
+      "role-with-a-state-that-is-not-absent",
+      withDatabase({ roles: [owner, { ...reader, state: "present" }] }),
+      false,
+      true,
+    ],
     [
       "reserved-role",
       withDatabase({ roles: [owner, { ...reader, name: "postgres" }] }),

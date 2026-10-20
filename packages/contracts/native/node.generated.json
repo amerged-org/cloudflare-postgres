@@ -2417,6 +2417,15 @@
     "MAINTENANCE_ROLE": "pgcf_maintenance",
     "RESERVED_ROLE_NAMES": ["postgres", "streaming_replica"],
     "RESERVED_ROLE_PREFIXES": ["pg_", "cnpg_"],
+    "PRESENT_ROLE_PROPERTIES": [
+      "owner",
+      "password",
+      "revision",
+      "valid_until",
+      "connection_limit",
+      "member_of",
+      "bypass_rls"
+    ],
     "ADMISSION_STARTS": [
       "wake",
       "create",

@@ -402,8 +402,10 @@ it: once, its binary is replaced through the shell. EU1 was such a node (it ran 
 `bb85de7d`) and was replaced on 2026-10-20. A node enrolled from an image that
 holds the first agent that writes host files needs none of this, and no code supports it: Dev runs
 the newest release only. It is the last such step: from the agent that ignores the properties it
-does not know, a release is installed by the release path whatever it adds
-([Changing the page](#changing-the-page-no-hand-step)); an agent of main `1ace7446`, which is still
+does not know, a change that keeps the order of the table in
+[Changing the page](#changing-the-page-no-hand-step) needs no hand replacement (a new property is one
+release; a new value, a new type of order, a rename and a change of the signed manifest are two); an
+agent of main `1ace7446`, which is still
 strict, is moved to that agent by the release path in the order of the plan's row for the CPU
 burst, and a node that needs this section again means a rule of that section was broken. The databases keep running throughout (their units do not depend on the
 agent, and a restart of the agent never stops one).
@@ -641,7 +643,8 @@ agent does not know is ignored**, so a release that adds one reaches a running n
 path, with no replacement of the agent. What the agent still refuses, whole, is a page it cannot
 read: a missing required property, a wrong type, a number out of bound, a value outside a closed
 set (an enum, a type of order, a kind of origin or host file, a link message), and a property of the
-other kind of origin (a move with a `target_time`, a restore with an `end`). The contract stays
+other kind (a move with a `target_time`, a restore with an `end`, a removed role that names a property
+of a present role). The contract stays
 strict on the API's side, so the API never sends or accepts a property by accident, and what the
 agent sends is held to it.
 

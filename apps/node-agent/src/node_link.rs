@@ -10,6 +10,7 @@
 //! contract's own, closed, schemas. Where a value of a received document is handed on whole to
 //! something that is strict (the route keyring, to the gateway), the agent copies the properties it
 //! names and no other.
+use crate::roles;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -389,7 +390,8 @@ fn reserved_role(name: &str) -> bool {
 }
 
 /// The roles of one database: unique, unreserved names; the owner `app`, never removed, exactly
-/// once while the database exists; memberships of other present roles only.
+/// once while the database exists; a role present or removed, never both; memberships of other
+/// present roles only.
 fn roles_valid(db: &Value) -> bool {
     let owner_name = text("OWNER_ROLE_NAME");
     let roles: Vec<&Value> = db["roles"].as_array().into_iter().flatten().collect();
@@ -403,7 +405,8 @@ fn roles_valid(db: &Value) -> bool {
             return false;
         }
         if role.get("state").is_some() {
-            if name == owner_name {
+            // A removal names nothing of a present role (`roles::removal`), and never the owner.
+            if name == owner_name || !roles::removal(role) {
                 return false;
             }
             continue;

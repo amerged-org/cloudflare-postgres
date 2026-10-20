@@ -5,11 +5,9 @@
  * fails when a schema has a required property that is not listed, or a listed one that is not
  * required, so that a new required property is a decision of the author and a line in this file.
  *
- * When a line may be added is the rule of the plan, 9.3 "Changing the page" (its table), which
- * is written there once. In short: a property starts optional, `.optional()` or `.default(...)`,
- * and its line is added only in a later release, when every node knows it. A line added in the
- * release that adds the property is a breaking change, and the plan's row for the release says why
- * it is safe.
+ * When a line may be added is the rule of the plan, 9.3 "Changing the page" (its table, by the
+ * kind of change and the direction), which is written there once. A line added in the release that
+ * adds the property is a breaking change, and the plan's row for the release says why it is safe.
  */
 export const NODE_REQUIRED: Record<string, string[]> = {
   "AgentLinkMessage|type=hello": [

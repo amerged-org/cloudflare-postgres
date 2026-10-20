@@ -12389,6 +12389,423 @@
     },
     {
       "schema": "NodeDesiredPage",
+      "name": "role-both-present-and-removed",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "node": {
+          "id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": {
+          "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
+          "binaries": {
+            "pgcf-agent": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-native-gateway": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-archive": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-wal-fetch": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            }
+          },
+          "os": {
+            "image_version": "25",
+            "debian_snapshot": "20261016T000000Z",
+            "package_lock": {
+              "url": "https://releases.example/packages.lock.json",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 2000
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
+          }
+        },
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 }
+        },
+        "credentials_revision": 3,
+        "orders": [],
+        "databases": [
+          {
+            "id": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 4,
+            "operation": "op_cccccccccccccccccccc",
+            "desired_state": "running",
+            "route_revision": 2,
+            "storage_generation": 1,
+            "pg_major": 18,
+            "resources": {
+              "memory_mib": 256,
+              "cpu_millicores": 250,
+              "storage_gib": 1
+            },
+            "settings": {
+              "max_connections": 25,
+              "archive_timeout_seconds": 60
+            },
+            "sleep_after_seconds": 300,
+            "roles": [
+              {
+                "name": "app",
+                "owner": true,
+                "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+                "revision": 1
+              },
+              {
+                "name": "reader",
+                "owner": false,
+                "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "revision": 2,
+                "valid_until": "2031-01-02T03:04:05.678Z",
+                "connection_limit": 5,
+                "bypass_rls": true,
+                "state": "absent"
+              }
+            ],
+            "archive": {
+              "path": "s3://pgcf-eu/eu-dev/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+              "credential": {
+                "id": "crd_kkkkkkkkkkkkkkkkkkkk",
+                "expires_at": "2026-10-24T12:00:00.000Z"
+              }
+            }
+          }
+        ],
+        "next": "gbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
+      "name": "removal-with-a-property-of-a-present-role",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "node": {
+          "id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": {
+          "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
+          "binaries": {
+            "pgcf-agent": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-native-gateway": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-archive": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-wal-fetch": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            }
+          },
+          "os": {
+            "image_version": "25",
+            "debian_snapshot": "20261016T000000Z",
+            "package_lock": {
+              "url": "https://releases.example/packages.lock.json",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 2000
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
+          }
+        },
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 }
+        },
+        "credentials_revision": 3,
+        "orders": [],
+        "databases": [
+          {
+            "id": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 4,
+            "operation": "op_cccccccccccccccccccc",
+            "desired_state": "running",
+            "route_revision": 2,
+            "storage_generation": 1,
+            "pg_major": 18,
+            "resources": {
+              "memory_mib": 256,
+              "cpu_millicores": 250,
+              "storage_gib": 1
+            },
+            "settings": {
+              "max_connections": 25,
+              "archive_timeout_seconds": 60
+            },
+            "sleep_after_seconds": 300,
+            "roles": [
+              {
+                "name": "app",
+                "owner": true,
+                "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+                "revision": 1
+              },
+              { "name": "report", "state": "absent", "bypass_rls": false }
+            ],
+            "archive": {
+              "path": "s3://pgcf-eu/eu-dev/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+              "credential": {
+                "id": "crd_kkkkkkkkkkkkkkkkkkkk",
+                "expires_at": "2026-10-24T12:00:00.000Z"
+              }
+            }
+          }
+        ],
+        "next": "gbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
+      "name": "role-with-a-state-that-is-not-absent",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "node": {
+          "id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": {
+          "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
+          "binaries": {
+            "pgcf-agent": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-native-gateway": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-archive": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-wal-fetch": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            }
+          },
+          "os": {
+            "image_version": "25",
+            "debian_snapshot": "20261016T000000Z",
+            "package_lock": {
+              "url": "https://releases.example/packages.lock.json",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 2000
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
+          }
+        },
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 }
+        },
+        "credentials_revision": 3,
+        "orders": [],
+        "databases": [
+          {
+            "id": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 4,
+            "operation": "op_cccccccccccccccccccc",
+            "desired_state": "running",
+            "route_revision": 2,
+            "storage_generation": 1,
+            "pg_major": 18,
+            "resources": {
+              "memory_mib": 256,
+              "cpu_millicores": 250,
+              "storage_gib": 1
+            },
+            "settings": {
+              "max_connections": 25,
+              "archive_timeout_seconds": 60
+            },
+            "sleep_after_seconds": 300,
+            "roles": [
+              {
+                "name": "app",
+                "owner": true,
+                "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+                "revision": 1
+              },
+              {
+                "name": "reader",
+                "owner": false,
+                "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "revision": 2,
+                "valid_until": "2031-01-02T03:04:05.678Z",
+                "connection_limit": 5,
+                "bypass_rls": true,
+                "state": "present"
+              }
+            ],
+            "archive": {
+              "path": "s3://pgcf-eu/eu-dev/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+              "credential": {
+                "id": "crd_kkkkkkkkkkkkkkkkkkkk",
+                "expires_at": "2026-10-24T12:00:00.000Z"
+              }
+            }
+          }
+        ],
+        "next": "gbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
       "name": "reserved-role",
       "valid": false,
       "node_valid": false,
