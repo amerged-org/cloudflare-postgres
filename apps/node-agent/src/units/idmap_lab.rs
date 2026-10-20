@@ -5,13 +5,17 @@
 //! handed to it. The tests run as root on a Debian 13 host with systemd as PID 1 (Linux 6.3 or
 //! newer, for the idmapped tmpfs), util-linux, e2fsprogs and perl, one at a time, and exist only in
 //! a build made for them: the kernel step of CI runs every ignored test in an unprivileged
-//! container and must not meet them. The test binary must run in a mount namespace of its own, as
-//! the agent does under `PrivateMounts=yes`, so that the lab's volumes stay out of PID 1's
-//! namespace, which every unit's executor copies:
+//! container and must not meet them. The test binary must run as the agent runs, in a mount
+//! namespace of its own with the propagation that `PrivateMounts=yes` of `pgcf-agent.service` gives
+//! it, so that the lab's volumes stay out of PID 1's namespace, which every unit's executor
+//! copies, and every mount of the lab is a member of a peer group (`shared:N`), as every mount of
+//! the agent is. A namespace made with `unshare --mount --propagation slave` is not that: its
+//! mounts are private and hide any coupling between the agent's mounts and a slot's. `Lab::new`
+//! refuses a namespace that is not the agent's:
 //!
 //! ```sh
 //! RUSTFLAGS='--cfg pgcf_idmap_lab' cargo test -p pgcf-node-agent --lib --no-run
-//! unshare --mount --propagation slave <test binary> --test-threads=1 --nocapture units::idmap_lab
+//! systemd-run --wait --pipe -p PrivateMounts=yes <test binary> --test-threads=1 --nocapture units::idmap_lab
 //! ```
 //!
 //! Everything the lab makes lives under `/var/tmp/pgcf-lab`, in the mounts `/var/lib/pgcf/db/labidm*`
@@ -161,7 +165,12 @@ impl Lab {
         assert_ne!(
             fs::read_link("/proc/1/ns/mnt").unwrap(),
             fs::read_link("/proc/self/ns/mnt").unwrap(),
-            "run the lab under `unshare --mount --propagation slave`"
+            "run the lab under `systemd-run --wait --pipe -p PrivateMounts=yes`"
+        );
+        assert!(
+            !groups_at(&peer_groups("/proc/self/mountinfo"), Path::new("/")).is_empty(),
+            "the lab's mounts are private, the agent's are shared: run the lab under \
+             `systemd-run --wait --pipe -p PrivateMounts=yes`"
         );
         assert!(
             Path::new("/run/systemd/system").is_dir(),
@@ -395,6 +404,30 @@ fn has_options(options: &str, wanted: &[&str]) -> bool {
     wanted.iter().all(|option| present.contains(option))
 }
 
+/// (mount point, peer group) for every `shared:N` in the optional fields of a mountinfo, so a
+/// mount in two groups is listed twice. The numbers are the kernel's, the same in every namespace.
+fn peer_groups(file: &str) -> Vec<(PathBuf, u64)> {
+    let mut groups = Vec::new();
+    for line in fs::read_to_string(file).unwrap().lines() {
+        let words: Vec<&str> = line.split(' ').collect();
+        let end = words.iter().position(|word| *word == "-").unwrap();
+        for field in &words[6..end] {
+            if let Some(group) = field.strip_prefix("shared:") {
+                groups.push((PathBuf::from(words[4]), group.parse().unwrap()));
+            }
+        }
+    }
+    groups
+}
+/// The groups of the mounts at `path`.
+fn groups_at(groups: &[(PathBuf, u64)], path: &Path) -> Vec<u64> {
+    groups
+        .iter()
+        .filter(|(point, _)| point == path)
+        .map(|(_, group)| *group)
+        .collect()
+}
+
 fn ids_of(path: &Path) -> String {
     let metadata = fs::metadata(path).unwrap();
     format!("{}:{}", metadata.uid(), metadata.gid())
@@ -513,6 +546,76 @@ fn the_slot_gets_the_volume_and_the_socket_directory_as_its_own_under_strict_pro
     let init = mount_table("/proc/1/mountinfo");
     assert!(mount_at(&init, &lab.root).is_none());
     assert!(mount_at(&init, &lab.sockets).is_none());
+}
+
+/// The agent's mounts are shared (`PrivateMounts=yes`), and a clone of one that kept its peer group
+/// would be a peer of it: a mount made on or under either would appear in the other and in every
+/// other slot that holds the volume. The slot's mounts are in groups of their own.
+#[test]
+fn the_slots_mounts_are_not_peers_of_the_agents_or_of_another_slots() {
+    let mut lab = Lab::new();
+    let slots = [Slot::start(), Slot::start()];
+    lab.provide();
+    let agent_file = "/proc/self/mountinfo";
+    let agent = peer_groups(agent_file);
+    assert!(
+        !groups_at(&agent, &lab.root).is_empty(),
+        "the agent's volume is not shared"
+    );
+    for slot in &slots {
+        hand_over(slot.pidfd(), &Lab::ids(), &lab.mounts()).unwrap();
+    }
+    // The socket directory is a directory of the agent's /run, so its clone is a clone of that
+    // mount: it must not be in the group of /run either.
+    let mut seen: Vec<u64> = agent.iter().map(|(_, group)| *group).collect();
+    for slot in &slots {
+        let slot_groups = peer_groups(&format!("/proc/{}/mountinfo", slot.pid));
+        for path in [&lab.root, &lab.sockets] {
+            let groups = groups_at(&slot_groups, path);
+            for group in &groups {
+                assert!(
+                    !seen.contains(group),
+                    "{} in {} is in the group {group} of another mount",
+                    path.display(),
+                    slot.unit
+                );
+            }
+            seen.extend(groups);
+        }
+    }
+
+    // A mount on the agent's volume does not reach the slots.
+    let probe = lab.root.join("data/probe");
+    fs::create_dir(&probe).unwrap();
+    let probe_text = probe.to_str().unwrap();
+    sh("mount", &["-t", "tmpfs", "tmpfs", probe_text]);
+    fs::write(probe.join("marker"), "x").unwrap();
+    for slot in &slots {
+        assert!(
+            mount_at(&slot.mounts(), &probe).is_none(),
+            "a mount under the agent's volume reached {}",
+            slot.unit
+        );
+        assert_eq!(
+            slot.run_ok(SLOT_ID, SLOT_ID, &format!("ls -A {probe_text}")),
+            "",
+            "the content of a mount under the agent's volume reached {}",
+            slot.unit
+        );
+    }
+    sh("umount", &[probe_text]);
+
+    // A mount on a slot's volume reaches neither the agent nor the other slot.
+    slots[0].run_ok(0, 0, &format!("mount -t tmpfs tmpfs {probe_text}"));
+    assert!(mount_at(&slots[0].mounts(), &probe).is_some());
+    assert!(
+        mount_at(&mount_table(agent_file), &probe).is_none(),
+        "a mount under a slot's volume reached the agent"
+    );
+    assert!(
+        mount_at(&slots[1].mounts(), &probe).is_none(),
+        "a mount under a slot's volume reached another slot"
+    );
 }
 
 /// The gateway's group dials a socket that PostgreSQL makes in the idmapped socket directory, and

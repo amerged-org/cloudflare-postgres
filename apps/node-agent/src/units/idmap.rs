@@ -23,7 +23,9 @@
 //!    calls only, as it uses the agent's memory.
 //! 2. For each mount, `open_tree(OPEN_TREE_CLONE)` of the agent's mount, a check that it is what
 //!    the caller expects (a directory, and for a volume the device of the volume), and
-//!    `mount_setattr(2)` with the idmap and the attributes of its [`Kind`].
+//!    `mount_setattr(2)` with the idmap, the attributes of its [`Kind`] and `MS_PRIVATE`: a clone
+//!    is born in the peer group of the agent's mount, which under `PrivateMounts=yes` is a shared
+//!    one, and it must not stay in it (see `mount_attr`).
 //! 3. A thread of its own that leaves the agent's file-system state (`unshare(CLONE_FS)`, which
 //!    `setns(2)` into a mount namespace needs), enters the slot's mount namespace through the
 //!    slot's pidfd, and moves each clone onto the same path there, without following a symlink
@@ -290,6 +292,24 @@ impl UserNamespace {
     }
 }
 
+/// The attributes `mount_setattr(2)` applies to a clone: those of its kind, the user namespace of
+/// the idmap, and no peer group.
+///
+/// `open_tree(OPEN_TREE_CLONE)` leaves the clone in the peer group of the mount it copies, and
+/// under `PrivateMounts=yes` every mount of the agent is shared. A clone that kept that group would
+/// be a peer of the agent's mount for as long as it lives: a mount made on or under either one
+/// would appear in the other, in every other slot that holds the volume, and the next
+/// `open_tree` of the agent's mount would copy a mount that was already idmapped.
+fn mount_attr(kind: Kind, namespace: BorrowedFd<'_>) -> MountAttr {
+    let (set, clear) = kind.attributes();
+    MountAttr {
+        attr_set: set,
+        attr_clr: clear,
+        propagation: libc::MS_PRIVATE,
+        userns_fd: namespace.as_raw_fd() as u64,
+    }
+}
+
 /// A detached, idmapped clone of the mount at `mount.path`: a descriptor, mounted nowhere.
 pub(crate) fn clone_tree(mount: &Planned, namespace: &UserNamespace) -> io::Result<OwnedFd> {
     let path = mount.path.to_string_lossy();
@@ -304,13 +324,7 @@ pub(crate) fn clone_tree(mount: &Planned, namespace: &UserNamespace) -> io::Resu
     })
     .map_err(|e| context(format!("open_tree {path}"), e))?;
     verify(&tree, mount.kind).map_err(|e| context(format!("{path}"), e))?;
-    let (set, clear) = mount.kind.attributes();
-    let attributes = MountAttr {
-        attr_set: set,
-        attr_clr: clear,
-        propagation: 0,
-        userns_fd: namespace.0.as_raw_fd() as u64,
-    };
+    let attributes = mount_attr(mount.kind, namespace.0.as_fd());
     // SAFETY: plain syscall with valid descriptors, an empty path and the struct's own size.
     ok(unsafe {
         libc::syscall(
@@ -499,6 +513,26 @@ mod tests {
             Kind::Socket.attributes(),
             (IDMAP | NOSUID | NODEV | NOEXEC, 0)
         );
+    }
+
+    #[test]
+    fn a_clone_gets_the_attributes_of_its_kind_the_namespace_and_a_peer_group_of_its_own() {
+        let namespace = std::fs::File::open("/dev/null").unwrap();
+        for kind in [
+            Kind::Volume {
+                major: 252,
+                minor: 4,
+            },
+            Kind::Socket,
+        ] {
+            let attributes = mount_attr(kind, namespace.as_fd());
+            let (set, clear) = kind.attributes();
+            assert_eq!((attributes.attr_set, attributes.attr_clr), (set, clear));
+            assert_eq!(attributes.userns_fd, namespace.as_raw_fd() as u64);
+            // MS_PRIVATE, from linux/mount.h: the clone leaves the peer group of the agent's mount.
+            // Zero leaves the group as it is, and the clone stays a peer of the agent's mount.
+            assert_eq!(attributes.propagation, 1 << 18, "{kind:?}");
+        }
     }
 
     #[test]

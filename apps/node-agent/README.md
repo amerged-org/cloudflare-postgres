@@ -248,8 +248,10 @@ The lab tests need a Debian 13 host with systemd as PID 1, root, LVM and the ima
 `storage/lab_tests.rs`, which is built only with `RUSTFLAGS='--cfg pgcf_storage_lab'`.
 `units/idmap_lab.rs` runs the idmapped handoff of a database's volume and socket directory into
 a systemd sandbox (`units/idmap.rs`); it is built only with `RUSTFLAGS='--cfg pgcf_idmap_lab'` and
-runs as root on a systemd host, under `unshare --mount --propagation slave` like the agent's own
-namespace (its header says how).
+runs as root on a systemd host inside `systemd-run --wait --pipe -p PrivateMounts=yes`, the mount
+namespace and propagation of `pgcf-agent.service`, where every mount is shared (its header says
+how). A namespace made with `unshare --mount --propagation slave` has private mounts and hides a
+clone that is still a peer of the agent's mount, so the lab refuses it.
 `start_lab.rs` is the agent's start on a node with 300 databases, on the same real parts and with a
 disk that is slow to flush (its header says how to run it); the numbers it gave are in the plan
 (11.1, "Agent start and stop at 300 databases").
