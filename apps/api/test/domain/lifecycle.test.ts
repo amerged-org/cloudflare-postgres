@@ -127,9 +127,10 @@ it("requires exact power-ready identity and current generation before completing
       .all()
   ).results;
   expect(events).toHaveLength(1);
-  expect(
-    JSON.parse(events[0]!.resource_snapshot as string).reserved_cpu_millicores,
-  ).toBe(500);
+  expect(JSON.parse(events[0]!.resource_snapshot as string)).toEqual({
+    memory_mib: expect.any(Number),
+    cpu_millicores: 500,
+  });
   await expect(
     env.DB.prepare(
       "UPDATE lifecycle_events SET resource_snapshot='{}' WHERE database_id=?",

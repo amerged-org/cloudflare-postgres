@@ -39,7 +39,7 @@ it("requires an exact node UID and retains the loss identity", () => {
   expect(NodeLoss.parse(record)).toEqual(record);
 });
 
-it("accepts generic RAM authority for an exact operator-selected order and preserves legacy triggers", () => {
+it("accepts standing authority for an exact operator-selected order and preserves legacy triggers", () => {
   const order = {
     product_id: "operator-selected-product",
     provider_region: "EU",
@@ -67,10 +67,7 @@ it("accepts generic RAM authority for an exact operator-selected order and prese
     max_nodes: null,
     purchases_enabled: true,
     order,
-    placement_mode: "actual_ram",
     maximum_database_memory_mib: 4096,
-    postgres_memory_request_mib: 128,
-    ram_expansion_threshold_ppm: 810000,
     standing_cost_profile: profile,
   };
   expect(NodeRegionPolicy.parse(policy).max_nodes).toBeNull();
@@ -93,12 +90,6 @@ it("accepts generic RAM authority for an exact operator-selected order and prese
     }).success,
   ).toBe(false);
   expect(
-    NodeRegionPolicy.parse({
-      ...policy,
-      placement_mode: "reserved",
-    }).placement_mode,
-  ).toBe("reserved");
-  expect(
     NodeRegionPolicy.safeParse({
       ...policy,
       order: { ...order, product_id: "another-product" },
@@ -106,61 +97,43 @@ it("accepts generic RAM authority for an exact operator-selected order and prese
   ).toBe(false);
 });
 
+it("no longer carries the regional RAM window, the placement mode or the PostgreSQL memory request", () => {
+  for (const removed of [
+    { ram_expansion_threshold_ppm: 760000 },
+    { ram_expansion_threshold_ppm: null },
+    { ram_warning_threshold_ppm: 800000 },
+    { placement_mode: "reserved" },
+    { postgres_memory_request_mib: 128 },
+  ])
+    expect(
+      NodeRegionPolicy.safeParse({ region_id: "eu-test", ...removed }).success,
+      JSON.stringify(removed),
+    ).toBe(false);
+});
+
 it("leaves omitted capacity and warning fields unset and accepts an explicitly uncapped disabled policy", () => {
   const fresh = NodeRegionPolicy.parse({ region_id: "eu-test" });
   expect(fresh.purchases_enabled).toBe(false);
   expect(fresh).not.toHaveProperty("max_nodes");
-  expect(fresh).not.toHaveProperty("ram_expansion_threshold_ppm");
-  expect(fresh).not.toHaveProperty("ram_warning_threshold_ppm");
   expect(fresh).not.toHaveProperty("cap_warning_enabled");
   expect(
     NodeRegionPolicy.parse({
       region_id: "eu-test",
       max_nodes: null,
-      ram_expansion_threshold_ppm: null,
-      ram_warning_threshold_ppm: null,
       cap_warning_enabled: false,
     }),
   ).toMatchObject({
     max_nodes: null,
     purchases_enabled: false,
-    ram_expansion_threshold_ppm: null,
-    ram_warning_threshold_ppm: null,
     cap_warning_enabled: false,
   });
 });
 
-it("bounds configured RAM thresholds to integer parts per million and requires an explicit warning boolean", () => {
+it("requires an explicit boolean for the node cap notice", () => {
   expect(
-    NodeRegionPolicy.parse({
-      region_id: "eu-test",
-      ram_expansion_threshold_ppm: 1,
-      ram_warning_threshold_ppm: 1_000_000,
-      cap_warning_enabled: true,
-    }),
-  ).toMatchObject({
-    ram_expansion_threshold_ppm: 1,
-    ram_warning_threshold_ppm: 1_000_000,
-    cap_warning_enabled: true,
-  });
-  expect(
-    NodeRegionPolicy.safeParse({
-      region_id: "eu-test",
-      ram_expansion_threshold_ppm: 0,
-    }).success,
-  ).toBe(false);
-  expect(
-    NodeRegionPolicy.safeParse({
-      region_id: "eu-test",
-      ram_warning_threshold_ppm: 1_000_001,
-    }).success,
-  ).toBe(false);
-  expect(
-    NodeRegionPolicy.safeParse({
-      region_id: "eu-test",
-      ram_expansion_threshold_ppm: 750000.5,
-    }).success,
-  ).toBe(false);
+    NodeRegionPolicy.parse({ region_id: "eu-test", cap_warning_enabled: true })
+      .cap_warning_enabled,
+  ).toBe(true);
   expect(
     NodeRegionPolicy.safeParse({
       region_id: "eu-test",

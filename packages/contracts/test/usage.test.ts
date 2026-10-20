@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from "vitest";
 import { newDatabaseId, newProjectId } from "../src/index.ts";
-import { UsageQuery, UsageSample } from "../src/usage.ts";
+import {
+  USAGE_METRICS,
+  UsageMetrics,
+  UsageQuery,
+  UsageResourceSnapshot,
+  UsageSample,
+} from "../src/usage.ts";
 
 const query = () => ({
   project_id: newProjectId(),
@@ -10,6 +16,36 @@ const query = () => ({
   granularity: "day" as const,
 });
 describe("usage contracts", () => {
+  it("measures the awake limits and no reserved figures", () => {
+    expect(
+      USAGE_METRICS.filter((name) => name.startsWith("reserved_")),
+    ).toEqual([]);
+    const metrics = Object.fromEntries(
+      USAGE_METRICS.map((name) => [name, null]),
+    );
+    expect(UsageMetrics.safeParse(metrics).success).toBe(true);
+    expect(
+      UsageMetrics.safeParse({
+        ...metrics,
+        reserved_memory_mib_seconds: null,
+      }).success,
+    ).toBe(false);
+    expect(
+      UsageResourceSnapshot.parse({ memory_mib: 512, cpu_millicores: 500 }),
+    ).toEqual({ memory_mib: 512, cpu_millicores: 500 });
+    for (const stale of [
+      { reserved_memory_mib: 512 },
+      { reserved_cpu_millicores: 500 },
+      { storage_allocated_bytes: null },
+    ])
+      expect(
+        UsageResourceSnapshot.safeParse({
+          memory_mib: 512,
+          cpu_millicores: 500,
+          ...stale,
+        }).success,
+      ).toBe(false);
+  });
   it("accepts exactly hourly/day UTC queries up to 31 days", () => {
     expect(UsageQuery.parse(query()).limit).toBe(50);
     expect(

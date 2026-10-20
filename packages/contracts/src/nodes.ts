@@ -132,7 +132,12 @@ export const NodeAdditionIntent = z
 export type NodeAdditionIntent = z.infer<typeof NodeAdditionIntent>;
 const NodePurchaseTrigger = z.enum(["regional_actual_ram", "ram_76_percent"]);
 const ThresholdPpm = z.number().int().min(1).max(1_000_000);
-/** Owner infrastructure authority; null ceilings require the explicit approved RAM trigger. */
+/**
+ * Owner infrastructure authority. A profile with a `trigger` approves only the orders the capacity
+ * cron reserves on its own (`capacity-headroom-`), at no stated price or ceiling; one without
+ * needs an expiry and finite ceilings and also approves manual order additions. The two trigger
+ * names are kept as stored: nothing reads a RAM threshold any more.
+ */
 export const StandingNodeCostProfile = z
   .strictObject({
     id: Selector,
@@ -204,16 +209,6 @@ export const NodeRegionPolicy = z
         "Permits paid provider orders: an order addition is dispatched only while this is true and its order equals `order`. Requires `order`.",
       ),
     autoscale_enabled: z.boolean().optional(),
-    ram_expansion_threshold_ppm: ThresholdPpm.nullable()
-      .optional()
-      .describe(
-        `Regional RAM utilization that permits an automatic order, measured like ram_warning_threshold_ppm. Required when autoscale_enabled, purchases_enabled and order are all set (409 otherwise); null means no RAM-triggered orders. ${PPM} ${KEEP}`,
-      ),
-    ram_warning_threshold_ppm: ThresholdPpm.nullable()
-      .optional()
-      .describe(
-        `Regional RAM warning (alert regional_ram_warning) when regional RAM utilization reaches it: the ten-minute average of kubelet working-set bytes of every ready, schedulable, placement-enabled, non-lost node against their summed memory capacity. Each such node needs ten consecutive one-minute samples with unchanged capacity, the newest at most 90 s old and in the same minute as the others, and an observation at most 180 s old; otherwise utilization is unknown and an episode neither starts nor clears. ${WARNING}`,
-      ),
     node_ram_warning_threshold_ppm: ThresholdPpm.nullable()
       .optional()
       .describe(
@@ -241,12 +236,6 @@ export const NodeRegionPolicy = z
       .describe(
         "Exact provider order (product, provider region, image, term, location, optional add-ons) for every order addition; manual order requests must equal it. null means no orders.",
       ),
-    placement_mode: z
-      .enum(["reserved", "actual_ram"])
-      .default("reserved")
-      .describe(
-        "reserved: admit databases against reserved size-class memory. actual_ram: admit them against fresh measured node memory, for size classes from postgres_memory_request_mib to maximum_database_memory_mib in 256 MiB steps. A change needs an empty or manually suspended assigned cohort and no unsettled start (409 otherwise).",
-      ),
     maximum_database_memory_mib: z
       .number()
       .int()
@@ -258,20 +247,10 @@ export const NodeRegionPolicy = z
       .describe(
         "The most memory one database of this region may have (MiB), for a size class and for a database's own memory; null means 4096.",
       ),
-    postgres_memory_request_mib: z
-      .number()
-      .int()
-      .positive()
-      .max(1048576)
-      .nullable()
-      .default(null)
-      .describe(
-        "actual_ram: memory reserved for each database's PostgreSQL (MiB); smaller size classes are not placed. A change under actual_ram has the same precondition as placement_mode.",
-      ),
     standing_cost_profile: StandingNodeCostProfile.nullable()
       .default(null)
       .describe(
-        "Standing owner approval for order additions of exactly `order`, bounded by its expiry, order count and total monthly and setup amounts; unknown prices stay null. With trigger regional_actual_ram it approves only automatic orders while regional RAM is at or above ram_expansion_threshold_ppm; without a trigger it also approves manual order additions and needs expiry and finite limits. null: every order waits for POST /v1/nodes/additions/{id}/approve.",
+        "Standing owner approval for order additions of exactly `order`, bounded by its expiry, order count and total monthly and setup amounts; unknown prices stay null. With a trigger (regional_actual_ram or ram_76_percent, kept as stored) it approves only the orders the capacity cron reserves while autoscale_enabled is true; without a trigger it also approves manual order additions and needs expiry and finite limits. null: every order waits for POST /v1/nodes/additions/{id}/approve.",
       ),
   })
   .superRefine((policy, context) => {
@@ -279,17 +258,6 @@ export const NodeRegionPolicy = z
       context.addIssue({
         code: "custom",
         message: "Enabled purchases require an explicit configured order",
-      });
-    if (
-      policy.placement_mode === "actual_ram" &&
-      (policy.maximum_database_memory_mib === null ||
-        policy.postgres_memory_request_mib === null ||
-        policy.postgres_memory_request_mib > policy.maximum_database_memory_mib)
-    )
-      context.addIssue({
-        code: "custom",
-        message:
-          "Actual RAM placement requires an explicit per-database maximum and PostgreSQL request within it",
       });
     if (
       policy.standing_cost_profile !== null &&

@@ -32,9 +32,6 @@ export function emptyUsageMetrics(): UsageMetrics {
 const resourceMetrics = [
   "memory_mib_seconds",
   "cpu_millicore_seconds",
-  "reserved_memory_mib_seconds",
-  "reserved_cpu_millicore_seconds",
-  "reserved_storage_byte_seconds",
 ] as const;
 const trafficMetrics = [
   "ingress_bytes",
@@ -89,22 +86,14 @@ export function computeUsageHour(
         gaps.add("resource_snapshot");
         for (const key of resourceMetrics) metrics[key] = null;
       } else {
-        const values = [
-          awake ? resources.memory_mib * seconds : 0,
-          awake ? resources.cpu_millicores * seconds : 0,
-          resources.reserved_memory_mib * seconds,
-          resources.reserved_cpu_millicores * seconds,
-          resources.storage_allocated_bytes === null
-            ? null
-            : resources.storage_allocated_bytes * seconds,
-        ];
-        for (const [index, key] of resourceMetrics.entries()) {
-          const value = values[index];
-          if (value == null) {
-            metrics[key] = null;
-            gaps.add(key);
-          } else if (metrics[key] !== null) metrics[key] += value;
-        }
+        if (metrics.memory_mib_seconds !== null)
+          metrics.memory_mib_seconds += awake
+            ? resources.memory_mib * seconds
+            : 0;
+        if (metrics.cpu_millicore_seconds !== null)
+          metrics.cpu_millicore_seconds += awake
+            ? resources.cpu_millicores * seconds
+            : 0;
       }
     }
     cursor = until;

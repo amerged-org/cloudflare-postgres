@@ -26,13 +26,7 @@ import { cleanupFixtures, fixture, report } from "./fixtures.ts";
 
 const epoch = Date.parse("2026-01-01T00:00:00.000Z"),
   iso = (value: number) => new Date(value).toISOString();
-const resources = {
-  memory_mib: 512,
-  cpu_millicores: 500,
-  reserved_memory_mib: 640,
-  reserved_cpu_millicores: 600,
-  storage_allocated_bytes: 5 * 1024 ** 3,
-};
+const resources = { memory_mib: 512, cpu_millicores: 500 };
 const databaseIds: string[] = [];
 afterEach(async () => {
   for (const id of databaseIds.splice(0))
@@ -205,11 +199,21 @@ describe("hourly usage", () => {
     expect(second.metrics.provisioned_seconds).toBe(1800);
     expect(second.metrics.awake_seconds).toBe(1200);
     expect(first.metrics.memory_mib_seconds).toBe(512 * 2400);
-    expect(second.metrics.reserved_memory_mib_seconds).toBe(640 * 1800);
+    expect(second.metrics.memory_mib_seconds).toBe(512 * 1200);
+    expect(first.metrics.cpu_millicore_seconds).toBe(500 * 2400);
+    // The class's limits times awake seconds are all there is of them: no reserved figure.
+    for (const row of [first, second]) {
+      expect(
+        Object.keys(row.metrics).filter((name) => name.startsWith("reserved_")),
+      ).toEqual([]);
+      expect(row.gaps.filter((name) => name.startsWith("reserved_"))).toEqual(
+        [],
+      );
+    }
   });
   it("preserves resize snapshots when the mutable size class changes", async () => {
     const f = await setup(),
-      resized = { ...resources, memory_mib: 1024, reserved_memory_mib: 1152 };
+      resized = { ...resources, memory_mib: 1024 };
     await env.DB.batch([
       f.event("created", 0),
       f.event("ready", 0),
@@ -629,7 +633,7 @@ describe("hourly usage", () => {
       sequence: 0,
       observed_at: iso(epoch + 1),
       storage_used_bytes: 0,
-      storage_allocated_bytes: resources.storage_allocated_bytes,
+      storage_allocated_bytes: 5 * 1024 ** 3,
     };
     await recordUsageSample(env.DB, principal, measured, epoch + USAGE_HOUR_MS);
     let injected = false;
@@ -820,32 +824,6 @@ describe("hourly usage", () => {
       ),
     ).rejects.toThrow("Invalid usage recorder");
   });
-});
-
-it("keeps known compute usage while thin physical allocation remains unknown", () => {
-  const id = newDatabaseId();
-  const usage = computeUsageHour(
-    { id, project_id: "prj_" + id, created_at: iso(epoch) },
-    epoch,
-    [
-      {
-        id: 1,
-        kind: "ready",
-        occurred_at: iso(epoch),
-        resource_snapshot: JSON.stringify({
-          ...resources,
-          storage_allocated_bytes: null,
-        }),
-      },
-    ],
-    [],
-    epoch + 3 * USAGE_HOUR_MS,
-  );
-  expect(usage.metrics.memory_mib_seconds).toBe(512 * 3600);
-  expect(usage.metrics.cpu_millicore_seconds).toBe(500 * 3600);
-  expect(usage.metrics.reserved_storage_byte_seconds).toBeNull();
-  expect(usage.gaps).toContain("reserved_storage_byte_seconds");
-  expect(usage.gaps).not.toContain("resource_snapshot");
 });
 
 // A sleeping database emits no usage row (the node agent says nothing for an interval in which

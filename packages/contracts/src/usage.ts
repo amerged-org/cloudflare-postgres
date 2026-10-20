@@ -12,9 +12,6 @@ export const USAGE_METRICS = [
   "awake_seconds",
   "memory_mib_seconds",
   "cpu_millicore_seconds",
-  "reserved_memory_mib_seconds",
-  "reserved_cpu_millicore_seconds",
-  "reserved_storage_byte_seconds",
   "storage_used_bytes_max",
   "storage_allocated_bytes",
   "backup_bytes_max",
@@ -99,9 +96,6 @@ export const UsageResourceSnapshot = z
   .strictObject({
     memory_mib: Integer,
     cpu_millicores: Integer,
-    reserved_memory_mib: Integer,
-    reserved_cpu_millicores: Integer,
-    storage_allocated_bytes: Integer.nullable(),
   })
   .meta({ id: "UsageResourceSnapshot" });
 export type UsageResourceSnapshot = z.infer<typeof UsageResourceSnapshot>;
