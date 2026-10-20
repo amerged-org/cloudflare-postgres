@@ -826,6 +826,181 @@ describe("hourly usage", () => {
   });
 });
 
+// Migration 0082 runs before the new Worker is deployed, and the Worker that still runs in between
+// keeps writing what it always wrote: lifecycle snapshots with the reserved_* figures and
+// storage_allocated_bytes, and hourly rows with the three reserved_* metrics and their gaps. Nothing
+// it writes reads a dropped column, so all of it lands; the new Worker must meter and serve it.
+describe("usage written by the Worker that ran before migration 0082", () => {
+  const legacySnapshot = (storage: number | null) => ({
+      memory_mib: 512,
+      cpu_millicores: 500,
+      reserved_memory_mib: 640,
+      reserved_cpu_millicores: 600,
+      storage_allocated_bytes: storage,
+    }),
+    legacyMetrics = {
+      provisioned_seconds: 3600,
+      awake_seconds: 3600,
+      memory_mib_seconds: 512 * 3600,
+      cpu_millicore_seconds: 500 * 3600,
+      reserved_memory_mib_seconds: 640 * 3600,
+      reserved_cpu_millicore_seconds: 600 * 3600,
+      reserved_storage_byte_seconds: null,
+      storage_used_bytes_max: 7,
+      storage_allocated_bytes: null,
+      backup_bytes_max: 9,
+      ingress_bytes: 0,
+      egress_bytes: 0,
+      connections: 0,
+      connection_seconds: 0,
+    },
+    legacyGaps = ["reserved_storage_byte_seconds", "storage_allocated_bytes"];
+  const legacyEvent = (
+    f: { id: string; node: string; size: string },
+    kind: string,
+    offset: number,
+    snapshot: unknown,
+    generation = 1,
+  ) =>
+    env.DB.prepare(
+      "INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot) VALUES(?,?,?,?,?,?,?)",
+    ).bind(
+      f.id,
+      kind,
+      f.node,
+      f.size,
+      generation,
+      iso(epoch + offset),
+      JSON.stringify(snapshot),
+    );
+  const legacyRow = (id: string, hour: number, final: number) =>
+    env.DB.prepare(
+      "INSERT INTO usage_hourly(database_id,hour,metrics,gaps,final,computed_at) VALUES(?,?,?,?,?,?)",
+    ).bind(
+      id,
+      iso(hour),
+      JSON.stringify(legacyMetrics),
+      JSON.stringify(legacyGaps),
+      final,
+      iso(hour + 3 * USAGE_HOUR_MS),
+    );
+  const stale = (names: string[]) =>
+    names.filter((name) => name.startsWith("reserved_"));
+
+  it("meters an awake span whose snapshot is in the old shape", () => {
+    const id = newDatabaseId();
+    for (const storage of [5 * 1024 ** 3, null]) {
+      const usage = computeUsageHour(
+        { id, project_id: "prj_" + id, created_at: iso(epoch) },
+        epoch,
+        [
+          {
+            id: 1,
+            kind: "created",
+            occurred_at: iso(epoch),
+            resource_snapshot: JSON.stringify(legacySnapshot(storage)),
+          },
+          {
+            id: 2,
+            kind: "woke",
+            occurred_at: iso(epoch),
+            resource_snapshot: JSON.stringify(legacySnapshot(storage)),
+          },
+        ],
+        [],
+        epoch + 3 * USAGE_HOUR_MS,
+      );
+      expect(usage.metrics.memory_mib_seconds).toBe(512 * 3600);
+      expect(usage.metrics.cpu_millicore_seconds).toBe(500 * 3600);
+      expect(usage.gaps).not.toContain("resource_snapshot");
+      expect(stale(Object.keys(usage.metrics))).toEqual([]);
+    }
+  });
+  it("finalizes an hour from events the old Worker wrote after the migration", async () => {
+    const f = await setup();
+    await env.DB.batch([
+      legacyEvent(f, "created", 0, legacySnapshot(null)),
+      legacyEvent(f, "ready", 0, legacySnapshot(null)),
+      legacyEvent(f, "hibernated", 1_200_000, legacySnapshot(null)),
+      legacyEvent(f, "woke", 2_400_000, legacySnapshot(null), 2),
+    ]);
+    const row = await rollupUsageHour(
+      env.DB,
+      f.id,
+      epoch,
+      epoch + 3 * USAGE_HOUR_MS,
+    );
+    expect(row.final).toBe(true);
+    expect(row.metrics.awake_seconds).toBe(1200 + 1200);
+    expect(row.metrics.memory_mib_seconds).toBe(512 * 2400);
+    expect(row.metrics.cpu_millicore_seconds).toBe(500 * 2400);
+    expect(row.gaps).not.toContain("resource_snapshot");
+  });
+  it("serves hourly rows the old Worker finalized, for a database, a project and a day", async () => {
+    const f = await setup();
+    await env.DB.batch([
+      legacyRow(f.id, epoch, 1),
+      legacyRow(f.id, epoch + USAGE_HOUR_MS, 0),
+    ]);
+    const hourly = { from: iso(epoch), to: iso(epoch + 2 * USAGE_HOUR_MS) };
+    const scopes: Record<string, string>[] = [
+      { database_id: f.id },
+      { project_id: f.project },
+    ];
+    for (const scope of scopes) {
+      const response = await getUsage(f.integrator, {
+        ...scope,
+        ...hourly,
+        granularity: "hour",
+      });
+      expect(response.status).toBe(200);
+      const data = (
+        await response.json<{
+          data: {
+            database_id: string;
+            metrics: Record<string, number | null>;
+            gaps: string[];
+          }[];
+        }>()
+      ).data.filter((row) => row.database_id === f.id);
+      expect(data).toHaveLength(2);
+      for (const row of data) {
+        expect(stale(Object.keys(row.metrics))).toEqual([]);
+        expect(stale(row.gaps)).toEqual([]);
+      }
+      expect(data[0]!.metrics.memory_mib_seconds).toBe(512 * 3600);
+      expect(data[0]!.gaps).toEqual(["storage_allocated_bytes"]);
+    }
+    const day = await getUsage(f.integrator, {
+      database_id: f.id,
+      from: iso(epoch),
+      to: iso(epoch + 24 * USAGE_HOUR_MS),
+      granularity: "day",
+    });
+    expect(day.status).toBe(200);
+    const [row] = (await day.json<{ data: { gaps: string[] }[] }>()).data;
+    expect(stale(row!.gaps)).toEqual([]);
+  });
+  it("returns the stored final hour of the old Worker when the cron meets it again", async () => {
+    const f = await setup();
+    await env.DB.batch([
+      legacyEvent(f, "created", 0, legacySnapshot(null)),
+      legacyEvent(f, "ready", 0, legacySnapshot(null)),
+      legacyRow(f.id, epoch, 1),
+    ]);
+    const row = await rollupUsageHour(
+      env.DB,
+      f.id,
+      epoch,
+      epoch + 3 * USAGE_HOUR_MS,
+    );
+    expect(row.final).toBe(true);
+    expect(row.metrics.backup_bytes_max).toBe(9);
+    expect(stale(Object.keys(row.metrics))).toEqual([]);
+    expect(stale(row.gaps)).toEqual([]);
+  });
+});
+
 // A sleeping database emits no usage row (the node agent says nothing for an interval in which
 // nothing was awake and nothing was counted), so the rollup must ask the gateway for coverage of
 // the awake time only; asleep time with no row is a measured zero, not a gap.

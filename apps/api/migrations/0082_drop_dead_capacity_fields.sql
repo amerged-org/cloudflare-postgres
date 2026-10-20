@@ -22,6 +22,9 @@
 -- is cleared: an order waits for approval until PUT /v1/regions/{id}/capacity-policy stores the
 -- profile again. The other hashes are the hash of the profile alone and stay valid.
 --
+-- Run the migration and the deploy of the API Worker one after the other. The Worker that still runs
+-- in between keeps writing the old usage shape (snapshots with the three keys above, hourly rows
+-- with the three metrics); nothing it writes names a dropped column, and the new Worker reads it.
 -- A rollback of the API Worker alone does not undo this migration; the older API reads columns it no
 -- longer has.
 
