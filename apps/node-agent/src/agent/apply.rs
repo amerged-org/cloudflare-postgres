@@ -2477,7 +2477,18 @@ mod tests {
 
     /// A database that exists, with a table of 4000 rows, asleep with its proof.
     async fn source(rig: &Rig) -> (Value, String, crate::state::DatabaseState) {
+        source_in_class(rig, 256, 25).await
+    }
+
+    /// The same, of a class of `memory_mib` and `max_connections`.
+    async fn source_in_class(
+        rig: &Rig,
+        memory_mib: u64,
+        max_connections: u64,
+    ) -> (Value, String, crate::state::DatabaseState) {
         let mut db = rig.entry_json();
+        db["resources"]["memory_mib"] = json!(memory_mib);
+        db["settings"]["max_connections"] = json!(max_connections);
         let id = id_of(&db);
         let handle = rig.core.db(&id);
         rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
@@ -2541,6 +2552,61 @@ mod tests {
                 .any(|e| e["type"] == "admission" && e["start"] == "restore")
         );
         assert_eq!(rig.observation(&id)["state"], "ready");
+    }
+
+    /// A restore into a class smaller than its source's recovers on the source's settings, which
+    /// PostgreSQL requires of a recovery with hot standby, and is restarted onto the class's own
+    /// before it is ready: what the agent builds, with the real unit start, is ready only then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restore_into_a_smaller_class_restarts_onto_the_classs_settings_before_it_is_ready() {
+        let Some(rig) = Rig::new("restore-smaller").await else {
+            return;
+        };
+        // The source is of a 1 GiB class with 200 connections; the restore is of the 256 MiB
+        // class with 20.
+        let (source_json, source_id, source_state) = source_in_class(&rig, 1024, 200).await;
+        let backup = source_state.backup.clone().unwrap();
+        let source_path = source_json["archive"]["path"].as_str().unwrap().to_string();
+        rig.deliver(&source_path, "read_only");
+
+        let mut restored = rig.entry_json();
+        let id = id_of(&restored);
+        restored["settings"]["max_connections"] = json!(20);
+        restored["origin"] = json!({"kind": "restore", "source": {
+            "database_id": source_id, "path": source_path, "backup_id": backup.backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"}}});
+        let handle = rig.core.db(&id);
+        rig.core
+            .apply(&Rig::page(vec![restored.clone()], vec![]))
+            .await;
+        eventually(120, "the restore", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+
+        let data = tenant(&rig, &id).await;
+        let rows = data.query("SELECT count(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 4000);
+        for (name, value) in [
+            ("max_connections", "20"),
+            ("max_worker_processes", "4"),
+            ("max_wal_senders", "0"),
+        ] {
+            let rows = data.query(&format!("SHOW {name}"), &[]).await.unwrap();
+            assert_eq!(rows[0].get::<_, String>(0), value, "{name}");
+        }
+        // The route names the postmaster that serves: the one after the restart.
+        let writer = handle.view().writer.clone().unwrap();
+        let pid_file =
+            std::fs::read_to_string(rig.core.layout().data(&id).join("postmaster.pid")).unwrap();
+        assert_eq!(
+            pid_file.lines().next().map(str::to_string),
+            Some(writer.pid.to_string())
+        );
+        // Its own first base backup is DONE, from the class's settings.
+        let own = handle.state().unwrap().backup.unwrap();
+        assert_eq!(own.timeline, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

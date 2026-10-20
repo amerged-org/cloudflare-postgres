@@ -8,11 +8,16 @@
 //! 2. `barman-cloud-restore` it into the new database's data directory, as the new database's user.
 //! 3. Write the recovery settings and register the database with its `Recovery`, so that its
 //!    `restore_command` is answered from the source archive (a move target must reach the
-//!    source's last segment, `End`).
+//!    source's last segment, `End`). The recovery runs with the larger of the backup's own
+//!    `max_connections`, process, sender, prepared transaction and lock settings (its control
+//!    file) and the class's, which PostgreSQL requires of a recovery with hot standby; the class
+//!    must have the memory for them.
 //! 4. Start it and wait for it to promote; check that it is the backup's database on a later
 //!    timeline (and the source's, for a move).
-//! 5. Remove the recovery settings and the spool, and take the first base backup of the new
-//!    timeline into the database's own archive; it counts only when the listing shows it DONE.
+//! 5. Remove the recovery settings and the spool; if the recovery ran with more than the class
+//!    has, restart the database onto the class's own settings. Then take the first base backup
+//!    of the new timeline into the database's own archive; it counts only when the listing shows
+//!    it DONE.
 //!
 //! The caller creates the new database's user and its volume (at least as large as the source's)
 //! first, and resets the roles of the page once the database is ready (plan 7.8 step 5): the
@@ -26,7 +31,7 @@ use super::{
     server::{Recovery, Registration, Table, log_failed_job, unix_seconds},
     upload_log::UploadLog,
 };
-use crate::credentials::Credentials;
+use crate::{credentials::Credentials, pg_control, proof, settings::Capacity};
 use serde_json::json;
 use std::{future::Future, time::Instant};
 
@@ -43,6 +48,10 @@ pub trait Host {
     /// Waits until the database has left recovery, and says who it is. `Failed` when its unit
     /// stopped first, or the wait ran out: the recovery did not reach its end.
     fn promoted(&self) -> impl Future<Output = Result<Restored, Failed>> + Send;
+    /// Stops the promoted database and starts it again, still admitted, on the configuration the
+    /// agent wrote (the recovery's settings are gone): the settings that a larger source made the
+    /// recovery run with are the class's own again. `Failed` when the unit did not come up.
+    fn restart(&self) -> impl Future<Output = Result<(), Failed>> + Send;
     /// Stops the unit and deletes the volume and the user of a build that failed.
     fn abandon(&self) -> impl Future<Output = ()> + Send;
 }
@@ -60,6 +69,9 @@ pub struct End {
 pub struct Order<'a> {
     /// The new database: its user, its volume, the directory of its socket.
     pub database: &'a Database,
+    /// The class it runs in: its memory (`memory.max`) and `max_connections`.
+    pub memory_mib: u64,
+    pub max_connections: u32,
     /// The user and group of the database, who own what the agent writes into its volume.
     pub uid: u32,
     pub gid: u32,
@@ -101,9 +113,10 @@ impl Restorer<'_> {
 
     async fn build<H: Host>(&self, order: &Order<'_>, host: &H) -> Result<Backup, &'static str> {
         let database = order.database;
-        // An order the settings cannot be made from fails before anything is fetched.
-        let settings =
-            recovery::settings(self.fetch_command, order.target_time).ok_or("build_failed")?;
+        let class = Capacity::of_class(order.memory_mib, order.max_connections);
+        // An order the settings cannot be made from fails before anything is fetched (they are
+        // written below, with the settings the backup needs).
+        recovery::settings(self.fetch_command, order.target_time, &class).ok_or("build_failed")?;
 
         let mut lap = Instant::now();
         // 1. The source's backup, DONE and with the size of its WAL segments.
@@ -132,6 +145,26 @@ impl Restorer<'_> {
         phase(order, "base_fetched", &mut lap);
 
         // 3. The recovery settings, and the database known to the archive socket as recovering.
+        // The backup's control file has the settings of the database it came from.
+        let source = proof::read_control(&database.volume)
+            .ok()
+            .and_then(|bytes| pg_control::parse_capacity(&bytes).ok())
+            .ok_or("archive_unusable")?;
+        let capacity = class.at_least(source);
+        if !capacity.fits(order.memory_mib) {
+            crate::timing::emit_event(json!({
+                "event": "restore_capacity_refused", "database_id": database.id,
+                "memory_mib": order.memory_mib,
+                "max_connections": capacity.max_connections,
+                "max_worker_processes": capacity.max_worker_processes,
+                "max_wal_senders": capacity.max_wal_senders,
+                "max_prepared_transactions": capacity.max_prepared_transactions,
+                "max_locks_per_transaction": capacity.max_locks_per_transaction,
+            }));
+            return Err("build_failed");
+        }
+        let settings = recovery::settings(self.fetch_command, order.target_time, &capacity)
+            .ok_or("build_failed")?;
         recovery::prepare(&database.data_directory(), &settings, order.uid, order.gid)
             .map_err(|_| "build_failed")?;
         let spool = recovery::spool_directory(&database.volume, order.operation);
@@ -163,6 +196,12 @@ impl Restorer<'_> {
         // otherwise carry them; the database now archives to its own store.
         self.table.set(registration(None));
         recovery::finish(&database.data_directory(), &spool).map_err(|_| "build_failed")?;
+        // The database runs on the settings its recovery needed. It runs on its class's before it
+        // counts as ready, and its first base backup records those.
+        if capacity != class {
+            host.restart().await.map_err(|_| "start_failed")?;
+            phase(order, "restarted", &mut lap);
+        }
         let first = Job::base_backup(order.store, database);
         self.barman(order, order.store, first, "backup")
             .await
@@ -262,6 +301,10 @@ mod tests {
             self.started.store(true, Ordering::SeqCst);
             Err(Failed)
         }
+        async fn restart(&self) -> Result<(), Failed> {
+            self.started.store(true, Ordering::SeqCst);
+            Err(Failed)
+        }
         async fn abandon(&self) {
             self.abandoned.store(true, Ordering::SeqCst);
         }
@@ -296,6 +339,9 @@ mod tests {
         let log = UploadLog::new(volume.join("uploads"));
         let order = Order {
             database: &database,
+            // The smallest class of the catalog.
+            memory_mib: 256,
+            max_connections: 20,
             uid: owner.uid(),
             gid: owner.gid(),
             source: &source,
@@ -361,11 +407,27 @@ mod tests {
         );
     }
 
+    /// The files of a backup of a cluster that ran with `capacity`: no more than what a restore
+    /// reads of it.
+    fn backup_files(name: &str, capacity: Option<&Capacity>) -> std::path::PathBuf {
+        let files = directory(name);
+        std::fs::write(files.join("PG_VERSION"), "18\n").unwrap();
+        if let Some(capacity) = capacity {
+            std::fs::create_dir_all(files.join("global")).unwrap();
+            std::fs::write(
+                files.join("global/pg_control"),
+                crate::pg_control::control_file(capacity),
+            )
+            .unwrap();
+        }
+        files
+    }
+
     #[tokio::test]
     async fn a_database_that_does_not_start_is_abandoned_with_its_files_prepared() {
         let node = Node::start("restore-start", AGENT_BOUND).await;
-        let files = directory("restore-start-files");
-        std::fs::write(files.join("PG_VERSION"), "18\n").unwrap();
+        // The backup of a database of the catalog's md class, restored into xs.
+        let files = backup_files("restore-start-files", Some(&Capacity::of_class(1024, 200)));
         node.fixture.put_backup(
             SOURCE,
             BACKUP,
@@ -382,12 +444,69 @@ mod tests {
             std::fs::read_to_string(volume.join("data/PG_VERSION")).unwrap(),
             "18\n"
         );
-        assert!(
-            std::fs::read_to_string(volume.join("data").join(recovery::SETTINGS_FILE))
-                .unwrap()
-                .contains("restore_command = '/usr/libexec/pgcf/pgcf-wal-fetch %f %p'")
-        );
+        let settings =
+            std::fs::read_to_string(volume.join("data").join(recovery::SETTINGS_FILE)).unwrap();
+        assert!(settings.contains("restore_command = '/usr/libexec/pgcf/pgcf-wal-fetch %f %p'"));
+        // The recovery runs with the larger of each setting: md's connections (200), workers (8)
+        // and senders (10); the locks and prepared transactions are the same in both classes.
+        for line in [
+            "max_connections = 200",
+            "max_worker_processes = 8",
+            "max_wal_senders = 10",
+            "max_prepared_transactions = 0",
+            "max_locks_per_transaction = 64",
+        ] {
+            assert!(settings.lines().any(|l| l == line), "{line}\n{settings}");
+        }
         assert!(volume.join("data").join(recovery::SIGNAL_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn a_backup_without_a_readable_control_file_is_unusable_and_nothing_is_written() {
+        let node = Node::start("restore-control", AGENT_BOUND).await;
+        let segment = Some(SEGMENT_BYTES);
+        let no_control = backup_files("restore-no-control", None);
+        node.fixture
+            .put_backup(SOURCE, BACKUP, &entry("DONE", segment), Some(&no_control));
+        let (result, host, volume) = restore_into(&node, "no-control", BACKUP, None).await;
+        assert_eq!(result.unwrap_err(), "archive_unusable");
+        assert!(host.abandoned.load(Ordering::SeqCst));
+        assert!(!host.started.load(Ordering::SeqCst));
+        assert!(!volume.join("data").join(recovery::SETTINGS_FILE).exists());
+
+        // The control file of another release is as good as none.
+        let other = backup_files("restore-other-release", Some(&Capacity::of_class(256, 20)));
+        let mut bytes = std::fs::read(other.join("global/pg_control")).unwrap();
+        bytes[8..12].copy_from_slice(&1700u32.to_le_bytes());
+        std::fs::write(other.join("global/pg_control"), bytes).unwrap();
+        node.fixture
+            .put_backup(SOURCE, BACKUP, &entry("DONE", segment), Some(&other));
+        let (result, host, _) = restore_into(&node, "other-release", BACKUP, None).await;
+        assert_eq!(result.unwrap_err(), "archive_unusable");
+        assert!(!host.started.load(Ordering::SeqCst));
+    }
+
+    /// The class's memory limit is the unit's: a recovery whose settings need more shared memory
+    /// than half of it is refused before the database starts, with the settings in the log, and
+    /// does not run into the kernel's out-of-memory kill.
+    #[tokio::test]
+    async fn a_source_whose_settings_the_class_has_no_memory_for_is_refused_before_it_starts() {
+        let node = Node::start("restore-memory", AGENT_BOUND).await;
+        let files = backup_files(
+            "restore-memory-files",
+            Some(&Capacity::of_class(4096, 10_000)),
+        );
+        node.fixture.put_backup(
+            SOURCE,
+            BACKUP,
+            &entry("DONE", Some(SEGMENT_BYTES)),
+            Some(&files),
+        );
+        let (result, host, volume) = restore_into(&node, "memory", BACKUP, None).await;
+        assert_eq!(result.unwrap_err(), "build_failed");
+        assert!(host.abandoned.load(Ordering::SeqCst));
+        assert!(!host.started.load(Ordering::SeqCst));
+        assert!(!volume.join("data").join(recovery::SETTINGS_FILE).exists());
     }
 
     #[tokio::test]

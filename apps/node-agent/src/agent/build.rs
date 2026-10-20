@@ -593,6 +593,8 @@ impl<M: Machine> Core<M> {
         };
         let order = Order {
             database: &job_database,
+            memory_mib: entry.memory_mib,
+            max_connections: entry.max_connections,
             uid: account.uid,
             gid: account.gid,
             source: &from,
@@ -671,13 +673,11 @@ impl<M: Machine> Rebuild<M> {
         }
     }
 }
-impl<M: Machine> Host for Rebuild<M> {
-    async fn start(&self) -> Result<(), Failed> {
-        let core = &self.core;
-        // The restored files are the source's: the agent's own replace them before the start.
-        core.write_configuration(&self.entry, &self.account)
-            .map_err(|_| Failed)?;
-        let started = core
+impl<M: Machine> Rebuild<M> {
+    /// Starts the unit, through admission, and keeps who started.
+    async fn start_unit(&self) -> Result<(), Failed> {
+        let started = self
+            .core
             .start_unit(
                 &self.db,
                 &self.entry,
@@ -695,6 +695,26 @@ impl<M: Machine> Host for Rebuild<M> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(started.0);
         Ok(())
+    }
+}
+impl<M: Machine> Host for Rebuild<M> {
+    async fn start(&self) -> Result<(), Failed> {
+        // The restored files are the source's: the agent's own replace them before the start.
+        self.core
+            .write_configuration(&self.entry, &self.account)
+            .map_err(|_| Failed)?;
+        self.start_unit().await
+    }
+
+    async fn restart(&self) -> Result<(), Failed> {
+        // The database stays admitted, so that no other start takes its memory in between, and
+        // the unit's new invocation is the one the route names.
+        self.core
+            .machine
+            .stop(&self.entry.id)
+            .await
+            .map_err(|_| Failed)?;
+        self.start_unit().await
     }
 
     async fn promoted(&self) -> Result<Restored, Failed> {

@@ -6,6 +6,7 @@
 //! `include_if_exists = 'pgcf-recovery.conf'`, so that the agent removes them without editing
 //! the configuration (step 5).
 use super::facts::Backup;
+use crate::settings::Capacity;
 use std::{
     io,
     path::{Path, PathBuf},
@@ -18,20 +19,21 @@ pub const SETTINGS_FILE: &str = "pgcf-recovery.conf";
 /// PostgreSQL starts archive recovery when this file exists, and removes it when it promotes.
 pub const SIGNAL_FILE: &str = "recovery.signal";
 
-/// PostgreSQL's defaults for the two settings that a recovery with hot standby compares with the
-/// source's, from its control file and the parameter changes in its WAL, and aborts on when its
-/// own are lower ("recovery aborted because of insufficient parameter settings"). A small database
-/// runs fewer (`settings::postgresql_conf`), and the source may be a larger class or a database of
-/// an earlier release, so the recovery runs with the most the agent ever writes. The file goes
-/// when the recovery is over, and the next start is the database's own.
-const SOURCE_LIMITS: &str = "max_worker_processes = 8\nmax_wal_senders = 10\n";
-
-/// The recovery settings: fetch through the archive socket, follow the latest timeline, and for a
-/// point in time (`target_time`, a contract timestamp) stop there and promote. Without a target
-/// the recovery ends where the archive does, and PostgreSQL promotes. `None` for a time that is
-/// not a contract timestamp. PostgreSQL 18 refuses `Z` here, which it reads as a time zone
-/// abbreviation, so the time is written with a numeric offset.
-pub fn settings(fetch_command: &str, target_time: Option<&str>) -> Option<String> {
+/// The recovery settings: fetch through the archive socket, follow the latest timeline, run with
+/// `capacity`, and for a point in time (`target_time`, a contract timestamp) stop there and
+/// promote. Without a target the recovery ends where the archive does, and PostgreSQL promotes.
+/// `None` for a time that is not a contract timestamp. PostgreSQL 18 refuses `Z` here, which it
+/// reads as a time zone abbreviation, so the time is written with a numeric offset.
+///
+/// A recovery with hot standby aborts when any of the five settings of `Capacity` is below the
+/// value its source's control file records ("recovery aborted because of insufficient parameter
+/// settings"). The caller passes the larger of the source's and the target class's, and the
+/// database restarts on the class's own once the recovery is over (`restore`).
+pub fn settings(
+    fetch_command: &str,
+    target_time: Option<&str>,
+    capacity: &Capacity,
+) -> Option<String> {
     let plain_path = fetch_command.starts_with('/')
         && fetch_command
             .bytes()
@@ -40,7 +42,14 @@ pub fn settings(fetch_command: &str, target_time: Option<&str>) -> Option<String
         return None;
     }
     let mut settings = format!(
-        "restore_command = '{fetch_command} %f %p'\nrecovery_target_timeline = 'latest'\n{SOURCE_LIMITS}"
+        "restore_command = '{fetch_command} %f %p'\nrecovery_target_timeline = 'latest'\n\
+         max_connections = {}\nmax_worker_processes = {}\nmax_wal_senders = {}\n\
+         max_prepared_transactions = {}\nmax_locks_per_transaction = {}\n",
+        capacity.max_connections,
+        capacity.max_worker_processes,
+        capacity.max_wal_senders,
+        capacity.max_prepared_transactions,
+        capacity.max_locks_per_transaction,
     );
     if let Some(time) = target_time {
         let contract_timestamp = time.len() == 24
@@ -138,14 +147,26 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
-    fn recovery_fetches_through_the_socket_and_stops_where_the_order_says() {
+    fn recovery_fetches_through_the_socket_runs_with_the_capacity_and_stops_where_the_order_says() {
+        let capacity = Capacity {
+            max_connections: 200,
+            max_worker_processes: 8,
+            max_wal_senders: 10,
+            max_prepared_transactions: 4,
+            max_locks_per_transaction: 128,
+        };
+        let head = "restore_command = '/usr/libexec/pgcf/pgcf-wal-fetch %f %p'\nrecovery_target_timeline = 'latest'\nmax_connections = 200\nmax_worker_processes = 8\nmax_wal_senders = 10\nmax_prepared_transactions = 4\nmax_locks_per_transaction = 128\n";
+        assert_eq!(settings(WAL_FETCH_COMMAND, None, &capacity).unwrap(), head);
         assert_eq!(
-            settings(WAL_FETCH_COMMAND, None).unwrap(),
-            "restore_command = '/usr/libexec/pgcf/pgcf-wal-fetch %f %p'\nrecovery_target_timeline = 'latest'\nmax_worker_processes = 8\nmax_wal_senders = 10\n"
-        );
-        assert_eq!(
-            settings(WAL_FETCH_COMMAND, Some("2026-10-17T22:53:45.664Z")).unwrap(),
-            "restore_command = '/usr/libexec/pgcf/pgcf-wal-fetch %f %p'\nrecovery_target_timeline = 'latest'\nmax_worker_processes = 8\nmax_wal_senders = 10\nrecovery_target_time = '2026-10-17 22:53:45.664+00'\nrecovery_target_action = 'promote'\n"
+            settings(
+                WAL_FETCH_COMMAND,
+                Some("2026-10-17T22:53:45.664Z"),
+                &capacity
+            )
+            .unwrap(),
+            format!(
+                "{head}recovery_target_time = '2026-10-17 22:53:45.664+00'\nrecovery_target_action = 'promote'\n"
+            )
         );
         for bad in [
             "",
@@ -156,15 +177,20 @@ mod tests {
             "2026-13-17T22:53:45.664Z",
             "'; DROP",
         ] {
-            assert_eq!(settings(WAL_FETCH_COMMAND, Some(bad)), None, "{bad:?}");
+            assert_eq!(
+                settings(WAL_FETCH_COMMAND, Some(bad), &capacity),
+                None,
+                "{bad:?}"
+            );
         }
     }
 
     #[test]
     fn the_fetch_command_is_a_plain_absolute_path() {
-        assert!(settings("/opt/pgcf/bin/wal-fetch_2", None).is_some());
+        let capacity = Capacity::of_class(256, 20);
+        assert!(settings("/opt/pgcf/bin/wal-fetch_2", None, &capacity).is_some());
         for bad in ["", "wal-fetch", "/a b", "/a'; touch /x; '", "/a%f", "/a\nb"] {
-            assert_eq!(settings(bad, None), None, "{bad:?}");
+            assert_eq!(settings(bad, None, &capacity), None, "{bad:?}");
         }
     }
 
@@ -185,7 +211,12 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         std::fs::create_dir_all(&spool).unwrap();
         std::fs::write(spool.join("000000010000000000000009"), b"prefetched").unwrap();
-        let text = settings(WAL_FETCH_COMMAND, Some("2026-10-17T22:53:45.664Z")).unwrap();
+        let text = settings(
+            WAL_FETCH_COMMAND,
+            Some("2026-10-17T22:53:45.664Z"),
+            &Capacity::of_class(256, 20),
+        )
+        .unwrap();
         // The directory's own user and group, here the test's.
         let owner = std::fs::metadata(&data).unwrap();
         prepare(&data, &text, owner.uid(), owner.gid()).unwrap();
@@ -339,8 +370,8 @@ mod tests {
     /// `max_wal_senders` is below the values its source's control file records (checked against a
     /// real server). A small database runs fewer than the defaults, so the restore of a larger
     /// class's backup and archive, here a cold copy of its cluster and the WAL it archived
-    /// afterwards, must run with at least those, and the promoted database runs on as the agent
-    /// configured it once the settings are removed.
+    /// afterwards, runs with the larger of each setting, and the database runs as the agent
+    /// configured it once the settings are removed and it has restarted.
     #[tokio::test]
     async fn a_small_database_recovers_the_backup_and_archive_of_a_larger_one() {
         use crate::testpg::{self, Cluster};
@@ -425,7 +456,14 @@ mod tests {
         target.configure(256, None);
         let data = target.data();
         let owner = std::fs::metadata(&data).unwrap();
-        let text = settings(fetch.to_str().unwrap(), None).unwrap();
+        // The settings of the source, read from the control file of its backup.
+        let source_capacity = crate::pg_control::parse_capacity(
+            &crate::proof::read_control(&target.volume()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(source_capacity, Capacity::of_class(1024, 25));
+        let capacity = Capacity::of_class(256, 25).at_least(source_capacity);
+        let text = settings(fetch.to_str().unwrap(), None, &capacity).unwrap();
         prepare(&data, &text, owner.uid(), owner.gid()).unwrap();
         target.start();
         let session = target.agent().await;
