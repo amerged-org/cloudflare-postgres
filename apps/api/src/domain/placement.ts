@@ -21,9 +21,10 @@ const POOL_METADATA_CLOSED_PPM = 500_000;
 const LOGICAL_CAP_FACTOR = 4;
 /**
  * The technical volume bound (plan 4.8, 4.11): from this many thin volumes a node is closed for
- * create, restore and move, and counts as full for the purchase signal. The LVM metadata area of
- * the default size runs out near 1,450 volumes (Stage 1); the margin absorbs the volumes created
- * between two samples. A resize adds no volume and is not stopped by it.
+ * create, restore and move, and counts as full for the purchase signal. It is the largest count
+ * Stage 1 measured, and it rises only after a measurement at a higher count; the 64 MiB LVM
+ * metadata area the agent creates would hold far more. Volumes created between two samples can
+ * take a node a little past it. A resize adds no volume and is not stopped by it.
  */
 export const MAX_VOLUMES_PER_NODE = 1000;
 /** The averaging window of a load figure, and how far back its highest value counts. */

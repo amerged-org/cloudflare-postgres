@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { INFRA_ALERT_ACTIONS, InfraAlertKind } from "@pgcf/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
@@ -77,6 +78,15 @@ describe("the technical volume bound of a node (plan 4.8, 4.11)", () => {
     expect(await closedPools(env.DB, f.region)).toEqual([]);
     await report(f.node, 1000);
     expect(await closedPools(env.DB, f.region)).toEqual([f.node]);
+  });
+
+  it("is named by the pool-closed alert: its definition and its runbook action say the volume bound, not only the pool", () => {
+    const bound = `${MAX_VOLUMES_PER_NODE.toLocaleString("en-US")} volumes`;
+    const definition = InfraAlertKind.description!.split(
+      "regional_node_pool_closed: ",
+    )[1]!.split(" database_volume_warning")[0]!;
+    expect(definition).toContain(bound);
+    expect(INFRA_ALERT_ACTIONS.regional_node_pool_closed).toContain(bound);
   });
 
   it("counts a node at the bound as full in the capacity decision: it raises the purchase signal at 1,000, not at 999", async () => {

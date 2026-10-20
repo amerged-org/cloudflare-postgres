@@ -248,9 +248,9 @@ What happens: the database record (generation 1) and the owner role `app` with a
 password are written (`pgcf_maintenance` is only a reserved name); the
 placement step picks the node that is the fullest of those that stay under 80 % active RAM and 80 %
 CPU load, each as the highest 30-minute average of the last seven days, and whose thin pool is
-open (data below 80 %, metadata below 50 %, sold storage within four times its data). A database
-placed after the node's newest sample counts at its full memory until that sample exists, and the
-newest sample's active RAM counts when it is above the average. The node then creates the volume
+open (data below 80 %, metadata below 50 %, sold storage within four times its data) and that holds
+fewer than 1,000 volumes. A database placed after the node's newest sample counts at its full
+memory until that sample exists, and the newest sample's active RAM counts when it is above the average. The node then creates the volume
 and the cluster, applies the roles, starts PostgreSQL through its own admission and takes the first
 base backup; WAL archiving starts with the first start. The database is ready only when that backup
 is DONE, so it is never writable before it is restorable. The idle time
@@ -846,12 +846,12 @@ times the pool's data. Chunks are zeroed before reuse, so space freed by one dat
 readable by another.
 
 - **The pool.** Placement closes a node's pool at 80 % of its data, 50 % of its metadata or the
-  cap, and the node itself at 1,000 volumes (the technical bound, a limit of the LVM metadata
-  area, not a sales limit): nothing new is created, restored or moved there, a resize still
-  works, and running databases keep running. A region whose nodes are all closed holds a new
-  database as "Waiting for verified regional capacity" until a node is added. A node whose
-  pool has no room refuses every create, restore and wake with `57P03` and the DETAIL "storage". A
-  pool that does fill fails writes at once, with no commit acknowledged without durable WAL; the
+  cap, and the node itself at 1,000 volumes (the technical bound: the largest count measured on a
+  node, raised only after a measurement at a higher count, not a sales limit): nothing new is
+  created, restored or moved there, a resize still works, and running databases keep running. A
+  region whose nodes are all closed holds a new database as "Waiting for verified regional
+  capacity" until a node is added. A node whose pool has no room refuses every create, restore and
+  wake with `57P03` and the DETAIL "storage". A pool that does fill fails writes at once, with no commit acknowledged without durable WAL; the
   affected databases stop, and the node recovers them by itself once space is back.
 - **One volume.** Raising a database's storage is an admin call (`PUT /v1/databases/{id}/resources`,
   growth only, online); nothing grows a volume for you. `health.disk.status` becomes `warning` at
@@ -977,7 +977,7 @@ measurement is fresh and below the threshold. A recurrence has the same `event_i
 | `database_base_backup_stale`                                  | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count         | fixed                              |
 | `thin_storage_blocked`                                        | a node's newest sample says its thin pool has no room, or a node that holds databases has no sample of its pool within 180 s (`thin_pool_*`) | fixed                                             |
 | `regional_node_capacity_refusals`                             | a node refused 5 or more wakes for awake capacity (`57P03`) in 10 minutes                                                                    | fixed                                             |
-| `regional_node_pool_closed`                                   | a node's newest sample closes its thin pool for placement: data at 80 %, metadata at 50 % or the sold storage at 4 times its data           | fixed                                             |
+| `regional_node_pool_closed`                                   | a node's newest sample closes it for placement: pool data at 80 %, pool metadata at 50 %, sold storage at 4 times its data, or 1,000 volumes | fixed                                             |
 | `database_volume_warning`, `database_volume_critical`         | a database volume's space or inodes are at least 80 % (below 90 %), or at least 90 %, used                                                   | fixed                                             |
 | `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed |
 | `node_unexpected_reboot` | a node rebooted and no maintenance order of it asked for it, within the last 24 h | fixed |

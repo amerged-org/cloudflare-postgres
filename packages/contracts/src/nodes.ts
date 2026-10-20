@@ -201,7 +201,7 @@ export const NodeRegionPolicy = z
       .boolean()
       .default(false)
       .describe(
-        "Permits paid provider orders: an order addition is dispatched only while this is true and its order equals `order`. Requires `order`.",
+        "Permits paid provider orders: the capacity cron reserves an order addition, and it is dispatched, only while this is true and its order equals `order`. Requires `order`.",
       ),
     autoscale_enabled: z.boolean().optional(),
     ram_expansion_threshold_ppm: ThresholdPpm.nullable()
