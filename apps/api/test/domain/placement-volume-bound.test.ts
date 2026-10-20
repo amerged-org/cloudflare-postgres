@@ -13,7 +13,7 @@ import {
   type PlacementNeed,
 } from "../../src/domain/placement.ts";
 import { addNode, cleanupFixtures, fixture } from "./fixtures.ts";
-import { seedSamples, steady } from "./node-samples.ts";
+import { OPEN_POOL, seedSamples, steady } from "./node-samples.ts";
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -28,8 +28,11 @@ const SMALL: PlacementNeed = {
 };
 /** Each report is a little newer than the one before, so the node's newest sample is the last one. */
 let clock = 0;
-const report = (nodeId: string, volumes: number) =>
-  seedSamples(nodeId, steady(Date.now() + ++clock, 40, { volumes }));
+const report = (
+  nodeId: string,
+  volumes: number,
+  pool: typeof OPEN_POOL = OPEN_POOL,
+) => seedSamples(nodeId, steady(Date.now() + ++clock, 40, { volumes, pool }));
 const nodeOf = async (f: Awaited<ReturnType<typeof fixture>>, now: number) =>
   (await placementNodes(env.DB, f.region, now)).find((n) => n.id === f.node)!;
 
@@ -70,6 +73,19 @@ describe("the technical volume bound of a node (plan 4.8, 4.11)", () => {
     expect(
       growthFits(node, { memory_mib: 256, cpu_millicores: 0, storage_gib: 1 }),
     ).toBe(true);
+  });
+
+  it("still refuses storage growth past the logical cap on a node at the bound: the cap keeps its own name", async () => {
+    const f = await fixture(4096);
+    await report(f.node, 1000, {
+      ...OPEN_POOL,
+      nominal: 4 * OPEN_POOL.dataTotal,
+    });
+    const node = await nodeOf(f, Date.now());
+    expect(node.pool_nominal_bytes).toBe(4 * OPEN_POOL.dataTotal);
+    expect(
+      growthFits(node, { memory_mib: 0, cpu_millicores: 0, storage_gib: 1 }),
+    ).toBe(false);
   });
 
   it("raises the pool-closed alarm's node list at 1,000 volumes and not at 999", async () => {
