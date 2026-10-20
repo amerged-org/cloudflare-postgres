@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // A wake of an idle sleeper that does not end in a running database returns the database to its idle
 // sleep, so that the node proves the sleep again and the next connection wakes it with a new ticket
-// (`recoverFailedResume`, which a resume that failed already uses). Real D1 and Durable Object
-// harness; no live evidence.
+// (`recoverFailedResume`, which a resume that failed already uses). A wake the agent does not carry
+// out reaches D1 as the agent's `asleep` at the wake's generation (a ticket it refuses, a start
+// that fails, a restart of the agent), and the power timeout ends it. A persistent node error
+// (`volume_missing`, `identity_mismatch`) is no wake failure and returns nothing to sleep. Real D1
+// and Durable Object harness; no live evidence.
 import { env } from "cloudflare:workers";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it } from "vitest";
 import { runCron } from "../../src/cron.ts";
 import { cleanupFixtures, report, verdicts } from "./fixtures.ts";
 import { actor, sleeping, untilWake } from "./wake-fixture.ts";
 
 afterEach(async () => {
-  vi.restoreAllMocks();
   await env.DB.prepare("DELETE FROM reconciliation_cursors").run();
   await env.DB.prepare("DELETE FROM power_timeout_cursor").run();
   await cleanupFixtures();
@@ -101,51 +103,13 @@ async function wakesNormally(f: Sleeper, hibernation: string) {
   });
 }
 
-it("returns the idle sleeper to its idle sleep when the node reports an error for the wake, and the node's proof ends the sleep again", async () => {
-  const f = await sleeping();
+/**
+ * The node took the ticket, did not start the database and reports it asleep at the wake's
+ * generation, as after a refused ticket or a restart of the agent: D1 shows the database running
+ * and asleep with a wake that nothing carries out, until the power timeout returns it to sleep.
+ */
+async function wakeThatNeverEnds(f: Sleeper) {
   const wake = await woken(f);
-  expect(
-    await verdicts(
-      await report(f, f.id, 3, "error", {
-        error: "start_failed",
-        message: "the unit did not start",
-      }),
-    ),
-  ).toEqual(["accept"]);
-  // The wake fails with the node's reason, and the database is the idle sleeper it was before it.
-  expect(await operation(wake.power_operation)).toMatchObject({
-    status: "failed",
-    error_code: "start_failed",
-  });
-  const after = await row(f.id);
-  expect(after).toMatchObject({
-    desired_state: "suspended",
-    suspension_reason: "idle",
-    generation: 4,
-    observed_state: "provisioning",
-    observed_power: "hibernated",
-    status_message: "Wake failed: start_failed",
-  });
-  expect(await operation(after!.power_operation)).toMatchObject({
-    kind: "database.hibernate",
-    status: "pending",
-    generation: 4,
-  });
-  // The node's report of the failed wake, sent again, changes nothing.
-  expect(
-    await verdicts(
-      await report(f, f.id, 3, "error", { error: "start_failed" }),
-    ),
-  ).toEqual(["stale"]);
-  expect((await row(f.id))!.generation).toBe(4);
-  await wakesNormally(f, after!.power_operation);
-});
-
-it("returns the idle sleeper to its idle sleep when its wake never ends, as after a refused ticket or a restart of the agent", async () => {
-  const f = await sleeping();
-  const wake = await woken(f);
-  // The node took the page, did not start the database and reports it asleep at the wake's
-  // generation: D1 shows it running and asleep, with a wake that nothing carries out.
   expect(await verdicts(await report(f, f.id, 3, "asleep"))).toEqual([
     "accept",
   ]);
@@ -175,59 +139,74 @@ it("returns the idle sleeper to its idle sleep when its wake never ends, as afte
     suspension_reason: "idle",
     generation: 4,
     observed_power: "hibernated",
+    status_message: "Wake failed: operation_timeout",
   });
   expect(await operation(after!.power_operation)).toMatchObject({
     kind: "database.hibernate",
     status: "pending",
+    generation: 4,
   });
+  return after!;
+}
+
+it("returns the idle sleeper to its idle sleep when its wake never ends, the node proves the sleep, and the next connection wakes it with a new ticket", async () => {
+  const f = await sleeping();
+  const after = await wakeThatNeverEnds(f);
+  await wakesNormally(f, after.power_operation);
+});
+
+it("fails a return to sleep that the node does not prove, and leaves the sleeper suspended", async () => {
+  const f = await sleeping();
+  const after = await wakeThatNeverEnds(f);
   // The suspension is not proven yet, but D1 knows the database asleep: the cron leaves it be.
   await env.DB.prepare("UPDATE operations SET updated_at=? WHERE id=?")
     .bind(
       new Date(Date.now() - 21 * 60_000).toISOString(),
-      after!.power_operation,
+      after.power_operation,
     )
     .run();
   await runCron(env);
-  expect((await row(f.id))!.generation).toBe(4);
-  expect(await operation(after!.power_operation)).toMatchObject({
-    status: "failed",
-    error_code: "operation_timeout",
-  });
-});
-
-it("asks for the report again while another writer wins the return to sleep", async () => {
-  const f = await sleeping();
-  const wake = await woken(f);
-  const batch = env.DB.batch.bind(env.DB);
-  const spy = vi
-    .spyOn(env.DB, "batch")
-    .mockImplementation(async (statements: D1PreparedStatement[]) => {
-      await env.DB.prepare("UPDATE databases SET updated_at=? WHERE id=?")
-        .bind("2099-01-01T00:00:00.000Z", f.id)
-        .run();
-      return batch(statements);
-    });
-  const lost = await verdicts(
-    await report(f, f.id, 3, "error", { error: "start_failed" }),
-  );
-  spy.mockRestore();
-  // The node sends what was not accepted again, and nothing was written for it.
-  expect(lost).toEqual(["conflict"]);
-  expect(await row(f.id)).toMatchObject({
-    desired_state: "running",
-    generation: 3,
-  });
-  expect(await operation(wake.power_operation)).toMatchObject({
-    status: "pending",
-  });
-  expect(
-    await verdicts(
-      await report(f, f.id, 3, "error", { error: "start_failed" }),
-    ),
-  ).toEqual(["accept"]);
   expect(await row(f.id)).toMatchObject({
     desired_state: "suspended",
     suspension_reason: "idle",
     generation: 4,
   });
+  expect(await operation(after.power_operation)).toMatchObject({
+    status: "failed",
+    error_code: "operation_timeout",
+  });
+});
+
+it("leaves a wake that a persistent node error ended at running and error, and the next connections reuse its ticket", async () => {
+  const f = await sleeping();
+  const wake = await woken(f);
+  // The volume of the database is missing on the node: the agent reports this for as long as it is.
+  expect(
+    await verdicts(
+      await report(f, f.id, 3, "error", { error: "volume_missing" }),
+    ),
+  ).toEqual(["accept"]);
+  const failed = await row(f.id);
+  expect(failed).toMatchObject({
+    desired_state: "running",
+    generation: 3,
+    observed_state: "error",
+  });
+  expect(await operation(wake.power_operation)).toMatchObject({
+    status: "failed",
+    error_code: "volume_missing",
+  });
+  // No return to sleep and no new wake: a connection takes the ticket it has, at the same
+  // generation, and the power timeout has no open wake left to return to sleep.
+  const again = await actor(f.id).admitWake(f.id, "app");
+  if (!again.ok || !("wake" in again)) throw new Error("no wake ticket");
+  expect(again.wake.generation).toBe(3);
+  await env.DB.prepare("UPDATE operations SET updated_at=? WHERE id=?")
+    .bind(
+      new Date(Date.now() - 21 * 60_000).toISOString(),
+      wake.power_operation,
+    )
+    .run();
+  await runCron(env);
+  expect(await row(f.id)).toEqual(failed);
 });
