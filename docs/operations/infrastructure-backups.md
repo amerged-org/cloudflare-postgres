@@ -424,7 +424,9 @@ wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
      file or another key stops it with nothing written;
    - cuts the SQL into chunk files of a bounded size (see [below](#how-the-tool-cuts-the-sql)),
      each statement byte for byte, in the same `0700` directory with mode `0600`, and removes the
-     decrypted file;
+     decrypted file; it measures every statement first and stops with `statement_too_large`,
+     before anything is imported, if one is above 100,000 bytes (see "A statement above 100,000
+     bytes" under step 5);
    - runs `wrangler d1 execute <database ID> --remote --yes --file <chunk>` for the chunks one
      after the other from that directory, which holds no wrangler configuration, so a configured
      binding cannot redirect the import, and removes each chunk once wrangler reports it imported;
@@ -483,6 +485,36 @@ wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
      `sqlite3 :memory: < FILE` to see whether the dump itself loads (if it does, D1 refused a
      statement that SQLite accepts: report N, S and B), and delete the file afterwards. Do not
      import the whole file by hand to read a chunk's error: the whole file is what D1 reset.
+
+   **A statement above 100,000 bytes.** D1 refuses one statement above 100,000 bytes
+   (`SQLITE_TOOBIG`), however small the chunk that holds it. The first complete backup (2026-10-20)
+   held two such rows, both diagnostics a node had sent: the answer to a journal probe in
+   `node_diagnostic_requests` (an `INSERT` of 127,397 bytes) and a boot report in `node_diagnostics`
+   (212,685 bytes), so chunk 16 of 18 failed with `statement too long: SQLITE_TOOBIG` after 15
+   chunks had been imported. The tool now reads every statement before it writes a chunk and, if
+   one is above 100,000 bytes, stops with `statement_too_large` before it imports anything. It
+   names each table with the number of such statements and the size of the largest, and never a
+   byte of one. The API now bounds what it stores (a boot report or probe result row is at most 64
+   KiB as its `INSERT` statement, and a larger answer is stored cut and marked `truncated`), so no
+   row stored after that deploy is too large. The rows stored before it stay in the control
+   database, and in every backup of it, until the 30-day cleanup or the statement below removes
+   them. What to do:
+   - **`node_diagnostics` or `node_diagnostic_requests`:** delete the rows from the live control
+     database once, then take a new backup (or wait for the next daily run) and restore that one;
+     the diagnostics are kept 30 days only, and the rows above the bound are the ones the API no
+     longer stores. Look first, then delete (from a directory with no wrangler configuration, naming
+     the control database by its ID):
+
+     ```sh
+     (cd "$(mktemp -d)" && wrangler d1 execute <control-database-id> --remote --command \
+       "SELECT 'node_diagnostics' AS \"table\", id, length(CAST(body AS BLOB)) AS bytes FROM node_diagnostics WHERE length(CAST(body AS BLOB)) > 65536 UNION ALL SELECT 'node_diagnostic_requests', id, length(CAST(body AS BLOB)) FROM node_diagnostic_requests WHERE length(CAST(body AS BLOB)) > 65536")
+     (cd "$(mktemp -d)" && wrangler d1 execute <control-database-id> --remote --command \
+       "DELETE FROM node_diagnostics WHERE length(CAST(body AS BLOB)) > 65536; DELETE FROM node_diagnostic_requests WHERE length(CAST(body AS BLOB)) > 65536")
+     ```
+
+   - **any other table:** ask for support, and keep the artifact. Do not cut the dump by hand: a
+     backup that was edited is no longer the backup, and the tool offers no flag to skip a
+     statement.
 
    Ctrl-C, `kill` and a closed terminal (SIGINT, SIGTERM, SIGHUP) stop wrangler, remove the
    decrypted SQL and end the run with exit code 130, 143 or 129. A run killed with SIGKILL, or by a
@@ -573,8 +605,9 @@ not measured limits**: each is about a tenth to a fifteenth of the unit that was
 47,000 statements), a few thousand of this database's rows, while a chunk's fixed cost (an
 upload to R2 and several API calls) stays small beside it. The statement bound matters for small
 rows, where CPU time grows with the row count rather than the bytes. The tool prints the number
-of chunks and the size of the largest statement; D1 refuses one above 100,000 bytes, and none in
-this schema comes near it.
+of chunks and the size of the largest statement; D1 refuses one above 100,000 bytes, and the tool
+refuses the SQL before it imports anything when one is (the first live backup held two, in the
+diagnostics; see "A statement above 100,000 bytes" under step 5).
 
 **What was checked without the provider.** The tool's tests run a wrangler double on real SQLite
 that, like the provider, resets a file above a size and loads each file as one transaction with
@@ -591,6 +624,7 @@ foreign_key_check`. The provider's own export and import are first tried by the 
 | `differs from the API's receipt` | The artifact is not the one the receipt describes, or it was replaced in R2. Treat it as unverified. |
 | `is the database this artifact was exported from` | The name resolves to the control database. Create a new scratch database. |
 | `already has N schema objects` | The target is not empty, or an earlier import stopped in it. Delete it and create a new scratch database. |
+| `the SQL holds a statement above 100000 bytes` | `statement_too_large`: D1 would refuse that statement, and nothing was imported. The message names the tables and the largest size of each. See "A statement above 100,000 bytes" under step 5. |
 | `chunk N of M failed (S statements, B bytes)` | The chunk did not import; chunks before it did. The `exit code C` or `timeout`, and the `D1 reset in its output` yes or no, decide the next step: see "If a chunk fails" under step 5. |
 | `PRAGMA foreign_key_check found N rows without a parent` | The scratch database is not a faithful copy of the artifact. Do not rely on it; keep the artifact and report the tables named. |
 

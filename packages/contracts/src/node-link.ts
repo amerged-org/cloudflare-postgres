@@ -1658,6 +1658,29 @@ export const NODE_BOOT_REPORT_MESSAGE_MAX_BYTES = 2048;
 /** The JSON body of a report: the agent drops the oldest entries until it fits. */
 export const NODE_BOOT_REPORT_MAX_BYTES = 1024 * 1024;
 const utf8Bytes = (text: string) => new TextEncoder().encode(text).byteLength;
+/**
+ * The most a stored boot report or probe result may take as the `INSERT` statement that a dump of
+ * the control database writes for its row (single quotes doubled, as a dump writes them). D1
+ * refuses a statement above 100,000 bytes (`SQLITE_TOOBIG`), so a row above that can be exported
+ * but never imported again, and no backup of the database could be restored. A node may send
+ * `NODE_BOOT_REPORT_MAX_BYTES` or `NODE_PROBE_RESULT_MAX_BYTES`; the API stores the newest part
+ * that fits this bound and marks the cut (`CutMark`). The node is not told: its send succeeded.
+ */
+export const NODE_DIAGNOSTIC_ROW_MAX_BYTES = 64 * 1024;
+/**
+ * What the API adds to a report or result it cut to `NODE_DIAGNOSTIC_ROW_MAX_BYTES`, and a node
+ * never sends: `truncated` is true and `dropped_entries` is how many of the oldest entries went (0
+ * when only the end of a text was cut). Both are there or neither.
+ */
+const CutMark = {
+  truncated: z.literal(true).optional(),
+  dropped_entries: Count.optional(),
+};
+const hasWholeMark = (body: { truncated?: true; dropped_entries?: number }) =>
+  (body.truncated === undefined) === (body.dropped_entries === undefined);
+const WHOLE_MARK = {
+  message: "truncated and dropped_entries are both there or neither",
+};
 
 /**
  * One line of the previous boot's journal, reduced to what explains a stop: when, which unit and
@@ -1684,6 +1707,12 @@ export const NodeJournalEntry = z.strictObject({
     ),
 });
 export type NodeJournalEntry = z.infer<typeof NodeJournalEntry>;
+const bootReport = {
+  boot_id: z.uuid(),
+  previous_boot_id: z.uuid().nullable(),
+  kernel_release: KernelRelease,
+  entries: z.array(NodeJournalEntry).max(NODE_BOOT_REPORT_ENTRIES_MAX),
+};
 /**
  * POST /node/v1/diagnostics: sent once after a boot, when the boot ID differs from the one the
  * agent stored when it last reported; the API keeps one report per boot ID of a node, and answers
@@ -1693,15 +1722,11 @@ export type NodeJournalEntry = z.infer<typeof NodeJournalEntry>;
  * null when the agent had stored none (it was just installed or updated). `entries` are the tail of
  * the previous boot's journal from the agent, the gateway, cloudflared,
  * networkd, the operator shell's sshd, PID 1 and the kernel, oldest first; they are empty when the node has no journal of the
- * previous boot.
+ * previous boot. The API stores at most `NODE_DIAGNOSTIC_ROW_MAX_BYTES` of a report: its newest
+ * entries, marked in the copy that `NodeDiagnostic.report` returns.
  */
 export const NodeBootReport = z
-  .strictObject({
-    boot_id: z.uuid(),
-    previous_boot_id: z.uuid().nullable(),
-    kernel_release: KernelRelease,
-    entries: z.array(NodeJournalEntry).max(NODE_BOOT_REPORT_ENTRIES_MAX),
-  })
+  .strictObject(bootReport)
   .refine(
     (report) => utf8Bytes(JSON.stringify(report)) <= NODE_BOOT_REPORT_MAX_BYTES,
     { message: "A boot report is at most 1 MiB" },
@@ -1725,10 +1750,21 @@ export const NodeDiagnosticSummary = z.strictObject({
 });
 export type NodeDiagnosticSummary = z.infer<typeof NodeDiagnosticSummary>;
 export const NodeDiagnostic = NodeDiagnosticSummary.extend({
-  report: NodeBootReport,
+  /** The report as stored: whole, or cut to `NODE_DIAGNOSTIC_ROW_MAX_BYTES` and marked. */
+  report: z
+    .strictObject({ ...bootReport, ...CutMark })
+    .refine(hasWholeMark, WHOLE_MARK),
 });
 export type NodeDiagnostic = z.infer<typeof NodeDiagnostic>;
 
+const probeResult = {
+  kind: z.literal("probe"),
+  diagnostic_id: z.uuid(),
+  probe: NodeProbe,
+  status: z.enum(["ok", "failed"]),
+  entries: z.array(NodeJournalEntry).max(NODE_PROBE_LINES_MAX),
+  text: z.string(),
+};
 /**
  * POST /node/v1/diagnostics with `kind` "probe": the answer to one request on the desired page.
  * `status` is "failed" when the command ended with a status other than 0 or could not be run, and
@@ -1737,17 +1773,11 @@ export type NodeDiagnostic = z.infer<typeof NodeDiagnostic>;
  * database's unit or of a backup job); every other probe answers with `text`, with the lines that
  * name a database's unit or a backup job left out. The side a probe does not answer with is
  * empty. The body is at most 1 MiB: the agent drops the oldest entries, or the end of the text,
- * until it fits.
+ * until it fits. The API stores at most `NODE_DIAGNOSTIC_ROW_MAX_BYTES` of it, cut the same way and
+ * marked in the copy that `NodeProbeDiagnostic.body` returns.
  */
 export const NodeProbeResult = z
-  .strictObject({
-    kind: z.literal("probe"),
-    diagnostic_id: z.uuid(),
-    probe: NodeProbe,
-    status: z.enum(["ok", "failed"]),
-    entries: z.array(NodeJournalEntry).max(NODE_PROBE_LINES_MAX),
-    text: z.string(),
-  })
+  .strictObject(probeResult)
   .refine(
     (result) =>
       utf8Bytes(JSON.stringify(result)) <= NODE_PROBE_RESULT_MAX_BYTES,
@@ -1777,7 +1807,11 @@ export const NodeProbeDiagnostic = z.strictObject({
   requested_at: Timestamp,
   status: z.enum(NODE_PROBE_STATUSES),
   received_at: Timestamp.nullable(),
-  body: NodeProbeResult.nullable(),
+  /** The result as stored: whole, or cut to `NODE_DIAGNOSTIC_ROW_MAX_BYTES` and marked. */
+  body: z
+    .strictObject({ ...probeResult, ...CutMark })
+    .refine(hasWholeMark, WHOLE_MARK)
+    .nullable(),
 });
 export type NodeProbeDiagnostic = z.infer<typeof NodeProbeDiagnostic>;
 

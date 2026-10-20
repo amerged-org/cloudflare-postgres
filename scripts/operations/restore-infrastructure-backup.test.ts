@@ -911,6 +911,119 @@ test("imports a dump the provider resets as one file in bounded chunks, parents 
   }
 });
 
+// D1 takes a statement of at most 100,000 bytes. The first complete backup (2026-10-20) held an
+// INSERT of 127,397 bytes (the answer to a journal probe) and one boot report of 212,685 bytes in
+// the table of the diagnostics, and chunk 16 of 18 failed with SQLITE_TOOBIG after 15 had been
+// imported. A row of `bytes` bytes as the dump writes it, with a marker in it that must never be
+// printed.
+const D1_STATEMENT_MAX = 100_000;
+function row(table: string, id: string, bytes: number) {
+  const head = `INSERT INTO "${table}" VALUES('${id}','SECRET-BODY-CONTENT`,
+    tail = `');`;
+  return head + "x".repeat(bytes - head.length - tail.length) + tail;
+}
+const overlong = (...rows: string[]) =>
+  Buffer.from(
+    [
+      "PRAGMA defer_foreign_keys=TRUE;",
+      "CREATE TABLE node_diagnostic_requests (id TEXT PRIMARY KEY, body TEXT);",
+      "CREATE TABLE node_diagnostics (id TEXT PRIMARY KEY, body TEXT);",
+      `INSERT INTO "node_diagnostic_requests" VALUES('small','a small answer');`,
+      ...rows,
+      "",
+    ].join("\n"),
+  );
+
+test("measures a statement without the line break before it, and takes one of exactly 100,000 bytes", async () => {
+  const { dir, done } = await workspace();
+  try {
+    const input = join(dir, "dump.sql");
+    await writeFile(
+      input,
+      overlong(row("node_diagnostics", "edge", D1_STATEMENT_MAX)),
+    );
+    const plan = await chunkSql(input, dir);
+    assert.equal(plan.largest, D1_STATEMENT_MAX);
+  } finally {
+    await done();
+  }
+});
+
+test("stops before importing anything when a statement is above what D1 takes, names the table and the size and never the content, and says what to do", async () => {
+  const { dir, done } = await workspace();
+  try {
+    const { bytes } = await artifact(
+        overlong(
+          row("node_diagnostic_requests", "request", 127_397),
+          row("node_diagnostics", "just-fits", D1_STATEMENT_MAX),
+          row("node_diagnostics", "crash", 212_685),
+          row("node_diagnostics", "one-over", D1_STATEMENT_MAX + 1),
+        ),
+      ),
+      input = join(dir, "d1-control.pgcfenc"),
+      lines: string[] = [];
+    await writeFile(input, bytes);
+    const fixture = await wranglerFixture(dir);
+    await assert.rejects(
+      importArtifact(
+        {
+          input,
+          keyring: KEYRING,
+          keysEnvironment: "PGCF_TEST_KEYS",
+          database: "pgcf-restore-drill",
+          wrangler: fixture.wrangler,
+        },
+        { environment: fixture.environment, log: (line) => lines.push(line) },
+      ),
+      (error) => {
+        assert.ok(refused("statement_too_large")(error), String(error));
+        const message = (error as Error).message;
+        // The table and the size of each statement above the bound: the largest of a table, and how
+        // many there are; the statement that just fits is not one of them.
+        assert.match(
+          message,
+          /node_diagnostic_requests: 1 statement, the largest 127397 bytes/,
+        );
+        assert.match(
+          message,
+          /node_diagnostics: 2 statements, the largest 212685 bytes/,
+        );
+        assert.match(message, /nothing was imported/);
+        // What to do: delete the row if the table holds diagnostics, else ask for support, and never
+        // cut the dump.
+        assert.match(message, /delete the row from the live database/);
+        assert.match(message, /node_diagnostics or node_diagnostic_requests/);
+        assert.match(message, /support/);
+        assert.match(message, /not .*cut the dump/i);
+        // Never a byte of the statement.
+        assert.ok(
+          !/SECRET-BODY-CONTENT|INSERT|VALUES|xxxx/.test(message),
+          message,
+        );
+        return true;
+      },
+    );
+    assert.ok(
+      !(await fixture.calls()).some((call) => call.file),
+      "a chunk was imported",
+    );
+    assert.ok(!lines.join("\n").includes("SECRET-BODY-CONTENT"));
+    // The database is as it was: the next run, with a dump that is fine, imports into it.
+    const scratch = new DatabaseSync(join(dir, `${SCRATCH_DATABASE}.sqlite`));
+    assert.equal(
+      (
+        scratch.prepare("SELECT count(*) AS n FROM sqlite_schema").get() as {
+          n: number;
+        }
+      ).n,
+      0,
+    );
+    scratch.close();
+  } finally {
+    await done();
+  }
+});
+
 test("imports into an empty scratch database through a private file, by its ID, and removes the file", async () => {
   const { dir, done } = await workspace();
   try {
