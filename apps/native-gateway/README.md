@@ -46,7 +46,8 @@ archive socket.
   as long as the table shows the database running on that unit. An entry the agent publishes again
   for the same unit, such as the page that carries Cloudflare's claim of a wake moving the route
   revision, interrupts nothing, and a wake that was released is admitted under the revision of its
-  release or a later one. While a database quiesces, no client byte reaches PostgreSQL: it waits,
+  release or a later one, on every path that admits a ticket (a held connection, one routed at
+  once, an HTTP request). While a database quiesces, no client byte reaches PostgreSQL: it waits,
   and runs once the database runs again; an HTTP request that finds the database quiescing,
   asleep or retired before its first statement answers `57P03` with nothing written to
   PostgreSQL. Quiescence includes partial WebSocket and PostgreSQL messages, authentication,

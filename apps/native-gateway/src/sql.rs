@@ -378,14 +378,13 @@ async fn handle(
     let request_bytes = body.len();
     drop(body);
     stages.statements = request.statements.len();
-    let (claims, released) = match route {
-        Presented::Admitted(claims) => (claims, None),
-        Presented::Wake(ticket) => {
-            let (claims, unit) = attempt!(wake(gateway, &ticket, stop, stages).await);
-            (claims, Some(unit))
+    let (claims, target) = match route {
+        Presented::Admitted(claims) => {
+            let target = attempt!(gateway.admit(&claims).await.map_err(not_accepting));
+            (claims, target)
         }
+        Presented::Wake(ticket) => attempt!(wake(gateway, &ticket, stop, stages).await),
     };
-    let target = attempt!(current(gateway, &claims, released.as_deref()).await);
     // Admitted without a hold: the database was running when the request arrived.
     stages.wake_path.get_or_insert("warm");
     let mut backend = match checkout(gateway, &claims, &target, &request.password).await {
@@ -605,17 +604,18 @@ async fn wake(
     ticket: &WakeClaims,
     stop: &watch::Receiver<bool>,
     stages: &mut Stages,
-) -> Result<(Route, String), Refused> {
-    let released = |writer: String, route_revision: u64| {
-        let claims = transport::admitted_wake(ticket, &writer, route_revision);
-        (claims, writer)
-    };
+) -> Result<(Route, Writer), Refused> {
     // Released at its generation already: routed at once, as a running database is.
     match transport::wake_state(gateway, ticket).await {
         WakeState::Released {
             writer,
             route_revision,
-        } => return Ok(released(writer, route_revision)),
+        } => {
+            return gateway
+                .admit_wake(ticket, &writer, route_revision)
+                .await
+                .map_err(not_accepting);
+        }
         WakeState::Stale => return Err(not_accepting("route_stale")),
         WakeState::Waiting => {}
     }
@@ -658,7 +658,10 @@ async fn wake(
                 route_revision,
             } => {
                 let _ = held.release();
-                return Ok(released(writer, route_revision));
+                return gateway
+                    .admit_wake(ticket, &writer, route_revision)
+                    .await
+                    .map_err(not_accepting);
             }
             WakeState::Stale => return Err(not_accepting("route_stale")),
             WakeState::Waiting => {}
@@ -675,15 +678,6 @@ async fn wake(
         }
     }
 }
-/// The unit the route was admitted on, if the agent's table still shows it.
-async fn current(
-    gateway: &Gateway,
-    claims: &Route,
-    released: Option<&str>,
-) -> Result<Writer, Refused> {
-    gateway.admit(claims, released).await.map_err(not_accepting)
-}
-
 /// What the pool had for a request.
 enum Checkout {
     Taken(Box<Backend>),

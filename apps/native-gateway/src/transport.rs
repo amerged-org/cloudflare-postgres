@@ -164,13 +164,30 @@ impl Gateway {
     pub(crate) async fn ready(&self) -> bool {
         self.table.read().await.synchronized() && !self.draining.load(Ordering::Acquire)
     }
-    /// The writer a route is admitted on, or the `conn_stages` outcome it is refused with.
-    /// `released` is the unit a held wake was released to.
-    pub(crate) async fn admit(
+    /// The writer a route the Edge signed is admitted on, or the `conn_stages` outcome it is
+    /// refused with. The route names the revision it was signed under, and no other is admitted.
+    pub(crate) async fn admit(&self, claims: &Route) -> Result<Writer, &'static str> {
+        self.admit_route(claims, false).await
+    }
+    /// The route and the writer a wake ticket is admitted under once the table has released its
+    /// wake on `writer` under `route_revision` (`wake_state`), or the outcome it is refused with.
+    /// Every path that admits a ticket does it here: the table is read again, and the page that
+    /// carries Cloudflare's claim of the wake moves the route revision on, also between the
+    /// release and this read, so a released wake is admitted under the revision of its release or
+    /// a later one. The generation, the unit and the database's mode are checked as for any route.
+    pub(crate) async fn admit_wake(
         &self,
-        claims: &Route,
-        released: Option<&str>,
-    ) -> Result<Writer, &'static str> {
+        ticket: &WakeClaims,
+        writer: &str,
+        route_revision: u64,
+    ) -> Result<(Route, Writer), &'static str> {
+        let claims = Route::released(ticket, writer, route_revision);
+        let target = self.admit_route(&claims, true).await?;
+        Ok((claims, target))
+    }
+    /// `released` is true only for a released wake's route (`admit_wake`), which names the
+    /// revision of its release and is admitted under that revision or a later one.
+    async fn admit_route(&self, claims: &Route, released: bool) -> Result<Writer, &'static str> {
         let table = self.table.read().await;
         if self.draining.load(Ordering::Acquire) || !table.synchronized() {
             return Err("fenced");
@@ -181,21 +198,12 @@ impl Gateway {
         let (Mode::Running, Some(unit)) = (record.mode, &record.writer) else {
             return Err("fenced");
         };
-        // The route names the generation, the route revision and the unit it was admitted for. A
-        // wake was released under the revision the table showed, and the page that carries
-        // Cloudflare's claim of it moves the revision on, also between that release and this
-        // admission: a released wake is admitted under that revision or a later one, as
-        // `wake_state` releases it.
-        let revision = if released.is_some() {
+        let revision = if released {
             claims.route_revision <= record.route_revision
         } else {
             claims.route_revision == record.route_revision
         };
-        if claims.generation != record.generation
-            || !revision
-            || claims.instance != unit.instance
-            || released.is_some_and(|instance| instance != unit.instance)
-        {
+        if claims.generation != record.generation || !revision || claims.instance != unit.instance {
             return Err("route_stale");
         }
         Ok(unit.clone())
@@ -476,7 +484,7 @@ pub async fn serve_socket(
     }
     let route = head.one("x-pgcf-route");
     // Declared before the lease and both streams, so it is dropped and logged after them.
-    let (claims, mut stages) = if route
+    let (admitted, mut stages) = if route
         .is_some_and(|route| route.starts_with(&format!("{}.", wake::ROUTE_PREFIX)))
     {
         let ticket = match wake::verify_wake(
@@ -494,7 +502,10 @@ pub async fn serve_socket(
             WakeState::Released {
                 writer,
                 route_revision,
-            } => (admitted_wake(&ticket, &writer, route_revision), stages),
+            } => (
+                gateway.admit_wake(&ticket, &writer, route_revision).await,
+                stages,
+            ),
             WakeState::Stale => {
                 stages.outcome = "route_stale";
                 return http::reply(&mut socket, 503, serde_json::json!({"error":"route_stale"}))
@@ -525,9 +536,12 @@ pub async fn serve_socket(
             Err(reason) => return route_denied(&mut socket, reason).await,
         };
         let stages = Stages::new(&claims.db, received);
-        (claims, stages)
+        (
+            gateway.admit(&claims).await.map(|target| (claims, target)),
+            stages,
+        )
     };
-    let target = match gateway.admit(&claims, None).await {
+    let (claims, target) = match admitted {
         Ok(admitted) => admitted,
         Err(refused) => {
             stages.outcome = refused;
@@ -672,11 +686,6 @@ pub(crate) async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeSt
         }
         _ => WakeState::Waiting,
     }
-}
-/// The route a released wake is admitted under: the ticket's connection at its generation, the
-/// released unit's invocation ID, and the route revision that released it.
-pub(crate) fn admitted_wake(ticket: &WakeClaims, writer: &str, route_revision: u64) -> Route {
-    Route::released(ticket, writer, route_revision)
 }
 /// Where a held wake connection stands: released to a writer, ended, or (none) still waiting.
 async fn held_state(
@@ -914,8 +923,7 @@ async fn serve_held(
     stages.held_outcome = Some("released");
     stages.wake_wait = Some(upgraded.elapsed());
     // From here the connection is the admitted route of the woken unit.
-    let claims = admitted_wake(&ticket, &writer, route_revision);
-    let target = match gateway.admit(&claims, Some(&writer)).await {
+    let (claims, target) = match gateway.admit_wake(&ticket, &writer, route_revision).await {
         Ok(admitted) => admitted,
         Err(refused) => {
             stages.outcome = refused;
@@ -1631,11 +1639,29 @@ mod tests {
         }
     }
 
+    fn ticket(route_revision: u64) -> WakeClaims {
+        WakeClaims {
+            v: 5,
+            db: DATABASE.into(),
+            user: "app".into(),
+            cid: "01234567-89ab-4def-8123-000000000001".into(),
+            rg: "eu-test".into(),
+            kid: "test".into(),
+            iat: 0,
+            exp: u64::MAX,
+            op: format!("op_{}", "w".repeat(20)),
+            generation: 2,
+            route_revision,
+            rh: "0".repeat(64),
+        }
+    }
+
     #[tokio::test]
     async fn a_released_wake_is_admitted_under_its_route_revision_or_a_later_one() {
         // The agent released the wake under revision 7. The page that carries Cloudflare's claim
-        // of it moves the revision to 8, also between the release and the admission of the
-        // request, which reads the table again.
+        // of it moves the revision to 8, also between the release and the admission, which
+        // reads the table again: the HTTP request, the connection routed at once and the held
+        // connection all admit their ticket here, and no one of them can name a revision exactly.
         let gateway = gateway();
         let writer = Writer {
             socket: "/run/pgcf/aaaaaaaaaaaaaaaaaaaa/.s.PGSQL.5432".into(),
@@ -1652,18 +1678,49 @@ mod tests {
             writer: Some(writer.clone()),
         };
         gateway.table.write().await.replace(vec![running(8)]);
+        let (claims, target) = gateway
+            .admit_wake(&ticket(7), INSTANCE, 7)
+            .await
+            .expect("a release under 7 is admitted at 8");
         assert_eq!(
-            gateway.admit(&route(7), Some(INSTANCE)).await.as_ref(),
-            Ok(&writer)
+            (&target, claims.instance.as_str(), claims.generation),
+            (&writer, INSTANCE, 2)
         );
         // A route the Edge signed is admitted under the revision it names and no other.
-        assert_eq!(gateway.admit(&route(7), None).await, Err("route_stale"));
-        assert_eq!(gateway.admit(&route(8), None).await.as_ref(), Ok(&writer));
-        // A release under a revision the table has not reached is stale.
+        assert_eq!(gateway.admit(&route(7)).await, Err("route_stale"));
+        assert_eq!(gateway.admit(&route(8)).await.as_ref(), Ok(&writer));
+        // A release under a revision the table has not reached is stale, and so is a release on
+        // a unit that is not the database's, or at another generation.
         gateway.table.write().await.update(running(6));
         assert_eq!(
-            gateway.admit(&route(7), Some(INSTANCE)).await,
+            gateway.admit_wake(&ticket(7), INSTANCE, 7).await,
             Err("route_stale")
+        );
+        gateway.table.write().await.update(running(8));
+        assert_eq!(
+            gateway
+                .admit_wake(&ticket(7), "another-invocation", 7)
+                .await,
+            Err("route_stale")
+        );
+        let mut elsewhere = ticket(7);
+        elsewhere.generation = 1;
+        assert_eq!(
+            gateway.admit_wake(&elsewhere, INSTANCE, 7).await,
+            Err("route_stale")
+        );
+        // A database that no longer runs admits nothing, whatever was released.
+        gateway
+            .table
+            .write()
+            .await
+            .update(pgcf_native_protocol::agent::Database {
+                mode: Mode::Quiesce,
+                ..running(8)
+            });
+        assert_eq!(
+            gateway.admit_wake(&ticket(7), INSTANCE, 7).await,
+            Err("fenced")
         );
     }
 
