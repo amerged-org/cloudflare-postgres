@@ -545,14 +545,26 @@ package from creating a default cluster.
   after final SIGKILL"): the unit is `failed` with a process in its cgroup, the sleep proof fails,
   the agent starts the unit to recover the database, and systemd starts a unit over a process of its
   cgroup ("Found left-over process ... while starting unit. Ignoring."; reproduced in the lab, where
-  the new postmaster recovered the data directory beside the stopped backend). **The agent refuses
-  that start:** `Units::start` reads the unit's `cgroup.events`, and a unit that is not running
-  (`failed` or `inactive`) whose cgroup says `populated 1` is not started (`Error::StrayProcesses`,
-  the diagnostic class `units_stray_processes`); the wake or the recovery fails like any failed
-  start, is tried again, and goes through when the process is gone. A stopped unit has no cgroup,
-  so the common case is one failed `open`. The lab test
-  `a_start_is_refused_while_a_process_of_an_earlier_start_is_in_the_units_cgroup` (`units/lab.rs`)
-  fails without it (the start succeeds beside the stopped backend) and passes with it. The pid half
+  the new postmaster recovered the data directory beside the stopped backend). The same start is
+  accepted earlier, while the unit is still `deactivating`: when the postmaster dies on its own,
+  systemd stops what is left (`stop-sigkill`, then `final-sigkill`, each of them
+  `TimeoutStopSec`, up to 60 s with the template's 30 s) with no main process and no job, and job
+  mode `fail` refuses a start only against a pending job. The start is accepted as a job that
+  waits, and it runs over the process when the unit has failed (lab, systemd 257.13: a backend in
+  uninterruptible sleep on a frozen filesystem, `fsfreeze`). **The agent refuses that start:**
+  `Units::start` reads the unit's `cgroup.events`, and a unit whose cgroup says `populated 1` is
+  not started unless it is `active`, `reloading`, `activating` or `refreshing`: `failed`,
+  `inactive` and `deactivating` are refused (`Error::StrayProcesses`, the diagnostic class
+  `units_stray_processes`); the wake or the recovery fails like any failed start, is tried again,
+  and goes through when the process is gone. A start asked for while a stop job is pending failed
+  at systemd before (job mode `fail`), so no legitimate start changes; a unit that runs, starts or
+  reloads is passed on to systemd as before. A stopped unit has no cgroup, so the common case is
+  one failed `open`. The lab test
+  `a_start_is_refused_while_the_unit_stops_over_a_process_no_signal_ends` (`units/lab.rs`) freezes
+  a database's filesystem so that a process of the unit sleeps in the kernel, kills the
+  postmaster, and asks for a start in each of the two states (`deactivating`, then `failed`); it
+  fails without the refusal (the start is accepted and waits behind the stop) and passes with it,
+  and the start goes through after the filesystem thaws. The pid half
   still refuses a second postmaster of the same user
   while a postmaster lives (the boot test asserts it). Neither half refuses one of another user:
   `kill` answers `EPERM`, which PostgreSQL reads as a stale file (`miscinit.c`), and an unreadable
@@ -693,10 +705,11 @@ token or the route keyring changed.
   starts, because `/run` is empty after a boot. It clears the database's `CPUQuota` (`CPUQuota=`)
   whenever the database stops and, when the agent itself starts, for every stopped `pgcf-pg@` unit:
   a quota that outlived a stop or an agent crash would throttle the next start.
-- It does not start a database's unit while the unit is not running and its cgroup still holds a
-  process (`cgroup.events` says `populated 1`): the unit has a new IPC namespace at every start, so
-  PostgreSQL could not find a backend that outlived its postmaster by its shared memory segment
-  (see Not set, above).
+- It does not start a database's unit while its cgroup still holds a process (`cgroup.events` says
+  `populated 1`) and the unit is not `active`, `reloading`, `activating` or `refreshing`, a
+  `deactivating` unit included: the unit has a new IPC namespace at every start, so PostgreSQL
+  could not find a backend that outlived its postmaster by its shared memory segment (see Not set,
+  above).
 - Its sockets are `/run/pgcf/agent/gateway.sock` (gateway only) and `/run/pgcf/agent/archive.sock`
   (databases, identified by uid); the archive clients are reached as
   `/usr/libexec/pgcf/pgcf-archive` and `/usr/libexec/pgcf/pgcf-wal-fetch`.

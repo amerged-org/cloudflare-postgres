@@ -226,11 +226,14 @@ pub enum Error {
     /// The unit finished starting but PostgreSQL is not the ready main process. The reason is one
     /// of `ready::ready_socket` or `unit_not_active`, `no_main_pid`, `no_uid`, `no_invocation_id`.
     NotReady(&'static str),
-    /// The unit is not running but its cgroup still holds a process of an earlier start: a backend
+    /// The unit does not run, and its cgroup still holds a process of an earlier start: a backend
     /// that outlived its postmaster, or one that no signal could end ("Processes still around
-    /// after final SIGKILL"). systemd starts a unit over such a process ("Found left-over process
-    /// ... Ignoring"), and the new postmaster could not find it: the unit has an IPC namespace of
-    /// its own at every start, so PostgreSQL's check of the shared memory segment named in
+    /// after final SIGKILL"). The unit is `inactive`, `failed`, or `deactivating` with no job:
+    /// when the postmaster dies on its own, systemd stops what is left (`stop-sigkill`, then
+    /// `final-sigkill`) and accepts a start meanwhile, as job mode `fail` refuses only against a
+    /// pending job. systemd starts a unit over such a process ("Found left-over process ...
+    /// Ignoring"), and the new postmaster could not find it: the unit has an IPC namespace of its
+    /// own at every start, so PostgreSQL's check of the shared memory segment named in
     /// `postmaster.pid` sees nothing, and the old backend would run beside the new postmaster on
     /// one data directory.
     StrayProcesses,
@@ -339,10 +342,22 @@ fn populated(events: &str) -> bool {
     events.lines().any(|line| line.trim() == "populated 1")
 }
 
-/// A process of the cgroup that the unit's state does not account for: the unit is not awake (no
-/// main process, no job that starts or stops one) and the cgroup is populated.
+/// A process of the cgroup that no start of the unit accounts for: the cgroup is populated and the
+/// unit is not running or starting its main process (`active`, `reloading`, `activating`,
+/// `refreshing`). `deactivating` is a stray too: it is a stop that has not ended, and a main
+/// process that died on its own leaves the unit there with no job for up to the stop timeouts
+/// while a process that no signal ends stays, so a start asked for then is accepted and runs over
+/// that process when the unit fails. A start asked for while a stop job is pending fails in job
+/// mode `fail` anyway, so the refusal changes nothing a legitimate caller does.
 fn stray_processes(active: ActiveState, events: &str) -> bool {
-    populated(events) && !active.awake()
+    populated(events)
+        && !matches!(
+            active,
+            ActiveState::Active
+                | ActiveState::Reloading
+                | ActiveState::Activating
+                | ActiveState::Refreshing
+        )
 }
 
 #[derive(Clone, Copy)]
@@ -545,8 +560,8 @@ impl Units {
     }
 
     /// Starts the unit and returns when PostgreSQL accepts connections. Dropping the future does
-    /// not stop the start. A unit that is not running but whose cgroup holds a process is not
-    /// started (`Error::StrayProcesses`).
+    /// not stop the start. A unit that does not run (`inactive`, `failed`, `deactivating`) but
+    /// whose cgroup holds a process is not started (`Error::StrayProcesses`).
     pub async fn start(&self, database: &str) -> Result<Started, Error> {
         let unit = Self::unit_of(database)?;
         self.refuse_stray_processes(database).await?;
@@ -556,8 +571,8 @@ impl Units {
 
     /// Refuses a start over a process that outlived the last one. The cgroup of a unit that is
     /// stopped does not exist, so the common case is one failed `open`; the state is read only
-    /// where the cgroup is populated, because a unit that runs, or is starting or stopping, holds
-    /// processes of its own.
+    /// where the cgroup is populated, because a unit that runs, or is starting, holds processes
+    /// of its own (`stray_processes`).
     async fn refuse_stray_processes(&self, database: &str) -> Result<(), Error> {
         let path = cgroup_events_path(database).ok_or(Error::InvalidDatabase)?;
         let events = match std::fs::read_to_string(path) {
@@ -721,19 +736,23 @@ mod tests {
     }
 
     #[test]
-    fn a_process_is_a_stray_when_the_unit_is_not_awake_and_the_cgroup_is_populated() {
+    fn a_process_is_a_stray_unless_the_unit_runs_or_starts_it() {
         let (held, empty) = ("populated 1\nfrozen 0\n", "populated 0\nfrozen 0\n");
-        for (active, awake) in [
+        // `Deactivating` is a stray: a unit whose main process died on its own is stopping its
+        // other processes with no job pending, and systemd accepts a start in that window (job
+        // mode `fail` refuses only against a pending job) and runs it over what survives the
+        // final SIGKILL.
+        for (active, own) in [
             (ActiveState::Active, true),
             (ActiveState::Reloading, true),
             (ActiveState::Inactive, false),
             (ActiveState::Failed, false),
             (ActiveState::Activating, true),
-            (ActiveState::Deactivating, true),
+            (ActiveState::Deactivating, false),
             (ActiveState::Maintenance, false),
             (ActiveState::Refreshing, true),
         ] {
-            assert_eq!(stray_processes(active, held), !awake, "{active:?}");
+            assert_eq!(stray_processes(active, held), !own, "{active:?}");
             assert!(!stray_processes(active, empty), "{active:?}");
         }
     }

@@ -597,54 +597,127 @@ fn cgroup_populated(database: &str) -> bool {
         .is_ok_and(|events| super::populated(&events))
 }
 
-/// A process of the last start that stays in the unit's cgroup after the unit stopped is a stray:
-/// systemd starts a unit over it ("Found left-over process ... Ignoring"), and the unit's IPC
-/// namespace is new at every start, so PostgreSQL's interlock cannot find the old backend by the
-/// shared memory segment it holds. The agent refuses the start, and starts at once when the cgroup
-/// is empty.
+/// Thaws a filesystem when it goes out of scope, so that a failing assertion leaves no process in
+/// uninterruptible sleep behind.
+struct Frozen(PathBuf);
+impl Frozen {
+    /// Freezes the filesystem mounted at `mount`: a process that writes to it sleeps in the kernel
+    /// (`D`) until it is thawed, and no signal ends it, `SIGKILL` included.
+    fn new(mount: &Path) -> Self {
+        run("fsfreeze", &["-f", mount.to_str().unwrap()]);
+        Self(mount.to_path_buf())
+    }
+    fn thaw(&self) {
+        quiet("fsfreeze", &["-u", self.0.to_str().unwrap()]);
+    }
+}
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        self.thaw();
+    }
+}
+
+/// The processes in a database's unit cgroup.
+fn cgroup_processes(database: &str) -> Vec<u32> {
+    let events = super::cgroup_events_path(database).unwrap();
+    fs::read_to_string(events.with_file_name("cgroup.procs"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .collect()
+}
+
+/// Whether a process is in uninterruptible sleep (`D` in `/proc/<pid>/stat`, after the command).
+fn in_uninterruptible_sleep(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('D'))
+        })
+        .unwrap_or(false)
+}
+
+/// The postmaster dies and a backend in uninterruptible sleep outlives every signal: the unit is
+/// `deactivating` (`stop-sigkill`, then `final-sigkill`) with no main process and no job for up to
+/// two stop timeouts, and then `failed` ("Processes still around after final SIGKILL"). Job mode
+/// `fail` refuses a start only against a pending job, so systemd accepts one in that window and
+/// runs it when the unit ends, over the process it left ("Found left-over process ... Ignoring").
+/// The agent refuses the start in both states.
 #[tokio::test]
 #[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
-async fn a_start_is_refused_while_a_process_of_an_earlier_start_is_in_the_units_cgroup() {
+async fn a_start_is_refused_while_the_unit_stops_over_a_process_no_signal_ends() {
     if !lab() {
         return;
     }
     let database = Database::new(13);
     let id = database.id.as_str();
     let units = Units::connect(DB_ROOT).await.unwrap();
-    // systemd does not kill what remains after the stop, as for a backend in uninterruptible sleep
-    // that no signal ends. The drop-in goes again before the start: the template kills.
+    // The stops are short, as the template's two would take 60 s.
     let dropin = format!("/run/systemd/system/{}.d", database.unit());
     fs::create_dir_all(&dropin).unwrap();
     fs::write(
-        format!("{dropin}/stray.conf"),
-        "[Service]\nSendSIGKILL=no\nTimeoutStopSec=1\n",
+        format!("{dropin}/stop.conf"),
+        "[Service]\nTimeoutStopSec=3\n",
     )
     .unwrap();
     run("systemctl", &["daemon-reload"]);
     let first = within(units.start(id)).await.unwrap();
-    assert!(cgroup_populated(id));
-    // A backend that does not end (it is stopped), and its postmaster gone.
-    let children =
-        fs::read_to_string(format!("/proc/{0}/task/{0}/children", first.main_pid)).unwrap();
-    let backend = children.split_whitespace().next().unwrap().to_string();
-    run("kill", &["-STOP", &backend]);
-    run("kill", &["-KILL", &first.main_pid.to_string()]);
-    for _ in 0..200 {
-        if !units.state(id).await.unwrap().active.awake() {
+
+    // A frozen filesystem, and a checkpoint that makes a process of the postmaster write to it.
+    let frozen = Frozen::new(&database.root);
+    let account = super::users::account_name(id);
+    let mut client = Command::new("runuser")
+        .args(["-u", &account, "--", &format!("{BIN}/psql"), "-h"])
+        .arg(format!("/run/pgcf/{id}"))
+        .args(["-d", "postgres", "-c", "checkpoint"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut asleep = false;
+    for _ in 0..100 {
+        asleep = cgroup_processes(id)
+            .into_iter()
+            .any(|pid| pid != first.main_pid && in_uninterruptible_sleep(pid));
+        if asleep {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(asleep, "no process of the unit is in uninterruptible sleep");
+    run("kill", &["-KILL", &first.main_pid.to_string()]);
+
+    // The unit is stopping with nothing to wait for but the process, and no job.
+    let mut state = units.state(id).await.unwrap();
+    for _ in 0..100 {
+        if state.active != ActiveState::Active {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        state = units.state(id).await.unwrap();
+    }
+    assert_eq!(state.active, ActiveState::Deactivating);
+    assert_eq!(state.main_pid, None);
+    assert!(cgroup_populated(id));
+    // Without the refusal the start waits for the stop to end and runs over the process, so it
+    // does not answer within these seconds.
+    let refused = tokio::time::timeout(Duration::from_secs(2), units.start(id)).await;
+    assert!(
+        matches!(refused, Ok(Err(Error::StrayProcesses))),
+        "{refused:?}"
+    );
+
+    // The stop ends in failed, with the process still in the cgroup, and the start is refused.
+    for _ in 0..400 {
+        if units.state(id).await.unwrap().active == ActiveState::Failed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let failed = units.state(id).await.unwrap();
     assert_eq!(failed.active, ActiveState::Failed);
-    assert!(
-        cgroup_populated(id),
-        "the stopped backend is still in the cgroup"
-    );
-    fs::remove_file(format!("{dropin}/stray.conf")).unwrap();
-    run("systemctl", &["daemon-reload"]);
-
-    // The start is refused, and nothing was started: the invocation is the one that was killed.
+    assert!(cgroup_populated(id), "the process is still in the cgroup");
     let refused = within(units.start(id)).await.unwrap_err();
     assert!(matches!(refused, Error::StrayProcesses), "{refused:?}");
     let after = units.state(id).await.unwrap();
@@ -652,11 +725,12 @@ async fn a_start_is_refused_while_a_process_of_an_earlier_start_is_in_the_units_
     assert_eq!(after.main_pid, None);
     assert_eq!(
         after.invocation_id.as_deref(),
-        Some(first.invocation_id.as_str())
+        Some(first.invocation_id.as_str()),
+        "nothing was started"
     );
 
-    // The backend ends, the cgroup is empty, and the start goes through.
-    run("kill", &["-KILL", &backend]);
+    // The filesystem thaws, the process ends, and the start goes through.
+    frozen.thaw();
     for _ in 0..200 {
         if !cgroup_populated(id) {
             break;
@@ -672,6 +746,8 @@ async fn a_start_is_refused_while_a_process_of_an_earlier_start_is_in_the_units_
         same_unit(second)
     );
     within(units.stop(id)).await.unwrap();
+    let _ = client.kill();
+    let _ = client.wait();
 }
 
 #[tokio::test]
