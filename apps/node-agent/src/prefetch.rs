@@ -22,25 +22,33 @@
 //! each file once to learn its length (blocking: run it in `spawn_blocking`, and before the moment
 //! it matters; it warms the dentries and inodes the issuing needs). `Plan::issue` advises the
 //! kernel in pieces of `PIECE` and stops at a time budget, a byte bound or a cancel; it returns a
-//! `Report` of counts and timings, which is the page cache accounting of a wake: it takes the place
-//! of the residency diagnostic of `cache.rs`, which opens and lists files while the wake runs,
-//! once a flow calls this module.
+//! `Report` of counts and timings, which is the page cache accounting of a wake. It replaces the
+//! residency diagnostic that `cache.rs` made, which opened up to 64 files and listed directories
+//! while the wake ran (judge gap 12): the counts now come from the files the issuing advises
+//! anyway, and the wake itself opens and lists nothing to count pages.
 //!
 //! The kernel reads at most `max(read_ahead_kb, the size asked)` of a range per `WILLNEED` call
 //! (EU1: 128 KiB), so one call over a large range reads only its first part. The lab tool of
 //! 2026-10-20 did that first; every call here covers at most `PIECE`.
 //!
-//! The data directory is the database user's, and the agent reads as root: a link at a directory
-//! is not followed (checked when the plan lists it and again before its files are opened), a link
-//! at a file is not opened (`O_NOFOLLOW`), a pipe or a device is not opened, every name below the
-//! data directory is built from numbers PostgreSQL wrote, and the number of directory entries,
-//! files, databases and bytes of `autoprewarm.blocks` read is bounded.
+//! The data directory is the database user's, and the agent reads as root, so nothing in it
+//! chooses what the plan costs. A link at a directory is not followed (checked when the plan lists
+//! it and again before its files are opened), a link at a file is not opened (`O_NOFOLLOW`), a pipe
+//! or a device is not opened, and every name below the data directory is built from numbers
+//! PostgreSQL wrote. The databases a plan reads are the real directories of `base/` (at most
+//! `MAX_DATABASES`, lowest OID first), whatever `autoprewarm.blocks` names: a line for another
+//! database is dropped before it costs a lookup. The directory entries, the files planned, the
+//! files a list names that are not there (each is a lookup that leaves a negative dentry) and the
+//! bytes and lines of the list are bounded, and the planning stops at a budget and a cancel as the
+//! issuing does (a plan that was stopped reports `budget`, `cancelled` or `bounded`).
 use crate::{
     cache,
     pg_control::{Lsn, parse_control_file},
     sleep::is_segment,
 };
 use std::{
+    cell::Cell,
+    collections::HashMap,
     fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -60,11 +68,17 @@ const WAL_WINDOW: u64 = 256 << 10;
 const MAX_FILES: usize = 4096;
 /// User databases whose catalogs the catalog set names.
 const MAX_DATABASES: usize = 32;
+/// Absent files of a list at which its plan stops: a real list names a few hundred relations, and
+/// a stale one a few that were dropped since. Each absent name is a lookup that leaves a negative
+/// dentry in a directory the database's user owns.
+const MAX_ABSENT: u64 = 512;
 /// `autoprewarm.blocks` read at most. A real list is at most one line per block of the shared
 /// buffers, about 6 MB for 128 MiB of them.
 const MAX_LIST_BYTES: u64 = 32 << 20;
 /// Lines a list may name.
 const MAX_LIST_BLOCKS: usize = 1 << 20;
+/// Lines of a list parsed between two looks at the budget and the cancel.
+const HALT_EVERY: usize = 4096;
 /// `pg_control` (8 KiB) and `pg_filenode.map` (524 bytes) are read to this length at most.
 const MAX_SMALL: u64 = 8192;
 /// The first object ID of the user's own objects (`FirstNormalObjectId`): the databases below it
@@ -124,6 +138,9 @@ pub struct Plan {
     bytes: u64,
     /// Files that the plan named and that were not there (a list of an older database).
     missing: u64,
+    /// Why the plan is not all the data directory names: the budget or the cancel of the planning,
+    /// or one of its bounds.
+    cut: Option<Stop>,
     plan_us: u64,
 }
 
@@ -154,14 +171,19 @@ pub struct Limits {
     pub max_bytes: u64,
 }
 
-/// Why the issuing ended.
+/// Why the planning or the issuing ended before the data directory's files were all advised: the
+/// reason that cut the plan, unless the issuing ended for another one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
-    /// Every piece of the plan was advised.
+    /// The plan is whole and every piece of it was advised.
     Done,
     Budget,
+    /// Only the issuing has a byte bound.
     Bytes,
     Cancelled,
+    /// Only the planning has this: it stopped at one of its bounds, the files in the plan or the
+    /// files a list names that are not there.
+    Bounded,
     /// The kernel refused an advice, or this system has none.
     Failed,
 }
@@ -173,6 +195,7 @@ impl Stop {
             Self::Budget => "budget",
             Self::Bytes => "bytes",
             Self::Cancelled => "cancelled",
+            Self::Bounded => "bounded",
             Self::Failed => "failed",
         }
     }
@@ -230,9 +253,7 @@ impl Kernel for Host {
         }
     }
     fn resident(&mut self, file: &File, offset: u64, length: u64) -> Option<u64> {
-        cache::cachestat_range(file, offset, length)
-            .ok()
-            .map(|pages| pages.resident)
+        cache::cachestat_range(file, offset, length).ok()
     }
 }
 /// Other systems have no `posix_fadvise` in `libc` and no `cachestat`: nothing is advised.
@@ -336,7 +357,7 @@ fn number(text: &str) -> Option<u32> {
 /// `autoprewarm.blocks` of PostgreSQL 18: `<<N>>`, then N lines `database,tablespace,
 /// filenumber,fork,block`. Anything else is no list: a line that does not parse, a fork above 3,
 /// more or fewer lines than the header says, or more than `MAX_LIST_BLOCKS`.
-fn parse_blocks(bytes: &[u8]) -> Option<Vec<Block>> {
+fn parse_blocks(bytes: &[u8], halt: &Halt) -> Option<Vec<Block>> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut lines = text.lines();
     let count = lines
@@ -347,6 +368,10 @@ fn parse_blocks(bytes: &[u8]) -> Option<Vec<Block>> {
         .filter(|n| *n <= MAX_LIST_BLOCKS)?;
     let mut blocks = Vec::with_capacity(count);
     for line in lines {
+        // A parse that has to stop returns the lines read so far; the plan is cut at its first step.
+        if blocks.len() % HALT_EVERY == 0 && halt.check() {
+            return Some(blocks);
+        }
         let mut fields = line.split(',');
         let mut next = || number(fields.next()?);
         let block = Block {
@@ -374,6 +399,36 @@ fn file_name(file_number: u32, fork: u8, segment: u64) -> String {
     }
 }
 
+/// What stops a plan being made: a budget and a cancel, asked as the issuing asks them. The first
+/// reason is kept.
+struct Halt<'a> {
+    started: Instant,
+    budget: Duration,
+    cancel: &'a AtomicBool,
+    stopped: Cell<Option<Stop>>,
+}
+impl<'a> Halt<'a> {
+    fn new(started: Instant, budget: Duration, cancel: &'a AtomicBool) -> Self {
+        Self {
+            started,
+            budget,
+            cancel,
+            stopped: Cell::new(None),
+        }
+    }
+    /// Whether the planning has to stop now.
+    fn check(&self) -> bool {
+        if self.stopped.get().is_none() {
+            if self.cancel.load(Ordering::Relaxed) {
+                self.stopped.set(Some(Stop::Cancelled));
+            } else if self.started.elapsed() >= self.budget {
+                self.stopped.set(Some(Stop::Budget));
+            }
+        }
+        self.stopped.get().is_some()
+    }
+}
+
 /// A directory of the data directory that a plan names.
 struct Directory {
     relative: PathBuf,
@@ -386,39 +441,71 @@ enum Added {
     Planned,
     /// There is no such file, or nothing of it inside its length.
     Absent,
-    /// The plan holds `MAX_FILES` files.
-    Full,
+    /// The planning stopped: its budget or cancel, or a bound of the plan.
+    Stopped,
 }
 
 /// A plan being made.
-struct Builder {
+struct Builder<'a> {
     data: PathBuf,
+    halt: Halt<'a>,
     directories: Vec<Directory>,
+    /// `directories` by their path relative to the data directory.
+    index: HashMap<String, usize>,
     targets: Vec<Target>,
     bytes: u64,
     missing: u64,
+    /// A bound of the plan was reached.
+    bounded: bool,
 }
-impl Builder {
-    fn new(data: &Path) -> Self {
+impl<'a> Builder<'a> {
+    fn new(data: &Path, started: Instant, budget: Duration, cancel: &'a AtomicBool) -> Self {
         Self {
             data: data.to_path_buf(),
+            halt: Halt::new(started, budget, cancel),
             directories: Vec::new(),
+            index: HashMap::new(),
             targets: Vec::new(),
             bytes: 0,
             missing: 0,
+            bounded: false,
         }
+    }
+
+    /// Whether nothing more is to be planned: the budget, the cancel or a bound.
+    fn stopped(&self) -> bool {
+        self.bounded || self.halt.check()
     }
 
     /// The index of the directory `relative` to the data directory; a link or a file in its
     /// place gives a directory that has no files.
     fn directory(&mut self, relative: &str) -> usize {
-        let relative = PathBuf::from(relative);
-        if let Some(found) = self.directories.iter().position(|d| d.relative == relative) {
-            return found;
+        if let Some(found) = self.index.get(relative) {
+            return *found;
         }
-        let real = real_directory(&self.data, &relative);
-        self.directories.push(Directory { relative, real });
+        let real = real_directory(&self.data, Path::new(relative));
+        self.directories.push(Directory {
+            relative: PathBuf::from(relative),
+            real,
+        });
+        self.index
+            .insert(relative.to_string(), self.directories.len() - 1);
         self.directories.len() - 1
+    }
+
+    /// The user databases of the data directory, lowest OID first: the directories of `base/`
+    /// (not links, not files) named by a number from the first user database on, at most
+    /// `MAX_DATABASES`. What a plan reads below `base/` is chosen from these and from nothing a
+    /// list or a file says.
+    fn databases(&self) -> Vec<u32> {
+        let mut oids: Vec<u32> = cache::subdirectories(&self.data.join("base"))
+            .iter()
+            .filter_map(|name| number(name))
+            .filter(|oid| *oid >= FIRST_USER_DATABASE)
+            .collect();
+        oids.sort_unstable();
+        oids.truncate(MAX_DATABASES);
+        oids
     }
 
     /// The path of a directory that is real.
@@ -442,8 +529,12 @@ impl Builder {
     /// Adds a file of a directory, with `spans` (the whole file for `None`) cut to its length.
     /// The file is opened once, as the issuing will, which also warms its inode.
     fn add(&mut self, directory: usize, name: &str, spans: Option<&[(u64, u64)]>) -> Added {
+        if self.stopped() {
+            return Added::Stopped;
+        }
         if self.targets.len() >= MAX_FILES {
-            return Added::Full;
+            self.bounded = true;
+            return Added::Stopped;
         }
         let Some(length) = self
             .path(directory, name)
@@ -476,6 +567,9 @@ impl Builder {
     fn control_and_wal(&mut self) {
         let global = self.directory("global");
         self.add(global, "pg_control", None);
+        if self.stopped() {
+            return;
+        }
         let Some(bytes) = self
             .path(global, "pg_control")
             .and_then(|path| read_small(&path, MAX_SMALL))
@@ -510,6 +604,9 @@ impl Builder {
 
     fn catalog(&mut self) {
         self.control_and_wal();
+        if self.stopped() {
+            return;
+        }
         let global = self.directory("global");
         // `pg_control` is planned first. `pg_internal.init` is removed at every start of
         // PostgreSQL, so a read of it is wasted.
@@ -518,13 +615,10 @@ impl Builder {
                 self.add(global, &name, None);
             }
         }
-        let mut databases: Vec<u32> = cache::names(&self.data.join("base"))
-            .iter()
-            .filter_map(|name| number(name))
-            .filter(|oid| *oid >= FIRST_USER_DATABASE)
-            .collect();
-        databases.sort_unstable();
-        for oid in databases.into_iter().take(MAX_DATABASES) {
+        for oid in self.databases() {
+            if self.stopped() {
+                break;
+            }
             let relative = format!("base/{oid}");
             let directory = self.directory(&relative);
             self.add(directory, "PG_VERSION", None);
@@ -544,8 +638,19 @@ impl Builder {
     }
 
     /// The blocks of a dump, relation by relation, the relations with the fewest blocks first.
+    /// Only the blocks of the shared relations and of the databases that `base/` holds are
+    /// planned: a line for any other costs nothing but its parsing.
     fn list(&mut self, mut blocks: Vec<Block>) {
-        blocks.retain(Block::supported);
+        if self.stopped() {
+            return;
+        }
+        let mut directories = HashMap::new();
+        directories.insert(0, self.directory("global"));
+        for oid in self.databases() {
+            let directory = self.directory(&format!("base/{oid}"));
+            directories.insert(oid, directory);
+        }
+        blocks.retain(|block| block.supported() && directories.contains_key(&block.database));
         blocks.sort_unstable();
         blocks.dedup();
         // The runs of one relation: (blocks in it, where it starts, where it ends).
@@ -559,13 +664,11 @@ impl Builder {
         }
         relations.sort_by_key(|(count, start, _)| (*count, blocks[*start].relation()));
         for (_, start, end) in relations {
+            if self.stopped() {
+                return;
+            }
             let first = blocks[start];
-            let relative = if first.database == 0 {
-                "global".to_string()
-            } else {
-                format!("base/{}", first.database)
-            };
-            let directory = self.directory(&relative);
+            let directory = directories[&first.database];
             // One file per segment, with the contiguous blocks of it as one span.
             let mut segment = u64::from(first.block) / SEGMENT_BLOCKS;
             let mut spans: Vec<(u64, u64)> = Vec::new();
@@ -590,7 +693,8 @@ impl Builder {
         }
     }
 
-    /// Adds one segment file of the relation of `first`; false when the plan is full.
+    /// Adds one segment file of the relation of `first`; false when the plan stopped: it is full,
+    /// it has met `MAX_ABSENT` files that are not there, or the budget or the cancel ended it.
     fn add_segment(
         &mut self,
         directory: usize,
@@ -604,19 +708,31 @@ impl Builder {
             Some(spans),
         ) {
             Added::Planned => {}
-            Added::Absent => self.missing += 1,
-            Added::Full => return false,
+            Added::Absent => {
+                self.missing += 1;
+                if self.missing >= MAX_ABSENT {
+                    self.bounded = true;
+                    return false;
+                }
+            }
+            Added::Stopped => return false,
         }
         true
     }
 
     fn finish(self, started: Instant) -> Plan {
+        let cut = self
+            .halt
+            .stopped
+            .get()
+            .or(self.bounded.then_some(Stop::Bounded));
         Plan {
             data: self.data,
             directories: self.directories.into_iter().map(|d| d.relative).collect(),
             targets: self.targets,
             bytes: self.bytes,
             missing: self.missing,
+            cut,
             plan_us: micros(started.elapsed()),
         }
     }
@@ -627,18 +743,21 @@ fn micros(elapsed: Duration) -> u64 {
 }
 
 /// The catalog set of the data directory `data`: nothing, for a directory that is not there or is
-/// a link. About 5 MB for a database with its own small schema.
-pub fn catalog(data: &Path) -> Plan {
+/// a link. About 5 MB for a database with its own small schema. The planning stops at `budget`
+/// and at `cancel`, as the issuing does, and the plan says so (`Report::stop`).
+pub fn catalog(data: &Path, budget: Duration, cancel: &AtomicBool) -> Plan {
     let started = Instant::now();
-    let mut builder = Builder::new(data);
+    let mut builder = Builder::new(data, started, budget, cancel);
     if cache::is_directory(data) {
         builder.catalog();
     }
     builder.finish(started)
 }
 
-/// The hot list of the data directory `data`, from its `autoprewarm.blocks`.
-pub fn list(data: &Path) -> Result<Plan, Unavailable> {
+/// The hot list of the data directory `data`, from its `autoprewarm.blocks`. The planning stops at
+/// `budget` and at `cancel`; what it plans is bounded by the files the data directory holds
+/// whatever the list names (`MAX_DATABASES`, `MAX_FILES`, `MAX_ABSENT`).
+pub fn list(data: &Path, budget: Duration, cancel: &AtomicBool) -> Result<Plan, Unavailable> {
     let started = Instant::now();
     if !cache::is_directory(data) {
         return Err(Unavailable::Missing);
@@ -656,8 +775,8 @@ pub fn list(data: &Path) -> Result<Plan, Unavailable> {
     if bytes.len() as u64 > MAX_LIST_BYTES {
         return Err(Unavailable::Unreadable);
     }
-    let blocks = parse_blocks(&bytes).ok_or(Unavailable::Unreadable)?;
-    let mut builder = Builder::new(data);
+    let mut builder = Builder::new(data, started, budget, cancel);
+    let blocks = parse_blocks(&bytes, &builder.halt).ok_or(Unavailable::Unreadable)?;
     builder.list(blocks);
     Ok(builder.finish(started))
 }
@@ -673,7 +792,7 @@ impl Plan {
         let started = Instant::now();
         let page = cache::page_size();
         let mut report = Report {
-            stop: Stop::Done,
+            stop: self.cut.unwrap_or(Stop::Done),
             files: self.targets.len() as u64,
             planned_bytes: self.bytes,
             missing: self.missing,
@@ -789,6 +908,20 @@ mod tests {
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)
     }
+    /// The plans, with a budget that nothing in a test reaches.
+    fn make_catalog(data: &Path) -> Plan {
+        catalog(data, Duration::from_secs(600), &no_cancel())
+    }
+    fn make_list(data: &Path) -> Result<Plan, Unavailable> {
+        list(data, Duration::from_secs(600), &no_cancel())
+    }
+    fn parse(bytes: &[u8]) -> Option<Vec<Block>> {
+        let never = no_cancel();
+        parse_blocks(
+            bytes,
+            &Halt::new(Instant::now(), Duration::from_secs(600), &never),
+        )
+    }
 
     /// A data directory with the places a plan lists.
     fn data(label: &str) -> PathBuf {
@@ -845,7 +978,7 @@ mod tests {
         sparse(data.join("base/16384/16500"), (1280 + 12) * BLOCK);
         let all: Vec<_> = (0..1292).map(|b| (16384, 1663, 16500, 0, b)).collect();
         dump(&data, &all);
-        let plan = list(&data).unwrap();
+        let plan = make_list(&data).unwrap();
         let mut model = Model::default();
         let report = plan.issue_with(limits(Duration::from_secs(60)), &no_cancel(), &mut model);
 
@@ -870,7 +1003,7 @@ mod tests {
 
     #[test]
     fn a_list_is_read_strictly_and_anything_else_is_no_list() {
-        let ok = parse_blocks(b"<<2>>\n5,1663,1259,0,0\n16384,1663,16500,3,131072\n").unwrap();
+        let ok = parse(b"<<2>>\n5,1663,1259,0,0\n16384,1663,16500,3,131072\n").unwrap();
         assert_eq!(
             ok,
             [
@@ -890,10 +1023,10 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(parse_blocks(b"<<0>>\n").unwrap(), []);
+        assert_eq!(parse(b"<<0>>\n").unwrap(), []);
         // The last line may lack its newline; blocks up to the largest 32-bit number are blocks.
         assert_eq!(
-            parse_blocks(b"<<1>>\n1,2,3,0,4294967295").unwrap()[0].block,
+            parse(b"<<1>>\n1,2,3,0,4294967295").unwrap()[0].block,
             u32::MAX
         );
         let too_many = format!("<<{}>>\n", MAX_LIST_BLOCKS + 1);
@@ -917,7 +1050,7 @@ mod tests {
             ("text", b"<<1>>\n1,2,3,0,x\n"),
             ("not UTF-8", b"<<1>>\n1,2,3,0,\xff\n"),
         ] {
-            assert_eq!(parse_blocks(bad), None, "{what}");
+            assert_eq!(parse(bad), None, "{what}");
         }
     }
 
@@ -960,7 +1093,7 @@ mod tests {
         blocks.sort_by_key(|b| std::cmp::Reverse(b.4));
         dump(&data, &blocks);
 
-        let plan = list(&data).unwrap();
+        let plan = make_list(&data).unwrap();
         let end = SEGMENT_BLOCKS * BLOCK;
         assert_eq!(
             planned(&plan),
@@ -1022,7 +1155,7 @@ mod tests {
         sparse(data.join("base/1/1259"), 3 * BLOCK);
         sparse(data.join("base/5/1259"), 3 * BLOCK);
 
-        let plan = catalog(&data);
+        let plan = make_catalog(&data);
         assert_eq!(
             planned(&plan),
             [
@@ -1048,7 +1181,7 @@ mod tests {
         // The old file of pg_class (1259), the relation of the user (16500) and the relcache init
         // files are not in it.
         assert_eq!(plan.missing, 0);
-        assert_eq!(catalog(&data.join("missing")).targets.len(), 0);
+        assert_eq!(make_catalog(&data.join("missing")).targets.len(), 0);
     }
 
     #[test]
@@ -1084,7 +1217,7 @@ mod tests {
         sparse(data.join("base/16384/16500"), 10 << 20);
         let all: Vec<_> = (0..1280).map(|b| (16384, 1663, 16500, 0, b)).collect();
         dump(&data, &all);
-        let plan = list(&data).unwrap();
+        let plan = make_list(&data).unwrap();
 
         // A budget of nothing issues nothing; a budget of 40 ms at 5 ms a piece issues some.
         let report = plan.issue_with(limits(Duration::ZERO), &no_cancel(), &mut Model::default());
@@ -1164,7 +1297,7 @@ mod tests {
             sparse(outside.join("000000010000000000000001"), 16 << 20);
             fs::remove_dir_all(data.join(place)).unwrap();
             symlink(&outside, data.join(place)).unwrap();
-            assert_eq!(names(&catalog(&data)), expected, "{place}");
+            assert_eq!(names(&make_catalog(&data)), expected, "{place}");
         }
         let data = data("prefetch-link-database");
         let outside = testpg::directory("prefetch-outside");
@@ -1172,26 +1305,27 @@ mod tests {
         sparse(outside.join("16500"), 8192);
         fs::remove_dir_all(data.join("base/16384")).unwrap();
         symlink(&outside, data.join("base/16384")).unwrap();
-        assert_eq!(names(&catalog(&data)), Vec::<String>::new());
+        assert_eq!(names(&make_catalog(&data)), Vec::<String>::new());
         dump(&data, &[(16384, 1663, 16500, 0, 0)]);
-        let plan = list(&data).unwrap();
-        assert_eq!((plan.targets.len(), plan.missing), (0, 1));
+        let plan = make_list(&data).unwrap();
+        // A line for a database that is a link is dropped: that database is not planned.
+        assert_eq!((plan.targets.len(), plan.missing), (0, 0));
         // The data directory itself, and a list that is a link.
         let real = self::data("prefetch-link-data");
         sparse(real.join("base/16384/16500"), 8192);
         dump(&real, &[(16384, 1663, 16500, 0, 0)]);
         let linked = testpg::directory("prefetch-linked").join("data");
         symlink(&real, &linked).unwrap();
-        assert_eq!(names(&list(&real).unwrap()), ["base/16384/16500"]);
-        assert_eq!(list(&linked).err(), Some(Unavailable::Missing));
-        assert_eq!(names(&catalog(&linked)), Vec::<String>::new());
+        assert_eq!(names(&make_list(&real).unwrap()), ["base/16384/16500"]);
+        assert_eq!(make_list(&linked).err(), Some(Unavailable::Missing));
+        assert_eq!(names(&make_catalog(&linked)), Vec::<String>::new());
         let other = testpg::directory("prefetch-other").join("list");
         fs::copy(real.join("autoprewarm.blocks"), &other).unwrap();
         fs::remove_file(real.join("autoprewarm.blocks")).unwrap();
         symlink(&other, real.join("autoprewarm.blocks")).unwrap();
-        assert_eq!(list(&real).err(), Some(Unavailable::Unreadable));
+        assert_eq!(make_list(&real).err(), Some(Unavailable::Unreadable));
         fs::remove_file(real.join("autoprewarm.blocks")).unwrap();
-        assert_eq!(list(&real).err(), Some(Unavailable::Missing));
+        assert_eq!(make_list(&real).err(), Some(Unavailable::Missing));
 
         // A directory that becomes a link, and a file that becomes a link or a pipe, after the
         // plan: the files are skipped and the kernel is never asked.
@@ -1207,7 +1341,7 @@ mod tests {
                 (0, 1664, 1260, 0, 0),
             ],
         );
-        let plan = list(&data).unwrap();
+        let plan = make_list(&data).unwrap();
         assert_eq!(plan.targets.len(), 3);
         let outside = testpg::directory("prefetch-outside");
         sparse(outside.join("16500"), 8192);
@@ -1229,6 +1363,148 @@ mod tests {
             (3, 0, Stop::Done)
         );
         assert!(model.calls.is_empty());
+    }
+
+    /// The database's own user writes `autoprewarm.blocks` and owns the directories it names
+    /// (the threat model of `cache.rs`), and the agent plans as root in a thread of the node's
+    /// blocking pool: a list of one line per database that is not there, or per file that is not
+    /// there, must cost a plan that is bounded by what the data directory really holds. Before the
+    /// bounds, 5,000 such lines took 1.6 s, 20,000 took 26 s and 40,000 (680 KB) took 109 s, as the
+    /// time grew with the square of the lines.
+    #[test]
+    fn a_crafted_list_costs_a_plan_bounded_by_what_the_data_directory_holds() {
+        let data = data("prefetch-crafted");
+        sparse(data.join("base/16384/16500"), 8 * BLOCK);
+        // 5,000 databases that are not there, 5,000 files that are not in the one that is, and
+        // the one block of a file that is.
+        let mut blocks: Vec<_> = (0..5000).map(|n| (20_000 + n, 1663, 16500, 0, 0)).collect();
+        blocks.extend((0..5000).map(|n| (16384, 1663, 30_000 + n, 0, 0)));
+        blocks.push((16384, 1663, 16500, 0, 0));
+        dump(&data, &blocks);
+
+        let plan = make_list(&data).unwrap();
+        // Only directories of the data directory are planned, never one a line made up.
+        assert!(
+            plan.directories.len() <= MAX_DATABASES + 2,
+            "{} directories",
+            plan.directories.len()
+        );
+        // The files that are not there are counted to a bound, where the plan stops and says so.
+        assert_eq!(plan.missing, MAX_ABSENT);
+        assert_eq!(names(&plan), ["base/16384/16500"]);
+        let report = plan.issue_with(
+            limits(Duration::from_secs(60)),
+            &no_cancel(),
+            &mut Model::default(),
+        );
+        assert_eq!(
+            (report.stop, report.missing, report.pieces),
+            (Stop::Bounded, MAX_ABSENT, 1)
+        );
+
+        // A link, a file or a pipe in `base/` is no database either, and neither are more than
+        // `MAX_DATABASES` real ones: the lowest are planned.
+        let data = self::data("prefetch-crafted-databases");
+        let outside = testpg::directory("prefetch-crafted-outside");
+        sparse(outside.join("16500"), 8 * BLOCK);
+        symlink(&outside, data.join("base/16385")).unwrap();
+        sparse(data.join("base/16386"), 8 * BLOCK);
+        let mut blocks = vec![
+            (16385, 1663, 16500, 0, 0),
+            (16386, 1663, 16500, 0, 0),
+            (16384, 1663, 16500, 0, 0),
+        ];
+        sparse(data.join("base/16384/16500"), 8 * BLOCK);
+        for oid in 20_000..20_000 + 2 * MAX_DATABASES as u32 {
+            fs::create_dir_all(data.join(format!("base/{oid}"))).unwrap();
+            sparse(data.join(format!("base/{oid}/16500")), 8 * BLOCK);
+            blocks.push((oid, 1663, 16500, 0, 0));
+        }
+        dump(&data, &blocks);
+        let plan = make_list(&data).unwrap();
+        let planned = names(&plan);
+        assert_eq!(planned.len(), MAX_DATABASES);
+        assert_eq!(planned[0], "base/16384/16500");
+        assert_eq!(planned[MAX_DATABASES - 1], "base/20030/16500");
+        assert_eq!(plan.missing, 0);
+        assert!(make_catalog(&data).directories.len() <= MAX_DATABASES + 2);
+
+        // So many files that are there, one block each, as the plan holds at most.
+        let data = self::data("prefetch-crafted-files");
+        let blocks: Vec<_> = (0..MAX_FILES as u32 + 100)
+            .map(|n| {
+                sparse(data.join(format!("base/16384/{}", 30_000 + n)), BLOCK);
+                (16384, 1663, 30_000 + n, 0, 0)
+            })
+            .collect();
+        dump(&data, &blocks);
+        let plan = make_list(&data).unwrap();
+        assert_eq!(
+            (plan.targets.len(), plan.cut),
+            (MAX_FILES, Some(Stop::Bounded))
+        );
+    }
+
+    /// The planning has the budget and the cancel the issuing has, and a plan that was stopped
+    /// says why in its report.
+    #[test]
+    fn planning_stops_at_its_budget_and_at_a_cancel_and_the_plan_says_so() {
+        let data = data("prefetch-plan-stops");
+        fs::write(data.join("global/pg_control"), control(0x0100_0100)).unwrap();
+        sparse(data.join("pg_wal/000000010000000000000001"), 16 << 20);
+        sparse(data.join("base/16384/16500"), 10 << 20);
+        sparse(data.join("base/16384/16501"), 10 << 20);
+        dump(
+            &data,
+            &[(16384, 1663, 16500, 0, 0), (16384, 1663, 16501, 0, 0)],
+        );
+        let minute = Duration::from_secs(60);
+        let issued =
+            |plan: &Plan| plan.issue_with(limits(minute), &no_cancel(), &mut Model::default());
+
+        // Not stopped: both files and `Done`.
+        let plan = make_list(&data).unwrap();
+        assert_eq!((plan.targets.len(), plan.cut), (2, None));
+        assert_eq!(issued(&plan).stop, Stop::Done);
+        // A budget of nothing plans nothing, in the list and in the catalog set.
+        for plan in [
+            list(&data, Duration::ZERO, &no_cancel()).unwrap(),
+            catalog(&data, Duration::ZERO, &no_cancel()),
+        ] {
+            assert_eq!((plan.targets.len(), plan.cut), (0, Some(Stop::Budget)));
+            let report = issued(&plan);
+            assert_eq!(
+                (report.stop, report.files, report.pieces),
+                (Stop::Budget, 0, 0)
+            );
+        }
+        // A cancel that is up plans nothing, and the issuing does not start either.
+        let cancel = AtomicBool::new(true);
+        for plan in [
+            list(&data, minute, &cancel).unwrap(),
+            catalog(&data, minute, &cancel),
+        ] {
+            assert_eq!((plan.targets.len(), plan.cut), (0, Some(Stop::Cancelled)));
+            let report = plan.issue_with(limits(minute), &cancel, &mut Model::default());
+            assert_eq!((report.stop, report.pieces), (Stop::Cancelled, 0));
+        }
+        // The first reason is kept: a flag that goes down again does not start the planning again.
+        let flag = AtomicBool::new(true);
+        let halt = Halt::new(Instant::now(), minute, &flag);
+        assert!(halt.check());
+        flag.store(false, Ordering::Relaxed);
+        assert!(halt.check());
+        assert_eq!(halt.stopped.get(), Some(Stop::Cancelled));
+        // A list that is cut while it is read, a long one: the lines read are not planned.
+        let lines = HALT_EVERY * 3;
+        let mut text = format!("<<{lines}>>\n");
+        for n in 0..lines {
+            text += &format!("16384,1663,16500,0,{n}\n");
+        }
+        let cancel = AtomicBool::new(true);
+        let halt = Halt::new(Instant::now(), minute, &cancel);
+        assert_eq!(parse_blocks(text.as_bytes(), &halt), Some(Vec::new()));
+        assert_eq!(parse(text.as_bytes()).unwrap().len(), lines);
     }
 
     // The real PostgreSQL 18 tests.
@@ -1339,7 +1615,7 @@ mod tests {
         assert_ne!(moved(1259), format!("{prefix}/1259"));
         assert_ne!(moved(1255), format!("{prefix}/1255"));
 
-        let plan = catalog(&data);
+        let plan = make_catalog(&data);
         let planned = names(&plan);
         // Every catalog with something in it is planned at the file PostgreSQL names; an empty one
         // (nothing in `pg_attrdef`) has nothing to read.
@@ -1433,10 +1709,10 @@ mod tests {
         };
         let data = real.cluster.data();
         let text = fs::read(data.join("autoprewarm.blocks")).unwrap();
-        let blocks = parse_blocks(&text).expect("PostgreSQL's own dump is a list");
+        let blocks = parse(&text).expect("PostgreSQL's own dump is a list");
         assert!(blocks.len() > 500, "{} blocks", blocks.len());
 
-        let plan = list(&data).unwrap();
+        let plan = make_list(&data).unwrap();
         // Every supported block is in the plan, and every file it names is there.
         let supported = blocks.iter().filter(|b| b.supported()).count() as u64;
         assert_eq!((plan.bytes, plan.missing), (supported * BLOCK, 0));
@@ -1529,21 +1805,30 @@ mod tests {
         File::open(&path).unwrap().sync_all().unwrap();
         let all: Vec<_> = (0..blocks).map(|b| (16384, 1663, 16500, 0, b)).collect();
         dump(&data, &all);
-        let plan = list(&data).unwrap();
+        let plan = make_list(&data).unwrap();
 
-        let file = File::open(&path).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let pages = u64::from(blocks) * BLOCK / cache::page_size();
+        let held = |file: &File| cache::cachestat_range(file, 0, 0);
+        // A file system can only be checked if it reports the pages of a file that was read in
+        // full (overlayfs, the root of a container, counts the pages of its own inode and finds
+        // none), and if it drops the pages it is told to drop (a tmpfs keeps every page).
+        file.read_to_end(&mut Vec::new()).unwrap();
+        match held(&file) {
+            Ok(0) => {
+                return eprintln!(
+                    "skipped: this file system does not report the pages of its files"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => return eprintln!("skipped: no cachestat here ({error})"),
+        }
         // SAFETY: advice for an open descriptor; length 0 is to the end of the file.
         let error =
             unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         assert_eq!(error, 0);
-        let pages = u64::from(blocks) * BLOCK / cache::page_size();
-        let held = |file: &File| cache::cachestat_range(file, 0, 0).map(|p| p.resident);
-        match held(&file) {
-            Ok(0) => {}
-            Ok(_) => {
-                return eprintln!("skipped: this file system keeps the pages it is told to drop");
-            }
-            Err(error) => return eprintln!("skipped: no cachestat here ({error})"),
+        if held(&file).unwrap() != 0 {
+            return eprintln!("skipped: this file system keeps the pages it is told to drop");
         }
 
         let report = plan.issue(limits(Duration::from_secs(10)), &no_cancel());

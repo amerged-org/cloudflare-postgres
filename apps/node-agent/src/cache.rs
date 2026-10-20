@@ -1,66 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-//! How much of a database's files the page cache holds, read before its unit starts (plan 5.9,
-//! 9.9). A database that slept for days has had its pages evicted when memory was needed, and its
-//! first statements read them from the disk; the `wake_detail` event carries this reading, so a
-//! slow cold request is told from a slow node path.
+//! How the agent opens and counts the files of a database's data directory (plan 5.9, 9.9). The
+//! data directory belongs to the database's user, who can put a link in place of any directory of
+//! it, and the agent reads as root: `prefetch` plans and advises the files a first request reads
+//! with the rules of this module, and counts the pages of the cache that held them with
+//! `cachestat(2)`.
 //!
 //! The kernel counts the cached pages of a file with `cachestat(2)` (Linux 6.5; glibc has no
-//! wrapper, so it is called as a system call). The reading covers a bounded set of files of the
-//! data directory, the ones a first request touches: `global/`, `pg_xact/`, the newest WAL segment
-//! and the files of the user databases below `base/`, newest-modified first, at most `MAX_FILES`
-//! of them and `MAX_LENGTH` bytes of file length together.
-//!
-//! The reading opens and lists files while the wake runs; on cold dentries that is disk reads of
-//! its own, at a cost nobody has measured (plan 11.2). `prefetch` counts the pages of the files it
-//! advises with its own accounting, off this reading, and shares this module's rules for opening
-//! a file of the data directory: `is_directory`, `names`, `open` and `cachestat_range`.
-use crate::sleep::is_segment;
+//! wrapper, so it is called as a system call). It looks the pages up and reads nothing.
 use std::{
-    fs::{File, OpenOptions},
+    fs::{DirEntry, File, OpenOptions},
     io,
     os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-    time::SystemTime,
+    path::Path,
 };
 
-/// Files read at most.
-const MAX_FILES: usize = 64;
-/// Bytes of file length read at most, together.
-const MAX_LENGTH: u64 = 256 << 20;
 /// Directory entries looked at in one directory: the data directory belongs to the database's
 /// user, who can fill it with files.
 const MAX_ENTRIES: usize = 16_384;
-/// The first object ID of the user's own objects in PostgreSQL (`FirstNormalObjectId`): the
-/// databases below it are `template1`, `template0` and `postgres`.
-const FIRST_USER_DATABASE: u32 = 16_384;
-
-/// What the cache holds of one file, in pages.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Pages {
-    pub resident: u64,
-    pub dirty: u64,
-    /// Evicted, and not read again since.
-    pub evicted: u64,
-    /// Evicted so recently that the kernel would have kept the page with more memory.
-    pub recently_evicted: u64,
-}
-
-/// What the cache holds of the files read, in pages.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Residency {
-    /// How many files were read.
-    pub files: u64,
-    /// The pages their length makes.
-    pub pages: u64,
-    pub cached: Pages,
-}
-
-/// A file that may be read.
-struct Candidate {
-    path: PathBuf,
-    length: u64,
-    modified: SystemTime,
-}
 
 /// Whether `path` is a directory and no link to one. The data directory is the database user's,
 /// who can put a link in place of any directory of it, and the agent reads as root.
@@ -68,10 +24,9 @@ pub(crate) fn is_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
-/// The names of the entries of `directory`, sorted: none if it is no directory or is a link. At
-/// most `MAX_ENTRIES` entries are looked at, and an entry is not examined (its name is all the
-/// listing reads), so a directory of many files costs its blocks and no inode.
-pub(crate) fn names(directory: &Path) -> Vec<String> {
+/// The names of the entries of `directory` that `wanted` accepts, sorted: none if it is no
+/// directory or is a link. At most `MAX_ENTRIES` entries are looked at.
+fn listing(directory: &Path, wanted: impl Fn(&DirEntry) -> bool) -> Vec<String> {
     if !is_directory(directory) {
         return Vec::new();
     }
@@ -80,88 +35,31 @@ pub(crate) fn names(directory: &Path) -> Vec<String> {
     };
     let mut names: Vec<String> = entries
         .take(MAX_ENTRIES)
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            wanted(&entry)
+                .then(|| entry.file_name().into_string().ok())
+                .flatten()
+        })
         .collect();
     names.sort_unstable();
     names
 }
 
-/// The regular files of `directory`, which is none if it is a link. A link among them is none:
-/// neither is followed. The check and the listing are two calls, so a link put there between them
-/// is followed once, for the opening of files without reading them.
-fn files_in(directory: &Path) -> Vec<Candidate> {
-    if !is_directory(directory) {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return Vec::new();
-    };
-    entries
-        .take(MAX_ENTRIES)
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let metadata = entry.metadata().ok().filter(std::fs::Metadata::is_file)?;
-            Some(Candidate {
-                path: entry.path(),
-                length: metadata.len(),
-                modified: metadata.modified().ok()?,
-            })
-        })
-        .collect()
+/// The names of the entries of `directory`, sorted: none if it is no directory or is a link. An
+/// entry is not examined (its name is all the listing reads), so a directory of many files costs
+/// its blocks and no inode.
+pub(crate) fn names(directory: &Path) -> Vec<String> {
+    listing(directory, |_| true)
 }
 
-/// The files to read: nothing is chosen of a data directory that is not there or is a link.
-fn select(data: &Path) -> Vec<Candidate> {
-    if !is_directory(data) {
-        return Vec::new();
-    }
-    let mut all = files_in(&data.join("global"));
-    all.extend(files_in(&data.join("pg_xact")));
-    all.extend(
-        files_in(&data.join("pg_wal"))
-            .into_iter()
-            .filter(|file| {
-                file.path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(is_segment)
-            })
-            .max_by_key(|file| file.modified),
-    );
-    let base = data.join("base");
-    if is_directory(&base)
-        && let Ok(databases) = std::fs::read_dir(&base)
-    {
-        for database in databases.take(MAX_ENTRIES).filter_map(Result::ok) {
-            let user_database = database
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-                .is_some_and(|oid| oid >= FIRST_USER_DATABASE);
-            if user_database {
-                all.extend(files_in(&database.path()));
-            }
-        }
-    }
-    all.sort_by(|a, b| {
-        b.modified
-            .cmp(&a.modified)
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    let mut length = 0u64;
-    let mut chosen = Vec::new();
-    for file in all {
-        if chosen.len() == MAX_FILES {
-            break;
-        }
-        // A file that does not fit is passed over: a smaller, older one may.
-        if file.length > MAX_LENGTH - length {
-            continue;
-        }
-        length += file.length;
-        chosen.push(file);
-    }
-    chosen
+/// The names of the subdirectories of `directory`, sorted: none if it is no directory or is a
+/// link. A link, a file or a pipe among the entries is no subdirectory. The type comes with the
+/// listing on the file systems that have one (and from one `lstat` where they have not).
+pub(crate) fn subdirectories(directory: &Path) -> Vec<String> {
+    listing(directory, |entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_dir())
+    })
 }
 
 /// The size of a page of this machine.
@@ -174,10 +72,10 @@ pub(crate) fn page_size() -> u64 {
         .unwrap_or(4096)
 }
 
-/// Opens a file of the data directory to count its pages. The directory is the database user's:
-/// a link at the file is not followed (`O_NOFOLLOW` covers the last part of the path, the
-/// directories were checked when they were listed), and a pipe or a device is not opened for
-/// reading.
+/// Opens a file of the data directory to read its length and advise the kernel on it. The
+/// directory is the database user's: a link at the file is not followed (`O_NOFOLLOW` covers the
+/// last part of the path; the directories are checked by the caller), and a pipe or a device is
+/// not opened for reading.
 pub(crate) fn open(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
@@ -190,52 +88,11 @@ pub(crate) fn open(path: &Path) -> io::Result<File> {
     }
 }
 
-/// The residency of the files of `data`, counted by `count` (a file and its length, to its pages).
-/// `None` where no file could be counted: no data directory, or a kernel that cannot say.
-pub fn read(data: &Path, count: impl Fn(&File, u64) -> io::Result<Pages>) -> Option<Residency> {
-    let page = page_size();
-    let mut total = Residency::default();
-    for candidate in select(data) {
-        let Ok(file) = open(&candidate.path) else {
-            continue;
-        };
-        let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
-            continue;
-        };
-        let Ok(pages) = count(&file, length) else {
-            continue;
-        };
-        total.files += 1;
-        total.pages += length.div_ceil(page);
-        total.cached.resident += pages.resident;
-        total.cached.dirty += pages.dirty;
-        total.cached.evicted += pages.evicted;
-        total.cached.recently_evicted += pages.recently_evicted;
-    }
-    (total.files > 0).then_some(total)
-}
-
-/// What the kernel of this machine says: `cachestat(2)`.
+/// `cachestat(file, {offset, length}, &status, 0)`: the pages of a range of the file that the page
+/// cache holds, to its end of the file where `length` is 0. The kernel looks the pages up and
+/// reads nothing.
 #[cfg(target_os = "linux")]
-pub fn host(data: &Path) -> Option<Residency> {
-    read(data, cachestat)
-}
-/// Other systems have no such call: no reading, and the event leaves its fields out.
-#[cfg(not(target_os = "linux"))]
-pub fn host(_data: &Path) -> Option<Residency> {
-    None
-}
-
-/// `cachestat(file, {0, 0}, &status, 0)`: the pages of the whole file.
-#[cfg(target_os = "linux")]
-fn cachestat(file: &File, _length: u64) -> io::Result<Pages> {
-    cachestat_range(file, 0, 0)
-}
-
-/// `cachestat(file, {offset, length}, &status, 0)`: the pages of a range of the file, to its end
-/// where `length` is 0. The kernel looks the pages up in the page cache and reads nothing.
-#[cfg(target_os = "linux")]
-pub(crate) fn cachestat_range(file: &File, offset: u64, length: u64) -> io::Result<Pages> {
+pub(crate) fn cachestat_range(file: &File, offset: u64, length: u64) -> io::Result<u64> {
     use std::os::fd::AsRawFd;
     /// The same number on every architecture that has the call (Linux 6.5).
     const SYS_CACHESTAT: libc::c_long = 451;
@@ -275,12 +132,7 @@ pub(crate) fn cachestat_range(file: &File, offset: u64, length: u64) -> io::Resu
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(Pages {
-        resident: status.nr_cache,
-        dirty: status.nr_dirty,
-        evicted: status.nr_evicted,
-        recently_evicted: status.nr_recently_evicted,
-    })
+    Ok(status.nr_cache)
 }
 
 #[cfg(test)]
@@ -288,22 +140,14 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        path::PathBuf,
         time::{Duration, UNIX_EPOCH},
     };
 
-    /// A data directory with a file in each place the reading looks at, and some it must not.
+    /// A data directory with the places a plan lists.
     fn data(label: &str) -> PathBuf {
         let data = crate::testpg::directory(label).join("data");
-        for directory in [
-            "global",
-            "pg_xact",
-            "pg_wal/archive_status",
-            "base/1",
-            "base/5",
-            "base/16384",
-            "base/16385",
-            "pg_multixact",
-        ] {
+        for directory in ["global", "base/1", "base/16384", "pg_multixact"] {
             fs::create_dir_all(data.join(directory)).unwrap();
         }
         data
@@ -316,86 +160,6 @@ mod tests {
             .set_modified(UNIX_EPOCH + Duration::from_secs(age))
             .unwrap();
         path
-    }
-    fn names(files: &[Candidate]) -> Vec<String> {
-        files
-            .iter()
-            .map(|file| {
-                let parent = file.path.parent().unwrap().file_name().unwrap();
-                format!(
-                    "{}/{}",
-                    parent.to_str().unwrap(),
-                    file.path.file_name().unwrap().to_str().unwrap()
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn the_reading_takes_the_files_a_first_request_touches_and_no_others() {
-        let data = data("cache-select");
-        file(data.join("global/pg_control"), 8192, 900);
-        file(data.join("pg_xact/0000"), 262_144, 800);
-        // Of the WAL segments the newest by modification time; the other files of the directory
-        // are no segments.
-        file(data.join("pg_wal/000000010000000000000001"), 16 << 20, 100);
-        file(data.join("pg_wal/000000010000000000000002"), 16 << 20, 700);
-        file(data.join("pg_wal/00000002.history"), 100, 950);
-        file(
-            data.join("pg_wal/archive_status/000000010000000000000002.done"),
-            0,
-            960,
-        );
-        // The user's databases only: not template1, template0 or postgres.
-        file(data.join("base/1/1259"), 8192, 970);
-        file(data.join("base/5/1259"), 8192, 970);
-        file(data.join("base/16384/16500"), 1 << 20, 600);
-        file(data.join("base/16385/16600"), 1 << 20, 500);
-        // Neither of these is a file of the data directory's own.
-        file(data.join("pg_multixact/0000"), 8192, 990);
-        std::os::unix::fs::symlink("/etc/hosts", data.join("global/a-link")).unwrap();
-
-        assert_eq!(
-            names(&select(&data)),
-            [
-                "global/pg_control",
-                "pg_xact/0000",
-                "pg_wal/000000010000000000000002",
-                "16384/16500",
-                "16385/16600",
-            ]
-        );
-        // No data directory, no files.
-        assert!(select(&data.join("missing")).is_empty());
-    }
-
-    #[test]
-    fn the_reading_stops_at_64_files_and_256_mib_of_length_and_prefers_the_newest() {
-        let data = data("cache-bounds");
-        for n in 0..100u64 {
-            file(
-                data.join(format!("base/16384/{}", 20_000 + n)),
-                8192,
-                1000 + n,
-            );
-        }
-        let chosen = select(&data);
-        assert_eq!(chosen.len(), 64);
-        // The 64 newest of the 100: modified at 1036 to 1099.
-        let oldest = chosen.iter().map(|file| file.modified).min().unwrap();
-        assert_eq!(oldest, UNIX_EPOCH + Duration::from_secs(1036));
-
-        // 200 MiB, then a file that does not fit, then small ones that do.
-        let data = self::data("cache-length");
-        file(data.join("base/16384/20001"), 200 << 20, 3000);
-        file(data.join("base/16384/20002"), 100 << 20, 2000);
-        file(data.join("base/16384/20003"), 50 << 20, 1000);
-        file(data.join("base/16384/20004"), 6 << 20, 900);
-        file(data.join("base/16384/20005"), 1 << 20, 800);
-        assert_eq!(
-            names(&select(&data)),
-            ["16384/20001", "16384/20003", "16384/20004"]
-        );
     }
 
     /// A pipe or a link that a file of the directory is replaced by after it was listed is not
@@ -417,38 +181,8 @@ mod tests {
         assert!(open(&real).is_ok());
         assert!(open(&piped).is_err());
         assert!(open(&linked).is_err());
-        // The pipe and the link are no files of the directory in the first place.
-        assert_eq!(names(&select(&data)), ["16384/20001"]);
-    }
-
-    /// The database's user can put a link where the data directory has a directory, and the agent
-    /// reads as root: the files behind it are not listed, so they are not opened.
-    #[test]
-    fn a_link_in_place_of_a_directory_is_not_followed() {
-        // Each place the reading lists, replaced by a link to a directory with what it would take.
-        for place in ["global", "pg_xact", "pg_wal", "base"] {
-            let data = data("cache-link");
-            let outside = crate::testpg::directory("cache-outside");
-            file(outside.join("000000010000000000000001"), 8192, 500);
-            fs::create_dir_all(outside.join("16384")).unwrap();
-            file(outside.join("16384/16500"), 8192, 500);
-            fs::remove_dir_all(data.join(place)).unwrap();
-            std::os::unix::fs::symlink(&outside, data.join(place)).unwrap();
-            assert_eq!(names(&select(&data)), Vec::<String>::new(), "{place}");
-        }
-        // The directory of a user database, and the data directory itself.
-        let data = data("cache-link-database");
-        let outside = crate::testpg::directory("cache-outside");
-        file(outside.join("16500"), 8192, 500);
-        fs::remove_dir_all(data.join("base/16384")).unwrap();
-        std::os::unix::fs::symlink(&outside, data.join("base/16384")).unwrap();
-        assert_eq!(names(&select(&data)), Vec::<String>::new());
-        let real = self::data("cache-link-data");
-        file(real.join("global/pg_control"), 8192, 900);
-        let linked = crate::testpg::directory("cache-linked").join("data");
-        std::os::unix::fs::symlink(&real, &linked).unwrap();
-        assert_eq!(names(&select(&real)), ["global/pg_control"]);
-        assert_eq!(names(&select(&linked)), Vec::<String>::new());
+        // A directory is no file to open.
+        assert!(open(&data.join("base/16384")).is_err());
     }
 
     #[test]
@@ -457,60 +191,40 @@ mod tests {
         file(data.join("base/16384/20002"), 1, 100);
         file(data.join("base/16384/20001"), 1, 100);
         file(data.join("base/16384/9"), 1, 100);
-        assert_eq!(
-            super::names(&data.join("base/16384")),
-            ["20001", "20002", "9"]
-        );
+        assert_eq!(names(&data.join("base/16384")), ["20001", "20002", "9"]);
         let outside = crate::testpg::directory("cache-names-outside");
         file(outside.join("20001"), 1, 100);
         std::os::unix::fs::symlink(&outside, data.join("pg_link")).unwrap();
-        assert!(super::names(&data.join("pg_link")).is_empty());
-        assert!(super::names(&data.join("base/16384/20001")).is_empty());
-        assert!(super::names(&data.join("missing")).is_empty());
+        assert!(names(&data.join("pg_link")).is_empty());
+        assert!(names(&data.join("base/16384/20001")).is_empty());
+        assert!(names(&data.join("missing")).is_empty());
     }
 
+    /// `base/` of the database's user holds what the user puts there: only a real directory is a
+    /// database, not a link to one, a file or a pipe.
     #[test]
-    fn the_residency_is_the_sum_over_the_files_and_none_where_nothing_was_counted() {
-        let data = data("cache-sum");
-        file(data.join("global/pg_control"), 8192, 900);
-        file(data.join("base/16384/20001"), 10_000, 800);
-        let pages = |resident, dirty, evicted, recently_evicted| Pages {
-            resident,
-            dirty,
-            evicted,
-            recently_evicted,
-        };
-        // Every file holds 2 resident pages, 1 dirty, 3 evicted of which 1 recently.
-        let residency = read(&data, |_, _| Ok(pages(2, 1, 3, 1))).unwrap();
-        let page = page_size();
-        assert_eq!(
-            residency,
-            Residency {
-                files: 2,
-                pages: 8192u64.div_ceil(page) + 10_000u64.div_ceil(page),
-                cached: pages(4, 2, 6, 2),
-            }
+    fn a_subdirectory_is_a_real_directory_and_not_a_link_a_file_or_a_pipe() {
+        let data = data("cache-subdirectories");
+        let base = data.join("base");
+        fs::create_dir_all(base.join("16385")).unwrap();
+        file(base.join("16386"), 1, 100);
+        std::os::unix::fs::symlink(base.join("16385"), base.join("16387")).unwrap();
+        std::os::unix::fs::symlink(base.join("missing"), base.join("16388")).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(base.join("16389"))
+                .status()
+                .unwrap()
+                .success()
         );
-        // A file that cannot be counted is left out of the sum.
-        let first = std::cell::Cell::new(true);
-        let one = read(&data, |_, _| {
-            if first.replace(false) {
-                Err(io::ErrorKind::Unsupported.into())
-            } else {
-                Ok(pages(1, 0, 0, 0))
-            }
-        })
-        .unwrap();
-        assert_eq!((one.files, one.cached), (1, pages(1, 0, 0, 0)));
-        // A kernel that cannot say, and a directory that is not there.
-        assert_eq!(
-            read(&data, |_, _| Err(io::ErrorKind::Unsupported.into())),
-            None
-        );
-        assert_eq!(
-            read(&data.join("missing"), |_, _| Ok(Pages::default())),
-            None
-        );
+        assert_eq!(subdirectories(&base), ["1", "16384", "16385"]);
+        // Nothing of a link to a directory, of a file or of what is not there.
+        let outside = crate::testpg::directory("cache-subdirectories-outside");
+        fs::create_dir_all(outside.join("16390")).unwrap();
+        std::os::unix::fs::symlink(&outside, data.join("pg_link")).unwrap();
+        assert!(subdirectories(&data.join("pg_link")).is_empty());
+        assert!(subdirectories(&base.join("16386")).is_empty());
+        assert!(subdirectories(&base.join("missing")).is_empty());
     }
 
     /// The kernel's own count of a real file: resident after it was read, gone after the kernel
@@ -529,7 +243,7 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         File::open(&path).unwrap().sync_all().unwrap();
         let mut file = File::open(&path).unwrap();
-        let count = |file: &File| match cachestat(file, 0) {
+        let count = |file: &File| match cachestat_range(file, 0, 0) {
             Ok(pages) => Some(pages),
             Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => None,
             Err(error) => panic!("cachestat: {error}"),
@@ -542,45 +256,37 @@ mod tests {
             eprintln!("skipped: this kernel has no cachestat");
             return;
         };
-        if cached.resident == 0 {
+        if cached == 0 {
             eprintln!("skipped: this file system does not report the pages of its files");
             return;
         }
-        assert_eq!(cached.resident, total, "{cached:?}");
-        assert_eq!(cached.dirty, 0, "{cached:?}");
+        assert_eq!(cached, total);
 
         // SAFETY: advice for an open descriptor; length 0 is to the end of the file.
         let error =
             unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         assert_eq!(error, 0);
         let dropped = count(&file).unwrap();
-        if dropped.resident == cached.resident {
+        if dropped == cached {
             eprintln!("skipped: this file system keeps the pages it is told to drop");
             return;
         }
-        assert_eq!(dropped.resident, 0, "{dropped:?}");
+        assert_eq!(dropped, 0);
 
         // A range counts its own pages: only the second half is read, and the first half, the
         // second half and "to the end of the file from the middle" say so.
         let half = 128 * 4096;
         file.seek(std::io::SeekFrom::Start(half)).unwrap();
         file.read_exact(&mut vec![0u8; half as usize]).unwrap();
-        let resident = |offset, length| cachestat_range(&file, offset, length).unwrap().resident;
+        let resident = |offset, length| cachestat_range(&file, offset, length).unwrap();
         assert_eq!(resident(0, half), 0);
         assert_eq!(resident(half, half), half / page);
         assert_eq!(resident(half, 0), half / page);
         assert_eq!(resident(0, 0), half / page);
 
-        // Read again: every page is back. The whole reading finds the file below a data
-        // directory and counts it the same way.
+        // Read again: every page is back.
         file.rewind().unwrap();
         file.read_to_end(&mut Vec::new()).unwrap();
-        assert_eq!(count(&file).unwrap().resident, total);
-        let data = path.parent().unwrap().join("data");
-        fs::create_dir_all(data.join("global")).unwrap();
-        fs::copy(&path, data.join("global/pg_control")).unwrap();
-        let residency = host(&data).unwrap();
-        assert_eq!((residency.files, residency.pages), (1, total));
-        assert_eq!(residency.cached.resident, total);
+        assert_eq!(count(&file).unwrap(), total);
     }
 }
