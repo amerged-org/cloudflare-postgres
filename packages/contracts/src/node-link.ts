@@ -1295,9 +1295,16 @@ export const NodeOrderResult = z
   );
 export type NodeOrderResult = z.infer<typeof NodeOrderResult>;
 
-/** The events a report carries, and the fields of one. */
+/**
+ * The events a report carries, and the fields of one. The agent keeps the first
+ * `NODE_REPORT_EVENT_FIELDS_MAX` fields of a log line by key order and drops the others without a
+ * word, so the bound has to hold the widest line it sends: the `wake_detail` of a wake on the
+ * slot path has 19 fields (the 15 of today's detail and `slot_from`, `slot_wait_us`, `bind_us`
+ * and `order_us`). It is raised from 16 and goes API first like every bound on what the node
+ * sends (plan 9.3): an API that still holds 16 refuses the whole report that carries such an event.
+ */
 export const NODE_REPORT_EVENTS_MAX = 64;
-export const NODE_REPORT_EVENT_FIELDS_MAX = 16;
+export const NODE_REPORT_EVENT_FIELDS_MAX = 24;
 /**
  * One line of the agent's own log (plan 9.9): an event's name, and fields that are numbers or
  * short tokens. The shape rules out whitespace, path separators, non-ASCII, nested values and
