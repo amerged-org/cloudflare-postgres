@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Specific modules, never the contracts barrel: a cold isolate evaluates only what it imports.
-import { isDatabaseId, isRoleName } from "@pgcf/contracts/ids";
+// Specific modules, never the contracts barrel, and the zod-free `-core` ones where there are two:
+// a cold isolate evaluates only what it imports (test/bundle.node-test.ts holds zod out).
+import { isDatabaseId, isRoleName } from "@pgcf/contracts/ids-core";
 import { encodeErrorResponse } from "@pgcf/contracts/pg-wire";
 import {
   AdmissionFailure,

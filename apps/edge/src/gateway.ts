@@ -7,7 +7,7 @@ import {
   accessTokenState,
   refusalCode,
 } from "@pgcf/contracts/edge-policy";
-import { ROUTE_TOKEN_HEADER } from "@pgcf/contracts/route-token";
+import { ROUTE_TOKEN_HEADER } from "@pgcf/contracts/route-token-core";
 import type { Env } from "./env.ts";
 
 export interface GatewayRegion {

@@ -1,5 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
+// The ID schemas. The patterns and the checks are in `ids-core.ts`, which has no zod and is what the
+// Edge loads; they are re-exported here, so this module's exports are what they were.
 import { z } from "zod";
+import {
+  API_KEY_ID_PATTERN,
+  DATABASE_ID_PATTERN,
+  NODE_ID_PATTERN,
+  OPERATION_ID_PATTERN,
+  PROJECT_ID_PATTERN,
+  REGION_ID_PATTERN,
+  ROLE_NAME_PATTERN,
+  SIZE_CLASS_ID_PATTERN,
+  isReservedRoleName,
+} from "./ids-core.ts";
+
+export * from "./ids-core.ts";
 
 export const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
 const LETTERS = "abcdefghijklmnopqrstuvwxyz";
@@ -13,30 +28,8 @@ export const ID_PREFIXES = {
 } as const;
 export type IdPrefix = (typeof ID_PREFIXES)[keyof typeof ID_PREFIXES];
 
-export const PROJECT_ID_PATTERN = /^prj_[a-z0-9]{20}$/;
-export const OPERATION_ID_PATTERN = /^op_[a-z0-9]{20}$/;
-export const API_KEY_ID_PATTERN = /^key_[a-z0-9]{20}$/;
-export const NODE_ID_PATTERN = /^nod_[a-z0-9]{20}$/;
-export const DATABASE_ID_PATTERN = /^[a-z][a-z0-9]{19}$/;
-export const REGION_ID_PATTERN = /^[a-z][a-z0-9-]{1,30}[a-z0-9]$/;
-export const SIZE_CLASS_ID_PATTERN = /^[a-z][a-z0-9-]{0,30}[a-z0-9]$/;
-export const ROLE_NAME_PATTERN = /^[a-z][a-z0-9_]{0,62}$/;
-
 /** The CNPG owner role of every database (`initdb.owner`). */
 export const OWNER_ROLE_NAME = "app";
-
-export const RESERVED_ROLE_NAMES: ReadonlySet<string> = new Set([
-  "postgres",
-  "streaming_replica",
-]);
-export const RESERVED_ROLE_PREFIXES = ["pg_", "cnpg_"] as const;
-
-export function isReservedRoleName(name: string): boolean {
-  return (
-    RESERVED_ROLE_NAMES.has(name) ||
-    RESERVED_ROLE_PREFIXES.some((prefix) => name.startsWith(prefix))
-  );
-}
 
 export const ProjectId = z
   .string()
@@ -85,25 +78,6 @@ export const RoleName = z
   })
   .meta({ id: "RoleName" });
 export type RoleName = z.infer<typeof RoleName>;
-
-export const isProjectId = (value: unknown): value is ProjectId =>
-  typeof value === "string" && PROJECT_ID_PATTERN.test(value);
-export const isOperationId = (value: unknown): value is OperationId =>
-  typeof value === "string" && OPERATION_ID_PATTERN.test(value);
-export const isApiKeyId = (value: unknown): value is ApiKeyId =>
-  typeof value === "string" && API_KEY_ID_PATTERN.test(value);
-export const isNodeId = (value: unknown): value is NodeId =>
-  typeof value === "string" && NODE_ID_PATTERN.test(value);
-export const isDatabaseId = (value: unknown): value is DatabaseId =>
-  typeof value === "string" && DATABASE_ID_PATTERN.test(value);
-export const isRegionId = (value: unknown): value is RegionId =>
-  typeof value === "string" && REGION_ID_PATTERN.test(value);
-export const isSizeClassId = (value: unknown): value is SizeClassId =>
-  typeof value === "string" && SIZE_CLASS_ID_PATTERN.test(value);
-export const isRoleName = (value: unknown): value is RoleName =>
-  typeof value === "string" &&
-  ROLE_NAME_PATTERN.test(value) &&
-  !isReservedRoleName(value);
 
 /**
  * Uniform random string over `alphabet` from crypto.getRandomValues.
