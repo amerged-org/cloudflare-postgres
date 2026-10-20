@@ -629,6 +629,10 @@ const FAKE_WRANGLER = `#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
+// wrangler's bin/wrangler.js answers SIGTERM by killing the real CLI and then calling
+// process.exit(code ?? 0): a stopped wrangler exits with code 0 (measured against wrangler 4.145 on
+// a remote import), and with 143 on a local one, not by the signal.
+if (process.env.FAKE_WRANGLER_TERM_EXIT_CODE) process.on("SIGTERM", () => process.exit(Number(process.env.FAKE_WRANGLER_TERM_EXIT_CODE)));
 const args = process.argv.slice(2);
 const statePath = process.env.FAKE_WRANGLER_STATE;
 const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
@@ -657,7 +661,7 @@ if (args[0] === "d1" && args[1] === "list") {
     };
     if (state.hold) { save(); fs.writeFileSync(state.hold + ".tmp", String(process.pid)); fs.renameSync(state.hold + ".tmp", state.hold); setInterval(() => {}, 1000); return; }
     if (state.failImport || state.failImportCall === number) { save(); process.stderr.write("SQLITE_ERROR near " + text.toString("utf8", 0, 40) + "\\n"); process.exit(1); }
-    if (state.maxFileBytes && text.length > state.maxFileBytes) { save(); (state.resetOnStderr ? process.stderr : process.stdout).write(JSON.stringify({ D1_RESET_DO: true }) + "\\n"); process.exit(1); }
+    if (state.maxFileBytes && text.length > state.maxFileBytes) { save(); (state.resetOnStderr ? process.stderr : process.stdout).write(JSON.stringify(state.resetBody ?? { D1_RESET_DO: true }) + "\\n"); process.exit(1); }
     db.exec("BEGIN;");
     try { db.exec(text.toString("utf8")); db.exec("COMMIT;"); }
     catch (error) { db.exec("ROLLBACK;"); save(); process.stderr.write(String(error.message) + "\\n"); process.exit(1); }
@@ -684,6 +688,8 @@ async function wranglerFixture(
     maxFileBytes?: number;
     /** The reset body goes to stderr instead of stdout. */
     resetOnStderr?: boolean;
+    /** What the double prints on a reset; the default is the body of the live drill. */
+    resetBody?: unknown;
     looseForeignKeys?: boolean;
     /** A file the fake writes its process ID to, and then never answers. */
     hold?: string;
@@ -703,6 +709,7 @@ async function wranglerFixture(
     failImportCall: overrides.failImportCall,
     maxFileBytes: overrides.maxFileBytes,
     resetOnStderr: overrides.resetOnStderr ?? false,
+    resetBody: overrides.resetBody,
     looseForeignKeys: overrides.looseForeignKeys ?? false,
     hold: overrides.hold,
     calls: [] as {
@@ -1171,7 +1178,7 @@ test("names the failed chunk's size, and says whether D1 reset the database, wit
       sql.message,
     );
     assert.equal(sql.sizes[2], planned[2]!.bytes);
-    assert.ok(/D1_RESET_DO in its output: no/.test(sql.message), sql.message);
+    assert.ok(/D1 reset in its output: no/.test(sql.message), sql.message);
     assert.ok(/exit code 1/.test(sql.message), sql.message);
     quiet(sql.message);
     // The provider resets the database on every file: chunk 1, the body on stdout or on stderr.
@@ -1185,12 +1192,96 @@ test("names the failed chunk's size, and says whether D1 reset the database, wit
         reset.message,
       );
       assert.ok(
-        /D1_RESET_DO in its output: yes/.test(reset.message),
+        /D1 reset in its output: yes/.test(reset.message),
         reset.message,
       );
       assert.ok(/exit code 1/.test(reset.message), reset.message);
       assert.ok(/delete/.test(reset.message), reset.message);
       quiet(reset.message);
+    }
+    // The provider's other documented resets name no token. Cloudflare's D1 debugging page words
+    // them "D1 DB exceeded its CPU time limit and was reset.", "D1 DB's isolate exceeded its memory
+    // limit and was reset." and "D1 DB storage operation exceeded timeout which caused object to be
+    // reset."; wrangler 4.145 throws "D1 reset before execute completed!" when the import ends
+    // unfinished. Each is a reset, whichever stream wrangler writes it to.
+    for (const text of [
+      "D1 DB exceeded its CPU time limit and was reset.",
+      "D1 DB's isolate exceeded its memory limit and was reset.",
+      "D1 DB storage operation exceeded timeout which caused object to be reset.",
+      "D1 reset before execute completed!",
+    ])
+      for (const resetOnStderr of [false, true]) {
+        const reset = await failure({
+          maxFileBytes: 1,
+          resetOnStderr,
+          resetBody: { error: { text } },
+        });
+        assert.ok(
+          /D1 reset in its output: yes/.test(reset.message),
+          `${text}: ${reset.message}`,
+        );
+        assert.ok(/exit code 1/.test(reset.message), reset.message);
+        quiet(reset.message);
+        assert.ok(
+          !reset.message.includes(text),
+          "wrangler's text is not printed",
+        );
+      }
+    // A refusal that is not a reset stays a no.
+    const refusedLogin = await failure({
+      maxFileBytes: 1,
+      resetBody: { error: { text: "Authentication error [code: 10000]" } },
+    });
+    assert.ok(
+      /D1 reset in its output: no/.test(refusedLogin.message),
+      refusedLogin.message,
+    );
+  } finally {
+    await done();
+  }
+});
+
+test("a chunk that outlives the timeout is reported as a timeout, whatever exit code wrangler's launcher answers the stop with", async () => {
+  const { dir, done } = await workspace(),
+    holding = join(dir, "holding");
+  try {
+    const { bytes } = await artifact(OUT_OF_ORDER_BYTES),
+      input = join(dir, "d1-control.pgcfenc");
+    await writeFile(input, bytes);
+    // The double never answers the import. Like bin/wrangler.js it ends with exit code 0 when it is
+    // stopped (a remote import), or with 143 (a local one), and never by the signal.
+    for (const stoppedWith of ["0", "143"]) {
+      const fixture = await wranglerFixture(dir, { hold: holding }),
+        environment = {
+          ...fixture.environment,
+          FAKE_WRANGLER_TERM_EXIT_CODE: stoppedWith,
+        };
+      await assert.rejects(
+        importArtifact(
+          {
+            input,
+            keyring: KEYRING,
+            keysEnvironment: "PGCF_TEST_KEYS",
+            database: "pgcf-restore-drill",
+            wrangler: fixture.wrangler,
+            chunkBytes: 150,
+            chunkStatements: 3,
+          },
+          { environment, log: () => {}, chunkTimeoutMs: 1500 },
+        ),
+        (error) =>
+          refused("wrangler_failed")(error) &&
+          /^chunk 1 of \d+ failed \(\d+ statements, \d+ bytes\): wrangler d1 execute failed \(timeout\); D1 reset in its output: no; delete /.test(
+            (error as Error).message,
+          ),
+        `stopped with exit code ${stoppedWith}`,
+      );
+      const imports = (await fixture.calls()).filter((call) => call.file);
+      assert.equal(imports.length, 1);
+      assert.equal(
+        await stat(imports[0]!.file!.directory).catch(() => null),
+        null,
+      );
     }
   } finally {
     await done();

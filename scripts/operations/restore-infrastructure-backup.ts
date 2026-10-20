@@ -30,11 +30,13 @@
 //   --chunk-bytes, --chunk-statements
 //                the most one chunk holds (defaults: 2 MiB and 5,000 statements). D1 resets its
 //                database when one import is too much work (the live drill of 2026-10-20 failed at
-//                31 MB in one file with D1_RESET_DO); lower them if a chunk is reset.
+//                31 MB in one file with D1_RESET_DO); halve them if a chunk reports a reset.
 //
 // Nothing of the SQL is printed, and neither is wrangler's text about the import, which can quote
-// it: a failed import reports the chunk and wrangler's exit code; decrypt to a file and run wrangler
-// by hand to read its message. The output holds no database ID except the scratch database's own.
+// it: a failed import reports the chunk, its statement and byte counts, wrangler's exit code (or
+// `timeout`) and whether its output reports a D1 reset (yes or no); the runbook says what each
+// answer asks for. Do not run the whole file through wrangler by hand: the whole file is what D1
+// reset. The output holds no database ID except the scratch database's own.
 // SIGINT, SIGTERM and SIGHUP stop wrangler, remove the decrypted SQL and end the run with exit
 // code 128 plus the signal's number; a run killed with SIGKILL leaves its files behind.
 import { execFile, type ChildProcess } from "node:child_process";
@@ -1058,13 +1060,20 @@ export interface ImportResult {
 export interface ImportDependencies {
   environment: Record<string, string | undefined>;
   log: (line: string) => void;
+  /** How long one chunk may run before it is stopped; the default is `CHUNK_TIMEOUT_MS`. */
+  chunkTimeoutMs?: number;
 }
 
 // One chunk is a few MiB; a chunk that takes longer than this is stuck, not slow.
 const CHUNK_TIMEOUT_MS = 10 * 60 * 1000;
-// The body wrangler prints when the provider resets the D1 database during an import, a size
-// problem that lower chunk bounds answer. The token is not documented by Cloudflare.
-const RESET_TOKEN = "D1_RESET_DO";
+// How the provider and wrangler word a reset of the D1 database during an import, a problem of too
+// much work that lower chunk bounds answer. `D1_RESET_DO` is the body of the live drill of
+// 2026-10-20 and is not documented. Cloudflare's D1 debugging page words the others "D1 DB exceeded
+// its CPU time limit and was reset.", "D1 DB's isolate exceeded its memory limit and was reset." and
+// "D1 DB storage operation exceeded timeout which caused object to be reset."; wrangler 4.145 throws
+// "D1 reset before execute completed!". The word "reset" covers all of them; a text that holds it
+// for another reason costs one run with lower bounds, and a missed reset would never get them.
+const RESET = /D1_RESET_DO|\breset\b/;
 // What D1 keeps for itself (`sqlite_*`, `_cf_*`) is not the database's. A scratch database must hold
 // no object of any kind before an import; what an import made is counted as tables.
 const SCHEMA_OBJECTS = String.raw`SELECT COUNT(*) AS n FROM sqlite_schema WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\' AND name NOT LIKE '\_cf\_%' ESCAPE '\'`,
@@ -1093,18 +1102,21 @@ async function wranglerRun(
       },
       (error, out, err) => {
         children.delete(child);
-        if (!error) return done({ stdout: out });
-        const status =
-          typeof (error as { code?: unknown }).code === "number"
-            ? `exit code ${(error as { code: number }).code}`
-            : error.killed
-              ? "timeout"
+        // execFile stops a child at the timeout with SIGTERM. wrangler's launcher
+        // (bin/wrangler.js) answers that by killing the CLI and exiting with `code ?? 0`, so a
+        // stopped wrangler can end with exit code 0 and no output, which is told by `killed` alone.
+        if (!error && !child.killed) return done({ stdout: out });
+        const code = (error as { code?: unknown } | null)?.code,
+          status = child.killed
+            ? "timeout"
+            : typeof code === "number"
+              ? `exit code ${code}`
               : "it did not start";
         // The text of a failed import can quote the SQL; the other calls carry none. Of an import's
-        // text only whether it holds the provider's reset token is said, a yes or a no.
+        // text only whether it reports a reset is said, a yes or a no.
         const detail = context.stderrIsSafe
           ? `: ${err.trim().split("\n").slice(0, 3).join(" ").slice(0, 300)}`
-          : `; ${RESET_TOKEN} in its output: ${out.includes(RESET_TOKEN) || err.includes(RESET_TOKEN) ? "yes" : "no"}`;
+          : `; D1 reset in its output: ${RESET.test(out) || RESET.test(err) ? "yes" : "no"}`;
         fail(
           new RestoreError(
             "wrangler_failed",
@@ -1280,7 +1292,11 @@ export async function importArtifact(
                 "--file",
                 chunk.path,
               ],
-              { ...context, timeoutMs: CHUNK_TIMEOUT_MS, stderrIsSafe: false },
+              {
+                ...context,
+                timeoutMs: dependencies.chunkTimeoutMs ?? CHUNK_TIMEOUT_MS,
+                stderrIsSafe: false,
+              },
             ),
           ),
           summary = Array.isArray(imported?.results)
