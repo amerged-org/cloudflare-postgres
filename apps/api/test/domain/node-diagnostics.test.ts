@@ -4,7 +4,9 @@ import {
   INFRA_ALERT_ACTIONS,
   InfraAlert,
   NODE_BOOT_REPORT_MAX_BYTES,
+  NODE_DIAGNOSTIC_ROW_MAX_BYTES,
   NODE_PROBE_RESULT_MAX_BYTES,
+  NodeDiagnostic,
   NodeProbeDiagnostic,
   newOperationId,
 } from "@pgcf/contracts";
@@ -126,6 +128,42 @@ const stored = (f: F) =>
       body: string;
     }>()
     .then((rows) => rows.results);
+const BOOT_COLUMNS = [
+  "id",
+  "node_id",
+  "kind",
+  "boot_id",
+  "previous_boot_id",
+  "received_at",
+  "expected_reboot",
+  "body",
+];
+const REQUEST_COLUMNS = [
+  "id",
+  "node_id",
+  "probe",
+  "boot",
+  "since_seconds",
+  "lines",
+  "requested_by_key_id",
+  "requested_at",
+  "received_at",
+  "body",
+];
+/**
+ * The bytes of the `INSERT` statement that a dump of the control database writes for one row:
+ * SQLite's own quote() writes the values (single quotes doubled), as its dump and D1's export do.
+ * D1 refuses a statement above 100,000 bytes when such a dump is imported.
+ */
+const dumped = (table: string, id: string, columns: string[]) =>
+  env.DB.prepare(
+    `SELECT length(CAST('INSERT INTO "${table}" VALUES(' || ${columns
+      .map((column) => `quote(${column})`)
+      .join(" || ',' || ")} || ');' AS BLOB)) bytes FROM ${table} WHERE id=?`,
+  )
+    .bind(id)
+    .first<number>("bytes")
+    .then((bytes) => bytes!);
 /**
  * The agent's report of a reboot. Its hello of the new boot has reached the API first, as the API
  * requires (the agent sends the report again until it has).
@@ -357,39 +395,96 @@ describe("a boot report whose reboot nobody asked for", () => {
     expect(await stored(f)).toEqual([]);
   });
 
-  it("is kept whole at the largest size the contract allows", async () => {
+  it("is kept whole while its row fits the bound of a backup, and cut to the newest lines when it does not", async () => {
+    // Every line holds a multibyte letter (2 bytes, 1 character) and a quote (written twice in a
+    // dump): counting characters, or leaving out the doubled quote, would put the row over.
+    const line = (i: number) => ({
+      ...entry,
+      message: `line ${String(i).padStart(4, "0")} ${"\u00e9'x".repeat(40)}`,
+    });
+    const lines = (count: number) =>
+      Array.from({ length: count }, (_, i) => line(i));
+    const rowOf = async (count: number) => {
+      const f = await fixture();
+      const made = await reboot(f, report({ entries: lines(count) }));
+      return {
+        f,
+        made,
+        bytes: await dumped("node_diagnostics", made.id, BOOT_COLUMNS),
+      };
+    };
+    // What one more line costs a row, and how many lines make the largest row that fits.
+    const [one, two] = [await rowOf(1), await rowOf(2)];
+    const cost = two.bytes - one.bytes;
+    const fits =
+      1 + Math.floor((NODE_DIAGNOSTIC_ROW_MAX_BYTES - one.bytes) / cost);
+    const whole = await rowOf(fits);
+    expect(whole.bytes).toBeLessThanOrEqual(NODE_DIAGNOSTIC_ROW_MAX_BYTES);
+    expect(NODE_DIAGNOSTIC_ROW_MAX_BYTES - whole.bytes).toBeLessThan(cost);
+    expect(JSON.parse((await stored(whole.f))[0]!.body)).toEqual(
+      report({ entries: lines(fits) }),
+    );
+    // One line more does not fit: the newest lines are kept, as many as fit with the mark.
+    const cut = await rowOf(fits + 1);
+    const body = JSON.parse((await stored(cut.f))[0]!.body) as {
+      entries: unknown[];
+      truncated?: boolean;
+      dropped_entries?: number;
+    };
+    expect(cut.bytes).toBeLessThanOrEqual(NODE_DIAGNOSTIC_ROW_MAX_BYTES);
+    expect(NODE_DIAGNOSTIC_ROW_MAX_BYTES - cut.bytes).toBeLessThan(cost);
+    expect(body.truncated).toBe(true);
+    expect(body.dropped_entries).toBeGreaterThanOrEqual(1);
+    expect(body.entries).toEqual(lines(fits + 1).slice(body.dropped_entries));
+    expect(body.entries.length + body.dropped_entries!).toBe(fits + 1);
+    // The operator reads what was stored, and sees the cut.
+    const read = await request(
+      `/v1/nodes/${cut.f.node}/diagnostics/${cut.made.id}`,
+      cut.f.admin,
+    );
+    expect(read.status).toBe(200);
+    const answer = NodeDiagnostic.parse(await read.json());
+    expect(answer.report).toMatchObject({
+      truncated: true,
+      dropped_entries: body.dropped_entries,
+    });
+    expect(answer.report.entries).toEqual(body.entries);
+  });
+
+  it("answers a report of 1 MiB like any other and keeps the newest lines of it", async () => {
     const f = await fixture();
+    // The largest report the contract allows: as many full lines as fit 1 MiB.
     const full = { ...entry, message: "a".repeat(2048) };
-    // As many full lines as fit under the cap, which a row of D1 holds and a read returns whole.
-    let lines = Math.floor(
+    const count = Math.floor(
       (NODE_BOOT_REPORT_MAX_BYTES -
         JSON.stringify(report({ entries: [] })).length) /
         (JSON.stringify(full).length + 1),
     );
-    while (
-      JSON.stringify(
-        report({ entries: Array.from({ length: lines + 1 }, () => full) }),
-      ).length <= NODE_BOOT_REPORT_MAX_BYTES
-    )
-      lines++;
+    // A node that knew no earlier boot sends no previous boot: its row holds two NULLs.
     const largest = report({
-      entries: Array.from({ length: lines }, () => full),
+      previous_boot_id: null,
+      entries: Array.from({ length: count }, (_, i) => ({
+        ...full,
+        message: `${String(i).padStart(4, "0")}${"a".repeat(2044)}`,
+      })),
     });
     expect(JSON.stringify(largest).length).toBeLessThanOrEqual(
       NODE_BOOT_REPORT_MAX_BYTES,
     );
-    expect(
-      NODE_BOOT_REPORT_MAX_BYTES - JSON.stringify(largest).length,
-    ).toBeLessThan(JSON.stringify(full).length + 1);
     const made = await reboot(f, largest);
-    const read = await request(
-      `/v1/nodes/${f.node}/diagnostics/${made.id}`,
-      f.admin,
+    expect(made.id).toEqual(expect.any(String));
+    const [row] = await stored(f);
+    const body = JSON.parse(row!.body) as {
+      entries: { message: string }[];
+      dropped_entries: number;
+    };
+    expect(
+      await dumped("node_diagnostics", made.id, BOOT_COLUMNS),
+    ).toBeLessThanOrEqual(NODE_DIAGNOSTIC_ROW_MAX_BYTES);
+    expect(body.entries.at(-1)!.message.slice(0, 4)).toBe(
+      String(count - 1).padStart(4, "0"),
     );
-    expect(read.status).toBe(200);
-    expect(((await read.json()) as { report: unknown }).report).toEqual(
-      largest,
-    );
+    expect(body.entries.length + body.dropped_entries).toBe(count);
   });
 
   it("is refused for a request the node did not sign", async () => {
@@ -787,14 +882,83 @@ describe("a probe on request", () => {
         JSON.stringify(broken).slice(0, 80),
       ).toBe(400);
     expect((await requests(f))[0]!.body).toBeNull();
-    // Exactly 1 MiB is kept whole.
+    // Exactly 1 MiB is accepted; the row keeps what fits a backup of it (below).
     expect((await send(f, probed(id, { text: "a".repeat(fits) }))).status).toBe(
       200,
     );
     const read = await (
       await reading(f, id)
-    ).json<{ body: { text: string } }>();
-    expect(read.body.text).toHaveLength(fits);
+    ).json<{ body: { text: string; truncated?: boolean } }>();
+    expect(read.body.truncated).toBe(true);
+    expect(read.body.text.length).toBeLessThan(fits);
+  });
+
+  it("keeps the newest entries of a journal result that does not fit the bound of a backup, and says how many went", async () => {
+    const f = await fixture();
+    const id = await asked(f, { probe: "journal", lines: 2000 });
+    // 2000 lines of 300 bytes are about 900 KB: under the 1 MiB a node may send.
+    const lines = Array.from({ length: 2000 }, (_, i) => ({
+      ...entry,
+      message: `line ${String(i).padStart(4, "0")} ${"\u00e9'x".repeat(75)}`,
+    }));
+    const result = probed(id, { probe: "journal", entries: lines, text: "" });
+    expect(JSON.stringify(result).length).toBeLessThan(
+      NODE_PROBE_RESULT_MAX_BYTES,
+    );
+    expect((await send(f, result)).status).toBe(200);
+    const [row] = await requests(f);
+    const body = JSON.parse(row!.body!) as {
+      entries: unknown[];
+      truncated?: boolean;
+      dropped_entries?: number;
+    };
+    const bytes = await dumped("node_diagnostic_requests", id, REQUEST_COLUMNS);
+    expect(bytes).toBeLessThanOrEqual(NODE_DIAGNOSTIC_ROW_MAX_BYTES);
+    // Another line would not have fit: a line is about 700 bytes in a dump.
+    expect(NODE_DIAGNOSTIC_ROW_MAX_BYTES - bytes).toBeLessThan(750);
+    expect(body.truncated).toBe(true);
+    expect(body.dropped_entries).toBeGreaterThan(1000);
+    expect(body.entries).toEqual(lines.slice(body.dropped_entries));
+    const read = NodeProbeDiagnostic.parse(await (await reading(f, id)).json());
+    expect(read.body).toMatchObject({
+      truncated: true,
+      dropped_entries: body.dropped_entries,
+    });
+  });
+
+  it("keeps the beginning of a text that does not fit, on a character boundary, and marks it with no entry dropped", async () => {
+    const f = await fixture();
+    const id = await asked(f);
+    // Letters of 2 and 4 bytes, a quote, a tab and a line break (a JSON escape each): about 900 KB.
+    const unit = "ss 'x' \u00e9 \u{1f600}\t\n";
+    const unitBytes = new TextEncoder().encode(JSON.stringify(unit)).length - 2;
+    const text = unit.repeat(Math.floor(900_000 / unitBytes));
+    expect(
+      new TextEncoder().encode(JSON.stringify(probed(id, { text }))).length,
+    ).toBeLessThan(NODE_PROBE_RESULT_MAX_BYTES);
+    expect((await send(f, probed(id, { text }))).status).toBe(200);
+    const [row] = await requests(f);
+    const body = JSON.parse(row!.body!) as {
+      text: string;
+      entries: unknown[];
+      truncated?: boolean;
+      dropped_entries?: number;
+    };
+    const bytes = await dumped("node_diagnostic_requests", id, REQUEST_COLUMNS);
+    expect(bytes).toBeLessThanOrEqual(NODE_DIAGNOSTIC_ROW_MAX_BYTES);
+    // The next character costs at most 6 bytes (the JSON escape of a control character), and a
+    // surrogate pair that the cut would split costs 4 more.
+    expect(NODE_DIAGNOSTIC_ROW_MAX_BYTES - bytes).toBeLessThan(12);
+    expect(body).toMatchObject({
+      entries: [],
+      truncated: true,
+      dropped_entries: 0,
+    });
+    expect(text.startsWith(body.text)).toBe(true);
+    // No half of a surrogate pair: the text round-trips through UTF-8.
+    expect(new TextDecoder().decode(new TextEncoder().encode(body.text))).toBe(
+      body.text,
+    );
   });
 
   it("is answered by its own node, with its own probe, and by none that did not ask", async () => {

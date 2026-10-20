@@ -146,8 +146,15 @@ a damaged journal file fails them with `Failed to iterate through journal`).
   ends the agent's own mounts, it answers `Busy` for a volume that only a unit holds, and refuses
   to make or mount the next generation of that database (`OtherGeneration`). Never write into the
   volume of a database that runs.
-- **Limits.** A result is at most 1 MiB; the oldest entries, or the end of a text (marked
-  `[truncated]`), go first. The lines of a database's unit (`pgcf-pg@…`) or of a backup job
+- **Limits.** A node sends a result of at most 1 MiB, or a boot report of at most 1 MiB, and the
+  oldest entries, or the end of a text (marked `[truncated]`), go first. The API stores at most 64
+  KiB of either, measured as the `INSERT` statement that a backup of the control database writes
+  for the row (D1 cannot import a statement above 100,000 bytes, so a larger row would make every
+  later backup impossible to restore): what does not fit is cut again, the oldest entries first
+  (a text keeps its beginning), and the stored `body` of a probe or `report` of a boot report then
+  says `"truncated": true` and `"dropped_entries"`, the number of entries left out (0 when only the
+  end of a text was cut). Ask again with fewer `lines` or a shorter `since_seconds` to read what
+  was left out. A report or result that fits has neither field. The lines of a database's unit (`pgcf-pg@…`) or of a backup job
   (`pgcf-job-…`), and the lines PID 1 writes about them, are never sent; in a text, every line
   that names one is left out. A kernel line that names a database's cgroup, such as an out of
   memory kill, is kept: it holds the database's identifier and nothing of its data. A node's page
