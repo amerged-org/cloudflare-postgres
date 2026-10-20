@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Conformance inputs of the node contracts, never live acceptance or product defaults. Each
-// vector states whether the Zod contract accepts it; `refinement` marks a value only the
-// contract's own checks refuse, which a JSON Schema alone accepts.
+// vector states whether the Zod contract accepts it (`valid`) and whether the node does
+// (`node_valid`: the node ignores a property that a document it receives does not name);
+// `refinement` marks a value only a rule of the contract and of the node refuses, which the
+// JSON Schema alone accepts.
 import type { z } from "zod";
 import * as link from "../src/node-link.ts";
 import * as local from "../src/node-local.ts";
@@ -224,6 +226,8 @@ const fenced = {
 };
 // A page with nothing on it but what its own rules are about.
 const bare = { ...page, orders: [], databases: [], next: null };
+// A property that only a later release of the API names.
+const later = { a_property_of_a_later_release: 1 };
 const withDatabase = (change: object) => ({
   ...page,
   orders: [],
@@ -452,6 +456,26 @@ export const nodeSchemas = {
   FleetReleaseId,
 } as const satisfies Record<string, z.ZodType>;
 
+/**
+ * The documents Cloudflare sends and the node reads. The node reads them with every object open:
+ * a property it does not name is ignored, so that an additive change reaches the API first and
+ * the nodes by the release that follows, with no hand step (plan 9.3, "Changing the page"). What
+ * the node sends stays closed, and so does the API's own contract, which never sends a property
+ * by accident. A value out of the closed sets (a type of order, a kind of origin or host file, a
+ * rule of memory) is still refused, as is a missing property, a wrong type and an out-of-bound
+ * number.
+ */
+export const nodeReceives = [
+  "NodeEnrollmentSeed",
+  "NodeEnrollmentResponse",
+  "NodeCredentials",
+  "ArchiveCredential",
+  "NodeDesiredPage",
+  "NodeObservationAnswer",
+  "NodeFencedResponse",
+  "ServerLinkMessage",
+] as const satisfies readonly (keyof typeof nodeSchemas)[];
+
 const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   NodeEnrollmentSeed: [
     [
@@ -551,6 +575,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
   NodeEnrollmentResponse: [
     ["identity", node, true],
+    ["extra-property", { ...node, ...later }, false],
     ["bad-uid", { ...node, uid: "not-a-uuid" }, false],
   ],
   NodeRequestClaims: [
@@ -585,6 +610,15 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
   NodeCredentials: [
     ["credentials", credentials, true],
+    [
+      "extra-property-on-the-credentials-and-the-keyring",
+      {
+        ...credentials,
+        ...later,
+        route_keyring: { ...credentials.route_keyring, ...later },
+      },
+      false,
+    ],
     [
       "no-revision",
       {
@@ -630,6 +664,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
   ArchiveCredential: [
     ["read-write", archiveCredential, true],
+    ["extra-property", { ...archiveCredential, ...later }, false],
     [
       "read-only-source",
       {
@@ -729,6 +764,187 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     ["unknown-field", { ...page, region: region }, false],
+    // A property of a later release is optional for the release that adds it: the page without
+    // it is a page, and the node reads the burst of 0 (plan 9.3, "Changing the page").
+    [
+      "policy-without-cpu-boost",
+      {
+        ...page,
+        policy: {
+          ...page.policy,
+          admission: { ...page.policy.admission, cpu_boost_ms: undefined },
+        },
+      },
+      true,
+    ],
+    // The contract refuses a property it does not name (the API never sends one by accident); the
+    // node ignores it wherever it stands, so that the API can send a property before the nodes know it.
+    ["extra-property-on-the-page", { ...page, ...later }, false],
+    [
+      "extra-property-on-the-policy",
+      { ...page, policy: { ...page.policy, ...later } },
+      false,
+    ],
+    [
+      "extra-property-on-a-policy-group",
+      {
+        ...page,
+        policy: {
+          ...page.policy,
+          admission: { ...page.policy.admission, ...later },
+          early_sleep: { ...page.policy.early_sleep, ...later },
+        },
+      },
+      false,
+    ],
+    [
+      "extra-property-on-the-release",
+      { ...page, release: { ...page.release, ...later } },
+      false,
+    ],
+    [
+      "extra-property-on-the-image",
+      {
+        ...page,
+        release: {
+          ...page.release,
+          image: { ...page.release.image, ...later },
+        },
+      },
+      false,
+    ],
+    [
+      "extra-property-on-a-binary",
+      {
+        ...page,
+        release: {
+          ...page.release,
+          binaries: {
+            ...page.release.binaries,
+            "pgcf-agent": { ...binary, ...later },
+          },
+        },
+      },
+      false,
+    ],
+    [
+      "extra-property-on-a-host-file",
+      {
+        ...page,
+        release: {
+          ...page.release,
+          os: {
+            ...page.release.os,
+            host_files: [{ ...page.release.os.host_files[0], ...later }],
+          },
+        },
+      },
+      false,
+    ],
+    ["extra-property-on-an-entry", withDatabase(later), false],
+    [
+      "extra-property-on-a-role",
+      withDatabase({ roles: [{ ...owner, ...later }, reader] }),
+      false,
+    ],
+    [
+      "extra-property-on-an-origin",
+      withDatabase({
+        origin: {
+          kind: "restore",
+          source: { ...restored.origin.source, ...later },
+        },
+      }),
+      false,
+    ],
+    [
+      "extra-property-on-an-order",
+      { ...page, orders: [{ ...page.orders[3], ...later }] },
+      false,
+    ],
+    [
+      "extra-property-everywhere",
+      {
+        ...page,
+        ...later,
+        policy: {
+          ...page.policy,
+          ...later,
+          admission: { ...page.policy.admission, ...later },
+        },
+        orders: page.orders.map((order) => ({ ...order, ...later })),
+        databases: page.databases.map((db) => ({
+          ...db,
+          ...later,
+          resources: { ...db.resources, ...later },
+          roles: db.roles.map((role) => ({ ...role, ...later })),
+        })),
+      },
+      false,
+    ],
+    // What the node still refuses: a type, a kind, a rule or a state it does not know, a missing
+    // property, a wrong type and a number out of bound.
+    [
+      "order-of-an-unknown-type",
+      { ...page, orders: [{ type: "reboot", operation: op("r") }] },
+      false,
+    ],
+    [
+      "order-without-an-operation",
+      {
+        ...page,
+        orders: [{ type: "wake", database: other, generation: 6 }],
+      },
+      false,
+    ],
+    [
+      "order-generation-as-text",
+      {
+        ...page,
+        orders: [
+          {
+            type: "wake",
+            operation: op("w"),
+            database: other,
+            generation: "6",
+          },
+        ],
+      },
+      false,
+    ],
+    [
+      "origin-of-an-unknown-kind",
+      withDatabase({ origin: { kind: "clone" } }),
+      false,
+    ],
+    [
+      "host-file-of-an-unknown-kind",
+      {
+        ...page,
+        release: {
+          ...page.release,
+          os: {
+            ...page.release.os,
+            host_files: [
+              { ...page.release.os.host_files[0], kind: "directory" },
+            ],
+          },
+        },
+      },
+      false,
+    ],
+    [
+      "unknown-memory-rule",
+      {
+        ...page,
+        policy: {
+          ...page.policy,
+          admission: { ...page.policy.admission, memory_rule: "elastic" },
+        },
+      },
+      false,
+    ],
+    ["unknown-desired-state", withDatabase({ desired_state: "paused" }), false],
     [
       "memory-step",
       withDatabase({ resources: { ...database.resources, memory_mib: 300 } }),
@@ -869,6 +1085,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
         ],
       },
       false,
+      true,
     ],
     [
       "move-without-end",
@@ -916,6 +1133,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
         },
       }),
       false,
+      true,
     ],
     ["no-owner", withDatabase({ roles: [reader] }), false, true],
     [
@@ -1616,7 +1834,14 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
   ServerLinkMessage: [
     ["welcome", { type: "welcome", protocol: 1 }, true],
+    [
+      "welcome-with-another-property",
+      { type: "welcome", protocol: 1, ...later },
+      false,
+    ],
     ["desired", { type: "desired" }, true],
+    ["desired-with-another-property", { type: "desired", ...later }, false],
+    ["message-of-an-unknown-type", { type: "reboot" }, false],
     ["desired-ids", { type: "desired", ids: [id] }, true],
     ["desired-no-ids", { type: "desired", ids: [] }, false],
     ["apply", { type: "apply" }, false],
@@ -1633,19 +1858,76 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
 };
 
-/** Every schema vector; generation fails when the contract disagrees with a stated result. */
+type Issue = z.core.$ZodIssue;
+/** The `unrecognized_keys` issues of `issues`, with the absolute path of the object they name. */
+function unknownKeys(
+  issues: readonly Issue[],
+  prefix: PropertyKey[] = [],
+): { path: PropertyKey[]; keys: string[] }[] {
+  return issues.flatMap((issue) => {
+    const path = [...prefix, ...issue.path];
+    if (issue.code === "unrecognized_keys") return [{ path, keys: issue.keys }];
+    if (issue.code !== "invalid_union") return [];
+    // Of the variants of a union only one that fails for unknown properties alone is the value's.
+    return issue.errors
+      .filter((errors) => errors.every((e) => e.code === "unrecognized_keys"))
+      .flatMap((errors) => unknownKeys(errors as Issue[], path));
+  });
+}
+/**
+ * Whether `value` is valid once the properties its schema does not name are taken away, which is
+ * how the node reads a document it receives. Everything else (a missing property, a wrong type, a
+ * value out of its set or its bound, and the contract's own rules) must still hold.
+ */
+function validWithoutUnknownProperties(schema: z.ZodType, value: unknown) {
+  const current = structuredClone(value);
+  for (let round = 0; round < 8; round++) {
+    const result = schema.safeParse(current);
+    if (result.success) return true;
+    const unknown = unknownKeys(result.error.issues);
+    if (unknown.length === 0) return false;
+    for (const { path, keys } of unknown) {
+      let at = current as Record<PropertyKey, unknown>;
+      for (const key of path) at = at[key] as Record<PropertyKey, unknown>;
+      for (const key of keys) delete at[key];
+    }
+  }
+  return false;
+}
+
+/**
+ * Every schema vector; generation fails when the contract disagrees with a stated result.
+ * `valid` is the contract's verdict, which refuses a property it does not name; `node_valid` is
+ * the node's: the same for what the node sends, and for what it receives (`nodeReceives`) the
+ * verdict on the value without its unknown properties.
+ */
 export function nodeSchemaVectors() {
+  const received = new Set<string>(nodeReceives);
   return Object.entries(cases).flatMap(([schema, list]) =>
     list.map(([name, input, valid, refinement]) => {
       // JSON drops undefined fields, exactly as the wire does.
       const value: unknown = JSON.parse(JSON.stringify(input));
-      const result =
-        nodeSchemas[schema as keyof typeof nodeSchemas].safeParse(value);
+      const zodSchema = nodeSchemas[schema as keyof typeof nodeSchemas];
+      const result = zodSchema.safeParse(value);
       if (result.success !== valid)
         throw new Error(
           `${schema}/${name}: the contract says ${result.success}`,
         );
-      return { schema, name, valid, refinement: refinement ?? false, value };
+      // A refinement is a rule the value breaks whatever properties it has, and the node holds it
+      // too (the node's page rules), so it stays invalid for the node.
+      const node_valid =
+        !refinement &&
+        (valid ||
+          (received.has(schema) &&
+            validWithoutUnknownProperties(zodSchema, value)));
+      return {
+        schema,
+        name,
+        valid,
+        node_valid,
+        refinement: refinement ?? false,
+        value,
+      };
     }),
   );
 }

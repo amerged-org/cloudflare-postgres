@@ -73,6 +73,30 @@ pub fn database_id(index: usize) -> String {
     format!("a{index:019}")
 }
 
+/// The property a later release adds (`with_unknown_properties`).
+pub const UNKNOWN_PROPERTY: &str = "a_property_of_a_later_release";
+/// `value` with a property this build does not know on every object of it, as a later release of
+/// the API adds one. The `keys` of a route keyring are a map of key identifiers and take none.
+pub fn with_unknown_properties(value: &Value) -> Value {
+    fn add(value: &mut Value, map: bool) {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object.iter_mut() {
+                    add(child, key == "keys");
+                }
+                if !map {
+                    object.insert(UNKNOWN_PROPERTY.into(), 1.into());
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|item| add(item, false)),
+            _ => {}
+        }
+    }
+    let mut value = value.clone();
+    add(&mut value, false);
+    value
+}
+
 /// What the double does with the next POSTs (the enrollment included), after it recorded them.
 #[derive(Clone, Copy, Debug)]
 pub enum Failure {
@@ -146,6 +170,11 @@ pub struct Inner {
     /// The credentials a read returns, where they are not the example's; the pages name their
     /// revision.
     pub credentials: Option<Value>,
+    /// The policy the pages carry, where it is not the example's.
+    pub policy: Option<Value>,
+    /// The API of a later release: every object it sends (pages, credentials, the enrollment, the
+    /// welcome and the fence) carries a property this build does not know.
+    pub unknown_properties: bool,
 }
 pub struct Cloud {
     pub origin: String,
@@ -216,6 +245,8 @@ impl Cloud {
             files: Default::default(),
             release: None,
             credentials: None,
+            policy: None,
+            unknown_properties: false,
         }));
         let (commands, _) = broadcast::channel(16);
         let task = tokio::spawn({
@@ -496,7 +527,8 @@ fn desired(inner: &Inner, query: &[(String, String)]) -> Value {
         .credentials
         .as_ref()
         .map_or(json!(3), |credentials| credentials["revision"].clone());
-    let mut page = json!({"node":node,"release":release,"policy":example["policy"],"credentials_revision":credentials_revision,"orders":inner.orders,"databases":rows,"next":next});
+    let policy = inner.policy.clone().unwrap_or(example["policy"].clone());
+    let mut page = json!({"node":node,"release":release,"policy":policy,"credentials_revision":credentials_revision,"orders":inner.orders,"databases":rows,"next":next});
     if !inner.diagnostics.is_empty() && !inner.fenced {
         page["diagnostics"] = inner.diagnostics.clone().into();
     }
@@ -664,6 +696,14 @@ async fn serve(
         } else {
             route(&mut inner, &request.method, &request.target, &body)
         };
+        let answer = if inner.unknown_properties {
+            Answer {
+                body: with_unknown_properties(&answer.body),
+                ..answer
+            }
+        } else {
+            answer
+        };
         let status = match failure {
             Some(Failure::Status(status)) => status,
             _ => answer.status,
@@ -733,18 +773,22 @@ async fn session<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     if !contract_valid("AgentLinkMessage", &hello) || hello["type"] != "hello" {
         return;
     }
-    let silent = {
+    let (silent, welcome) = {
         let mut inner = inner.lock().unwrap();
         inner.hellos.push(hello);
-        inner.silent_welcome
+        let welcome = json!({"type":"welcome","protocol":1});
+        let welcome = if inner.unknown_properties {
+            with_unknown_properties(&welcome)
+        } else {
+            welcome
+        };
+        (inner.silent_welcome, welcome)
     };
     if silent {
         return std::future::pending().await;
     }
     if socket
-        .send(Message::text(
-            json!({"type":"welcome","protocol":1}).to_string(),
-        ))
+        .send(Message::text(welcome.to_string()))
         .await
         .is_err()
     {

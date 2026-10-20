@@ -2,6 +2,14 @@
 //! The node's contract with Cloudflare (`packages/contracts/src/node-link.ts`, ULTRA plan 5.3,
 //! 5.6, 7.11 and 8): the generated JSON Schemas and constants, the rules of a desired page that a
 //! JSON Schema cannot state, and the node's Ed25519 signature on its requests.
+//!
+//! The schemas of what Cloudflare sends the node (the page, the credentials, the answers, the
+//! link's messages, the seed) leave every object open, and the node's parsers of them name only
+//! what the agent reads: a property it does not know is ignored, so that the API can send one
+//! before every node knows it (plan 9.3, "Changing the page"). What the node sends is held to the
+//! contract's own, closed, schemas. Where a value of a received document is handed on whole to
+//! something that is strict (the route keyring, to the gateway), the agent copies the properties it
+//! names and no other.
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -68,6 +76,15 @@ pub fn archive_path(path: &str) -> Option<ArchivePath<'_>> {
         generation: generation.parse().ok()?,
         operation,
     })
+}
+
+/// The route keyring of `NodeCredentials` as the gateway reads it: the properties the contract
+/// names (`active` and `keys`) and no other. The credentials may carry a property of a later
+/// release, which the agent ignores; the gateway parses its keyring strictly, so it must never be
+/// handed one.
+pub fn route_keyring(credentials: &Value) -> Value {
+    let keyring = &credentials["route_keyring"];
+    serde_json::json!({"active": keyring["active"], "keys": keyring["keys"]})
 }
 
 /// A desired page the agent may act on: its schema, and the rules no JSON Schema states.
@@ -330,7 +347,10 @@ fn page_rules(page: &Value) -> bool {
 }
 
 /// A restore reads another database; a move reads this database's earlier generation to its end
-/// (the schema gives a move its `end` record and no target time).
+/// (a move names its `end` record and no target time, a restore a target time and no `end`). The
+/// schema the node holds is open, so that a property it does not know is ignored; these two are
+/// properties it does know, of the other kind, and they change what is read, so they are refused
+/// here.
 fn origin_valid(origin: &Value, id: &str, storage: u64) -> bool {
     let kind = origin["kind"].as_str();
     if matches!(kind, None | Some("create")) {
@@ -345,8 +365,10 @@ fn origin_valid(origin: &Value, id: &str, storage: u64) -> bool {
     };
     from.database == source_id
         && match kind {
-            Some("restore") => source_id != id,
-            Some("move") => source_id == id && from.generation < storage,
+            Some("restore") => source_id != id && source.get("end").is_none(),
+            Some("move") => {
+                source_id == id && from.generation < storage && source.get("target_time").is_none()
+            }
             _ => false,
         }
 }
@@ -505,7 +527,10 @@ mod tests {
                 vector["name"].as_str().unwrap(),
                 &vector["value"],
             );
-            let valid = vector["valid"].as_bool().unwrap();
+            // The contract refuses a property it does not name; the node ignores one in what
+            // Cloudflare sends it (`node_valid`, plan 9.3, "Changing the page"), and holds what it
+            // sends to the contract's own verdict.
+            let valid = vector["node_valid"].as_bool().unwrap();
             let refinement = vector["refinement"].as_bool().unwrap();
             // A refinement is exactly what the JSON Schema alone accepts.
             assert_eq!(

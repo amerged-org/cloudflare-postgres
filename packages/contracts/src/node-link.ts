@@ -6,6 +6,19 @@
  * release, policy and orders), reads its credentials, keeps the link to its NodeActor with a
  * sample every 15 s, and posts observations, volume reports and events. The Rust node agent reads
  * the JSON Schemas and vectors in `native/node.generated.json` and `node-vectors.generated.json`.
+ *
+ * Changing it (ULTRA plan 9.3, "Changing the page"). The objects here are strict, and so is the
+ * API: it never sends or accepts a property by accident. The node reads what Cloudflare sends it
+ * with every object open (`native/node-schema.ts`), because the API deploys first. So:
+ * - A new property starts optional: `.optional()` or `.default(...)`, with the default
+ *   documented, and the node uses it when the page leaves it out. It becomes required in the
+ *   release after every node runs an agent that knows it, by a line in `test/node-required.ts`,
+ *   which fails until it is there.
+ * - A property that is renamed, removed or changed in type, a new type of order, a new value of
+ *   an enum, a new kind of origin or host file, and a new required property of what the node
+ *   sends go in two releases, the agent first: the node refuses a page it cannot read whole.
+ * - The facts the release key signs (`signedReleaseManifest`) are not optional: the agent
+ *   builds the signed text from them.
  */
 import { z } from "zod";
 import {
@@ -737,8 +750,11 @@ export const NodePolicy = z.strictObject({
      * from the release of the writer, so that its first requests, its start-up and the reading of
      * its buffer list are not throttled (plan 4.4). Its weight and its memory, IO and task limits
      * stay. 0 applies the quota at once. A restarted agent applies it at once to what it finds.
+     * Optional for its first release (plan 9.3, "Changing the page"): a policy and a page without
+     * it mean 0, the quota with the wake as before, so that an agent that does not know it reads
+     * the page and an agent that does reads a page without it.
      */
-    cpu_boost_ms: z.number().int().min(0).max(60_000),
+    cpu_boost_ms: z.number().int().min(0).max(60_000).default(0),
   }),
   /** D2: put idle-but-awake databases to sleep early, only while a wake waits. */
   early_sleep: z.strictObject({
@@ -944,6 +960,10 @@ export const NodeOrder = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("maintenance"), operation: OperationId }),
 ]);
 export type NodeOrder = z.infer<typeof NodeOrder>;
+/** The types of order a node reads: a page with another is refused whole (plan 9.3). */
+export const NODE_ORDER_TYPES = NodeOrder.options.map(
+  (order) => order.shape.type.value,
+);
 
 // ---------- Probes on request (POST /v1/nodes/{id}/diagnostics) ----------
 

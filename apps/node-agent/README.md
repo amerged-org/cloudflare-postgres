@@ -135,6 +135,16 @@ the gateway's keyring and the Tunnel token from `GET /node/v1/credentials` when 
 when the page names a higher credentials revision, and R2 temporary credentials from
 `GET /node/v1/archive-credentials/{id}` as the page names them. A node never holds the R2 parent key.
 
+The agent reads what Cloudflare sends it (the page, the credentials, the answers, the link's
+messages and the enrollment seed) with every object open: a property it does not name is ignored, so
+that the API can send one before every node knows it and an update never needs a hand replacement of
+the agent (plan 9.3, "Changing the page"). It still refuses a page whole for a missing property, a
+wrong type, a number out of bound, a value outside a closed set (an enum, a kind of origin or host
+file) and an order of a type it does not read (`link/desired.rs`, event `desired_pull_failed`, class
+`cloudflare_desired_page_has_an_order_this_agent_does_not_know`): nothing of that page is applied. A
+property of the page that is new is optional with a default (`cpu_boost_ms` is 0 when left out).
+What the agent sends stays closed to the contract.
+
 ## A wake, a sleep and a recovery
 
 - **Wake.** The gateway holds the client's startup and sends the agent the wake before it answers

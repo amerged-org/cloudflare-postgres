@@ -920,6 +920,85 @@ mod tests {
         );
     }
 
+    /// A page of a later release may carry properties this build does not know on its release:
+    /// on the release, its image, its binaries, its lock and its host files, a binary of another
+    /// name, a URL or the bytes of a file. The agent installs what the manifest names and nothing
+    /// else, and the signature it checks is of that text alone: an unknown property can neither
+    /// change what the signature covers nor bring in a file it does not cover.
+    #[tokio::test]
+    async fn a_property_the_agent_does_not_know_is_no_part_of_the_release_it_checks_and_installs() {
+        use crate::link::test_server::{UNKNOWN_PROPERTY, with_unknown_properties};
+        use serde_json::json;
+        let (key, release) = (throwaway(), vector_release());
+        let signature = signed(&key, &release.manifest());
+        let plain = crate::link::test_server::release_vectors()[0]["release"].clone();
+        let mut later = with_unknown_properties(&plain);
+        later["binaries"]["cloudflared"] = json!({"url":"https://elsewhere.example/cloudflared","sha256":"9".repeat(64),"size_bytes":1});
+        later["binaries"]["pgcf-extra"] =
+            json!({"url":"https://elsewhere.example/extra","sha256":"9".repeat(64),"size_bytes":1});
+        later["os"]["host_files"][0]["url"] = "https://elsewhere.example/sshd".into();
+        later["os"]["host_files"][0]["content"] = "PermitRootLogin yes\n".into();
+        later["os"]["packages"] = json!([{"name":"evil","version":"1","url":"https://elsewhere.example/evil.deb","sha256":"9".repeat(64),"size_bytes":1}]);
+        assert_eq!(later[UNKNOWN_PROPERTY], 1);
+        let parsed = Release::parse(&later).unwrap();
+        // The release is the one without them, its manifest is the same text and its signature holds.
+        assert_eq!(parsed, release);
+        assert_eq!(parsed.manifest(), release.manifest());
+        assert_eq!(verify(&public(&key), &parsed, &signature), Ok(()));
+        assert_eq!(
+            parsed
+                .binaries
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            names()
+        );
+        // What is installed is the four binaries of the manifest, downloaded from their pinned
+        // URLs: a fifth binary of the page is not downloaded, and nothing is staged for it.
+        let bin = crate::link::test_server::tempdir();
+        let downloaded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = downloaded.clone();
+        install_binaries(&bin, &parsed, move |pinned: Pinned, path: PathBuf| {
+            record.lock().unwrap().push(pinned.url.clone());
+            std::future::ready(fs::write(&path, b"binary").map_err(Into::into))
+        })
+        .await
+        .unwrap_err();
+        let urls: Vec<String> = downloaded.lock().unwrap().clone();
+        assert!(
+            urls.iter()
+                .all(|url| release.binaries.iter().any(|(_, p)| p.url == *url))
+        );
+        assert!(urls.iter().all(|url| !url.contains("elsewhere")));
+        // The host file is fetched by its signed digest from beside the agent, never from a URL of
+        // the page.
+        assert_eq!(
+            parsed.host_file_url(&parsed.host_files[0].sha256),
+            release.host_file_url(&release.host_files[0].sha256)
+        );
+        // A file the page adds to the list is the manifest's: the signature does not cover it.
+        let mut longer = later.clone();
+        longer["os"]["host_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"path":"/usr/lib/zzz.conf","kind":"file","mode":"0644","sha256":"9".repeat(64),"size_bytes":1,"apply":"daemon_reload"}));
+        assert_eq!(
+            verify(&public(&key), &Release::parse(&longer).unwrap(), &signature),
+            Err(ReleaseRefusal::SignatureInvalid)
+        );
+        // A fact the manifest holds, changed beside an unknown property, fails it as before.
+        let mut changed = later.clone();
+        changed["binaries"]["pgcf-agent"]["sha256"] = "9".repeat(64).into();
+        assert_eq!(
+            verify(
+                &public(&key),
+                &Release::parse(&changed).unwrap(),
+                &signature
+            ),
+            Err(ReleaseRefusal::SignatureInvalid)
+        );
+    }
+
     #[test]
     fn the_signature_says_nothing_of_the_agents_rules_for_host_files() {
         // The key signed these lists as they are, and each breaks a rule of this agent: a later

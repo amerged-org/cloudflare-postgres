@@ -49,9 +49,8 @@ pub enum MemoryRule {
     Reserved,
 }
 
-/// The contract's `policy.admission`.
+/// The contract's `policy.admission`. A property of it that this build does not name is ignored.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AdmissionPolicy {
     pub memory_rule: MemoryRule,
     pub memory_floor_mib: u64,
@@ -61,13 +60,14 @@ pub struct AdmissionPolicy {
     pub queue_wait_ms: u64,
     pub retry_after_seconds: u32,
     /// How long after a wake a database runs without the CPU quota of its class (0: the quota
-    /// comes with the wake). Admission does not read it; the wake does (`Core::after_wake`).
+    /// comes with the wake). Admission does not read it; the wake does (`Core::after_wake`). The
+    /// contract starts it optional (plan 9.3, "Changing the page"): a page without it means 0.
+    #[serde(default)]
     pub cpu_boost_ms: u64,
 }
 
 /// The contract's `policy.early_sleep` (D2).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EarlySleepPolicy {
     pub enabled: bool,
     pub min_idle_seconds: u64,
@@ -1898,10 +1898,43 @@ mod tests {
         changed["admission"]["memory_rule"] = "reserved".into();
         let reserved_policy: Policy = serde_json::from_value(changed).unwrap();
         assert_eq!(reserved_policy.admission.memory_rule, MemoryRule::Reserved);
-        // A field the agent does not know is not ignored.
+        // A property the agent does not know is ignored, on the policy and on each of its groups:
+        // an API of a later release adds one before every node runs an agent that knows it.
         let mut unknown = page["value"]["policy"].clone();
         unknown["admission"]["surprise"] = 1.into();
-        assert!(serde_json::from_value::<Policy>(unknown).is_err());
+        unknown["early_sleep"]["surprise"] = 1.into();
+        unknown["surprise"] = 1.into();
+        assert_eq!(
+            serde_json::from_value::<Policy>(unknown).unwrap(),
+            from_contract
+        );
+        // One it needs is not optional: a missing property and a wrong type are refused.
+        let mut missing = page["value"]["policy"].clone();
+        missing["admission"]
+            .as_object_mut()
+            .unwrap()
+            .remove("start_concurrency");
+        assert!(serde_json::from_value::<Policy>(missing).is_err());
+        let mut wrong = page["value"]["policy"].clone();
+        wrong["admission"]["queue_wait_ms"] = "10000".into();
+        assert!(serde_json::from_value::<Policy>(wrong).is_err());
+    }
+
+    #[test]
+    fn a_policy_without_the_cpu_burst_has_the_burst_of_0_the_default_of_its_first_release() {
+        let mut bare = serde_json::json!({
+            "admission": {
+                "memory_rule": "measured", "memory_floor_mib": 600, "awake_budget_mib": 9913,
+                "reservation_overhead_mib": 8, "start_concurrency": 4, "queue_wait_ms": 10000,
+                "retry_after_seconds": 5,
+            },
+            "early_sleep": {"enabled": true, "min_idle_seconds": 30},
+        });
+        let policy: Policy = serde_json::from_value(bare.clone()).unwrap();
+        assert_eq!(policy.admission.cpu_boost_ms, 0);
+        bare["admission"]["cpu_boost_ms"] = 5000.into();
+        let policy: Policy = serde_json::from_value(bare).unwrap();
+        assert_eq!(policy.admission.cpu_boost_ms, 5000);
     }
 
     #[test]

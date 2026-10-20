@@ -56,9 +56,10 @@ pub enum Kind {
 }
 
 /// What the page says of one host file (`HostFile` of the contract). The values are kept as the
-/// page gave them, so that `check` can refuse each by its class.
+/// page gave them, so that `check` can refuse each by its class. A property the page adds that
+/// this build does not name is ignored: the agent reads the file by its signed digest, and the
+/// facts the signature covers are these fields alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HostFile {
     pub path: String,
     pub kind: Kind,

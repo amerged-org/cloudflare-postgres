@@ -1349,8 +1349,10 @@ describe("credentials and the node's policy", () => {
     for (const valid of [0, 1, 5000, 60_000])
       expect(NodeDesiredPage.safeParse(withBoost(valid)).success).toBe(true);
     // The quota of a class is applied late, not never, and not after a fraction of a millisecond:
-    // a missing field, a negative, fractional or oversized number, and a string are refused.
-    for (const broken of [undefined, -1, 0.5, 60_001, "5000", null])
+    // a negative, fractional or oversized number, and a string are refused. A missing field is the
+    // burst of 0 (the field is optional for one release, plan 9.3, "Changing the page").
+    expect(NodeDesiredPage.safeParse(withBoost(undefined)).success).toBe(true);
+    for (const broken of [-1, 0.5, 60_001, "5000", null])
       expect(NodeDesiredPage.safeParse(withBoost(broken)).success).toBe(false);
   });
 });

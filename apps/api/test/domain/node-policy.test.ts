@@ -7,6 +7,7 @@ import {
   cleanupFixtures,
   fixture,
   nodePolicy,
+  nodeRequest,
   refusal,
   request,
 } from "./fixtures.ts";
@@ -79,9 +80,9 @@ it("sets the CPU burst after a wake as it is given, 0 included, and refuses a bu
         .admission.cpu_boost_ms,
     ).toBe(cpu_boost_ms);
   }
-  // A policy is replaced as a whole: one without the field, or with a number that is no burst, is
-  // refused, and the policy that was set stays.
-  for (const broken of [undefined, -1, 1.5, 60_001, "5000"]) {
+  // A policy is replaced as a whole: one with a number that is no burst is refused, and the
+  // policy that was set stays.
+  for (const broken of [-1, 1.5, 60_001, "5000"]) {
     const refused = await request(
       path(f.region),
       f.admin,
@@ -96,7 +97,28 @@ it("sets the CPU burst after a wake as it is given, 0 included, and refuses a bu
   ).toBe(60_000);
 });
 
-it("reaches the node's page, and a policy stored before the field existed is read with the default after migration 0081", async () => {
+it("takes a policy without the CPU burst as a burst of 0, which the node's page then carries (a property starts optional, plan 9.3)", async () => {
+  const f = await fixture();
+  const without = nodePolicy();
+  delete (without.admission as Partial<typeof without.admission>).cpu_boost_ms;
+  const set = await request(path(f.region), f.admin, "PUT", without);
+  expect(set.status).toBe(200);
+  expect(NodePolicy.parse(await set.json()).admission.cpu_boost_ms).toBe(0);
+  const read = await request(path(f.region), f.admin);
+  expect(
+    ((await read.json()) as { admission: Record<string, unknown> }).admission,
+  ).toHaveProperty("cpu_boost_ms", 0);
+  // The API sends the property: the page of a node of the region names it, whatever it was set
+  // from, so that an agent that knows it never has to guess.
+  const page = await nodeRequest(f, "/node/v1/desired");
+  expect(page.status).toBe(200);
+  expect(
+    ((await page.json()) as { policy: { admission: Record<string, unknown> } })
+      .policy.admission,
+  ).toHaveProperty("cpu_boost_ms", 0);
+});
+
+it("reaches the node's page, and a policy stored before the field existed is read with the default, and gets the operator's value from migration 0081", async () => {
   const f = await fixture();
   const legacy = nodePolicy();
   delete (legacy.admission as Partial<typeof legacy.admission>).cpu_boost_ms;
@@ -105,8 +127,11 @@ it("reaches the node's page, and a policy stored before the field existed is rea
   )
     .bind(f.region, JSON.stringify(legacy))
     .run();
-  // The stored policy no longer parses: the page of every node of the region would fail with it.
-  expect((await request(path(f.region), f.admin)).status).toBe(500);
+  // The stored policy still reads: the field is optional, and a node that reads the page of the
+  // region gets the burst of 0 until the operator sets one.
+  const before = await request(path(f.region), f.admin);
+  expect(before.status).toBe(200);
+  expect(NodePolicy.parse(await before.json()).admission.cpu_boost_ms).toBe(0);
   const migration = (
     env as typeof env & { TEST_MIGRATIONS: D1Migration[] }
   ).TEST_MIGRATIONS.filter((m) => m.name.startsWith("0081_"));

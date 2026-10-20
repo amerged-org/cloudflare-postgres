@@ -398,10 +398,14 @@ made as in step 3.
 An agent of a build before host files cannot read the page of a release that carries them (nor,
 since manifest v3, the image's facts that every page's release carries: its generated schema is
 strict), and the API refuses its hello, which lacks `os.host_files_sha256`, so no release can reach
-it: once, its binary is replaced through the shell. EU1 is such a node (it runs the agent of main
-`bb85de7d`). A node enrolled from an image that
+it: once, its binary is replaced through the shell. EU1 was such a node (it ran the agent of main
+`bb85de7d`) and was replaced on 2026-10-20. A node enrolled from an image that
 holds the first agent that writes host files needs none of this, and no code supports it: Dev runs
-the newest release only. The databases keep running throughout (their units do not depend on the
+the newest release only. It is the last such step: from the agent that ignores the properties it
+does not know, a release is installed by the release path whatever it adds
+([Changing the page](#changing-the-page-no-hand-step)); an agent of main `1ace7446`, which is still
+strict, is moved to that agent by the release path in the order of the plan's row for the CPU
+burst, and a node that needs this section again means a rule of that section was broken. The databases keep running throughout (their units do not depend on the
 agent, and a restart of the agent never stops one).
 
 1. **While the node is still linked,** check that the shell reaches it (steps 1 to 4 above;
@@ -461,7 +465,9 @@ each is told to pull the new page, and admission uses the new values from then o
 | `io`         | `write_bytes_per_second` and `write_iops` of a 256 MiB database; a database of _m_ MiB gets _m_/256 times as much                                                | 16 MB/s, 1,000                             |
 
 `cpu_boost_ms` is how long after a wake a database runs without the CPU quota of its class, counted
-from the release of its writer (`0`: the quota comes with the wake). The first requests, PostgreSQL's
+from the release of its writer (`0`: the quota comes with the wake). It is optional for its first
+release ([Changing the page](#changing-the-page-no-hand-step)): a `PUT` that leaves it out sets 0,
+and a stored policy that lacks it reads as 0 until migration `0081` or a `PUT` gives it a value. The first requests, PostgreSQL's
 start-up and the reading of its buffer list (`autoprewarm`) then are not held to 0.5 CPU (0.25 for
 `xs`). The weight and the memory, IO and task limits of the unit stay, so the burst lifts only the
 cap of the quota: contested CPU is still divided by weight, and a database that bursts takes its
@@ -569,7 +575,7 @@ and actual delivery are separate evidence. The alert kinds and their runbook act
 5. A new release reaches a running node without a reboot: assign it to the region and the node pulls
    its binaries and writes its host files (plan 9.3; the section below). Packages and kernels change
    only in the [maintenance cycle](recovery.md#node-maintenance-cycle), one node at a time. A node
-   whose agent predates host files (EU1 today) first has its agent
+   whose agent predates host files (EU1 did, until 2026-10-20) first has its agent
    [replaced by hand](#replacing-the-agent-by-hand-a-node-whose-agent-predates-host-files), once.
 
 Verify an install as described under [the node firewall](#the-node-firewall) and
@@ -626,6 +632,53 @@ volumes) is written to every running node, and nothing refuses it or checks it: 
 databases keep the topology they started with, each database's next start takes the new one, and
 a node that holds both until every database has slept is in a state nothing has measured. Do not
 assign such a release to a region that has running nodes; the change reaches EU1 with a reinstall.
+
+### Changing the page: no hand step
+
+The desired page (a field of the policy, the release, an entry, a role, an order or a probe), the
+credentials and the API's answers are read by the agent with every object open: **a property the
+agent does not know is ignored**, so a release that adds one reaches a running node by the release
+path, with no replacement of the agent (plan 9.3, "Changing the page"). What the agent still
+refuses, whole, is a page it cannot read: a missing required property, a wrong type, a number out
+of bound, a value outside a closed set (an enum, a type of order, a kind of origin or host file, a
+link message), and a property of the other kind of origin (a move with a `target_time`, a restore
+with an `end`). The contract stays strict on the API's side, so the API never sends or accepts a
+property by accident. The rules for the author of a change are in the header of
+`packages/contracts/src/node-link.ts` and in `packages/contracts/test/node-required.ts`, which fails
+until a required property is a line of it:
+
+1. **A new property is optional, with its default.** `.optional()` or `.default(...)` in the
+   contract, the default written in its comment, vectors with and without it, the Rust consumer
+   with `#[serde(default)]` or `get`, and the generated files (`node packages/contracts/native/generate-node.ts`).
+   The API sends it at once; an agent that does not know it ignores it and an agent that does uses
+   the default when a page leaves it out. A property that would change what an old agent does when it
+   is ignored (a restriction, another way to read a time) is not additive: use rule 3.
+2. **It becomes required only in the release after every node runs the agent that knows it**
+   (`GET /v1/nodes/{id}/release`: `converged` on every node of every region), by adding its line to
+   `node-required.ts`. A property the agent sends (the hello, the reports) follows the same rule:
+   the API deploys first and knows it as optional, the agent sends it from its release, and the API
+   requires it only in the release after every agent sends it. The API serves no answer in an old
+   form for the hello of an older agent, because it never requires what the agent in the field does
+   not send. The facts the release key signs (`release.image`, `release.binaries`, `release.os` and
+   its host files) and the digests of them that the hello reports stay required: the agent builds the
+   signed text from them.
+3. **A rename, a removal, a type change, a new value of a closed set, a new type of order and a new
+   kind of origin, host file or link message go in two releases, agent first.** The first release
+   ships an agent that reads the old and the new form; assign it and wait until every node is
+   `converged` on it; only then deploy the API of the second release, which changes what it sends.
+   A change of the signed manifest (a new line of it) is the same: the first agent verifies the old
+   and the new text while the signer still signs the old, and the second switches the signer.
+4. **The order of deploy** for an additive change does not matter: deploy the API, then register
+   and assign the release (the usual order), or the other way round. For rule 3 the order is the
+   rule.
+
+If an agent meets a page it cannot read it applies none of it (no entry, no order, no release; what
+runs keeps running) and logs `desired_pull_failed` with the class `cloudflare_desired_page_invalid`,
+or `cloudflare_desired_page_has_an_order_this_agent_does_not_know` for an order of a type it does
+not read. Read it with the `journal` probe ([recovery](recovery.md#looking-at-a-node)), roll the
+API Worker back to the version before the change, assign the release whose agent reads the page,
+wait until the node is `converged`, and deploy again. Replacing the agent by hand is the last
+resort.
 
 ## API-only resource profiles and regional configuration
 
