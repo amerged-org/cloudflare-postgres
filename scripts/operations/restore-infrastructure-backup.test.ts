@@ -27,9 +27,10 @@ import {
   decryptArtifact,
   envelopeKey,
   importArtifact,
+  chunkSql,
   keyringFromEnvironment,
+  loadOrder,
   parseOptions,
-  schemaFirst,
 } from "./restore-infrastructure-backup.ts";
 
 const RUN = "7c0d1b5e-52a3-4a52-9a4e-1f2f6b0d6a11";
@@ -378,76 +379,210 @@ const OUT_OF_ORDER = [
   "DELETE FROM sqlite_sequence;",
   `INSERT INTO "sqlite_sequence" ("name","seq") VALUES('log',7);`,
   "CREATE INDEX child_parent ON child(parent_id);",
-  `CREATE TRIGGER child_audit AFTER INSERT ON child BEGIN INSERT INTO log("odd;name") VALUES(NEW.id); SELECT 1; END;`,
+  // The body's second statement begins with INSERT, as a row of the dump does.
+  `CREATE TRIGGER child_audit AFTER INSERT ON child BEGIN SELECT 1; INSERT INTO log("odd;name") VALUES(NEW.id); END;`,
   "",
 ].join("\n");
 
-test("puts every CREATE TABLE ahead of the data, whatever the quoting and chunking, without changing a byte of any statement", async () => {
+/** The provider's way: every file its own transaction, foreign keys enforced. */
+async function loadChunks(chunks: { path: string }[]) {
+  const db = new DatabaseSync(":memory:");
+  for (const { path } of chunks) {
+    db.exec("BEGIN;");
+    try {
+      db.exec(await readFile(path, "utf8"));
+      db.exec("COMMIT;");
+    } catch (error) {
+      db.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+  return db;
+}
+/** The dump as a shell would take it: one file, foreign keys not enforced. */
+function loadWhole(sql: string) {
+  const db = new DatabaseSync(":memory:", {
+    enableForeignKeyConstraints: false,
+  });
+  db.exec(sql);
+  return db;
+}
+// The dump's pragma, which opens every chunk, and the line break the chunk adds after it.
+const PRAGMA_STATEMENT = "PRAGMA defer_foreign_keys=TRUE;",
+  PREAMBLE = `${PRAGMA_STATEMENT}\n`;
+
+const OUT_OF_ORDER_BYTES = Buffer.from(OUT_OF_ORDER);
+
+test("orders tables parents first, keeps the creation order otherwise and groups the tables that cannot be ordered", () => {
+  const table = (name: string, ...parents: string[]) => ({ name, parents }),
+    one = (name: string) => ({ tables: [name], together: false });
+  // A migration that rebuilt `regions` leaves it after the tables that reference it.
+  assert.deepEqual(
+    loadOrder([
+      table("nodes", "regions"),
+      table("databases", "regions", "nodes"),
+      table("regions"),
+      table("audit"),
+    ]),
+    [one("regions"), one("nodes"), one("databases"), one("audit")],
+  );
+  // Tables that reference each other, a table that references itself, a parent the dump does not
+  // hold, and a parent named in another case are told apart.
+  assert.deepEqual(
+    loadOrder([
+      table("x", "y"),
+      table("y", "x"),
+      table("z", "X"),
+      table("tree", "tree"),
+      table("ghost", "missing"),
+    ]),
+    [
+      { tables: ["x", "y"], together: true },
+      one("z"),
+      { tables: ["tree"], together: true },
+      one("ghost"),
+    ],
+  );
+});
+
+test("splits the dump at statement boundaries into chunks that load one by one and equal the dump, whatever the quoting and reading", async () => {
   const { dir, done } = await workspace();
   try {
-    // The dump is loaded as one transaction, which is what `defer_foreign_keys` is for. That the
-    // provider's import runs the file as one transaction is not verified: the restore drill is
-    // where it is first tried (docs/operations/infrastructure-backups.md).
-    const load = (db: DatabaseSync, sql: string) =>
-      db.exec(`BEGIN;\n${sql}\nCOMMIT;`);
+    // The dump as one transaction is what `defer_foreign_keys` is for; as separate transactions its
+    // first chunk of rows meets a parent that is not there yet.
     const raw = new DatabaseSync(":memory:");
-    assert.throws(() => load(raw, OUT_OF_ORDER), /no such table/);
+    assert.throws(
+      () => raw.exec("BEGIN;\n" + OUT_OF_ORDER + "\nCOMMIT;"),
+      /no such table/,
+    );
     raw.close();
     const input = join(dir, "dump.sql");
     await writeFile(input, OUT_OF_ORDER);
-    let first: string | undefined;
-    // One byte at a time puts a chunk boundary inside every two-byte token and every quote.
-    for (const chunkBytes of [1, 2, 3, 7, 64, 1 << 20]) {
-      const output = join(dir, `ordered-${chunkBytes}.sql`),
-        result = await schemaFirst(input, output, { chunkBytes }),
-        text = await readFile(output, "utf8");
-      assert.equal(result.tables, 4, `chunk ${chunkBytes}`);
-      assert.equal(result.moved, 3, `chunk ${chunkBytes}`);
-      assert.equal(Buffer.byteLength(text), OUT_OF_ORDER.length);
-      first ??= text;
-      assert.equal(text, first, `chunk ${chunkBytes} differs`);
-      assert.equal((await stat(output)).mode & 0o777, 0o600);
+    let first: string[] | undefined,
+      firstPlan: Awaited<ReturnType<typeof chunkSql>> | undefined;
+    // One byte at a time puts a read boundary inside every two-byte token and every quote.
+    for (const readBytes of [1, 2, 3, 7, 64, 1 << 20]) {
+      const directory = join(dir, `read-${readBytes}`);
+      await mkdir(directory, { mode: 0o700 });
+      const plan = await chunkSql(input, directory, {
+          chunkBytes: 150,
+          chunkStatements: 3,
+          readBytes,
+        }),
+        texts = await Promise.all(
+          plan.chunks.map(({ path }) => readFile(path, "utf8")),
+        );
+      assert.equal(plan.tables, 4, `read ${readBytes}`);
+      assert.equal(plan.moved, 3, `read ${readBytes}`);
+      first ??= texts;
+      firstPlan ??= plan;
+      assert.deepEqual(texts, first, `read ${readBytes} differs`);
+      for (const chunk of plan.chunks)
+        assert.equal((await stat(chunk.path)).mode & 0o777, 0o600);
+      // The bounds hold for everything but the schema's last chunk of indexes and triggers, which
+      // is never cut; every chunk opens with the dump's own pragma.
+      for (const chunk of plan.chunks.slice(0, -1))
+        assert.ok(
+          chunk.statements <= 3 && chunk.bytes <= 150 + PREAMBLE.length,
+        );
+      assert.ok(plan.chunks.length >= 6);
     }
-    const db = new DatabaseSync(":memory:");
-    load(db, first!);
-    const rows = (sql: string) =>
-      db
-        .prepare(sql)
-        .all()
-        .map((row) => ({ ...row }));
-    assert.deepEqual(rows("SELECT id, parent_id FROM child"), [
-      { id: "c1", parent_id: "p1" },
-    ]);
-    assert.deepEqual(rows("SELECT id, note FROM parent ORDER BY id"), [
-      { id: "p1", note: "a; CREATE TABLE evil (x); -- not a comment" },
-      {
-        id: "p2",
-        note: `it's "quoted"; /* nor this */ and\na second line; CREATE TABLE evil2 (x);`,
-      },
-    ]);
-    assert.deepEqual(
-      rows("SELECT name, seq FROM sqlite_sequence WHERE name = 'log'"),
-      [{ name: "log", seq: 7 }],
+    const texts = first!;
+    for (const text of texts) assert.ok(text.startsWith(PREAMBLE));
+    // Not a byte lost or doubled: the statements are the dump's, the pragma is repeated.
+    assert.equal(
+      texts.reduce(
+        (sum, text) => sum + Buffer.byteLength(text) - PREAMBLE.length,
+        0,
+      ) +
+        PREAMBLE.length -
+        1,
+      OUT_OF_ORDER.length,
     );
+    // The first chunks hold the tables, the last the objects the dump put after its rows.
+    assert.ok(!texts[0]!.includes("INSERT"));
+    assert.ok(texts.at(-1)!.includes("CREATE TRIGGER child_audit"));
+    assert.ok(texts.at(-1)!.includes("CREATE INDEX child_parent"));
+    const loaded = await loadChunks(firstPlan!.chunks),
+      whole = loadWhole(OUT_OF_ORDER);
+    assert.deepEqual(snapshot(loaded), snapshot(whole));
     assert.deepEqual(
-      rows(
-        "SELECT name FROM sqlite_schema WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY name",
-      ).map((row) => row.name),
+      loaded
+        .prepare("SELECT id, note FROM parent ORDER BY id")
+        .all()
+        .map((row) => ({ ...row })),
       [
-        "after_comment",
-        "child",
-        "child_audit",
-        "child_parent",
-        "log",
-        "parent",
+        { id: "p1", note: "a; CREATE TABLE evil (x); -- not a comment" },
+        {
+          id: "p2",
+          note: `it's "quoted"; /* nor this */ and\na second line; CREATE TABLE evil2 (x);`,
+        },
       ],
     );
-    db.close();
-    // A dump already in order is left as it is.
-    const ordered = join(dir, "in-order.sql"),
-      again = await schemaFirst(join(dir, "ordered-7.sql"), ordered);
-    assert.equal(again.moved, 0);
-    assert.equal(await readFile(ordered, "utf8"), first);
+    assert.deepEqual(
+      loaded
+        .prepare("SELECT name, seq FROM sqlite_sequence WHERE name = 'log'")
+        .all()
+        .map((row) => ({ ...row })),
+      [{ name: "log", seq: 7 }],
+    );
+    loaded.close();
+    whole.close();
+  } finally {
+    await done();
+  }
+});
+
+test("keeps the tables that reference each other, or themselves, in one chunk whatever the bound, and reads every way a table is named", async () => {
+  const { dir, done } = await workspace();
+  try {
+    const dump = [
+        "PRAGMA defer_foreign_keys=TRUE;",
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER REFERENCES b(id));",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER REFERENCES a(id));",
+        "CREATE TABLE tree (id INTEGER PRIMARY KEY, up INTEGER REFERENCES tree(id));",
+        `CREATE TABLE "odd ""name""" (x INTEGER);`,
+        "CREATE TABLE `tick` (x INTEGER);",
+        "CREATE TABLE [br] (x INTEGER);",
+        `INSERT INTO "a" VALUES(1,1);`,
+        "INSERT INTO B VALUES(1,1);",
+        "INSERT INTO a VALUES(2,1);",
+        `INSERT INTO "tree" VALUES(1,2);`,
+        `INSERT INTO "tree" VALUES(2,NULL);`,
+        `INSERT INTO "odd ""name""" VALUES(1);`,
+        "INSERT INTO `tick` VALUES(1);",
+        "INSERT INTO [br] VALUES(1);",
+        "",
+      ].join("\n"),
+      input = join(dir, "dump.sql");
+    await writeFile(input, dump);
+    // Chunks of one statement, so that only the rule keeps these rows together.
+    const plan = await chunkSql(input, dir, {
+      chunkBytes: 1,
+      chunkStatements: 1,
+    });
+    assert.deepEqual(plan.together, [["a", "b"], ["tree"]]);
+    const rows = await Promise.all(
+      plan.chunks.map(async ({ path }) => {
+        const text = await readFile(path, "utf8");
+        return {
+          a: (text.match(/INSERT INTO "?[aAbB]"? VALUES/g) ?? []).length,
+          tree: (text.match(/INSERT INTO "tree"/g) ?? []).length,
+        };
+      }),
+    );
+    assert.deepEqual(
+      rows.filter((chunk) => chunk.a + chunk.tree > 0),
+      [
+        { a: 3, tree: 0 },
+        { a: 0, tree: 2 },
+      ],
+    );
+    const loaded = await loadChunks(plan.chunks),
+      whole = loadWhole(dump);
+    assert.deepEqual(snapshot(loaded), snapshot(whole));
+    loaded.close();
+    whole.close();
   } finally {
     await done();
   }
@@ -457,6 +592,10 @@ test("puts every CREATE TABLE ahead of the data, whatever the quoting and chunki
 // --json`, runs what it is given in a real SQLite database per D1 database (a file is loaded as
 // one transaction, and a failure rolls it back), and records what it was asked and what the file it
 // was given looked like at that time. With `hold` set it stops inside the import, as a slow one does.
+// Like the provider, it resets the database when one file is too large (`maxFileBytes`): exit code 1
+// with the body {"D1_RESET_DO":true} and nothing written (the live drill of 2026-10-20 on a 31 MB
+// file); `failImportCall` fails the import call of that number; `looseForeignKeys` is a database
+// that does not enforce foreign keys while it loads, which the provider is not.
 const FAKE_WRANGLER = `#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
@@ -473,10 +612,11 @@ if (args[0] === "d1" && args[1] === "list") {
 } else if (args[0] === "d1" && args[1] === "execute") {
   const database = state.databases.find((db) => db.uuid === args[2]);
   if (!database) { save(); process.stderr.write("Couldn't find a D1 DB with name or binding\\n"); process.exit(1); }
-  const db = new DatabaseSync(path.join(path.dirname(statePath), database.uuid + ".sqlite"));
+  const db = new DatabaseSync(path.join(path.dirname(statePath), database.uuid + ".sqlite"), { enableForeignKeyConstraints: !state.looseForeignKeys });
   if (flag("--file")) {
     const file = flag("--file");
     const text = fs.readFileSync(file);
+    const number = state.calls.filter((call) => call.file).length + 1;
     record.file = {
       mode: fs.statSync(file).mode & 0o777,
       directoryMode: fs.statSync(path.dirname(file)).mode & 0o777,
@@ -486,11 +626,13 @@ if (args[0] === "d1" && args[1] === "list") {
       lastCreate: text.lastIndexOf("CREATE TABLE"),
     };
     if (state.hold) { save(); fs.writeFileSync(state.hold + ".tmp", String(process.pid)); fs.renameSync(state.hold + ".tmp", state.hold); setInterval(() => {}, 1000); return; }
-    if (state.failImport) { save(); process.stderr.write("SQLITE_ERROR near " + text.toString("utf8", 0, 40) + "\\n"); process.exit(1); }
+    if (state.failImport || state.failImportCall === number) { save(); process.stderr.write("SQLITE_ERROR near " + text.toString("utf8", 0, 40) + "\\n"); process.exit(1); }
+    if (state.maxFileBytes && text.length > state.maxFileBytes) { save(); process.stdout.write(JSON.stringify({ D1_RESET_DO: true }) + "\\n"); process.exit(1); }
     db.exec("BEGIN;");
     try { db.exec(text.toString("utf8")); db.exec("COMMIT;"); }
     catch (error) { db.exec("ROLLBACK;"); save(); process.stderr.write(String(error.message) + "\\n"); process.exit(1); }
-    out([{ results: [{ "Total queries executed": text.toString("utf8").split("\\n").length, "Rows read": 0, "Rows written": 4003, "Database size (MB)": "0.31" }], success: true, finalBookmark: "00000001-00000002-0000000a-abc", meta: { duration: 12.5 } }]);
+    const written = db.prepare("SELECT total_changes() AS n").get().n;
+    out([{ results: [{ "Total queries executed": text.toString("utf8").split("\\n").length, "Rows read": 0, "Rows written": written, "Database size (MB)": "0.31" }], success: true, finalBookmark: "00000001-00000002-0000000a-abc", meta: { duration: 12.5 } }]);
   } else {
     out([{ results: db.prepare(flag("--command")).all().map((row) => ({ ...row })), success: true, meta: { duration: 0.2 } }]);
   }
@@ -506,6 +648,11 @@ async function wranglerFixture(
     /** SQL that a database already holds, by its ID. */
     existing?: Record<string, string>;
     failImport?: boolean;
+    /** The number (from 1) of the import call that fails. */
+    failImportCall?: number;
+    /** Imports of a file larger than this reset the database, as the provider does. */
+    maxFileBytes?: number;
+    looseForeignKeys?: boolean;
     /** A file the fake writes its process ID to, and then never answers. */
     hold?: string;
   } = {},
@@ -521,6 +668,9 @@ async function wranglerFixture(
       { uuid: SCRATCH_DATABASE, name: "pgcf-restore-drill" },
     ],
     failImport: overrides.failImport ?? false,
+    failImportCall: overrides.failImportCall,
+    maxFileBytes: overrides.maxFileBytes,
+    looseForeignKeys: overrides.looseForeignKeys ?? false,
     hold: overrides.hold,
     calls: [] as {
       args: string[];
@@ -564,6 +714,150 @@ async function inputFile(dir: string) {
   return input;
 }
 
+// A dump the provider cannot take as one file. Its tables are in the order a migration that rebuilt
+// them leaves: `samples` (24,000 rows, the bulk) is created before `databases`, which is created
+// before `regions`, so each child's rows come before its parent's. The literals hold semicolons,
+// quotes, comment markers and line breaks, and the trigger's body holds an INSERT of its own.
+const BIG = Buffer.from(
+  [
+    "PRAGMA defer_foreign_keys=TRUE;",
+    "CREATE TABLE samples (id INTEGER PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), note TEXT NOT NULL);",
+    ...Array.from(
+      { length: 24000 },
+      (_, i) =>
+        `INSERT INTO "samples" VALUES(${i},'d${i % 400}','row ${i}; it''s "second"\nline with '';'' and -- not a comment ${"x".repeat(120)}');`,
+    ),
+    "CREATE TABLE databases (id TEXT PRIMARY KEY, region_id TEXT NOT NULL REFERENCES regions(id));",
+    ...Array.from(
+      { length: 400 },
+      (_, i) => `INSERT INTO "databases" VALUES('d${i}','r${i % 3}');`,
+    ),
+    "CREATE TABLE regions (id TEXT PRIMARY KEY);",
+    ...["r0", "r1", "r2"].map((id) => `INSERT INTO "regions" VALUES('${id}');`),
+    "CREATE TABLE audit (n INTEGER);",
+    `INSERT INTO "audit" VALUES(0);`,
+    "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL);",
+    ...Array.from(
+      { length: 100 },
+      (_, i) => `INSERT INTO "events" VALUES(${i + 1},'k');`,
+    ),
+    "DELETE FROM sqlite_sequence;",
+    `INSERT INTO "sqlite_sequence" ("name","seq") VALUES('events',250);`,
+    "CREATE INDEX samples_database ON samples (database_id);",
+    "CREATE TRIGGER samples_audit AFTER INSERT ON samples BEGIN INSERT INTO audit(n) VALUES(NEW.id); END;",
+    "",
+  ].join("\n"),
+);
+
+/** Everything a database holds that the dump defines: its objects, its rows by table, its sequences. */
+function snapshot(db: DatabaseSync) {
+  const plain = (rows: unknown[]) =>
+      rows.map((row) => ({ ...(row as object) })),
+    objects = plain(
+      db
+        .prepare(
+          String.raw`SELECT type, name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name`,
+        )
+        .all(),
+    ) as { type: string; name: string }[];
+  return {
+    objects,
+    tables: Object.fromEntries(
+      objects
+        .filter((object) => object.type === "table")
+        .map(({ name }) => [
+          name,
+          plain(
+            db
+              .prepare(
+                `SELECT * FROM "${name.replaceAll('"', '""')}" ORDER BY rowid`,
+              )
+              .all(),
+          ),
+        ]),
+    ),
+    // The table exists once a table with AUTOINCREMENT does.
+    sequence: db
+      .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_sequence'")
+      .get()
+      ? plain(
+          db
+            .prepare("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+            .all(),
+        )
+      : [],
+  };
+}
+
+test("imports a dump the provider resets as one file in bounded chunks, parents first, and the result equals the dump", async () => {
+  const { dir, done } = await workspace();
+  try {
+    // The live drill of 2026-10-20 failed at 31 MB with D1_RESET_DO; the double resets at 3 MiB.
+    const reset = 3 * 1024 * 1024,
+      { bytes } = await artifact(BIG, { chunk: 64 * 1024 }),
+      input = join(dir, "d1-control.pgcfenc"),
+      lines: string[] = [];
+    assert.ok(BIG.length > 1.5 * reset, "the dump must not fit one file");
+    await writeFile(input, bytes);
+    const fixture = await wranglerFixture(dir, { maxFileBytes: reset }),
+      result = await importArtifact(
+        {
+          input,
+          keyring: KEYRING,
+          keysEnvironment: "PGCF_TEST_KEYS",
+          database: "pgcf-restore-drill",
+          wrangler: fixture.wrangler,
+        },
+        { environment: fixture.environment, log: (line) => lines.push(line) },
+      ),
+      calls = await fixture.calls(),
+      imports = calls.filter((call) => call.file);
+    assert.equal(result.tables, 5);
+    // The schema, at least three chunks of rows and the indexes and triggers.
+    assert.ok(imports.length >= 5, `${imports.length} imports`);
+    for (const call of imports) {
+      assert.ok(call.file!.bytes <= 2 * 1024 * 1024 + 1024);
+      assert.equal(call.file!.mode, 0o600);
+      assert.equal(call.file!.directoryMode, 0o700);
+      assert.equal(await stat(call.file!.directory).catch(() => null), null);
+    }
+    assert.equal(
+      imports[0]!.file!.firstInsert,
+      -1,
+      "the first chunk is schema",
+    );
+    // The foreign key check is asked of the scratch database, by its ID, after the last chunk.
+    const check = calls.findIndex((call) =>
+      call.args.includes("PRAGMA foreign_key_check"),
+    );
+    assert.equal(calls[check]!.args[2], SCRATCH_DATABASE);
+    assert.ok(check > calls.lastIndexOf(imports.at(-1)!));
+    const scratch = new DatabaseSync(join(dir, `${SCRATCH_DATABASE}.sqlite`)),
+      reference = new DatabaseSync(":memory:", {
+        enableForeignKeyConstraints: false,
+      });
+    reference.exec(BIG.toString("utf8"));
+    assert.deepEqual(snapshot(scratch), snapshot(reference));
+    assert.deepEqual(scratch.prepare("PRAGMA foreign_key_check").all(), []);
+    assert.equal(
+      (
+        scratch.prepare("SELECT count(*) AS n FROM audit").get() as {
+          n: number;
+        }
+      ).n,
+      1,
+      "the trigger fired during the import",
+    );
+    scratch.close();
+    reference.close();
+    const printed = lines.join("\n");
+    assert.ok(!printed.includes("INSERT INTO"));
+    assert.ok(!printed.includes("not a comment"));
+  } finally {
+    await done();
+  }
+});
+
 test("imports into an empty scratch database through a private file, by its ID, and removes the file", async () => {
   const { dir, done } = await workspace();
   try {
@@ -583,14 +877,26 @@ test("imports into an empty scratch database through a private file, by its ID, 
     // The dump has two tables and an index; what is counted is the tables, as it is printed.
     assert.equal(result.tables, 2);
     const calls = await fixture.calls(),
-      imported = calls.find((call) => call.file)!;
-    // The import names the database by the ID that was checked, never by name or binding, so a
-    // wrangler configuration cannot redirect it; it runs against the remote database from a
-    // directory that holds no configuration.
-    assert.equal(imported.args[2], SCRATCH_DATABASE);
-    assert.ok(imported.args.includes("--remote"));
-    assert.ok(imported.args.includes("--yes"));
-    assert.ok(!imported.args.includes("--local"));
+      imports = calls.filter((call) => call.file);
+    // The schema, the rows (fewer than one chunk holds) and the index are three imports.
+    assert.equal(imports.length, 3);
+    for (const imported of imports) {
+      // Each import names the database by the ID that was checked, never by name or binding, so a
+      // wrangler configuration cannot redirect it; it runs against the remote database from a
+      // directory that holds no configuration.
+      assert.equal(imported.args[2], SCRATCH_DATABASE);
+      assert.ok(imported.args.includes("--remote"));
+      assert.ok(imported.args.includes("--yes"));
+      assert.ok(!imported.args.includes("--local"));
+      assert.equal(imported.file!.mode, 0o600);
+      assert.equal(imported.file!.directoryMode, 0o700);
+      assert.equal(imported.cwd, imported.file!.directory);
+      assert.equal(
+        await stat(imported.file!.directory).catch(() => null),
+        null,
+        "the decrypted file stays",
+      );
+    }
     assert.ok(
       !calls.some(
         (call) =>
@@ -598,21 +904,18 @@ test("imports into an empty scratch database through a private file, by its ID, 
           call.args[1] === "execute",
       ),
     );
-    assert.equal(imported.file!.mode, 0o600);
-    assert.equal(imported.file!.directoryMode, 0o700);
-    // The file is the artifact's SQL with its CREATE TABLE statements ahead of the rows: the same
-    // bytes, in another order.
-    assert.equal(imported.file!.bytes, DUMP.length);
-    assert.ok(imported.file!.lastCreate < imported.file!.firstInsert);
-    assert.equal(imported.cwd, imported.file!.directory);
+    // The chunks are the artifact's SQL: the same statements with the CREATE TABLE statements
+    // ahead of the rows, and the dump's pragma at the head of each chunk.
+    assert.equal(
+      imports.reduce((sum, call) => sum + call.file!.bytes, 0),
+      DUMP.length + imports.length * PREAMBLE.length - PRAGMA_STATEMENT.length,
+    );
+    assert.equal(imports[0]!.file!.firstInsert, -1);
+    assert.ok(imports[1]!.file!.firstInsert >= 0);
+    assert.equal(imports[1]!.file!.lastCreate, -1);
     assert.ok(
       !calls.some((call) => call.keyring),
       "the keyring reached wrangler",
-    );
-    assert.equal(
-      await stat(imported.file!.directory).catch(() => null),
-      null,
-      "the decrypted file stays",
     );
     // Nothing the tool prints holds the SQL, a value from it or the key.
     const printed = lines.join("\n");
@@ -620,6 +923,8 @@ test("imports into an empty scratch database through a private file, by its ID, 
     assert.ok(!printed.includes("INSERT INTO"));
     assert.ok(!printed.includes(JSON.parse(KEYRING).keys.v2));
     assert.match(printed, /imported: 2 tables/);
+    assert.match(printed, /3 chunks/);
+    assert.match(printed, /foreign_key_check: no violations/);
     // What the runbook has the operator write into the plan is printed (day, byte counts, hashes),
     // and the live control database's ID is not: the artifact names it, and nothing needs it shown.
     assert.ok(printed.includes("day 2026-10-20"));
@@ -706,12 +1011,105 @@ test("never imports into the database the artifact was exported from, into one w
       ),
       (error) =>
         refused("wrangler_failed")(error) &&
+        /chunk 1 of 3/.test((error as Error).message) &&
         !(error as Error).message.includes("PRAGMA") &&
         !(error as Error).message.includes("SQLITE_ERROR"),
     );
     assert.ok(!lines.join("\n").includes("PRAGMA"));
     const failed = (await failing.calls()).find((call) => call.file)!;
     assert.equal(await stat(failed.file!.directory).catch(() => null), null);
+  } finally {
+    await done();
+  }
+});
+
+test("stops at the chunk that fails with its number and wrangler's exit code, and does not import again into the half-filled database", async () => {
+  const { dir, done } = await workspace();
+  try {
+    const { bytes } = await artifact(OUT_OF_ORDER_BYTES),
+      input = join(dir, "d1-control.pgcfenc");
+    await writeFile(input, bytes);
+    const fixture = await wranglerFixture(dir, { failImportCall: 3 }),
+      go = () =>
+        importArtifact(
+          {
+            input,
+            keyring: KEYRING,
+            keysEnvironment: "PGCF_TEST_KEYS",
+            database: "pgcf-restore-drill",
+            wrangler: fixture.wrangler,
+            chunkBytes: 150,
+            chunkStatements: 3,
+          },
+          { environment: fixture.environment, log: () => {} },
+        );
+    await assert.rejects(
+      go(),
+      (error) =>
+        refused("wrangler_failed")(error) &&
+        /chunk 3 of \d+/.test((error as Error).message) &&
+        /exit code 1/.test((error as Error).message) &&
+        /delete/.test((error as Error).message) &&
+        !/SQLITE_ERROR|CREATE|INSERT/.test((error as Error).message),
+    );
+    // Chunks 1 and 2 are in the scratch database, chunk 3 was the last asked, and nothing stays.
+    const imports = (await fixture.calls()).filter((call) => call.file);
+    assert.equal(imports.length, 3);
+    assert.equal(
+      await stat(imports[0]!.file!.directory).catch(() => null),
+      null,
+    );
+    const scratch = new DatabaseSync(join(dir, `${SCRATCH_DATABASE}.sqlite`));
+    assert.ok(
+      (
+        scratch.prepare("SELECT count(*) AS n FROM sqlite_schema").get() as {
+          n: number;
+        }
+      ).n > 0,
+    );
+    scratch.close();
+    // A second run on that database is refused before anything is written; the operator deletes it.
+    await assert.rejects(go(), refused("database_not_empty"));
+    assert.equal((await fixture.calls()).filter((call) => call.file).length, 3);
+  } finally {
+    await done();
+  }
+});
+
+test("refuses an import that leaves a foreign key violated, and names the table, never a value", async () => {
+  const { dir, done } = await workspace();
+  try {
+    const dump = Buffer.from(
+        [
+          "PRAGMA defer_foreign_keys=TRUE;",
+          "CREATE TABLE regions (id TEXT PRIMARY KEY);",
+          "CREATE TABLE nodes (id TEXT PRIMARY KEY, region_id TEXT REFERENCES regions(id));",
+          `INSERT INTO "nodes" VALUES('n-secret','gone');`,
+          "",
+        ].join("\n"),
+      ),
+      { bytes } = await artifact(dump),
+      input = join(dir, "d1-control.pgcfenc");
+    await writeFile(input, bytes);
+    // A database that does not enforce foreign keys while it loads; the provider's does.
+    const fixture = await wranglerFixture(dir, { looseForeignKeys: true });
+    await assert.rejects(
+      importArtifact(
+        {
+          input,
+          keyring: KEYRING,
+          keysEnvironment: "PGCF_TEST_KEYS",
+          database: "pgcf-restore-drill",
+          wrangler: fixture.wrangler,
+        },
+        { environment: fixture.environment, log: () => {} },
+      ),
+      (error) =>
+        refused("foreign_key_violations")(error) &&
+        /1 row/.test((error as Error).message) &&
+        /nodes/.test((error as Error).message) &&
+        !/n-secret|gone/.test((error as Error).message),
+    );
   } finally {
     await done();
   }
@@ -779,6 +1177,34 @@ test("takes the keyring from a named environment variable only, and never echoes
   assert.equal(
     parseOptions(database("--database", "pgcf-restore-drill")).mode,
     "import",
+  );
+  // The chunk bounds are whole positive numbers and belong to import.
+  const bounded = parseOptions(
+    database(
+      "--database",
+      "pgcf-restore-drill",
+      "--chunk-bytes",
+      "1048576",
+      "--chunk-statements",
+      "2500",
+    ),
+  );
+  assert.ok(bounded.mode === "import" && bounded.chunkBytes === 1048576);
+  assert.ok(bounded.mode === "import" && bounded.chunkStatements === 2500);
+  for (const bad of ["0", "-1", "1.5", "1e6", "many"])
+    assert.throws(
+      () =>
+        parseOptions(
+          database("--database", "pgcf-restore-drill", "--chunk-bytes", bad),
+        ),
+      /--chunk-bytes/,
+    );
+  assert.throws(
+    () =>
+      parseOptions(
+        argv("--keys-env", "PGCF_KEYS", "--chunk-statements", "100"),
+      ),
+    /belong to import/,
   );
 });
 
@@ -894,8 +1320,11 @@ test("a signal removes the decrypted SQL and stops wrangler, and the run ends wi
       assert.equal(names.length, 1);
       const directory = names[0]!;
       assert.ok(directory.startsWith("pgcf-restore-"));
+      // The decrypted SQL is gone; its chunks, all but those already imported, are not.
       assert.deepEqual(await readdir(join(temporary, directory)), [
-        "ordered.sql",
+        "chunk-0001.sql",
+        "chunk-0002.sql",
+        "chunk-0003.sql",
       ]);
       child.kill(signal);
       const [code, killedBy] = await exited;
