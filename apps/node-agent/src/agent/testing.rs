@@ -88,6 +88,7 @@ while [ $# -gt 0 ]; do
 done
 dest=$1; server=$2
 if [ -f "$STORE/backup-fail" ]; then echo 'simulated backup failure' >&2; exit 4; fi
+if [ -f "$STORE/backup-delay" ]; then sleep "$(cat "$STORE/backup-delay")"; fi
 base="$STORE/objects/${{dest#s3://}}/$server/base"
 id=$(date -u +%Y%m%dT%H%M%S)
 while [ -d "$base/$id" ]; do sleep 1; id=$(date -u +%Y%m%dT%H%M%S); done
@@ -118,6 +119,9 @@ pub(crate) fn policy() -> Policy {
     let mut page = vector("NodeDesiredPage", "full-page");
     // Tests wait for what they wait for; nothing in them should be refused for want of time.
     page["policy"]["admission"]["queue_wait_ms"] = json!(300);
+    // The quota comes with the wake, as the tests that read it expect; the tests of the burst set
+    // theirs (`boost`).
+    page["policy"]["admission"]["cpu_boost_ms"] = json!(0);
     Policy::parse(&page["policy"]).unwrap()
 }
 
@@ -282,6 +286,10 @@ impl Rig {
     pub(crate) async fn restart_with(self, running: Vec<Running>) -> Self {
         for task in &self.tasks {
             task.abort();
+        }
+        // The timers that apply the quotas after a burst die with the process.
+        for db in self.core.all() {
+            db.end_boost();
         }
         let (machine, fixture, root) = (
             self.machine.clone(),

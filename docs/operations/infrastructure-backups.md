@@ -422,40 +422,86 @@ wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
      AAD and the plaintext hash and length, and holds the artifact to the receipt (run, key
      version, hashes, sizes, object key) when one is given; a flipped or missing byte, a truncated
      file or another key stops it with nothing written;
-   - writes every `CREATE TABLE` statement ahead of the rest, byte for byte (see below), and runs
-     `wrangler d1 execute <database ID> --remote --yes --file` from that directory, which holds no
-     wrangler configuration, so a configured binding cannot redirect the import;
+   - cuts the SQL into chunk files of a bounded size (see [below](#how-the-tool-cuts-the-sql)),
+     each statement byte for byte, in the same `0700` directory with mode `0600`, and removes the
+     decrypted file;
+   - runs `wrangler d1 execute <database ID> --remote --yes --file <chunk>` for the chunks one
+     after the other from that directory, which holds no wrangler configuration, so a configured
+     binding cannot redirect the import, and removes each chunk once wrangler reports it imported;
+   - runs `PRAGMA foreign_key_check` on the scratch database and refuses a database where it finds
+     a row;
    - removes the directory, and counts the tables of the scratch database (tables only; the
      indexes, triggers and views the dump also creates are not in that number).
 
    It prints the artifact's day, region and key version, the plaintext and encrypted byte counts
-   and SHA-256, the scratch database's ID, and the counts. It never prints SQL, the keyring, the
+   and SHA-256, the scratch database's ID, the number of chunks and a line for each chunk imported,
+   `foreign_key_check: no violations`, and the counts. It never prints SQL, the keyring, the
    control database's ID or wrangler's own text about the import, which can quote a statement; if
-   an import fails, it reports wrangler's exit code. wrangler's output says that a failed import
-   returns the database to its original state; check with step 6's queries before reusing it, or
-   create a new scratch database. To read wrangler's message, write the verified SQL with
-   `decrypt --input FILE --output FILE --keys-env NAME` (mode `0600`, never over an existing
-   file), run the import by hand, and delete the file afterwards.
+   a chunk fails, it reports the chunk's number, its statement and byte counts, wrangler's exit
+   code or `timeout`, and whether wrangler's output reports a D1 reset (yes or no, nothing else of
+   it): the token `D1_RESET_DO` or the word "reset", as in Cloudflare's "D1 DB exceeded its CPU time
+   limit and was reset." and wrangler's "D1 reset before execute completed!".
+
+   **Progress.** Each chunk is one wrangler run (an upload to R2, the provider's ingest, and polling
+   until it ends); the first artifact (31.8 MB) is about 18 chunks. wrangler's own lines are not
+   shown, so the tool prints a line when a chunk is imported and nothing while one runs; it stops a
+   chunk that runs for 10 minutes.
+
+   **If a chunk fails.** The error reads `chunk N of M failed (S statements, B bytes): wrangler d1
+   execute failed (exit code C); D1 reset in its output: yes` (or `no`), with `(timeout)` in place
+   of `(exit code C)` when the tool stopped wrangler. After an exit code the chunks before N are
+   committed and N itself is not (wrangler: a failed import returns the database to its original
+   state); after a `timeout` that does not hold, because stopping wrangler does not cancel the
+   provider's ingest, so N may still be applied afterwards, which does not matter because the
+   database is deleted next. Either way the scratch database is half filled. There is no resume: a
+   retry on that database is refused (`already has N schema objects`), because importing again would
+   duplicate rows. Delete the scratch database (step 7) and create a new one (step 3) before
+   importing again. What to change depends on the answer:
+   - **`yes`, after an exit code or a `timeout`:** the output reports a reset: the provider reset
+     the D1 database while it ran a chunk of S statements and B bytes. Run the import on the new
+     scratch database with `--chunk-bytes` and `--chunk-statements` at half of the values the run
+     printed on its `chunks of at most` line, and record the values that pass in the ULTRA plan.
+     Halving cannot shrink a chunk that is never cut: the last one (sequences, indexes, triggers
+     and views), one statement above the byte bound, and tables that reference each other (the
+     `loaded in one chunk` line). If B is such a chunk, keep the artifact and report the numbers.
+   - **`timeout` with `no`:** wrangler did not finish the chunk in 10 minutes and the tool stopped
+     it. It is not established whether the chunk was too much work, the provider's ingest was stuck
+     or the network stalled, so do not treat it as unrelated to the chunk size: import into a new
+     scratch database with both bounds halved. If a chunk times out again with the halved bounds,
+     the size of the chunk is not the whole cause: check Cloudflare's status page and the account,
+     and report N, S and B.
+   - **`no` with an exit code:** the output holds neither the token nor the word "reset". That is
+     the absence of those words and not proof that the chunk was not a reset, so it does not say
+     that smaller chunks change nothing. wrangler may have failed for another reason: D1 refused a
+     statement, a token or login was refused, or the network failed. Import once more into a new
+     scratch database with the same bounds; a network or provider error usually does not repeat at
+     the same chunk. If the same chunk number fails again with `no` and the same S and B, import
+     once into a third scratch database with both bounds halved. If that chunk fails again, the
+     cause is that chunk or the account, and wrangler's message stays unprinted because it can quote
+     the SQL. Write the verified SQL with `decrypt --input FILE --output FILE --keys-env NAME` (mode
+     `0600`, never over an existing file), load it into a plain SQLite shell with
+     `sqlite3 :memory: < FILE` to see whether the dump itself loads (if it does, D1 refused a
+     statement that SQLite accepts: report N, S and B), and delete the file afterwards. Do not
+     import the whole file by hand to read a chunk's error: the whole file is what D1 reset.
 
    Ctrl-C, `kill` and a closed terminal (SIGINT, SIGTERM, SIGHUP) stop wrangler, remove the
    decrypted SQL and end the run with exit code 130, 143 or 129. A run killed with SIGKILL, or by a
    power cut, cannot clean up: delete `$TMPDIR/pgcf-restore-*` (for `import`) or `<output>.partial`
    (for `decrypt`) by hand.
 
-   **Unverified until the first drill:** that D1 runs the imported file as one transaction. The
-   reordered file only imports in one transaction, because the dump's `PRAGMA
-   defer_foreign_keys=TRUE` lasts for one transaction and the rows of a table can precede its
-   parent's rows. If the drill fails with `FOREIGN KEY constraint failed`, the data statements
-   need an order by foreign key as well; record that in the plan instead of working around it
-   by hand.
+   **Unverified until the first drill:** that D1 accepts a file that opens with the dump's `PRAGMA
+   defer_foreign_keys=TRUE;` and takes chunks of the default size (2 MiB, 5,000 statements). The
+   first chunk is the schema, so a refusal of the pragma shows at chunk 1; a reset shows at the
+   first chunk of rows. The chunks do not depend on how D1 groups a file into transactions: every
+   table's rows come after the rows of the tables it references.
 
-6. **Check the scratch database** against the live one. `d1_migrations` and `regions` must match;
-   the other counts may have moved since the export began. Name the database by the ID the tool
-   printed on its `importing into` line, and run wrangler from an empty directory as in step 3,
-   so that a wrangler configuration cannot redirect the query to another database:
+6. **Check the scratch database** against the live one. The tool has run `PRAGMA foreign_key_check`
+   (it printed `foreign_key_check: no violations`). `d1_migrations` and `regions` must match the
+   live database; the other counts may have moved since the export began. Name the database by the
+   ID the tool printed on its `importing into` line, and run wrangler from an empty directory as in
+   step 3, so that a wrangler configuration cannot redirect the query to another database:
 
    ```sh
-   (cd "$(mktemp -d)" && wrangler d1 execute <scratch-database-id> --remote --command "PRAGMA foreign_key_check")
    (cd "$(mktemp -d)" && wrangler d1 execute <scratch-database-id> --remote --command \
      "SELECT (SELECT count(*) FROM d1_migrations) AS migrations, (SELECT count(*) FROM regions) AS regions, (SELECT count(*) FROM nodes) AS nodes, (SELECT count(*) FROM databases) AS databases")
    ```
@@ -476,17 +522,66 @@ wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
    the artifact, the scratch database), not the control database's ID, and nothing else of the
    content.
 
-**Why the tool reorders the SQL.** D1's export lists each table's rows right after its
-`CREATE TABLE`, and the tables in the order they were created. A migration that rebuilt a table
-puts it after the tables that reference it: in this repository's migrations `regions` comes after
-`nodes`, `databases` and others. SQLite refuses the first row of a table whose referenced table
-does not exist yet (`no such table: main.regions`), even under `PRAGMA defer_foreign_keys`, which
-defers constraint violations only. The local export of the repository's migrations (wrangler's
-local D1) fails to import this way; with every `CREATE TABLE` first it imports as one
-transaction, and a second export holds the same statements as the first. The drill is where the
-provider's own export and the provider's import are first tried (see the unverified premise
-under step 5). The same holds for a restore of the control database: do not import a decrypted
-file by hand; use `import`.
+### How the tool cuts the SQL
+
+**Why one file did not work.** The first complete artifact (day 2026-10-20, 31,785,799 bytes, 55
+tables, the largest `usage_samples` with 30,722 rows) decrypted, authenticated and held to its
+receipt, but importing it as one file failed three times: wrangler exited with code 1 and the
+error body `{"D1_RESET_DO":true}`, with no row read or written. The provider reset the D1 database
+while it ran one 31 MB file. 31 MB reaches none of the size limits Cloudflare documents: an import
+through `wrangler d1 execute --file` is limited to 5 GB (the file goes to R2), one statement to
+100,000 bytes and one row to 2 MB; whether the 30-second limit on a query or API request applies to
+an import is not documented. Cloudflare's D1 debugging page lists a query that is "trying to write a
+large amount of information (e.g. GBs), and is taking too long" (written for gigabytes, which 31 MB
+is not), the database's isolate exceeding its memory limit, and CPU time exceeded when "attempting
+a large import/export", and advises splitting the work; it also lists an internal error or code
+update, for which it says to retry. `D1_RESET_DO` itself is not documented and the response names no
+reason, so **which of them it was is not established**. Each of them grows with the work one import does, and one file of
+31 MB and at least 47,000 rows (the five largest tables alone) is a great deal of it. The tool therefore bounds the work of
+every import and does not rely on a number it has not seen.
+
+**What a chunk is.** The decrypted SQL is cut at statement boundaries (the scan follows quotes,
+identifiers and comments, so a semicolon or a line break inside a string ends nothing, and a
+trigger's pieces stay together) into files `chunk-0001.sql`, ..., and the chunks run in this order:
+
+1. **The schema:** every `CREATE TABLE`. D1's export lists a table's rows right after its
+   `CREATE TABLE` and the tables in the order they were created. A migration that rebuilt a table
+   puts it after the tables that reference it: in this repository's migrations 13 of the 68
+   foreign key entries point at a table created later (`nodes`, `databases` and others at `regions`).
+   SQLite refuses the first row of a table whose referenced table does not exist yet (`no such
+   table: main.regions`), even under `PRAGMA defer_foreign_keys`, which defers violations only.
+2. **The rows, parents first.** The tool loads the `CREATE TABLE` statements into an in-memory
+   SQLite and reads each table's `PRAGMA foreign_key_list`; a table's rows come after the rows of
+   the tables it references, and otherwise in creation order. Because every chunk is committed
+   before the next, a chunk is valid whether D1 runs a file as one transaction or statement by
+   statement. Tables that reference each other, and a table that references itself, cannot be
+   ordered: their rows are loaded in one chunk whatever its size, under the dump's
+   `defer_foreign_keys`, and the tool names them in a line `tables that reference each other are
+   loaded in one chunk`. This repository's schema has none (54 tables and 68 foreign keys in the
+   migrations; no cycle, no self-reference).
+3. **The rest, in the dump's order,** as one chunk: the `sqlite_sequence` rows, indexes, triggers
+   and views, which the dump puts after its rows (triggers must not exist while rows load, or the
+   inserts fire them). It holds no rows, only schema, so it is not cut by size.
+
+Every chunk opens with the dump's own `PRAGMA` statements, because `defer_foreign_keys` lasts for
+one transaction. The chunks hold exactly the dump's bytes (the pragma once per chunk more); the
+tool checks that before it imports anything and otherwise stops with `reorder_failed`.
+
+**The bounds** are `--chunk-bytes` (default 2 MiB) and `--chunk-statements` (default 5,000), each
+at most; a statement larger than the byte bound has a chunk of its own. They are **starting values,
+not measured limits**: each is about a tenth to a fifteenth of the unit that was reset (31.8 MB, at least
+47,000 statements), a few thousand of this database's rows, while a chunk's fixed cost (an
+upload to R2 and several API calls) stays small beside it. The statement bound matters for small
+rows, where CPU time grows with the row count rather than the bytes. The tool prints the number
+of chunks and the size of the largest statement; D1 refuses one above 100,000 bytes, and none in
+this schema comes near it.
+
+**What was checked without the provider.** The tool's tests run a wrangler double on real SQLite
+that, like the provider, resets a file above a size and loads each file as one transaction with
+foreign keys enforced; and wrangler's own local D1: the export of this repository's migrations
+(55 tables, 27 triggers, 80,225 bytes), cut into 19 small chunks and run with `wrangler d1 execute
+--local --file`, exports the same lines as the original and has an empty `PRAGMA
+foreign_key_check`. The provider's own export and import are first tried by the drill.
 
 | The tool says | Meaning |
 | --- | --- |
@@ -495,5 +590,7 @@ file by hand; use `import`.
 | `the keyring has no usable key version` | The keyring lacks the version the artifact names. Find the custody copy that holds it. |
 | `differs from the API's receipt` | The artifact is not the one the receipt describes, or it was replaced in R2. Treat it as unverified. |
 | `is the database this artifact was exported from` | The name resolves to the control database. Create a new scratch database. |
-| `already has N schema objects` | The target is not empty. Create a new scratch database. |
+| `already has N schema objects` | The target is not empty, or an earlier import stopped in it. Delete it and create a new scratch database. |
+| `chunk N of M failed (S statements, B bytes)` | The chunk did not import; chunks before it did. The `exit code C` or `timeout`, and the `D1 reset in its output` yes or no, decide the next step: see "If a chunk fails" under step 5. |
+| `PRAGMA foreign_key_check found N rows without a parent` | The scratch database is not a faithful copy of the artifact. Do not rely on it; keep the artifact and report the tables named. |
 

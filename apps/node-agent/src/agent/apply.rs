@@ -481,6 +481,12 @@ impl<M: Machine> Core<M> {
     /// ready when the database is released, failed when the unit is not active, and not at all
     /// when the unit runs and is not served, or when the bus would not answer (it holds its
     /// memory until its unit is reported stopped).
+    ///
+    /// The timer that was to apply its CPU quota after a burst died with the agent that held it,
+    /// and the agent cannot tell how much of the burst is left: the quota is applied at once,
+    /// which is the same one the unit holds if its burst was over. That is one property call on
+    /// the bus, which takes a place among the unit calls like a read does (`units::Calls`), so
+    /// the databases that run at the agent's start cannot flood the bus with them.
     async fn adopt_running(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) -> bool {
         self.ensure_archive(db, entry);
         match self.machine.wait_started(&db.id).await {
@@ -493,6 +499,7 @@ impl<M: Machine> Core<M> {
                         view.error = None;
                     });
                     self.end_resumed(&db.id, true);
+                    self.after_ready(db).await;
                 }
                 None => self.go_unproven(db),
             },
@@ -2159,6 +2166,9 @@ mod tests {
             (vec![id.clone()], 0),
             "a bus that would not answer did not fail the start"
         );
+        // The wake's burst was the old agent's, and its timer died with it: the quota of the
+        // class comes at once, with the decision that ends the start (`cpu_boost_ms`).
+        assert_eq!(rig.machine.quota(&id), Some(std::num::NonZeroU32::new(250)));
     }
 
     /// A start was in flight when the agent read its units, and its unit is not awake when the

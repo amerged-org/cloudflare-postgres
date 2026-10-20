@@ -8,7 +8,7 @@
 //   node scripts/operations/restore-infrastructure-backup.ts decrypt --input FILE --output FILE
 //        --keys-env NAME [--receipt FILE]
 //   node scripts/operations/restore-infrastructure-backup.ts import --input FILE --database NAME
-//        --keys-env NAME [--receipt FILE] [--wrangler COMMAND]
+//        --keys-env NAME [--receipt FILE] [--wrangler COMMAND] [--chunk-bytes N] [--chunk-statements N]
 //
 //   --input      the R2 object, downloaded: `wrangler r2 object get BUCKET/KEY --file FILE --remote`.
 //   --keys-env   the NAME of an environment variable that holds the keyring, the same JSON as the
@@ -20,16 +20,23 @@
 //                optional because a lost control database takes the receipt with it; the artifact
 //                authenticates its own identity and plaintext hash either way.
 //   decrypt      writes the verified SQL to --output (mode 0600; an existing file is never replaced).
-//   import       decrypts into a private temporary file, imports it into the scratch D1 database
-//                named by --database with `wrangler d1 execute --remote --file`, and removes the file.
-//                It refuses the database the artifact was exported from, a database that has tables,
-//                and a name that is not exactly one database. Wrangler's own login or
-//                CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID authenticate it (D1 edit).
+//   import       decrypts into a private temporary file, cuts the SQL into chunks, imports them one
+//                after the other into the scratch D1 database named by --database, each with its own
+//                `wrangler d1 execute --remote --file`, checks `PRAGMA foreign_key_check` and removes
+//                the files. It refuses the database the artifact was exported from, a database that
+//                has any schema object, and a name that is not exactly one database. Wrangler's own
+//                login or CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID authenticate it (D1 edit).
 //   --wrangler   the wrangler executable (default: wrangler on PATH).
+//   --chunk-bytes, --chunk-statements
+//                the most one chunk holds (defaults: 2 MiB and 5,000 statements). D1 resets its
+//                database when one import is too much work (the live drill of 2026-10-20 failed at
+//                31 MB in one file with D1_RESET_DO); halve them if a chunk reports a reset.
 //
 // Nothing of the SQL is printed, and neither is wrangler's text about the import, which can quote
-// it: a failed import reports wrangler's exit code; decrypt to a file and run wrangler by hand to
-// read its message. The output holds no database ID except the scratch database's own.
+// it: a failed import reports the chunk, its statement and byte counts, wrangler's exit code (or
+// `timeout`) and whether its output reports a D1 reset (yes or no); the runbook says what each
+// answer asks for. Do not run the whole file through wrangler by hand: the whole file is what D1
+// reset. The output holds no database ID except the scratch database's own.
 // SIGINT, SIGTERM and SIGHUP stop wrangler, remove the decrypted SQL and end the run with exit
 // code 128 plus the signal's number; a run killed with SIGKILL leaves its files behind.
 import { execFile, type ChildProcess } from "node:child_process";
@@ -64,11 +71,13 @@ const MAGIC = Buffer.from("PGCFINF1"),
   KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/,
   DATABASE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/,
   VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/,
+  WHOLE_NUMBER = /^[1-9][0-9]{0,9}$/,
   UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
   SHA256 = /^[0-9a-f]{64}$/;
 const USAGE =
   "usage: restore-infrastructure-backup.ts decrypt --input FILE --output FILE --keys-env NAME [--receipt FILE]\n" +
-  "       restore-infrastructure-backup.ts import --input FILE --database NAME --keys-env NAME [--receipt FILE] [--wrangler COMMAND]";
+  "       restore-infrastructure-backup.ts import --input FILE --database NAME --keys-env NAME [--receipt FILE] [--wrangler COMMAND]\n" +
+  "                                         [--chunk-bytes N] [--chunk-statements N]";
 
 /**
  * What holds decrypted SQL while the tool runs: a signal must remove it before the process ends,
@@ -107,7 +116,8 @@ export type RestoreErrorCode =
   | "live_database"
   | "database_not_empty"
   | "reorder_failed"
-  | "wrangler_failed";
+  | "wrangler_failed"
+  | "foreign_key_violations";
 
 export class RestoreError extends Error {
   readonly code: RestoreErrorCode;
@@ -132,6 +142,8 @@ export type Options =
       keysEnvironment: string;
       receipt?: string;
       wrangler: string;
+      chunkBytes?: number;
+      chunkStatements?: number;
     };
 
 export function parseOptions(argv: string[]): Options {
@@ -147,6 +159,8 @@ export function parseOptions(argv: string[]): Options {
         "keys-env": { type: "string" },
         receipt: { type: "string" },
         wrangler: { type: "string" },
+        "chunk-bytes": { type: "string" },
+        "chunk-statements": { type: "string" },
       },
     });
   } catch (error) {
@@ -173,18 +187,36 @@ export function parseOptions(argv: string[]): Options {
   };
   if (mode === "decrypt") {
     if (!values.output) fail("--output is required for decrypt");
-    if (values.database !== undefined || values.wrangler !== undefined)
-      fail("--database and --wrangler belong to import");
+    if (
+      values.database !== undefined ||
+      values.wrangler !== undefined ||
+      values["chunk-bytes"] !== undefined ||
+      values["chunk-statements"] !== undefined
+    )
+      fail(
+        "--database, --wrangler, --chunk-bytes and --chunk-statements belong to import",
+      );
     return { mode, ...common, output: values.output! };
   }
   if (values.output !== undefined) fail("--output belongs to decrypt");
   if (!values.database || !DATABASE_NAME.test(values.database))
     fail("--database must be the name of the scratch D1 database");
+  const bound = (name: "chunk-bytes" | "chunk-statements") => {
+    const value = values[name];
+    if (value === undefined) return undefined;
+    if (!WHOLE_NUMBER.test(value))
+      fail(`--${name} must be a whole number above 0`);
+    return Number(value);
+  };
+  const chunkBytes = bound("chunk-bytes"),
+    chunkStatements = bound("chunk-statements");
   return {
     mode,
     ...common,
     database: values.database!,
     wrangler: values.wrangler ?? "wrangler",
+    ...(chunkBytes === undefined ? {} : { chunkBytes }),
+    ...(chunkStatements === undefined ? {} : { chunkStatements }),
   };
 }
 
@@ -526,7 +558,7 @@ async function exists(path: string) {
   );
 }
 
-// ---------- Schema first ----------
+// ---------- Chunks ----------
 
 // The bytes the scanner reacts to.
 const SEMICOLON = 0x3b,
@@ -554,19 +586,19 @@ const Scan = {
 /**
  * The statements of an SQL file as byte ranges, each ending at a `;` that is outside quotes,
  * identifiers and comments, and each starting right after the previous one (so it holds the line
- * break that followed it). A trigger's body is split at its inner semicolons: every piece stays in
- * its place, which is all the caller needs. Bytes are enough: a multi-byte character never holds
- * an ASCII byte.
+ * break that followed it). What follows the last `;` comes last, with `ended` false. A trigger's body
+ * is split at its inner semicolons; the caller keeps its pieces together. Bytes are enough: a
+ * multi-byte character never holds an ASCII byte.
  */
 async function* statements(
   path: string,
-  chunkBytes: number,
-): AsyncGenerator<Buffer> {
+  readBytes: number,
+): AsyncGenerator<{ bytes: Buffer; ended: boolean }> {
   let mode: number = Scan.Normal,
     quote = 0,
     parts: Buffer[] = [];
   for await (const chunk of createReadStream(path, {
-    highWaterMark: chunkBytes,
+    highWaterMark: readBytes,
   }) as AsyncIterable<Buffer>) {
     let from = 0;
     for (let at = 0; at < chunk.length; at++) {
@@ -628,76 +660,390 @@ async function* statements(
       }
       if (ended) {
         parts.push(chunk.subarray(from, at + 1));
-        yield Buffer.concat(parts);
+        yield { bytes: Buffer.concat(parts), ended: true };
         parts = [];
         from = at + 1;
       }
     }
     if (from < chunk.length) parts.push(chunk.subarray(from));
   }
-  if (parts.length) yield Buffer.concat(parts);
+  if (parts.length) yield { bytes: Buffer.concat(parts), ended: false };
 }
 
 const LEADING = String.raw`(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)*`,
   CREATE_TABLE = new RegExp(`^${LEADING}CREATE\\s+TABLE\\b`, "i"),
-  INSERT = new RegExp(`^${LEADING}INSERT\\b`, "i");
-const head = (piece: Buffer) => piece.toString("latin1", 0, 512);
+  CREATE_TRIGGER = new RegExp(
+    `^${LEADING}CREATE\\s+(?:TEMP(?:ORARY)?\\s+)?TRIGGER\\b`,
+    "i",
+  ),
+  // A trigger's body is a list of statements, so the piece that begins with END closes it.
+  END = new RegExp(`^${LEADING}END\\b`, "i"),
+  PRAGMA = new RegExp(`^${LEADING}PRAGMA\\b`, "i"),
+  INSERT = new RegExp(`^${LEADING}INSERT\\b`, "i"),
+  // The table an INSERT names, quoted in any of SQLite's three ways or bare.
+  INSERT_TARGET = new RegExp(
+    `^${LEADING}INSERT\\s+(?:OR\\s+\\w+\\s+)?INTO\\s+("(?:[^"]|"")*"|\`(?:[^\`]|\`\`)*\`|\\[[^\\]]*\\]|[\\w$]+)`,
+    "i",
+  ),
+  BLANK = /^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*$/;
+const head = (piece: Buffer) => piece.toString("utf8", 0, 512);
+
+/** A table's name as SQLite compares it: unquoted, in lower case. */
+function tableName(written: string): string {
+  const quote = written[0] === "[" ? "]" : written[0];
+  const name =
+    quote === "]"
+      ? written.slice(1, -1)
+      : quote === '"' || quote === "`"
+        ? written.slice(1, -1).replaceAll(quote + quote, quote)
+        : written;
+  return name.toLowerCase();
+}
 
 /**
- * Writes `output` with every CREATE TABLE statement of `input` ahead of all other statements, each
- * statement byte for byte as it was. D1's export lists a table's rows right after its CREATE
- * TABLE and the tables in the order they were created; a migration that rebuilt a table puts it
- * after the tables that reference it, and SQLite refuses the first row of a table whose
- * referenced table does not exist yet (`no such table: main.regions`), whatever
- * `defer_foreign_keys` says. The rest keeps its order: rows, then indexes, triggers and views.
- * `moved` counts the tables that came after a row.
+ * The order in which to load the rows of tables: a table after every table it references. Tables
+ * that need no order keep the order they were created in. Tables that reference each other, and a
+ * table that references itself, cannot be ordered: their rows are loaded in one transaction under
+ * `defer_foreign_keys`, so they come as one group with `together` set. A parent that the dump does
+ * not create is ignored. (Tarjan's strongly connected components over the child-to-parent edges,
+ * which emits a component after everything it references.)
  */
-export async function schemaFirst(
-  input: string,
-  output: string,
-  options: { chunkBytes?: number } = {},
-): Promise<{ tables: number; moved: number }> {
-  const chunkBytes = options.chunkBytes ?? 1024 * 1024,
-    out = await open(output, "wx", 0o600);
-  let tables = 0,
-    moved = 0,
-    rows = false,
-    pending: Buffer[] = [],
-    pendingBytes = 0;
-  const write = async (piece: Buffer) => {
-      pending.push(piece);
-      pendingBytes += piece.length;
-      if (pendingBytes < 1024 * 1024) return;
-      await out.write(Buffer.concat(pending));
-      pending = [];
-      pendingBytes = 0;
-    },
-    flush = async () => {
-      if (pendingBytes) await out.write(Buffer.concat(pending));
-      pending = [];
-      pendingBytes = 0;
-    };
-  try {
-    for await (const piece of statements(input, chunkBytes)) {
-      if (CREATE_TABLE.test(head(piece))) {
-        tables++;
-        if (rows) moved++;
-        await write(piece);
-      } else if (INSERT.test(head(piece))) rows = true;
+export function loadOrder(
+  tables: { name: string; parents: string[] }[],
+): { tables: string[]; together: boolean }[] {
+  const at = new Map(tables.map((table, i) => [table.name.toLowerCase(), i])),
+    parents = tables.map((table) => [
+      ...new Set(
+        table.parents
+          .map((parent) => at.get(parent.toLowerCase()))
+          .filter((parent): parent is number => parent !== undefined),
+      ),
+    ]),
+    order: number[] = [],
+    low: number[] = [],
+    stack: number[] = [],
+    onStack = new Set<number>(),
+    groups: { tables: string[]; together: boolean }[] = [];
+  let visited = 0;
+  const visit = (table: number) => {
+    order[table] = low[table] = visited++;
+    stack.push(table);
+    onStack.add(table);
+    for (const parent of parents[table]!) {
+      if (order[parent] === undefined) {
+        visit(parent);
+        low[table] = Math.min(low[table]!, low[parent]!);
+      } else if (onStack.has(parent))
+        low[table] = Math.min(low[table]!, order[parent]!);
     }
-    for await (const piece of statements(input, chunkBytes))
-      if (!CREATE_TABLE.test(head(piece))) await write(piece);
-    await flush();
-    await out.sync();
+    if (low[table] !== order[table]) return;
+    const members: number[] = [];
+    for (let member = -1; member !== table;) {
+      member = stack.pop()!;
+      onStack.delete(member);
+      members.push(member);
+    }
+    members.sort((a, b) => a - b);
+    groups.push({
+      tables: members.map((member) => tables[member]!.name),
+      together: members.length > 1 || parents[table]!.includes(table),
+    });
+  };
+  tables.forEach((_, table) => {
+    if (order[table] === undefined) visit(table);
+  });
+  return groups;
+}
+
+/** Each table of the CREATE TABLE statements with the tables it references, as SQLite reads them. */
+async function foreignKeys(
+  creates: Buffer[],
+): Promise<{ name: string; parents: string[] }[]> {
+  // Loaded here: the experimental-feature warning of node:sqlite belongs to this step alone.
+  const { DatabaseSync } = await import("node:sqlite"),
+    db = new DatabaseSync(":memory:");
+  try {
+    try {
+      db.exec(Buffer.concat(creates).toString("utf8"));
+    } catch {
+      // SQLite's message can quote the statement.
+      throw new RestoreError(
+        "reorder_failed",
+        "this Node's SQLite cannot read the artifact's CREATE TABLE statements; nothing was imported",
+      );
+    }
+    return db
+      .prepare(
+        String.raw`SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY rowid`,
+      )
+      .all()
+      .map(({ name }) => ({
+        name: name as string,
+        parents: db
+          .prepare(
+            `PRAGMA foreign_key_list("${(name as string).replaceAll('"', '""')}")`,
+          )
+          .all()
+          .map((key) => key.table as string),
+      }));
   } finally {
-    await out.close();
+    db.close();
   }
-  if ((await stat(output)).size !== (await stat(input)).size)
+}
+
+// D1 resets its database when one import is too much work. These are starting values, not measured
+// limits; the runbook (How the tool cuts the SQL) says what they rest on.
+const CHUNK_BYTES = 2 * 1024 * 1024,
+  CHUNK_STATEMENTS = 5000;
+/** The most of the decrypted SQL held in memory at once while a chunk is written. */
+const READ_BYTES = 4 * 1024 * 1024;
+
+interface Span {
+  at: number;
+  length: number;
+}
+
+async function readRange(handle: FileHandle, { at, length }: Span) {
+  const bytes = Buffer.alloc(length);
+  for (let done = 0; done < length;) {
+    const { bytesRead } = await handle.read(
+      bytes,
+      done,
+      length - done,
+      at + done,
+    );
+    if (bytesRead === 0)
+      throw new RestoreError(
+        "reorder_failed",
+        "the decrypted SQL was cut short",
+      );
+    done += bytesRead;
+  }
+  return bytes;
+}
+
+export interface Chunk {
+  path: string;
+  statements: number;
+  /** The size of the file, which opens with the dump's own pragma. */
+  bytes: number;
+}
+export interface ChunkPlan {
+  chunks: Chunk[];
+  tables: number;
+  /** Tables that the dump creates after a row, which now come ahead of every row. */
+  moved: number;
+  /** Tables whose rows cannot be ordered and are loaded in one chunk whatever its size. */
+  together: string[][];
+  /** The size of the largest statement; D1 refuses one above 100,000 bytes. */
+  largest: number;
+}
+
+/**
+ * Cuts the SQL into chunk files `chunk-0001.sql`, ... in `directory`, each a transaction of its own
+ * for D1 and each statement byte for byte as it was, in this order:
+ *
+ * 1. every CREATE TABLE. D1's export lists a table's rows right after its CREATE TABLE and the
+ *    tables in the order they were created; a migration that rebuilt a table puts it after the
+ *    tables that reference it, and SQLite refuses the first row of a table whose referenced table
+ *    does not exist yet (`no such table: main.regions`), whatever `defer_foreign_keys` says;
+ * 2. the rows, table by table, each table after the tables it references (`loadOrder`), so that
+ *    every chunk is valid whatever has been committed before it;
+ * 3. the rest, in the dump's order: the `sqlite_sequence` rows, indexes, triggers and views, which
+ *    the dump puts after its rows. A trigger's pieces stay together, and this last part is one chunk
+ *    whatever its size: it holds no rows, only the schema.
+ *
+ * A chunk holds at most `chunkBytes` and `chunkStatements` (a statement larger than the bound has a
+ * chunk of its own; rows that cannot be ordered, `ChunkPlan.together`, are never cut). The dump's
+ * PRAGMA statements open every chunk, since `defer_foreign_keys` lasts for one transaction. A
+ * statement is never cut: the scan follows quotes and comments, so a semicolon inside a string
+ * ends nothing. The chunks together hold the dump's bytes, the pragma once per chunk.
+ */
+export async function chunkSql(
+  input: string,
+  directory: string,
+  options: {
+    chunkBytes?: number;
+    chunkStatements?: number;
+    readBytes?: number;
+  } = {},
+): Promise<ChunkPlan> {
+  const maxBytes = options.chunkBytes ?? CHUNK_BYTES,
+    maxStatements = options.chunkStatements ?? CHUNK_STATEMENTS,
+    pragmas: Span[] = [],
+    schema: Span[] = [],
+    rest: Span[] = [],
+    rows = new Map<string, Span[]>(),
+    creates: Buffer[] = [];
+  let at = 0,
+    moved = 0,
+    largest = 0,
+    rowSeen = false,
+    inTrigger = false,
+    last: Span | undefined;
+  for await (const { bytes: piece, ended } of statements(
+    input,
+    options.readBytes ?? 1024 * 1024,
+  )) {
+    const span = { at, length: piece.length };
+    at += piece.length;
+    if (!ended) {
+      // Only blank space and comments may follow the last statement; they go with it.
+      if (!BLANK.test(piece.toString("utf8")))
+        throw new RestoreError(
+          "reorder_failed",
+          "the SQL ends inside a statement; nothing was imported",
+        );
+      if (last) last.length += piece.length;
+      continue;
+    }
+    largest = Math.max(largest, piece.length);
+    last = span;
+    const text = head(piece);
+    if (inTrigger) {
+      rest.push(span);
+      inTrigger = !END.test(text);
+    } else if (PRAGMA.test(text)) pragmas.push(span);
+    else if (CREATE_TABLE.test(text)) {
+      schema.push(span);
+      creates.push(piece);
+      if (rowSeen) moved++;
+    } else if (INSERT.test(text)) {
+      const written = INSERT_TARGET.exec(text)?.[1];
+      if (written === undefined)
+        throw new RestoreError(
+          "reorder_failed",
+          "an INSERT statement names a table this tool cannot read; nothing was imported",
+        );
+      const table = tableName(written);
+      if (table.startsWith("sqlite_")) rest.push(span);
+      else {
+        rowSeen = true;
+        const spans = rows.get(table) ?? [];
+        spans.push(span);
+        rows.set(table, spans);
+      }
+    } else {
+      rest.push(span);
+      inTrigger = CREATE_TRIGGER.test(text);
+    }
+  }
+  const order = loadOrder(await foreignKeys(creates)),
+    known = new Set(
+      order.flatMap((group) => group.tables.map((t) => t.toLowerCase())),
+    );
+  for (const table of rows.keys())
+    if (!known.has(table))
+      throw new RestoreError(
+        "reorder_failed",
+        `the SQL inserts rows into "${table}", which it does not create; nothing was imported`,
+      );
+  const phases: { spans: Span[]; whole: boolean }[][] = [
+    [{ spans: schema, whole: false }],
+    order.map((group) => ({
+      spans: group.tables.flatMap((t) => rows.get(t.toLowerCase()) ?? []),
+      whole: group.together,
+    })),
+    [{ spans: rest, whole: true }],
+  ];
+  const planned: Span[][] = [];
+  let current: Span[] = [],
+    currentBytes = 0;
+  const close = () => {
+    if (current.length) planned.push(current);
+    current = [];
+    currentBytes = 0;
+  };
+  // Schema, rows and the rest never share a chunk.
+  for (const phase of phases) {
+    for (const { spans, whole } of phase) {
+      const size = spans.reduce((sum, span) => sum + span.length, 0),
+        fits = (bytes: number, count: number) =>
+          currentBytes + bytes <= maxBytes &&
+          current.length + count <= maxStatements;
+      if (whole) {
+        if (!fits(size, spans.length)) close();
+        for (const span of spans) current.push(span);
+        currentBytes += size;
+      } else
+        for (const span of spans) {
+          if (!fits(span.length, 1)) close();
+          current.push(span);
+          currentBytes += span.length;
+        }
+    }
+    close();
+  }
+  const handle = await open(input, "r"),
+    pragma = pragmas.length
+      ? Buffer.concat([
+          ...(await Promise.all(
+            pragmas.map((span) => readRange(handle, span)),
+          )),
+          Buffer.from("\n"),
+        ])
+      : Buffer.alloc(0),
+    chunks: Chunk[] = [];
+  try {
+    for (const spans of planned) {
+      const path = join(
+          directory,
+          `chunk-${String(chunks.length + 1).padStart(4, "0")}.sql`,
+        ),
+        out = await open(path, "wx", 0o600);
+      try {
+        await out.write(pragma);
+        // Statements that follow each other in the dump are read as one run.
+        let run: Span | undefined;
+        for (const span of [...spans, undefined]) {
+          if (run && span && run.at + run.length === span.at)
+            run = { at: run.at, length: run.length + span.length };
+          else {
+            for (let done = 0; run && done < run.length; done += READ_BYTES)
+              await out.write(
+                await readRange(handle, {
+                  at: run.at + done,
+                  length: Math.min(READ_BYTES, run.length - done),
+                }),
+              );
+            run = span && { ...span };
+          }
+        }
+        await out.sync();
+      } finally {
+        await out.close();
+      }
+      chunks.push({
+        path,
+        statements: spans.length,
+        bytes: (await stat(path)).size,
+      });
+    }
+  } finally {
+    await handle.close();
+  }
+  const pragmaBytes = pragmas.reduce((sum, span) => sum + span.length, 0),
+    statementBytes = chunks.reduce(
+      (sum, chunk) => sum + chunk.bytes - pragma.length,
+      0,
+    );
+  if (statementBytes + pragmaBytes !== (await stat(input)).size)
     throw new RestoreError(
       "reorder_failed",
-      "the reordered SQL differs in size from the artifact's; nothing was imported",
+      "the chunks differ in size from the artifact's SQL; nothing was imported",
     );
-  return { tables, moved };
+  return {
+    chunks,
+    tables: schema.length,
+    moved,
+    together: order
+      .filter(
+        (group) =>
+          group.together && group.tables.some((t) => rows.has(t.toLowerCase())),
+      )
+      .map((group) => group.tables),
+    largest,
+  };
 }
 
 // ---------- The scratch D1 database ----------
@@ -705,6 +1051,7 @@ export async function schemaFirst(
 export interface ImportResult {
   database_id: string;
   tables: number;
+  chunks: number;
   queries: number | undefined;
   rows_written: number | undefined;
   artifact: DecryptResult;
@@ -713,8 +1060,20 @@ export interface ImportResult {
 export interface ImportDependencies {
   environment: Record<string, string | undefined>;
   log: (line: string) => void;
+  /** How long one chunk may run before it is stopped; the default is `CHUNK_TIMEOUT_MS`. */
+  chunkTimeoutMs?: number;
 }
 
+// One chunk is a few MiB; a chunk that takes longer than this is stuck, not slow.
+const CHUNK_TIMEOUT_MS = 10 * 60 * 1000;
+// How the provider and wrangler word a reset of the D1 database during an import, a problem of too
+// much work that lower chunk bounds answer. `D1_RESET_DO` is the body of the live drill of
+// 2026-10-20 and is not documented. Cloudflare's D1 debugging page words the others "D1 DB exceeded
+// its CPU time limit and was reset.", "D1 DB's isolate exceeded its memory limit and was reset." and
+// "D1 DB storage operation exceeded timeout which caused object to be reset."; wrangler 4.145 throws
+// "D1 reset before execute completed!". The word "reset" covers all of them; a text that holds it
+// for another reason costs one run with lower bounds, and a missed reset would never get them.
+const RESET = /D1_RESET_DO|\breset\b/;
 // What D1 keeps for itself (`sqlite_*`, `_cf_*`) is not the database's. A scratch database must hold
 // no object of any kind before an import; what an import made is counted as tables.
 const SCHEMA_OBJECTS = String.raw`SELECT COUNT(*) AS n FROM sqlite_schema WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\' AND name NOT LIKE '\_cf\_%' ESCAPE '\'`,
@@ -743,17 +1102,21 @@ async function wranglerRun(
       },
       (error, out, err) => {
         children.delete(child);
-        if (!error) return done({ stdout: out });
-        const status =
-          typeof (error as { code?: unknown }).code === "number"
-            ? `exit code ${(error as { code: number }).code}`
-            : error.killed
-              ? "timeout"
+        // execFile stops a child at the timeout with SIGTERM. wrangler's launcher
+        // (bin/wrangler.js) answers that by killing the CLI and exiting with `code ?? 0`, so a
+        // stopped wrangler can end with exit code 0 and no output, which is told by `killed` alone.
+        if (!error && !child.killed) return done({ stdout: out });
+        const code = (error as { code?: unknown } | null)?.code,
+          status = child.killed
+            ? "timeout"
+            : typeof code === "number"
+              ? `exit code ${code}`
               : "it did not start";
-        // The text of a failed import can quote the SQL; the other calls carry none.
+        // The text of a failed import can quote the SQL; the other calls carry none. Of an import's
+        // text only whether it reports a reset is said, a yes or a no.
         const detail = context.stderrIsSafe
           ? `: ${err.trim().split("\n").slice(0, 3).join(" ").slice(0, 300)}`
-          : "";
+          : `; D1 reset in its output: ${RESET.test(out) || RESET.test(err) ? "yes" : "no"}`;
         fail(
           new RestoreError(
             "wrangler_failed",
@@ -765,7 +1128,11 @@ async function wranglerRun(
     children.add(child);
   });
   try {
-    return JSON.parse(stdout);
+    // wrangler prints a progress block ("Checking if file needs uploading", "Uploading ...") before the
+    // JSON of a remote file execution, even with --json (wrangler 4.145, measured live): the JSON starts
+    // at the first line that opens an array or an object.
+    const start = stdout.search(/^[[{]/m);
+    return JSON.parse(start < 0 ? stdout : stdout.slice(start));
   } catch {
     throw new RestoreError(
       "wrangler_failed",
@@ -779,6 +1146,28 @@ const first = (value: unknown): Record<string, unknown> | undefined =>
     ? (value[0] as Record<string, unknown>)
     : undefined;
 
+/** The rows a query gives for a D1 database, asked by its ID. */
+async function rowsOf(
+  wrangler: string,
+  id: string,
+  query: string,
+  context: Parameters<typeof wranglerRun>[2],
+): Promise<Record<string, unknown>[]> {
+  const answer = first(
+    await wranglerRun(
+      wrangler,
+      ["d1", "execute", id, "--remote", "--json", "--command", query],
+      context,
+    ),
+  );
+  if (answer?.success !== true || !Array.isArray(answer.results))
+    throw new RestoreError(
+      "wrangler_failed",
+      "wrangler d1 execute did not answer rows",
+    );
+  return answer.results as Record<string, unknown>[];
+}
+
 /** The count a query (`SCHEMA_OBJECTS` or `TABLES`) gives for a D1 database, asked by its ID. */
 async function count(
   wrangler: string,
@@ -786,18 +1175,8 @@ async function count(
   query: string,
   context: Parameters<typeof wranglerRun>[2],
 ) {
-  const answer = first(
-      await wranglerRun(
-        wrangler,
-        ["d1", "execute", id, "--remote", "--json", "--command", query],
-        context,
-      ),
-    ),
-    rows = answer?.results,
-    n = Array.isArray(rows)
-      ? (rows[0] as { n?: unknown } | undefined)?.n
-      : undefined;
-  if (answer?.success !== true || typeof n !== "number")
+  const n = (await rowsOf(wrangler, id, query, context))[0]?.n;
+  if (typeof n !== "number")
     throw new RestoreError(
       "wrangler_failed",
       "wrangler d1 execute did not answer a count",
@@ -813,6 +1192,8 @@ export async function importArtifact(
     database: string;
     wrangler: string;
     receipt?: unknown;
+    chunkBytes?: number;
+    chunkStatements?: number;
   },
   dependencies: ImportDependencies,
 ): Promise<ImportResult> {
@@ -863,7 +1244,7 @@ export async function importArtifact(
     if (before !== 0)
       throw new RestoreError(
         "database_not_empty",
-        `"${options.database}" already has ${before} schema objects; import only into a new, empty scratch database`,
+        `"${options.database}" already has ${before} schema objects; import only into a new, empty scratch database (delete one that an earlier import stopped in)`,
       );
     const sql = join(directory, "restore.sql"),
       artifact = await decryptArtifact({
@@ -874,42 +1255,90 @@ export async function importArtifact(
       });
     for (const line of artifactLines(artifact)) log(line);
     log(`receipt: ${options.receipt === undefined ? "not given" : "matched"}`);
-    const ordered = join(directory, "ordered.sql"),
-      order = await schemaFirst(sql, ordered);
+    const plan = await chunkSql(sql, directory, {
+      ...(options.chunkBytes === undefined
+        ? {}
+        : { chunkBytes: options.chunkBytes }),
+      ...(options.chunkStatements === undefined
+        ? {}
+        : { chunkStatements: options.chunkStatements }),
+    });
     await rm(sql);
     log(
-      `${order.tables} tables${order.moved ? `, ${order.moved} of them created after rows in the dump and moved ahead of the rows` : ""}`,
+      `${plan.tables} tables${plan.moved ? `, ${plan.moved} of them created after rows in the dump and moved ahead of the rows` : ""}`,
     );
     log(
-      `importing into "${options.database}" (${id}); this locks that database until it ends`,
+      `${plan.chunks.length} chunks of at most ${options.chunkBytes ?? CHUNK_BYTES} bytes and ${options.chunkStatements ?? CHUNK_STATEMENTS} statements; the largest statement is ${plan.largest} bytes`,
     );
-    const imported = first(
-        await wranglerRun(
-          wrangler,
-          [
-            "d1",
-            "execute",
-            id,
-            "--remote",
-            "--yes",
-            "--json",
-            "--file",
-            ordered,
-          ],
-          { ...context, timeoutMs: 60 * 60 * 1000, stderrIsSafe: false },
-        ),
-      ),
-      summary = Array.isArray(imported?.results)
-        ? (imported.results[0] as Record<string, unknown> | undefined)
-        : undefined;
-    if (imported?.success !== true)
-      throw new RestoreError(
-        "wrangler_failed",
-        "wrangler d1 execute did not report a successful import",
+    if (plan.together.length)
+      log(
+        `tables that reference each other are loaded in one chunk, whatever its size: ${plan.together.map((group) => group.join(", ")).join("; ")}`,
       );
-    const number = (value: unknown) =>
-        typeof value === "number" ? value : undefined,
-      tables = await count(wrangler, id, TABLES, context);
+    log(
+      `importing into "${options.database}" (${id}); this locks that database while a chunk runs`,
+    );
+    const sum = (a: number | undefined, b: unknown) =>
+      typeof b === "number" ? (a ?? 0) + b : a;
+    let queries: number | undefined, rowsWritten: number | undefined;
+    for (const [i, chunk] of plan.chunks.entries()) {
+      const where = `chunk ${i + 1} of ${plan.chunks.length}`;
+      try {
+        const imported = first(
+            await wranglerRun(
+              wrangler,
+              [
+                "d1",
+                "execute",
+                id,
+                "--remote",
+                "--yes",
+                "--json",
+                "--file",
+                chunk.path,
+              ],
+              {
+                ...context,
+                timeoutMs: dependencies.chunkTimeoutMs ?? CHUNK_TIMEOUT_MS,
+                stderrIsSafe: false,
+              },
+            ),
+          ),
+          summary = Array.isArray(imported?.results)
+            ? (imported.results[0] as Record<string, unknown> | undefined)
+            : undefined;
+        if (imported?.success !== true)
+          throw new RestoreError(
+            "wrangler_failed",
+            "wrangler d1 execute did not report a successful import",
+          );
+        queries = sum(queries, summary?.["Total queries executed"]);
+        rowsWritten = sum(rowsWritten, summary?.["Rows written"]);
+      } catch (error) {
+        if (!(error instanceof RestoreError)) throw error;
+        // The chunks before this one are committed: the database is half filled.
+        throw new RestoreError(
+          error.code,
+          `${where} failed (${chunk.statements} statements, ${chunk.bytes} bytes): ${error.message}; delete "${options.database}" and create a new scratch database before importing again`,
+        );
+      }
+      await rm(chunk.path);
+      log(
+        `${where} imported (${chunk.statements} statements, ${chunk.bytes} bytes)`,
+      );
+    }
+    const violations = await rowsOf(
+      wrangler,
+      id,
+      "PRAGMA foreign_key_check",
+      context,
+    );
+    if (violations.length)
+      throw new RestoreError(
+        "foreign_key_violations",
+        `PRAGMA foreign_key_check found ${violations.length} row${violations.length === 1 ? "" : "s"} without a parent, in ${[...new Set(violations.map((row) => String(row.table)))].slice(0, 10).join(", ")}; the scratch database is not a faithful copy`,
+      );
+    log("foreign_key_check: no violations");
+    const tables = await count(wrangler, id, TABLES, context);
     if (tables === 0)
       throw new RestoreError(
         "wrangler_failed",
@@ -918,8 +1347,9 @@ export async function importArtifact(
     const result: ImportResult = {
       database_id: id,
       tables,
-      queries: number(summary?.["Total queries executed"]),
-      rows_written: number(summary?.["Rows written"]),
+      chunks: plan.chunks.length,
+      queries,
+      rows_written: rowsWritten,
       artifact,
     };
     log(

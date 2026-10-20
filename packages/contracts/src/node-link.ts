@@ -6,6 +6,14 @@
  * release, policy and orders), reads its credentials, keeps the link to its NodeActor with a
  * sample every 15 s, and posts observations, volume reports and events. The Rust node agent reads
  * the JSON Schemas and vectors in `native/node.generated.json` and `node-vectors.generated.json`.
+ *
+ * Changing it: the objects here are strict, and so is the API, which never sends or accepts a
+ * property by accident. The node reads what Cloudflare sends it with every object open
+ * (`native/node-schema.ts`). The rule for a change, and the order of its releases by the kind of
+ * change and the direction (what the node receives or sends), is written once in the plan, 9.3
+ * "Changing the page" (its table); `test/node-required.ts` and `test/node-closed-sets.ts` fail
+ * until a required property or a value of a closed set is a deliberate line. What this file does
+ * for it: a new property is `.optional()` or `.default(...)` with the default in its comment.
  */
 import { z } from "zod";
 import {
@@ -732,6 +740,16 @@ export const NodePolicy = z.strictObject({
     /** A wake waits this long for room, below the gateway's 25 s wake bound, then gets 57P03. */
     queue_wait_ms: z.number().int().min(0).max(20_000),
     retry_after_seconds: z.number().int().min(1).max(300),
+    /**
+     * After a wake the database runs without the CPU quota of its class for this long, counted
+     * from the release of the writer, so that its first requests, its start-up and the reading of
+     * its buffer list are not throttled (plan 4.4). Its weight and its memory, IO and task limits
+     * stay. 0 applies the quota at once. A restarted agent applies it at once to what it finds.
+     * Optional for its first release (plan 9.3, "Changing the page"): a policy and a page without
+     * it mean 0, the quota with the wake as before, so that an agent that does not know it reads
+     * the page and an agent that does reads a page without it.
+     */
+    cpu_boost_ms: z.number().int().min(0).max(60_000).default(0),
   }),
   /** D2: put idle-but-awake databases to sleep early, only while a wake waits. */
   early_sleep: z.strictObject({
@@ -937,6 +955,10 @@ export const NodeOrder = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("maintenance"), operation: OperationId }),
 ]);
 export type NodeOrder = z.infer<typeof NodeOrder>;
+/** The types of order a node reads: a page with another is refused whole (plan 9.3). */
+export const NODE_ORDER_TYPES = NodeOrder.options.map(
+  (order) => order.shape.type.value,
+);
 
 // ---------- Probes on request (POST /v1/nodes/{id}/diagnostics) ----------
 

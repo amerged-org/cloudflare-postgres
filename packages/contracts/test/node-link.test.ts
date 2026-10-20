@@ -137,6 +137,7 @@ const page = {
       start_concurrency: 4,
       queue_wait_ms: 10_000,
       retry_after_seconds: 5,
+      cpu_boost_ms: 5000,
     },
     early_sleep: { enabled: true, min_idle_seconds: 30 },
     storage: {
@@ -1334,6 +1335,25 @@ describe("credentials and the node's policy", () => {
       { io: { ...page.policy.io, write_bytes_per_second: 0 } },
     ])
       expect(NodeDesiredPage.safeParse(withPolicy(broken)).success).toBe(false);
+  });
+
+  it("carries the CPU burst after a wake as whole milliseconds, 0 for the quota at once, and nothing else is a burst", () => {
+    const withBoost = (cpu_boost_ms: unknown) => ({
+      ...page,
+      policy: {
+        ...page.policy,
+        admission: { ...page.policy.admission, cpu_boost_ms },
+      },
+    });
+    expect(page.policy.admission.cpu_boost_ms).toBe(5000);
+    for (const valid of [0, 1, 5000, 60_000])
+      expect(NodeDesiredPage.safeParse(withBoost(valid)).success).toBe(true);
+    // The quota of a class is applied late, not never, and not after a fraction of a millisecond:
+    // a negative, fractional or oversized number, and a string are refused. A missing field is the
+    // burst of 0 (the field is optional for one release, plan 9.3, "Changing the page").
+    expect(NodeDesiredPage.safeParse(withBoost(undefined)).success).toBe(true);
+    for (const broken of [-1, 0.5, 60_001, "5000", null])
+      expect(NodeDesiredPage.safeParse(withBoost(broken)).success).toBe(false);
   });
 });
 

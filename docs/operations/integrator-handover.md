@@ -84,7 +84,7 @@ creation or resize. Disabled classes (`enabled: false`) are listed but refused.
 | Field                                      | Bounds in the contract                                 | Meaning                                                                                                                                   |
 | ------------------------------------------ | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `memory_mib`                               | 256 to 1,048,576 in steps of 256                       | The database's hard memory ceiling while it is awake; PostgreSQL's settings follow it (`shared_buffers` an eighth, `effective_cache_size` three quarters of it) |
-| `cpu_millicores`, `cpu_request_millicores` | 100 to 256,000; request optional and at most the limit | CPU size: the database's CPU weight is proportional to it and a quota of it applies once PostgreSQL has started. The request is accepted and stored, and no node reads it |
+| `cpu_millicores`, `cpu_request_millicores` | 100 to 256,000; request optional and at most the limit | CPU size: the database's CPU weight is proportional to it and a quota of it applies once PostgreSQL has started; after a wake the quota comes only after the region's CPU burst (the node policy's `cpu_boost_ms`, 5 s at first), during which the database is not held to its size: it takes its weight's share of contested CPU and what is idle. Each wake has such a burst, so frequent suspend and resume cycles repeat it. The request is accepted and stored, and no node reads it |
 | `storage_gib`                              | 1 to 65,536                                            | The thin volume's size; the pool hands out real space only as the database writes. It grows online and never shrinks |
 | `max_connections`                          | 10 to 10,000                                           | PostgreSQL `max_connections`                                                                                                              |
 | `sleep_after_seconds`                      | 60 to 2,592,000, or `null`                             | Idle time before hibernation of a database that sets none of its own; `null` is always warm                                               |
@@ -803,7 +803,7 @@ Where a new database goes is described in [2.1](#21-create). The per-database me
 (11,967 MiB visible to the system). What a node admits is decided by the region's node policy (an
 admin reads it at `GET /v1/regions/{id}/node-policy`; ask the operator for its values): the memory
 rule, the memory floor and the awake-database budget, how many starts may run at once, how long a
-wake may wait for room, early sleep, the pool reserve, the backup concurrency and the write limits.
+wake may wait for room, how long after a wake the CPU quota stays off (the CPU burst), early sleep, the pool reserve, the backup concurrency and the write limits.
 The plan's starting values for EU1 are an awake budget of 9,937 MiB, a floor of 600 MiB, at most 4
 starts at once and a wait of up to 10 s before `57P03` with a retry hint of 5 s; Stage 5 replaces
 them with measured values.

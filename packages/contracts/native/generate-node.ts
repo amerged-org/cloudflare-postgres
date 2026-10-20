@@ -2,7 +2,6 @@
 // The node agent, the gateway and the archive clients consume these exact schemas, constants and
 // vectors of the node contracts (src/node-link.ts, src/node-local.ts). Check them in CI.
 import { readFile, writeFile } from "node:fs/promises";
-import { z } from "zod";
 import { format } from "prettier";
 import * as link from "../src/node-link.ts";
 import * as local from "../src/node-local.ts";
@@ -28,25 +27,21 @@ import {
   archiveVectors,
   gatewayChannelVectors,
   nodeRequestVectors,
-  nodeSchemas,
   nodeSchemaVectors,
   packageVectors,
   refusalVectors,
   releaseVectors,
 } from "./node-vectors.ts";
+import { nodeJsonSchemas } from "./node-schema.ts";
 
 const files = {
   "node.generated.json": {
     version: 1,
-    schemas: Object.fromEntries(
-      Object.entries(nodeSchemas).map(([name, schema]) => [
-        name,
-        z.toJSONSchema(schema),
-      ]),
-    ),
+    schemas: nodeJsonSchemas(),
     constants: {
       NODE_PROTOCOL_VERSION: link.NODE_PROTOCOL_VERSION,
       NODE_API_PATHS: link.NODE_API_PATHS,
+      NODE_ORDER_TYPES: link.NODE_ORDER_TYPES,
       INSTALLER_PROGRESS_PATH: link.INSTALLER_PROGRESS_PATH,
       NODE_ENROLLMENT_SEED_PATH: link.NODE_ENROLLMENT_SEED_PATH,
       ENROLLMENT_TOKEN_LIFETIME_SECONDS: link.ENROLLMENT_TOKEN_LIFETIME_SECONDS,
@@ -82,6 +77,10 @@ const files = {
       MAINTENANCE_ROLE,
       RESERVED_ROLE_NAMES: [...RESERVED_ROLE_NAMES],
       RESERVED_ROLE_PREFIXES,
+      // What a present role names and a removal never does: the node refuses a role that is both.
+      PRESENT_ROLE_PROPERTIES: Object.keys(link.DesiredRole.shape).filter(
+        (property) => property !== "name",
+      ),
       ADMISSION_STARTS: link.ADMISSION_STARTS,
       NODE_DATABASE_STATES: link.NODE_DATABASE_STATES,
       NODE_DATABASE_ERRORS: link.NODE_DATABASE_ERRORS,
