@@ -673,6 +673,77 @@ fn a_booted_node_mounts_every_formatted_volume_again() {
     assert!(!lab.mounted(&b));
 }
 
+/// The agent mounts a database's volume when it decides on the database, many at once: the
+/// mounts of different databases share the lock, and each gets its link.
+#[test]
+fn the_volumes_of_different_databases_are_mounted_at_once() {
+    let lab = Lab::open(2048);
+    let volumes: Vec<VolumeId> = (0..8)
+        .map(|n| id(&format!("m{n}b2c3d4e5f6g7h8i9j0"), 1))
+        .collect();
+    for volume in &volumes {
+        lab.create(volume, 32);
+        fs::write(lab.dir_of(volume).join("kept"), b"committed").unwrap();
+        lab.storage.unmount_volume(volume).unwrap();
+        assert!(!lab.mounted(volume) && lab.link(volume).is_none());
+    }
+    let failures: Vec<_> = std::thread::scope(|scope| {
+        let mounting: Vec<_> = volumes
+            .iter()
+            .map(|volume| scope.spawn(|| lab.storage.mount_all(slice::from_ref(volume))))
+            .collect();
+        mounting
+            .into_iter()
+            .flat_map(|mounting| mounting.join().unwrap().unwrap())
+            .collect()
+    });
+    assert!(failures.is_empty(), "{failures:?}");
+    for volume in &volumes {
+        assert!(lab.linked_to_the_mounted_volume(volume));
+        assert_eq!(
+            fs::read(lab.dir_of(volume).join("kept")).unwrap(),
+            b"committed"
+        );
+    }
+}
+
+/// The agent's exit unmounts what it mounted, many at once, and leaves what it did not mount.
+#[test]
+fn the_agents_exit_unmounts_every_volume_it_mounted() {
+    let lab = Lab::open(2048);
+    let volumes: Vec<VolumeId> = (0..6)
+        .map(|n| id(&format!("x{n}b2c3d4e5f6g7h8i9j0"), 1))
+        .collect();
+    for volume in &volumes {
+        lab.create(volume, 32);
+        fs::write(lab.dir_of(volume).join("kept"), b"committed").unwrap();
+    }
+    // Something else of the agent's namespace stays, a mount below the volumes' root that is no
+    // volume's.
+    let other = lab.config().mount_root.join("other");
+    fs::create_dir_all(&other).unwrap();
+    sh("mount", &["-t", "tmpfs", "tmpfs", other.to_str().unwrap()]);
+    lab.storage.unmount_all();
+    for volume in &volumes {
+        assert!(!lab.mounted(volume), "{volume:?}");
+    }
+    assert!(
+        mountinfo::parse(&lab.mount_table())
+            .unwrap()
+            .iter()
+            .any(|mount| mount.mount_point == other)
+    );
+    sh("umount", &[other.to_str().unwrap()]);
+    // The volumes and what is in them are as they were: the next agent mounts them again.
+    assert!(lab.storage.mount_all(&volumes).unwrap().is_empty());
+    for volume in &volumes {
+        assert_eq!(
+            fs::read(lab.dir_of(volume).join("kept")).unwrap(),
+            b"committed"
+        );
+    }
+}
+
 #[test]
 fn a_wake_asks_the_kernel_and_not_lvm2_about_a_mounted_volume() {
     let lab = Lab::open(512);

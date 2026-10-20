@@ -29,6 +29,8 @@ pub mod settings;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod shell_ca;
 pub mod sleep;
+#[cfg(all(test, target_os = "linux"))]
+mod start_lab;
 pub mod state;
 pub mod storage;
 #[cfg(test)]

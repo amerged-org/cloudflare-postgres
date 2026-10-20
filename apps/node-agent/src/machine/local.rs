@@ -78,6 +78,12 @@ struct State {
     unit_reads_fail: u32,
     volume_reads: u64,
     unit_reads: u64,
+    /// The databases whose unit reads wait for `release_unit_reads`: a systemd that is slow to
+    /// answer about them.
+    held_units: BTreeSet<String>,
+    /// The next this many waits for a unit to be ready cannot read it, as a bus does that refuses
+    /// the call (`LimitsExceeded`).
+    wait_reads_fail: u32,
     /// Every volume must be repaired before its database starts again.
     needs_repair: bool,
     units_unreadable: bool,
@@ -137,6 +143,16 @@ fn tool_failed(program: &str, file: &str) -> io::Error {
     ))
 }
 
+/// What a read of a unit fails with when the bus refuses the call, as dbus-daemon does past its
+/// limit of calls that are not answered yet.
+fn bus_refused() -> units::Error {
+    units::Error::Bus(zbus::Error::Failure(
+        "org.freedesktop.DBus.Error.LimitsExceeded: the maximum number of pending replies per \
+         connection has been reached"
+            .into(),
+    ))
+}
+
 /// The kernel's boot ID of the node's `boots`th boot.
 fn boot_id(boots: u64) -> String {
     format!("00000000-0000-4000-8000-{boots:012x}")
@@ -148,6 +164,8 @@ pub struct Local {
     uid: u32,
     gid: u32,
     state: Mutex<State>,
+    /// `false` while the reads of `held_units` wait.
+    unit_gate: tokio::sync::watch::Sender<bool>,
 }
 
 impl Local {
@@ -199,6 +217,7 @@ impl Local {
                 kernel_release: "6.12.111+deb13-amd64".into(),
                 ..State::default()
             }),
+            unit_gate: tokio::sync::watch::channel(true).0,
         };
         machine.load_units();
         Some(machine)
@@ -412,6 +431,18 @@ impl Local {
     /// systemd cannot be read for the next `count` questions, and can be after them.
     pub fn fail_next_unit_reads(&self, count: u32) {
         self.state().unit_reads_fail = count;
+    }
+    /// The reads of these databases' units wait until `release_unit_reads`.
+    pub fn hold_unit_reads(&self, databases: impl IntoIterator<Item = String>) {
+        self.state().held_units = databases.into_iter().collect();
+        self.unit_gate.send_replace(false);
+    }
+    pub fn release_unit_reads(&self) {
+        self.unit_gate.send_replace(true);
+    }
+    /// The next `count` waits for a unit to be ready fail as a bus does that refuses the call.
+    pub fn fail_next_waits(&self, count: u32) {
+        self.state().wait_reads_fail = count;
     }
     /// How often `has_volume` was asked, and how often `unit` was.
     pub fn reads(&self) -> (u64, u64) {
@@ -828,11 +859,23 @@ impl Machine for Local {
     }
 
     async fn unit(&self, database: &str) -> Result<UnitState, units::Error> {
+        let held = {
+            let mut state = self.state();
+            state.unit_reads += 1;
+            state.held_units.contains(database)
+        };
+        if held {
+            let mut gate = self.unit_gate.subscribe();
+            while !*gate.borrow_and_update() {
+                if gate.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
         let mut state = self.state();
-        state.unit_reads += 1;
         if state.units_unreadable || state.unit_reads_fail > 0 {
             state.unit_reads_fail = state.unit_reads_fail.saturating_sub(1);
-            return Err(units::Error::NotReady("bus"));
+            return Err(bus_refused());
         }
         let memory_max = state.limits.get(database).and_then(|limits| {
             limits
@@ -987,6 +1030,13 @@ impl Machine for Local {
         Ok(Timeline::default())
     }
     async fn wait_started(&self, database: &str) -> Result<Started, units::Error> {
+        {
+            let mut state = self.state();
+            if state.wait_reads_fail > 0 {
+                state.wait_reads_fail -= 1;
+                return Err(bus_refused());
+            }
+        }
         let waited = Instant::now();
         loop {
             match self.started(database) {

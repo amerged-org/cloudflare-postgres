@@ -68,6 +68,13 @@ impl Listing {
         let (began, lvs) = kept.last.as_ref()?;
         (began.elapsed() < self.max_age).then(|| lvs.clone())
     }
+    /// The list, if its read began at or after `arrival` and nothing has changed since: whatever
+    /// its age, it shows every volume and tag as they were when the caller asked.
+    pub fn since(&self, arrival: Instant) -> Option<Arc<Vec<LogicalVolume>>> {
+        let kept = self.kept();
+        let (began, lvs) = kept.last.as_ref()?;
+        (*began >= arrival).then(|| lvs.clone())
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +111,20 @@ mod tests {
         let newer = list(&["db_a", "db_b"]);
         listing.keep(listing.begin(), &newer);
         assert!(Arc::ptr_eq(&listing.recent().unwrap(), &newer));
+    }
+
+    /// A caller takes a read that began after it asked, and no read that began before.
+    #[test]
+    fn a_list_serves_the_callers_that_asked_before_its_read_began() {
+        let listing = Listing::new(Duration::ZERO);
+        let before = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        listing.keep(listing.begin(), &list(&["db_a"]));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(listing.since(before).is_some());
+        assert!(listing.since(Instant::now()).is_none());
+        listing.changed();
+        assert!(listing.since(before).is_none());
     }
 
     #[test]

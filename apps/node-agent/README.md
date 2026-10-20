@@ -233,6 +233,9 @@ alone (the mount API, for example).
 The lab tests need a Debian 13 host with systemd as PID 1, root, LVM and the image's units
 (`units/lab.rs`, `machine/node.rs`), or a privileged container with loop devices for
 `storage/lab_tests.rs`, which is built only with `RUSTFLAGS='--cfg pgcf_storage_lab'`.
+`start_lab.rs` is the agent's start on a node with 300 databases, on the same real parts and with a
+disk that is slow to flush (its header says how to run it); the numbers it gave are in the plan
+(11.1, "Agent start and stop at 300 databases").
 
 The contract with Cloudflare is `packages/contracts/src/node-link.ts`. `node_link.rs` reads its
 generated JSON Schemas, and conformance tests hold the agent and the API to the same vectors.

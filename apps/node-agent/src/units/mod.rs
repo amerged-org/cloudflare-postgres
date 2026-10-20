@@ -32,8 +32,35 @@ mod dbus;
 use futures_util::StreamExt;
 use limits::{Limits, Property, cpu_quota, slice_memory};
 use pgcf_native_protocol::valid_pattern;
-use std::{num::NonZeroU32, path::PathBuf};
+use std::{future::Future, num::NonZeroU32, path::PathBuf, sync::Arc};
+use tokio::sync::Semaphore;
 use zbus::{proxy::CacheProperties, zvariant::OwnedObjectPath};
+
+/// How many unit reads are in flight at once. A read is a call and then five at once on the one
+/// connection to the bus, and the bus daemon allows a connection 128 calls that are not answered
+/// yet (dbus-daemon's `max_replies_per_connection`): past that every call fails with
+/// `LimitsExceeded`. A node decides on every database when its agent starts, and 300 reads at
+/// once failed 260 of them in the lab (Debian 13); 16 are at most 80 calls, which leaves the rest
+/// of the limit to the starts, stops and property changes that run beside them.
+const READS_IN_FLIGHT: usize = 16;
+
+/// systemd's answer to a call about a unit that is not loaded.
+const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
+
+/// The reads that may be in flight at once.
+#[derive(Clone)]
+struct Reads(Arc<Semaphore>);
+impl Reads {
+    fn new(limit: usize) -> Self {
+        Self(Arc::new(Semaphore::new(limit)))
+    }
+    /// Runs `read` when fewer than the limit are running. The waiting is in order.
+    async fn within<T>(&self, read: impl Future<Output = T>) -> T {
+        // The semaphore is never closed; a read that finds it so runs without a place.
+        let _place = self.0.acquire().await.ok();
+        read.await
+    }
+}
 
 /// Where the database volumes are mounted: `<DB_ROOT>/<id>` holds the data directory `data`.
 pub const DB_ROOT: &str = "/var/lib/pgcf/db";
@@ -152,6 +179,17 @@ pub struct UnitState {
     pub memory_max_bytes: Option<u64>,
 }
 impl UnitState {
+    /// A unit that systemd has not loaded: it has no process.
+    fn not_loaded(database: &str) -> Self {
+        Self {
+            database: database.to_string(),
+            active: ActiveState::Inactive,
+            main_pid: None,
+            invocation_id: None,
+            uid: None,
+            memory_max_bytes: None,
+        }
+    }
     /// From the raw values of the unit's D-Bus properties, which spell "none" as zero, `u32::MAX`
     /// and `u64::MAX`.
     pub fn from_properties(
@@ -288,6 +326,7 @@ pub struct Units {
     connection: zbus::Connection,
     manager: dbus::ManagerProxy<'static>,
     db_root: PathBuf,
+    reads: Reads,
 }
 impl Units {
     /// Connects to the system bus and subscribes to systemd's job signals. `db_root` is where the
@@ -300,6 +339,7 @@ impl Units {
             connection,
             manager,
             db_root: db_root.into(),
+            reads: Reads::new(READS_IN_FLIGHT),
         })
     }
 
@@ -367,12 +407,33 @@ impl Units {
             .await?)
     }
 
-    /// The state of a database's unit. systemd loads a unit when it is asked for it, so a database
-    /// that never started is `inactive`, with the memory ceiling of the unit template.
+    /// The state of a database's unit. A unit that is not loaded has no process and is `inactive`,
+    /// and systemd is not asked to load it: reading a property of an unloaded unit loads it, which
+    /// reads the unit's files, and a node has hundreds of databases that are asleep (lab: 3.7 ms
+    /// for each of 300 against 0.2 ms to be told it is not loaded). The reads wait for a place
+    /// among `READS_IN_FLIGHT`.
     pub async fn state(&self, database: &str) -> Result<UnitState, Error> {
         let unit_name = Self::unit_of(database)?;
-        let unit = self.unit_proxy(&unit_name, CacheProperties::No).await?;
-        let service = self.service_proxy(&unit_name).await?;
+        self.reads
+            .within(async {
+                let began = std::time::Instant::now();
+                let state = self.read_state(database, &unit_name).await;
+                crate::timing::UNIT_READ.add(began.elapsed());
+                state
+            })
+            .await
+    }
+
+    async fn read_state(&self, database: &str, unit_name: &str) -> Result<UnitState, Error> {
+        match self.manager.get_unit(unit_name).await {
+            Ok(_) => {}
+            Err(zbus::Error::MethodError(name, ..)) if name.as_str() == NO_SUCH_UNIT => {
+                return Ok(UnitState::not_loaded(database));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let unit = self.unit_proxy(unit_name, CacheProperties::No).await?;
+        let service = self.service_proxy(unit_name).await?;
         let (active, invocation, pid, uid, memory) = tokio::join!(
             unit.active_state(),
             unit.invocation_id(),
@@ -561,6 +622,38 @@ pub(crate) fn test_dir(label: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Hundreds of reads ask at once, and no more than the limit run: the rest wait for a place and
+    /// every one of them is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reads_that_ask_at_once_run_no_more_than_the_limit_at_a_time() {
+        let reads = Reads::new(READS_IN_FLIGHT);
+        let (running, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let tasks: Vec<_> = (0..300)
+            .map(|n| {
+                let (reads, running, most) = (reads.clone(), running.clone(), most.clone());
+                tokio::spawn(async move {
+                    reads
+                        .within(async {
+                            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                            most.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            running.fetch_sub(1, Ordering::SeqCst);
+                            n
+                        })
+                        .await
+                })
+            })
+            .collect();
+        let mut answered = 0;
+        for (n, task) in tasks.into_iter().enumerate() {
+            assert_eq!(task.await.unwrap(), n);
+            answered += 1;
+        }
+        assert_eq!(answered, 300);
+        assert_eq!(most.load(Ordering::SeqCst), READS_IN_FLIGHT);
+    }
 
     #[test]
     fn a_unit_name_and_its_database_round_trip() {

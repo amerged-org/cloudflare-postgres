@@ -143,16 +143,25 @@ impl<M: Machine> Core<M> {
         if let Some(policy) = Policy::parse(&page.policy) {
             self.set_policy(policy);
         }
-        for value in &page.databases {
-            let Some(entry) = Entry::parse(value) else {
-                crate::timing::emit_event(
-                    json!({"event": "desired_entry_refused", "database_id": value["id"]}),
-                );
-                continue;
-            };
+        // The databases that run come first: the gateway's first table waits for them.
+        let mut entries: Vec<Entry> = page
+            .databases
+            .iter()
+            .filter_map(|value| {
+                let entry = Entry::parse(value);
+                if entry.is_none() {
+                    crate::timing::emit_event(
+                        json!({"event": "desired_entry_refused", "database_id": value["id"]}),
+                    );
+                }
+                entry
+            })
+            .collect();
+        entries.sort_by_key(|entry| !self.awake_at_start.contains(&entry.id));
+        for entry in entries {
             let db = self.db(&entry.id);
             if self.accept(&db, entry) {
-                self.schedule(&db);
+                self.schedule_page(&db);
             }
         }
         if page.complete {
@@ -211,6 +220,47 @@ impl<M: Machine> Core<M> {
 
     /// Runs the reconciliation of a database, and again if its entry changes while it runs.
     pub(crate) fn schedule(self: &Arc<Self>, db: &Arc<Db>) {
+        self.schedule_with(db, None);
+    }
+
+    /// The reconciliation that a page asks for. A database the node has not decided on yet waits
+    /// for its turn among `FIRST_PASS_AT_ONCE`, which it keeps until it is decided on: a node has
+    /// hundreds of them when it starts, and each reads LVM, systemd and the disk and mounts a
+    /// volume. A wake does not wait for a turn (`try_wake`), and neither does a database that is
+    /// decided on already. What the decision then does (a build, a delete, a sleep) is no part of
+    /// the turn.
+    fn schedule_page(self: &Arc<Self>, db: &Arc<Db>) {
+        {
+            let mut view = db.view();
+            if view.adopted {
+                drop(view);
+                return self.schedule(db);
+            }
+            if view.queued {
+                return;
+            }
+            view.queued = true;
+        }
+        let (core, db) = (self.clone(), db.clone());
+        tokio::spawn(async move {
+            let turn = core.first_pass.clone().acquire_owned().await.ok();
+            let adopted = {
+                let mut view = db.view();
+                view.queued = false;
+                view.adopted
+            };
+            // A wake decided on it while it waited.
+            if !adopted {
+                core.schedule_with(&db, turn);
+            }
+        });
+    }
+
+    fn schedule_with(
+        self: &Arc<Self>,
+        db: &Arc<Db>,
+        turn: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         {
             let mut view = db.view();
             match view.reconcile {
@@ -223,8 +273,9 @@ impl<M: Machine> Core<M> {
         }
         let (core, db) = (self.clone(), db.clone());
         tokio::spawn(async move {
+            let mut turn = turn;
             loop {
-                core.reconcile(&db).await;
+                core.reconcile(&db, &mut turn).await;
                 let mut view = db.view();
                 if view.reconcile == Reconcile::Again {
                     view.reconcile = Reconcile::Running;
@@ -233,6 +284,7 @@ impl<M: Machine> Core<M> {
                     break;
                 }
             }
+            drop(turn);
             core.retry_until_adopted(&db);
         });
     }
@@ -284,8 +336,14 @@ impl<M: Machine> Core<M> {
         }));
     }
 
-    /// Decides on a database's entry and does what that needs.
-    pub(crate) async fn reconcile(self: &Arc<Self>, db: &Arc<Db>) {
+    /// Decides on a database's entry and does what that needs. The decision's turn among the first
+    /// (`schedule_page`) ends with it: for a database that runs or sleeps when it is decided on,
+    /// for any other when the step is known.
+    pub(crate) async fn reconcile(
+        self: &Arc<Self>,
+        db: &Arc<Db>,
+        turn: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         let _flow = db.lock.lock().await;
         let Some(entry) = db.view().entry.clone() else {
             return;
@@ -335,6 +393,9 @@ impl<M: Machine> Core<M> {
                 refused: view.refusal.is_some(),
             })
         };
+        if !matches!(step, Step::AdoptRunning | Step::AdoptAsleep) {
+            turn.take();
+        }
         match step {
             Step::Nothing => {}
             Step::Build => {
@@ -344,8 +405,19 @@ impl<M: Machine> Core<M> {
             Step::Suspend => {
                 self.sleep_locked(db, Why::Order).await;
             }
-            Step::AdoptRunning => self.adopt_running(db, &entry).await,
-            Step::AdoptAsleep => self.adopt_asleep(db).await,
+            // The database is decided on from its volume: the agent's mounts ended with the agent
+            // before, and the volume is attached before anything reads it.
+            Step::AdoptRunning => {
+                if !self.attach(db, &entry).await || !self.adopt_running(db, &entry).await {
+                    return;
+                }
+            }
+            Step::AdoptAsleep => {
+                if !self.attach(db, &entry).await {
+                    return;
+                }
+                self.adopt_asleep(db).await;
+            }
             Step::Fail(error) => self.set(db, |view| {
                 view.phase = Phase::Error;
                 view.error = Some(error);
@@ -355,6 +427,7 @@ impl<M: Machine> Core<M> {
             }
         }
         self.set(db, |view| view.adopted = true);
+        turn.take();
         if matches!(db.phase(), Phase::Ready | Phase::Asleep) {
             self.resize(db, &entry).await;
         }
@@ -363,9 +436,43 @@ impl<M: Machine> Core<M> {
         }
     }
 
+    /// Attaches the database's volume if the agent has not: its mounts end with the agent, and a
+    /// database is decided on from the files below its mount point. A volume that cannot be
+    /// attached is a fact to decide on (a volume that needs a repair has no `pg_control` to
+    /// show); a volume list that cannot be read is not, and `false` says that nothing is decided.
+    async fn attach(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) -> bool {
+        let Some(volume) = Self::volume_id(entry) else {
+            return true;
+        };
+        if self.machine.attached(&volume) {
+            return true;
+        }
+        match self
+            .machine
+            .mount_volumes(std::slice::from_ref(&volume))
+            .await
+        {
+            Ok(failures) => {
+                for (volume, error) in failures {
+                    crate::timing::emit_event(json!({
+                        "event": "mount_failed", "database_id": volume.database(),
+                        "class": crate::diagnostics::error_code(&error.into()),
+                    }));
+                }
+                true
+            }
+            Err(error) => {
+                Self::unread(db, "volume", error.into());
+                false
+            }
+        }
+    }
+
     /// The unit runs, as the agent found it at its start: it is released to the gateway as ready,
-    /// and its archiver reaches the archive socket again.
-    async fn adopt_running(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
+    /// and its archiver reaches the archive socket again. `false` when the bus would not say
+    /// whether the unit is ready: nothing is known of it, the decision is for the retry, and the
+    /// database is neither served nor recovered (recovery would stop it).
+    async fn adopt_running(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) -> bool {
         self.ensure_archive(db, entry);
         match self.machine.wait_started(&db.id).await {
             Ok(started) => match writer_of(&started) {
@@ -377,9 +484,16 @@ impl<M: Machine> Core<M> {
                 }),
                 None => self.go_unproven(db),
             },
-            // A unit that cannot be read as ready is not served; recovery takes it.
-            Err(_) => self.go_unproven(db),
+            // A unit that is not ready is not served; recovery takes it.
+            Err(crate::units::Error::NotReady(_) | crate::units::Error::Job { .. }) => {
+                self.go_unproven(db);
+            }
+            Err(error) => {
+                Self::unread(db, "unit", error.into());
+                return false;
+            }
         }
+        true
     }
 
     /// The unit is stopped: the volume against the record decides whether it sleeps provenly.
@@ -822,7 +936,9 @@ mod tests {
         agent::testing::{Rig, eventually},
         link::Order,
         node_link::contract_valid,
-        postgres, testpg,
+        postgres,
+        storage::VolumeId,
+        testpg,
     };
     use pgcf_native_protocol::agent::Mode;
     use serde_json::{Value, json};
@@ -1875,6 +1991,80 @@ mod tests {
             .await;
             assert_eq!(rig.machine.unit(&id).await.unwrap().main_pid, pid);
         }
+    }
+
+    /// A bus that refuses the call that waits for a running database's unit says nothing of the
+    /// unit: the database is neither served nor recovered on it, and recovery would stop it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_running_database_that_the_bus_will_not_tell_about_is_not_recovered() {
+        let Some(rig) = Rig::new("restart-bus").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let (id, path) = (
+            id_of(&db),
+            db["archive"]["path"].as_str().unwrap().to_string(),
+        );
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        db.as_object_mut().unwrap().remove("origin");
+        let pid = rig.machine.unit(&id).await.unwrap().main_pid;
+
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        rig.machine.clear_calls();
+        rig.machine.fail_next_waits(1);
+        let page = Rig::page(vec![db.clone()], vec![]);
+        rig.core.apply(&page).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the running database to be found", || {
+            handle.phase() == Phase::Ready
+        })
+        .await;
+        assert_eq!(rig.machine.unit(&id).await.unwrap().main_pid, pid);
+        let calls = rig.machine.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("start") || call.starts_with("stop")),
+            "{calls:?}"
+        );
+    }
+
+    /// The agent's mounts end with it. It attaches a database's volume when it decides on the
+    /// database, which reads `pg_control` through the mount, and asks nothing of a volume that is
+    /// attached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_attaches_the_volume_of_a_database_when_it_decides_on_it() {
+        let Some(rig) = Rig::new("restart-attach").await else {
+            return;
+        };
+        let (rig, db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        let volume = VolumeId::new(&id, 1).unwrap();
+        assert!(!rig.machine.attached(&volume));
+        rig.machine.clear_calls();
+        let page = Rig::page(vec![db.clone()], vec![]);
+        rig.core.apply(&page).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the database to be adopted", || handle.view().adopted).await;
+        assert!(rig.machine.attached(&volume));
+        assert_eq!(handle.phase(), Phase::Asleep);
+        let mounts = |machine: &crate::machine::local::Local| {
+            machine
+                .calls()
+                .into_iter()
+                .filter(|call| call.starts_with("mount"))
+                .count()
+        };
+        assert_eq!(mounts(&rig.machine), 1);
+        rig.core.apply(&page).await;
+        eventually(10, "the pull to be decided on", || {
+            handle.view().reconcile == super::super::Reconcile::Idle
+        })
+        .await;
+        assert_eq!(mounts(&rig.machine), 1);
     }
 
     /// A database that sleeps provenly, as the page names it once it was built, and an agent that

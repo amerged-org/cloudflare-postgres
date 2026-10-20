@@ -98,6 +98,16 @@ impl Node {
     pub async fn reset_device_links(&self) -> Result<(), storage::Error> {
         self.storage(|storage| storage.reset_device_links()).await
     }
+    /// The agent's exit: its mounts of the volumes go, many at once, before the kernel would end
+    /// them one by one with the namespace (`Storage::unmount_all`).
+    pub async fn release_mounts(&self) {
+        let _ = self
+            .storage(|storage| {
+                storage.unmount_all();
+                Ok(())
+            })
+            .await;
+    }
     /// The user of the scratch database that `pgcf-agent check` makes, or finds: a system account
     /// of the system's own uid range. The agent's table of uids stays the running agent's alone;
     /// a second process, the check, never writes it.
