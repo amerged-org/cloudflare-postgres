@@ -181,6 +181,25 @@ impl Unit {
         .await
         .expect("the statement runs");
     }
+    /// Waits until the tenant's sessions have nothing left to run or to end: none runs a statement
+    /// or sits in a transaction. A session whose client is gone has finished its statement and
+    /// committed it, or it has been rolled back, by then; before that its rows are not visible
+    /// either way, so a count taken earlier proves nothing about the outcome.
+    async fn settled(&self) {
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let open = self.tenant(
+                    "select count(*) from pg_stat_activity where backend_type = 'client backend' and usename = 'app' and state is distinct from 'idle'",
+                );
+                if open == "0" {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("PostgreSQL has nothing left to run for the tenant");
+    }
 }
 
 /// A gateway on loopback served by `transport::serve`, in this process.
@@ -292,6 +311,9 @@ impl Node {
     }
     async fn running(&self, text: &str) {
         self.unit.running(text).await
+    }
+    async fn settled(&self) {
+        self.unit.settled().await
     }
     async fn finish(self) {
         self.channel.abort();
@@ -542,6 +564,9 @@ async fn a_transaction_still_open_when_the_drain_ends_is_ended_with_57p01_and_ro
         client.ends(Duration::from_secs(5)).await,
         (vec!["57P01".to_string()], Some(Some(1012)))
     );
+    // Nothing was running, so ending the PostgreSQL session ends the transaction: PostgreSQL
+    // leaves no session in it, and the row never becomes visible.
+    node.settled().await;
     assert_eq!(node.tenant("select count(*) from ledger"), "0");
     assert!(node.returned().await < Duration::from_secs(3));
     node.finish().await;
@@ -567,13 +592,14 @@ async fn an_http_transaction_in_flight_when_the_drain_starts_commits_and_is_answ
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_http_transaction_still_running_when_the_drain_ends_is_answered_08007_and_rolled_back() {
+async fn an_http_transaction_still_running_when_the_drain_ends_is_answered_08007_and_commits_after_the_answer()
+ {
     let Some(bin) = binaries() else { return };
     let mut node = Node::start(&bin, Duration::from_secs(1)).await;
     let request = tokio::spawn(sql(
         node.port,
         route(1),
-        vec!["insert into ledger values (1)", "select pg_sleep(30)"],
+        vec!["insert into ledger values (1)", "select pg_sleep(5)"],
     ));
     node.running("pg_sleep").await;
     let began = Instant::now();
@@ -588,10 +614,60 @@ async fn an_http_transaction_still_running_when_the_drain_ends_is_answered_08007
         (400, Some("08007")),
         "{answer}"
     );
-    assert!(began.elapsed() < Duration::from_secs(4));
+    assert!(
+        answer["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("outcome is unknown")),
+        "{answer}"
+    );
+    assert!(began.elapsed() < Duration::from_secs(3));
+    // At the answer the statement is still running and nothing is visible. Ending the gateway's
+    // connection does not stop PostgreSQL: it finishes the pipeline it was given, COMMIT
+    // included, so the answer's "unknown" is the whole truth and the row is there once the
+    // statement has ended.
     assert_eq!(node.tenant("select count(*) from ledger"), "0");
+    node.running("pg_sleep").await;
+    node.settled().await;
+    assert_eq!(node.tenant("select count(*) from ledger"), "1");
     assert!(node.returned().await < Duration::from_secs(3));
     node.finish().await;
+}
+
+/// A session that sends `sql` and is still waiting for the statement when the drain ends: it is
+/// told FATAL 08007 (transaction_resolution_unknown) and closed with Restart, and PostgreSQL goes
+/// on with what it was given, so the row is there once the statement has ended.
+async fn cut_while_running(sql: &str) {
+    let Some(bin) = binaries() else { return };
+    let mut node = Node::start(&bin, Duration::from_secs(1)).await;
+    let mut client = node.connect(1).await;
+    client
+        .send(frame(b'Q', format!("{sql}\0").as_bytes()))
+        .await;
+    node.running("pg_sleep").await;
+    node.begin_drain();
+    assert_eq!(
+        client.ends(Duration::from_secs(5)).await,
+        (vec!["08007".to_string()], Some(Some(1012)))
+    );
+    // The statement is still running at the answer, and nothing is visible yet.
+    node.running("pg_sleep").await;
+    assert_eq!(node.tenant("select count(*) from ledger"), "0");
+    node.settled().await;
+    assert_eq!(node.tenant("select count(*) from ledger"), "1");
+    assert!(node.returned().await < Duration::from_secs(3));
+    node.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_websocket_statement_running_when_the_drain_ends_gets_08007_and_commits_after_the_answer()
+{
+    cut_while_running("insert into ledger select 1 from pg_sleep(5)").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_websocket_transaction_with_its_commit_sent_when_the_drain_ends_gets_08007_and_commits_after_the_answer()
+ {
+    cut_while_running("begin; insert into ledger values (1); select pg_sleep(5); commit").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1015,6 +1091,7 @@ async fn a_swap_with_a_transaction_open_waits_the_drain_out_inside_the_retry_bud
         busy.ends(Duration::from_secs(2)).await,
         (vec!["57P01".to_string()], Some(Some(1012)))
     );
+    unit.settled().await;
     assert_eq!(unit.tenant("select count(*) from ledger"), "0");
     // New connections waited for the new gateway, never longer than an integrator retries.
     assert!(longest < RETRY_BUDGET, "{longest:?}");

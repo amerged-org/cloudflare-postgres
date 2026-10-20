@@ -164,6 +164,24 @@ impl PostgresActivity {
     pub fn backend_partial(&self) -> bool {
         self.backend.partial()
     }
+    /// Whether PostgreSQL may be running something for the client, or may have run it: a whole
+    /// request not yet answered through ReadyForQuery, an extended-protocol sequence (PostgreSQL
+    /// executes an Execute at once, before its Sync) or a COPY, or anything the observer cannot
+    /// follow. A session idle in a transaction is not (PostgreSQL waits for the client, so ending
+    /// its connection ends the transaction), nor is one that has not logged in or sent a request
+    /// whole. Ending the connection of a session that is in flight does not stop PostgreSQL: it
+    /// finishes the statement, and anything the client already sent behind it (a COMMIT), and
+    /// notices the lost client only when it writes.
+    pub fn in_flight(&self) -> bool {
+        let state = &self.state;
+        state.authenticated
+            && (state.uncertain
+                || state.complete_ready_cycles != 0
+                || state.extended
+                || state.copy
+                || self.frontend.invalid
+                || self.backend.invalid)
+    }
     pub fn busy(&self) -> bool {
         let state = &self.state;
         state.uncertain
@@ -220,6 +238,68 @@ mod tests {
                 );
             }
         }
+    }
+    fn frontend(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![tag];
+        bytes.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+    fn logged_in() -> PostgresActivity {
+        let mut activity = PostgresActivity::default();
+        activity.observe_backend(&frontend(b'R', &[0; 4]));
+        activity.observe_backend(&frontend(b'Z', b"I"));
+        activity
+    }
+    #[test]
+    fn a_statement_is_in_flight_from_the_whole_request_to_ready_for_query() {
+        // Not logged in: nothing was handed to PostgreSQL.
+        assert!(!PostgresActivity::default().in_flight());
+        let mut activity = logged_in();
+        assert!(!activity.in_flight());
+        // Half a request has not started anything; the whole of it has.
+        let query = frontend(b'Q', b"select pg_sleep(60)\0");
+        activity.observe_frontend(&query[..10]);
+        assert!(activity.busy() && !activity.in_flight());
+        activity.observe_frontend(&query[10..]);
+        assert!(activity.in_flight());
+        // Half of PostgreSQL's answer is still its statement.
+        activity.observe_backend(&frontend(b'C', b"SELECT 1\0")[..4]);
+        assert!(activity.in_flight());
+        activity.observe_backend(&frontend(b'C', b"SELECT 1\0")[4..]);
+        activity.observe_backend(&frontend(b'Z', b"I"));
+        assert!(!activity.in_flight() && !activity.busy());
+    }
+    #[test]
+    fn a_session_idle_in_a_transaction_has_nothing_in_flight() {
+        let mut activity = logged_in();
+        activity.observe_frontend(&frontend(b'Q', b"begin\0"));
+        assert!(activity.in_flight());
+        activity.observe_backend(&frontend(b'Z', b"T"));
+        // Busy, because the transaction is open; but PostgreSQL waits for the client, so ending
+        // its connection ends the transaction.
+        assert!(activity.busy() && !activity.in_flight());
+        // A failed transaction waits for its ROLLBACK in the same way.
+        activity.observe_frontend(&frontend(b'Q', b"select 1/0\0"));
+        activity.observe_backend(&frontend(b'Z', b"E"));
+        assert!(activity.busy() && !activity.in_flight());
+    }
+    #[test]
+    fn an_extended_sequence_and_a_copy_are_in_flight_and_so_is_what_the_observer_cannot_follow() {
+        // PostgreSQL executes an Execute at once, before the Sync that ends the sequence.
+        let mut activity = logged_in();
+        activity.observe_frontend(&frontend(b'P', b"\0select 1\0\0\0"));
+        assert!(activity.in_flight());
+        activity.observe_frontend(&frontend(b'S', b""));
+        activity.observe_backend(&frontend(b'Z', b"I"));
+        assert!(!activity.in_flight());
+        let mut activity = logged_in();
+        activity.observe_frontend(&frontend(b'd', b"row\n"));
+        assert!(activity.in_flight());
+        // A message the observer does not know: it cannot say that nothing runs.
+        let mut activity = logged_in();
+        activity.observe_frontend(&frontend(b'?', b""));
+        assert!(activity.in_flight());
     }
     #[test]
     fn protocol_observer_retains_only_headers_and_prefixes() {

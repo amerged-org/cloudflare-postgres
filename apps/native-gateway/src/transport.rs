@@ -1593,6 +1593,26 @@ async fn early_dial(gateway: &Gateway, claims: &Route, bound: &Writer) -> Option
         }),
     })
 }
+/// What a session that is still busy when the drain ends is told before it is closed. Ending the
+/// gateway's connection to PostgreSQL rolls back a session that is idle in a transaction, as
+/// PostgreSQL tells a client when it shuts down (57P01). It does not stop a statement in flight:
+/// PostgreSQL finishes it, and the COMMIT the client sent behind it, and notices that the client
+/// is gone only when it writes its answer, so the statement may commit after this message. Its
+/// outcome is unknown (08007, as for a COMMIT whose answer was lost).
+fn drain_cut(activity: &PostgresActivity) -> Vec<u8> {
+    if activity.in_flight() {
+        error_response_with(
+            "08007",
+            "gateway restarting during a statement; its outcome is unknown",
+            Some("PostgreSQL goes on with the statement and may commit it after this error."),
+            Some(
+                "Repeat only a write that is idempotent, or check its effect after the statement's run time.",
+            ),
+        )
+    } else {
+        error_response_with("57P01", "gateway restarting", None, None)
+    }
+}
 /// `held` is what the client sent that waits for the session to run: the bytes it pipelined
 /// behind a password the gateway logged in with.
 #[allow(clippy::too_many_arguments)]
@@ -1666,11 +1686,10 @@ async fn relay(
             _=stop.changed()=>{},
             _=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))=>{
                 stages.outcome="gateway_draining";
-                // Cut with a transaction or a query open: the client is told why, as PostgreSQL
-                // tells it when it shuts down (57P01), unless a message of PostgreSQL's is half
-                // delivered, which nothing may be inserted into.
+                // Cut with a transaction or a statement open: the client is told what became of it,
+                // unless a message of PostgreSQL's is half delivered, which nothing may be inserted into.
                 if !activity.backend_partial(){
-                    let error=error_response_with("57P01","gateway restarting",None,None);
+                    let error=drain_cut(activity);
                     let _=timeout(Duration::from_millis(500),websocket.send(Message::Binary(error.into()))).await;
                 }
                 close(websocket,CloseCode::Restart,"gateway restarting").await;

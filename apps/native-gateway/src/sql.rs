@@ -326,10 +326,16 @@ pub async fn serve(
         }
     };
     let (answer, backend) = handled.unwrap_or_else(|| {
-        // Dropping the request ended its PostgreSQL session, which rolls its transaction back.
-        // Whether the statements ran before that is not known once they were sent.
+        // Dropping the request ended the gateway's connection to PostgreSQL, which does not stop
+        // what PostgreSQL was given: it finishes the statements and the COMMIT sent with them and
+        // notices the lost client only when it writes, so a request whose statements were sent
+        // may commit after this answer. Its outcome is unknown.
         let refusal = if stages.sent {
-            unknown("gateway_draining")
+            refused(
+                "gateway_draining",
+                "08007",
+                "gateway restarting during the request; PostgreSQL may still complete it; its outcome is unknown and it was not retried",
+            )
         } else {
             not_accepting("gateway_draining")
         };
