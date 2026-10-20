@@ -126,7 +126,8 @@ Zero Trust "Expiring Access Service Token" notification, which warns a week ahea
 Choose short `CREDENTIAL_KEYS` IDs (the live one has 4 characters): the ID is written into every
 role of a database, and a deleted database's retained archive holds all of them in one row, which D1
 cannot import into a restore if it passes 100,000 bytes. The largest set of roles the contracts
-allow stays below that with an ID of 19 characters or fewer, and can pass it from 35 characters.
+allow stays below that with an ID of 18 characters or fewer, whatever the revision of the passwords,
+and from 34 characters even a first password can pass it.
 
 For `CREDENTIAL_KEYS`, adding a new active key ID does not make old ciphertext disposable. Retain
 all key IDs referenced by database roles, deleted-source archives and older D1 exports. Back up

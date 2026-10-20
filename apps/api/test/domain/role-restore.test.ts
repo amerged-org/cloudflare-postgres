@@ -4,6 +4,7 @@ import {
   ROLE_LIMIT,
   ROLE_MEMBER_OF_MAX,
   Role,
+  archiveDestinationPath,
   bytesToBase64url,
   listEnvelope,
   newRolePassword,
@@ -269,10 +270,66 @@ async function deletedWithLargestRoles(keyLength: number, revision: number) {
 }
 
 // The plan (11.1, row "Diagnostics are stored within the bound of a backup") quotes these sizes and
-// the key version length from which the statement passes D1's limit. `roles_json` is 96,401 bytes
+// the key version lengths from which the statement passes D1's limit. `roles_json` is 96,401 bytes
 // with a key version of 2 characters and a one-digit revision, and each further character of the
 // key version or digit of the revision adds 100 (once for each of the 100 roles).
 const D1_STATEMENT_MAX = 100_000;
+
+/**
+ * The bytes of the `INSERT` of a retained archive apart from its `roles_json` (SQLite's quote(), as
+ * a dump writes the values), for a row of the given shape: the archive path (a bucket, a region and
+ * a storage generation) and the `cleanup_claim` (NULL, or the 36 characters that
+ * `cleanupRetainedArchives` holds while it deletes the objects of the archive).
+ */
+async function insertWithoutRoles(
+  bucket: string,
+  region: string,
+  generation: number,
+  claim: string | null,
+) {
+  const path = archiveDestinationPath(
+    bucket,
+    region,
+    "d".repeat(20),
+    generation,
+    `op_${"o".repeat(20)}`,
+  );
+  const at = new Date().toISOString();
+  const row = await env.DB.prepare(
+    `SELECT length(CAST('INSERT INTO "retained_archives" VALUES(' || quote(?) || ',' || quote(?) || ',' || quote(?) || ',' || quote(?) || ',' || quote(CAST(? AS INTEGER)) || ',' || quote('') || ',' || quote(?) || ',' || quote(?) || ',' || quote(?) || ');' AS BLOB)) bytes`,
+  )
+    .bind(
+      "d".repeat(20),
+      `prj_${"p".repeat(20)}`,
+      region,
+      path,
+      String(generation),
+      at,
+      at,
+      claim,
+    )
+    .first<{ bytes: number }>();
+  return row!.bytes;
+}
+// The shortest row (a bucket and a region of 3 characters, generation 1, no claim) and the longest
+// `ARCHIVE_DESTINATION_PATTERN` allows (a bucket of 63 characters, `regions.backup_bucket`, a region
+// of 32, `regions.id`, a storage generation of 16 digits, and a claim held).
+const shortestRest = () => insertWithoutRoles("bbb", "rrr", 1, null);
+const longestRest = () =>
+  insertWithoutRoles(
+    "b".repeat(63),
+    "r".repeat(32),
+    Number.MAX_SAFE_INTEGER,
+    crypto.randomUUID(),
+  );
+
+it("the rest of the INSERT of a retained archive is 223 to 405 bytes", async () => {
+  expect(await shortestRest()).toBe(223);
+  expect(await longestRest()).toBe(405);
+  const stored = await deletedWithLargestRoles(4, 1);
+  expect(stored.statement - stored.roles).toBeGreaterThanOrEqual(223);
+  expect(stored.statement - stored.roles).toBeLessThanOrEqual(405);
+});
 
 it("a key version of 64 characters, the longest the keyring takes, can make a retained archive that D1 cannot import", async () => {
   const stored = await deletedWithLargestRoles(64, 1);
@@ -285,4 +342,31 @@ it("a key version of the live length cannot, whatever the roles and the revision
   const stored = await deletedWithLargestRoles(4, Number.MAX_SAFE_INTEGER);
   expect(stored.roles).toBe(96_401 + 2 * 100 + 15 * 100);
   expect(stored.statement).toBeLessThan(D1_STATEMENT_MAX);
+});
+
+it("a key version of 18 characters keeps every combination below the limit, and 19 does not", async () => {
+  // The most roles, a revision of 16 digits, the longest path and a held claim.
+  const rest = await longestRest();
+  const below = await deletedWithLargestRoles(18, Number.MAX_SAFE_INTEGER);
+  expect(below.roles).toBe(96_401 + 16 * 100 + 15 * 100);
+  expect(below.roles + rest).toBe(99_906);
+  const above = await deletedWithLargestRoles(19, Number.MAX_SAFE_INTEGER);
+  expect(above.roles + rest).toBe(100_006);
+  expect(above.roles + rest).toBeGreaterThan(D1_STATEMENT_MAX);
+});
+
+it("a key version of 34 characters and a first password can pass the limit, 33 cannot", async () => {
+  const rest = await longestRest();
+  const below = await deletedWithLargestRoles(33, 1);
+  expect(below.roles + rest).toBeLessThan(D1_STATEMENT_MAX);
+  const above = await deletedWithLargestRoles(34, 1);
+  expect(above.roles + rest).toBe(100_006);
+});
+
+it("a key version of 36 characters passes the limit whatever the path and the claim", async () => {
+  const stored = await deletedWithLargestRoles(36, 1);
+  expect(stored.roles + (await shortestRest())).toBeGreaterThan(
+    D1_STATEMENT_MAX,
+  );
+  expect(stored.statement).toBeGreaterThan(D1_STATEMENT_MAX);
 });
