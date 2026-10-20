@@ -127,15 +127,17 @@ so the API Worker visits every actor of a database that is not deleted, sleeping
 all, with a no-op call (`DatabaseActor.warm`) that reads and writes nothing: no row, no D1
 statement, no counter, no ticket.
 
-The visits come from `ActorWarmer` Durable Objects, one for every 250 databases (a stable hash of
-the database ID picks the shard), each from its own alarm loop. The minute cron's step
-`actor_warmers` counts the databases, arms one warmer per 250 of them and renews their three-minute
-lease; a warmer that is no longer armed stops by itself, so a cron that stops or an interval of 0
-ends the visits within three minutes, and a deploy or a fault that loses an alarm is repaired by
-the next minute. A warmer reads its list of databases from D1 every 60 s, not every cycle, so a
-new database is visited within about a minute of its creation and a deleted one stops being
-visited within about a minute. A visit that fails or does not answer within 3 s is counted and never delays the
-admission of any connection.
+The visits come from `ActorWarmer` Durable Objects, one for every 250 databases, each from its own
+alarm loop. A database ID is 20 random characters, so the warmers split the ID space into equal
+ranges (warmer k of n visits the IDs between the k-th and the (k+1)-th n-th of the space) and each
+holds about 250 databases give or take 6 %. The minute cron's step `actor_warmers` counts the live
+databases, arms one warmer per 250 of them and renews their three-minute lease; a warmer that is no
+longer armed stops by itself, so a cron that stops or an interval of 0 ends the visits within three
+minutes, and a deploy or a fault that loses an alarm is repaired by the next minute. A warmer reads
+the databases of its own range from D1 about every minute, not every cycle (see "D1 reads" below), so
+a new database is visited within about a minute of its creation and a deleted one stops being visited
+within about a minute. A visit that fails or does not answer within 3 s is counted and never delays
+the admission of any connection.
 
 | Setting | Where | Meaning |
 | --- | --- | --- |
@@ -148,23 +150,67 @@ minute cron afterwards arms the warmers, and their first visit comes one interva
 
 **Cost.** Each visit is one Durable Object request, so the cost is proportional to the number of
 databases and to the visit rate, and it is charged for sleeping databases as well. Per 1,000
-databases and 30 days (estimated from the measured figures of plan 11.1 at the pricing page of
-2026-10-18, not from an invoice): 324 million requests at an interval of 8 s (USD 0.15 per million:
-USD 48.6) plus about USD 5 of duration (billed only while an actor runs a call, not while it is
-loaded) is about USD 54; the measured figures at 10 s and 5 s are USD 43.6 and USD 83.8, and at
-30 s USD 16.3 with a tail of 250 to 317 ms at p95. The warmers add about USD 1 per shard and month
-(an alarm, one row written and about a second of duration every cycle: 324,000 cycles), that is
-about USD 4 per 1,000 databases, and one line of log per cycle and shard (324,000 a month). The
-list reads of D1 are one row per database and warmer a minute, which is below any quota. These are
-gross figures: the first million requests, 400,000 GB-s and 50 million rows written a month of the
-account's plan are not subtracted.
+databases and 30 days at an interval of 8 s (the Durable Object figures are estimated from the
+measured ones of plan 11.1 at the pricing page of 2026-10-18, not from an invoice):
+
+| Item | Per 1,000 databases and month | Basis |
+| --- | --- | --- |
+| DatabaseActor requests | 324 million, USD 48.6 | USD 0.15 per million; the measured figures at 10 s and 5 s are USD 43.6 and USD 83.8 in all, and at 30 s USD 16.3 with a tail of 250 to 317 ms at p95 |
+| DatabaseActor duration | about USD 5 | billed only while an actor runs a call, not while it is loaded |
+| The warmers | about USD 4 (about USD 1 per shard) | an alarm, one row written and about a second of duration every cycle: 324,000 cycles a shard |
+| D1 rows read | about 170 million, USD 0.17 gross | see "D1 reads"; inside the 25 billion rows a month the plan includes |
+| Workers Logs, if each visit is one invocation event | up to 324 million events, up to USD 194 | not measured, see "Workers Logs"; the cycle lines add 324,000 events a shard |
+
+All figures are gross: the first million requests, 400,000 GB-s, 50 million rows written, 25 billion
+rows read and 20 million log events a month of the account's plan are not subtracted. Without the
+log line the total is about USD 54 per 1,000 databases (USD 10 for 170, USD 18 for 300); with it, up
+to about USD 248 (USD 43 for 170) until the log setting below is decided.
+
+**D1 reads.** The cron's count reads two rows for each live database (the database and its
+project) every minute. Each warmer reads only its own range of the primary key's index, in one query
+of about 250 rows, every 64 s (it keeps the list for 60 s and a cycle comes every 8 s); a deleted
+database is read as well, one row, because deleted rows stay in D1. All warmers together therefore
+read each row once, not once for each warmer, and rows read a month are about 43,200 x 2 x L +
+40,500 x (2 x L + X) for L live and X deleted databases: 170 million for 1,000 live databases
+(USD 0.17 gross at USD 0.001 per million) and 10.4 billion for 50,000 live and 50,000 deleted ones,
+against the 25 billion a month the plan includes. D1 sees one query per warmer and minute (about 200
+for 50,000 databases) and one for the cron. Measured on the D1 of the tests: 8 databases, one of
+them deleted, read 15 rows (2 for each live database, 1 for the deleted one), the same with 2, 3 or
+5 warmers (at most one row more for each statement, the first key beyond a range). The production
+meter may count differently: read `rows_read` of the `SELECT d.id` statement in D1's analytics after
+the deploy and put it into this model.
+
+**Workers Logs.** The API Worker's Workers Logs hold request lines such as
+`POST /node/v1/observations` (the plan reads them), so its invocation logs are on, and Cloudflare's
+documentation lists RPC and alarm calls among the invocations that each produce one invocation log.
+If so, every visit is one billed event and every warmer alarm another: 324 million events per 1,000
+databases and month at 8 s, which is USD 194 at USD 0.60 per million events beyond the 20 million a
+month the plan includes (shared with every other log of the account), and 55 million events (USD 33
+gross, USD 21 if nothing else uses the 20 million included events) for 170 databases. From 1
+December 2026 Cloudflare bills logs by ingested volume instead (USD 0.25 per GB beyond 50 GB a
+month): USD 81 per 1,000 databases and month for every kilobyte an event holds. This is inferred
+from the documentation (pages read 2026-10-20), not measured: the account's log usage and the size
+of an event were not read. Before the costed go for the deploy:
+
+1. Read the account's Workers Logs usage (events a day), and look in Workers Logs of the API Worker
+   for events of a `DatabaseActor` RPC over the last hour: the minute cron and the Edge already call
+   the actors, so if such events exist every visit will produce one, and their size gives the size
+   of an event for the model.
+2. After the deploy, count those events in a window of ten minutes: 75 per database at 8 s if each
+   visit is logged, none if not, and compare the day's total with step 1.
+3. If the cost is not accepted, set `observability.logs.invocation_logs` to `false` in the private
+   API configuration (a key of the pinned wrangler's configuration schema). The visits and the
+   alarms then produce no events, and the console lines (`actor_warm_cycle`, `node_event`) stay;
+   what is lost is every request line of the API Worker (the `POST /node/v1/observations` kind).
+   `head_sampling_rate` is no substitute: it drops whole invocations, console lines included.
 
 **Observing it.** Each cycle of a warmer writes one line, `actor_warm_cycle`, to Workers Logs with
 `shard`, `shards`, `databases`, `visited`, `failed`, `cycle_ms`, `interval_ms`, `overrun` and
-`list_error`; there is never a line per visit. A healthy shard shows `visited` equal to
-`databases`, `failed` 0, a `cycle_ms` of a second or less and `overrun` false (a first cycle after
-a deploy, with every actor cold, can take about ten seconds). `overrun` true again and again means
-the shard's cycle takes longer than the interval: raise the interval or check the actors.
+`list_error`; there is never a console line per visit (the invocation events of "Workers Logs" above
+are the platform's). A healthy shard shows `visited` equal to `databases`, `failed` 0, a `cycle_ms`
+of a second or less and `overrun` false (a first cycle after a deploy, with every actor cold, can
+take about ten seconds). `overrun` true again and again means the shard's cycle takes longer than
+the interval: raise the interval or check the actors.
 `actor_warm_failed` is an unexpected fault of a cycle and does not stop the loop. The effect shows
 in the Edge's admission lines: `admit_ms` of the first connect to a database that was idle falls
 from a cold actor's 200 to 600 ms to the warm actor's 40 to 80 ms.

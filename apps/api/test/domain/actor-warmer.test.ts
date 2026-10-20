@@ -17,7 +17,7 @@ import {
 import {
   ACTOR_WARM_LEASE_MS,
   ACTOR_WARM_LIST_TTL_MS,
-  actorWarmShard,
+  actorWarmRange,
   actorWarmer,
   armActorWarmers,
   warmCycle,
@@ -117,17 +117,63 @@ const d1Lists = (prepare: MockInstance) =>
   prepare.mock.calls.filter((call) => String(call[0]).includes("SELECT d.id"))
     .length;
 
-it("assigns every database to exactly one shard, the same one every time, and spreads them evenly", () => {
+/** Whether `id` is in shard `shard` of `shards`. */
+const inShard = (id: string, shard: number, shards: number) => {
+  const { after, upto } = actorWarmRange(shard, shards);
+  return id > after && (upto === null || id <= upto);
+};
+
+it("splits the id space into ranges that follow each other with no gap and no overlap, so every id is in exactly one shard, and spreads random ids evenly", () => {
+  expect(actorWarmRange(0, 1)).toEqual({ after: "", upto: null });
+  for (const shards of [2, 3, 7, 40, 200]) {
+    const ranges = Array.from({ length: shards }, (_unused, shard) =>
+      actorWarmRange(shard, shards),
+    );
+    expect(ranges[0]!.after).toBe("");
+    expect(ranges.at(-1)!.upto).toBeNull();
+    for (let shard = 1; shard < shards; shard++) {
+      // The upper end of a range is the lower end of the next: no id falls between them.
+      expect(ranges[shard - 1]!.upto).toBe(ranges[shard]!.after);
+      // And they increase, in the byte order of D1's index.
+      expect(ranges[shard]!.after > ranges[shard - 1]!.after).toBe(true);
+    }
+  }
   const ids = Array.from({ length: 7000 }, newDatabaseId);
   const counts = new Array<number>(7).fill(0);
   for (const id of ids) {
-    const shard = actorWarmShard(id, 7);
-    expect(shard).toBe(actorWarmShard(id, 7));
-    expect(Number.isInteger(shard) && shard >= 0 && shard < 7).toBe(true);
-    counts[shard]!++;
+    const shards = [0, 1, 2, 3, 4, 5, 6].filter((shard) =>
+      inShard(id, shard, 7),
+    );
+    expect(shards).toHaveLength(1);
+    counts[shards[0]!]!++;
   }
   for (const count of counts) expect(Math.abs(count - 1000)).toBeLessThan(150);
-  expect(ids.every((id) => actorWarmShard(id, 1) === 0)).toBe(true);
+  // The first and the last id of the alphabet, and the ids next to a boundary.
+  const edges = [
+    "a" + "0".repeat(19),
+    "z" + "z".repeat(19),
+    ...[3, 40].flatMap((shards) =>
+      Array.from({ length: shards - 1 }, (_unused, k) => {
+        const boundary = actorWarmRange(k + 1, shards).after;
+        return [boundary + "0".repeat(17), boundary + "z".repeat(17)];
+      }).flat(),
+    ),
+  ];
+  for (const id of edges)
+    for (const shards of [3, 40])
+      expect(
+        Array.from({ length: shards }, (_unused, shard) => shard).filter(
+          (shard) => inShard(id, shard, shards),
+        ),
+      ).toHaveLength(1);
+  // Every shard of 200 holds ids of the whole 7000: no range is empty, none holds a tenth of them.
+  const wide = new Array<number>(200).fill(0);
+  for (const id of Array.from({ length: 20000 }, newDatabaseId))
+    for (let shard = 0; shard < 200; shard++)
+      if (inShard(id, shard, 200)) wide[shard]!++;
+  expect(wide.reduce((sum, count) => sum + count, 0)).toBe(20000);
+  expect(Math.min(...wide)).toBeGreaterThan(50);
+  expect(Math.max(...wide)).toBeLessThan(160);
 });
 
 it("a cycle visits every database of its shard once, and no other, within the interval, and logs one line", async () => {
@@ -137,7 +183,7 @@ it("a cycle visits every database of its shard once, and no other, within the in
   const seen: string[] = [];
   for (let shard = 0; shard < 3; shard++) {
     visits.visited.length = 0;
-    const expected = ids.filter((id) => actorWarmShard(id, 3) === shard);
+    const expected = ids.filter((id) => inShard(id, shard, 3));
     const result = await warmCycle(
       env,
       { shard, shards: 3, interval_ms: INTERVAL },
@@ -271,6 +317,131 @@ it("keeps visiting the last list it read when D1 cannot be read, and visits noth
   expect(none).toMatchObject({ databases: 0, list_error: "d1_unavailable" });
 });
 
+const ONE_SHARD = { shard: 0, shards: 1, interval_ms: INTERVAL };
+
+it("a cycle with fewer workers than databases still visits every database exactly once", async () => {
+  const ids = await databases(7);
+  const visits = await recordVisits(ids[0]!);
+  for (const concurrency of [1, 2, 3, 6, 7, 16]) {
+    visits.visited.length = 0;
+    const result = await warmCycle(env, ONE_SHARD, {}, Date.now(), {
+      concurrency,
+    });
+    // Sorted lists, so that a skipped id and a repeated one both fail.
+    expect([...visits.visited].sort()).toEqual([...keys(ids)].sort());
+    expect(result).toMatchObject({ databases: 7, visited: 7, failed: 0 });
+  }
+});
+
+it("reads a list longer than a page in pages and visits every database of every page once", async () => {
+  const ids = await databases(5);
+  const prepare = vi.spyOn(Object.getPrototypeOf(env.DB), "prepare");
+  const visits = await recordVisits(ids[0]!);
+  const before = d1Lists(prepare);
+  const result = await warmCycle(env, ONE_SHARD, {}, Date.now(), {
+    listPage: 2,
+  });
+  // Pages of 2, 2 and 1: the short page ends the list.
+  expect(d1Lists(prepare) - before).toBe(3);
+  expect([...visits.visited].sort()).toEqual([...keys(ids)].sort());
+  expect(result).toMatchObject({ databases: 5, visited: 5, failed: 0 });
+});
+
+/**
+ * Wraps the list statements of the warmers: records each one's SQL and bound values, and the
+ * rows D1 says it read for it. The statement itself is the real one.
+ */
+function meterLists() {
+  const lists: { sql: string; values: unknown[]; rowsRead: number }[] = [];
+  const database = Object.getPrototypeOf(env.DB) as D1Database;
+  const prepare = database.prepare;
+  const meter = (
+    statement: D1PreparedStatement,
+    sql: string,
+    values: unknown[],
+  ): D1PreparedStatement =>
+    new Proxy(statement, {
+      get(inner, key) {
+        if (key === "bind")
+          return (...bound: unknown[]) =>
+            meter(inner.bind(...bound), sql, bound);
+        if (key === "all")
+          return async () => {
+            const result = await inner.all();
+            lists.push({ sql, values, rowsRead: result.meta.rows_read });
+            return result;
+          };
+        const member = Reflect.get(inner, key) as unknown;
+        return typeof member === "function"
+          ? (member as () => unknown).bind(inner)
+          : member;
+      },
+    });
+  vi.spyOn(database, "prepare").mockImplementation(function (
+    this: D1Database,
+    sql: string,
+  ) {
+    const statement = prepare.call(this, sql);
+    return sql.includes("SELECT d.id") ? meter(statement, sql, []) : statement;
+  });
+  return lists;
+}
+
+it("each warmer reads only its own share of D1, so all warmers together read the databases once, by the id index", async () => {
+  const ids = await databases(8);
+  // A deleted database is read by the range that holds it, as every row of the id index is.
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='deleted',deleted_at=? WHERE id=?",
+  )
+    .bind(new Date().toISOString(), ids[7]!)
+    .run();
+  const lists = meterLists();
+  const rows = async (shards: number, listPage?: number) => {
+    lists.length = 0;
+    let counted = 0;
+    for (let shard = 0; shard < shards; shard++)
+      counted += (
+        await warmCycle(
+          env,
+          { shard, shards, interval_ms: INTERVAL },
+          {},
+          Date.now(),
+          { listPage },
+        )
+      ).databases;
+    return {
+      counted,
+      rowsRead: lists.reduce((sum, list) => sum + list.rowsRead, 0),
+      statements: lists.slice(),
+    };
+  };
+  const whole = await rows(1);
+  expect(whole.counted).toBe(7);
+  expect(whole.rowsRead).toBeGreaterThan(0);
+  for (const shards of [2, 3, 5]) {
+    const split = await rows(shards, 2);
+    // Every live database was listed once and every row read once, however many warmers: the
+    // index scan of a range reads at most the first key beyond it, so a statement costs at most
+    // one row more. Listing the whole table in every warmer would read `shards` times as much.
+    expect(split.counted).toBe(7);
+    expect(split.rowsRead).toBeGreaterThanOrEqual(whole.rowsRead);
+    expect(split.rowsRead).toBeLessThanOrEqual(
+      whole.rowsRead + split.statements.length,
+    );
+    // The statement is a search of the id index, never a scan.
+    for (const { sql, values } of split.statements) {
+      const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${sql}`)
+        .bind(...values)
+        .all<{ detail: string }>();
+      const details = plan.results.map((row) => row.detail).join("\n");
+      expect(details).toMatch(
+        /SEARCH d USING INDEX sqlite_autoindex_databases_1/,
+      );
+      expect(details).not.toMatch(/SCAN d/);
+    }
+  }
+});
+
 it("reaches the actors and the warmers by the namespace, the name and the location hint the Edge uses", async () => {
   const ids = await databases(2);
   // Both namespaces are one class of binding, so one spy sees every `get`.
@@ -327,12 +498,14 @@ it("arms one warmer for every shard-size databases, each with its shape, a lease
   });
   const lease = ((await configOf(1)) as { lease_until: number }).lease_until;
   expect(lease).toBeGreaterThanOrEqual(before + ACTOR_WARM_LEASE_MS);
-  // Arming again renews the lease and keeps the alarm that is pending.
+  // Arming again, some time later, moves the lease on by that time and keeps the alarm that is
+  // pending: a lease that were kept would end every warmer three minutes after its first arming.
+  await new Promise((resolve) => setTimeout(resolve, 30));
   await armActorWarmers(on(), size);
   expect([await alarmOf(0), await alarmOf(1)]).toEqual(first);
-  expect(
-    ((await configOf(1)) as { lease_until: number }).lease_until,
-  ).toBeGreaterThanOrEqual(lease);
+  const renewed = ((await configOf(1)) as { lease_until: number }).lease_until;
+  expect(renewed).toBeGreaterThanOrEqual(lease + 25);
+  expect(renewed).toBeLessThan(lease + 5000);
 });
 
 it("interval 0 schedules nothing and calls no warmer; an unset interval is eight seconds; an invalid one is refused", async () => {

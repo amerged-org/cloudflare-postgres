@@ -9,14 +9,18 @@
 //   time waiting for the actors; its own CPU is the creation of the stubs and the calls, well under
 //   a second for a shard.
 // - An invocation may make up to 10,000 subrequests (1,000 on the older plans, which this stays
-//   under too). A cycle makes one call per database of its shard (`ACTOR_WARM_SHARD_SIZE` is 250,
-//   with room for the spread of the hash) and a D1 query per 1,000 databases when it reads its
-//   list, which is once per `ACTOR_WARM_LIST_TTL_MS`.
-// - The six-connection limit is for fetch, KV, R2 and the like, not for calls to Durable Objects;
-//   the cron already runs 8 at a time (`ACTOR_RECONCILE_CONCURRENCY`), and a cycle runs
-//   `ACTOR_WARM_CONCURRENCY`. A shard of 250 warm actors (about 50 ms a visit) takes under a second;
-//   one of cold actors (up to 600 ms a visit) about 10 s, once, after a deploy. The cycle line
-//   reports `overrun` when a cycle outlasts its interval.
+//   under too). A cycle makes one call per database of its shard (`ACTOR_WARM_SHARD_SIZE` is 250
+//   on average; a random range of the ID space holds that many, give or take 6 % at one
+//   standard deviation)
+//   and, when it reads its list, one D1 query per 1,000 databases of its own range, once per
+//   `ACTOR_WARM_LIST_TTL_MS`. D1 therefore sees about one query of about 250 rows per warmer and
+//   minute, and every row of `databases` is read by one warmer only.
+// - The six-connection limit is listed for fetch, KV, R2 and the like, not for calls to Durable
+//   Objects; the cron already runs 8 at a time (`ACTOR_RECONCILE_CONCURRENCY`), and a cycle runs
+//   `ACTOR_WARM_CONCURRENCY`. If the runtime did queue calls beyond six, the visits would wait,
+//   not fail: a shard of 250 warm actors (about 50 ms a visit) would take about two seconds, which
+//   the cycle line shows as `cycle_ms`, and `overrun` says when a cycle outlasts its interval.
+//   A shard of cold actors (up to 600 ms a visit) takes about 10 s once, after a deploy.
 import type { ActorWarmerShape } from "../actor-warmer.ts";
 import type { Env } from "../env.ts";
 import { cronErrorCode } from "./cron-health.ts";
@@ -26,7 +30,7 @@ import { databaseActor } from "./database-actor-sync.ts";
 export const ACTOR_WARM_INTERVAL_MS = 8_000;
 const ACTOR_WARM_MIN_INTERVAL_MS = 1_000;
 const ACTOR_WARM_MAX_INTERVAL_MS = 300_000;
-/** The databases one warmer visits at most, on average: the cron arms one warmer for each. */
+/** The databases one warmer visits, on average: the cron arms one warmer for each. */
 export const ACTOR_WARM_SHARD_SIZE = 250;
 /** Visits in flight at once in one cycle. */
 export const ACTOR_WARM_CONCURRENCY = 16;
@@ -73,14 +77,39 @@ export function actorWarmInterval(value: string | undefined): number {
   return interval;
 }
 
-/** The shard of a database among `shards`: FNV-1a over its id, stable and evenly spread. */
-export function actorWarmShard(id: string, shards: number): number {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < id.length; index++) {
-    hash ^= id.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0) % shards;
+/** The ids that sort first among the lowercase letters and digits of a database ID (digits before letters, as bytes sort). */
+const ID_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz";
+const ID_LETTERS = ID_DIGITS.slice(10);
+/** The ID space as three positions: a letter, then two characters of letters and digits. */
+const ID_BUCKETS = ID_LETTERS.length * ID_DIGITS.length ** 2;
+
+/**
+ * The ids of shard `shard` of `shards`: those greater than `after` and not greater than `upto`
+ * (`null` is no upper end), in the byte order D1 sorts them in. A database ID is 20 random
+ * characters, a letter and then letters and digits (`DATABASE_ID_PATTERN`), so equal slices of the
+ * ID space hold about the same number of databases, and a warmer can read its share from the
+ * primary key's index alone: the rows all warmers read together are the databases once, not
+ * once for every warmer. The boundaries are the first three characters of the ID at k/shards of
+ * the space; a database ID is longer, so none equals a boundary, and the ranges of the shards
+ * follow each other with no gap and no overlap whatever the number of shards.
+ */
+export function actorWarmRange(
+  shard: number,
+  shards: number,
+): { after: string; upto: string | null } {
+  const boundary = (index: number): string => {
+    const bucket = Math.floor((index * ID_BUCKETS) / shards);
+    const second = Math.floor(bucket / ID_DIGITS.length) % ID_DIGITS.length;
+    return (
+      ID_LETTERS[Math.floor(bucket / ID_DIGITS.length ** 2)]! +
+      ID_DIGITS[second]! +
+      ID_DIGITS[bucket % ID_DIGITS.length]!
+    );
+  };
+  return {
+    after: shard === 0 ? "" : boundary(shard),
+    upto: shard === shards - 1 ? null : boundary(shard + 1),
+  };
 }
 
 /** The warmer of a shard, placed with the location hint of the actors it visits. */
@@ -112,22 +141,28 @@ async function within<T>(ms: number, call: Promise<T>): Promise<T> {
   }
 }
 
-/** The live databases of one shard, in id order: D1 is read in pages and the hash picks the shard. */
+/** The live databases of one shard, in id order: its range of the id index, read in keyset pages. */
 async function listShard(
   db: D1Database,
   { shard, shards }: ActorWarmerShape,
+  page: number,
 ): Promise<string[]> {
+  const range = actorWarmRange(shard, shards);
+  const bounded = range.upto === null ? "" : " AND d.id<=?";
   const ids: string[] = [];
-  let after = "";
+  let after = range.after;
   for (;;) {
-    const page = await db
-      .prepare(`SELECT d.id ${LIVE} AND d.id>? ORDER BY d.id LIMIT ?`)
-      .bind(after, LIST_PAGE)
-      .all<{ id: string }>();
-    for (const { id } of page.results)
-      if (actorWarmShard(id, shards) === shard) ids.push(id);
-    if (page.results.length < LIST_PAGE) return ids;
-    after = page.results.at(-1)!.id;
+    const statement = db.prepare(
+      `SELECT d.id ${LIVE} AND d.id>?${bounded} ORDER BY d.id LIMIT ?`,
+    );
+    const rows = await (
+      range.upto === null
+        ? statement.bind(after, page)
+        : statement.bind(after, range.upto, page)
+    ).all<{ id: string }>();
+    for (const { id } of rows.results) ids.push(id);
+    if (rows.results.length < page) return ids;
+    after = rows.results.at(-1)!.id;
   }
 }
 
@@ -143,7 +178,11 @@ export async function warmCycle(
   target: ActorWarmerShape,
   cache: WarmCache,
   now = Date.now(),
-  limits: { concurrency?: number; visitTimeoutMs?: number } = {},
+  limits: {
+    concurrency?: number;
+    visitTimeoutMs?: number;
+    listPage?: number;
+  } = {},
 ): Promise<WarmCycle> {
   const started = Date.now();
   const same = (list: WarmCache["list"]) =>
@@ -155,7 +194,7 @@ export async function warmCycle(
         shard: target.shard,
         shards: target.shards,
         at: now,
-        ids: await listShard(env.DB, target),
+        ids: await listShard(env.DB, target, limits.listPage ?? LIST_PAGE),
       };
     } catch (error) {
       listError = cronErrorCode(error);
