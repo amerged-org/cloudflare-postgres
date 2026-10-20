@@ -533,6 +533,35 @@ test("splits the dump at statement boundaries into chunks that load one by one a
   }
 });
 
+test("cuts a chunk at the statement bound when the byte bound is far away", async () => {
+  const { dir, done } = await workspace();
+  try {
+    const input = join(dir, "dump.sql");
+    await writeFile(input, OUT_OF_ORDER);
+    // The whole dump is far below a megabyte, so only the three statements can cut a chunk.
+    const plan = await chunkSql(input, dir, {
+      chunkBytes: 1 << 20,
+      chunkStatements: 3,
+    });
+    // The last chunk is the rest (sequences, indexes, triggers), which is never cut.
+    const bounded = plan.chunks.slice(0, -1).map((chunk) => chunk.statements);
+    assert.ok(bounded.length >= 3, `${bounded}`);
+    assert.ok(
+      bounded.every((n) => n <= 3),
+      `${bounded}`,
+    );
+    assert.equal(Math.max(...bounded), 3);
+    assert.ok(plan.chunks.every((chunk) => chunk.bytes < 1 << 20));
+    const loaded = await loadChunks(plan.chunks),
+      whole = loadWhole(OUT_OF_ORDER);
+    assert.deepEqual(snapshot(loaded), snapshot(whole));
+    loaded.close();
+    whole.close();
+  } finally {
+    await done();
+  }
+});
+
 test("keeps the tables that reference each other, or themselves, in one chunk whatever the bound, and reads every way a table is named", async () => {
   const { dir, done } = await workspace();
   try {
@@ -624,10 +653,11 @@ if (args[0] === "d1" && args[1] === "list") {
       bytes: text.length,
       firstInsert: text.indexOf("INSERT INTO"),
       lastCreate: text.lastIndexOf("CREATE TABLE"),
+      inserts: (text.toString("utf8").match(/^INSERT INTO /gm) || []).length,
     };
     if (state.hold) { save(); fs.writeFileSync(state.hold + ".tmp", String(process.pid)); fs.renameSync(state.hold + ".tmp", state.hold); setInterval(() => {}, 1000); return; }
     if (state.failImport || state.failImportCall === number) { save(); process.stderr.write("SQLITE_ERROR near " + text.toString("utf8", 0, 40) + "\\n"); process.exit(1); }
-    if (state.maxFileBytes && text.length > state.maxFileBytes) { save(); process.stdout.write(JSON.stringify({ D1_RESET_DO: true }) + "\\n"); process.exit(1); }
+    if (state.maxFileBytes && text.length > state.maxFileBytes) { save(); (state.resetOnStderr ? process.stderr : process.stdout).write(JSON.stringify({ D1_RESET_DO: true }) + "\\n"); process.exit(1); }
     db.exec("BEGIN;");
     try { db.exec(text.toString("utf8")); db.exec("COMMIT;"); }
     catch (error) { db.exec("ROLLBACK;"); save(); process.stderr.write(String(error.message) + "\\n"); process.exit(1); }
@@ -652,6 +682,8 @@ async function wranglerFixture(
     failImportCall?: number;
     /** Imports of a file larger than this reset the database, as the provider does. */
     maxFileBytes?: number;
+    /** The reset body goes to stderr instead of stdout. */
+    resetOnStderr?: boolean;
     looseForeignKeys?: boolean;
     /** A file the fake writes its process ID to, and then never answers. */
     hold?: string;
@@ -670,6 +702,7 @@ async function wranglerFixture(
     failImport: overrides.failImport ?? false,
     failImportCall: overrides.failImportCall,
     maxFileBytes: overrides.maxFileBytes,
+    resetOnStderr: overrides.resetOnStderr ?? false,
     looseForeignKeys: overrides.looseForeignKeys ?? false,
     hold: overrides.hold,
     calls: [] as {
@@ -683,6 +716,7 @@ async function wranglerFixture(
         bytes: number;
         firstInsert: number;
         lastCreate: number;
+        inserts: number;
       };
     }[],
   };
@@ -826,6 +860,14 @@ test("imports a dump the provider resets as one file in bounded chunks, parents 
       -1,
       "the first chunk is schema",
     );
+    // The statement bound applies where the byte bound is far away: this dump's rows are about
+    // 230 bytes, so 5,000 of them are 1.1 MB, and without the bound a chunk would take 9,000.
+    const rowStatements = imports.map((call) => call.file!.inserts);
+    assert.ok(
+      rowStatements.every((n) => n <= 5000),
+      `${rowStatements}`,
+    );
+    assert.equal(Math.max(...rowStatements), 5000);
     // The foreign key check is asked of the scratch database, by its ID, after the last chunk.
     const check = calls.findIndex((call) =>
       call.args.includes("PRAGMA foreign_key_check"),
@@ -1071,6 +1113,85 @@ test("stops at the chunk that fails with its number and wrangler's exit code, an
     // A second run on that database is refused before anything is written; the operator deletes it.
     await assert.rejects(go(), refused("database_not_empty"));
     assert.equal((await fixture.calls()).filter((call) => call.file).length, 3);
+  } finally {
+    await done();
+  }
+});
+
+test("names the failed chunk's size, and says whether D1 reset the database, without printing wrangler's text", async () => {
+  const { dir, done } = await workspace();
+  try {
+    const { bytes } = await artifact(OUT_OF_ORDER_BYTES),
+      input = join(dir, "d1-control.pgcfenc"),
+      dump = join(dir, "dump.sql");
+    await writeFile(input, bytes);
+    await writeFile(dump, OUT_OF_ORDER);
+    const bounds = { chunkBytes: 150, chunkStatements: 3 },
+      planned = (await chunkSql(dump, dir, bounds)).chunks,
+      failure = async (
+        overrides: Parameters<typeof wranglerFixture>[1],
+      ): Promise<{ message: string; sizes: number[] }> => {
+        const fixture = await wranglerFixture(dir, overrides);
+        let message = "";
+        await assert.rejects(
+          importArtifact(
+            {
+              input,
+              keyring: KEYRING,
+              keysEnvironment: "PGCF_TEST_KEYS",
+              database: "pgcf-restore-drill",
+              wrangler: fixture.wrangler,
+              ...bounds,
+            },
+            { environment: fixture.environment, log: () => {} },
+          ),
+          (error) => {
+            message = (error as Error).message;
+            return refused("wrangler_failed")(error);
+          },
+        );
+        const sizes = (await fixture.calls())
+          .filter((call) => call.file)
+          .map((call) => call.file!.bytes);
+        return { message, sizes };
+      };
+    // wrangler's text and the SQL it may quote are never printed, whatever the cause.
+    const quiet = (message: string) =>
+      assert.ok(
+        !/SQLITE_ERROR|PRAGMA|CREATE|INSERT|\{|true/.test(message),
+        message,
+      );
+    // Chunk 3 fails with an SQL error: the size is the chunk's own, and it was not a reset.
+    const sql = await failure({ failImportCall: 3 });
+    assert.equal(sql.sizes.length, 3);
+    assert.ok(
+      sql.message.includes(
+        `chunk 3 of ${planned.length} failed (${planned[2]!.statements} statements, ${sql.sizes[2]} bytes): `,
+      ),
+      sql.message,
+    );
+    assert.equal(sql.sizes[2], planned[2]!.bytes);
+    assert.ok(/D1_RESET_DO in its output: no/.test(sql.message), sql.message);
+    assert.ok(/exit code 1/.test(sql.message), sql.message);
+    quiet(sql.message);
+    // The provider resets the database on every file: chunk 1, the body on stdout or on stderr.
+    for (const resetOnStderr of [false, true]) {
+      const reset = await failure({ maxFileBytes: 1, resetOnStderr });
+      assert.equal(reset.sizes.length, 1);
+      assert.ok(
+        reset.message.includes(
+          `chunk 1 of ${planned.length} failed (${planned[0]!.statements} statements, ${reset.sizes[0]} bytes): `,
+        ),
+        reset.message,
+      );
+      assert.ok(
+        /D1_RESET_DO in its output: yes/.test(reset.message),
+        reset.message,
+      );
+      assert.ok(/exit code 1/.test(reset.message), reset.message);
+      assert.ok(/delete/.test(reset.message), reset.message);
+      quiet(reset.message);
+    }
   } finally {
     await done();
   }

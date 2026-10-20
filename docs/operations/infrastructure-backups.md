@@ -437,23 +437,39 @@ wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
    and SHA-256, the scratch database's ID, the number of chunks and a line for each chunk imported,
    `foreign_key_check: no violations`, and the counts. It never prints SQL, the keyring, the
    control database's ID or wrangler's own text about the import, which can quote a statement; if
-   a chunk fails, it reports the chunk's number and wrangler's exit code. To read wrangler's message,
-   write the verified SQL with `decrypt --input FILE --output FILE --keys-env NAME` (mode `0600`,
-   never over an existing file), run the import by hand, and delete the file afterwards.
+   a chunk fails, it reports the chunk's number, its statement and byte counts, wrangler's exit
+   code and whether wrangler's output contained `D1_RESET_DO` (yes or no, nothing else of it).
 
-   **Time.** Each chunk is one wrangler run (an upload to R2, the provider's ingest, and polling
-   until it ends), so an import takes minutes for tens of MB, not seconds; the first artifact
-   (31.8 MB) is about 18 chunks. wrangler's own lines are not shown, so the tool is silent while a
-   chunk runs; it stops a chunk that takes more than 10 minutes.
+   **Progress.** Each chunk is one wrangler run (an upload to R2, the provider's ingest, and polling
+   until it ends); the first artifact (31.8 MB) is about 18 chunks. wrangler's own lines are not
+   shown, so the tool prints a line when a chunk is imported and nothing while one runs; it stops a
+   chunk that runs for 10 minutes.
 
-   **If a chunk fails.** The error reads `chunk N of M failed: wrangler d1 execute failed (exit code
-   C)`. The chunks before it are committed and N itself is not (wrangler: a failed import returns
-   the database to its original state), so the scratch database is half filled. There is no resume:
-   a retry on that database is refused (`already has N schema objects`), because importing again
-   would duplicate rows. Delete the scratch database (step 7), create a new one (step 3) and run
-   the import again. If D1 reset the database (exit code 1 after a chunk of the full size), lower
-   `--chunk-bytes` and `--chunk-statements` (half of the values the run printed) for the new
-   scratch database; record the values that pass in the ULTRA plan.
+   **If a chunk fails.** The error reads `chunk N of M failed (S statements, B bytes): wrangler d1
+   execute failed (exit code C); D1_RESET_DO in its output: yes` (or `no`). The chunks before it are
+   committed and N itself is not (wrangler: a failed import returns the database to its original
+   state), so the scratch database is half filled. There is no resume: a retry on that database is
+   refused (`already has N schema objects`), because importing again would duplicate rows. Delete
+   the scratch database (step 7) and create a new one (step 3) before importing again. What to
+   change depends on the yes or no:
+   - **`yes`:** the provider reset the D1 database while it ran a chunk of S statements and B bytes.
+     Run the import on the new scratch database with `--chunk-bytes` and `--chunk-statements` at
+     half of the values the run printed on its `chunks of at most` line, and record the values that
+     pass in the ULTRA plan. Halving cannot shrink a chunk that is never cut: the last one
+     (sequences, indexes, triggers and views), one statement above the byte bound, and tables that
+     reference each other (the `loaded in one chunk` line). If B is such a chunk, keep the artifact
+     and report the numbers.
+   - **`no`:** this is not a reset, and smaller chunks change nothing. wrangler failed for another
+     reason: D1 refused a statement, a token or login was refused, the network failed, or the
+     10-minute stop ended the chunk (the error then says `timeout` instead of an exit code). Import
+     once more into a new scratch database; a network or provider error usually does not repeat at
+     the same chunk. If the same chunk number fails again with `no` and the same S and B, the cause
+     is that chunk or the account, and wrangler's message stays unprinted because it can quote the
+     SQL. Write the verified SQL with `decrypt --input FILE --output FILE --keys-env NAME` (mode
+     `0600`, never over an existing file), load it into a plain SQLite shell with
+     `sqlite3 :memory: < FILE` to see whether the dump itself loads (if it does, D1 refused a
+     statement that SQLite accepts: report N, S and B), and delete the file afterwards. Do not
+     import the whole file by hand to read a chunk's error: the whole file is what D1 reset.
 
    Ctrl-C, `kill` and a closed terminal (SIGINT, SIGTERM, SIGHUP) stop wrangler, remove the
    decrypted SQL and end the run with exit code 130, 143 or 129. A run killed with SIGKILL, or by a
@@ -499,13 +515,15 @@ wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
 tables, the largest `usage_samples` with 30,722 rows) decrypted, authenticated and held to its
 receipt, but importing it as one file failed three times: wrangler exited with code 1 and the
 error body `{"D1_RESET_DO":true}`, with no row read or written. The provider reset the D1 database
-while it ran one 31 MB file. Cloudflare documents no limit that this breaks: an import through
-`wrangler d1 execute --file` is limited to 5 GiB (the file goes to R2), one statement to 100,000
-bytes, one row to 2 MB and one API request to 30 seconds. Its list of resets names a storage
-operation that "writes a large amount of data and takes too long", the database's isolate
-exceeding its memory limit, and CPU time exceeded by "a large import/export", and advises splitting
-the work; `D1_RESET_DO` itself is not documented and the response names no reason, so **which of
-them it was is not established**. Each of them grows with the work one import does, and one file of
+while it ran one 31 MB file. 31 MB reaches none of the size limits Cloudflare documents: an import
+through `wrangler d1 execute --file` is limited to 5 GB (the file goes to R2), one statement to
+100,000 bytes and one row to 2 MB; whether the 30-second limit on a query or API request applies to
+an import is not documented. Cloudflare's D1 debugging page lists a query that is "trying to write a
+large amount of information (e.g. GBs), and is taking too long" (written for gigabytes, which 31 MB
+is not), the database's isolate exceeding its memory limit, and CPU time exceeded when "attempting
+a large import/export", and advises splitting the work; it also lists an internal error or code
+update, for which it says to retry. `D1_RESET_DO` itself is not documented and the response names no
+reason, so **which of them it was is not established**. Each of them grows with the work one import does, and one file of
 31 MB and at least 47,000 rows (the five largest tables alone) is a great deal of it. The tool therefore bounds the work of
 every import and does not rely on a number it has not seen.
 
@@ -560,6 +578,6 @@ foreign_key_check`. The provider's own export and import are first tried by the 
 | `differs from the API's receipt` | The artifact is not the one the receipt describes, or it was replaced in R2. Treat it as unverified. |
 | `is the database this artifact was exported from` | The name resolves to the control database. Create a new scratch database. |
 | `already has N schema objects` | The target is not empty, or an earlier import stopped in it. Delete it and create a new scratch database. |
-| `chunk N of M failed` | The chunk did not import; chunks before it did. See "If a chunk fails" under step 5. |
+| `chunk N of M failed (S statements, B bytes)` | The chunk did not import; chunks before it did. The `D1_RESET_DO in its output` yes or no decides the next step: see "If a chunk fails" under step 5. |
 | `PRAGMA foreign_key_check found N rows without a parent` | The scratch database is not a faithful copy of the artifact. Do not rely on it; keep the artifact and report the tables named. |
 

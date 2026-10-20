@@ -1060,10 +1060,13 @@ export interface ImportDependencies {
   log: (line: string) => void;
 }
 
-// What D1 keeps for itself (`sqlite_*`, `_cf_*`) is not the database's. A scratch database must hold
-// no object of any kind before an import; what an import made is counted as tables.
 // One chunk is a few MiB; a chunk that takes longer than this is stuck, not slow.
 const CHUNK_TIMEOUT_MS = 10 * 60 * 1000;
+// The body wrangler prints when the provider resets the D1 database during an import, a size
+// problem that lower chunk bounds answer. The token is not documented by Cloudflare.
+const RESET_TOKEN = "D1_RESET_DO";
+// What D1 keeps for itself (`sqlite_*`, `_cf_*`) is not the database's. A scratch database must hold
+// no object of any kind before an import; what an import made is counted as tables.
 const SCHEMA_OBJECTS = String.raw`SELECT COUNT(*) AS n FROM sqlite_schema WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\' AND name NOT LIKE '\_cf\_%' ESCAPE '\'`,
   TABLES = `${SCHEMA_OBJECTS} AND type = 'table'`;
 
@@ -1097,10 +1100,11 @@ async function wranglerRun(
             : error.killed
               ? "timeout"
               : "it did not start";
-        // The text of a failed import can quote the SQL; the other calls carry none.
+        // The text of a failed import can quote the SQL; the other calls carry none. Of an import's
+        // text only whether it holds the provider's reset token is said, a yes or a no.
         const detail = context.stderrIsSafe
           ? `: ${err.trim().split("\n").slice(0, 3).join(" ").slice(0, 300)}`
-          : "";
+          : `; ${RESET_TOKEN} in its output: ${out.includes(RESET_TOKEN) || err.includes(RESET_TOKEN) ? "yes" : "no"}`;
         fail(
           new RestoreError(
             "wrangler_failed",
@@ -1294,7 +1298,7 @@ export async function importArtifact(
         // The chunks before this one are committed: the database is half filled.
         throw new RestoreError(
           error.code,
-          `${where} failed: ${error.message}; delete "${options.database}" and create a new scratch database before importing again`,
+          `${where} failed (${chunk.statements} statements, ${chunk.bytes} bytes): ${error.message}; delete "${options.database}" and create a new scratch database before importing again`,
         );
       }
       await rm(chunk.path);
