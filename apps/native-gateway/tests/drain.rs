@@ -113,6 +113,10 @@ struct Unit {
 }
 impl Unit {
     async fn start(bin: &Path) -> Self {
+        Self::start_after(bin, Duration::ZERO).await
+    }
+    /// The agent sends its table `table_after` after the gateway has connected.
+    async fn start_after(bin: &Path, table_after: Duration) -> Self {
         let cluster = blocking(|| database_cluster(bin));
         tenant_sql(
             &cluster,
@@ -141,6 +145,7 @@ impl Unit {
                 };
                 let (reader, mut writer) = stream.into_split();
                 let databases = table.clone();
+                tokio::time::sleep(table_after).await;
                 writer
                     .write_all(&agent::encode(&ToGateway::Table { databases }))
                     .await
@@ -189,9 +194,27 @@ struct Node {
     channel: JoinHandle<()>,
 }
 impl Node {
-    /// A node whose drain gives a busy session `bound`.
+    /// A node whose drain gives a busy session `bound`, once it has the agent's table.
     async fn start(bin: &Path, bound: Duration) -> Self {
-        let unit = Unit::start(bin).await;
+        let node = Self::spawn(bin, bound, Duration::ZERO, transport::FIRST_TABLE_BOUND).await;
+        timeout(Duration::from_secs(10), async {
+            while !node.gateway.table.read().await.synchronized() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the gateway has the agent's table");
+        node
+    }
+    /// A node that serves at once: the agent sends its table `table_after` after the gateway
+    /// connects, and the gateway waits for it at most `first_table`.
+    async fn spawn(
+        bin: &Path,
+        bound: Duration,
+        table_after: Duration,
+        first_table: Duration,
+    ) -> Self {
+        let unit = Unit::start_after(bin, table_after).await;
         let gateway = Gateway::new(Arc::new(Config {
             region: REGION.into(),
             node: NODE.into(),
@@ -219,14 +242,8 @@ impl Node {
                 let _ = begin.await;
             },
             bound,
+            first_table,
         ));
-        timeout(Duration::from_secs(10), async {
-            while !gateway.table.read().await.synchronized() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the gateway has the agent's table");
         Self {
             gateway,
             port,
@@ -287,17 +304,27 @@ async fn connect(port: u16, id: usize) -> Client {
     client.login().await;
     client
 }
-async fn upgrade(port: u16, route: &str) -> Result<Client, (u16, String)> {
+fn upgrade_request(port: u16, route: &str) -> tokio_tungstenite::tungstenite::http::Request<()> {
     let mut request = format!("ws://127.0.0.1:{port}/pg")
         .into_client_request()
         .unwrap();
     request
         .headers_mut()
         .insert("x-pgcf-route", route.parse().unwrap());
-    match timeout(Duration::from_secs(10), connect_async(request))
-        .await
-        .unwrap()
-    {
+    request
+}
+/// What the gateway answered an upgrade with: the client, or the status and body of its refusal
+/// (status 0 for a connection that failed before any answer).
+fn answered(
+    result: Result<
+        (
+            WebSocketStream<MaybeTlsStream<TcpStream>>,
+            tokio_tungstenite::tungstenite::handshake::client::Response,
+        ),
+        tokio_tungstenite::tungstenite::Error,
+    >,
+) -> Result<Client, (u16, String)> {
+    match result {
         Ok((socket, _)) => Ok(Client {
             socket,
             buffer: Vec::new(),
@@ -306,8 +333,18 @@ async fn upgrade(port: u16, route: &str) -> Result<Client, (u16, String)> {
             response.status().as_u16(),
             String::from_utf8_lossy(response.body().as_deref().unwrap_or_default()).into_owned(),
         )),
-        Err(error) => panic!("{error}"),
+        Err(error) => Err((0, error.to_string())),
     }
+}
+async fn upgrade(port: u16, route: &str) -> Result<Client, (u16, String)> {
+    answered(
+        timeout(
+            Duration::from_secs(10),
+            connect_async(upgrade_request(port, route)),
+        )
+        .await
+        .unwrap(),
+    )
 }
 /// One `POST /sql` as the Edge sends it: the statements in one transaction.
 async fn sql(port: u16, route: String, statements: Vec<&'static str>) -> (u16, Value) {
@@ -581,6 +618,65 @@ async fn new_work_gets_08006_gateway_draining_and_the_probes_say_draining() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_connection_that_arrives_before_the_agents_table_waits_for_it_and_is_admitted() {
+    let Some(bin) = binaries() else { return };
+    // The new gateway of a swap has connected to the agent and has no table yet: the connections
+    // that waited in the socket are not accepted into a refusal.
+    let node = Node::spawn(
+        &bin,
+        Duration::from_secs(30),
+        Duration::from_millis(900),
+        transport::FIRST_TABLE_BOUND,
+    )
+    .await;
+    let began = Instant::now();
+    let upgraded = node.upgrade(&route(1)).await;
+    assert!(upgraded.is_ok(), "{:?}", upgraded.err());
+    assert!(began.elapsed() >= Duration::from_millis(700));
+    node.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_that_waits_for_a_table_that_does_not_come_is_refused_fenced_at_the_bound() {
+    let Some(bin) = binaries() else { return };
+    let node = Node::spawn(
+        &bin,
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        Duration::from_millis(600),
+    )
+    .await;
+    let began = Instant::now();
+    let Err((status, body)) = node.upgrade(&route(1)).await else {
+        panic!("a gateway without the agent's table upgrades nothing");
+    };
+    assert_eq!(status, 503);
+    assert!(body.contains("fenced"), "{body}");
+    let waited = began.elapsed();
+    assert!(
+        waited >= Duration::from_millis(500) && waited < Duration::from_secs(3),
+        "{waited:?}"
+    );
+    node.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_while_the_gateway_waits_for_the_table_ends_the_serve_loop_at_once() {
+    let Some(bin) = binaries() else { return };
+    let mut node = Node::spawn(
+        &bin,
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    node.begin_drain();
+    assert!(node.returned().await < Duration::from_secs(2));
+    node.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn connections_beyond_the_handshake_limit_wait_in_the_socket_and_are_not_reset() {
     // After a swap the new gateway meets every connection that waited in the socket at once. The
     // ones beyond the limit of simultaneous handshakes wait for their turn; they are not reset.
@@ -606,6 +702,7 @@ async fn connections_beyond_the_handshake_limit_wait_in_the_socket_and_are_not_r
             let _ = begin.await;
         },
         Duration::from_secs(1),
+        Duration::ZERO,
     ));
     // Every handshake slot is taken by a client that has not sent its request yet.
     let mut slow = Vec::new();
@@ -644,6 +741,10 @@ async fn connections_beyond_the_handshake_limit_wait_in_the_socket_and_are_not_r
 
 /// The longest an integrator keeps retrying a connection that failed (1, 2, 4 and 8 s).
 const RETRY_BUDGET: Duration = Duration::from_secs(15);
+/// How long after the old gateway has exited the test starts the new one. A restart of the
+/// service takes a few milliseconds, too short for more than a few connections to arrive in it,
+/// so the gap is made one in which many do.
+const RESTART_GAP: Duration = Duration::from_millis(300);
 
 /// A gateway process the way systemd runs it, with the socket unit's listening socket passed as
 /// descriptor 3 (`LISTEN_PID`, `LISTEN_FDS`).
@@ -741,29 +842,42 @@ async fn probe(port: u16, request: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
 /// One probe: a new connection and how long it waited for its answer, with whether the gateway had
 /// been told to stop when it was made.
 type Probe = (bool, Result<Duration, String>);
-/// New connections, one every `interval`, each in a task of its own, as clients arrive; the loop ends
-/// when `done` is set and the answer is every probe.
+/// New WebSocket upgrades, as the Edge makes them, one every `interval`, each in a task of its
+/// own, as clients arrive: a probe passes only if the gateway admits the route, which it does
+/// only with the agent's table. None is made while `quiet` is set. The loop ends when `done` is
+/// set and the answer is every probe.
 fn probes(
     port: u16,
     interval: Duration,
     done: Arc<AtomicBool>,
     terminated: Arc<AtomicBool>,
+    quiet: Arc<AtomicBool>,
 ) -> JoinHandle<Vec<Probe>> {
     tokio::spawn(async move {
         let mut probes = tokio::task::JoinSet::new();
+        // The sessions of the test use the low ids; every route's connection ID is used once.
+        let mut id = 1_000;
         while !done.load(Ordering::SeqCst) {
-            let after = terminated.load(Ordering::SeqCst);
-            probes.spawn(async move {
-                let began = Instant::now();
-                let request = b"GET /healthz HTTP/1.1\r\nHost: gateway\r\n\r\n";
-                let outcome = match timeout(Duration::from_secs(25), probe(port, request)).await {
-                    Ok(Ok((200, _))) => Ok(began.elapsed()),
-                    Ok(Ok((status, _))) => Err(format!("status {status}")),
-                    Ok(Err(error)) => Err(error.to_string()),
-                    Err(_) => Err("no answer in 25 s".into()),
-                };
-                (after, outcome)
-            });
+            if !quiet.load(Ordering::SeqCst) {
+                let (after, route) = (terminated.load(Ordering::SeqCst), route(id));
+                id += 1;
+                probes.spawn(async move {
+                    let began = Instant::now();
+                    let outcome = match timeout(
+                        Duration::from_secs(25),
+                        connect_async(upgrade_request(port, &route)),
+                    )
+                    .await
+                    {
+                        Ok(result) => match answered(result) {
+                            Ok(_) => Ok(began.elapsed()),
+                            Err((status, body)) => Err(format!("status {status}: {body}")),
+                        },
+                        Err(_) => Err("no answer in 25 s".into()),
+                    };
+                    (after, outcome)
+                });
+            }
             tokio::time::sleep(interval).await;
         }
         let mut all = Vec::new();
@@ -775,7 +889,12 @@ fn probes(
 }
 /// Replaces the gateway the way `systemctl restart` does: the old process gets SIGTERM and must
 /// exit before the new one starts. New connections arrive throughout; the answer is how long the
-/// longest of them waited, after it is shown that every one of them was answered.
+/// longest of them waited, after it is shown that every one of them was upgraded, which the new
+/// gateway can do only with the agent's table.
+///
+/// No connection is made in the few milliseconds around the signal: a connection that the old
+/// gateway had accepted and not yet read when the signal arrived gets the defined refusal of a
+/// draining gateway (`new_work_gets_08006_gateway_draining...`), which is a retry and not a swap's gap.
 async fn swap(
     manager: &Manager,
     agent_socket: &Path,
@@ -783,19 +902,31 @@ async fn swap(
     exits_within: Duration,
     interval: Duration,
 ) -> (Process, Duration) {
-    let (done, terminated) = (
+    let (done, terminated, quiet) = (
+        Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     );
-    let probing = probes(manager.port, interval, done.clone(), terminated.clone());
+    let probing = probes(
+        manager.port,
+        interval,
+        done.clone(),
+        terminated.clone(),
+        quiet.clone(),
+    );
     tokio::time::sleep(Duration::from_millis(200)).await;
+    quiet.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(5)).await;
     terminated.store(true, Ordering::SeqCst);
     old.terminate();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    quiet.store(false, Ordering::SeqCst);
     let status = old
         .exited(exits_within)
         .await
         .expect("the old gateway exits when its drain is over");
     assert!(status.success(), "{status}");
+    tokio::time::sleep(RESTART_GAP).await;
     let new = manager.start(agent_socket);
     manager.ready().await;
     done.store(true, Ordering::SeqCst);
@@ -805,7 +936,7 @@ async fn swap(
         probes.iter().filter(|(after, _)| *after).count(),
     );
     assert!(
-        probes_during >= 3,
+        probes_during >= 10,
         "connections arrived during the swap: {probes_made}"
     );
     let mut longest = Duration::ZERO;
@@ -846,8 +977,9 @@ async fn a_swap_with_an_idle_session_open_refuses_no_connection_and_the_gap_is_t
         idle.ends(Duration::from_secs(2)).await,
         (vec![], Some(Some(1012)))
     );
-    // Every connection that arrived meanwhile waited in the socket and was answered by the new
-    // gateway: the gap is the restart, far inside the retry budget.
+    // Every connection that arrived meanwhile waited in the socket and was upgraded by the new
+    // gateway: the gap is the restart (here the test's 300 ms and the start), far inside the retry
+    // budget.
     assert!(longest < Duration::from_secs(3), "{longest:?}");
     // And the new gateway serves a session.
     let mut again = connect(manager.port, 2).await;

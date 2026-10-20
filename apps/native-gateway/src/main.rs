@@ -75,6 +75,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stop,
         shutdown_signal(),
         transport::DRAIN_BOUND,
+        transport::FIRST_TABLE_BOUND,
     )
     .await;
     let _ = synchronizer.await;

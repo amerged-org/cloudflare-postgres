@@ -173,6 +173,23 @@ impl Gateway {
     pub(crate) fn drain_until(&self) -> Option<Instant> {
         self.drain_until.get().copied()
     }
+    /// Waits until the agent's table has arrived, at most `bound`; whether it has.
+    async fn table_arrived(&self, bound: Duration) -> bool {
+        timeout(bound, async {
+            loop {
+                // The wait is registered before the table is read, so that a table that arrives
+                // in between wakes it.
+                let changed = self.changed().await;
+                let notified = changed.notified();
+                if self.table.read().await.synchronized() {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
     /// Whether the gateway admits new work: the agent's table is current and it is not draining.
     pub(crate) async fn ready(&self) -> bool {
         self.table.read().await.synchronized() && !self.draining()
@@ -459,6 +476,11 @@ fn upgrade(head: &HttpHead) -> bool {
 /// flight may take to end, and so the longest a new connection waits for the gateway that
 /// replaces this one. It stays well under the integrators' retry rule (1, 2, 4 and 8 s).
 pub const DRAIN_BOUND: Duration = Duration::from_secs(10);
+/// How long a new gateway waits for the agent's table before it accepts. The agent sends it as
+/// soon as the gateway connects, so the wait is as long as the connect takes; the bound is for a
+/// gateway that starts while the agent does not serve its channel (a boot), which then answers
+/// `fenced` as it does whenever it has no table, instead of leaving connections without an answer.
+pub const FIRST_TABLE_BOUND: Duration = Duration::from_secs(5);
 /// The time the sessions have to close after the drain's bound.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// The connections whose request is being read at one time.
@@ -467,38 +489,50 @@ pub const HANDSHAKES: usize = 128;
 /// stops accepting and admitting new work (`Gateway::drain`), the sessions are told, and the
 /// function returns when the last of them has ended or `bound` and the grace after it are over.
 /// The listening socket stays open until the function returns, so that a connection that arrives
-/// meanwhile waits in its queue instead of being refused.
+/// meanwhile waits in its queue instead of being refused. It is also not accepted before the
+/// agent's table has arrived (for `first_table` at most): without the table every route is
+/// refused as `fenced`, and the connections that waited through a swap are the ones the new
+/// gateway must serve.
 pub async fn serve(
     listener: TcpListener,
     gateway: Arc<Gateway>,
     stop: watch::Sender<bool>,
     shutdown: impl Future<Output = ()>,
     bound: Duration,
+    first_table: Duration,
 ) -> std::io::Result<()> {
     let pending = Arc::new(Semaphore::new(HANDSHAKES));
     let mut sessions = JoinSet::new();
     tokio::pin!(shutdown);
-    let accepting = loop {
-        // A slot first, then the connection: when every slot is taken, a connection waits in the
-        // socket's queue and is served in its turn, instead of being accepted and reset. The
-        // burst that meets a new gateway after a swap is the connections that waited for it.
-        let permit = tokio::select! {
-            _ = &mut shutdown => break Ok(()),
-            Some(_) = sessions.join_next() => continue,
-            permit = pending.clone().acquire_owned() => permit.expect("the semaphore is never closed"),
-        };
-        tokio::select! {
-            _ = &mut shutdown => break Ok(()),
-            Some(_) = sessions.join_next() => {},
-            accepted = listener.accept() => match accepted {
-                Ok((socket, _)) => {
-                    let (gateway, receiver) = (gateway.clone(), stop.subscribe());
-                    sessions.spawn(async move {
-                        let _ = serve_socket(socket, gateway, receiver, permit).await;
-                    });
-                }
-                Err(error) => break Err(error),
-            },
+    let stopped = tokio::select! {
+        _ = &mut shutdown => true,
+        _ = gateway.table_arrived(first_table) => false,
+    };
+    let accepting = if stopped {
+        Ok(())
+    } else {
+        loop {
+            // A slot first, then the connection: when every slot is taken, a connection waits in the
+            // socket's queue and is served in its turn, instead of being accepted and reset. The
+            // burst that meets a new gateway after a swap is the connections that waited for it.
+            let permit = tokio::select! {
+                _ = &mut shutdown => break Ok(()),
+                Some(_) = sessions.join_next() => continue,
+                permit = pending.clone().acquire_owned() => permit.expect("the semaphore is never closed"),
+            };
+            tokio::select! {
+                _ = &mut shutdown => break Ok(()),
+                Some(_) = sessions.join_next() => {},
+                accepted = listener.accept() => match accepted {
+                    Ok((socket, _)) => {
+                        let (gateway, receiver) = (gateway.clone(), stop.subscribe());
+                        sessions.spawn(async move {
+                            let _ = serve_socket(socket, gateway, receiver, permit).await;
+                        });
+                    }
+                    Err(error) => break Err(error),
+                },
+            }
         }
     };
     gateway.drain(bound);

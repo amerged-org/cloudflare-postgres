@@ -26,11 +26,15 @@ export const imageTree = join(import.meta.dirname, "mkosi.extra");
  * running database its stop settings (`KillSignal=`, `TimeoutStopSec=`, `ExecStop=`) at its next
  * stop and everything else (the process, `ExecStart=`, `MountImages=`, `PrivateMounts=` and the
  * limits of its cgroup, which systemd does not re-apply at a reload) at its next start, a mask or a
- * slice needs nothing beyond the reload, the gateway's socket needs nothing beyond it either (the
- * restart of the gateway starts the socket, which the service requires, and a restart of the
- * socket itself would stop the gateway and close the port), and a sysusers or tmpfiles file is run
- * through its tool (systemd makes users at a boot only when /usr is newer than /etc/.updated,
- * which a changed file in /usr/lib/sysusers.d does not make it, so a reboot would not apply it).
+ * slice needs nothing beyond the reload, the gateway's socket gets the reload only (a restart of
+ * the socket stops the gateway and closes the port): the restart of the gateway starts it, because
+ * the service requires it, but a later change of the socket file reaches a running socket only at
+ * its next restart (a reboot, or `systemctl restart pgcf-gateway.socket`, which restarts the
+ * gateway too), and after a rollback to a release without the file and a roll forward the socket
+ * is active without a descriptor, so the gateway binds its own port until then (plan 11.1,
+ * `gateway-drain-proof`), and a sysusers or tmpfiles file is run through its tool (systemd makes
+ * users at a boot only when /usr is newer than /etc/.updated, which a changed file in
+ * /usr/lib/sysusers.d does not make it, so a reboot would not apply it).
  */
 export const HOST_FILE_APPLY: Record<string, HostFile["apply"]> = {
   "/etc/ssh/sshd_config.d/10-pgcf.conf": "restart_unit:ssh.service",
