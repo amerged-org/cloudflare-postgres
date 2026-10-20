@@ -219,8 +219,9 @@ of a second or less and `overrun` false (a first cycle after a deploy, with ever
 take about ten seconds). `overrun` true again and again means the shard's cycle takes longer than
 the interval: raise the interval or check the actors.
 `actor_warm_failed` is an unexpected fault of a cycle and does not stop the loop. The effect shows
-in the Edge's admission lines: `admit_ms` of the first connect to a database that was idle falls
-from a cold actor's 200 to 600 ms to the warm actor's 40 to 80 ms.
+in the Edge's admission lines: `admit_ms` of the first connect to a database that was idle is
+expected to fall from a cold actor's 200 to 600 ms to the warm actor's 40 to 80 ms (the scratch
+measurement of the plan's keep-warm study found that effect); confirm it live after the deploy.
 
 ## Edge Worker
 

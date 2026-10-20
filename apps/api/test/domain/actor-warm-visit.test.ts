@@ -20,7 +20,7 @@ afterEach(async () => {
 const actor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
 
-/** Every row of every table of the Actor, and what it holds in memory for admissions. */
+/** Every row of every table of the Actor, every key of its KV storage, and what it holds in memory for admissions. */
 function actorState(id: string) {
   return runInDurableObject(actor(id), async (instance, state) => {
     const tables = state.storage.sql
@@ -33,6 +33,8 @@ function actorState(id: string) {
         ...table,
         rows: state.storage.sql.exec(`SELECT * FROM "${table.name}"`).toArray(),
       })),
+      // The KV storage API keeps its entries in `_cf_KV`, which the table listing above skips.
+      kv: [...(await state.storage.list()).entries()],
       alarm: await state.storage.getAlarm(),
       memory: {
         admissions: Reflect.get(instance, "admissions"),
@@ -115,6 +117,7 @@ it("creates nothing in an Actor that holds nothing yet, and it still refuses as 
   await actor(id).warm();
   const state = await actorState(id);
   expect(JSON.parse(state).tables).toEqual([]);
+  expect(JSON.parse(state).kv).toEqual([]);
   expect(JSON.parse(state).alarm).toBeNull();
   expect(prepare).not.toHaveBeenCalled();
   expect(await actor(id).admitWake(id, "app")).toEqual({

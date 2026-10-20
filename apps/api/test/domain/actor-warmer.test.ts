@@ -16,6 +16,7 @@ import {
 } from "vitest";
 import {
   ACTOR_WARM_LEASE_MS,
+  ARM_TIMEOUT_MS,
   ACTOR_WARM_LIST_TTL_MS,
   actorWarmRange,
   actorWarmer,
@@ -506,6 +507,65 @@ it("arms one warmer for every shard-size databases, each with its shape, a lease
   const renewed = ((await configOf(1)) as { lease_until: number }).lease_until;
   expect(renewed).toBeGreaterThanOrEqual(lease + 25);
   expect(renewed).toBeLessThan(lease + 5000);
+});
+
+it("a warmer that rejects and one that hangs past the arm timeout fail the step, after the others were armed", async () => {
+  await databases(4);
+  const live = (await env.DB.prepare(
+    "SELECT count(*) n FROM databases WHERE deleted_at IS NULL",
+  ).first<{ n: number }>())!.n;
+  // One shard per database: shard 0 rejects, shard 1 hangs, every other shard is armed for real.
+  expect(live).toBe(4);
+  const hung: Promise<void>[] = [];
+  await runInDurableObject(actorWarmer(env, 0), (instance) => {
+    const prototype = Object.getPrototypeOf(instance) as {
+      arm(shape: { shard: number }, leaseMs: number): Promise<void>;
+    };
+    const real = prototype.arm;
+    vi.spyOn(prototype, "arm").mockImplementation(function (
+      this: unknown,
+      shape,
+      leaseMs,
+    ) {
+      if (shape.shard === 0)
+        return Promise.reject(new Error("warmer_unreachable"));
+      if (shape.shard === 1) {
+        const pending = new Promise<void>((resolve) =>
+          setTimeout(resolve, ARM_TIMEOUT_MS + 500),
+        );
+        hung.push(pending);
+        return pending;
+      }
+      return real.call(this, shape, leaseMs);
+    });
+  });
+  const started = Date.now();
+  await expect(armActorWarmers(on(), 1)).rejects.toThrow(
+    "actor_warmer_arm_failed",
+  );
+  // The step waited for the hanging warmer's timeout, not for the warmer.
+  expect(Date.now() - started).toBeGreaterThanOrEqual(ARM_TIMEOUT_MS - 100);
+  expect(Date.now() - started).toBeLessThan(ARM_TIMEOUT_MS + 400);
+  // Neither failed warmer holds an alarm; both others were armed with their shape and lease.
+  expect(await alarmOf(0)).toBeNull();
+  expect(await alarmOf(1)).toBeNull();
+  for (const shard of [2, 3]) {
+    expect(await alarmOf(shard)).not.toBeNull();
+    expect(await configOf(shard)).toEqual({
+      shard,
+      shards: 4,
+      interval_ms: INTERVAL,
+      lease_until: expect.any(Number),
+    });
+  }
+  // And the minute cron reports the step as failing, as it does for a missing binding.
+  const cron = await runCron(on());
+  expect(cron.step_failures).toContainEqual({
+    step: "actor_warmers",
+    error_code: "actor_warmer_arm_failed",
+  });
+  expect(cron.step_failures).toHaveLength(1);
+  await Promise.all(hung);
 });
 
 it("interval 0 schedules nothing and calls no warmer; an unset interval is eight seconds; an invalid one is refused", async () => {

@@ -40,7 +40,8 @@ export const ACTOR_WARM_VISIT_TIMEOUT_MS = 3_000;
 export const ACTOR_WARM_LIST_TTL_MS = 60_000;
 /** The cron renews the lease every minute; a warmer it no longer arms stops after three missed minutes. */
 export const ACTOR_WARM_LEASE_MS = 180_000;
-const ARM_TIMEOUT_MS = 2_000;
+/** The cron waits this long for a warmer to be armed; a warmer that takes longer fails the step. */
+export const ARM_TIMEOUT_MS = 2_000;
 const LIST_PAGE = 1_000;
 /** The databases an actor can admit: the presence of the actor says deleted for every other. */
 const LIVE =
