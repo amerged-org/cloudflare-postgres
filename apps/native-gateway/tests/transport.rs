@@ -33,7 +33,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UnixListener, UnixStream},
-    sync::{Semaphore, mpsc, watch},
+    sync::{RwLock, RwLockWriteGuard, Semaphore, mpsc, watch},
     task::JoinHandle,
     time::timeout,
 };
@@ -1586,6 +1586,84 @@ async fn a_v5_ticket_already_released_at_its_generation_is_routed_at_once_as_war
     assert_eq!(fixture.gateway.wakes.held(DATABASE), 0);
     assert!(fixture.gateway.wakes.ticket(DATABASE).is_none());
     fixture.login(&mut client).await;
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+/// Lets the reader that waits behind `held` through, and returns the write lock that queues
+/// behind that read: tokio's lock is fair, so the writer goes ahead of the reader's next read.
+/// A reader that has not arrived yet leaves `try_write` the lock, which is held again until one
+/// has.
+async fn after_next_read<'a, T>(
+    table: &'a RwLock<T>,
+    mut held: RwLockWriteGuard<'a, T>,
+) -> RwLockWriteGuard<'a, T> {
+    loop {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        drop(held);
+        match table.try_write() {
+            Ok(guard) => held = guard,
+            Err(_) => return table.write().await,
+        }
+    }
+}
+#[tokio::test]
+async fn a_v5_ticket_the_table_released_at_once_is_routed_when_the_claim_lands_between_its_two_reads()
+ {
+    // The connection reads the table to see that its wake is released (`wake_state`, under route
+    // revision 19) and reads it again to admit the route. The page with Cloudflare's claim of the
+    // wake lands in between and moves the revision to 20: a released wake is admitted under its
+    // revision or a later one, not refused as route_stale.
+    let mut fixture = Fixture::sleeping().await;
+    fixture.release(2).await;
+    let table = fixture.gateway.table.clone();
+    let held = table.write().await;
+    let driver = async {
+        // The connection's first read of the table is granted, and this writer is behind it.
+        let mut between = after_next_read(&table, held).await;
+        between.update(Database {
+            route_revision: ROUTE_REVISION + 1,
+            ..entry(Mode::Running, 2, &wake_operation(), Some(&fixture.unit))
+        });
+    };
+    let ticket = wake_token(1090, 2);
+    let (client, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(fixture.upgrade(&ticket), driver)
+    })
+    .await
+    .unwrap();
+    let mut client = client.expect("the released wake is routed under the later revision");
+    fixture.login(&mut client).await;
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_held_wake_is_routed_when_the_claim_lands_between_its_release_and_its_admission() {
+    // The held connection reads the table for its release (`changed`, then `wake_state`) and
+    // reads it again to admit the route; the claim's entry lands behind the second of the first
+    // two reads, before the admission.
+    let mut fixture = Fixture::sleeping().await;
+    let mut client = fixture.upgrade(&wake_token(1091, 2)).await.unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    untouched(&mut fixture).await;
+    let table = fixture.gateway.table.clone();
+    let mut released = table.write().await;
+    released.update(entry(
+        Mode::Running,
+        2,
+        &wake_operation(),
+        Some(&fixture.unit),
+    ));
+    let waiting = after_next_read(&table, released).await;
+    let mut between = after_next_read(&table, waiting).await;
+    between.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 2, &wake_operation(), Some(&fixture.unit))
+    });
+    drop(between);
+    fixture.login_sent(&mut client).await;
     client.close(None).await.unwrap();
     fixture.stop().await;
 }

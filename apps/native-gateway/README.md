@@ -46,11 +46,15 @@ archive socket.
   as long as the table shows the database running on that unit. An entry the agent publishes again
   for the same unit, such as the page that carries Cloudflare's claim of a wake moving the route
   revision, interrupts nothing, and a wake that was released is admitted under the revision of its
-  release or a later one, on every path that admits a ticket (a held connection, one routed at
-  once, an HTTP request). While a database quiesces, no client byte reaches PostgreSQL: it waits,
-  and runs once the database runs again; an HTTP request that finds the database quiescing,
-  asleep or retired before its first statement answers `57P03` with nothing written to
-  PostgreSQL. Quiescence includes partial WebSocket and PostgreSQL messages, authentication,
+  release or a later one on every path that admits a ticket (a held connection, one routed at
+  once, an HTTP request held or routed at once). Each calls `Gateway::admit_wake`; that is a
+  convention, which the types do not enforce (`Gateway::admit` takes any `Route`), and a test per
+  path pins it by landing the claim's entry between the path's two reads of the table. While a
+  database quiesces, no client byte reaches PostgreSQL: it waits, and runs once the database runs
+  again; an HTTP request that finds the database quiescing, asleep or retired before its first
+  statement, also one that stops admitting between its dial check and the write of its
+  StartupMessage, answers `57P03`: no statement reaches PostgreSQL, and before the StartupMessage
+  nothing does. Quiescence includes partial WebSocket and PostgreSQL messages, authentication,
   outstanding queries, transactions and COPY. A unit that changes (another PID, socket or
   invocation ID) closes its sessions with 1012 and is never written to.
 - Masked-frame lengths reserve memory before decoder allocation. Fragment and decoded-message

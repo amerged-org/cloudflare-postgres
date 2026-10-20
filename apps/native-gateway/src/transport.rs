@@ -171,10 +171,13 @@ impl Gateway {
     }
     /// The route and the writer a wake ticket is admitted under once the table has released its
     /// wake on `writer` under `route_revision` (`wake_state`), or the outcome it is refused with.
-    /// Every path that admits a ticket does it here: the table is read again, and the page that
-    /// carries Cloudflare's claim of the wake moves the route revision on, also between the
-    /// release and this read, so a released wake is admitted under the revision of its release or
-    /// a later one. The generation, the unit and the database's mode are checked as for any route.
+    /// The HTTP request, the connection routed at once and the held connection admit their
+    /// ticket here: the table is read again, and the page that carries Cloudflare's claim of the
+    /// wake moves the route revision on, also between the release and this read, so a released
+    /// wake is admitted under the revision of its release or a later one. The generation, the
+    /// unit and the database's mode are checked as for any route. This is a convention and not a
+    /// type: `admit` takes any `Route`, whose fields are public, so the tests of each path pin it
+    /// (`tests/transport.rs`, `tests/sql.rs`: the claim lands between the two reads).
     pub(crate) async fn admit_wake(
         &self,
         ticket: &WakeClaims,
@@ -1661,7 +1664,8 @@ mod tests {
         // The agent released the wake under revision 7. The page that carries Cloudflare's claim
         // of it moves the revision to 8, also between the release and the admission, which
         // reads the table again: the HTTP request, the connection routed at once and the held
-        // connection all admit their ticket here, and no one of them can name a revision exactly.
+        // connection all admit their ticket here (their own tests place the claim between the
+        // two reads).
         let gateway = gateway();
         let writer = Writer {
             socket: "/run/pgcf/aaaaaaaaaaaaaaaaaaaa/.s.PGSQL.5432".into(),

@@ -33,7 +33,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UnixListener, UnixStream},
-    sync::{Semaphore, watch},
+    sync::{RwLock, RwLockWriteGuard, Semaphore, watch},
     task::JoinHandle,
     time::timeout,
 };
@@ -1065,6 +1065,120 @@ async fn a_cold_request_goes_on_when_the_claim_of_its_wake_reaches_the_table_dur
     let (status, answer) = answer.await.unwrap();
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["rows"], json!([["woken"]]));
+    fixture.stop().await;
+}
+/// Lets the reader that waits behind `held` through, and returns the write lock that queues
+/// behind that read: tokio's lock is fair, so the writer goes ahead of the reader's next read.
+/// A reader that has not arrived yet leaves `try_write` the lock, which is held again until one
+/// has.
+async fn after_next_read<'a, T>(
+    table: &'a RwLock<T>,
+    mut held: RwLockWriteGuard<'a, T>,
+) -> RwLockWriteGuard<'a, T> {
+    loop {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        drop(held);
+        match table.try_write() {
+            Ok(guard) => held = guard,
+            Err(_) => return table.write().await,
+        }
+    }
+}
+#[tokio::test]
+async fn a_cold_request_the_table_released_at_once_goes_on_when_the_claim_lands_between_its_two_reads()
+ {
+    // The request reads the table to see that its wake is released (`wake_state`, under route
+    // revision 19) and reads it again to admit the route. The page with Cloudflare's claim of the
+    // wake lands in between and moves the revision to 20: a released wake is admitted under its
+    // revision or a later one, not refused as route_stale.
+    let fixture = Fixture::with(Mode::Sleeping).await;
+    release(&fixture, 2).await;
+    let table = fixture.gateway.table.clone();
+    let held = table.write().await;
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["woken"]))], None);
+    let answer = tokio::spawn(async move {
+        post(port, &wake_token(28, 2), request.to_string().as_bytes()).await
+    });
+    // The request's first read of the table is granted, and this writer is behind it.
+    let mut between = after_next_read(&table, held).await;
+    between.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 2, &wake_operation(), &fixture.unit)
+    });
+    drop(between);
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["rows"], json!([["woken"]]));
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_held_cold_request_goes_on_when_the_claim_lands_between_its_release_and_its_admission() {
+    // The held request reads the table for its release (`changed`, then `wake_state`) and reads
+    // it again to admit the route; the claim's entry lands behind the second of the first two
+    // reads, before the admission.
+    let fixture = Fixture::with(Mode::Sleeping).await;
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["woken"]))], None);
+    let answer = tokio::spawn(async move {
+        post(port, &wake_token(30, 2), request.to_string().as_bytes()).await
+    });
+    timeout(Duration::from_secs(5), async {
+        while fixture.gateway.wakes.held(DATABASE) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let table = fixture.gateway.table.clone();
+    let mut released = table.write().await;
+    released.update(entry(Mode::Running, 2, &wake_operation(), &fixture.unit));
+    let waiting = after_next_read(&table, released).await;
+    let mut between = after_next_read(&table, waiting).await;
+    between.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 2, &wake_operation(), &fixture.unit)
+    });
+    drop(between);
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["rows"], json!([["woken"]]));
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_request_whose_database_quiesces_before_its_startup_message_is_refused_as_57p03() {
+    // The route is admitted (first read of the table) and the writer is still the database's
+    // (second read, before the dial); the sleep proof begins before the guarded write of the
+    // StartupMessage (third read). Nothing was written to PostgreSQL, so the request is the
+    // refusal an integrator retries by its code, not a failed connection.
+    let fixture = Fixture::new().await;
+    let table = fixture.gateway.table.clone();
+    let held = table.write().await;
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["late"]))], None);
+    let answer =
+        tokio::spawn(async move { post(port, &route(29), request.to_string().as_bytes()).await });
+    let admitted = after_next_read(&table, held).await;
+    let mut dialable = after_next_read(&table, admitted).await;
+    dialable.update(entry(Mode::Quiesce, 1, &operation(), &fixture.unit));
+    drop(dialable);
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(
+        (status, &answer["code"]),
+        (400, &json!("57P03")),
+        "{answer}"
+    );
+    fixture.idle(0).await;
+    assert!(
+        fixture
+            .journal
+            .entries()
+            .iter()
+            .all(|entry| !entry.starts_with("startup:")),
+        "{:?}",
+        fixture.journal.entries()
+    );
     fixture.stop().await;
 }
 #[tokio::test]

@@ -848,9 +848,14 @@ async fn authenticate(
     startup.push(0);
     let mut bytes = ((startup.len() + 4) as u32).to_be_bytes().to_vec();
     bytes.extend_from_slice(&startup);
+    // A database that stopped admitting before the guarded write got nothing: it is refused as
+    // any request that finds the database not accepting, which an integrator retries by its code.
     write_guarded(gateway, backend, &bytes)
         .await
-        .map_err(|_| failed())?;
+        .map_err(|guard| match guard {
+            Guard::Fenced => not_accepting("fenced"),
+            Guard::Lost => failed(),
+        })?;
     let login = auth::login(&mut backend.postgres, password, known)
         .await
         .map_err(|_| failed())?;
