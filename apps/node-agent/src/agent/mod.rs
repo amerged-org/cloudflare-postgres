@@ -215,9 +215,19 @@ pub(crate) struct Db {
     /// One flow of the database at a time.
     pub lock: tokio::sync::Mutex<()>,
     view: Mutex<View>,
-    /// The task of the last wake that applies the database's CPU quota once its burst is over
-    /// (`Core::after_wake`): one at a time, and gone when the database leaves service.
-    boost: Mutex<Option<AbortHandle>>,
+    boost: Mutex<Boost>,
+}
+
+/// The CPU burst of a database's last wake (`Core::after_wake`), which ends when its quota is
+/// applied.
+#[derive(Default)]
+struct Boost {
+    /// The task of the wake that applies the quota once the window is over: one at a time, and
+    /// gone when the database leaves service.
+    timer: Option<AbortHandle>,
+    /// Whether the quota is still to come. Whoever applies it takes this first, under the
+    /// database's flow, so that it is applied once whichever of them is first.
+    pending: bool,
 }
 impl Db {
     /// The view, locked: never held across an `await`, and never while taking it again (the lock is
@@ -232,37 +242,44 @@ impl Db {
     pub fn state(&self) -> Option<DatabaseState> {
         self.view().state.clone()
     }
-    /// Keeps the task that ends a wake's burst; the task of an earlier wake, if one is left, ends.
-    pub fn begin_boost(&self, task: AbortHandle) {
-        let earlier = self
-            .boost
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .replace(task);
+    /// A wake's burst begins: the task that ends it is kept, and the task of an earlier wake, if
+    /// one is left, ends.
+    pub fn begin_boost(&self, timer: AbortHandle) {
+        let earlier = {
+            let mut boost = self.boost.lock().unwrap_or_else(PoisonError::into_inner);
+            boost.pending = true;
+            boost.timer.replace(timer)
+        };
         if let Some(earlier) = earlier {
             earlier.abort();
         }
     }
-    /// The unit stopped or the database left service: the quota is not applied any more, and a
-    /// quota set on a stopped unit would throttle its next start.
-    pub fn end_boost(&self) {
-        let task = self
-            .boost
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(task) = task {
-            task.abort();
-        }
+    /// The burst is over: its quota is to be applied now, once. `false` when something else
+    /// applied it, or the database left service. Called under the database's flow.
+    pub fn claim_boost(&self) -> bool {
+        let mut boost = self.boost.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut boost.pending)
     }
-    /// Whether a task waits to apply the quota.
+    /// The burst ends before its window does: the task that waits is gone. `true` when the quota
+    /// was still to come, which the caller that holds the database's flow applies (a stopped unit
+    /// has none: a stop lifts it, and a quota set on a stopped unit would throttle its next start).
+    pub fn end_boost(&self) -> bool {
+        let (timer, pending) = {
+            let mut boost = self.boost.lock().unwrap_or_else(PoisonError::into_inner);
+            (boost.timer.take(), std::mem::take(&mut boost.pending))
+        };
+        if let Some(timer) = timer {
+            timer.abort();
+        }
+        pending
+    }
+    /// Whether the quota of a wake is still to come.
     #[cfg(test)]
     pub fn boosting(&self) -> bool {
         self.boost
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|task| !task.is_finished())
+            .pending
     }
 }
 
@@ -399,7 +416,7 @@ impl<M: Machine> Core<M> {
                     id: id.to_string(),
                     lock: tokio::sync::Mutex::new(()),
                     view: Mutex::new(View::new()),
-                    boost: Mutex::new(None),
+                    boost: Mutex::new(Boost::default()),
                 })
             })
             .clone()

@@ -462,14 +462,20 @@ each is told to pull the new page, and admission uses the new values from then o
 
 `cpu_boost_ms` is how long after a wake a database runs without the CPU quota of its class, counted
 from the release of its writer (`0`: the quota comes with the wake). The first requests, PostgreSQL's
-start-up and the reading of its buffer list (`autoprewarm`) then use the idle cores instead of
-sharing 0.5 CPU (0.25 for `xs`); the weight, memory, IO and task limits of the unit stay, so the
-burst takes only CPU that nobody else wants (plan 4.4 states the bound). A change applies from the
-next wake: a timer that runs keeps its time. A database that sleeps, moves or is deleted inside its
-window loses the timer, and an agent that starts applies the quota at once to every database it
-finds running. The event `wake_detail`, read 2 s after the release, carries `nr_throttled` and
-`throttled_usec` since the release: about none inside a burst of 2 s or more, the quota's
-throttling at `0` (the A/B in the plan, 11.2, compares the two).
+start-up and the reading of its buffer list (`autoprewarm`) then are not held to 0.5 CPU (0.25 for
+`xs`). The weight and the memory, IO and task limits of the unit stay, so the burst lifts only the
+cap of the quota: contested CPU is still divided by weight, and a database that bursts takes its
+weight's share of it, which can be more than its size and can come from the gateway, `cloudflared`
+and the agent (plan 4.4 states the bound: all databases together take at most half of contested CPU
+from them, and every database keeps its weight's share). Each wake has a burst of its own, so the
+CPU a database can take grows with how often it wakes (after an idle sleep, an early sleep, a
+suspend and resume, a move or a maintenance). A change applies from the next wake: a timer that runs
+keeps its time. A database that sleeps, moves or is deleted inside its window loses the timer, a
+base backup that begins inside it ends it (the quota is applied before the backup), and an agent
+that starts applies the quota at once to every database it finds running. The event `wake_detail`,
+read 2 s after the release, carries `nr_throttled` and `throttled_usec` since the release: about
+none inside a burst of 2 s or more, the quota's throttling at `0` (the A/B in the plan, 11.2,
+compares the two).
 
 The starting values come from plan sections 4.3 to 4.6 and 7.5 and stay estimates until Stage 5
 measures the node; the memory budget is the visible RAM minus the system, the mounted volumes, the

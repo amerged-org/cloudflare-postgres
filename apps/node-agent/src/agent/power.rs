@@ -429,12 +429,14 @@ impl<M: Machine> Core<M> {
     /// `cpu_boost_ms`, and at once if that is 0. The start-up, the first request and the reading
     /// of the buffer list of the last stop (`autoprewarm`) share the quota's 0.5 or 0.25 CPU when
     /// it comes with the release, and that was throttled in 19 of about 25 periods (EU1,
-    /// 2026-10-20). The unit keeps its weight and its memory, IO and task limits meanwhile, so the
-    /// burst takes only CPU that nobody else wants.
+    /// 2026-10-20). The unit keeps its weight and its memory, IO and task limits meanwhile: the
+    /// burst lifts the cap of the quota and nothing else, so the weights still divide contested
+    /// CPU (plan 4.4 states the bound).
     ///
     /// One task per wake waits out the burst and ends with it; `Db::end_boost` ends it earlier,
-    /// when the database leaves service (`Core::set`). It applies the quota under the database's
-    /// flow, so that it cannot meet the stop of a sleep, which lifts the quota, half way.
+    /// when the database leaves service (`Core::set`) or a base backup begins (`end_burst`). It
+    /// applies the quota under the database's flow, so that it cannot meet the stop of a sleep,
+    /// which lifts the quota, half way.
     pub(crate) async fn after_wake(self: &Arc<Self>, db: &Arc<Db>) {
         let boost = Duration::from_millis(self.policy().admission.admission.cpu_boost_ms);
         if boost.is_zero() {
@@ -445,9 +447,21 @@ impl<M: Machine> Core<M> {
         let task = tokio::spawn(async move {
             tokio::time::sleep(boost).await;
             let _flow = database.lock.lock().await;
-            core.after_ready(&database).await;
+            if database.claim_boost() {
+                core.after_ready(&database).await;
+            }
         });
         db.begin_boost(task.abort_handle());
+    }
+
+    /// A flow that holds the database's flow for as long as its data is large while the database
+    /// stays served (a base backup) cannot let the burst wait behind it: the timer would apply the
+    /// quota only when the flow ends. The burst ends now, with the quota applied under the flow
+    /// the caller holds. Without a burst that is still to end, nothing happens.
+    pub(crate) async fn end_burst(&self, db: &Db) {
+        if db.end_boost() {
+            self.after_ready(db).await;
+        }
     }
 
     // ---- wake
@@ -2908,5 +2922,61 @@ mod tests {
         })
         .await;
         assert!(!found.boosting());
+    }
+
+    /// Found by review: the timer waits for the database's flow lock, and the daily base backup of
+    /// an always-warm database holds it for as long as it takes (minutes for 10 GiB), so the burst
+    /// outlasted its window by that time. Such a database is woken after a long suspend or a node
+    /// reboot, which is when its backup is due. The backup ends the burst before it begins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_base_backup_that_begins_inside_a_boost_ends_it_before_it_takes_the_flow() {
+        let Some(rig) = Rig::new("cpu-boost-backup").await else {
+            return;
+        };
+        let mut json = rig.entry_json();
+        json["sleep_after_seconds"] = Value::Null;
+        let entry = rig.entry_for(&json);
+        let db = rig.core.db(&entry.id);
+        assert!(rig.core.accept(&db, entry.clone()));
+        {
+            let _flow = db.lock.lock().await;
+            rig.core.build(&db, &entry).await.unwrap();
+        }
+        let first = db.state().unwrap().backup.unwrap();
+        let quota = NonZeroU32::new(250);
+        assert_eq!(rig.core.sleep(&db, Why::Order).await, Slept::Proven);
+        // A day later it is woken, and its backup is due. The base backup takes 6 s.
+        age_backup(&rig, &db);
+        rig.fixture.set("backup-delay", "6");
+        boost(&rig, Duration::from_secs(1));
+        let ticket = Rig::ticket(&entry);
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        assert_eq!(rig.machine.quota(&entry.id), Some(None));
+        assert!(db.boosting());
+
+        // The idle pass starts the backup, which holds the flow of the database.
+        rig.core.idle_pass().await;
+        eventually(4, "the quota before the base backup is over", || {
+            rig.machine.quota(&entry.id) == Some(quota)
+        })
+        .await;
+        assert!(db.lock.try_lock().is_err(), "the backup holds the flow");
+        assert_eq!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id,
+            "the base backup is not over"
+        );
+        assert!(!db.boosting());
+
+        // The backup ends, and nothing applies the quota again.
+        eventually(30, "the daily backup", || {
+            db.state()
+                .and_then(|state| state.backup)
+                .is_some_and(|backup| backup.backup_id != first.backup_id)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(rig.machine.quota_calls(&entry.id), [quota, quota]);
+        assert_eq!(db.phase(), Phase::Ready);
     }
 }

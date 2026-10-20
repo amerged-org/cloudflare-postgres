@@ -142,10 +142,11 @@ when the page names a higher credentials revision, and R2 temporary credentials 
   compares it with the proven-sleep record, passes admission, starts the unit and waits for the job
   that ends at `READY=1`. It hands the gateway the unit's socket, uid, main PID and invocation ID in
   the writer table, applies the database's CPU quota `cpu_boost_ms` after the release (at once when
-  that is 0; a build and a restart of the agent apply it at once) and reports the phases of the wake
-  as events; about 2 s later a `wake_detail` event adds the split of the start and the share of the
-  database's files that the page cache held before the start (`cache.rs`). A wake it already
-  serves is answered `wake_in_progress`, which is no result.
+  that is 0; a build and a restart of the agent apply it at once, and a base backup that begins
+  inside the burst applies it first) and reports the phases of the wake as events; about 2 s later
+  a `wake_detail` event adds the split of the start and the share of the database's files that the
+  page cache held before the start (`cache.rs`). A wake it already serves is answered
+  `wake_in_progress`, which is no result.
 - **Sleep.** After the database's idle time the agent runs the sleep proof (plan 7.9): the gateway
   quiesces and closes idle sessions, the guard refuses while a session is busy or a transaction is
   prepared (`power_busy`), a checkpoint and a WAL switch close the last segment, the upload log must

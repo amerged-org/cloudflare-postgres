@@ -88,6 +88,7 @@ while [ $# -gt 0 ]; do
 done
 dest=$1; server=$2
 if [ -f "$STORE/backup-fail" ]; then echo 'simulated backup failure' >&2; exit 4; fi
+if [ -f "$STORE/backup-delay" ]; then sleep "$(cat "$STORE/backup-delay")"; fi
 base="$STORE/objects/${{dest#s3://}}/$server/base"
 id=$(date -u +%Y%m%dT%H%M%S)
 while [ -d "$base/$id" ]; do sleep 1; id=$(date -u +%Y%m%dT%H%M%S); done
