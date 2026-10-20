@@ -224,6 +224,7 @@ it("a cycle visits every database of its shard once, and no other, within the in
   const log = vi.spyOn(console, "log");
   const visits = await recordVisits(ids[0]!);
   const seen: string[] = [];
+  const sizes: number[] = [];
   for (let shard = 0; shard < 3; shard++) {
     visits.visited.length = 0;
     const expected = ids.filter((id) => inShard(id, shard, 3));
@@ -245,6 +246,7 @@ it("a cycle visits every database of its shard once, and no other, within the in
     });
     expect(result.cycle_ms).toBeLessThan(INTERVAL);
     seen.push(...expected);
+    sizes.push(expected.length);
   }
   // Every database was in exactly one shard.
   expect([...seen].sort()).toEqual([...ids].sort());
@@ -255,21 +257,25 @@ it("a cycle visits every database of its shard once, and no other, within the in
     "actor_warm_cycle",
     "actor_warm_cycle",
   ]);
-  expect(lines[0]).toEqual({
-    event: "actor_warm_cycle",
-    shard: 0,
-    shards: 3,
-    databases: expect.any(Number),
-    visited: expect.any(Number),
-    failed: 0,
-    cycle_ms: expect.any(Number),
-    interval_ms: INTERVAL,
-    overrun: false,
-    list_error: null,
-    concurrency: ACTOR_WARM_CONCURRENCY,
-    visit_p50_ms: expect.any(Number),
-    visit_max_ms: expect.any(Number),
-  });
+  // The ids are random, so a shard may hold none of the four databases (one run in five for
+  // shard 0): the visit times of a cycle that visited nothing are null by design.
+  expect(lines).toEqual(
+    sizes.map((size, shard) => ({
+      event: "actor_warm_cycle",
+      shard,
+      shards: 3,
+      databases: size,
+      visited: size,
+      failed: 0,
+      cycle_ms: expect.any(Number),
+      interval_ms: INTERVAL,
+      overrun: false,
+      list_error: null,
+      concurrency: ACTOR_WARM_CONCURRENCY,
+      visit_p50_ms: size === 0 ? null : expect.any(Number),
+      visit_max_ms: size === 0 ? null : expect.any(Number),
+    })),
+  );
 });
 
 it("reads the list of databases again only after its time to live, and a deleted database or project stops being visited", async () => {

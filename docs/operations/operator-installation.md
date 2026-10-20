@@ -130,11 +130,18 @@ statement, no counter, no ticket.
 The visits come from `ActorWarmer` Durable Objects, one for every 78 databases at the default
 interval of 8 s, each from its own alarm loop. A warmer keeps six visits in flight, the six
 simultaneous outgoing connections a Durable Object has for one invocation (Cloudflare's Durable
-Objects limits page, read 2026-10-20: "Simultaneous outgoing connections/request: 6 (same as
-Workers)"; a seventh waits in a queue), and its shard is as many rounds of six visits as take half
-the interval at 300 ms a visit (13 rounds of 6 at 8 s, `actorWarmShardSize`); the 300 ms is what the
-first live cycles of the Dev installation implied and is lowered once the cycle lines show
-the visit time near the actors (see "Observing it"). A database ID is 20 random characters, so the
+Objects limits page, https://developers.cloudflare.com/durable-objects/platform/limits/, read
+2026-10-20: "Simultaneous outgoing connections/request: 6 (same as Workers)"). The Workers limits
+page it points to (https://developers.cloudflare.com/workers/platform/limits/, read 2026-10-20)
+queues a seventh connection and lists fetch, KV, Cache, R2, Queues and TCP among those that count,
+without naming calls to Durable Object stubs, so whether a visit counts is open; six in flight
+never wait for a slot either way. A shard is as many rounds of six visits as take half the
+interval at 300 ms a visit (13 rounds of 6 at 8 s, `actorWarmShardSize`). The 300 ms is what the
+first live cycles of the Dev installation imply if the limit applies (167 visits in a median 9.0 s
+at 16 in flight: 320 ms a visit at six at a time); if it does not apply they imply 820 to 860 ms a
+visit, and shards of 56 to 78 then fit the interval only after the warmers are placed near the
+actors. It is lowered once the cycle lines show the visit time near the actors (see "Observing
+it"). A database ID is 20 random characters, so the
 warmers split the ID space into equal ranges (warmer k of n visits the IDs between the k-th and the
 (k+1)-th n-th of the space) and each holds about 78 databases give or take 11 % at one standard
 deviation, so a shard twice the average still ends its cycle within the interval. The warmers are
@@ -169,8 +176,8 @@ minute cron afterwards arms the warmers, and their first visit comes one interva
 
 **Cost.** Each visit is one Durable Object request, so the cost is proportional to the number of
 databases and to the visit rate, and it is charged for sleeping databases as well. Per month of 30
-days at an interval of 8 s, for 170, 300 and 1,000 databases, with one warmer for every 250
-databases (3, 4 and 13 warmers, one for every 78). The Durable Object figures are estimated from the measured ones of
+days at an interval of 8 s, for 170, 300 and 1,000 databases, with one warmer for every 78
+databases (3, 4 and 13 warmers). The Durable Object figures are estimated from the measured ones of
 plan 11.1 at the pricing page of 2026-10-18, not from an invoice. Figures are in USD.
 
 | Item | 170 databases | 300 databases | 1,000 databases | Basis |
@@ -189,8 +196,10 @@ the sum of the lines above it, so the three columns agree with each other. Witho
 cost is about USD 67 per 1,000 databases (USD 12 for 170, USD 20 for 300, warmers included); with
 them, up to about USD 266 (USD 46 for 170, USD 80 for 300) until the log setting below is decided.
 The shards of 78 (instead of the 250 this was first sized for) cost USD 9 more per 1,000 databases
-and month in warmers and their log events; they are what the first live cycles required, and they
-grow when the cycle lines show shorter visits.
+and month in warmers (13 instead of 4) and, if invocation logs are on, USD 3.5 more in log events
+(332.4 instead of 326.6 million), USD 12.5 more with Workers Logs (USD 2.0 and USD 2.8 for 170 or
+300 databases); they are what the first live cycles required, and they grow when the cycle lines
+show shorter visits.
 
 **D1 reads.** The cron's count reads two rows for each live database (the database and its
 project) every minute. Each warmer reads only its own range of the primary key's index, in one query
@@ -252,9 +261,9 @@ interval. Then read the colo and the visit time together: a `colo` outside the r
 live in (West Europe for Dev: AMS, LHR, FRA, CDG and the like) with a `visit_p50_ms` of 100 ms or
 more is the warmer's distance, and the fix is the hint and a new name version (see "Placement"); a
 `colo` near the actors with a high
-`visit_p50_ms` points at the actors or at the limit of six connections, and a `visit_max_ms` at the
-3 s timeout with `failed` above 0 at single slow actors. With six visits in flight no visit waits
-for a slot in the runtime's queue, so `visit_p50_ms` is the call's own time and
+`visit_p50_ms` points at the actors, and a `visit_max_ms` at the 3 s timeout with `failed` above 0
+at single slow actors. With six visits in flight no visit waits for a slot in the runtime's queue,
+whether or not the limit counts these calls, so `visit_p50_ms` is the call's own time and
 `ceil(databases / 6) x visit_p50_ms` should match `cycle_ms`; if `cycle_ms` is much larger than that
 the cycle waits for something else (the list read from D1 on the cycle that reads it, shown by
 `list_error` and a cycle every 64 s that is slower than the others). When `visit_p50_ms` is stable
@@ -264,6 +273,17 @@ does not stop the loop. The effect shows in the Edge's admission lines: `admit_m
 connect to a database that was idle is expected to fall from a cold actor's 200 to 600 ms to the
 warm actor's 40 to 80 ms (the scratch measurement of the plan's keep-warm study found that
 effect); confirm it live after the deploy.
+
+The shard size holds only while a visit takes about what it is planned for. A full shard of 78
+fits the interval of 8 s up to 615 ms a visit (13 rounds) and the planned half of it up to 307 ms.
+The signature of a shard that does not fit is `concurrency` 6, `overrun` true, `visit_p50_ms` above
+about 600 ms and `cycle_ms` near `ceil(databases / 6) x visit_p50_ms`. With a `colo` near the
+actors that means the call itself is slow and the limit of six connections is not the cause. Two
+releases answer it: raise `ACTOR_WARM_VISIT_PLAN_MS` to the measured `visit_p50_ms`, which makes the
+shards smaller and the warmers more (it works whatever the limit counts), or raise
+`ACTOR_WARM_CONCURRENCY` to 16, which shortens the cycle by about two thirds only if the calls are
+not counted against the six connections (then `visit_p50_ms` stays and `cycle_ms` falls) and not at
+all if they are (then `visit_p50_ms` grows to about 2.7 times and `cycle_ms` stays).
 
 ## Edge Worker
 

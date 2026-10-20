@@ -17,22 +17,33 @@
 // - Six simultaneous outgoing connections for each request, alarm and message. The Durable Objects
 //   limits page lists "Simultaneous outgoing connections/request: 6 (same as Workers)" for every
 //   Durable Object (https://developers.cloudflare.com/durable-objects/platform/limits/, read
-//   2026-10-20). The Workers limits page (https://developers.cloudflare.com/workers/platform/limits/,
-//   read 2026-10-20) says a seventh connection waiting for response headers is queued until one of
-//   the six gets them, and lists fetch, KV, Cache, R2, Queues and TCP among those that count, not
-//   calls to Durable Object stubs. The design relies on the first page: a cycle keeps six calls in
-//   flight (`ACTOR_WARM_CONCURRENCY`). If the second page is the whole truth and stubs are not
-//   counted, six is only slower than the runtime allows, and the shard size, which assumes six,
-//   still holds. The first design kept 16 in flight: no faster if the limit applies, and every
-//   visit's time then included its wait in the queue.
+//   2026-10-20) and says nothing of which calls count. The Workers limits page it points to
+//   (https://developers.cloudflare.com/workers/platform/limits/, read 2026-10-20) queues a seventh
+//   connection until one of the six gets its response headers, and lists fetch, KV, Cache, R2,
+//   Queues, TCP and outbound WebSockets among those that count; it does not name calls to Durable
+//   Object stubs. Whether a stub call counts is therefore open. A cycle keeps six calls in flight
+//   (`ACTOR_WARM_CONCURRENCY`): that never waits in the runtime's queue, whichever way it is, so
+//   a visit's time is the call's own, which is what the cycle line has to show. The price is that
+//   the shard size holds only while a visit takes what it is planned for. If stubs are not
+//   counted, the live 9.0 s for 167 visits at 16 in flight are 820 to 860 ms a visit, and six in
+//   flight then take 8.2 to 8.6 s for Dev's shards of about 56 (10 rounds) and 10.7 to 11.2 s for
+//   a full shard of 78 (13 rounds): more than the interval. A full shard fits the interval at six
+//   in flight while a visit takes at most 615 ms (8 s over 13 rounds) and fits the planned half
+//   of it at 307 ms. The cycle line shows a shard that does not fit: `concurrency` 6, `overrun`
+//   true and `visit_p50_ms` above about 600 ms, `cycle_ms` near `ceil(databases / 6) x
+//   visit_p50_ms`. 16 in flight would fit a shard of 78 on the live figures either way (about 4 s:
+//   13 rounds of 300 to 320 ms if the limit applies, 5 rounds of 820 to 860 ms if not), but if the
+//   limit applies every visit's time would then include its wait in the queue, and the line could
+//   not say how long the call itself takes.
 // - The live Dev API Worker (2026-10-20, 167 databases, one warmer, 16 in flight) took a median of
-//   9.0 s a cycle (6.7 to 15.2 s), about 300 ms for each visit at six in flight, where 50 ms were
-//   expected. Whether that is the warmer's distance to the actors (the minute cron created it
-//   wherever that invocation ran, with a location hint only if DATABASE_ACTOR_LOCATION_HINT was
-//   set) or something else is read from the new fields of the cycle line (`visit_p50_ms`,
-//   `visit_max_ms`, `concurrency`) and from the colo of the line `actor_warmer_placed`. Until a read
-//   says otherwise a shard is sized for those 300 ms (`ACTOR_WARM_VISIT_PLAN_MS`):
-//   `actorWarmShardSize`.
+//   9.0 s a cycle (6.7 to 15.2 s) where 2 s (50 ms a visit) were expected: about 320 ms a visit if
+//   only six calls run at once (28 rounds), about 820 to 860 ms if all 16 do (10 to 11 rounds).
+//   Whether that is the warmer's distance to the actors (the minute cron created it wherever that
+//   invocation ran, with a location hint only if DATABASE_ACTOR_LOCATION_HINT was set) or
+//   something else is read from the cycle line (`visit_p50_ms`, `visit_max_ms`, `concurrency`)
+//   and from the colo of the line `actor_warmer_placed`. Until a read says otherwise a shard is
+//   sized for 300 ms a visit (`ACTOR_WARM_VISIT_PLAN_MS`), the reading under which the limit
+//   applies: `actorWarmShardSize`.
 import type { ActorWarmerShape } from "../actor-warmer.ts";
 import type { Env } from "../env.ts";
 import { cronErrorCode } from "./cron-health.ts";
@@ -44,14 +55,17 @@ const ACTOR_WARM_MIN_INTERVAL_MS = 1_000;
 const ACTOR_WARM_MAX_INTERVAL_MS = 300_000;
 /**
  * Visits in flight at once in one cycle: the six simultaneous outgoing connections a Durable
- * Object has for one invocation (see the header). If the limit applies, more would wait in the
- * runtime's queue and the wait would show as the time of the visits.
+ * Object has for one invocation (see the header). Six never wait in the runtime's queue, so a
+ * visit's time is the call's own; if the limit applies to these calls, more would wait and the
+ * wait would show as the time of the visits.
  */
 export const ACTOR_WARM_CONCURRENCY = 6;
 /**
  * The time one visit is planned to take, in milliseconds: what the live cycles of 2026-10-20
- * implied (167 visits, six in flight, a median cycle of 9.0 s). Lower it to the `visit_p50_ms` of the cycle
- * lines once the warmers are placed near the actors and a read shows it; the shards then grow.
+ * imply if the six-connection limit applies to the calls (167 visits, a median cycle of 9.0 s, 28
+ * rounds of six: 320 ms; if it does not apply, 820 to 860 ms, see the header). Lower it to the
+ * `visit_p50_ms` of the cycle lines once the warmers are placed near the actors and a read shows
+ * it; the shards then grow.
  */
 export const ACTOR_WARM_VISIT_PLAN_MS = 300;
 /** A cycle of an average shard should take at most this share of the interval; the rest is margin for a shard larger than average and for a slow visit. */
