@@ -34,16 +34,16 @@ export const ALERT_DELIVERY_BUDGET_MS = 20_000;
 /**
  * The power operations that the power timeout undoes itself, so that the generic operation sweep
  * leaves them to it: a suspension of a database that D1 does not know asleep (it may still run,
- * and the database goes back to running), and a resume of one it knows asleep (the database goes
- * back to sleep). The two statements share this text, so that every timed-out power operation is
- * taken by exactly one of them. A suspension of a database that D1 knows asleep needs no undo: the
- * sleep it asks for is what is known, so the sweep only fails the operation, and the database stays
- * suspended. Undoing it would turn it into a resume and make a cycle with the resume's revert for
- * as long as no node reports on the database.
+ * and the database goes back to running), and a resume or a wake of one it knows asleep (the
+ * database goes back to sleep). The two statements share this text, so that every timed-out power
+ * operation is taken by exactly one of them. A suspension of a database that D1 knows asleep needs
+ * no undo: the sleep it asks for is what is known, so the sweep only fails the operation, and the
+ * database stays suspended. Undoing it would turn it into a resume and make a cycle with the
+ * resume's revert for as long as no node reports on the database.
  */
 const undoneByPowerTimeout = (database: string, operation: string) =>
   `((${database}.desired_state='suspended' AND ${database}.observed_power<>'hibernated' AND ${operation}.kind IN('database.suspend','database.hibernate'))
-        OR (${database}.desired_state='running' AND ${database}.observed_power='hibernated' AND ${operation}.kind='database.resume'))`;
+        OR (${database}.desired_state='running' AND ${database}.observed_power='hibernated' AND ${operation}.kind IN('database.resume','database.wake')))`;
 
 const noUsage: UsageCronResult = {
   databases: 0,
@@ -169,22 +169,22 @@ export async function runCron(
       let recovered = 0;
       const nodes = new Map<string, Set<string>>();
       for (const row of expiredPower.results.slice(0, 8)) {
-        // A suspension the node did not prove is undone; a resume it did not carry out, of a
-        // database that sleeps, puts the database back to sleep (nothing else would wake it).
+        // A suspension the node did not prove is undone; a resume or a wake it did not carry out,
+        // of a database that sleeps, puts the database back to sleep (nothing else would wake it).
         const expected = {
           databaseId: row.id,
           operation: row.power_operation,
           revision: row.generation,
         };
         const recovery =
-          row.kind === "database.resume"
-            ? await recoverFailedResume(
+          row.kind === "database.suspend" || row.kind === "database.hibernate"
+            ? await recoverQuiescence(env, expected, "timeout", timestamp)
+            : await recoverFailedResume(
                 env,
                 expected,
                 "operation_timeout",
                 timestamp,
-              )
-            : await recoverQuiescence(env, expected, "timeout", timestamp);
+              );
         if (recovery) {
           recovered++;
           if (recovery.nodeId !== null) {

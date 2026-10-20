@@ -885,9 +885,44 @@ async function takeObservation(
     if (recovered) await hintDatabases(env, [row.id]).catch(() => 0);
     return recovered ? "accept" : "conflict";
   }
+  // The node could not carry out a wake of an idle sleeper: the wake fails with the node's error
+  // and the database goes back to its idle sleep, which the node proves again, so that the next
+  // connection wakes it with a new ticket; a database left running with a failed wake would be one
+  // nothing wakes. The recovery is a compare-and-set on the row read above, as the report's own
+  // update is: it loses to a concurrent change, and the node sends the report again.
+  if (observation.state === "error" && (await wakingSleeper(env, row))) {
+    const recovered = await recoverFailedResume(
+      env,
+      {
+        databaseId: row.id,
+        operation: row.power_operation!,
+        revision: row.generation,
+      },
+      observation.error!,
+    );
+    if (recovered) await hintDatabases(env, [row.id]).catch(() => 0);
+    return recovered ? "accept" : "conflict";
+  }
   return (await applyObservation(env, node, row, observation, reportedAt))
     ? "accept"
     : "conflict";
+}
+
+/** Whether the database's open power operation is a wake of a sleeper that D1 knows asleep. */
+async function wakingSleeper(env: Env, row: Row): Promise<boolean> {
+  if (
+    row.desired_state !== "running" ||
+    row.observed_power !== "hibernated" ||
+    !row.power_operation
+  )
+    return false;
+  return (
+    (await env.DB.prepare(
+      `SELECT 1 FROM operations WHERE id=? AND database_id=? AND kind='database.wake' AND status IN('pending','running')`,
+    )
+      .bind(row.power_operation, row.id)
+      .first()) !== null
+  );
 }
 
 /**
