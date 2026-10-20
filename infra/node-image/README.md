@@ -484,8 +484,9 @@ before inside the namespace; the database units and the backup jobs mount their 
   to EU1's mount time: 300 volumes, stop and start to the first served wake 76 s before the change
   and 6 s after it. On EU1 it is not measured yet; the events `agent_start_phase` of one restart
   (`storage_open`, `device_links`, `restore_runtime`, `link_started`, `first_page`, `units_read`,
-  `archive_credentials`, `node_credentials`, `apply`, `settled`, `gateway_table`,
-  `service_started`, with `link_hello` and `first_wake_served` beside them, and
+  `credentials` (the archive credentials of the databases and the node's own, read at the same
+  time), `apply`, `settled`, `gateway_table`, `service_started`, with `link_hello` and
+  `first_wake_served` beside them, and
   `reconcile_first_pass` with the number and the summed time of the runs of `lvs`, the mounts and
   the unit reads) say where its time went.
 - What the agent decides never rests on its own mount table alone, because a unit or a job mounts

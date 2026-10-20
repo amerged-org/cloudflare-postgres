@@ -202,6 +202,46 @@ it("finds the Tunnel it made before, creates nothing again and corrects a record
   ).toEqual([]);
 });
 
+it.each([false, true])(
+  "asks Cloudflare for the configuration, the DNS records and the token at the same time once it has the Tunnel (shell %s)",
+  async (shell) => {
+    const api = cloudflare({ delay: 10 });
+    const tunnel = await ensureNodeTunnel(services(api.fetcher, shell), NODE);
+    expect(tunnel.token).toBe(TUNNEL_TOKEN);
+    // The configuration, the three DNS reads and the token are in flight together (the Tunnel's
+    // identifier is all they wait for); a Worker keeps six calls open at once.
+    expect(api.peak).toBe(5);
+    expect(published(api)).toEqual(
+      shell ? [CNAME(GATEWAY), CNAME(SHELL)] : [CNAME(GATEWAY)],
+    );
+    // Called again with everything in place, the same five calls make no change.
+    const calls = api.calls.length;
+    await ensureNodeTunnel(services(api.fetcher, shell), NODE);
+    expect(
+      api.calls
+        .slice(calls)
+        .filter(
+          (c) => c.method !== "GET" && !c.url.endsWith("/configurations"),
+        ),
+    ).toEqual([]);
+  },
+);
+
+it("does not fail while a call it made is still running", async () => {
+  const slow = cloudflare({ delay: 30 });
+  // The token is refused at once; the calls beside it take longer.
+  const fetcher: typeof fetch = (input, init) =>
+    String(input).endsWith("/token")
+      ? Promise.resolve(
+          Response.json({ success: false, result: null }, { status: 403 }),
+        )
+      : slow.fetcher(input, init);
+  await expect(ensureNodeTunnel(services(fetcher), NODE)).rejects.toThrow(
+    /^cloudflare_api_failed$/,
+  );
+  expect(slow.inFlight).toBe(0);
+});
+
 it("fails with the class of the API's refusal and never with what it said", async () => {
   const fetcher: typeof fetch = async () =>
     Response.json(

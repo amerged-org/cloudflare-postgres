@@ -166,6 +166,9 @@ pub struct Inner {
     /// How long the double takes to answer a read of an archive credential, as the Worker takes
     /// (a lookup in D1 and a round trip): zero unless a test gives it one.
     pub credential_delay: Duration,
+    /// The same for a read of the node's credentials (the Tunnel and the route keyring), which the
+    /// Worker answers after several calls to Cloudflare's API.
+    pub node_credentials_delay: Duration,
     /// Files served to anyone at `/files/...`, as a release's binaries are by their URLs.
     pub files: std::collections::HashMap<String, Vec<u8>>,
     /// The release the pages name, where it is not the example's.
@@ -246,6 +249,7 @@ impl Cloud {
             samples: vec![],
             credential_paths: Default::default(),
             credential_delay: Duration::ZERO,
+            node_credentials_delay: Duration::ZERO,
             files: Default::default(),
             release: None,
             credentials: None,
@@ -719,12 +723,14 @@ async fn serve(
             signed,
             status,
         });
-        let delay = if request.target.starts_with(
-            constant("NODE_API_PATHS")["archiveCredentials"]
-                .as_str()
-                .unwrap(),
-        ) {
+        let paths = constant("NODE_API_PATHS");
+        let delay = if request
+            .target
+            .starts_with(paths["archiveCredentials"].as_str().unwrap())
+        {
             inner.credential_delay
+        } else if request.target == paths["credentials"].as_str().unwrap() {
+            inner.node_credentials_delay
         } else {
             Duration::ZERO
         };

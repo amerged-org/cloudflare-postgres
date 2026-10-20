@@ -471,10 +471,16 @@ impl<M: Machine> Service<M> {
                 crate::timing::phase(name);
             }
         };
-        self.deliver_credentials(&page).await;
-        phase("archive_credentials");
-        self.apply_credentials(&page).await;
-        phase("node_credentials");
+        // The two reads do not depend on each other: the archive credentials are for the jobs
+        // and the archive socket (`Core::deliver`), the node's own for the gateway and the Tunnel
+        // (`apply_credentials`); they share no state, and the page is applied after both. The
+        // node's credentials are polled first because the Worker makes several calls to
+        // Cloudflare's API for them.
+        tokio::join!(
+            self.apply_credentials(&page),
+            self.deliver_credentials(&page)
+        );
+        phase("credentials");
         self.core.apply(&page).await;
         phase("apply");
         self.answer_probes(&page);
@@ -1955,6 +1961,57 @@ mod tests {
         }
         // One after the other, 24 round trips of 150 ms are 3.6 s.
         assert!(took < Duration::from_millis(2000), "{took:?}");
+        service.stop();
+    }
+
+    /// The archive credentials of the databases and the node's own credentials (the Tunnel and the
+    /// route keyring) are two reads from Cloudflare, and neither needs the other: the first page
+    /// is applied in about the time of the slower one, and not of both added.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_archive_credentials_and_the_nodes_credentials_are_read_at_the_same_time() {
+        let Some((machine, _fixture, _root)) = site("credentials-both", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let databases: Vec<Value> = (0..CREDENTIALS_AT_ONCE)
+            .map(|n| {
+                let mut db = database(&database_id(n));
+                db["archive"]["credential"]["id"] = json!(format!("crd_{n:020}"));
+                db
+            })
+            .collect();
+        cloud.with(|inner| {
+            for db in &databases {
+                inner.credential_paths.insert(
+                    db["archive"]["credential"]["id"].as_str().unwrap().into(),
+                    db["archive"]["path"].as_str().unwrap().into(),
+                );
+            }
+            inner.databases = databases.clone();
+            // All the archive credentials are one round of reads.
+            inner.credential_delay = Duration::from_millis(600);
+            inner.node_credentials_delay = Duration::from_millis(1200);
+        });
+        let began = std::time::Instant::now();
+        let service = serve(&machine, &cloud, &base).await;
+        let took = began.elapsed();
+        for db in &databases {
+            let path = db["archive"]["path"].as_str().unwrap();
+            assert!(
+                service
+                    .core()
+                    .store(path, crate::credentials::Access::ReadWrite)
+                    .is_some(),
+                "{path}"
+            );
+        }
+        assert_eq!(machine.credentials_applied().len(), 1);
+        // One after the other the two are 1.8 s; at the same time they are the 1.2 s of the slower.
+        assert!(took >= Duration::from_millis(1200), "{took:?}");
+        assert!(took < Duration::from_millis(1600), "{took:?}");
         service.stop();
     }
 

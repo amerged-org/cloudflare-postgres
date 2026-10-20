@@ -58,6 +58,18 @@ export interface NodeTunnel {
   token: string;
 }
 
+/**
+ * Runs the calls at once and returns their results in order. It returns when every call has
+ * ended, and a failure is the first one in the order of the calls: a read that failed leaves no
+ * call of its own running behind it, and a failed read is repeated whole.
+ */
+async function together<T>(calls: Promise<T>[]): Promise<T[]> {
+  const settled = await Promise.allSettled(calls);
+  for (const result of settled)
+    if (result.status === "rejected") throw result.reason;
+  return settled.map((result) => (result as PromiseFulfilledResult<T>).value);
+}
+
 export async function ensureNodeTunnel(
   services: NodeTunnelServices,
   nodeId: string,
@@ -88,18 +100,6 @@ export async function ensureNodeTunnel(
   const id = (tunnel as { id?: unknown } | null)?.id;
   if (typeof id !== "string" || !TUNNEL_ID.test(id))
     throw new Error("cloudflare_api_failed");
-  await call("PUT", `${base}/${id}/configurations`, {
-    config: {
-      ingress: [
-        { hostname: gateway, service: GATEWAY_SERVICE },
-        ...(services.shell
-          ? [{ hostname: shell, service: SHELL_SERVICE }]
-          : []),
-        // Anything else is refused.
-        { service: "http_status:404" },
-      ],
-    },
-  });
   const dns = `/zones/${services.zoneId}/dns_records`;
   const recordOf = async (hostname: string) => {
     const records = await call(
@@ -111,7 +111,7 @@ export async function ensureNodeTunnel(
       records as { id?: unknown; content?: unknown; proxied?: unknown }[]
     )[0];
   };
-  for (const hostname of services.shell ? [gateway, shell] : [gateway]) {
+  const point = async (hostname: string) => {
     const wanted = {
       type: "CNAME",
       name: hostname,
@@ -125,19 +125,36 @@ export async function ensureNodeTunnel(
       if (typeof have.id !== "string") throw new Error("cloudflare_api_failed");
       await call("PUT", `${dns}/${have.id}`, wanted);
     }
-  }
-  // The ingress above no longer names any of these; their records go too. The former name is
-  // deleted whatever `shell` says: a node that got one before the rename still has the record.
-  for (const hostname of services.shell
-    ? [legacyShell]
-    : [shell, legacyShell]) {
+  };
+  const remove = async (hostname: string) => {
     const have = await recordOf(hostname);
     if (have !== undefined) {
       if (typeof have.id !== "string") throw new Error("cloudflare_api_failed");
       await call("DELETE", `${dns}/${have.id}`);
     }
-  }
-  const token = await call("GET", `${base}/${id}/token`);
+  };
+  // The token, the ingress and the records wait for the Tunnel's identifier and for nothing else,
+  // so they are asked at once: a read of the credentials is a round trip for the Tunnel and one
+  // for the rest, and not one for each of six calls. The ingress names neither hostname that
+  // `remove` deletes, so their records go too. The former name is deleted whatever `shell` says:
+  // a node that got one before the rename still has the record.
+  const [token] = await together<unknown>([
+    call("GET", `${base}/${id}/token`),
+    call("PUT", `${base}/${id}/configurations`, {
+      config: {
+        ingress: [
+          { hostname: gateway, service: GATEWAY_SERVICE },
+          ...(services.shell
+            ? [{ hostname: shell, service: SHELL_SERVICE }]
+            : []),
+          // Anything else is refused.
+          { service: "http_status:404" },
+        ],
+      },
+    }),
+    ...(services.shell ? [gateway, shell] : [gateway]).map(point),
+    ...(services.shell ? [legacyShell] : [shell, legacyShell]).map(remove),
+  ]);
   if (typeof token !== "string" || !TUNNEL_TOKEN.test(token))
     throw new Error("cloudflare_api_failed");
   // The gateway accepts a WebSocket upgrade at /pg only; the region contract ends the URL there.

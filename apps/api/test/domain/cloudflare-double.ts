@@ -30,9 +30,14 @@ export interface DnsRecord {
   proxied: boolean;
 }
 
-/** The Cloudflare API as the Worker sees it: Tunnels, their configuration and DNS records. */
+/**
+ * The Cloudflare API as the Worker sees it: Tunnels, their configuration and DNS records. With
+ * `delay` (milliseconds) every call takes that long to answer, as a round trip does, so that calls
+ * made at the same time are in flight at the same time (`peak` is the most there were, `inFlight`
+ * is how many are now).
+ */
 export function cloudflare(
-  initial: { tunnels?: Tunnel[]; records?: DnsRecord[] } = {},
+  initial: { tunnels?: Tunnel[]; records?: DnsRecord[]; delay?: number } = {},
 ) {
   const tunnels = [...(initial.tunnels ?? [])],
     records = [...(initial.records ?? [])],
@@ -40,7 +45,8 @@ export function cloudflare(
     calls: { method: string; url: string; body: unknown }[] = [];
   // A record's id is never reused after the record is deleted.
   let nextRecord = records.length;
-  const fetcher: typeof fetch = async (input, init) => {
+  const state = { inFlight: 0, peak: 0 };
+  const answer: typeof fetch = async (input, init) => {
     const url = new URL(String(input)),
       method = init?.method ?? "GET",
       body =
@@ -99,5 +105,27 @@ export function cloudflare(
     }
     return Response.json({ success: false, result: null }, { status: 404 });
   };
-  return { fetcher, tunnels, records, configurations, calls };
+  const fetcher: typeof fetch = async (input, init) => {
+    state.inFlight += 1;
+    state.peak = Math.max(state.peak, state.inFlight);
+    try {
+      if (initial.delay) await new Promise((r) => setTimeout(r, initial.delay));
+      return await answer(input, init);
+    } finally {
+      state.inFlight -= 1;
+    }
+  };
+  return {
+    fetcher,
+    tunnels,
+    records,
+    configurations,
+    calls,
+    get inFlight() {
+      return state.inFlight;
+    },
+    get peak() {
+      return state.peak;
+    },
+  };
 }
