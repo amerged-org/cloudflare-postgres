@@ -153,8 +153,12 @@ a damaged journal file fails them with `Failed to iterate through journal`).
   later backup impossible to restore): what does not fit is cut again, the oldest entries first
   (a text keeps its beginning), and the stored `body` of a probe or `report` of a boot report then
   says `"truncated": true` and `"dropped_entries"`, the number of entries left out (0 when only the
-  end of a text was cut). Ask again with fewer `lines` or a shorter `since_seconds` to read what
-  was left out. A report or result that fits has neither field. The lines of a database's unit (`pgcf-pg@…`) or of a backup job
+  end of a text was cut). What was left out cannot be read through a probe: `journal` answers with
+  the newest `lines` entries of the last `since_seconds` seconds of the boot, `kernel` with the
+  newest `lines` of the boot, and the other probes with a text that ignores both numbers, and a
+  probe has no upper time bound. A request with fewer `lines` or a shorter `since_seconds` therefore
+  returns a subset of the entries the API kept, never the older ones it dropped; it only makes the
+  answer fit whole, and a report or result that fits has neither field. The lines of a database's unit (`pgcf-pg@…`) or of a backup job
   (`pgcf-job-…`), and the lines PID 1 writes about them, are never sent; in a text, every line
   that names one is left out. A kernel line that names a database's cgroup, such as an out of
   memory kill, is kept: it holds the database's identifier and nothing of its data. A node's page

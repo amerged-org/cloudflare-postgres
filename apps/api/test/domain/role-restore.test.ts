@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { Role, listEnvelope } from "@pgcf/contracts";
+import {
+  ROLE_LIMIT,
+  ROLE_MEMBER_OF_MAX,
+  Role,
+  bytesToBase64url,
+  listEnvelope,
+  newRolePassword,
+} from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
+import { keyring } from "../../src/crypto/keyring.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 const keys: string[] = [];
@@ -186,4 +194,95 @@ it("an archive retained before roles had attributes restores plain roles", async
     member_of: [],
     bypass_rls: false,
   });
+});
+
+/**
+ * A database whose roles are the most the contracts allow (`ROLE_LIMIT` roles with names of 63
+ * characters, `ROLE_MEMBER_OF_MAX` memberships of 63 characters each, a `valid_until`, the highest
+ * `connection_limit` and `bypass_rls`, a password encrypted by the keyring under a key version of
+ * `keyLength` characters and a `password_revision` of `revision`), deleted; and the bytes of what a
+ * dump of the control database writes for its retained archive: the `roles_json` and the whole
+ * `INSERT` (SQLite's own quote(), as its dump and D1's export write the values). D1 takes a
+ * statement of at most 100,000 bytes when such a dump is imported.
+ */
+async function deletedWithLargestRoles(keyLength: number, revision: number) {
+  const f = await source();
+  const kid = "k".repeat(keyLength);
+  const ring = keyring(
+    JSON.stringify({
+      active: kid,
+      keys: { [kid]: bytesToBase64url(new Uint8Array(32)) },
+    }),
+  );
+  const names = Array.from({ length: ROLE_LIMIT }, (_, at) =>
+    `r${at}`.padEnd(63, "x"),
+  );
+  const rows = await Promise.all(
+    names.map(async (name, at) => ({
+      name,
+      owner: at === 0 ? 1 : 0,
+      member_of: Array.from(
+        { length: ROLE_MEMBER_OF_MAX },
+        (_, member) => names[(at + 1 + member) % ROLE_LIMIT],
+      ),
+      encrypted: await ring.encrypt(f.id, name, newRolePassword()),
+    })),
+  );
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM roles WHERE database_id=?").bind(f.id),
+    ...rows.map((row) =>
+      env.DB.prepare(
+        `INSERT INTO roles(database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at,valid_until,connection_limit,member_of_json,bypass_rls)
+         VALUES(?,?,?,?,?,?,${revision},?,?,?,10000,?,1)`,
+      ).bind(
+        f.id,
+        row.name,
+        row.owner,
+        row.encrypted.ciphertext,
+        row.encrypted.iv,
+        row.encrypted.kid,
+        f.until,
+        f.until,
+        f.until,
+        JSON.stringify(row.member_of),
+      ),
+    ),
+  ]);
+  expect(
+    (
+      await request(
+        `/v1/databases/${f.id}`,
+        f.integrator,
+        "DELETE",
+        undefined,
+        key(),
+      )
+    ).status,
+  ).toBe(202);
+  const stored = await env.DB.prepare(
+    `SELECT length(CAST(roles_json AS BLOB)) roles, length(CAST('INSERT INTO "retained_archives" VALUES(' || quote(source_database_id) || ',' || quote(project_id) || ',' || quote(region_id) || ',' || quote(archive_path) || ',' || quote(storage_generation) || ',' || quote(roles_json) || ',' || quote(deleted_at) || ',' || quote(expires_at) || ',' || quote(cleanup_claim) || ');' AS BLOB)) statement
+     FROM retained_archives WHERE source_database_id=?`,
+  )
+    .bind(f.id)
+    .first<{ roles: number; statement: number }>();
+  return stored!;
+}
+
+// The plan (11.1, row "Diagnostics are stored within the bound of a backup") quotes these sizes and
+// the key version length from which the statement passes D1's limit. `roles_json` is 96,401 bytes
+// with a key version of 2 characters and a one-digit revision, and each further character of the
+// key version or digit of the revision adds 100 (once for each of the 100 roles).
+const D1_STATEMENT_MAX = 100_000;
+
+it("a key version of 64 characters, the longest the keyring takes, can make a retained archive that D1 cannot import", async () => {
+  const stored = await deletedWithLargestRoles(64, 1);
+  expect(stored.roles).toBe(96_401 + 62 * 100);
+  expect(stored.statement).toBeGreaterThan(D1_STATEMENT_MAX);
+});
+
+it("a key version of the live length cannot, whatever the roles and the revision", async () => {
+  // 4 characters, and a revision of 16 digits, the most a JSON number holds exactly.
+  const stored = await deletedWithLargestRoles(4, Number.MAX_SAFE_INTEGER);
+  expect(stored.roles).toBe(96_401 + 2 * 100 + 15 * 100);
+  expect(stored.statement).toBeLessThan(D1_STATEMENT_MAX);
 });

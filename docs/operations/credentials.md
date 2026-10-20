@@ -123,6 +123,11 @@ created (8760h in the operator installation), after which Access refuses the Edg
 Refresh it in Zero Trust (or with the Refresh endpoint, one more year) before then, and turn on the
 Zero Trust "Expiring Access Service Token" notification, which warns a week ahead.
 
+Choose short `CREDENTIAL_KEYS` IDs (the live one has 4 characters): the ID is written into every
+role of a database, and a deleted database's retained archive holds all of them in one row, which D1
+cannot import into a restore if it passes 100,000 bytes. The largest set of roles the contracts
+allow stays below that with an ID of 19 characters or fewer, and can pass it from 35 characters.
+
 For `CREDENTIAL_KEYS`, adding a new active key ID does not make old ciphertext disposable. Retain
 all key IDs referenced by database roles, deleted-source archives and older D1 exports. Back up
 the complete keyring before changing it. Re-encryption and automatic rotation
