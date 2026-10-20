@@ -1,4 +1,5 @@
 flowchart LR
+    n_1d7911e4e1b9["Durable Object<br/>ACTOR_WARMER<br/>class_name: ActorWarmer"]
     n_839713e89618["Cron<br/>* * * * *"]
     n_f305dbc12c79["D1 database<br/>DB<br/>database_name: #60;D1_DATABASE_NAME#62;"]
     n_049ba2d64372["Workflow<br/>ADD_NODE<br/>name: pgcf-add-node<br/>class_name: AddNode"]
@@ -15,6 +16,7 @@ flowchart LR
     n_839713e89618 -->|"scheduled event"| n_7a30182df25a
     n_7a30182df25a --> n_049ba2d64372
     n_7a30182df25a --> n_d0efe52f1f47
+    n_7a30182df25a --> n_1d7911e4e1b9
     n_7a30182df25a --> n_71083a5197e9
     n_7a30182df25a --> n_85c654928d8c
     n_7a30182df25a --> n_056b63fe76be

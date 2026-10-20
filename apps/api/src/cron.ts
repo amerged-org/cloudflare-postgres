@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DatabaseId, RegionId } from "@pgcf/contracts";
 import type { Env } from "./env.ts";
+import { armActorWarmers } from "./domain/actor-warm.ts";
 import { reconcileDatabaseActors } from "./domain/database-actor-sync.ts";
 import { recoverAdmissionMutations } from "./domain/admission-mutations.ts";
 import { recoverFailedResume, recoverQuiescence } from "./domain/lifecycle.ts";
@@ -301,6 +302,11 @@ export async function runCron(
     )
       .bind(actorPage.next, cursor.cursor)
       .run();
+  });
+  // Keeps the DatabaseActors warm; its own failure boundary, since a Worker without the binding
+  // must still reconcile and meter.
+  await attempt("actor_warmers", undefined, async () => {
+    await armActorWarmers(env);
   });
   const usage = await attempt("usage", { ...noUsage }, () =>
     runUsageCron(env.DB, now, env),

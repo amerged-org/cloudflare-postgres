@@ -13,8 +13,8 @@ owner's explicit, costed go.
 Use a source commit that passed the common CI checks.
 
 Keep the private API configuration outside Git. It supplies D1, region-specific R2 bindings,
-NodeActor/DatabaseActor/CronWatchdog Durable Objects and the AddNode and InfrastructureBackup
-Workflows. Start from `apps/api/wrangler.example.jsonc`; replace every placeholder. Import secret
+NodeActor/DatabaseActor/CronWatchdog/ActorWarmer Durable Objects and the AddNode and
+InfrastructureBackup Workflows. Start from `apps/api/wrangler.example.jsonc`; replace every placeholder. Import secret
 values from private custody and preserve the existing ones on every redeploy. Export D1 before
 applying additive migrations and rehearse them against the export.
 
@@ -116,6 +116,58 @@ because a new paid resource needs the owner's explicit, costed go. Put the firew
   above.
 - To verify an install, try a TCP connect to port 22 of the instance's public IPv4 address from
   outside during the rescue and after the reboot. Both must time out.
+
+### Keeping the DatabaseActors warm
+
+A DatabaseActor whose isolate has been idle for a few seconds is evicted, and the next admission
+of its database then pays 200 to 600 ms to load it again: after a quiet hour that is the biggest
+part of a cold first request that is not PostgreSQL's own (ULTRA plan 11.1, "Keep-warm for the
+DatabaseActor", and 11.2, "Cold gate"). A call to the actor every 10 s or faster keeps it loaded,
+so the API Worker visits every actor of a database that is not deleted, sleeping databases above
+all, with a no-op call (`DatabaseActor.warm`) that reads and writes nothing: no row, no D1
+statement, no counter, no ticket.
+
+The visits come from `ActorWarmer` Durable Objects, one for every 250 databases (a stable hash of
+the database ID picks the shard), each from its own alarm loop. The minute cron's step
+`actor_warmers` counts the databases, arms one warmer per 250 of them and renews their three-minute
+lease; a warmer that is no longer armed stops by itself, so a cron that stops or an interval of 0
+ends the visits within three minutes, and a deploy or a fault that loses an alarm is repaired by
+the next minute. A warmer reads its list of databases from D1 every 60 s, not every cycle, so a
+new database is visited within about a minute of its creation and a deleted one stops being
+visited within about a minute. A visit that fails or does not answer within 3 s is counted and never delays the
+admission of any connection.
+
+| Setting | Where | Meaning |
+| --- | --- | --- |
+| `ACTOR_WARMER` binding, class `ActorWarmer`, and a migration with `new_sqlite_classes: ["ActorWarmer"]` (tag `v7` in `apps/api/wrangler.example.jsonc`; use the next unused tag of the deployed configuration) | private API configuration | Required while the interval is not 0. Without the binding the step `actor_warmers` fails each minute (`actor_warmer_binding_missing`) and, after five runs in a row, raises `control_cron_step_failing`; every other step still runs. |
+| `DATABASE_ACTOR_WARM_INTERVAL_MS` (variable) | private API configuration | Milliseconds between two visits of an actor: unset is 8000, `0` turns the keep-warm off, any other value is 1000 to 300000; anything else makes the step fail (`invalid_actor_warm_interval`). Keep it at 10000 or below: the gap between two visits of an actor is the interval plus the alarm's jitter plus the spread of a cycle (about a second), a visit loop of 10 s or faster kept every probe fast in the measurement, and beyond it a growing share of admissions found a reloaded actor. |
+| `DATABASE_ACTOR_LOCATION_HINT` (existing variable) | API and Edge Workers | The warmers are placed with the same hint as the actors, so that a visit does not cross a continent. |
+
+No secret and no other binding is needed. Deploy the API Worker with the migration; the first
+minute cron afterwards arms the warmers, and their first visit comes one interval later.
+
+**Cost.** Each visit is one Durable Object request, so the cost is proportional to the number of
+databases and to the visit rate, and it is charged for sleeping databases as well. Per 1,000
+databases and 30 days (estimated from the measured figures of plan 11.1 at the pricing page of
+2026-10-18, not from an invoice): 324 million requests at an interval of 8 s (USD 0.15 per million:
+USD 48.6) plus about USD 5 of duration (billed only while an actor runs a call, not while it is
+loaded) is about USD 54; the measured figures at 10 s and 5 s are USD 43.6 and USD 83.8, and at
+30 s USD 16.3 with a tail of 250 to 317 ms at p95. The warmers add about USD 1 per shard and month
+(an alarm, one row written and about a second of duration every cycle: 324,000 cycles), that is
+about USD 4 per 1,000 databases, and one line of log per cycle and shard (324,000 a month). The
+list reads of D1 are one row per database and warmer a minute, which is below any quota. These are
+gross figures: the first million requests, 400,000 GB-s and 50 million rows written a month of the
+account's plan are not subtracted.
+
+**Observing it.** Each cycle of a warmer writes one line, `actor_warm_cycle`, to Workers Logs with
+`shard`, `shards`, `databases`, `visited`, `failed`, `cycle_ms`, `interval_ms`, `overrun` and
+`list_error`; there is never a line per visit. A healthy shard shows `visited` equal to
+`databases`, `failed` 0, a `cycle_ms` of a second or less and `overrun` false (a first cycle after
+a deploy, with every actor cold, can take about ten seconds). `overrun` true again and again means
+the shard's cycle takes longer than the interval: raise the interval or check the actors.
+`actor_warm_failed` is an unexpected fault of a cycle and does not stop the loop. The effect shows
+in the Edge's admission lines: `admit_ms` of the first connect to a database that was idle falls
+from a cold actor's 200 to 600 ms to the warm actor's 40 to 80 ms.
 
 ## Edge Worker
 

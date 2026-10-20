@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { newDatabaseId, newOperationId } from "@pgcf/contracts";
+import { newDatabaseId } from "@pgcf/contracts";
 import { roleRevisionHash } from "@pgcf/contracts/route-token";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -11,7 +11,10 @@ import {
 import { DatabaseAdmissionSnapshot } from "../../src/domain/admission-state.ts";
 import { DatabasePresence } from "../../src/database-actor.ts";
 import { cleanupFixtures } from "./fixtures.ts";
-import { admissionSnapshotFixture } from "./admission-snapshot-fixture.ts";
+import {
+  admissionSnapshotFixture,
+  sleepingSnapshotFixture as sleeper,
+} from "./admission-snapshot-fixture.ts";
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -25,38 +28,6 @@ const route = (region: string) => ({
   gateway_binding: null,
 });
 
-/** A database the node reported asleep after an idle (or manual) sleep. */
-async function sleeper(reason: "idle" | "manual" = "idle") {
-  const f = await admissionSnapshotFixture();
-  const sleepOperation = newOperationId(),
-    sleepGeneration = f.generation + 1,
-    at = new Date().toISOString();
-  // Controlled committed sleep metadata, as the idle sleeper test writes it.
-  await env.DB.batch([
-    env.DB.prepare(
-      "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,?,'succeeded',?,?,?,?,?,?)",
-    ).bind(
-      sleepOperation,
-      reason === "idle" ? "database.hibernate" : "database.suspend",
-      f.project,
-      f.id,
-      sleepGeneration,
-      at,
-      at,
-      at,
-    ),
-    env.DB.prepare(
-      "UPDATE databases SET desired_state='suspended',suspension_reason=?,generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_json=NULL WHERE id=?",
-    ).bind(reason, sleepGeneration, sleepGeneration, sleepOperation, f.id),
-    env.DB.prepare(
-      "UPDATE database_admission_epochs SET admission_revision=admission_revision+1,route_revision=route_revision+1 WHERE database_id=?",
-    ).bind(f.id),
-  ]);
-  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
-  const snapshot = (await readDatabaseAdmissionSnapshot(env, f.id))!.snapshot;
-  expect(snapshot.wakeable).toBe(reason === "idle");
-  return { ...f, sleepGeneration, sleepOperation, snapshot };
-}
 type Sleeper = Awaited<ReturnType<typeof sleeper>>;
 async function expectedWake(f: Sleeper) {
   return {

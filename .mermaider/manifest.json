@@ -17,11 +17,11 @@
     },
     {
       "path": "docs/architecture/mermaider/api-resources.md",
-      "sha256": "43b4f1eee57217fb9362bb9d1f73d2b03818b0a1eb04187529bc0867cdccd154"
+      "sha256": "80e972f0354c600d8a4bfc264d7bafa16fc2fb8e31d3780cbc1d9091e52b1095"
     },
     {
       "path": "docs/architecture/mermaider/api-resources.mmd",
-      "sha256": "05c503d67857750c7f4fed5e6c6fc4374655f99ff4b48b6ada21e235b878a28d"
+      "sha256": "93eaaa17fccb394370c8bcb59a6bcd38c03e9f3ad9872f4fd758b2d94896ab5e"
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.md",
@@ -49,10 +49,10 @@
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "0866baef53f4235788395a6fd5e3d5cd9340203f10cf5f355845ce2a7fd0b87f"
+      "sha256": "a469550aa7e086c08745b93f3c5e0e661da53d3aeb47d73bb45dd3f34b31e13c"
     }
   ],
-  "fingerprint": "1553b25cf5b6af32a060fcd5648204f8a73eb705cacffeef633cd0f50bb4dfa9",
+  "fingerprint": "97d3ca0d4cfb875ca07ca9600e72e56bb2ee39e172122a64d4f0e3fa7c8e2525",
   "toolVersion": "0.1.1",
   "version": 1
 }

@@ -2,6 +2,7 @@
 import type { Env } from "./env.ts";
 // A Durable Object evaluates this module before its first call, so it imports only what a Durable
 // Object class needs: the router, the cron and the Workflows load on first use.
+export { ActorWarmer } from "./actor-warmer.ts";
 export { CronWatchdog } from "./cron-watchdog.ts";
 export { DatabaseActor } from "./database-actor.ts";
 export { NodeActor } from "./node-actor.ts";

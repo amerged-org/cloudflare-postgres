@@ -51,6 +51,11 @@
     // Durable Object location hint for new DatabaseActor objects, near the database regions and D1.
     // Set the same value on the Edge Worker. An existing object never moves.
     "DATABASE_ACTOR_LOCATION_HINT": "weur",
+    // Milliseconds between two visits of each DatabaseActor by the ActorWarmer objects, which keep its
+    // isolate loaded so that the first admission after a quiet period is not a cold start: any value
+    // from 1000 to 300000, 0 turns the keep-warm off, unset means 8000. A visit every 10 s or faster
+    // keeps an actor warm; the cost grows with the visit rate (docs/operations/operator-installation.md).
+    "DATABASE_ACTOR_WARM_INTERVAL_MS": "8000",
     "ARCHIVE_BINDINGS": "{\"<EU_REGION_ID>\":{\"binding\":\"ARCHIVE\",\"bucket\":\"replace-r2-backup-bucket\"},\"<US_REGION_ID>\":{\"binding\":\"ARCHIVE_US\",\"bucket\":\"replace-r2-us-backup-bucket\"}}",
     // The id of the Contabo firewall every node sits behind: active, created once with no inbound
     // rule, as docs/operations/operator-installation.md describes. AddNode sends the installer's
@@ -68,6 +73,9 @@
       // Checks the minute cron's heartbeat from its own alarm; keep the binding and the v4 migration
       // in every deployed configuration so a stopped or failing cron is still reported.
       { "name": "CRON_WATCHDOG", "class_name": "CronWatchdog" },
+      // Visits every DatabaseActor every DATABASE_ACTOR_WARM_INTERVAL_MS from its alarm; the minute
+      // cron arms it. Keep the binding and the v7 migration while the interval is not 0.
+      { "name": "ACTOR_WARMER", "class_name": "ActorWarmer" },
     ],
   },
   "migrations": [
@@ -82,6 +90,7 @@
       "new_sqlite_classes": ["NodeActor"],
       "deleted_classes": ["RegionLink"],
     },
+    { "tag": "v7", "new_sqlite_classes": ["ActorWarmer"] },
   ],
   "workflows": [
     {

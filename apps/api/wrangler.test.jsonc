@@ -27,12 +27,16 @@
     "CONTABO_ORDER_SSH_KEY_IDS": "<CONTABO_ORDER_SSH_KEY_IDS_JSON>",
     "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>",
     "ARCHIVE_BUCKET_NAME": "pgcf-api-test",
+    // The keep-warm is off: a warmer's alarm would visit actors, and read D1, in the middle of
+    // another test. The tests of the keep-warm arm it with an interval of their own.
+    "DATABASE_ACTOR_WARM_INTERVAL_MS": "0",
   },
   "durable_objects": {
     "bindings": [
       { "name": "NODE_ACTOR", "class_name": "NodeActor" },
       { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
       { "name": "CRON_WATCHDOG", "class_name": "CronWatchdog" },
+      { "name": "ACTOR_WARMER", "class_name": "ActorWarmer" },
     ],
   },
   "migrations": [
@@ -47,6 +51,7 @@
       "new_sqlite_classes": ["NodeActor"],
       "deleted_classes": ["RegionLink"],
     },
+    { "tag": "v7", "new_sqlite_classes": ["ActorWarmer"] },
   ],
   "workflows": [
     {
