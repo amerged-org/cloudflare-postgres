@@ -163,6 +163,9 @@ pub struct Inner {
     pub samples: Vec<Value>,
     /// The archive path a credential identifier is for, where it is not the example's.
     pub credential_paths: std::collections::HashMap<String, String>,
+    /// How long the double takes to answer a read of an archive credential, as the Worker takes
+    /// (a lookup in D1 and a round trip): zero unless a test gives it one.
+    pub credential_delay: Duration,
     /// Files served to anyone at `/files/...`, as a release's binaries are by their URLs.
     pub files: std::collections::HashMap<String, Vec<u8>>,
     /// The release the pages name, where it is not the example's.
@@ -242,6 +245,7 @@ impl Cloud {
             hellos: vec![],
             samples: vec![],
             credential_paths: Default::default(),
+            credential_delay: Duration::ZERO,
             files: Default::default(),
             release: None,
             credentials: None,
@@ -639,7 +643,7 @@ async fn serve(
     let upgrade = request
         .header("upgrade")
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    let (answer, failure) = {
+    let (answer, failure, delay) = {
         let mut inner = inner.lock().unwrap();
         let signed = if enrolling || public {
             None
@@ -715,8 +719,20 @@ async fn serve(
             signed,
             status,
         });
-        (answer, failure)
+        let delay = if request.target.starts_with(
+            constant("NODE_API_PATHS")["archiveCredentials"]
+                .as_str()
+                .unwrap(),
+        ) {
+            inner.credential_delay
+        } else {
+            Duration::ZERO
+        };
+        (answer, failure, delay)
     };
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     match failure {
         Some(Failure::Drop) => return Ok(()),
         Some(Failure::Status(status)) => {

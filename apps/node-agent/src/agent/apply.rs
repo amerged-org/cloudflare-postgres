@@ -143,16 +143,25 @@ impl<M: Machine> Core<M> {
         if let Some(policy) = Policy::parse(&page.policy) {
             self.set_policy(policy);
         }
-        for value in &page.databases {
-            let Some(entry) = Entry::parse(value) else {
-                crate::timing::emit_event(
-                    json!({"event": "desired_entry_refused", "database_id": value["id"]}),
-                );
-                continue;
-            };
+        // The databases that run come first: the gateway's first table waits for them.
+        let mut entries: Vec<Entry> = page
+            .databases
+            .iter()
+            .filter_map(|value| {
+                let entry = Entry::parse(value);
+                if entry.is_none() {
+                    crate::timing::emit_event(
+                        json!({"event": "desired_entry_refused", "database_id": value["id"]}),
+                    );
+                }
+                entry
+            })
+            .collect();
+        entries.sort_by_key(|entry| !self.awake_at_start.contains(&entry.id));
+        for entry in entries {
             let db = self.db(&entry.id);
             if self.accept(&db, entry) {
-                self.schedule(&db);
+                self.schedule_page(&db);
             }
         }
         if page.complete {
@@ -211,6 +220,47 @@ impl<M: Machine> Core<M> {
 
     /// Runs the reconciliation of a database, and again if its entry changes while it runs.
     pub(crate) fn schedule(self: &Arc<Self>, db: &Arc<Db>) {
+        self.schedule_with(db, None);
+    }
+
+    /// The reconciliation that a page asks for. A database the node has not decided on yet waits
+    /// for its turn among `FIRST_PASS_AT_ONCE`, which it keeps until it is decided on: a node has
+    /// hundreds of them when it starts, and each reads LVM, systemd and the disk and mounts a
+    /// volume. A wake does not wait for a turn (`try_wake`), and neither does a database that is
+    /// decided on already. What the decision then does (a build, a delete, a sleep) is no part of
+    /// the turn.
+    fn schedule_page(self: &Arc<Self>, db: &Arc<Db>) {
+        {
+            let mut view = db.view();
+            if view.adopted {
+                drop(view);
+                return self.schedule(db);
+            }
+            if view.queued {
+                return;
+            }
+            view.queued = true;
+        }
+        let (core, db) = (self.clone(), db.clone());
+        tokio::spawn(async move {
+            let turn = core.first_pass.clone().acquire_owned().await.ok();
+            let adopted = {
+                let mut view = db.view();
+                view.queued = false;
+                view.adopted
+            };
+            // A wake decided on it while it waited.
+            if !adopted {
+                core.schedule_with(&db, turn);
+            }
+        });
+    }
+
+    fn schedule_with(
+        self: &Arc<Self>,
+        db: &Arc<Db>,
+        turn: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         {
             let mut view = db.view();
             match view.reconcile {
@@ -223,8 +273,9 @@ impl<M: Machine> Core<M> {
         }
         let (core, db) = (self.clone(), db.clone());
         tokio::spawn(async move {
+            let mut turn = turn;
             loop {
-                core.reconcile(&db).await;
+                core.reconcile(&db, &mut turn).await;
                 let mut view = db.view();
                 if view.reconcile == Reconcile::Again {
                     view.reconcile = Reconcile::Running;
@@ -233,6 +284,7 @@ impl<M: Machine> Core<M> {
                     break;
                 }
             }
+            drop(turn);
             core.retry_until_adopted(&db);
         });
     }
@@ -284,8 +336,14 @@ impl<M: Machine> Core<M> {
         }));
     }
 
-    /// Decides on a database's entry and does what that needs.
-    pub(crate) async fn reconcile(self: &Arc<Self>, db: &Arc<Db>) {
+    /// Decides on a database's entry and does what that needs. The decision's turn among the first
+    /// (`schedule_page`) ends with it: for a database that runs or sleeps when it is decided on,
+    /// for any other when the step is known.
+    pub(crate) async fn reconcile(
+        self: &Arc<Self>,
+        db: &Arc<Db>,
+        turn: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         let _flow = db.lock.lock().await;
         let Some(entry) = db.view().entry.clone() else {
             return;
@@ -335,6 +393,9 @@ impl<M: Machine> Core<M> {
                 refused: view.refusal.is_some(),
             })
         };
+        if !matches!(step, Step::AdoptRunning | Step::AdoptAsleep) {
+            turn.take();
+        }
         match step {
             Step::Nothing => {}
             Step::Build => {
@@ -344,8 +405,22 @@ impl<M: Machine> Core<M> {
             Step::Suspend => {
                 self.sleep_locked(db, Why::Order).await;
             }
-            Step::AdoptRunning => self.adopt_running(db, &entry).await,
-            Step::AdoptAsleep => self.adopt_asleep(db).await,
+            // The database is decided on from its volume: the agent's mounts ended with the agent
+            // before, and the volume is attached before anything reads it.
+            Step::AdoptRunning => {
+                if !self.attach(db, &entry).await || !self.adopt_running(db, &entry).await {
+                    return;
+                }
+            }
+            Step::AdoptAsleep => {
+                // The unit that was starting when the agent began is not awake: its start failed,
+                // and holds nothing.
+                self.end_resumed(&db.id, false);
+                if !self.attach(db, &entry).await {
+                    return;
+                }
+                self.adopt_asleep(db).await;
+            }
             Step::Fail(error) => self.set(db, |view| {
                 view.phase = Phase::Error;
                 view.error = Some(error);
@@ -355,6 +430,7 @@ impl<M: Machine> Core<M> {
             }
         }
         self.set(db, |view| view.adopted = true);
+        turn.take();
         if matches!(db.phase(), Phase::Ready | Phase::Asleep) {
             self.resize(db, &entry).await;
         }
@@ -363,12 +439,55 @@ impl<M: Machine> Core<M> {
         }
     }
 
+    /// Attaches the database's volume if the agent has not: its mounts end with the agent, and a
+    /// database is decided on from the files below its mount point. A volume that cannot be
+    /// attached is a fact to decide on (a volume that needs a repair has no `pg_control` to
+    /// show); a volume list that cannot be read is not, and `false` says that nothing is decided.
+    async fn attach(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) -> bool {
+        let Some(volume) = Self::volume_id(entry) else {
+            return true;
+        };
+        if self.machine.attached(&volume) {
+            return true;
+        }
+        match self
+            .machine
+            .mount_volumes(std::slice::from_ref(&volume))
+            .await
+        {
+            Ok(failures) => {
+                for (volume, error) in failures {
+                    crate::timing::emit_event(json!({
+                        "event": "mount_failed", "database_id": volume.database(),
+                        "class": crate::diagnostics::error_code(&error.into()),
+                    }));
+                }
+                true
+            }
+            Err(error) => {
+                Self::unread(db, "volume", error.into());
+                false
+            }
+        }
+    }
+
     /// The unit runs, as the agent found it at its start: it is released to the gateway as ready,
-    /// and its archiver reaches the archive socket again. The timer that was to apply its CPU
-    /// quota after a burst died with the agent that held it, and the agent cannot tell how much of
-    /// the burst is left: the quota is applied at once, which is the same one the unit holds if
-    /// its burst was over.
-    async fn adopt_running(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
+    /// and its archiver reaches the archive socket again. `false` when the bus would not say
+    /// whether the unit is ready: nothing is known of it, the decision is for the retry, and the
+    /// database is neither served nor recovered (recovery would stop it). The volume is attached
+    /// (`attach`): the unit's answer is read from its files.
+    ///
+    /// A start that was in flight when the agent began ends here, with what the unit answers:
+    /// ready when the database is released, failed when the unit is not active, and not at all
+    /// when the unit runs and is not served, or when the bus would not answer (it holds its
+    /// memory until its unit is reported stopped).
+    ///
+    /// The timer that was to apply its CPU quota after a burst died with the agent that held it,
+    /// and the agent cannot tell how much of the burst is left: the quota is applied at once,
+    /// which is the same one the unit holds if its burst was over. That is one property call on
+    /// the bus, which takes a place among the unit calls like a read does (`units::Calls`), so
+    /// the databases that run at the agent's start cannot flood the bus with them.
+    async fn adopt_running(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) -> bool {
         self.ensure_archive(db, entry);
         match self.machine.wait_started(&db.id).await {
             Ok(started) => match writer_of(&started) {
@@ -379,12 +498,42 @@ impl<M: Machine> Core<M> {
                         view.awake_since_ms = Some(super::now_ms());
                         view.error = None;
                     });
+                    self.end_resumed(&db.id, true);
                     self.after_ready(db).await;
                 }
                 None => self.go_unproven(db),
             },
-            // A unit that cannot be read as ready is not served; recovery takes it.
-            Err(_) => self.go_unproven(db),
+            // A unit that stopped, or whose start failed, holds nothing; recovery takes the
+            // database.
+            Err(
+                crate::units::Error::NotReady("unit_not_active") | crate::units::Error::Job { .. },
+            ) => {
+                self.end_resumed(&db.id, false);
+                self.go_unproven(db);
+            }
+            // A unit that is not ready is not served; recovery takes it, and stops it.
+            Err(crate::units::Error::NotReady(_)) => self.go_unproven(db),
+            Err(error) => {
+                Self::unread(db, "unit", error.into());
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The start that was in flight when the agent began ends: the permit it was resumed with
+    /// reports it ready or failed. Nothing happens for a database that had none, or whose start
+    /// ended already.
+    fn end_resumed(&self, database: &str, ready: bool) {
+        let permit = self
+            .resumed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(database);
+        match permit {
+            Some(permit) if ready => permit.ready(),
+            Some(permit) => permit.failed(),
+            None => {}
         }
     }
 
@@ -828,7 +977,9 @@ mod tests {
         agent::testing::{Rig, eventually},
         link::Order,
         node_link::contract_valid,
-        postgres, testpg,
+        postgres,
+        storage::VolumeId,
+        testpg,
     };
     use pgcf_native_protocol::agent::Mode;
     use serde_json::{Value, json};
@@ -1883,6 +2034,80 @@ mod tests {
         }
     }
 
+    /// A bus that refuses the call that waits for a running database's unit says nothing of the
+    /// unit: the database is neither served nor recovered on it, and recovery would stop it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_running_database_that_the_bus_will_not_tell_about_is_not_recovered() {
+        let Some(rig) = Rig::new("restart-bus").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let (id, path) = (
+            id_of(&db),
+            db["archive"]["path"].as_str().unwrap().to_string(),
+        );
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        db.as_object_mut().unwrap().remove("origin");
+        let pid = rig.machine.unit(&id).await.unwrap().main_pid;
+
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        rig.machine.clear_calls();
+        rig.machine.fail_next_waits(1);
+        let page = Rig::page(vec![db.clone()], vec![]);
+        rig.core.apply(&page).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the running database to be found", || {
+            handle.phase() == Phase::Ready
+        })
+        .await;
+        assert_eq!(rig.machine.unit(&id).await.unwrap().main_pid, pid);
+        let calls = rig.machine.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("start") || call.starts_with("stop")),
+            "{calls:?}"
+        );
+    }
+
+    /// The agent's mounts end with it. It attaches a database's volume when it decides on the
+    /// database, which reads `pg_control` through the mount, and asks nothing of a volume that is
+    /// attached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_attaches_the_volume_of_a_database_when_it_decides_on_it() {
+        let Some(rig) = Rig::new("restart-attach").await else {
+            return;
+        };
+        let (rig, db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        let volume = VolumeId::new(&id, 1).unwrap();
+        assert!(!rig.machine.attached(&volume));
+        rig.machine.clear_calls();
+        let page = Rig::page(vec![db.clone()], vec![]);
+        rig.core.apply(&page).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the database to be adopted", || handle.view().adopted).await;
+        assert!(rig.machine.attached(&volume));
+        assert_eq!(handle.phase(), Phase::Asleep);
+        let mounts = |machine: &crate::machine::local::Local| {
+            machine
+                .calls()
+                .into_iter()
+                .filter(|call| call.starts_with("mount"))
+                .count()
+        };
+        assert_eq!(mounts(&rig.machine), 1);
+        rig.core.apply(&page).await;
+        eventually(10, "the pull to be decided on", || {
+            handle.view().reconcile == super::super::Reconcile::Idle
+        })
+        .await;
+        assert_eq!(mounts(&rig.machine), 1);
+    }
+
     /// A database that sleeps provenly, as the page names it once it was built, and an agent that
     /// restarted while it slept: nothing is decided on it yet. Its entry and its archive path.
     async fn restarted_sleeper(rig: Rig) -> (Rig, Value, String) {
@@ -1894,6 +2119,93 @@ mod tests {
         let rig = rig.restart().await;
         rig.deliver(&path, "read_write");
         (rig, db, path)
+    }
+
+    /// A start was in flight when the agent began. The bus refuses the call that waits for its
+    /// unit when the agent decides on the database, which says nothing of the unit: the start
+    /// stays counted, as it holds its memory, and ends ready with the decision that the retry
+    /// makes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_in_flight_when_the_agent_began_stays_counted_when_the_bus_will_not_answer() {
+        let Some(rig) = Rig::new("resumed-bus").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let (id, path) = (
+            id_of(&db),
+            db["archive"]["path"].as_str().unwrap().to_string(),
+        );
+        let (_, handle) = rig.create_from(&db).await;
+        db.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+        // A start of it is in flight when the agent restarts: its unit is activating.
+        rig.machine
+            .delay_next_start(std::time::Duration::from_millis(1500));
+        tokio::spawn({
+            let (machine, id) = (rig.machine.clone(), id.clone());
+            async move { machine.start(&id).await }
+        });
+        eventually(10, "the unit to be activating", || {
+            rig.machine.active_state(&id) == crate::units::ActiveState::Activating
+        })
+        .await;
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        let snapshot = rig.core.admission.snapshot().await.unwrap();
+        assert_eq!((snapshot.awake, snapshot.starting), (vec![id.clone()], 1));
+        rig.machine.fail_next_waits(1);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the database to be released", || {
+            handle.phase() == Phase::Ready
+        })
+        .await;
+        let snapshot = rig.core.admission.snapshot().await.unwrap();
+        assert_eq!(
+            (snapshot.awake, snapshot.starting),
+            (vec![id.clone()], 0),
+            "a bus that would not answer did not fail the start"
+        );
+        // The wake's burst was the old agent's, and its timer died with it: the quota of the
+        // class comes at once, with the decision that ends the start (`cpu_boost_ms`).
+        assert_eq!(rig.machine.quota(&id), Some(std::num::NonZeroU32::new(250)));
+    }
+
+    /// A start was in flight when the agent read its units, and its unit is not awake when the
+    /// agent decides on the database (the start failed): it holds nothing, and the database is
+    /// not counted as awake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_in_flight_when_the_agent_began_that_failed_is_not_counted() {
+        let Some(rig) = Rig::new("resumed-failed").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let (_, handle) = rig.create_from(&db).await;
+        db.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+        let rig = rig
+            .restart_with(vec![crate::admission::Running {
+                database: id.clone(),
+                memory_mib: 256,
+                starting: true,
+                always_warm: false,
+            }])
+            .await;
+        let snapshot = rig.core.admission.snapshot().await.unwrap();
+        assert_eq!((snapshot.awake, snapshot.starting), (vec![id.clone()], 1));
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the database to be decided on", || {
+            let view = handle.view();
+            view.adopted && view.phase == Phase::Asleep
+        })
+        .await;
+        let snapshot = rig.core.admission.snapshot().await.unwrap();
+        assert!(
+            snapshot.awake.is_empty(),
+            "a start whose unit is not awake is not counted: {snapshot:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

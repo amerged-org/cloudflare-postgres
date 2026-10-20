@@ -26,7 +26,7 @@ mod linux {
         sample::uptime_seconds,
         service::{Intervals, Service, ServiceConfig, gateway_owner},
         storage,
-        timing::emit_event,
+        timing::{self, emit_event},
         update,
     };
     use serde_json::json;
@@ -44,7 +44,9 @@ mod linux {
             os: os_report(node).await?,
             timing: LinkTiming::default(),
         };
-        Link::start(config, Transport::production()?).await
+        let link = Link::start(config, Transport::production()?).await?;
+        timing::phase("link_started");
+        Ok(link)
     }
 
     /// The link of the node to Cloudflare, retried until it stands: the node may not be enrolled
@@ -81,12 +83,16 @@ mod linux {
     }
 
     pub async fn run() -> Result<(), Error> {
+        timing::phase("process_start");
         let layout = Layout::default();
         let node = Arc::new(Node::connect(layout.clone(), storage::Config::default()).await?);
+        timing::phase("storage_open");
         // The volumes the agent before mounted are unmounted with its namespace: so are their links.
         node.reset_device_links().await?;
+        timing::phase("device_links");
         // What a boot lost is back before the agent is ready, link or no link.
         restore_runtime(&*node).await;
+        timing::phase("restore_runtime");
         // After a boot the first wake would read its start path from the disk: have it cached in
         // the background, while the agent gets ready.
         let warm = node.clone();
@@ -108,13 +114,17 @@ mod linux {
         };
         tokio::pin!(stop);
         let service = tokio::select! {
-            service = start(node, &layout) => service?,
-            () = &mut stop => return Ok(()),
+            service = start(node.clone(), &layout) => service?,
+            () = &mut stop => {
+                node.release_mounts().await;
+                return Ok(());
+            }
         };
         // The seconds since boot tell a node that restarted from an agent that did.
         let uptime = std::fs::read_to_string("/proc/uptime")
             .ok()
             .and_then(|text| uptime_seconds(&text));
+        timing::phase("service_started");
         emit_event(json!({"event": "agent_started", "uptime_s": uptime}));
         tokio::select! {
             () = &mut stop => {}
@@ -122,8 +132,10 @@ mod linux {
             // starts the agent from the new link.
             () = service.restart_requested() => emit_event(json!({"event": "agent_restarting"})),
         }
-        // The databases run on: they are units of their own.
+        // The databases run on: they are units of their own. The agent's mounts of their volumes
+        // go before the process does, many at once: the kernel would end them one by one.
         service.stop();
+        node.release_mounts().await;
         Ok(())
     }
 

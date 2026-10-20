@@ -462,18 +462,32 @@ before inside the namespace; the database units and the backup jobs mount their 
 (`MountImages=`).
 
 - The namespace ends with the agent. An agent restart (a release, a crash) ends every mount it made
-  and drops every device link; it mounts every current volume again when it gets its first desired
-  page, one after the other under the storage lock, and serves no wake before it has. The
-  databases that run are not touched: a unit has its own mount, which does not depend on the
-  agent's. A restart also ends the page cache of the volumes of sleeping databases (their last
-  mount is gone), so the first wake after it reads from disk: the plan measured about 300 ms more
-  on a cold first request. What the restart costs on EU1 is not measured. In the lab (loop-backed
-  thin pool, 300 volumes of 32 MiB, one agent's namespace) the mounts of 50, 100 and 300 volumes
-  took 0.20, 0.26 and 0.86 s (about 3 ms each, with each attach reading the whole mount table
-  again), and unmounting 300 took 1.1 s; the agent waits for all of them before it serves a wake.
-  Until it is measured on EU1 (Open in the plan), the remedy, if it is needed, is to keep the
-  agent's namespace across restarts (bind it under `/run` and enter it before the runtime starts)
-  or to serve wakes while the mounts are made; neither is built.
+  and drops every device link. The agent mounts a database's volume when it decides on the
+  database (`Core::reconcile`), after it has read the database's unit and its volume: the
+  databases that run first, then the others, 16 at a time, each mount waiting for the disk beside
+  the others. It serves the gateway as soon as it has decided on the databases that run (they
+  must be in its first table as running, or the gateway ends their sessions), not when it has
+  mounted every volume, and a wake for a database it has not decided on yet has the decision made
+  at once, its mount included. A start that was in flight when the agent began (a unit still
+  `activating`) stays counted by admission, with its memory, until the decision on its database ends
+  it: the unit's answer is read from its `postmaster.pid` through the agent's mount, so it is not
+  read, and not taken for a failure, before the mount is made. The databases that run are not touched: a unit has its own mount,
+  which does not depend on the agent's. A restart also ends the page cache of the volumes of
+  sleeping databases (their last mount is gone), so the first wake after it reads from disk: the
+  plan measured about 300 ms more on a cold first request.
+- The agent's exit unmounts its volumes 16 at a time (`Storage::unmount_all`) before the process
+  ends. A process that exits leaves its mount namespace, and the kernel unmounts what the
+  namespace holds one after the other, each as slow as the disk's flushes; the process is not gone
+  until it has, and systemd starts the next agent after it (EU1: 14 s to stop with 301 volumes).
+  A mount that is busy stays for the kernel.
+- What a restart costs is in the plan (11.1, "Agent start"), measured in a lab with a disk slowed
+  to EU1's mount time: 300 volumes, stop and start to the first served wake 76 s before the change
+  and 6 s after it. On EU1 it is not measured yet; the events `agent_start_phase` of one restart
+  (`storage_open`, `device_links`, `restore_runtime`, `link_started`, `first_page`, `units_read`,
+  `archive_credentials`, `node_credentials`, `apply`, `settled`, `gateway_table`,
+  `service_started`, with `link_hello` and `first_wake_served` beside them, and
+  `reconcile_first_pass` with the number and the summed time of the runs of `lvs`, the mounts and
+  the unit reads) say where its time went.
 - What the agent decides never rests on its own mount table alone, because a unit or a job mounts
   the volume in a namespace of its own, and the agent's own mounts end with its restart: whether a
   unit may start is the link (`attached`); which generation a running unit serves is its own

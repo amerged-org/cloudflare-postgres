@@ -27,6 +27,9 @@ pub type Listed = (
 pub trait Manager {
     /// Makes systemd send job signals to this client.
     fn subscribe(&self) -> zbus::Result<()>;
+    /// The object path of a unit that is loaded; `NoSuchUnit` for one that is not (it is not
+    /// loaded by the call, unlike a read of one of its properties).
+    fn get_unit(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
     fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
     fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
     fn restart_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;

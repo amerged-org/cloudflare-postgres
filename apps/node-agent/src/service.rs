@@ -20,7 +20,6 @@ use crate::{
     link::{Desired as Page, Link, LinkEvent, LinkEvents},
     machine::{CpuTimes, Machine},
     sample::{Inputs, busy_millicores, node_sample},
-    storage::VolumeId,
     update,
 };
 use pgcf_native_protocol::wake::WakeRequest;
@@ -37,6 +36,9 @@ use tokio::{
     sync::{Notify, mpsc},
     task::JoinSet,
 };
+
+/// How many archive credentials are read from Cloudflare at once.
+const CREDENTIALS_AT_ONCE: usize = 8;
 
 /// How often each loop runs. The defaults are the plan's (4.3, 4.9); tests shorten them.
 #[derive(Clone, Debug)]
@@ -189,9 +191,11 @@ pub fn gateway_owner() -> Option<(u32, u32)> {
 
 impl<M: Machine> Service<M> {
     /// Starts the agent on a node: reads the first desired page, builds the core from the node's
-    /// units and the page's policy, serves the archive socket and the gateway's channel, does
-    /// what a boot does, and starts the loops. Returns once the node is up; the loops run until
-    /// `stop`.
+    /// units and the page's policy, serves the archive socket, hands the page to the core, serves
+    /// the gateway's channel once the databases that run are decided on, and starts the loops.
+    /// Returns once the node is up; the loops run until `stop`. The databases that sleep are
+    /// decided on after it returns, a few at a time, and a wake for one that is not yet has it
+    /// decided on at once.
     pub async fn start(
         machine: Arc<M>,
         link: Link,
@@ -214,8 +218,10 @@ impl<M: Machine> Service<M> {
                 }
             }
         };
+        crate::timing::phase("first_page");
         let policy = Policy::parse(&page.policy).ok_or("the desired page's policy is invalid")?;
         let units = machine.units().await?;
+        crate::timing::phase("units_read");
         let running: Vec<Running> = units
             .iter()
             .filter_map(|unit| Running::from_unit(unit, false))
@@ -228,7 +234,7 @@ impl<M: Machine> Service<M> {
             policy.backup.clone(),
         ));
         let gateway = Arc::new(Feed::new());
-        let (core, early, resumed) = Core::new(
+        let (core, early) = Core::new(
             Parts {
                 machine: machine.clone(),
                 jobs: jobs.clone(),
@@ -271,31 +277,45 @@ impl<M: Machine> Service<M> {
         service.spawn(async move {
             archive.serve(listener).await;
         });
-        // The agent's mounts of the volumes are made first: a start that was in flight when the
-        // agent began reads its database's `postmaster.pid` through them, and the namespace of the
-        // agent before is gone with its mounts.
-        service.boot(&page).await;
-        // Starts that were in flight when the agent began end with their units' answers.
-        for permit in resumed {
-            let (machine, database) = (machine.clone(), permit.database().to_string());
-            service.spawn(async move {
-                match machine.wait_started(&database).await {
-                    Ok(_) => permit.ready(),
-                    Err(_) => permit.failed(),
-                }
-            });
-        }
-        service.pull_page(page).await;
+        // The memory all databases may hold together (plan 4.3). The agent's mounts of the volumes
+        // are not made here: they ended with the agent before, and the agent mounts a database's
+        // volume when it decides on the database (`Core::reconcile`). The starts that were in
+        // flight when the agent began end with that decision (`Core::end_resumed`): their units'
+        // answers cannot be read before it, since a unit's `postmaster.pid` is read through the
+        // agent's mount.
+        let _ = machine
+            .set_slice_memory(core.policy().admission.admission.awake_budget_mib)
+            .await;
+        service.pull_page(page, true).await;
         // The link stands: the previous boot's journal goes to Cloudflare, if there was a boot.
         let s = service.clone();
         service.spawn(async move { s.report_boot().await });
         // The gateway is served once the node has found what runs: its first table is then what
         // runs, and the sessions it kept across the agent's restart go on.
         core.settled(config.timing.settle).await;
+        crate::timing::phase("settled");
         let feed = gateway.clone();
         let owner = config.gateway.map(|(uid, _)| uid);
         service.spawn(async move {
             feed.serve(channel, wake_sender, owner).await;
+        });
+        crate::timing::phase("gateway_table");
+        // When the node has decided on every database: the end of the first pass over them.
+        let first_pass = core.clone();
+        service.spawn(async move {
+            first_pass.decided(Duration::from_secs(600)).await;
+            crate::timing::phase_with(
+                "reconcile_first_pass",
+                &[
+                    ("databases", first_pass.all().len() as u64),
+                    ("lvs_runs", crate::timing::LVS.runs()),
+                    ("lvs_ms", crate::timing::LVS.ms()),
+                    ("mounts", crate::timing::MOUNT.runs()),
+                    ("mount_ms", crate::timing::MOUNT.ms()),
+                    ("unit_reads", crate::timing::UNIT_READ.runs()),
+                    ("unit_ms", crate::timing::UNIT_READ.ms()),
+                ],
+            );
         });
 
         let s = service.clone();
@@ -345,73 +365,53 @@ impl<M: Machine> Service<M> {
             .spawn(task);
     }
 
-    /// What the first page of a boot does (plan 5.6 job 4, 4.3): the memory ceiling of all
-    /// databases and the volumes of the page's databases mounted, and again what the agent
-    /// restored when it started (`restore_runtime`), now that the mounts are there. The mounts
-    /// are the agent's own, in its mount namespace, which a restart of the agent ends: it makes
-    /// them all again, so a node serves no wake before they are made (databases that run are not
-    /// touched: their units have mounts of their own).
-    async fn boot(&self, page: &Page) {
-        let budget = self.core.policy().admission.admission.awake_budget_mib;
-        let _ = self.machine.set_slice_memory(budget).await;
-        let current: Vec<VolumeId> = page
-            .databases
-            .iter()
-            .filter_map(Entry::parse)
-            .filter_map(|entry| VolumeId::new(&entry.id, entry.storage_generation).ok())
-            .collect();
-        match self.machine.mount_volumes(&current).await {
-            Ok(failures) => {
-                for (volume, error) in failures {
-                    crate::timing::emit_event(json!({
-                        "event": "mount_failed", "database_id": volume.database(),
-                        "class": crate::diagnostics::error_code(&error.into()),
-                    }));
-                }
-            }
-            Err(error) => crate::timing::emit_event(json!({
-                "event": "mount_failed", "class": crate::diagnostics::error_code(&error.into()),
-            })),
-        }
-        crate::machine::restore_runtime(&*self.machine).await;
-    }
-
     // ---- the link brings the page
 
-    /// Reads the archive credentials the page's databases need and have not been read.
+    /// Reads the archive credentials the page's databases need and have not been read, some at a
+    /// time: a node has a credential for each of its databases, and each is a round trip to
+    /// Cloudflare.
     async fn deliver_credentials(&self, page: &Page) {
-        let wanted: Vec<String> = page
+        use futures_util::StreamExt;
+        let mut wanted: Vec<String> = Vec::new();
+        for id in page
             .databases
             .iter()
             .filter_map(Entry::parse)
             .flat_map(|entry| credential_ids(&entry))
-            .collect();
-        for id in wanted {
-            if self
+        {
+            let delivered = self
                 .delivered
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .contains(&id)
-            {
-                continue;
-            }
-            let delivered = match self.link.archive_credential(&id).await {
-                Ok(credential) => self.core.deliver(&credential),
-                Err(error) => Err(error),
-            };
-            match delivered {
-                Ok(()) => {
-                    self.delivered
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(id);
-                }
-                Err(error) => crate::timing::emit_event(json!({
-                    "event": "credential_not_delivered",
-                    "class": crate::diagnostics::error_code(&error),
-                })),
+                .contains(&id);
+            if !delivered && !wanted.contains(&id) {
+                wanted.push(id);
             }
         }
+        futures_util::stream::iter(wanted)
+            .map(|id| async move {
+                let delivered = match self.link.archive_credential(&id).await {
+                    Ok(credential) => self.core.deliver(&credential),
+                    Err(error) => Err(error),
+                };
+                (id, delivered)
+            })
+            .buffer_unordered(CREDENTIALS_AT_ONCE)
+            .for_each(|(id, delivered)| async move {
+                match delivered {
+                    Ok(()) => {
+                        self.delivered
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(id);
+                    }
+                    Err(error) => crate::timing::emit_event(json!({
+                        "event": "credential_not_delivered",
+                        "class": crate::diagnostics::error_code(&error),
+                    })),
+                }
+            })
+            .await;
     }
 
     /// The Tunnel token and the route keyring, when the page names a newer revision than the one
@@ -463,10 +463,20 @@ impl<M: Machine> Service<M> {
         }
     }
 
-    async fn pull_page(self: &Arc<Self>, page: Page) {
+    /// Takes in a pull of the page. The first one, the agent's start, says how long each part took
+    /// (`agent_start_phase`).
+    async fn pull_page(self: &Arc<Self>, page: Page, first: bool) {
+        let phase = |name| {
+            if first {
+                crate::timing::phase(name);
+            }
+        };
         self.deliver_credentials(&page).await;
+        phase("archive_credentials");
         self.apply_credentials(&page).await;
+        phase("node_credentials");
         self.core.apply(&page).await;
+        phase("apply");
         self.answer_probes(&page);
         self.consider_update(&page.release);
     }
@@ -498,7 +508,7 @@ impl<M: Machine> Service<M> {
 
     async fn pull(self: &Arc<Self>, ids: Option<&[String]>) {
         match self.link.desired_page(ids).await {
-            Ok(page) => self.pull_page(page).await,
+            Ok(page) => self.pull_page(page, false).await,
             Err(error) => crate::timing::emit_event(json!({
                 "event": "desired_pull_failed", "class": crate::diagnostics::error_code(&error),
             })),
@@ -1085,7 +1095,12 @@ impl<M: Machine> Service<M> {
                         .await;
                 }
                 let result = service.core.wake(&request).await;
+                // `wake_in_progress` is no answer: the gateway asks again.
+                let answered = result.reason.as_deref() != Some("wake_in_progress");
                 service.core.gateway.wake_result(result);
+                if answered {
+                    crate::timing::phase_once("first_wake_served");
+                }
             });
         }
     }
@@ -1284,12 +1299,13 @@ impl<M: Machine> Service<M> {
 mod tests {
     use super::*;
     use crate::{
-        agent::testing::{FakeGateway, eventually, new_entry_json, site, timing},
+        agent::testing::{FakeGateway, Rig, eventually, new_entry_json, site, timing},
         link::{
             LinkConfig, Timing as LinkTiming, Transport,
-            test_server::{Cloud, tempdir},
+            test_server::{Cloud, database, database_id, tempdir},
         },
         node_link::contract_valid,
+        units::ActiveState,
     };
     use pgcf_native_protocol::{
         agent::{Mode, ToGateway},
@@ -1657,6 +1673,288 @@ mod tests {
             ) || matches!(message, ToGateway::Removed { database } if database == &id)),
             "{received:?}"
         );
+        service.stop();
+    }
+
+    /// A wake's start, or a recovery's, was in flight when the agent began: its unit was
+    /// `activating`. The unit becomes active before the new agent has mounted the volume of its
+    /// database (the agent mounts it when it decides on the database, and a disk can be slow), so
+    /// the agent cannot read `postmaster.pid` yet and cannot say the start failed: the unit runs.
+    /// The start stays counted, memory and all, until the decision on its database ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_in_flight_when_the_agent_began_is_ended_by_the_decision_on_its_database() {
+        let Some((machine, _fixture, _root)) =
+            site("start-in-flight", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let link = || async {
+            Link::start(
+                LinkConfig {
+                    paths: crate::link::Paths::new(&base),
+                    image_version: "25".into(),
+                    agent_version: "0.1.0".into(),
+                    release_id: None,
+                    os: crate::machine::os_report(&*machine).await.unwrap(),
+                    timing: LinkTiming {
+                        interval: Duration::from_millis(300),
+                        ..LinkTiming::default()
+                    },
+                },
+                Transport::new(cloud.roots()).unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let config = || ServiceConfig {
+            intervals: quick(),
+            // The agent serves the gateway when the databases that run are decided on, or after
+            // this: the decision here waits for a mount.
+            timing: crate::agent::Timing {
+                settle: Duration::from_millis(300),
+                ..timing()
+            },
+            gateway: None,
+            release_key: test_release_key(),
+        };
+        let db = new_entry_json();
+        let id = db["id"].as_str().unwrap().to_string();
+        let credential = db["archive"]["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        cloud.with(|inner| {
+            inner.databases = vec![db.clone()];
+            inner.credential_paths.insert(credential, path);
+        });
+        let (first, events) = link().await;
+        let service = Service::start(machine.clone(), first, events, config())
+            .await
+            .unwrap();
+        eventually(90, "the database to be ready", || {
+            observed(&cloud, &id, "ready")
+        })
+        .await;
+        service.stop();
+        drop(service);
+
+        // A start of the database is in flight when the agent ends: its postmaster is up and
+        // systemd waits for its `READY=1`. The agent's mounts end with it, and the next agent's
+        // mounts wait for the disk.
+        machine.stop(&id).await.unwrap();
+        machine.delay_next_start(Duration::from_secs(2));
+        tokio::spawn({
+            let (machine, id) = (machine.clone(), id.clone());
+            async move { machine.start(&id).await }
+        });
+        eventually(10, "the unit to be activating", || {
+            machine.active_state(&id) == ActiveState::Activating
+        })
+        .await;
+        machine.forget_mounts();
+        machine.hold_mounts();
+        let (second, events) = link().await;
+        let service = Service::start(machine.clone(), second, events, config())
+            .await
+            .unwrap();
+        let counted = |snapshot: crate::admission::Snapshot| {
+            (
+                snapshot.awake,
+                snapshot.starting,
+                snapshot.awake_memory_mib > 0,
+            )
+        };
+        assert_eq!(
+            counted(service.core().admission.snapshot().await.unwrap()),
+            (vec![id.clone()], 1, true),
+            "the start in flight is counted"
+        );
+
+        // The start ends before the agent has mounted the volume.
+        eventually(30, "the unit to be active", || {
+            machine.active_state(&id) == ActiveState::Active
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!service.core().find(&id).unwrap().view().adopted);
+        assert_eq!(
+            counted(service.core().admission.snapshot().await.unwrap()),
+            (vec![id.clone()], 1, true),
+            "a unit that is active and cannot be read through a mount is not a failed start"
+        );
+
+        // The mount comes, the agent decides on the database, and the start ends ready.
+        machine.release_mounts();
+        eventually(30, "the database to be released", || {
+            service
+                .core()
+                .find(&id)
+                .is_some_and(|db| db.view().writer.is_some())
+        })
+        .await;
+        let snapshot = service.core().admission.snapshot().await.unwrap();
+        assert_eq!(
+            (snapshot.awake, snapshot.starting),
+            (vec![id.clone()], 0),
+            "the start ended ready"
+        );
+        service.stop();
+    }
+
+    /// systemd is slow to answer about most of the databases of the node, as it is for hundreds of
+    /// units at once. The agent decides on at most `FIRST_PASS_AT_ONCE` of them at a time, serves
+    /// the gateway at once (none of them runs), answers the wake of a database it has looked at,
+    /// and starts none that it has not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_is_answered_while_the_agent_has_not_looked_at_most_of_its_databases() {
+        let Some((machine, _fixture, _root)) =
+            site("slow-systemd", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let ids: Vec<String> = (0..61).map(database_id).collect();
+        cloud.with(|inner| inner.databases = ids.iter().map(|id| database(id)).collect());
+        machine.hold_unit_reads(ids[1..].iter().cloned());
+        cloud.seed(&base);
+        let (link, events) = Link::start(
+            LinkConfig {
+                paths: crate::link::Paths::new(&base),
+                image_version: "25".into(),
+                agent_version: "0.1.0".into(),
+                release_id: None,
+                os: crate::machine::os_report(&*machine).await.unwrap(),
+                timing: LinkTiming {
+                    interval: Duration::from_millis(300),
+                    ..LinkTiming::default()
+                },
+            },
+            Transport::new(cloud.roots()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let starting = tokio::spawn(Service::start(
+            machine.clone(),
+            link,
+            events,
+            ServiceConfig {
+                intervals: quick(),
+                timing: crate::agent::Timing {
+                    adopt_wait: Duration::from_millis(300),
+                    ..timing()
+                },
+                gateway: None,
+                release_key: test_release_key(),
+            },
+        ));
+        let mut gateway = FakeGateway::connect(&machine.layout().gateway_socket()).await;
+        let answered = |gateway: &FakeGateway, id: &str| {
+            gateway
+                .received()
+                .into_iter()
+                .filter_map(|message| match message {
+                    ToGateway::WakeResult { result } if result.database == id => Some(result),
+                    _ => None,
+                })
+                .next_back()
+        };
+        // The wake of the database it has looked at is answered (it has no volume to start on),
+        // and the one of a database it has not looked at is told to ask again.
+        let wake = |id: &str| Rig::ticket(&Entry::parse(&database(id)).unwrap());
+        gateway.send_wake(wake(&ids[0])).await;
+        eventually(5, "the wake to be answered", || {
+            answered(&gateway, &ids[0]).is_some()
+        })
+        .await;
+        assert_eq!(
+            answered(&gateway, &ids[0]).unwrap().reason.as_deref(),
+            Some("volume_missing")
+        );
+        gateway.send_wake(wake(&ids[1])).await;
+        eventually(5, "the wake of the database it has not looked at", || {
+            answered(&gateway, &ids[1]).is_some()
+        })
+        .await;
+        let result = answered(&gateway, &ids[1]).unwrap();
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (Outcome::Refused, Some("wake_in_progress"))
+        );
+        assert!(!machine.calls().iter().any(|call| call.starts_with("start")));
+        // The bound asked systemd about its databases, and the two that were decided on, the
+        // database of the wake among them, asked again with the first pull of the link.
+        let service = starting.await.unwrap().unwrap();
+        assert!(
+            machine.reads().1 <= crate::agent::FIRST_PASS_AT_ONCE as u64 + 2,
+            "{} reads of units",
+            machine.reads().1
+        );
+        let undecided = |service: &Service<crate::machine::local::Local>| {
+            service
+                .core()
+                .all()
+                .iter()
+                .filter(|db| !db.view().adopted)
+                .count()
+        };
+        assert!(undecided(&service) > 40);
+        machine.release_unit_reads();
+        eventually(30, "every database to be decided on", || {
+            undecided(&service) == 0
+        })
+        .await;
+        service.stop();
+    }
+
+    /// A node has a credential for each of its databases, and each is a round trip to Cloudflare:
+    /// the agent reads several at once, and has all of them before it applies the page.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_archive_credentials_of_the_databases_are_read_several_at_a_time() {
+        let Some((machine, _fixture, _root)) =
+            site("credentials", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let databases: Vec<Value> = (0..24)
+            .map(|n| {
+                let mut db = database(&database_id(n));
+                db["archive"]["credential"]["id"] = json!(format!("crd_{n:020}"));
+                db
+            })
+            .collect();
+        cloud.with(|inner| {
+            for db in &databases {
+                inner.credential_paths.insert(
+                    db["archive"]["credential"]["id"].as_str().unwrap().into(),
+                    db["archive"]["path"].as_str().unwrap().into(),
+                );
+            }
+            inner.databases = databases.clone();
+            inner.credential_delay = Duration::from_millis(150);
+        });
+        let began = std::time::Instant::now();
+        let service = serve(&machine, &cloud, &base).await;
+        let took = began.elapsed();
+        for db in &databases {
+            let path = db["archive"]["path"].as_str().unwrap();
+            assert!(
+                service
+                    .core()
+                    .store(path, crate::credentials::Access::ReadWrite)
+                    .is_some(),
+                "{path}"
+            );
+        }
+        // One after the other, 24 round trips of 150 ms are 3.6 s.
+        assert!(took < Duration::from_millis(2000), "{took:?}");
         service.stop();
     }
 

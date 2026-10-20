@@ -23,7 +23,7 @@ pub(crate) mod testing;
 pub use entry::{Desired, Entry, Origin, Policy, Source};
 
 use crate::{
-    admission::{Admission, Admitter, Facts, Running},
+    admission::{Admission, Admitter, Facts, Permit, Running},
     archive::{
         job::{Database as JobDatabase, Jobs, Store},
         server::Table,
@@ -39,11 +39,18 @@ use crate::{
 };
 use pgcf_native_protocol::agent as protocol;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, atomic::AtomicBool},
     time::Duration,
 };
-use tokio::{sync::Notify, task::AbortHandle};
+use tokio::{
+    sync::{Notify, Semaphore},
+    task::AbortHandle,
+};
+
+/// How many databases the node decides on at once when it starts (`Core::apply` of the first
+/// page): each decision reads LVM, systemd and the disk, and mounts the database's volume.
+pub(crate) const FIRST_PASS_AT_ONCE: usize = 16;
 
 /// The waits and bounds of the agent. The defaults are the product's; tests shorten them.
 #[derive(Clone, Debug)]
@@ -74,8 +81,9 @@ pub struct Timing {
     /// a run of a tool, a restart) after it failed, and the longest wait.
     pub host_files_retry: Duration,
     pub host_files_retry_maximum: Duration,
-    /// How long a starting agent waits for its decisions on the databases of the first page before
-    /// it serves the gateway, whose sessions end on a database the table does not show running.
+    /// How long a starting agent waits for its decisions on the databases that run, of the first
+    /// page, before it serves the gateway, whose sessions end on a database the table does not
+    /// show running. The databases that sleep are not waited for (`Core::settled`).
     pub settle: Duration,
     /// How long after a wake's release its `wake_detail` is read: past the login and the first
     /// statements. The CPU quota comes with the wake's release at a `cpu_boost_ms` of 0 and after
@@ -176,6 +184,8 @@ pub(crate) struct View {
     /// A task runs the decision again, with growing waits, until the node has made it
     /// (`retry_until_adopted`).
     pub retrying: bool,
+    /// The decision waits for its turn among the first (`Core::schedule_page`).
+    pub queued: bool,
     /// The reconciliation of the entry: one runs, and runs again when the entry changed meanwhile.
     pub reconcile: Reconcile,
 }
@@ -205,6 +215,7 @@ impl View {
             backup_failed_ms: None,
             adopted: false,
             retrying: false,
+            queued: false,
             reconcile: Reconcile::Idle,
         }
     }
@@ -319,6 +330,16 @@ pub struct Core<M: Machine> {
     /// The R2 endpoint each archive path was delivered with.
     endpoints: Mutex<HashMap<String, String>>,
     dbs: Mutex<HashMap<String, Arc<Db>>>,
+    /// The databases whose unit was awake when the agent started: the gateway's first table must
+    /// show them running (`settled`).
+    awake_at_start: HashSet<String>,
+    /// The permits of the starts that were in flight when the agent began, by database: a start
+    /// ends with the decision on its database (`Core::end_resumed`), which reads the database's
+    /// files through the agent's own mount of its volume, and the agent mounts that when it
+    /// decides.
+    resumed: Mutex<HashMap<String, Permit>>,
+    /// The turns of the first decisions on the page's databases (`schedule_page`).
+    first_pass: Arc<Semaphore>,
     reports: Mutex<report::Reports>,
     /// What each database used (`usage.rs`).
     meter: Meter,
@@ -339,10 +360,11 @@ impl<M: Machine> Core<M> {
     ) -> (
         Arc<Self>,
         tokio::sync::mpsc::UnboundedReceiver<crate::admission::EarlySleep>,
-        Vec<crate::admission::Permit>,
     ) {
         let layout = parts.machine.layout().clone();
         let policy = Arc::new(RwLock::new(parts.policy.clone()));
+        let running: Vec<Running> = running.into_iter().collect();
+        let awake_at_start = running.iter().map(|r| r.database.clone()).collect();
         let admitter = Admitter::rebuild(
             parts.policy.admission.clone(),
             running,
@@ -377,13 +399,21 @@ impl<M: Machine> Core<M> {
             taken: Mutex::new(std::collections::HashSet::new()),
             endpoints: Mutex::new(HashMap::new()),
             dbs: Mutex::new(HashMap::new()),
+            awake_at_start,
+            resumed: Mutex::new(
+                resumed
+                    .into_iter()
+                    .map(|permit| (permit.database().to_string(), permit))
+                    .collect(),
+            ),
+            first_pass: Arc::new(Semaphore::new(FIRST_PASS_AT_ONCE)),
             reports: Mutex::new(report::Reports::default()),
             meter: Meter::load(layout.agent().join("usage.json")),
             changed: Notify::new(),
             slept: Mutex::new(Vec::new()),
             slept_signal: Notify::new(),
         });
-        (core, early, resumed)
+        (core, early)
     }
 
     pub(crate) fn layout(&self) -> &Layout {
@@ -428,13 +458,29 @@ impl<M: Machine> Core<M> {
             .get(id)
             .cloned()
     }
-    /// Waits until the node has decided on every database it knows, for at most `bound`.
+    /// Waits until the node has decided on every database it knows whose unit was awake when the
+    /// agent started, for at most `bound`. The table the gateway gets first must show them running
+    /// or the gateway ends their sessions; a database that sleeps is right in the table before the
+    /// node has looked at it, and a wake for one that it has not looked at has it decided on at once
+    /// (`try_wake`).
     pub async fn settled(&self, bound: Duration) {
+        let decided = || {
+            self.awake_at_start
+                .iter()
+                .filter_map(|id| self.find(id))
+                .all(|db| db.view().adopted)
+        };
+        Self::wait_for(bound, Duration::from_millis(10), decided).await;
+    }
+    /// Waits until the node has decided on every database it knows, for at most `bound`.
+    pub async fn decided(&self, bound: Duration) {
+        let decided = || self.all().iter().all(|db| db.view().adopted);
+        Self::wait_for(bound, Duration::from_millis(100), decided).await;
+    }
+    async fn wait_for(bound: Duration, every: Duration, done: impl Fn() -> bool) {
         let deadline = tokio::time::Instant::now() + bound;
-        while !self.all().iter().all(|db| db.view().adopted)
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        while !done() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(every).await;
         }
     }
     /// Waits until the node has decided on the database, for at most `bound`; whether it has.

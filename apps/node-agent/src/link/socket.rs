@@ -93,6 +93,7 @@ async fn serve(
     if welcome["type"] != "welcome" {
         return Err("link did not welcome the node".into());
     }
+    crate::timing::phase_once("link_hello");
     // Pushes that came while the link was down are lost: pull the whole page.
     events.pull(None);
     let latest = samples.borrow_and_update().clone();

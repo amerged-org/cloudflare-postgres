@@ -11,7 +11,7 @@
 //! `/run/pgcf/dev/<id>` (`MountImages=`). A host without udev (a container) has no `/dev/dm-<n>`
 //! nodes, which systemd's image dissection needs: the lab makes them as udev does.
 use super::{
-    ActiveState, DB_ROOT, Error, Units,
+    ActiveState, CALLS_IN_FLIGHT, DB_ROOT, Error, Units,
     limits::{Io, Limits},
     unit_name,
     users::Users,
@@ -23,6 +23,7 @@ use std::{
     process::Command,
     time::Duration,
 };
+use zbus::proxy::CacheProperties;
 
 const BIN: &str = "/usr/lib/postgresql/18/bin";
 
@@ -305,14 +306,19 @@ async fn a_database_unit_starts_serves_changes_its_limits_and_stops() {
     let database = Database::new(1);
     let id = database.id.as_str();
     let units = Units::connect(DB_ROOT).await.unwrap();
-    // A unit that never started is loaded on demand and inactive, at the template's ceiling.
+    // A unit that never started is not loaded, and is inactive: the read does not load it.
     let idle = units.state(id).await.unwrap();
     assert_eq!(idle.active, ActiveState::Inactive);
     assert_eq!(
-        (idle.main_pid, idle.invocation_id, idle.uid),
-        (None, None, None)
+        (
+            idle.main_pid,
+            idle.invocation_id,
+            idle.uid,
+            idle.memory_max_bytes
+        ),
+        (None, None, None, None)
     );
-    assert_eq!(idle.memory_max_bytes, Some(256 << 20));
+    assert!(loaded(&database.unit()).is_empty());
 
     // Limits before the first start, persistent and without a reload.
     units.set_limits(id, &limits(256, 500)).await.unwrap();
@@ -1177,4 +1183,143 @@ async fn a_unit_in_the_runtime_directory_wins_over_the_images_and_leaves_with_it
     within(units.reload()).await.unwrap();
     assert_eq!(show(unit, "FragmentPath"), image);
     assert_eq!(show(unit, "Description"), "new");
+}
+
+/// The units that systemd has loaded and that match `pattern`, as `systemctl list-units` lists
+/// them: it does not load a unit, as `systemctl show` of one does.
+fn loaded(pattern: &str) -> Vec<String> {
+    let output = Command::new("systemctl")
+        .args(["list-units", "--all", "--no-legend", "--plain", pattern])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// The agent reads the state of every database's unit when it starts, all at once: the bus
+/// connection has one pending reply per call, and the bus daemon (dbus-daemon's
+/// `max_replies_per_connection`) refuses the calls past its limit. A node has hundreds of
+/// databases and almost all of them are asleep, not loaded, and a read of one of their properties
+/// loads the unit.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1 and the node image's units (lab)"]
+async fn the_state_of_hundreds_of_units_is_read_at_once_and_every_read_is_answered() {
+    if !lab() {
+        return;
+    }
+    const UNITS: usize = 300;
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    let ids: Vec<String> = (0..UNITS).map(|n| format!("labrd{n:015}")).collect();
+    let started = std::time::Instant::now();
+    let reads = futures_util::future::join_all(ids.iter().map(|id| units.state(id))).await;
+    eprintln!(
+        "lab: {UNITS} unit reads at once took {} ms",
+        started.elapsed().as_millis()
+    );
+    let failed: Vec<String> = reads
+        .iter()
+        .filter_map(|read| read.as_ref().err().map(ToString::to_string))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "{} of {UNITS} reads failed: {:?}",
+        failed.len(),
+        failed.first()
+    );
+    assert!(
+        reads
+            .iter()
+            .all(|read| matches!(read, Ok(state) if state.active == ActiveState::Inactive))
+    );
+    // The reads loaded none of them.
+    assert!(loaded("pgcf-pg@labrd*").is_empty());
+}
+
+/// The agent applies the CPU quota of every database that runs when it starts, at once
+/// (`Core::adopt_running`): one property change each, decided on 16 at a time among the first and
+/// by a retry for any other, and a node has dozens of them. The changes take a place among
+/// `CALLS_IN_FLIGHT` like the reads do, so that 300 asked at once, which are past the bus's limit
+/// of 128 calls that are not answered yet, are all answered. A unit that is not loaded is loaded
+/// by the change, which is the slow part (the reads of such units are 3.7 ms each).
+#[tokio::test]
+#[ignore = "needs systemd as PID 1 and the node image's units (lab)"]
+async fn hundreds_of_property_changes_are_asked_at_once_and_every_one_is_answered() {
+    if !lab() {
+        return;
+    }
+    const UNITS: usize = 300;
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    let ids: Vec<String> = (0..UNITS).map(|n| format!("labpc{n:015}")).collect();
+    let changes = futures_util::future::join_all(
+        ids.iter()
+            .map(|id| units.set_cpu_quota(id, NonZeroU32::new(250))),
+    )
+    .await;
+    for id in &ids {
+        let _ = fs::remove_dir_all(format!("/run/systemd/system.control/{}.d", unit_name(id)));
+    }
+    let failed: Vec<String> = changes
+        .iter()
+        .filter_map(|change| change.as_ref().err().map(ToString::to_string))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "{} of {UNITS} changes failed: {:?}",
+        failed.len(),
+        failed.first()
+    );
+    within(units.reload()).await.unwrap();
+}
+
+/// The limit the bound stands on: the bus daemon answers one connection with no more than 128
+/// calls that are not answered yet, and a read of a unit that systemd has not loaded is five
+/// calls that it answers one after the other, each after it has loaded the unit. The reads that
+/// `CALLS_IN_FLIGHT` allows are far below the limit, and a few times as many are not.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1 (lab)"]
+async fn the_bus_answers_the_reads_in_flight_and_refuses_those_past_its_limit() {
+    if !lab() {
+        return;
+    }
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    // The five properties of `state`, asked of a unit that is not loaded, so that systemd loads it
+    // before it answers.
+    let read = |unit: String| {
+        let units = units.clone();
+        async move {
+            let (unit_proxy, service) = (
+                units.unit_proxy(&unit, CacheProperties::No).await.unwrap(),
+                units.service_proxy(&unit).await.unwrap(),
+            );
+            let (a, b, c, d, e) = tokio::join!(
+                unit_proxy.active_state(),
+                unit_proxy.invocation_id(),
+                service.main_pid(),
+                service.uid(),
+                service.memory_max(),
+            );
+            a.is_ok() && b.is_ok() && c.is_ok() && d.is_ok() && e.is_ok()
+        }
+    };
+    let mut report = Vec::new();
+    for reads in [CALLS_IN_FLIGHT, 24, 25, 26, 32, 64] {
+        let answered = futures_util::future::join_all(
+            (0..reads).map(|n| read(unit_name(&format!("labbs{reads:05}{n:010}")))),
+        )
+        .await
+        .into_iter()
+        .filter(|ok| *ok)
+        .count();
+        report.push((reads, answered));
+    }
+    eprintln!("lab: reads at once and reads answered: {report:?}");
+    assert_eq!(report[0], (CALLS_IN_FLIGHT, CALLS_IN_FLIGHT));
+    assert!(
+        report
+            .last()
+            .is_some_and(|(reads, answered)| answered < reads)
+    );
 }
