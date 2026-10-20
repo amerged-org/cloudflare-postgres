@@ -1128,7 +1128,11 @@ async function wranglerRun(
     children.add(child);
   });
   try {
-    return JSON.parse(stdout);
+    // wrangler prints a progress block ("Checking if file needs uploading", "Uploading ...") before the
+    // JSON of a remote file execution, even with --json (wrangler 4.145, measured live): the JSON starts
+    // at the first line that opens an array or an object.
+    const start = stdout.search(/^[[{]/m);
+    return JSON.parse(start < 0 ? stdout : stdout.slice(start));
   } catch {
     throw new RestoreError(
       "wrangler_failed",

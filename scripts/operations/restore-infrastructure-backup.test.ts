@@ -639,7 +639,11 @@ const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
 const record = { args, cwd: fs.realpathSync(process.cwd()), keyring: process.env[state.keyringVariable] !== undefined };
 const flag = (name) => { const at = args.indexOf(name); return at < 0 ? undefined : args[at + 1]; };
 const save = () => { state.calls.push(record); fs.writeFileSync(statePath, JSON.stringify(state)); };
-const out = (value) => { save(); process.stdout.write(JSON.stringify(value, null, 2) + "\\n"); };
+// wrangler 4.145 prints a progress block before the JSON array of a remote file execution, even with
+// --json (measured live, 2026-10-20): the double does the same, so the tool must find the JSON itself.
+const progress = () => (args.includes("--remote") && args.includes("--file")
+  ? ["\\u251c Checking if file needs uploading", "\\u2502", "\\u251c Uploading 822e9fbd.sql", "\\u2502 Uploading complete.", "\\u2502", ""].join("\\n") : "");
+const out = (value) => { save(); process.stdout.write(progress() + JSON.stringify(value, null, 2) + "\\n"); };
 if (args[0] === "d1" && args[1] === "list") {
   out(state.databases);
 } else if (args[0] === "d1" && args[1] === "execute") {
