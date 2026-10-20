@@ -211,11 +211,14 @@ const TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace";
 const TRACE_TIMEOUT_MS = 2_000;
 
 /**
- * Logs, once for each warmer object in memory, the colo it runs in (`actor_warmer_placed`) and the
- * location hint it was asked for: the warmer's distance to the actors is one of the two things
- * that decide how long a visit takes. The colo is the three-letter `colo` of Cloudflare's trace
- * for this request; nothing else of the trace (it holds the caller's address) is read into a log.
- * Never throws and gives up after `TRACE_TIMEOUT_MS`; `colo` is null when it is not known.
+ * Logs, once for each warmer object in memory, the colo it runs in (`actor_warmer_placed`): the
+ * warmer's distance to the actors is one of the two things that decide how long a visit takes. The
+ * colo is the three-letter `colo` of Cloudflare's trace for this request; nothing else of the trace
+ * (it holds the caller's address) is read into a log. `new_warmer_location_hint` is the hint that
+ * this deployment's variables give a warmer that is created now: a hint applies only when an object
+ * is created, so for a warmer created earlier it is not the hint the warmer was placed with, and
+ * the `colo` is what tells where it runs. Never throws and gives up after `TRACE_TIMEOUT_MS`;
+ * `colo` is null when it is not known.
  */
 export async function reportPlacement(
   env: Pick<Env, "DATABASE_ACTOR_LOCATION_HINT" | "ACTOR_WARMER_LOCATION_HINT">,
@@ -236,7 +239,7 @@ export async function reportPlacement(
       shard,
       shards,
       colo,
-      location_hint: warmerLocationHint(env) ?? null,
+      new_warmer_location_hint: warmerLocationHint(env) ?? null,
     }),
   );
 }

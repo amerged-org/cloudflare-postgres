@@ -859,7 +859,7 @@ it("says once per warmer object which colo it runs in, and logs nothing else the
     shard: 0,
     shards: 1,
     colo: "AMS",
-    location_hint: null,
+    new_warmer_location_hint: null,
   });
   expect(
     traceFetch.mock.calls.filter((c) => String(c[0]) === TRACE_URL),
@@ -868,7 +868,7 @@ it("says once per warmer object which colo it runs in, and logs nothing else the
   expect(JSON.stringify(log.mock.calls)).not.toContain("2001:db8");
 });
 
-it("reports the hint it was placed with, and no colo when the trace cannot be read or has none, without delaying or ending anything", async () => {
+it("reports the hint configured for new warmers, and no colo when the trace cannot be read or has none, without delaying or ending anything", async () => {
   const log = vi.spyOn(console, "log");
   const of = (shard: number) => ({ shard, shards: 6 });
   await reportPlacement(
@@ -890,7 +890,7 @@ it("reports the hint it was placed with, and no colo when the trace cannot be re
     shard,
     shards: 6,
     colo,
-    location_hint: hint,
+    new_warmer_location_hint: hint,
   });
   expect(cycleLines(log)).toEqual([
     placed(2, "AMS", "enam"),
@@ -902,18 +902,25 @@ it("reports the hint it was placed with, and no colo when the trace cannot be re
   await reportPlacement(on(), of(0), cache);
   await reportPlacement(on(), of(0), cache);
   expect(cycleLines(log)).toHaveLength(4);
-  // And a trace that never answers is given up on, so the first cycle is not held for long.
+});
+
+it("gives up on a trace that never answers after 2 s, so the first cycle of a warmer is not held", async () => {
+  const log = vi.spyOn(console, "log");
+  // A fetch that settles only when its own signal aborts: without a signal it hangs for good.
   traceFetch.mockImplementation(
     (_url, init) =>
       new Promise((_resolve, reject) =>
-        (init as RequestInit).signal!.addEventListener("abort", () =>
-          reject(new Error("aborted")),
+        (init as RequestInit | undefined)?.signal?.addEventListener(
+          "abort",
+          () => reject(new Error("aborted")),
         ),
       ),
   );
-  const started = Date.now();
-  await reportPlacement(on(), of(5), {});
-  expect(Date.now() - started).toBeLessThan(3500);
+  const outcome = await Promise.race([
+    reportPlacement(on(), { shard: 5, shards: 6 }, {}).then(() => "reported"),
+    new Promise((resolve) => setTimeout(resolve, 3500, "held")),
+  ]);
+  expect(outcome).toBe("reported");
   expect(cycleLines(log).at(-1)).toMatchObject({ shard: 5, colo: null });
 });
 
