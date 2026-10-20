@@ -7,6 +7,7 @@ import {
   NODE_AWAKE_LIMIT,
   NODE_BOOT_REPORT_MAX_BYTES,
   NODE_DESIRED_PAGE_LIMIT_MAX,
+  NODE_DIAGNOSTIC_ROW_MAX_BYTES,
   NODE_FENCED_PATHS,
   NODE_LINK_MESSAGE_MAX_BYTES,
   NODE_REQUEST_MAX_LIFETIME_SECONDS,
@@ -15,12 +16,14 @@ import {
   NodeCredentials,
   NodeDatabaseObservation,
   NodeDesiredPage,
+  NodeDiagnostic,
   NodeDesiredQuery,
   NodeEnrollmentRequest,
   NodeEnrollmentSeed,
   NodeEventReport,
   NodeFencedResponse,
   NodeObservationReport,
+  NodeProbeDiagnostic,
   NodeProbeRequest,
   NodeProbeResult,
   NodeSample,
@@ -1405,6 +1408,103 @@ describe("the report of the previous boot", () => {
       NodeBootReport.safeParse(report(Array.from({ length: 1000 }, () => full)))
         .success,
     ).toBe(false);
+  });
+});
+
+describe("a report or result the API cut to the bound of a stored row", () => {
+  const entry = {
+    at: now,
+    unit: "pgcf-agent.service",
+    identifier: "pgcf-agent",
+    transport: "stdout",
+    priority: 6,
+    message: "agent started",
+  };
+  const report = {
+    boot_id: "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+    previous_boot_id: null,
+    kernel_release: "6.12.111+deb13-amd64",
+    entries: [entry],
+  };
+  const result = {
+    kind: "probe",
+    diagnostic_id: "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81",
+    probe: "journal",
+    status: "ok",
+    entries: [entry],
+    text: "",
+  };
+  const read = (body: object) => ({
+    id: "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b82",
+    node_id: node.id,
+    kind: "boot",
+    boot_id: report.boot_id,
+    previous_boot_id: null,
+    received_at: now,
+    expected_reboot: null,
+    report: body,
+  });
+  const asked = (body: object) => ({
+    id: result.diagnostic_id,
+    node_id: node.id,
+    kind: "probe",
+    probe: "journal",
+    boot: 0,
+    since_seconds: 3600,
+    lines: 200,
+    requested_by: `key_${"k".repeat(20)}`,
+    requested_at: now,
+    status: "received",
+    received_at: now,
+    body,
+  });
+
+  it("bounds a row at 64 KiB, below the 100,000 bytes D1 takes in one statement", () => {
+    expect(NODE_DIAGNOSTIC_ROW_MAX_BYTES).toBe(64 * 1024);
+    expect(NODE_DIAGNOSTIC_ROW_MAX_BYTES).toBeLessThan(100_000);
+  });
+
+  it("is read with its mark: truncated is true and says how many entries went, both or neither", () => {
+    const mark = { truncated: true, dropped_entries: 700 };
+    expect(NodeDiagnostic.safeParse(read(report)).success).toBe(true);
+    expect(NodeDiagnostic.safeParse(read({ ...report, ...mark })).success).toBe(
+      true,
+    );
+    expect(
+      NodeProbeDiagnostic.safeParse(asked({ ...result, ...mark })).success,
+    ).toBe(true);
+    // A cut of the end of a text drops no entry.
+    expect(
+      NodeProbeDiagnostic.safeParse(
+        asked({ ...result, entries: [], truncated: true, dropped_entries: 0 }),
+      ).success,
+    ).toBe(true);
+    for (const broken of [
+      { truncated: true },
+      { dropped_entries: 700 },
+      { truncated: false, dropped_entries: 700 },
+      { truncated: true, dropped_entries: -1 },
+      { truncated: true, dropped_entries: 1.5 },
+    ]) {
+      expect(
+        NodeDiagnostic.safeParse(read({ ...report, ...broken })).success,
+        JSON.stringify(broken),
+      ).toBe(false);
+      expect(
+        NodeProbeDiagnostic.safeParse(asked({ ...result, ...broken })).success,
+        JSON.stringify(broken),
+      ).toBe(false);
+    }
+  });
+
+  it("is a mark only the API puts: a node that sends one is refused", () => {
+    const mark = { truncated: true, dropped_entries: 1 };
+    expect(NodeBootReport.safeParse({ ...report, ...mark }).success).toBe(
+      false,
+    );
+    expect(NodeProbeResult.safeParse({ ...result, ...mark }).success).toBe(
+      false,
+    );
   });
 });
 

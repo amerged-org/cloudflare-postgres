@@ -32,6 +32,10 @@
 //                database when one import is too much work (the live drill of 2026-10-20 failed at
 //                31 MB in one file with D1_RESET_DO); halve them if a chunk reports a reset.
 //
+// A dump with a statement above 100,000 bytes, which D1 refuses (SQLITE_TOOBIG), is refused before
+// anything is imported: the message names each table and the size of its largest statement, never a
+// byte of one. A backup made before the API bounded the diagnostics it stores can hold such a row.
+//
 // Nothing of the SQL is printed, and neither is wrangler's text about the import, which can quote
 // it: a failed import reports the chunk, its statement and byte counts, wrangler's exit code (or
 // `timeout`) and whether its output reports a D1 reset (yes or no); the runbook says what each
@@ -116,6 +120,7 @@ export type RestoreErrorCode =
   | "live_database"
   | "database_not_empty"
   | "reorder_failed"
+  | "statement_too_large"
   | "wrangler_failed"
   | "foreign_key_violations";
 
@@ -791,6 +796,41 @@ async function foreignKeys(
   }
 }
 
+/** D1 refuses a statement longer than this (SQLITE_TOOBIG), however small the file it is in. */
+const D1_STATEMENT_MAX_BYTES = 100_000;
+
+/** The bytes before a statement's first character: the line break that followed the one before. */
+function leadingBlank(piece: Buffer): number {
+  let at = 0;
+  while (
+    at < piece.length &&
+    (piece[at] === 0x0a ||
+      piece[at] === 0x0d ||
+      piece[at] === 0x09 ||
+      piece[at] === 0x20)
+  )
+    at++;
+  return at;
+}
+
+function statementTooLarge(
+  oversize: Map<string, { count: number; largest: number }>,
+): RestoreError {
+  const tables = [...oversize]
+    .map(
+      ([table, { count, largest }]) =>
+        `${table}: ${count} statement${count === 1 ? "" : "s"}, the largest ${largest} bytes`,
+    )
+    .join("; ");
+  return new RestoreError(
+    "statement_too_large",
+    `the SQL holds a statement above ${D1_STATEMENT_MAX_BYTES} bytes, which D1 refuses (SQLITE_TOOBIG), so the import would stop part of the way through; nothing was imported (${tables}). ` +
+      "A backup made before the API bounded the diagnostics it stores can hold such a row. " +
+      'If the table is node_diagnostics or node_diagnostic_requests, delete the row from the live database (the runbook, "A statement above 100,000 bytes", gives the statement), take a new backup and restore that one; ' +
+      "for any other table ask for support. Do not cut the dump by hand: a backup that was edited is no longer the backup.",
+  );
+}
+
 // D1 resets its database when one import is too much work. These are starting values, not measured
 // limits; the runbook (How the tool cuts the SQL) says what they rest on.
 const CHUNK_BYTES = 2 * 1024 * 1024,
@@ -835,7 +875,10 @@ export interface ChunkPlan {
   moved: number;
   /** Tables whose rows cannot be ordered and are loaded in one chunk whatever its size. */
   together: string[][];
-  /** The size of the largest statement; D1 refuses one above 100,000 bytes. */
+  /**
+   * The size of the largest statement, without the line break before it. D1 refuses one above
+   * 100,000 bytes, and `chunkSql` then refuses the SQL before it writes a chunk.
+   */
   largest: number;
 }
 
@@ -874,6 +917,7 @@ export async function chunkSql(
     schema: Span[] = [],
     rest: Span[] = [],
     rows = new Map<string, Span[]>(),
+    oversize = new Map<string, { count: number; largest: number }>(),
     creates: Buffer[] = [];
   let at = 0,
     moved = 0,
@@ -897,9 +941,25 @@ export async function chunkSql(
       if (last) last.length += piece.length;
       continue;
     }
-    largest = Math.max(largest, piece.length);
+    const size = piece.length - leadingBlank(piece);
+    largest = Math.max(largest, size);
     last = span;
     const text = head(piece);
+    // The table a statement names is the one of a row; any other statement is counted as such.
+    const target = INSERT.test(text)
+      ? INSERT_TARGET.exec(text)?.[1]
+      : undefined;
+    if (size > D1_STATEMENT_MAX_BYTES) {
+      const table =
+          target === undefined
+            ? "a statement that is no row"
+            : tableName(target),
+        found = oversize.get(table) ?? { count: 0, largest: 0 };
+      oversize.set(table, {
+        count: found.count + 1,
+        largest: Math.max(found.largest, size),
+      });
+    }
     if (inTrigger) {
       rest.push(span);
       inTrigger = !END.test(text);
@@ -928,6 +988,7 @@ export async function chunkSql(
       inTrigger = CREATE_TRIGGER.test(text);
     }
   }
+  if (oversize.size) throw statementTooLarge(oversize);
   const order = loadOrder(await foreignKeys(creates)),
     known = new Set(
       order.flatMap((group) => group.tables.map((t) => t.toLowerCase())),

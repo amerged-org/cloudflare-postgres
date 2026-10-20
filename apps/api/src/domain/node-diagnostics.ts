@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   isAdminScope,
+  NODE_DIAGNOSTIC_ROW_MAX_BYTES,
   NODE_PROBE_EXPIRY_SECONDS,
   NODE_PROBE_REQUESTS_MAX,
   NodeBootReport,
   NodeDiagnostic,
   NodeDiagnosticRequest,
   NodeDiagnosticSummary,
+  NodeJournalEntry,
   NodeProbeDiagnostic,
   NodeProbeRequest,
   NodeProbeResult,
@@ -23,6 +25,91 @@ const DAY_MS = 86_400_000;
 export const NODE_DIAGNOSTICS_RETENTION_MS = 30 * DAY_MS;
 const PROBE_EXPIRY_MS = NODE_PROBE_EXPIRY_SECONDS * 1000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+type Column = string | number | null;
+const encoder = new TextEncoder();
+
+/** The bytes `text` takes between the quotes of a string in a dump: UTF-8, with `'` written twice. */
+function literalBytes(text: string): number {
+  let quotes = 0;
+  for (let at = text.indexOf("'"); at !== -1; at = text.indexOf("'", at + 1))
+    quotes++;
+  return encoder.encode(text).byteLength + quotes;
+}
+
+/**
+ * The bytes of `INSERT INTO "table" VALUES(...);`, the statement that a dump of the control
+ * database (D1's export) writes for a row whose columns are `columns`, in the table's order.
+ */
+function insertBytes(table: string, columns: Column[]): number {
+  let bytes = `INSERT INTO "${table}" VALUES(`.length + columns.length - 1 + 2;
+  for (const column of columns)
+    bytes +=
+      column === null
+        ? 4
+        : typeof column === "number"
+          ? String(column).length
+          : 2 + literalBytes(column);
+  return bytes;
+}
+
+/**
+ * The JSON to store as the `body` of a row whose other columns are `others`, so that the row's
+ * `INSERT` statement in a dump is at most `NODE_DIAGNOSTIC_ROW_MAX_BYTES` (D1 refuses an import of
+ * a statement above 100,000 bytes, and a row that exceeds it makes every backup of the database
+ * impossible to restore). The node's answer is stored whole when it fits. When it does not, the
+ * oldest entries go until the newest that fit remain, and the body says so: `truncated` is true
+ * and `dropped_entries` counts them. An answer whose text alone is too long keeps the beginning
+ * of the text, cut on a character, with `dropped_entries` 0. The answer is never refused for its
+ * size: the node ran the probe, and would send it again.
+ */
+function bodyWithin(
+  table: string,
+  others: Column[],
+  value: { entries: NodeJournalEntry[]; text?: string },
+): string {
+  const room =
+    NODE_DIAGNOSTIC_ROW_MAX_BYTES - insertBytes(table, [...others, ""]);
+  const whole = JSON.stringify(value);
+  if (literalBytes(whole) <= room) return whole;
+  const count = value.entries.length;
+  const marked = (entries: NodeJournalEntry[], text = value.text) =>
+    JSON.stringify({
+      ...value,
+      entries,
+      ...(text === undefined ? {} : { text }),
+      truncated: true,
+      dropped_entries: count - entries.length,
+    });
+  // The mark counts every entry as dropped, which has at least as many digits as the true count.
+  const base = literalBytes(marked([]));
+  if (base <= room) {
+    let size = base,
+      kept = 0;
+    for (let at = count - 1; at >= 0; at--) {
+      const next =
+        size + literalBytes(JSON.stringify(value.entries[at])) + (kept ? 1 : 0);
+      if (next > room) break;
+      size = next;
+      kept++;
+    }
+    return marked(value.entries.slice(count - kept));
+  }
+  // Even without an entry the text is too long. A half of a surrogate pair is not a character.
+  const text = value.text ?? "";
+  const beginning = (end: number) => {
+    const cut = text.slice(0, end);
+    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
+  };
+  let low = 0,
+    high = text.length;
+  while (high - low > 1) {
+    const middle = (low + high) >> 1;
+    if (literalBytes(marked([], beginning(middle))) <= room) low = middle;
+    else high = middle;
+  }
+  return marked([], beginning(low));
+}
 
 interface NodeRow {
   os_boot_id: string | null;
@@ -67,8 +154,10 @@ async function rebootWasAsked(
 
 /**
  * `POST /node/v1/diagnostics`: the journal tail of the boot before this one, sent by the agent
- * when its boot ID changed. The report is stored whole, once for a boot: the agent sends it again
- * when the answer was lost, and that send is answered with the stored report's id and verdict. An
+ * when its boot ID changed. The report is stored once for a boot, whole or, when its row would
+ * be above `NODE_DIAGNOSTIC_ROW_MAX_BYTES` in a backup, as its newest lines that fit
+ * (`bodyWithin`): the agent sends it again when the answer was lost, and that send is answered
+ * with the stored report's id and verdict. An
  * unexpected reboot (no maintenance order asked for it) is what the `node_unexpected_reboot` alert
  * reads; a report of an agent that knew no earlier boot claims no reboot at all. A report that
  * reaches the API before the hello of its boot is stored (the agent does not order the two) is
@@ -87,19 +176,20 @@ export async function nodeBootReport(
     report.previous_boot_id === null
       ? null
       : await rebootWasAsked(c.env.DB, node.id, report.boot_id);
+  const columns: Column[] = [
+    crypto.randomUUID(),
+    node.id,
+    "boot",
+    report.boot_id,
+    report.previous_boot_id,
+    new Date().toISOString(),
+    expected === null ? null : expected ? 1 : 0,
+  ];
   await c.env.DB.prepare(
     `INSERT INTO node_diagnostics(id,node_id,kind,boot_id,previous_boot_id,received_at,expected_reboot,body)
-     VALUES(?,?,'boot',?,?,?,?,?) ON CONFLICT(node_id,boot_id) DO NOTHING`,
+     VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(node_id,boot_id) DO NOTHING`,
   )
-    .bind(
-      crypto.randomUUID(),
-      node.id,
-      report.boot_id,
-      report.previous_boot_id,
-      new Date().toISOString(),
-      expected === null ? null : expected ? 1 : 0,
-      JSON.stringify(report),
-    )
+    .bind(...columns, bodyWithin("node_diagnostics", columns, report))
     .run();
   const stored = await c.env.DB.prepare(
     "SELECT id,expected_reboot FROM node_diagnostics WHERE node_id=? AND boot_id=?",
@@ -130,8 +220,9 @@ export async function nodeDiagnosticUpload(
 }
 
 /**
- * The answer to one request of the node: kept whole, once. A request that is unknown, or is
- * another node's, is not found; an answer for another probe than the one asked is refused. An
+ * The answer to one request of the node: kept once, whole or, when its row would be above
+ * `NODE_DIAGNOSTIC_ROW_MAX_BYTES` in a backup, cut and marked (`bodyWithin`). A request that is
+ * unknown, or is another node's, is not found; an answer for another probe than the one asked is refused. An
  * answer that comes after the request expired is kept too: the node ran the probe, and the page no
  * longer lists the request, so nothing runs twice for it. A second answer is acknowledged and
  * changes nothing.
@@ -146,23 +237,35 @@ async function nodeProbeResult(
     throw new ApiError("invalid_request", "Invalid probe result");
   const result = parsed.data;
   const request = await c.env.DB.prepare(
-    "SELECT probe FROM node_diagnostic_requests WHERE id=? AND node_id=?",
+    `SELECT id,node_id,probe,boot,since_seconds,lines,requested_by_key_id,requested_at
+     FROM node_diagnostic_requests WHERE id=? AND node_id=?`,
   )
     .bind(result.diagnostic_id, node.id)
-    .first<{ probe: string }>();
+    .first<Omit<ProbeRow, "received_at" | "body">>();
   if (request === null)
     throw new ApiError("not_found", "Diagnostic request not found");
   if (request.probe !== result.probe)
     throw new ApiError("invalid_request", "The result answers another probe");
+  const receivedAt = new Date().toISOString();
+  const body = bodyWithin(
+    "node_diagnostic_requests",
+    [
+      request.id,
+      request.node_id,
+      request.probe,
+      request.boot,
+      request.since_seconds,
+      request.lines,
+      request.requested_by_key_id,
+      request.requested_at,
+      receivedAt,
+    ],
+    result,
+  );
   await c.env.DB.prepare(
     "UPDATE node_diagnostic_requests SET received_at=?,body=? WHERE id=? AND node_id=? AND received_at IS NULL",
   )
-    .bind(
-      new Date().toISOString(),
-      JSON.stringify(result),
-      result.diagnostic_id,
-      node.id,
-    )
+    .bind(receivedAt, body, result.diagnostic_id, node.id)
     .run();
   return c.json({ id: result.diagnostic_id });
 }
