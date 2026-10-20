@@ -781,7 +781,7 @@ it("names each warmer by the name version and its shard, so that a warmer create
 });
 
 it("places a warmer with ACTOR_WARMER_LOCATION_HINT when the actors have no hint, and with the actors' hint when they have one", async () => {
-  await databases(1);
+  const [databaseId] = await databases(1);
   const get = vi.spyOn(Object.getPrototypeOf(env.ACTOR_WARMER), "get");
   const warmerKey = env.ACTOR_WARMER.idFromName("v2:0").toString();
   const hintsOfWarmer = () =>
@@ -802,6 +802,19 @@ it("places a warmer with ACTOR_WARMER_LOCATION_HINT when the actors have no hint
   get.mockClear();
   await armActorWarmers(on(), 1000);
   expect(hintsOfWarmer()).toEqual([undefined]);
+  // The warmer's hint is for the warmers only: with nothing but ACTOR_WARMER_LOCATION_HINT set, a
+  // cycle reaches every DatabaseActor without a hint, so that it never places an actor.
+  get.mockClear();
+  await warmCycle(
+    on({ ACTOR_WARMER_LOCATION_HINT: "weur" }),
+    ONE_SHARD,
+    {},
+    Date.now(),
+  );
+  expect(
+    get.mock.calls.map((call) => (call[0] as DurableObjectId).toString()),
+  ).toEqual([actorKey(databaseId!)]);
+  expect(get.mock.calls.map((call) => call[1])).toEqual([undefined]);
 });
 
 it("a warmer of the earlier name is not renewed by the cron and stops itself, leaving no alarm and nothing stored", async () => {

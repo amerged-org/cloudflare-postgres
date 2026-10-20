@@ -8,12 +8,17 @@
 // - A Durable Object alarm may run 15 minutes of wall time and 30 s of CPU. A cycle spends its
 //   time waiting for the actors; its own CPU is the creation of the stubs and the calls, well under
 //   a second for a shard.
-// - An invocation may make up to 10,000 subrequests (1,000 on the older plans, which this stays
-//   under too). A cycle makes one call per database of its shard (`actorWarmShardSize` is 78 at
-//   the default interval, give or take 11 % at one standard deviation for a random range of the ID
-//   space) and, when it reads its list, one D1 query per 1,000 databases of its own range, once
-//   per `ACTOR_WARM_LIST_TTL_MS`. D1 therefore sees about one query of about 78 rows per warmer
-//   and minute, and every row of `databases` is read by one warmer only.
+// - An invocation may make up to 10,000 subrequests on Workers Paid, which this installation
+//   runs on (the Workers limits page lists 50 on Free and 10,000 on Paid, configurable up to 10
+//   million: https://developers.cloudflare.com/workers/platform/limits/, read 2026-10-20; it does
+//   not say whether calls to Durable Object stubs count, so they are counted here). A cycle makes
+//   one call per database of its shard and, when it reads its list, one D1 query per 1,000
+//   databases of its own range, once per `ACTOR_WARM_LIST_TTL_MS`. The shard grows with the
+//   interval (`actorWarmShardSize`): 78 at the default 8 s (give or take 11 % at one standard
+//   deviation for a random range of the ID space) and 3,000 at the longest interval, 300 s: the
+//   default is over the 50 of Free and every interval is under the 10,000 of Paid with room for a
+//   shard larger than average. D1 therefore sees about one query of about 78 rows per warmer and
+//   minute at the default interval, and every row of `databases` is read by one warmer only.
 // - Six simultaneous outgoing connections for each request, alarm and message. The Durable Objects
 //   limits page lists "Simultaneous outgoing connections/request: 6 (same as Workers)" for every
 //   Durable Object (https://developers.cloudflare.com/durable-objects/platform/limits/, read

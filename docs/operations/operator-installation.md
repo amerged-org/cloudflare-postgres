@@ -219,15 +219,23 @@ time, not with fewer or more warmers, and a warmer more or less changes the line
 USD 0.42. The table assumes 300 ms a visit; the 50 ms of the first design is in the paragraph above.
 Neither is measured near the actors yet (the next read of the cycle lines gives `visit_p50_ms`, see
 "Observing it"). If Durable Object stubs do not count against the six connections, the live cycles
-imply 820 to 860 ms a visit, and the line is 14.0, 23.8 and 77.4 with cycles of 8.4 to 10.9 s (USD
-72 of the 77.4 for 1,000 databases is duration; the cycles of a full shard no longer fit the
-interval, see "Observing it"). Six visits in flight instead of 16 cost, if stubs do not count, 16 /
-6 = 2.7 times the duration (USD 72 for 1,000 databases, against about USD 28 at 16 in flight); if
-they count, 16 in flight take the same wall time as six and every visit's time then includes its
-wait, which is why six was chosen. The first deploy on Dev (one warmer, 16 in flight, 167 databases)
-ran a median cycle of 5.9 s over 254 cycles (19:37 to 20:17 UTC on 2026-10-20, 5.4 to 9.6 s), which
-is USD 3.4 a month for that one warmer (USD 5.0 at the 9.0 s median of the first read, 19:10 to
-19:28 UTC).
+imply 820 to 860 ms a visit, and the full shards no longer fit the interval: cycles of 8.4 s (57
+databases) and 10.9 s (75 to 77) overrun 8 s, each alarm then starts as soon as the one before it
+has ended, and a warmer is active the whole month at most. That caps its duration at 2,592,000 s x
+0.125 GB x USD 12.50 per million GB-s = USD 4.05, and the requests and rows written fall with the
+cycles that fit a month (308,571 and 237,798 instead of 324,000), so the line is 13.4, 17.5 and
+56.9 for 170, 300 and 1,000 databases (USD 53 of the 56.9 is duration: 13 warmers x 4.05). The
+formula above, 0.506 x the cycle seconds, holds only for cycles that fit the interval; applied to
+8.4 and 10.9 s it gave 14.0, 23.8 and 77.4, which counts those cycles 324,000 times a month. Six
+visits in flight instead of 16 cost, if stubs do not count, up to 16 / 6 = 2.7 times the duration
+of cycles that fit; with the cap they cost 1.9 times for these shards (USD 53 for 1,000 databases,
+against about USD 28 at 16 in flight, where a cycle of 4.2 s fits). If stubs count, 16 in flight
+take the same wall time as six and every visit's time then includes its wait, which is why six was
+chosen. The first deploy on Dev (one warmer, 16 in flight, 167 databases) wrote 255 cycle lines
+(19:37 to 20:17 UTC on 2026-10-20, re-read at 20:50 UTC; a median `cycle_ms` of 5.9 s, 5.4 to 9.6
+s), which is USD 3.4 a month for that one warmer; its first read (19:10 to 19:28 UTC, a median of
+9.0 s, a cycle longer than the interval) is USD 4.4 under the cap. 255 lines are not 255 cycles:
+an 8 s loop would have written about 299, see "Lines that never arrive" under "Observing it".
 
 The shards of 78 (instead of the 250 this was first sized for: 4 warmers for 1,000 databases at 16
 visits in flight and 50 ms a visit, 0.8 s a cycle, USD 3.3) cost USD 28 more per 1,000 databases and
@@ -311,11 +319,27 @@ the cycle waits for something else (the list read from D1 on the cycle that read
 at well below 300 ms across a day, lower `ACTOR_WARM_VISIT_PLAN_MS` in `domain/actor-warm.ts` to it
 and the shards grow, with fewer warmers (this saves the fixed USD 0.42 of each warmer removed; the
 warmers' duration follows `cycle_ms` itself: USD 0.506 a month for every second of a warmer's
-median `cycle_ms`, see "The warmers line"). `actor_warm_failed` is an unexpected fault of a cycle and
-does not stop the loop. The effect shows in the Edge's admission lines: `admit_ms` of the first
+median `cycle_ms` up to the interval and at most USD 4.05 above it, see "The warmers line").
+`actor_warm_failed` is an unexpected fault of a cycle and does not stop the loop. The effect shows in the Edge's admission lines: `admit_ms` of the first
 connect to a database that was idle is expected to fall from a cold actor's 200 to 600 ms to the
 warm actor's 40 to 80 ms (the scratch measurement of the plan's keep-warm study found that
 effect); confirm it live after the deploy.
+
+**Lines that never arrive.** Count the lines of each shard over ten minutes, without a filter on
+`$workers.eventType` (7 of the 67 lines of 19:40 to 19:50 UTC on Dev carry `jsrpc`, not `alarm`):
+an 8 s loop writes 75. Take each line's start as its log time minus `cycle_ms` and read the gap
+from one start to the next. A gap of 8.0 s is a healthy loop. A gap that equals the previous
+`cycle_ms` after an `overrun` is a slow shard (see above). A gap of exactly k x 8 s, to within a
+few milliseconds, is neither a late alarm nor a slow cycle but k - 1 lines that did not arrive:
+the alarm fired and set its next alarm before it worked, so the loop went on, and either Workers
+Logs dropped the line or the alarm ended without completing a cycle (then those actors went 16 to
+32 s without a visit, longer than the 10 s a keep-warm needs). Which of the two is open. Dev's
+first deploy (one warmer, 167 databases) wrote 62 to 68 lines in each period of ten minutes from
+19:40 to 20:40 UTC on 2026-10-20, about 14 % fewer than 75. From 19:37 to 20:40, 53 of its 57
+gaps of 16 s or more were exact multiples of 8 s and the other 4 were 0.4 to 2.0 s longer, which is
+what an unlogged cycle of 8.4 to 10 s would leave (logged cycles overran by as much); there was no
+`actor_warm_failed` and no `actor_warm_stopped` line. The plan row of this keep-warm holds the
+numbers.
 
 The shard size holds only while a visit takes about what it is planned for. A full shard of 78
 fits the interval of 8 s up to 615 ms a visit (13 rounds) and the planned half of it up to 307 ms.
