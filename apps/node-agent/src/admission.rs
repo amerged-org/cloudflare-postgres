@@ -60,6 +60,9 @@ pub struct AdmissionPolicy {
     pub start_concurrency: usize,
     pub queue_wait_ms: u64,
     pub retry_after_seconds: u32,
+    /// How long after a wake a database runs without the CPU quota of its class (0: the quota
+    /// comes with the wake). Admission does not read it; the wake does (`Core::after_wake`).
+    pub cpu_boost_ms: u64,
 }
 
 /// The contract's `policy.early_sleep` (D2).
@@ -905,6 +908,7 @@ mod tests {
                 start_concurrency: 4,
                 queue_wait_ms: 10_000,
                 retry_after_seconds: 5,
+                cpu_boost_ms: 5000,
             },
             early_sleep: EarlySleepPolicy {
                 enabled: true,

@@ -389,7 +389,7 @@ impl<M: Machine> Core<M> {
             view.writer = Some(writer);
             view.awake_since_ms = Some(now_ms());
         });
-        self.after_ready(db).await;
+        self.after_wake(db).await;
     }
 
     /// A start that outlasted its wake and gave no database that accepts connections: a unit that
@@ -413,7 +413,9 @@ impl<M: Machine> Core<M> {
         self.go_unproven(db);
     }
 
-    /// Off the path of a wake, once PostgreSQL is released: the CPU quota of the database's size.
+    /// The CPU quota of the database's size, applied now (plan 4.4): a build's, a restart's, and a
+    /// wake's once its burst is over. The entry counts as it is at this time, so a resize in
+    /// between is the quota that follows.
     pub(crate) async fn after_ready(&self, db: &Db) {
         let millicores = db
             .view()
@@ -421,6 +423,31 @@ impl<M: Machine> Core<M> {
             .as_ref()
             .and_then(|entry| NonZeroU32::new(entry.cpu_millicores));
         let _ = self.machine.set_cpu_quota(&db.id, millicores).await;
+    }
+
+    /// Once a wake has released PostgreSQL: its CPU quota follows after the policy's
+    /// `cpu_boost_ms`, and at once if that is 0. The start-up, the first request and the reading
+    /// of the buffer list of the last stop (`autoprewarm`) share the quota's 0.5 or 0.25 CPU when
+    /// it comes with the release, and that was throttled in 19 of about 25 periods (EU1,
+    /// 2026-10-20). The unit keeps its weight and its memory, IO and task limits meanwhile, so the
+    /// burst takes only CPU that nobody else wants.
+    ///
+    /// One task per wake waits out the burst and ends with it; `Db::end_boost` ends it earlier,
+    /// when the database leaves service (`Core::set`). It applies the quota under the database's
+    /// flow, so that it cannot meet the stop of a sleep, which lifts the quota, half way.
+    pub(crate) async fn after_wake(self: &Arc<Self>, db: &Arc<Db>) {
+        let boost = Duration::from_millis(self.policy().admission.admission.cpu_boost_ms);
+        if boost.is_zero() {
+            self.after_ready(db).await;
+            return;
+        }
+        let (core, database) = (self.clone(), db.clone());
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(boost).await;
+            let _flow = database.lock.lock().await;
+            core.after_ready(&database).await;
+        });
+        db.begin_boost(task.abort_handle());
     }
 
     // ---- wake
@@ -702,7 +729,7 @@ impl<M: Machine> Core<M> {
         });
         steps.insert("release".into(), millis(releasing.elapsed()));
         self.detail_later(&db, started, steal, cache);
-        self.after_ready(&db).await;
+        self.after_wake(&db).await;
         Ok(())
     }
 
@@ -714,8 +741,9 @@ impl<M: Machine> Core<M> {
     }
 
     /// Off the path of a wake, once its writer is released: one `wake_detail` event, read
-    /// `Timing::detail` later, when the login and the first statements are over. The CPU quota is
-    /// applied right after the release, so its throttling in between is in the event. `cache` is
+    /// `Timing::detail` later, when the login and the first statements are over. The throttling
+    /// since the release is in the event: that of the quota where it came with the release
+    /// (`cpu_boost_ms` 0) or before the event is read, and none inside a burst. `cache` is
     /// the reading of the page cache that began before the start; it is joined here, for at most
     /// `CACHE_WAIT`.
     fn detail_later(
@@ -2707,5 +2735,178 @@ mod tests {
             "NodeEventReport",
             &json!({"events": events})
         ));
+    }
+
+    // ---- the CPU burst after a wake (policy.admission.cpu_boost_ms)
+
+    /// The rig's agent applies the CPU quota `window` after a wake.
+    fn boost(rig: &Rig, window: Duration) {
+        let mut policy = rig.core.policy();
+        policy.admission.admission.cpu_boost_ms = u64::try_from(window.as_millis()).unwrap();
+        rig.core.set_policy(policy);
+    }
+
+    /// Found live on EU1 (2026-10-20, 59 sm-class databases woken after an hour): the quota applied
+    /// at the release throttled the first request, the start-up and the reading of the buffer list
+    /// in 19 of about 25 periods, and the whole request took 2.0 s at p50 against 0.3 s awake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_woken_database_gets_its_quota_once_after_the_boost_and_with_the_wake_at_zero() {
+        let Some(rig) = Rig::new("cpu-boost").await else {
+            return;
+        };
+        let window = Duration::from_millis(1500);
+        boost(&rig, window);
+        let (entry, db) = rig.create().await;
+        let quota = NonZeroU32::new(250);
+        // A build is no wake: its quota comes with ready, whatever the policy says.
+        assert_eq!(rig.machine.quota(&entry.id), Some(quota));
+        assert!(!db.boosting());
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        assert_eq!(rig.machine.quota(&entry.id), Some(None), "a stop lifts it");
+
+        let began = Instant::now();
+        let ticket = Rig::ticket(&entry);
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        assert!(rig.machine.running(&entry.id));
+        assert_eq!(
+            rig.machine.quota(&entry.id),
+            Some(None),
+            "released, no quota"
+        );
+        assert!(db.boosting());
+        tokio::time::sleep(window / 2).await;
+        assert_eq!(
+            rig.machine.quota(&entry.id),
+            Some(None),
+            "inside the window"
+        );
+        eventually(10, "the quota after the boost", || {
+            rig.machine.quota(&entry.id) == Some(quota)
+        })
+        .await;
+        assert!(began.elapsed() >= window, "{:?}", began.elapsed());
+        // Not twice: nothing else sets it while the database runs on.
+        tokio::time::sleep(window).await;
+        assert_eq!(rig.machine.quota_calls(&entry.id), [quota, quota]);
+
+        // At zero the quota comes with the wake, as before the burst existed.
+        boost(&rig, Duration::ZERO);
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        assert_eq!(rig.machine.quota(&entry.id), Some(quota));
+        assert!(!db.boosting());
+        assert_eq!(rig.machine.quota_calls(&entry.id), [quota, quota, quota]);
+    }
+
+    /// The timer is one bounded task of the wake, and a stop ends it: a quota set on a stopped
+    /// unit would outlive the stop and throttle the next start. A later wake has a window of its
+    /// own, which the earlier wake's timer does not cut short.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sleep_ends_the_boost_and_the_next_wake_has_a_boost_of_its_own() {
+        let Some(rig) = Rig::new("cpu-boost-sleep").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let quota = NonZeroU32::new(250);
+        let window = Duration::from_millis(4000);
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        boost(&rig, window);
+        let ticket = Rig::ticket(&entry);
+
+        let first = Instant::now();
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        assert!(db.boosting());
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let second = Instant::now();
+        assert!(
+            second.duration_since(first) < window / 2,
+            "the sleep was slow"
+        );
+        assert!(!db.boosting(), "the sleep ended the timer");
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        assert!(db.boosting());
+        assert!(second.duration_since(first) > Duration::from_millis(100));
+
+        // Past the end of the first wake's window the unit still has no quota.
+        tokio::time::sleep_until((first + window + Duration::from_millis(100)).into()).await;
+        assert_eq!(rig.machine.quota(&entry.id), Some(None));
+        assert_eq!(
+            rig.machine.quota_calls(&entry.id),
+            [quota],
+            "the build's only"
+        );
+        eventually(10, "the quota after the second window", || {
+            rig.machine.quota(&entry.id) == Some(quota)
+        })
+        .await;
+        assert!(second.elapsed() >= window, "{:?}", second.elapsed());
+        assert_eq!(rig.machine.quota_calls(&entry.id), [quota, quota]);
+    }
+
+    /// A resize inside the window changes the quota that follows it: the entry at the time counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_quota_after_the_boost_is_the_class_the_database_has_by_then() {
+        let Some(rig) = Rig::new("cpu-boost-resize").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        boost(&rig, Duration::from_millis(1500));
+        let ticket = Rig::ticket(&entry);
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        assert_eq!(rig.machine.quota(&entry.id), Some(None));
+        // The page catches up with the wake and names a bigger class.
+        let bigger = Entry {
+            generation: ticket.generation,
+            operation: ticket.operation.clone(),
+            cpu_millicores: 500,
+            ..entry.clone()
+        };
+        assert!(rig.core.accept(&db, bigger));
+        eventually(10, "the quota of the new class", || {
+            rig.machine.quota(&entry.id) == Some(NonZeroU32::new(500))
+        })
+        .await;
+    }
+
+    /// An agent that restarts inside a window has lost its timer: it applies the quota at once to
+    /// what it finds running, whatever the policy says.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_applies_the_quota_to_a_unit_it_finds_inside_a_boost() {
+        let Some(rig) = Rig::new("cpu-boost-restart").await else {
+            return;
+        };
+        rig.machine.direct_archive();
+        let mut json = rig.entry_json();
+        let id = json["id"].as_str().unwrap().to_string();
+        let page = |json: &Value| {
+            let mut page = Rig::page(vec![json.clone()], vec![]);
+            page.policy["admission"]["cpu_boost_ms"] = json!(60_000);
+            page
+        };
+        rig.core.apply(&page(&json)).await;
+        let db = rig.core.db(&id);
+        eventually(90, "ready", || db.phase() == Phase::Ready).await;
+        json.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let ticket = Rig::ticket(&rig.entry_for(&json));
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        assert_eq!(
+            rig.machine.quota(&id),
+            Some(None),
+            "inside a window of a minute"
+        );
+
+        let rig = rig.restart().await;
+        rig.deliver(json["archive"]["path"].as_str().unwrap(), "read_write");
+        rig.core.apply(&page(&json)).await;
+        let found = rig.core.db(&id);
+        eventually(20, "the unit and its quota", || {
+            found.phase() == Phase::Ready && rig.machine.quota(&id) == Some(NonZeroU32::new(250))
+        })
+        .await;
+        assert!(!found.boosting());
     }
 }

@@ -292,6 +292,7 @@ mod tests {
         let page = vector("NodeDesiredPage", "full-page");
         let policy = Policy::parse(&page["policy"]).unwrap();
         assert_eq!(policy.admission.admission.start_concurrency, 4);
+        assert_eq!(policy.admission.admission.cpu_boost_ms, 5000);
         assert!(policy.admission.early_sleep.enabled);
         assert_eq!(policy.storage.reserve_bytes, 6 << 30);
         assert_eq!(policy.backup.wal_jobs, 2);

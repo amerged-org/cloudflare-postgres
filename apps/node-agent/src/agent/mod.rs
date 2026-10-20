@@ -43,7 +43,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, atomic::AtomicBool},
     time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::{sync::Notify, task::AbortHandle};
 
 /// The waits and bounds of the agent. The defaults are the product's; tests shorten them.
 #[derive(Clone, Debug)]
@@ -78,7 +78,9 @@ pub struct Timing {
     /// it serves the gateway, whose sessions end on a database the table does not show running.
     pub settle: Duration,
     /// How long after a wake's release its `wake_detail` is read: past the login and the first
-    /// statements, which the CPU quota may throttle.
+    /// statements. The CPU quota comes with the wake's release at a `cpu_boost_ms` of 0 and after
+    /// that time otherwise, so with the default boost of 5 s the event is read inside the burst and
+    /// counts no throttling, and at 0 it counts the quota's.
     pub detail: Duration,
 }
 impl Default for Timing {
@@ -213,6 +215,9 @@ pub(crate) struct Db {
     /// One flow of the database at a time.
     pub lock: tokio::sync::Mutex<()>,
     view: Mutex<View>,
+    /// The task of the last wake that applies the database's CPU quota once its burst is over
+    /// (`Core::after_wake`): one at a time, and gone when the database leaves service.
+    boost: Mutex<Option<AbortHandle>>,
 }
 impl Db {
     /// The view, locked: never held across an `await`, and never while taking it again (the lock is
@@ -226,6 +231,38 @@ impl Db {
     #[cfg(test)]
     pub fn state(&self) -> Option<DatabaseState> {
         self.view().state.clone()
+    }
+    /// Keeps the task that ends a wake's burst; the task of an earlier wake, if one is left, ends.
+    pub fn begin_boost(&self, task: AbortHandle) {
+        let earlier = self
+            .boost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(task);
+        if let Some(earlier) = earlier {
+            earlier.abort();
+        }
+    }
+    /// The unit stopped or the database left service: the quota is not applied any more, and a
+    /// quota set on a stopped unit would throttle its next start.
+    pub fn end_boost(&self) {
+        let task = self
+            .boost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.abort();
+        }
+    }
+    /// Whether a task waits to apply the quota.
+    #[cfg(test)]
+    pub fn boosting(&self) -> bool {
+        self.boost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
     }
 }
 
@@ -362,6 +399,7 @@ impl<M: Machine> Core<M> {
                     id: id.to_string(),
                     lock: tokio::sync::Mutex::new(()),
                     view: Mutex::new(View::new()),
+                    boost: Mutex::new(None),
                 })
             })
             .clone()
@@ -510,6 +548,9 @@ impl<M: Machine> Core<M> {
         };
         if let Some(served) = served {
             self.meter.awake(&db.id, served, now_ms());
+            if !served {
+                db.end_boost();
+            }
         }
         match entry {
             Some(entry) => {

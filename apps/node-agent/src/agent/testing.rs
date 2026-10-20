@@ -118,6 +118,9 @@ pub(crate) fn policy() -> Policy {
     let mut page = vector("NodeDesiredPage", "full-page");
     // Tests wait for what they wait for; nothing in them should be refused for want of time.
     page["policy"]["admission"]["queue_wait_ms"] = json!(300);
+    // The quota comes with the wake, as the tests that read it expect; the tests of the burst set
+    // theirs (`boost`).
+    page["policy"]["admission"]["cpu_boost_ms"] = json!(0);
     Policy::parse(&page["policy"]).unwrap()
 }
 
@@ -271,6 +274,10 @@ impl Rig {
     pub(crate) async fn restart(self) -> Self {
         for task in &self.tasks {
             task.abort();
+        }
+        // The timers that apply the quotas after a burst die with the process.
+        for db in self.core.all() {
+            db.end_boost();
         }
         let units = self.machine.units().await.unwrap();
         let running = units

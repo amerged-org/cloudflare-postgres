@@ -454,11 +454,22 @@ each is told to pull the new page, and admission uses the new values from then o
 
 | Group        | Fields                                                                                                                                                           | The plan's starting values for EU1 (12 GB) |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `admission`  | `memory_rule` (`measured` or `reserved`, decision D3), `memory_floor_mib`, `awake_budget_mib`, `reservation_overhead_mib`, `start_concurrency`, `queue_wait_ms`, `retry_after_seconds` | `measured`, 600, 9,937, 8, 4, 10,000, 5 |
+| `admission`  | `memory_rule` (`measured` or `reserved`, decision D3), `memory_floor_mib`, `awake_budget_mib`, `reservation_overhead_mib`, `start_concurrency`, `queue_wait_ms`, `retry_after_seconds`, `cpu_boost_ms` | `measured`, 600, 9,937, 8, 4, 10,000, 5, 5,000 |
 | `early_sleep` | `enabled`, `min_idle_seconds` (decision D2)                                                                                                                     | enabled, 30                                |
 | `storage`    | `reserve_bytes`, `metadata_no_room_percent`, `sample_max_age_seconds`                                                                                            | 6 GiB, 75, 10                              |
 | `backup`     | `wal_uploads`, `base_backups`, and `memory_mib` of a WAL upload, a WAL fetch and a base backup or restore                                                        | 2, 1, 128, 128, 256                        |
 | `io`         | `write_bytes_per_second` and `write_iops` of a 256 MiB database; a database of _m_ MiB gets _m_/256 times as much                                                | 16 MB/s, 1,000                             |
+
+`cpu_boost_ms` is how long after a wake a database runs without the CPU quota of its class, counted
+from the release of its writer (`0`: the quota comes with the wake). The first requests, PostgreSQL's
+start-up and the reading of its buffer list (`autoprewarm`) then use the idle cores instead of
+sharing 0.5 CPU (0.25 for `xs`); the weight, memory, IO and task limits of the unit stay, so the
+burst takes only CPU that nobody else wants (plan 4.4 states the bound). A change applies from the
+next wake: a timer that runs keeps its time. A database that sleeps, moves or is deleted inside its
+window loses the timer, and an agent that starts applies the quota at once to every database it
+finds running. The event `wake_detail`, read 2 s after the release, carries `nr_throttled` and
+`throttled_usec` since the release: about none inside a burst of 2 s or more, the quota's
+throttling at `0` (the A/B in the plan, 11.2, compares the two).
 
 The starting values come from plan sections 4.3 to 4.6 and 7.5 and stay estimates until Stage 5
 measures the node; the memory budget is the visible RAM minus the system, the mounted volumes, the

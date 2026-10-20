@@ -28,9 +28,9 @@ policy, and reports each decision (plan 1.6, 5.2):
   proven again (below).
 
 Cloudflare sets the policy with `PUT /v1/regions/{id}/node-policy`: the admission rule, floor,
-awake budget and queue, early sleep, the pool reserve, the backup concurrency and memory limits, and
-the write limits of a 256 MiB database. Every node's desired page carries it, and a region whose
-policy is not set serves no page.
+awake budget and queue, the CPU burst after a wake, early sleep, the pool reserve, the backup
+concurrency and memory limits, and the write limits of a 256 MiB database. Every node's desired page
+carries it, and a region whose policy is not set serves no page.
 
 ## Commands
 
@@ -141,7 +141,8 @@ when the page names a higher credentials revision, and R2 temporary credentials 
   the upgrade. The agent checks the ticket against its page and volume, reads `pg_control` and
   compares it with the proven-sleep record, passes admission, starts the unit and waits for the job
   that ends at `READY=1`. It hands the gateway the unit's socket, uid, main PID and invocation ID in
-  the writer table, applies the database's CPU quota after ready and reports the phases of the wake
+  the writer table, applies the database's CPU quota `cpu_boost_ms` after the release (at once when
+  that is 0; a build and a restart of the agent apply it at once) and reports the phases of the wake
   as events; about 2 s later a `wake_detail` event adds the split of the start and the share of the
   database's files that the page cache held before the start (`cache.rs`). A wake it already
   serves is answered `wake_in_progress`, which is no result.

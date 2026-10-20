@@ -508,6 +508,11 @@
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 300
+                },
+                "cpu_boost_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
                 }
               },
               "required": [
@@ -517,7 +522,8 @@
                 "reservation_overhead_mib",
                 "start_concurrency",
                 "queue_wait_ms",
-                "retry_after_seconds"
+                "retry_after_seconds",
+                "cpu_boost_ms"
               ],
               "additionalProperties": false
             },

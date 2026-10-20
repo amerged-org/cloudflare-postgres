@@ -732,6 +732,13 @@ export const NodePolicy = z.strictObject({
     /** A wake waits this long for room, below the gateway's 25 s wake bound, then gets 57P03. */
     queue_wait_ms: z.number().int().min(0).max(20_000),
     retry_after_seconds: z.number().int().min(1).max(300),
+    /**
+     * After a wake the database runs without the CPU quota of its class for this long, counted
+     * from the release of the writer, so that its first requests, its start-up and the reading of
+     * its buffer list are not throttled (plan 4.4). Its weight and its memory, IO and task limits
+     * stay. 0 applies the quota at once. A restarted agent applies it at once to what it finds.
+     */
+    cpu_boost_ms: z.number().int().min(0).max(60_000),
   }),
   /** D2: put idle-but-awake databases to sleep early, only while a wake waits. */
   early_sleep: z.strictObject({
