@@ -16259,6 +16259,41 @@
     },
     {
       "schema": "NodeEventReport",
+      "name": "wake-on-the-slot-path",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "events": [
+          {
+            "type": "wake",
+            "id": "bbbbbbbb-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "outcome": "started",
+            "phases_ms": {
+              "admission": 9,
+              "volume_check": 1,
+              "repair_check": 1,
+              "mount": 1,
+              "pg_control": 2,
+              "config": 1,
+              "archive": 1,
+              "queue_wait": 1,
+              "start": 61,
+              "roles": 2,
+              "release": 3,
+              "slot": 38,
+              "bind": 9
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeEventReport",
       "name": "empty",
       "valid": false,
       "node_valid": false,

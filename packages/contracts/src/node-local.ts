@@ -41,8 +41,11 @@ export const WAKE_REDELIVER_MS = 3_000;
 /**
  * Phases of a wake on the node; wake results and wake events time them in ms. `admission` is the
  * whole check before the start: `volume_check` to `archive`, in the order the agent takes them.
- * `release` is the time from the end of `start` to the writer in the gateway's table, and holds
- * `roles`, the page's roles written before anyone logs in.
+ * `slot` is the time to get the slot PostgreSQL runs in, taken from the pool or built, and `bind`
+ * is what binds it to the database (its properties, mounts and exec order); `start` is the exec
+ * to ready. Every phase is optional: an agent that has no slot path reports neither `slot` nor
+ * `bind`. `release` is the time from the end of `start` to the writer in the gateway's table, and
+ * holds `roles`, the page's roles written before anyone logs in.
  */
 export const WAKE_PHASES = [
   "admission",
@@ -53,6 +56,8 @@ export const WAKE_PHASES = [
   "config",
   "archive",
   "queue_wait",
+  "slot",
+  "bind",
   "start",
   "roles",
   "release",

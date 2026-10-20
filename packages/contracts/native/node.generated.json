@@ -1771,6 +1771,16 @@
                         "minimum": 0,
                         "maximum": 600000
                       },
+                      "slot": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
+                      "bind": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
                       "start": {
                         "type": "integer",
                         "minimum": 0,

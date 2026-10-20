@@ -1619,6 +1619,15 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       },
       true,
     ],
+    [
+      "wake-on-the-slot-path",
+      {
+        events: [
+          { ...wake, phases_ms: { ...wake.phases_ms, slot: 38, bind: 9 } },
+        ],
+      },
+      true,
+    ],
     ["empty", { events: [] }, false],
     ["event-without-id", { events: [{ ...wake, id: undefined }] }, false],
     ["event-id-not-a-uuid", { events: [{ ...wake, id: "wake-1" }] }, false],
