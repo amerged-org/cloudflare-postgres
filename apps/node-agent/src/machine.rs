@@ -158,7 +158,7 @@ pub(crate) fn gateway_environment(
     node: &NodeIdentity,
     credentials: &serde_json::Value,
 ) -> io::Result<String> {
-    let keyring = serde_json::to_string(&credentials["route_keyring"])?;
+    let keyring = serde_json::to_string(&crate::node_link::route_keyring(credentials))?;
     if keyring.contains(['\'', '\n'])
         || !crate::valid_region(&node.region_id)
         || !pgcf_native_protocol::valid_pattern("node", &node.id)
@@ -767,6 +767,21 @@ mod tests {
         refuse_init_mount_namespace(&agent, &init).unwrap();
         // A namespace that cannot be read is no answer.
         assert!(refuse_init_mount_namespace(&directory.join("missing"), &init).is_err());
+    }
+
+    /// The credentials may carry a property this build does not name, in the keyring too. The
+    /// gateway parses its keyring strictly, so only what the contract names reaches its environment:
+    /// a property of a later release must not keep the gateway from starting.
+    #[test]
+    fn a_property_the_keyring_has_that_this_build_does_not_name_is_not_written_to_the_gateway() {
+        let keyring =
+            json!({"active": "k1", "keys": {"k1": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}});
+        let mut later = keyring.clone();
+        later["a_property_of_a_later_release"] = 1.into();
+        assert_eq!(
+            gateway_environment(&node(), &json!({"route_keyring": later})).unwrap(),
+            gateway_environment(&node(), &json!({"route_keyring": keyring})).unwrap()
+        );
     }
 
     #[test]

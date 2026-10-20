@@ -398,10 +398,16 @@ made as in step 3.
 An agent of a build before host files cannot read the page of a release that carries them (nor,
 since manifest v3, the image's facts that every page's release carries: its generated schema is
 strict), and the API refuses its hello, which lacks `os.host_files_sha256`, so no release can reach
-it: once, its binary is replaced through the shell. EU1 is such a node (it runs the agent of main
-`bb85de7d`). A node enrolled from an image that
+it: once, its binary is replaced through the shell. EU1 was such a node (it ran the agent of main
+`bb85de7d`) and was replaced on 2026-10-20. A node enrolled from an image that
 holds the first agent that writes host files needs none of this, and no code supports it: Dev runs
-the newest release only. The databases keep running throughout (their units do not depend on the
+the newest release only. It is the last such step: from the agent that ignores the properties it
+does not know, a change that keeps the order of the table in
+[Changing the page](#changing-the-page-no-hand-step) needs no hand replacement (a new property is one
+release; a new value, a new type of order, a rename and a change of the signed manifest are two); an
+agent of main `1ace7446`, which is still
+strict, is moved to that agent by the release path in the order of the plan's row for the CPU
+burst, and a node that needs this section again means a rule of that section was broken. The databases keep running throughout (their units do not depend on the
 agent, and a restart of the agent never stops one).
 
 1. **While the node is still linked,** check that the shell reaches it (steps 1 to 4 above;
@@ -454,11 +460,30 @@ each is told to pull the new page, and admission uses the new values from then o
 
 | Group        | Fields                                                                                                                                                           | The plan's starting values for EU1 (12 GB) |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `admission`  | `memory_rule` (`measured` or `reserved`, decision D3), `memory_floor_mib`, `awake_budget_mib`, `reservation_overhead_mib`, `start_concurrency`, `queue_wait_ms`, `retry_after_seconds` | `measured`, 600, 9,937, 8, 4, 10,000, 5 |
+| `admission`  | `memory_rule` (`measured` or `reserved`, decision D3), `memory_floor_mib`, `awake_budget_mib`, `reservation_overhead_mib`, `start_concurrency`, `queue_wait_ms`, `retry_after_seconds`, `cpu_boost_ms` | `measured`, 600, 9,937, 8, 4, 10,000, 5, 5,000 |
 | `early_sleep` | `enabled`, `min_idle_seconds` (decision D2)                                                                                                                     | enabled, 30                                |
 | `storage`    | `reserve_bytes`, `metadata_no_room_percent`, `sample_max_age_seconds`                                                                                            | 6 GiB, 75, 10                              |
 | `backup`     | `wal_uploads`, `base_backups`, and `memory_mib` of a WAL upload, a WAL fetch and a base backup or restore                                                        | 2, 1, 128, 128, 256                        |
 | `io`         | `write_bytes_per_second` and `write_iops` of a 256 MiB database; a database of _m_ MiB gets _m_/256 times as much                                                | 16 MB/s, 1,000                             |
+
+`cpu_boost_ms` is how long after a wake a database runs without the CPU quota of its class, counted
+from the release of its writer (`0`: the quota comes with the wake). It is optional for its first
+release ([Changing the page](#changing-the-page-no-hand-step)): a `PUT` that leaves it out sets 0,
+and a stored policy that lacks it reads as 0 until migration `0081` or a `PUT` gives it a value. The first requests, PostgreSQL's
+start-up and the reading of its buffer list (`autoprewarm`) then are not held to 0.5 CPU (0.25 for
+`xs`). The weight and the memory, IO and task limits of the unit stay, so the burst lifts only the
+cap of the quota: contested CPU is still divided by weight, and a database that bursts takes its
+weight's share of it, which can be more than its size and can come from the gateway, `cloudflared`
+and the agent (plan 4.4 states the bound: all databases together take at most half of contested CPU
+from them, and every database keeps its weight's share). Each wake has a burst of its own, so the
+CPU a database can take grows with how often it wakes (after an idle sleep, an early sleep, a
+suspend and resume, a move or a maintenance). A change applies from the next wake: a timer that runs
+keeps its time. A database that sleeps, moves or is deleted inside its window loses the timer, a
+base backup that begins inside it ends it (the quota is applied before the backup), and an agent
+that starts applies the quota at once to every database it finds running. The event `wake_detail`,
+read 2 s after the release, carries `nr_throttled` and `throttled_usec` since the release: about
+none inside a burst of 2 s or more, the quota's throttling at `0` (the A/B in the plan, 11.2,
+compares the two).
 
 The starting values come from plan sections 4.3 to 4.6 and 7.5 and stay estimates until Stage 5
 measures the node; the memory budget is the visible RAM minus the system, the mounted volumes, the
@@ -552,7 +577,7 @@ and actual delivery are separate evidence. The alert kinds and their runbook act
 5. A new release reaches a running node without a reboot: assign it to the region and the node pulls
    its binaries and writes its host files (plan 9.3; the section below). Packages and kernels change
    only in the [maintenance cycle](recovery.md#node-maintenance-cycle), one node at a time. A node
-   whose agent predates host files (EU1 today) first has its agent
+   whose agent predates host files (EU1 did, until 2026-10-20) first has its agent
    [replaced by hand](#replacing-the-agent-by-hand-a-node-whose-agent-predates-host-files), once.
 
 Verify an install as described under [the node firewall](#the-node-firewall) and
@@ -609,6 +634,69 @@ volumes) is written to every running node, and nothing refuses it or checks it: 
 databases keep the topology they started with, each database's next start takes the new one, and
 a node that holds both until every database has slept is in a state nothing has measured. Do not
 assign such a release to a region that has running nodes; the change reaches EU1 with a reinstall.
+
+### Changing the page: no hand step
+
+The desired page (a field of the policy, the release, an entry, a role, an order or a probe), the
+credentials and the API's answers are read by the agent with every object open: **a property the
+agent does not know is ignored**, so a release that adds one reaches a running node by the release
+path, with no replacement of the agent. What the agent still refuses, whole, is a page it cannot
+read: a missing required property, a wrong type, a number out of bound, a value outside a closed
+set (an enum, a type of order, a kind of origin or host file, a link message), and a property of the
+other kind (a move with a `target_time`, a restore with an `end`, a removed role that names a property
+of a present role). The contract stays
+strict on the API's side, so the API never sends or accepts a property by accident, and what the
+agent sends is held to it.
+
+**The rule for the author of a change is the table in
+[plan 9.3, "Changing the page"](../architecture/cloudflare-convergence-and-serverless-plan.md); it is
+written there once, by the kind of change and by the direction (what the node receives, what it
+sends), and nothing of it is repeated here.** What an operator does with it:
+
+- Before a release or an API deploy, find the row of its change in the table and keep its order.
+  Where the row says "the release after every node runs it", that is `converged` on every node of
+  every region (`GET /v1/nodes/{id}/release`), not a time that has passed.
+- **EU1 today** runs the agent of main `1ace7446`, which is strict: the rule starts with the agent
+  that ignores unknown properties, so the first change after it is not "any order". Register and
+  assign that release first, while the API is still the older one, and deploy the API (with migration
+  `0081`) after the node runs it: the order of the plan's row for the CPU burst (11.2). The API first
+  would leave the agent unable to read the page that assigns the release, which is the hand
+  replacement above.
+- A change of the signed manifest is two releases as well
+  ([release-signing.md](release-signing.md#changing-the-manifest)).
+
+#### If an agent cannot read the page
+
+It applies none of the page (no entry, no order, no release; what runs keeps running) and reports
+`desired_pull_failed` with the class `cloudflare_desired_page_invalid`, or
+`cloudflare_desired_page_has_an_order_this_agent_does_not_know` for an order of a type it does not
+read. A rule of the table was broken, or the API sent a page that does not match its own contract.
+
+1. **Read the refusal in Workers Logs,** not with a probe. The line has `event` `node_event`,
+   `node_event` `desired_pull_failed`, the `node_id` and the `class`. Probe requests (`journal` and
+   the others) travel on the desired page, which the agent refuses, and it answers a probe only after
+   it has pulled a page, so none is answered. The event does reach Cloudflare: the agent posts its
+   event ring by itself, with no page.
+2. **Make the API send a page the agent reads.** Rolling forward with a fix is the safe way. A
+   rollback of the API Worker alone is not: **it does not undo what the newer API wrote to D1**, and
+   the older API refuses or misreads that, so check what it left before rolling back.
+   - *A stored policy with a field the older API does not know.* The next deploy is the case:
+     migration `0081` writes `policy.admission.cpu_boost_ms` into `node_region_policies`, and the API
+     of `1ace7446` parses the stored policy with its strict `NodePolicy`, so after a Worker-only
+     rollback `GET /v1/regions/{id}/node-policy` and every page of the region return 500 and no
+     release reaches the node. With the rollback, `PUT /v1/regions/{id}/node-policy` the policy
+     without `cpu_boost_ms` through the older API (it replaces the stored policy without reading it);
+     after rolling forward, `PUT` it with `cpu_boost_ms` `5000` again, because migration `0081` is
+     applied once and does not run a second time.
+   - *Open orders of a type the older API does not know.* It reads every open order that is neither a
+     `move` nor `maintenance` as `superseded`, which retires the storage generation the row names (the
+     node never starts or archives it again), or it fails the page when the row has none. List them
+     first (`SELECT type, count(*) FROM lifecycle_orders WHERE closed_at IS NULL GROUP BY type`) and do
+     not roll back while orders of the new type are open: closing them is a write to D1 that needs the
+     owner's go, and the order is lost.
+3. **Then the release path works again:** assign the release whose agent reads the page, wait until
+   the node is `converged`, and deploy the API again, with the `PUT` of step 2 where it applies.
+   Replacing the agent by hand is the last resort.
 
 ## API-only resource profiles and regional configuration
 

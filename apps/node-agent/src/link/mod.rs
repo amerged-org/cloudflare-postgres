@@ -533,6 +533,56 @@ mod tests {
         assert_eq!(cloud.requests().len(), before);
     }
 
+    /// An API of a later release adds a property to every document it sends. The node enrolls,
+    /// links, pulls and reads exactly as it does without it, and the property changes nothing it
+    /// does (plan 9.3, "Changing the page").
+    #[tokio::test]
+    async fn an_api_of_a_later_release_adds_properties_and_the_node_works_as_before() {
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        // The seed of an installer of a later release carries one too.
+        std::fs::create_dir_all(base.join("enrollment")).unwrap();
+        std::fs::write(
+            base.join("enrollment/seed.json"),
+            json!({"node_id":test_server::NODE_ID,"region":"eu-dev","api_url":cloud.origin,
+                "enrollment_token":test_server::TOKEN,test_server::UNKNOWN_PROPERTY:1})
+            .to_string(),
+        )
+        .unwrap();
+        cloud.with(|inner| {
+            inner.unknown_properties = true;
+            inner.databases = vec![database(&database_id(1)), database(&database_id(2))];
+            inner.orders =
+                vec![json!({"type":"maintenance","operation":"op_tttttttttttttttttttt"})];
+        });
+        let (link, mut events) = start(&cloud, &base).await;
+        assert_eq!(link.node().id, test_server::NODE_ID);
+        // The welcome has one, and so has a hint to pull.
+        assert_eq!(next(&mut events).await, Some(LinkEvent::Desired(None)));
+        cloud
+            .push(json!({"type":"desired","ids":[database_id(2)],test_server::UNKNOWN_PROPERTY:1}));
+        assert_eq!(
+            next(&mut events).await,
+            Some(LinkEvent::Desired(Some(vec![database_id(2)])))
+        );
+        let desired = link.desired_page(None).await.unwrap();
+        assert_eq!(desired.databases.len(), 2);
+        assert_eq!(desired.orders.len(), 1);
+        assert_eq!(link.credentials().await.unwrap()["revision"], 3);
+        let archive = link
+            .archive_credential("crd_kkkkkkkkkkkkkkkkkkkk")
+            .await
+            .unwrap();
+        assert_eq!(archive["id"], "crd_kkkkkkkkkkkkkkkkkkkk");
+        let observation = vector("NodeObservationReport", "asleep");
+        let id = observation["databases"][0]["id"].as_str().unwrap();
+        assert_eq!(link.post_observation(&observation).await.unwrap(), [id]);
+        // A node it declared lost is still known as lost.
+        cloud.with(|inner| inner.fenced = true);
+        cloud.drop_links();
+        assert_eq!(next(&mut events).await, Some(LinkEvent::Fenced));
+    }
+
     #[tokio::test]
     async fn the_hello_names_the_boot_and_the_os_and_a_changed_os_is_said_on_a_new_link() {
         let cloud = Cloud::start().await;

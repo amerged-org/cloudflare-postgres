@@ -18,7 +18,6 @@
         }
       },
       "required": ["node_id", "region", "api_url", "enrollment_token"],
-      "additionalProperties": false,
       "$defs": {
         "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
         "RegionId": {
@@ -70,7 +69,6 @@
         "region_id": { "$ref": "#/$defs/RegionId" }
       },
       "required": ["id", "uid", "hostname", "region_id"],
-      "additionalProperties": false,
       "$defs": {
         "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
         "RegionId": {
@@ -139,16 +137,14 @@
               }
             }
           },
-          "required": ["active", "keys"],
-          "additionalProperties": false
+          "required": ["active", "keys"]
         },
         "shell_ca_public_key": {
           "type": "string",
           "pattern": "^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-P][A-Za-z0-9+/]{42}$"
         }
       },
-      "required": ["revision", "tunnel_token", "route_keyring"],
-      "additionalProperties": false
+      "required": ["revision", "tunnel_token", "route_keyring"]
     },
     "ArchiveCredential": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -189,7 +185,6 @@
         "session_token",
         "expires_at"
       ],
-      "additionalProperties": false,
       "$defs": {
         "Timestamp": {
           "type": "string",
@@ -217,8 +212,7 @@
             },
             "region_id": { "$ref": "#/$defs/RegionId" }
           },
-          "required": ["id", "uid", "hostname", "region_id"],
-          "additionalProperties": false
+          "required": ["id", "uid", "hostname", "region_id"]
         },
         "release": {
           "anyOf": [
@@ -253,8 +247,7 @@
                     "size_bytes",
                     "raw_sha256",
                     "raw_bytes"
-                  ],
-                  "additionalProperties": false
+                  ]
                 },
                 "binaries": {
                   "type": "object",
@@ -277,8 +270,7 @@
                           "maximum": 9007199254740991
                         }
                       },
-                      "required": ["url", "sha256", "size_bytes"],
-                      "additionalProperties": false
+                      "required": ["url", "sha256", "size_bytes"]
                     },
                     "pgcf-native-gateway": {
                       "type": "object",
@@ -298,8 +290,7 @@
                           "maximum": 9007199254740991
                         }
                       },
-                      "required": ["url", "sha256", "size_bytes"],
-                      "additionalProperties": false
+                      "required": ["url", "sha256", "size_bytes"]
                     },
                     "pgcf-archive": {
                       "type": "object",
@@ -319,8 +310,7 @@
                           "maximum": 9007199254740991
                         }
                       },
-                      "required": ["url", "sha256", "size_bytes"],
-                      "additionalProperties": false
+                      "required": ["url", "sha256", "size_bytes"]
                     },
                     "pgcf-wal-fetch": {
                       "type": "object",
@@ -340,8 +330,7 @@
                           "maximum": 9007199254740991
                         }
                       },
-                      "required": ["url", "sha256", "size_bytes"],
-                      "additionalProperties": false
+                      "required": ["url", "sha256", "size_bytes"]
                     }
                   },
                   "required": [
@@ -349,8 +338,7 @@
                     "pgcf-native-gateway",
                     "pgcf-archive",
                     "pgcf-wal-fetch"
-                  ],
-                  "additionalProperties": false
+                  ]
                 },
                 "os": {
                   "type": "object",
@@ -381,8 +369,7 @@
                           "maximum": 9007199254740991
                         }
                       },
-                      "required": ["url", "sha256", "size_bytes"],
-                      "additionalProperties": false
+                      "required": ["url", "sha256", "size_bytes"]
                     },
                     "host_files": {
                       "maxItems": 1024,
@@ -426,8 +413,7 @@
                               "sha256",
                               "size_bytes",
                               "apply"
-                            ],
-                            "additionalProperties": false
+                            ]
                           },
                           {
                             "type": "object",
@@ -447,8 +433,7 @@
                                 "maxLength": 128
                               }
                             },
-                            "required": ["path", "kind", "apply"],
-                            "additionalProperties": false
+                            "required": ["path", "kind", "apply"]
                           }
                         ]
                       }
@@ -459,12 +444,10 @@
                     "debian_snapshot",
                     "package_lock",
                     "host_files"
-                  ],
-                  "additionalProperties": false
+                  ]
                 }
               },
-              "required": ["id", "image", "binaries", "os"],
-              "additionalProperties": false
+              "required": ["id", "image", "binaries", "os"]
             },
             { "type": "null" }
           ]
@@ -508,6 +491,12 @@
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 300
+                },
+                "cpu_boost_ms": {
+                  "default": 0,
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
                 }
               },
               "required": [
@@ -518,8 +507,7 @@
                 "start_concurrency",
                 "queue_wait_ms",
                 "retry_after_seconds"
-              ],
-              "additionalProperties": false
+              ]
             },
             "early_sleep": {
               "type": "object",
@@ -531,8 +519,7 @@
                   "maximum": 3600
                 }
               },
-              "required": ["enabled", "min_idle_seconds"],
-              "additionalProperties": false
+              "required": ["enabled", "min_idle_seconds"]
             },
             "storage": {
               "type": "object",
@@ -557,8 +544,7 @@
                 "reserve_bytes",
                 "metadata_no_room_percent",
                 "sample_max_age_seconds"
-              ],
-              "additionalProperties": false
+              ]
             },
             "backup": {
               "type": "object",
@@ -592,12 +578,10 @@
                       "maximum": 4096
                     }
                   },
-                  "required": ["wal_upload", "wal_fetch", "base_backup"],
-                  "additionalProperties": false
+                  "required": ["wal_upload", "wal_fetch", "base_backup"]
                 }
               },
-              "required": ["wal_uploads", "base_backups", "memory_mib"],
-              "additionalProperties": false
+              "required": ["wal_uploads", "base_backups", "memory_mib"]
             },
             "io": {
               "type": "object",
@@ -613,12 +597,10 @@
                   "maximum": 10000000
                 }
               },
-              "required": ["write_bytes_per_second", "write_iops"],
-              "additionalProperties": false
+              "required": ["write_bytes_per_second", "write_iops"]
             }
           },
-          "required": ["admission", "early_sleep", "storage", "backup", "io"],
-          "additionalProperties": false
+          "required": ["admission", "early_sleep", "storage", "backup", "io"]
         },
         "credentials_revision": {
           "type": "integer",
@@ -642,8 +624,7 @@
                     "maximum": 9007199254740991
                   }
                 },
-                "required": ["type", "operation", "database", "generation"],
-                "additionalProperties": false
+                "required": ["type", "operation", "database", "generation"]
               },
               {
                 "type": "object",
@@ -662,8 +643,7 @@
                   "operation",
                   "database",
                   "storage_generation"
-                ],
-                "additionalProperties": false
+                ]
               },
               {
                 "type": "object",
@@ -684,8 +664,7 @@
                   "database",
                   "storage_generation",
                   "remove_volume"
-                ],
-                "additionalProperties": false
+                ]
               },
               {
                 "type": "object",
@@ -693,8 +672,7 @@
                   "type": { "type": "string", "const": "fence" },
                   "operation": { "$ref": "#/$defs/OperationId" }
                 },
-                "required": ["type", "operation"],
-                "additionalProperties": false
+                "required": ["type", "operation"]
               },
               {
                 "type": "object",
@@ -702,8 +680,7 @@
                   "type": { "type": "string", "const": "maintenance" },
                   "operation": { "$ref": "#/$defs/OperationId" }
                 },
-                "required": ["type", "operation"],
-                "additionalProperties": false
+                "required": ["type", "operation"]
               }
             ]
           }
@@ -745,8 +722,7 @@
               },
               "lines": { "type": "integer", "minimum": 1, "maximum": 2000 }
             },
-            "required": ["id", "probe", "boot", "since_seconds", "lines"],
-            "additionalProperties": false
+            "required": ["id", "probe", "boot", "since_seconds", "lines"]
           }
         },
         "databases": {
@@ -797,8 +773,7 @@
                     "maximum": 65536
                   }
                 },
-                "required": ["memory_mib", "cpu_millicores", "storage_gib"],
-                "additionalProperties": false
+                "required": ["memory_mib", "cpu_millicores", "storage_gib"]
               },
               "settings": {
                 "type": "object",
@@ -814,8 +789,7 @@
                     "maximum": 3600
                   }
                 },
-                "required": ["max_connections", "archive_timeout_seconds"],
-                "additionalProperties": false
+                "required": ["max_connections", "archive_timeout_seconds"]
               },
               "sleep_after_seconds": {
                 "anyOf": [
@@ -864,8 +838,7 @@
                           "description": "BYPASSRLS. Absent means NOBYPASSRLS."
                         }
                       },
-                      "required": ["name", "owner", "password", "revision"],
-                      "additionalProperties": false
+                      "required": ["name", "owner", "password", "revision"]
                     },
                     {
                       "type": "object",
@@ -874,7 +847,6 @@
                         "state": { "type": "string", "const": "absent" }
                       },
                       "required": ["name", "state"],
-                      "additionalProperties": false,
                       "description": "A deleted role the node must remove; it carries no credential."
                     }
                   ]
@@ -896,12 +868,10 @@
                       },
                       "expires_at": { "$ref": "#/$defs/Timestamp" }
                     },
-                    "required": ["id", "expires_at"],
-                    "additionalProperties": false
+                    "required": ["id", "expires_at"]
                   }
                 },
-                "required": ["path", "credential"],
-                "additionalProperties": false
+                "required": ["path", "credential"]
               },
               "origin": {
                 "oneOf": [
@@ -910,8 +880,7 @@
                     "properties": {
                       "kind": { "type": "string", "const": "create" }
                     },
-                    "required": ["kind"],
-                    "additionalProperties": false
+                    "required": ["kind"]
                   },
                   {
                     "type": "object",
@@ -939,8 +908,7 @@
                               },
                               "expires_at": { "$ref": "#/$defs/Timestamp" }
                             },
-                            "required": ["id", "expires_at"],
-                            "additionalProperties": false
+                            "required": ["id", "expires_at"]
                           }
                         },
                         "required": [
@@ -948,12 +916,10 @@
                           "path",
                           "backup_id",
                           "credential"
-                        ],
-                        "additionalProperties": false
+                        ]
                       }
                     },
-                    "required": ["kind", "source"],
-                    "additionalProperties": false
+                    "required": ["kind", "source"]
                   },
                   {
                     "type": "object",
@@ -980,8 +946,7 @@
                               },
                               "expires_at": { "$ref": "#/$defs/Timestamp" }
                             },
-                            "required": ["id", "expires_at"],
-                            "additionalProperties": false
+                            "required": ["id", "expires_at"]
                           },
                           "end": {
                             "type": "object",
@@ -1011,8 +976,7 @@
                               "checkpoint_lsn",
                               "last_archived_segment",
                               "proven_at"
-                            ],
-                            "additionalProperties": false
+                            ]
                           }
                         },
                         "required": [
@@ -1021,12 +985,10 @@
                           "backup_id",
                           "credential",
                           "end"
-                        ],
-                        "additionalProperties": false
+                        ]
                       }
                     },
-                    "required": ["kind", "source"],
-                    "additionalProperties": false
+                    "required": ["kind", "source"]
                   }
                 ]
               }
@@ -1044,8 +1006,7 @@
               "sleep_after_seconds",
               "roles",
               "archive"
-            ],
-            "additionalProperties": false
+            ]
           }
         },
         "next": {
@@ -1061,7 +1022,6 @@
         "databases",
         "next"
       ],
-      "additionalProperties": false,
       "$defs": {
         "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
         "RegionId": {
@@ -1324,8 +1284,7 @@
                 "enum": ["accept", "stale", "conflict"]
               }
             },
-            "required": ["id", "verdict"],
-            "additionalProperties": false
+            "required": ["id", "verdict"]
           }
         },
         "orders": {
@@ -1335,7 +1294,6 @@
         }
       },
       "required": ["databases", "orders"],
-      "additionalProperties": false,
       "$defs": {
         "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
       }
@@ -2096,8 +2054,7 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
       "properties": { "error": { "type": "string", "const": "node_fenced" } },
-      "required": ["error"],
-      "additionalProperties": false
+      "required": ["error"]
     },
     "AgentLinkMessage": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2355,8 +2312,7 @@
             "type": { "type": "string", "const": "welcome" },
             "protocol": { "type": "number", "const": 1 }
           },
-          "required": ["type", "protocol"],
-          "additionalProperties": false
+          "required": ["type", "protocol"]
         },
         {
           "type": "object",
@@ -2369,8 +2325,7 @@
               "items": { "$ref": "#/$defs/DatabaseId" }
             }
           },
-          "required": ["type"],
-          "additionalProperties": false
+          "required": ["type"]
         }
       ],
       "$defs": {
@@ -2418,6 +2373,7 @@
       "usage": "/node/v1/usage",
       "diagnostics": "/node/v1/diagnostics"
     },
+    "NODE_ORDER_TYPES": ["wake", "move", "superseded", "fence", "maintenance"],
     "INSTALLER_PROGRESS_PATH": "/node/v1/installer/progress",
     "NODE_ENROLLMENT_SEED_PATH": "/var/lib/pgcf/enrollment/seed.json",
     "ENROLLMENT_TOKEN_LIFETIME_SECONDS": 1800,
@@ -2461,6 +2417,15 @@
     "MAINTENANCE_ROLE": "pgcf_maintenance",
     "RESERVED_ROLE_NAMES": ["postgres", "streaming_replica"],
     "RESERVED_ROLE_PREFIXES": ["pg_", "cnpg_"],
+    "PRESENT_ROLE_PROPERTIES": [
+      "owner",
+      "password",
+      "revision",
+      "valid_until",
+      "connection_limit",
+      "member_of",
+      "bypass_rls"
+    ],
     "ADMISSION_STARTS": [
       "wake",
       "create",

@@ -364,17 +364,23 @@ impl<M: Machine> Core<M> {
     }
 
     /// The unit runs, as the agent found it at its start: it is released to the gateway as ready,
-    /// and its archiver reaches the archive socket again.
+    /// and its archiver reaches the archive socket again. The timer that was to apply its CPU
+    /// quota after a burst died with the agent that held it, and the agent cannot tell how much of
+    /// the burst is left: the quota is applied at once, which is the same one the unit holds if
+    /// its burst was over.
     async fn adopt_running(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
         self.ensure_archive(db, entry);
         match self.machine.wait_started(&db.id).await {
             Ok(started) => match writer_of(&started) {
-                Some(writer) => self.set(db, |view| {
-                    view.phase = Phase::Ready;
-                    view.writer = Some(writer);
-                    view.awake_since_ms = Some(super::now_ms());
-                    view.error = None;
-                }),
+                Some(writer) => {
+                    self.set(db, |view| {
+                        view.phase = Phase::Ready;
+                        view.writer = Some(writer);
+                        view.awake_since_ms = Some(super::now_ms());
+                        view.error = None;
+                    });
+                    self.after_ready(db).await;
+                }
                 None => self.go_unproven(db),
             },
             // A unit that cannot be read as ready is not served; recovery takes it.

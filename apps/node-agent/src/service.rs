@@ -104,7 +104,7 @@ fn gateway_secrets(credentials: &Value) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let secrets = json!({
         "tunnel_token": credentials["tunnel_token"],
-        "route_keyring": credentials["route_keyring"],
+        "route_keyring": crate::node_link::route_keyring(credentials),
     });
     Sha256::digest(secrets.to_string().as_bytes()).into()
 }
@@ -1353,6 +1353,12 @@ mod tests {
             "route_keyring": {"active": "k2", "keys": {"k1": "key-a", "k2": "key-b"}},
         });
         assert_ne!(base, gateway_secrets(&rotated));
+        // A property of a later release, in the credentials or in the keyring, is no secret of
+        // the gateway: it restarts nothing, and it is not written to its environment.
+        let mut later = credentials(3, "token-a", "key-a", None);
+        later["a_property_of_a_later_release"] = 1.into();
+        later["route_keyring"]["a_property_of_a_later_release"] = 1.into();
+        assert_eq!(base, gateway_secrets(&later));
     }
 
     fn observed(cloud: &crate::link::test_server::Cloud, id: &str, state: &str) -> bool {

@@ -527,6 +527,7 @@ export const nodePolicy = () => ({
     start_concurrency: 4,
     queue_wait_ms: 10_000,
     retry_after_seconds: 5,
+    cpu_boost_ms: 5000,
   },
   early_sleep: { enabled: true, min_idle_seconds: 30 },
   storage: {

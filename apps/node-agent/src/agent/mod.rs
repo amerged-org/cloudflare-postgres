@@ -43,7 +43,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, atomic::AtomicBool},
     time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::{sync::Notify, task::AbortHandle};
 
 /// The waits and bounds of the agent. The defaults are the product's; tests shorten them.
 #[derive(Clone, Debug)]
@@ -78,7 +78,9 @@ pub struct Timing {
     /// it serves the gateway, whose sessions end on a database the table does not show running.
     pub settle: Duration,
     /// How long after a wake's release its `wake_detail` is read: past the login and the first
-    /// statements, which the CPU quota may throttle.
+    /// statements. The CPU quota comes with the wake's release at a `cpu_boost_ms` of 0 and after
+    /// that time otherwise, so with the default boost of 5 s the event is read inside the burst and
+    /// counts no throttling, and at 0 it counts the quota's.
     pub detail: Duration,
 }
 impl Default for Timing {
@@ -213,6 +215,19 @@ pub(crate) struct Db {
     /// One flow of the database at a time.
     pub lock: tokio::sync::Mutex<()>,
     view: Mutex<View>,
+    boost: Mutex<Boost>,
+}
+
+/// The CPU burst of a database's last wake (`Core::after_wake`), which ends when its quota is
+/// applied.
+#[derive(Default)]
+struct Boost {
+    /// The task of the wake that applies the quota once the window is over: one at a time, and
+    /// gone when the database leaves service.
+    timer: Option<AbortHandle>,
+    /// Whether the quota is still to come. Whoever applies it takes this first, under the
+    /// database's flow, so that it is applied once whichever of them is first.
+    pending: bool,
 }
 impl Db {
     /// The view, locked: never held across an `await`, and never while taking it again (the lock is
@@ -226,6 +241,45 @@ impl Db {
     #[cfg(test)]
     pub fn state(&self) -> Option<DatabaseState> {
         self.view().state.clone()
+    }
+    /// A wake's burst begins: the task that ends it is kept, and the task of an earlier wake, if
+    /// one is left, ends.
+    pub fn begin_boost(&self, timer: AbortHandle) {
+        let earlier = {
+            let mut boost = self.boost.lock().unwrap_or_else(PoisonError::into_inner);
+            boost.pending = true;
+            boost.timer.replace(timer)
+        };
+        if let Some(earlier) = earlier {
+            earlier.abort();
+        }
+    }
+    /// The burst is over: its quota is to be applied now, once. `false` when something else
+    /// applied it, or the database left service. Called under the database's flow.
+    pub fn claim_boost(&self) -> bool {
+        let mut boost = self.boost.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut boost.pending)
+    }
+    /// The burst ends before its window does: the task that waits is gone. `true` when the quota
+    /// was still to come, which the caller that holds the database's flow applies (a stopped unit
+    /// has none: a stop lifts it, and a quota set on a stopped unit would throttle its next start).
+    pub fn end_boost(&self) -> bool {
+        let (timer, pending) = {
+            let mut boost = self.boost.lock().unwrap_or_else(PoisonError::into_inner);
+            (boost.timer.take(), std::mem::take(&mut boost.pending))
+        };
+        if let Some(timer) = timer {
+            timer.abort();
+        }
+        pending
+    }
+    /// Whether the quota of a wake is still to come.
+    #[cfg(test)]
+    pub fn boosting(&self) -> bool {
+        self.boost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
     }
 }
 
@@ -362,6 +416,7 @@ impl<M: Machine> Core<M> {
                     id: id.to_string(),
                     lock: tokio::sync::Mutex::new(()),
                     view: Mutex::new(View::new()),
+                    boost: Mutex::new(Boost::default()),
                 })
             })
             .clone()
@@ -510,6 +565,9 @@ impl<M: Machine> Core<M> {
         };
         if let Some(served) = served {
             self.meter.awake(&db.id, served, now_ms());
+            if !served {
+                db.end_boost();
+            }
         }
         match entry {
             Some(entry) => {

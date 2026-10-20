@@ -401,7 +401,8 @@ package from creating a default cluster.
 - **Limits:** `MemorySwapMax=0`, `TasksMax=64` and, until the agent applies the database's size, the
   smallest class (`MemoryMax=256M`, `MemoryHigh=230M`). The agent sets `MemoryMax`, `MemoryHigh` (90 %),
   `CPUWeight`, `IOWriteBandwidthMax`, `IOWriteIOPSMax` and `TasksMax` as persistent unit properties
-  (`SetUnitProperties`), never by `daemon-reload`. `CPUQuota` is set only after ready and cleared
+  (`SetUnitProperties`), never by `daemon-reload`. `CPUQuota` is set only after ready (for a wake, after the policy's `cpu_boost_ms`, so that the
+  start-up and the first requests are not throttled) and cleared
   at stop with the empty assignment `CPUQuota=` (`CPUQuotaPerSecUSec` = `UINT64_MAX` over D-Bus
   `SetUnitProperties`): a unit property outlives the stop and would throttle the next start.
   `CPUQuota=infinity` is no value: systemd rejects it ("Invalid CPU quota") and ignores a drop-in

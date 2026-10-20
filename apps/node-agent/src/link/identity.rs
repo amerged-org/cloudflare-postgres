@@ -51,9 +51,10 @@ impl Default for Paths {
     }
 }
 
-/// The node record of one install (`NodeIdentity`); a reinstall is a new node with a new key.
+/// The node record of one install (`NodeIdentity`); a reinstall is a new node with a new key. The
+/// enrollment answer may carry a property this build does not name, which is ignored; what the
+/// node stores of it is exactly these four.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NodeIdentity {
     pub id: String,
     pub uid: String,
@@ -117,9 +118,8 @@ fn origin(url: &str) -> Result<Url, Error> {
     Ok(url)
 }
 
-/// `Seed` is the installer's `NodeEnrollmentSeed`.
+/// `Seed` is the installer's `NodeEnrollmentSeed`; a property it does not name is ignored.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Seed {
     node_id: String,
     region: String,

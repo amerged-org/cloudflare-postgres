@@ -54,6 +54,9 @@ struct State {
     accounts: Vec<String>,
     limits: HashMap<String, Limits>,
     quotas: HashMap<String, Option<NonZeroU32>>,
+    /// Every `set_cpu_quota` the agent made, in order: (database, quota). A stop lifts a quota
+    /// without a call, as systemd's does.
+    quota_calls: Vec<(String, Option<NonZeroU32>)>,
     /// Calls the tests assert on, in order: `start <id>`, `stop <id>`, `trim <id>`, `remove <id>`.
     calls: Vec<String>,
     no_room: bool,
@@ -356,6 +359,15 @@ impl Local {
     }
     pub fn quota(&self, database: &str) -> Option<Option<NonZeroU32>> {
         self.state().quotas.get(database).copied()
+    }
+    /// The quotas the agent set on the database, in order.
+    pub fn quota_calls(&self, database: &str) -> Vec<Option<NonZeroU32>> {
+        self.state()
+            .quota_calls
+            .iter()
+            .filter(|(id, _)| id == database)
+            .map(|(_, quota)| *quota)
+            .collect()
     }
     pub fn credentials_applied(&self) -> Vec<(String, String, u64, bool)> {
         self.state().credentials.clone()
@@ -1034,7 +1046,9 @@ impl Machine for Local {
         database: &str,
         millicores: Option<NonZeroU32>,
     ) -> Result<(), units::Error> {
-        self.state().quotas.insert(database.to_string(), millicores);
+        let mut state = self.state();
+        state.quotas.insert(database.to_string(), millicores);
+        state.quota_calls.push((database.to_string(), millicores));
         Ok(())
     }
     async fn set_slice_memory(&self, awake_budget_mib: u64) -> Result<(), units::Error> {
