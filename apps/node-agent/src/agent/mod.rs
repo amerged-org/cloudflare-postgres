@@ -23,7 +23,7 @@ pub(crate) mod testing;
 pub use entry::{Desired, Entry, Origin, Policy, Source};
 
 use crate::{
-    admission::{Admission, Admitter, Facts, Running},
+    admission::{Admission, Admitter, Facts, Permit, Running},
     archive::{
         job::{Database as JobDatabase, Jobs, Store},
         server::Table,
@@ -276,6 +276,11 @@ pub struct Core<M: Machine> {
     /// The databases whose unit was awake when the agent started: the gateway's first table must
     /// show them running (`settled`).
     awake_at_start: HashSet<String>,
+    /// The permits of the starts that were in flight when the agent began, by database: a start
+    /// ends with the decision on its database (`Core::end_resumed`), which reads the database's
+    /// files through the agent's own mount of its volume, and the agent mounts that when it
+    /// decides.
+    resumed: Mutex<HashMap<String, Permit>>,
     /// The turns of the first decisions on the page's databases (`schedule_page`).
     first_pass: Arc<Semaphore>,
     reports: Mutex<report::Reports>,
@@ -298,7 +303,6 @@ impl<M: Machine> Core<M> {
     ) -> (
         Arc<Self>,
         tokio::sync::mpsc::UnboundedReceiver<crate::admission::EarlySleep>,
-        Vec<crate::admission::Permit>,
     ) {
         let layout = parts.machine.layout().clone();
         let policy = Arc::new(RwLock::new(parts.policy.clone()));
@@ -339,6 +343,12 @@ impl<M: Machine> Core<M> {
             endpoints: Mutex::new(HashMap::new()),
             dbs: Mutex::new(HashMap::new()),
             awake_at_start,
+            resumed: Mutex::new(
+                resumed
+                    .into_iter()
+                    .map(|permit| (permit.database().to_string(), permit))
+                    .collect(),
+            ),
             first_pass: Arc::new(Semaphore::new(FIRST_PASS_AT_ONCE)),
             reports: Mutex::new(report::Reports::default()),
             meter: Meter::load(layout.agent().join("usage.json")),
@@ -346,7 +356,7 @@ impl<M: Machine> Core<M> {
             slept: Mutex::new(Vec::new()),
             slept_signal: Notify::new(),
         });
-        (core, early, resumed)
+        (core, early)
     }
 
     pub(crate) fn layout(&self) -> &Layout {

@@ -39,6 +39,10 @@ struct Unit {
     /// The volume the unit mounted when it started, from the agent's link: what it runs on until
     /// it stops, whatever the agent has attached since.
     volume: Option<VolumeId>,
+    /// systemd has the unit's start job open: the unit is `activating`, as a `Type=notify` unit is
+    /// until its postmaster says it is ready (`READY=1`, which `postmaster.pid`'s status line
+    /// precedes). The instant is the earliest the job may end (`delay_next_start`).
+    activating: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -166,6 +170,8 @@ pub struct Local {
     state: Mutex<State>,
     /// `false` while the reads of `held_units` wait.
     unit_gate: tokio::sync::watch::Sender<bool>,
+    /// `false` while the agent's mounts wait: a disk that answers late.
+    mount_gate: tokio::sync::watch::Sender<bool>,
 }
 
 impl Local {
@@ -218,6 +224,7 @@ impl Local {
                 ..State::default()
             }),
             unit_gate: tokio::sync::watch::channel(true).0,
+            mount_gate: tokio::sync::watch::channel(true).0,
         };
         machine.load_units();
         Some(machine)
@@ -440,6 +447,13 @@ impl Local {
     pub fn release_unit_reads(&self) {
         self.unit_gate.send_replace(true);
     }
+    /// The agent's mounts of volumes wait until `release_mounts`.
+    pub fn hold_mounts(&self) {
+        self.mount_gate.send_replace(false);
+    }
+    pub fn release_mounts(&self) {
+        self.mount_gate.send_replace(true);
+    }
     /// The next `count` waits for a unit to be ready fail as a bus does that refuses the call.
     pub fn fail_next_waits(&self, count: u32) {
         self.state().wait_reads_fail = count;
@@ -459,6 +473,7 @@ impl Local {
                 invocations: 0,
                 invocation_id: None,
                 volume: None,
+                activating: None,
             },
         );
     }
@@ -635,6 +650,12 @@ impl Machine for Local {
         &self,
         current: &[VolumeId],
     ) -> Result<Vec<(VolumeId, storage::Error)>, storage::Error> {
+        let mut gate = self.mount_gate.subscribe();
+        while !*gate.borrow_and_update() {
+            if gate.changed().await.is_err() {
+                break;
+            }
+        }
         let mut failures = Vec::new();
         for id in current {
             let other_held = self.other_generation_held(id);
@@ -886,30 +907,7 @@ impl Machine for Local {
                     _ => None,
                 })
         });
-        let unit = state.units.get_mut(database);
-        let (active, main_pid, invocation_id) = match unit {
-            Some(unit) => {
-                let alive = unit
-                    .child
-                    .as_mut()
-                    .is_some_and(|child| child.try_wait().ok().flatten().is_none());
-                if !alive && unit.child.is_some() {
-                    // The postmaster ended on its own.
-                    unit.child = None;
-                    unit.crashed = true;
-                }
-                match (&unit.child, unit.crashed) {
-                    (Some(child), _) => (
-                        ActiveState::Active,
-                        Some(child.id()),
-                        unit.invocation_id.clone(),
-                    ),
-                    (None, true) => (ActiveState::Failed, None, unit.invocation_id.clone()),
-                    (None, false) => (ActiveState::Inactive, None, unit.invocation_id.clone()),
-                }
-            }
-            None => (ActiveState::Inactive, None, None),
-        };
+        let (active, main_pid, invocation_id) = self.unit_facts(&mut state, database);
         Ok(UnitState {
             database: database.to_string(),
             active,
@@ -981,43 +979,37 @@ impl Machine for Local {
             .stderr(log)
             .spawn()
             .map_err(|error| units::Error::Bus(zbus::Error::Failure(error.to_string())))?;
-        let pid = child.id();
         {
             let mut state = self.state();
+            // A start that takes long, as a recovery does, goes on in systemd whether or not the
+            // caller still waits for it: the unit is activating until the job ends.
+            let delay = state.start_delay.take().unwrap_or_default();
             let unit = state.units.entry(database.to_string()).or_insert(Unit {
                 child: None,
                 crashed: false,
                 invocations: 0,
                 invocation_id: None,
                 volume: None,
+                activating: None,
             });
             unit.volume = Some(attached);
             unit.invocations += 1;
             unit.crashed = false;
             unit.child = Some(child);
             unit.invocation_id = Some(format!("00000000-0000-4000-8000-{:012x}", unit.invocations));
-        }
-        // A start that takes long, as a recovery does, goes on in systemd whether or not the caller
-        // still waits for it.
-        let delay = self.state().start_delay.take();
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
+            unit.activating = Some(Instant::now() + delay);
         }
         let started = Instant::now();
         loop {
-            if ready::ready_socket(&volume, pid).is_ok() {
-                return self.started(database);
-            }
-            if !self.running(database) {
-                let mut state = self.state();
-                if let Some(unit) = state.units.get_mut(database) {
-                    unit.child = None;
-                    unit.crashed = true;
+            match self.active_state(database) {
+                ActiveState::Active => return self.started(database),
+                ActiveState::Activating => {}
+                _ => {
+                    return Err(units::Error::Job {
+                        unit: units::unit_name(database),
+                        result: "failed".into(),
+                    });
                 }
-                return Err(units::Error::Job {
-                    unit: units::unit_name(database),
-                    result: "failed".into(),
-                });
             }
             if started.elapsed() > Duration::from_secs(60) {
                 return Err(units::Error::NotReady("postmaster_not_ready"));
@@ -1037,12 +1029,13 @@ impl Machine for Local {
                 return Err(bus_refused());
             }
         }
-        let waited = Instant::now();
+        // As the unit's own answer does: it waits while the unit is activating, reads the files
+        // once when the unit is active, and a unit that is not active is not ready.
         loop {
-            match self.started(database) {
-                Err(units::Error::NotReady(_))
-                    if self.running(database) && waited.elapsed() < Duration::from_secs(60) => {}
-                other => return other,
+            match self.active_state(database) {
+                ActiveState::Activating => {}
+                ActiveState::Active => return self.started(database),
+                _ => return Err(units::Error::NotReady("unit_not_active")),
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1456,7 +1449,66 @@ fn mincore(file: &fs::File, length: u64) -> io::Result<crate::cache::Pages> {
 }
 
 impl Local {
-    /// The facts of a unit that is ready.
+    /// What systemd says of a unit: its active state, its main process and its invocation. A
+    /// postmaster that ended on its own is a crash. A unit whose start job is open is
+    /// `activating`: until its postmaster is ready, and, for a start that takes long
+    /// (`delay_next_start`), not before the job may end, ready or failed.
+    fn unit_facts(
+        &self,
+        state: &mut State,
+        database: &str,
+    ) -> (ActiveState, Option<u32>, Option<String>) {
+        let Some(unit) = state.units.get_mut(database) else {
+            return (ActiveState::Inactive, None, None);
+        };
+        if unit.child.is_none() {
+            unit.activating = None;
+        }
+        if unit
+            .activating
+            .is_some_and(|earliest| Instant::now() < earliest)
+        {
+            let pid = unit.child.as_ref().map(Child::id);
+            return (ActiveState::Activating, pid, unit.invocation_id.clone());
+        }
+        let alive = unit
+            .child
+            .as_mut()
+            .is_some_and(|child| child.try_wait().ok().flatten().is_none());
+        if !alive && unit.child.is_some() {
+            // The postmaster ended on its own.
+            unit.child = None;
+            unit.crashed = true;
+            unit.activating = None;
+        }
+        let Some(pid) = unit.child.as_ref().map(Child::id) else {
+            let active = if unit.crashed {
+                ActiveState::Failed
+            } else {
+                ActiveState::Inactive
+            };
+            return (active, None, unit.invocation_id.clone());
+        };
+        if unit.activating.is_some()
+            && ready::ready_socket(&self.layout.volume(database), pid).is_ok()
+        {
+            unit.activating = None;
+        }
+        let active = if unit.activating.is_some() {
+            ActiveState::Activating
+        } else {
+            ActiveState::Active
+        };
+        (active, Some(pid), unit.invocation_id.clone())
+    }
+
+    /// The unit's active state, which reading it counts as no read of the test.
+    pub fn active_state(&self, database: &str) -> ActiveState {
+        self.unit_facts(&mut self.state(), database).0
+    }
+
+    /// The facts of a unit that is ready, read as the agent reads them: through its own mount of
+    /// the volume, where an agent that has not attached it finds an empty directory.
     fn started(&self, database: &str) -> Result<Started, units::Error> {
         let mut state = self.state();
         let unit = state
@@ -1472,7 +1524,14 @@ impl Local {
             .invocation_id
             .clone()
             .ok_or(units::Error::NotReady("no_invocation_id"))?;
+        let mounted = state
+            .attached
+            .iter()
+            .any(|volume| volume.database() == database);
         drop(state);
+        if !mounted {
+            return Err(units::Error::NotReady("postmaster_pid_missing"));
+        }
         let socket = ready::ready_socket(&self.layout.volume(database), main_pid)
             .map_err(units::Error::NotReady)?;
         Ok(Started {

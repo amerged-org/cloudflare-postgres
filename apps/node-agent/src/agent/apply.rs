@@ -413,6 +413,9 @@ impl<M: Machine> Core<M> {
                 }
             }
             Step::AdoptAsleep => {
+                // The unit that was starting when the agent began is not awake: its start failed,
+                // and holds nothing.
+                self.end_resumed(&db.id, false);
                 if !self.attach(db, &entry).await {
                     return;
                 }
@@ -471,29 +474,60 @@ impl<M: Machine> Core<M> {
     /// The unit runs, as the agent found it at its start: it is released to the gateway as ready,
     /// and its archiver reaches the archive socket again. `false` when the bus would not say
     /// whether the unit is ready: nothing is known of it, the decision is for the retry, and the
-    /// database is neither served nor recovered (recovery would stop it).
+    /// database is neither served nor recovered (recovery would stop it). The volume is attached
+    /// (`attach`): the unit's answer is read from its files.
+    ///
+    /// A start that was in flight when the agent began ends here, with what the unit answers:
+    /// ready when the database is released, failed when the unit is not active, and not at all
+    /// when the unit runs and is not served, or when the bus would not answer (it holds its
+    /// memory until its unit is reported stopped).
     async fn adopt_running(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) -> bool {
         self.ensure_archive(db, entry);
         match self.machine.wait_started(&db.id).await {
             Ok(started) => match writer_of(&started) {
-                Some(writer) => self.set(db, |view| {
-                    view.phase = Phase::Ready;
-                    view.writer = Some(writer);
-                    view.awake_since_ms = Some(super::now_ms());
-                    view.error = None;
-                }),
+                Some(writer) => {
+                    self.set(db, |view| {
+                        view.phase = Phase::Ready;
+                        view.writer = Some(writer);
+                        view.awake_since_ms = Some(super::now_ms());
+                        view.error = None;
+                    });
+                    self.end_resumed(&db.id, true);
+                }
                 None => self.go_unproven(db),
             },
-            // A unit that is not ready is not served; recovery takes it.
-            Err(crate::units::Error::NotReady(_) | crate::units::Error::Job { .. }) => {
+            // A unit that stopped, or whose start failed, holds nothing; recovery takes the
+            // database.
+            Err(
+                crate::units::Error::NotReady("unit_not_active") | crate::units::Error::Job { .. },
+            ) => {
+                self.end_resumed(&db.id, false);
                 self.go_unproven(db);
             }
+            // A unit that is not ready is not served; recovery takes it, and stops it.
+            Err(crate::units::Error::NotReady(_)) => self.go_unproven(db),
             Err(error) => {
                 Self::unread(db, "unit", error.into());
                 return false;
             }
         }
         true
+    }
+
+    /// The start that was in flight when the agent began ends: the permit it was resumed with
+    /// reports it ready or failed. Nothing happens for a database that had none, or whose start
+    /// ended already.
+    fn end_resumed(&self, database: &str, ready: bool) {
+        let permit = self
+            .resumed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(database);
+        match permit {
+            Some(permit) if ready => permit.ready(),
+            Some(permit) => permit.failed(),
+            None => {}
+        }
     }
 
     /// The unit is stopped: the volume against the record decides whether it sleeps provenly.
@@ -2078,6 +2112,90 @@ mod tests {
         let rig = rig.restart().await;
         rig.deliver(&path, "read_write");
         (rig, db, path)
+    }
+
+    /// A start was in flight when the agent began. The bus refuses the call that waits for its
+    /// unit when the agent decides on the database, which says nothing of the unit: the start
+    /// stays counted, as it holds its memory, and ends ready with the decision that the retry
+    /// makes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_in_flight_when_the_agent_began_stays_counted_when_the_bus_will_not_answer() {
+        let Some(rig) = Rig::new("resumed-bus").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let (id, path) = (
+            id_of(&db),
+            db["archive"]["path"].as_str().unwrap().to_string(),
+        );
+        let (_, handle) = rig.create_from(&db).await;
+        db.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+        // A start of it is in flight when the agent restarts: its unit is activating.
+        rig.machine
+            .delay_next_start(std::time::Duration::from_millis(1500));
+        tokio::spawn({
+            let (machine, id) = (rig.machine.clone(), id.clone());
+            async move { machine.start(&id).await }
+        });
+        eventually(10, "the unit to be activating", || {
+            rig.machine.active_state(&id) == crate::units::ActiveState::Activating
+        })
+        .await;
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        let snapshot = rig.core.admission.snapshot().await.unwrap();
+        assert_eq!((snapshot.awake, snapshot.starting), (vec![id.clone()], 1));
+        rig.machine.fail_next_waits(1);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the database to be released", || {
+            handle.phase() == Phase::Ready
+        })
+        .await;
+        let snapshot = rig.core.admission.snapshot().await.unwrap();
+        assert_eq!(
+            (snapshot.awake, snapshot.starting),
+            (vec![id.clone()], 0),
+            "a bus that would not answer did not fail the start"
+        );
+    }
+
+    /// A start was in flight when the agent read its units, and its unit is not awake when the
+    /// agent decides on the database (the start failed): it holds nothing, and the database is
+    /// not counted as awake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_in_flight_when_the_agent_began_that_failed_is_not_counted() {
+        let Some(rig) = Rig::new("resumed-failed").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let (_, handle) = rig.create_from(&db).await;
+        db.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+        let rig = rig
+            .restart_with(vec![crate::admission::Running {
+                database: id.clone(),
+                memory_mib: 256,
+                starting: true,
+                always_warm: false,
+            }])
+            .await;
+        let snapshot = rig.core.admission.snapshot().await.unwrap();
+        assert_eq!((snapshot.awake, snapshot.starting), (vec![id.clone()], 1));
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the database to be decided on", || {
+            let view = handle.view();
+            view.adopted && view.phase == Phase::Asleep
+        })
+        .await;
+        let snapshot = rig.core.admission.snapshot().await.unwrap();
+        assert!(
+            snapshot.awake.is_empty(),
+            "a start whose unit is not awake is not counted: {snapshot:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

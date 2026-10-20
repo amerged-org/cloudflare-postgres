@@ -234,7 +234,7 @@ impl<M: Machine> Service<M> {
             policy.backup.clone(),
         ));
         let gateway = Arc::new(Feed::new());
-        let (core, early, resumed) = Core::new(
+        let (core, early) = Core::new(
             Parts {
                 machine: machine.clone(),
                 jobs: jobs.clone(),
@@ -279,21 +279,13 @@ impl<M: Machine> Service<M> {
         });
         // The memory all databases may hold together (plan 4.3). The agent's mounts of the volumes
         // are not made here: they ended with the agent before, and the agent mounts a database's
-        // volume when it decides on the database (`Core::reconcile`), a start that was in flight
-        // when the agent began among them.
+        // volume when it decides on the database (`Core::reconcile`). The starts that were in
+        // flight when the agent began end with that decision (`Core::end_resumed`): their units'
+        // answers cannot be read before it, since a unit's `postmaster.pid` is read through the
+        // agent's mount.
         let _ = machine
             .set_slice_memory(core.policy().admission.admission.awake_budget_mib)
             .await;
-        // Starts that were in flight when the agent began end with their units' answers.
-        for permit in resumed {
-            let (machine, database) = (machine.clone(), permit.database().to_string());
-            service.spawn(async move {
-                match machine.wait_started(&database).await {
-                    Ok(_) => permit.ready(),
-                    Err(_) => permit.failed(),
-                }
-            });
-        }
         service.pull_page(page, true).await;
         // The link stands: the previous boot's journal goes to Cloudflare, if there was a boot.
         let s = service.clone();
@@ -1313,6 +1305,7 @@ mod tests {
             test_server::{Cloud, database, database_id, tempdir},
         },
         node_link::contract_valid,
+        units::ActiveState,
     };
     use pgcf_native_protocol::{
         agent::{Mode, ToGateway},
@@ -1673,6 +1666,135 @@ mod tests {
                 ToGateway::Database { database } if database.database == id && database.mode != Mode::Running
             ) || matches!(message, ToGateway::Removed { database } if database == &id)),
             "{received:?}"
+        );
+        service.stop();
+    }
+
+    /// A wake's start, or a recovery's, was in flight when the agent began: its unit was
+    /// `activating`. The unit becomes active before the new agent has mounted the volume of its
+    /// database (the agent mounts it when it decides on the database, and a disk can be slow), so
+    /// the agent cannot read `postmaster.pid` yet and cannot say the start failed: the unit runs.
+    /// The start stays counted, memory and all, until the decision on its database ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_in_flight_when_the_agent_began_is_ended_by_the_decision_on_its_database() {
+        let Some((machine, _fixture, _root)) =
+            site("start-in-flight", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let link = || async {
+            Link::start(
+                LinkConfig {
+                    paths: crate::link::Paths::new(&base),
+                    image_version: "25".into(),
+                    agent_version: "0.1.0".into(),
+                    release_id: None,
+                    os: crate::machine::os_report(&*machine).await.unwrap(),
+                    timing: LinkTiming {
+                        interval: Duration::from_millis(300),
+                        ..LinkTiming::default()
+                    },
+                },
+                Transport::new(cloud.roots()).unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let config = || ServiceConfig {
+            intervals: quick(),
+            // The agent serves the gateway when the databases that run are decided on, or after
+            // this: the decision here waits for a mount.
+            timing: crate::agent::Timing {
+                settle: Duration::from_millis(300),
+                ..timing()
+            },
+            gateway: None,
+            release_key: test_release_key(),
+        };
+        let db = new_entry_json();
+        let id = db["id"].as_str().unwrap().to_string();
+        let credential = db["archive"]["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        cloud.with(|inner| {
+            inner.databases = vec![db.clone()];
+            inner.credential_paths.insert(credential, path);
+        });
+        let (first, events) = link().await;
+        let service = Service::start(machine.clone(), first, events, config())
+            .await
+            .unwrap();
+        eventually(90, "the database to be ready", || {
+            observed(&cloud, &id, "ready")
+        })
+        .await;
+        service.stop();
+        drop(service);
+
+        // A start of the database is in flight when the agent ends: its postmaster is up and
+        // systemd waits for its `READY=1`. The agent's mounts end with it, and the next agent's
+        // mounts wait for the disk.
+        machine.stop(&id).await.unwrap();
+        machine.delay_next_start(Duration::from_secs(2));
+        tokio::spawn({
+            let (machine, id) = (machine.clone(), id.clone());
+            async move { machine.start(&id).await }
+        });
+        eventually(10, "the unit to be activating", || {
+            machine.active_state(&id) == ActiveState::Activating
+        })
+        .await;
+        machine.forget_mounts();
+        machine.hold_mounts();
+        let (second, events) = link().await;
+        let service = Service::start(machine.clone(), second, events, config())
+            .await
+            .unwrap();
+        let counted = |snapshot: crate::admission::Snapshot| {
+            (
+                snapshot.awake,
+                snapshot.starting,
+                snapshot.awake_memory_mib > 0,
+            )
+        };
+        assert_eq!(
+            counted(service.core().admission.snapshot().await.unwrap()),
+            (vec![id.clone()], 1, true),
+            "the start in flight is counted"
+        );
+
+        // The start ends before the agent has mounted the volume.
+        eventually(30, "the unit to be active", || {
+            machine.active_state(&id) == ActiveState::Active
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!service.core().find(&id).unwrap().view().adopted);
+        assert_eq!(
+            counted(service.core().admission.snapshot().await.unwrap()),
+            (vec![id.clone()], 1, true),
+            "a unit that is active and cannot be read through a mount is not a failed start"
+        );
+
+        // The mount comes, the agent decides on the database, and the start ends ready.
+        machine.release_mounts();
+        eventually(30, "the database to be released", || {
+            service
+                .core()
+                .find(&id)
+                .is_some_and(|db| db.view().writer.is_some())
+        })
+        .await;
+        let snapshot = service.core().admission.snapshot().await.unwrap();
+        assert_eq!(
+            (snapshot.awake, snapshot.starting),
+            (vec![id.clone()], 0),
+            "the start ended ready"
         );
         service.stop();
     }

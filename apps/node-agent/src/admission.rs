@@ -677,8 +677,9 @@ impl Admission {
     /// Runs the loop on the current tokio runtime. `facts` is called whenever the loop decides.
     /// The second value delivers the databases to put to sleep early. The third holds the permit
     /// of every start that was in flight in the rebuilt admitter, sorted by database: its holder
-    /// waits for the unit (`Units::wait_started`) and reports the start ready or failed. The loop
-    /// ends when the last handle and the last permit are gone.
+    /// reports the start ready or failed when it knows the unit's answer (`Units::wait_started`
+    /// reads it through the agent's mount of the database's volume), and `failed` only for a unit
+    /// that is not active. The loop ends when the last handle and the last permit are gone.
     pub fn spawn(
         admitter: Admitter,
         facts: impl FnMut() -> Facts + Send + 'static,

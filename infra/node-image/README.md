@@ -467,7 +467,10 @@ before inside the namespace; the database units and the backup jobs mount their 
   the others. It serves the gateway as soon as it has decided on the databases that run (they
   must be in its first table as running, or the gateway ends their sessions), not when it has
   mounted every volume, and a wake for a database it has not decided on yet has the decision made
-  at once, its mount included. The databases that run are not touched: a unit has its own mount,
+  at once, its mount included. A start that was in flight when the agent began (a unit still
+  `activating`) stays counted by admission, with its memory, until the decision on its database ends
+  it: the unit's answer is read from its `postmaster.pid` through the agent's mount, so it is not
+  read, and not taken for a failure, before the mount is made. The databases that run are not touched: a unit has its own mount,
   which does not depend on the agent's. A restart also ends the page cache of the volumes of
   sleeping databases (their last mount is gone), so the first wake after it reads from disk: the
   plan measured about 300 ms more on a cold first request.
