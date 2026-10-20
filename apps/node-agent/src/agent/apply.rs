@@ -2609,6 +2609,73 @@ mod tests {
         assert_eq!(own.timeline, 2);
     }
 
+    /// A source that was resized up after its backup and down again before the restore has a
+    /// parameter change in its WAL above both the backup's settings and the class's. PostgreSQL
+    /// pauses that recovery ("recovery has paused") and its postmaster still reports ready, so
+    /// the restore's start returns: the restore must see the pause and fail, with the database
+    /// abandoned, instead of waiting for a promotion that never comes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restore_that_postgresql_pauses_fails_instead_of_waiting_without_end() {
+        let Some(rig) = Rig::new("restore-paused").await else {
+            return;
+        };
+        let (mut db, source_id, source_state) = source(&rig).await;
+        let backup = source_state.backup.clone().unwrap();
+        let source_path = db["archive"]["path"].as_str().unwrap().to_string();
+        rig.deliver(&source_path, "read_only");
+
+        // The source runs with 200 connections for a while, and with 25 again: its WAL records
+        // both changes, and the backup holds the first 25.
+        let source_handle = rig.core.db(&source_id);
+        for (generation, memory_mib, max_connections) in [(6, 1024, 200), (8, 256, 25)] {
+            next(&mut db, generation);
+            db["resources"]["memory_mib"] = json!(memory_mib);
+            db["settings"]["max_connections"] = json!(max_connections);
+            rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+            eventually(30, "the limits of the new size", || {
+                rig.machine
+                    .limits(&source_id)
+                    .is_some_and(|limits| limits.memory_mib == memory_mib)
+            })
+            .await;
+            let mut ticket = Rig::ticket(&rig.entry_for(&db));
+            ticket.operation = format!("op_{:0>20}", format!("w{generation}"));
+            let woken = rig.core.wake(&ticket).await;
+            assert_eq!(woken.outcome, Outcome::Started, "{:?}", woken.reason);
+            assert_eq!(
+                rig.core.sleep(&source_handle, Why::Idle).await,
+                Slept::Proven
+            );
+        }
+
+        // The restore is of the class the source began in.
+        let mut restored = rig.entry_json();
+        let id = id_of(&restored);
+        restored["resources"]["memory_mib"] = json!(256);
+        restored["settings"]["max_connections"] = json!(25);
+        restored["origin"] = json!({"kind": "restore", "source": {
+            "database_id": source_id, "path": source_path, "backup_id": backup.backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"}}});
+        let handle = rig.core.db(&id);
+        rig.core
+            .apply(&Rig::page(vec![restored.clone()], vec![]))
+            .await;
+        eventually(60, "the paused restore to fail", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Error);
+        assert_eq!(handle.view().error, Some("no_recovery_point"));
+        // Abandoned: the unit is stopped, and the volume is gone.
+        assert!(!rig.machine.running(&id));
+        assert!(
+            rig.machine
+                .volumes()
+                .iter()
+                .all(|(volume, _)| volume.database() != id)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_order_that_runs_is_not_run_again_by_the_pulls_that_still_list_it() {
         use pgcf_native_protocol::agent::{ControlAction, ToGateway};

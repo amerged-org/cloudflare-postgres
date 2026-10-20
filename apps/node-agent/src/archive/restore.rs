@@ -46,7 +46,8 @@ pub trait Host {
     /// before PostgreSQL accepted connections.
     fn start(&self) -> impl Future<Output = Result<(), Failed>> + Send;
     /// Waits until the database has left recovery, and says who it is. `Failed` when its unit
-    /// stopped first, or the wait ran out: the recovery did not reach its end.
+    /// stopped first, the wait ran out, or PostgreSQL paused the recovery (its postmaster stays
+    /// up, and nothing resumes it): the recovery did not reach its end.
     fn promoted(&self) -> impl Future<Output = Result<Restored, Failed>> + Send;
     /// Stops the promoted database and starts it again, still admitted, on the configuration the
     /// agent wrote (the recovery's settings are gone): the settings that a larger source made the

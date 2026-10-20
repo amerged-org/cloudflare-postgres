@@ -179,8 +179,10 @@ plan 9.3, "Changing the page"; it is written there once.
   the new timeline. The recovery runs with the larger of the settings in the backup's `pg_control`
   and the class's (`settings::Capacity`); when that is more than the class's, the database restarts
   onto the class's own before the first backup, and a source whose settings the class has no memory
-  for is refused before it starts. A move target replays through the segment named in the source's
-  proven-sleep record before it may promote.
+  for is refused before it starts. A recovery that PostgreSQL pauses (the source's WAL raised a
+  setting above both the backup's and the class's) fails the restore with `no_recovery_point`. A
+  move target replays through the segment named in the source's proven-sleep record before it may
+  promote.
 
 ## Backups
 

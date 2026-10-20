@@ -729,6 +729,17 @@ impl<M: Machine> Host for Rebuild<M> {
             if !rows[0].try_get::<_, bool>(0).map_err(|_| Failed)? {
                 break;
             }
+            // PostgreSQL pauses a recovery whose WAL raises a parameter above the settings it
+            // runs with, and its postmaster stays up and ready: nothing resumes it, as the
+            // recovery never targets a pause. The query fails when the recovery ended since the
+            // one above, and the next pass finds that.
+            if let Ok(rows) = session
+                .query("SELECT pg_catalog.pg_get_wal_replay_pause_state()", &[])
+                .await
+                && rows[0].try_get::<_, String>(0).map_err(|_| Failed)? != "not paused"
+            {
+                return Err(Failed);
+            }
             // The unit may have ended: a recovery that died is not promoted.
             if core
                 .machine
