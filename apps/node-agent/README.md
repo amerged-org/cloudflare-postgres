@@ -123,17 +123,20 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   ask the kernel to read a sleeping database's hot files ahead with `posix_fadvise(WILLNEED)`:
   the catalog set (`pg_control`, 256 KiB of WAL at the latest checkpoint, `global/`, and in each
   user database its `PG_VERSION`, `pg_filenode.map` and the login's catalogs with their indexes
-  and forks, found through the map where `VACUUM FULL` moved them; about 5 MB) and the autoprewarm
-  list (blocks merged where contiguous, the relations with the fewest listed blocks first, system
-  databases left out). A plan is built first (blocking: directories, `pg_control`, the maps and
-  the list are read, each file is opened once for its length), then issued in pieces of at most
-  128 KiB, because the kernel reads only the first `read_ahead_kb` of a range per call. The data
-  directory is the database user's, so a plan reads only the real directories of `base/` (at most
-  32 databases) whatever the list names, stops after 512 files of a list that are not there, and
-  stops at a budget and a cancel as the issuing does. Issuing stops at a time budget, a byte
-  bound or a cancel and returns the counts, the bytes the cache already held and the timings;
-  they take the place of the residency diagnostic that `cache.rs` made while a wake ran (deleted)
-  once a flow calls it. `pg_internal.init` is left out: PostgreSQL removes it at every start.
+  and forks; about 5 MB) and the autoprewarm list (blocks merged where contiguous, the relations
+  with the fewest listed blocks first, system databases left out). The mapped catalogs
+  (`pg_class`, `pg_attribute`, `pg_proc`, `pg_type` and their indexes) are found through the map
+  where `VACUUM FULL` moved them; the others are read at their OID, so a rewrite of one drops it
+  from the set, and the report's `missing` counts it. A plan is built first (blocking:
+  directories, `pg_control`, the maps and the list are read, each file is opened once for its
+  length), then issued in pieces of at most 128 KiB, because the kernel reads only the first
+  `read_ahead_kb` of a range per call. The data directory is the database user's, so a plan reads
+  only the real directories of `base/` (at most 32 databases) whatever the list names, stops after
+  512 files of a list that are not there, and stops at a budget and a cancel as the issuing does.
+  Issuing stops at a time budget, a byte bound or a cancel and returns the counts, the bytes the
+  cache already held and the timings; they take the place of the residency diagnostic that
+  `cache.rs` made while a wake ran (deleted) once a flow calls it. `pg_internal.init` is left out:
+  PostgreSQL removes it at every start.
 - **Login.** The node's root reaches the cluster's superuser `postgres` by peer authentication
   through `pg_ident.conf`; the backup role `pgcf_backup` is reached by the database's own Linux user
   the same way; every other role logs in over the socket with SCRAM-SHA-256. Replication connections

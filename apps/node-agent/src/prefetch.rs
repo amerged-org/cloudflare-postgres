@@ -10,9 +10,12 @@
 //!
 //! - **`catalog`**: `pg_control`, a window of the WAL at the latest checkpoint, `global/`, and in
 //!   each user database (`base/<oid>`, oid 16384 and up) its `PG_VERSION`, its `pg_filenode.map`
-//!   and the catalogs a login and a first statement read, with their indexes and forks. A catalog
-//!   that PostgreSQL has rewritten (`VACUUM FULL`) lives at the file number the map names, not at
-//!   its oid. About 5 MB, found without starting PostgreSQL.
+//!   and the catalogs a login and a first statement read, with their indexes and forks. A mapped
+//!   catalog (`pg_class`, `pg_attribute`, `pg_proc`, `pg_type` and their indexes) that PostgreSQL
+//!   has rewritten (`VACUUM FULL`) lives at the file number the map names, not at its oid. Every
+//!   other catalog is read at its oid: a rewrite of one gives it a file number that only `pg_class`
+//!   records, which the plan does not read, so it drops out of the set and its absent main fork is
+//!   counted in `Report::missing`. About 5 MB, found without starting PostgreSQL.
 //! - **`list`**: the blocks of `autoprewarm.blocks`, which PostgreSQL writes at each clean stop,
 //!   merged where they are contiguous and ordered by the fewest listed blocks per relation first
 //!   (catalogs, indexes and small tables before the one big heap), so that a time budget cuts off
@@ -136,7 +139,8 @@ pub struct Plan {
     targets: Vec<Target>,
     /// The bytes of all spans.
     bytes: u64,
-    /// Files that the plan named and that were not there (a list of an older database).
+    /// Files that the plan named and that were not there: a list of an older database, or a
+    /// catalog that was rewritten to a file number that only `pg_class` knows.
     missing: u64,
     /// Why the plan is not all the data directory names: the budget or the cancel of the planning,
     /// or one of its bounds.
@@ -208,7 +212,9 @@ pub struct Report {
     /// Files the plan holds, and the bytes of their ranges.
     pub files: u64,
     pub planned_bytes: u64,
-    /// Files that the plan named and found missing.
+    /// Files that the plan named and found missing: the files of a list that are gone, and the
+    /// catalogs of a catalog set whose main fork is not at the file number the plan reads (the
+    /// ones `VACUUM FULL` or `REINDEX` moved, other than the mapped ones).
     pub missing: u64,
     /// Files that could not be opened when they were issued (gone, replaced by a link or a pipe,
     /// or below a directory that became a link).
@@ -437,10 +443,14 @@ struct Directory {
 }
 
 /// Whether a file was added to the plan.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Added {
     Planned,
-    /// There is no such file, or nothing of it inside its length.
+    /// There is no such file.
     Absent,
+    /// The file is there and nothing of it is inside its length: a catalog with no rows, or a
+    /// relation that was truncated since the list was written.
+    Empty,
     /// The planning stopped: its budget or cancel, or a bound of the plan.
     Stopped,
 }
@@ -552,7 +562,7 @@ impl<'a> Builder<'a> {
             .filter(|(from, to)| from < to)
             .collect();
         if spans.is_empty() {
-            return Added::Absent;
+            return Added::Empty;
         }
         self.bytes += spans.iter().map(|(from, to)| to - from).sum::<u64>();
         self.targets.push(Target {
@@ -631,7 +641,13 @@ impl<'a> Builder<'a> {
             for &catalog in CATALOGS {
                 let number = map.file_number(catalog);
                 for fork in CATALOG_FORKS {
-                    self.add(directory, &format!("{number}{fork}"), None);
+                    let added = self.add(directory, &format!("{number}{fork}"), None);
+                    // Only the main fork is always there. One that is not has been rewritten to a
+                    // file number that only `pg_class` records (`VACUUM FULL`, `REINDEX`); the
+                    // plan does not read `pg_class`, so it counts the gap and leaves it.
+                    if fork.is_empty() && added == Added::Absent {
+                        self.missing += 1;
+                    }
                 }
             }
         }
@@ -708,7 +724,7 @@ impl<'a> Builder<'a> {
             Some(spans),
         ) {
             Added::Planned => {}
-            Added::Absent => {
+            Added::Absent | Added::Empty => {
                 self.missing += 1;
                 if self.missing >= MAX_ABSENT {
                     self.bounded = true;
@@ -1151,6 +1167,8 @@ mod tests {
         ] {
             sparse(data.join("base/16384").join(name), 3 * BLOCK);
         }
+        // A catalog with no rows is a file of no length: it is there, and there is nothing to read.
+        sparse(data.join("base/16384/2663"), 0);
         // The system databases are left out.
         sparse(data.join("base/1/1259"), 3 * BLOCK);
         sparse(data.join("base/5/1259"), 3 * BLOCK);
@@ -1179,8 +1197,11 @@ mod tests {
             ]
         );
         // The old file of pg_class (1259), the relation of the user (16500) and the relcache init
-        // files are not in it.
-        assert_eq!(plan.missing, 0);
+        // files are not in it. The main forks of the catalogs that are not there are counted as
+        // missing, the way a list counts the files it names that are gone: the 60 catalogs less
+        // pg_class (through the map), pg_attribute, 2662 and the empty 2663. The forks of a catalog
+        // are mostly absent and are not counted.
+        assert_eq!(plan.missing, (CATALOGS.len() - 4) as u64);
         assert_eq!(make_catalog(&data.join("missing")).targets.len(), 0);
     }
 
@@ -1510,14 +1531,17 @@ mod tests {
     // The real PostgreSQL 18 tests.
 
     /// A stopped cluster of the agent's layout with the user database `app`, a table with an
-    /// index, two mapped catalogs rewritten by `VACUUM FULL`, and what PostgreSQL says of its
-    /// files.
+    /// index, catalogs rewritten by `VACUUM FULL` (two mapped ones, and two that are not mapped,
+    /// which only `pg_class` knows the new file of), and what PostgreSQL says of its files.
     struct Real {
         cluster: Cluster,
         /// `app`'s OID.
         database: u32,
         /// `pg_relation_filepath` of each catalog of `CATALOGS` in `app`.
         catalogs: Vec<(u32, String)>,
+        /// The catalogs of `CATALOGS` that are at a file number other than their oid and are not
+        /// in `pg_filenode.map`: `pg_class.relfilenode` is neither 0 (a mapped catalog) nor the oid.
+        rewritten: Vec<u32>,
         table: String,
         index: String,
     }
@@ -1543,9 +1567,12 @@ mod tests {
         .await
         .unwrap();
         app.batch("CREATE INDEX t_g ON t (g)").await.unwrap();
-        // Two catalogs that PostgreSQL rewrites to a file number of their own.
+        // Two catalogs that PostgreSQL rewrites to a file number of their own and records in the
+        // map, and two that it rewrites to one that only `pg_class` records (each with its indexes).
         app.batch_long("VACUUM FULL pg_class").await.unwrap();
         app.batch_long("VACUUM FULL pg_proc").await.unwrap();
+        app.batch_long("VACUUM FULL pg_namespace").await.unwrap();
+        app.batch_long("VACUUM FULL pg_index").await.unwrap();
         drop(app);
         // A session after the rewrite reads the catalogs through the map and the heap.
         let app = postgres::connect(&cluster.socket_directory(), AGENT_ROLE, "app")
@@ -1557,19 +1584,20 @@ mod tests {
         let oids: Vec<i64> = CATALOGS.iter().map(|oid| i64::from(*oid)).collect();
         let rows = app
             .query(
-                "SELECT oid::pg_catalog.int8, pg_relation_filepath(oid) FROM pg_class WHERE oid::pg_catalog.int8 = ANY($1)",
+                "SELECT oid::pg_catalog.int8, pg_relation_filepath(oid), relfilenode::pg_catalog.int8 FROM pg_class WHERE oid::pg_catalog.int8 = ANY($1)",
                 &[&oids],
             )
             .await
             .unwrap();
+        let oid_of = |row: &tokio_postgres::Row| u32::try_from(row.get::<_, i64>(0)).unwrap();
         let catalogs = rows
             .iter()
-            .map(|row| {
-                (
-                    u32::try_from(row.get::<_, i64>(0)).unwrap(),
-                    row.get::<_, String>(1),
-                )
-            })
+            .map(|row| (oid_of(row), row.get::<_, String>(1)))
+            .collect();
+        let rewritten = rows
+            .iter()
+            .filter(|row| row.get::<_, i64>(2) != 0 && row.get::<_, i64>(2) != row.get::<_, i64>(0))
+            .map(oid_of)
             .collect();
         let path = |name: &'static str| {
             let app = &app;
@@ -1589,6 +1617,7 @@ mod tests {
             cluster,
             database,
             catalogs,
+            rewritten,
             table,
             index,
         })
@@ -1600,9 +1629,12 @@ mod tests {
             return;
         };
         let data = real.cluster.data();
-        // Every catalog of the list is a relation of PostgreSQL 18, and two of them are not at the
-        // file number of their oid: without the map the plan would name the old, empty files.
+        // Every catalog of the list is a relation of PostgreSQL 18. Two of them are mapped and are
+        // not at the file number of their oid: without the map the plan would name the old files.
+        // Six more (pg_namespace and pg_index with their indexes) are not mapped and are not at
+        // their oid either: only `pg_class` records where they are.
         assert_eq!(real.catalogs.len(), CATALOGS.len());
+        assert_eq!(real.rewritten.len(), 6, "{:?}", real.rewritten);
         let moved = |oid: u32| {
             real.catalogs
                 .iter()
@@ -1617,11 +1649,17 @@ mod tests {
 
         let plan = make_catalog(&data);
         let planned = names(&plan);
-        // Every catalog with something in it is planned at the file PostgreSQL names; an empty one
-        // (nothing in `pg_attrdef`) has nothing to read.
+        // Every catalog with something in it is planned at the file PostgreSQL names, through the
+        // map or at its oid; an empty one (nothing in `pg_attrdef`) has nothing to read. A catalog
+        // that was rewritten and is not mapped is not planned: the plan reads no `pg_class`, and
+        // its old file is gone.
         let mut with_content = 0;
         for (oid, path) in &real.catalogs {
             if fs::metadata(data.join(path)).is_ok_and(|m| m.len() > 0) {
+                if real.rewritten.contains(oid) {
+                    assert!(!planned.contains(path), "catalog {oid} at {path}");
+                    continue;
+                }
                 with_content += 1;
                 assert!(
                     planned.contains(path),
@@ -1685,7 +1723,8 @@ mod tests {
             "{} bytes",
             plan.bytes
         );
-        assert_eq!(plan.missing, 0);
+        // The event shows the gap: the main forks of the rewritten catalogs that are not mapped.
+        assert_eq!(plan.missing, real.rewritten.len() as u64);
         #[cfg(target_os = "linux")]
         {
             let report = plan.issue(limits(Duration::from_secs(10)), &no_cancel());
