@@ -109,7 +109,9 @@ connection is held, and runs the request (one statement, or a transaction betwee
 `COMMIT`) as one extended-protocol pipeline. Its PostgreSQL sessions are authenticated with
 SCRAM-SHA-256 using the password the Edge forwards in the request body; the password is wiped
 after use and never logged or stored. A session is kept after `DISCARD ALL` for at most 10 s idle
-and 60 s in all, reused only for a password that derives its SCRAM StoredKey, and closed by the
+and 60 s in all, reused only for a password that derives its SCRAM StoredKey, on the same
+writer and at the generation of the route (a role change moves the generation, so the request
+logs in itself and PostgreSQL decides; the route revision does not matter), and closed by the
 agent's actions like any idle session. Statement bytes are never resent: a session lost after the
 write answers `08007`. Each request logs one `sql_stages` line with the database ID, a fixed
 `outcome`, `pooled`, `wake_path` (`warm`, `cold` or null, as for a connection), the statement

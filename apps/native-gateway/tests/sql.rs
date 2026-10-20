@@ -46,6 +46,8 @@ const NODE: &str = "nod_aaaaaaaaaaaaaaaaaaaa";
 const INSTANCE: &str = "01234567-89ab-4def-8123-0123456789ab";
 const ROUTE_REVISION: u64 = 19;
 const PASSWORD: &str = "correct horse battery";
+/// The role's password after a reset.
+const ROTATED: &str = "staple correct horse";
 const SALT: &[u8] = b"pgcf-test-salt";
 fn cid(id: usize) -> String {
     format!("01234567-89ab-4def-8123-{id:012x}")
@@ -62,11 +64,15 @@ fn token(prefix: &str, purpose: &str, claims: Value) -> String {
 }
 /// The admission route Cloudflare signs for the fixture's running generation and unit.
 fn route(id: usize) -> String {
+    route_at(id, 1, ROUTE_REVISION)
+}
+/// The admission route for the database at `generation` and `route_revision`.
+fn route_at(id: usize, generation: u64, route_revision: u64) -> String {
     let now = http::now() / 1000;
     token(
         wire("nodeRouteTokenPrefix"),
         wire("nodeRouteSignatureDomain"),
-        json!({"v":6,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":1,"route_revision":ROUTE_REVISION,"node":NODE,"inst":INSTANCE}),
+        json!({"v":6,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"route_revision":route_revision,"node":NODE,"inst":INSTANCE}),
     )
 }
 fn wake_operation() -> String {
@@ -192,8 +198,8 @@ fn strings(body: &[u8]) -> Vec<String> {
         .map(|part| String::from_utf8(part.to_vec()).unwrap())
         .collect()
 }
-/// The server side of SCRAM-SHA-256 for `PASSWORD`; true when the client proved it.
-async fn scram(stream: &mut UnixStream) -> Result<bool, Failure> {
+/// The server side of SCRAM-SHA-256 for `password`; true when the client proved it.
+async fn scram(stream: &mut UnixStream, password: &str) -> Result<bool, Failure> {
     let mut mechanisms = 10u32.to_be_bytes().to_vec();
     mechanisms.extend_from_slice(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0");
     send(stream, b'R', &mechanisms).await?;
@@ -216,7 +222,7 @@ async fn scram(stream: &mut UnixStream) -> Result<bool, Failure> {
     let last = String::from_utf8(last)?;
     let (without_proof, proof) = last.rsplit_once(",p=").unwrap();
     assert_eq!(without_proof, format!("c=biws,r={nonce}"));
-    let salted = pbkdf2(PASSWORD.as_bytes(), SALT, 4096);
+    let salted = pbkdf2(password.as_bytes(), SALT, 4096);
     let stored = Sha256::digest(mac(&salted, b"Client Key")).to_vec();
     let message = format!("{bare},{server_first},{without_proof}");
     let signature = mac(&stored, message.as_bytes());
@@ -243,7 +249,10 @@ async fn scram(stream: &mut UnixStream) -> Result<bool, Failure> {
 /// How the double authenticates a session.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Authentication {
+    /// SCRAM-SHA-256 for `PASSWORD`.
     Scram,
+    /// SCRAM-SHA-256 for `ROTATED`: the role's password was reset.
+    Rotated,
     /// AuthenticationCleartextPassword; what the gateway answers is journaled.
     Cleartext,
     /// No password: AuthenticationOk at once.
@@ -275,7 +284,8 @@ async fn postgres_session(
     // the login to go on.
     gate.wait_for(|open| *open).await?;
     let accepted = match authentication {
-        Authentication::Scram => scram(&mut stream).await?,
+        Authentication::Scram => scram(&mut stream, PASSWORD).await?,
+        Authentication::Rotated => scram(&mut stream, ROTATED).await?,
         Authentication::Cleartext => {
             send(&mut stream, b'R', &3u32.to_be_bytes()).await?;
             let answer = receive(&mut stream).await.map(|(tag, _)| tag as char);
@@ -761,6 +771,69 @@ async fn a_pooled_session_is_reused_only_for_its_password_and_closes_when_the_da
     })
     .await
     .unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_pooled_session_is_reused_across_a_route_revision_but_not_across_a_generation() {
+    // The page that carries Cloudflare's claim of a wake moves the route revision of the entry
+    // and nothing else: the pooled session goes on. A role change (resetPassword) moves the
+    // generation on the unit that runs, and the agent publishes it on the same writer without
+    // ending the sessions of the role: PostgreSQL has a new verifier, the pooled session proved
+    // the old one and is never asked again. A request at the new generation logs in itself, and
+    // PostgreSQL refuses the password that was reset.
+    let fixture = Fixture::new().await;
+    let request = body(PASSWORD, &[("select", json!([]))], None);
+    assert_eq!(fixture.sql(&route(30), &request).await.0, 200);
+    fixture.idle(1).await;
+    fixture.gateway.table.write().await.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 1, &operation(), &fixture.unit)
+    });
+    assert_eq!(
+        fixture
+            .sql(&route_at(31, 1, ROUTE_REVISION + 1), &request)
+            .await
+            .0,
+        200
+    );
+    fixture.idle(1).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.journal.count("auth:ok"), 1);
+    // The role's password is reset: the generation moves, and the unit is the same.
+    *fixture.authentication.lock().unwrap() = Authentication::Rotated;
+    fixture.gateway.table.write().await.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 2, &operation(), &fixture.unit)
+    });
+    let (status, answer) = fixture
+        .sql(&route_at(32, 2, ROUTE_REVISION + 1), &request)
+        .await;
+    assert_eq!(
+        (status, &answer["code"]),
+        (400, &json!("28P01")),
+        "{answer}"
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    fixture.idle(0).await;
+    // The new password logs in once and is pooled at the new generation.
+    let rotated = body(ROTATED, &[("select", json!([]))], None);
+    assert_eq!(
+        fixture
+            .sql(&route_at(33, 2, ROUTE_REVISION + 1), &rotated)
+            .await
+            .0,
+        200
+    );
+    fixture.idle(1).await;
+    assert_eq!(
+        fixture
+            .sql(&route_at(34, 2, ROUTE_REVISION + 1), &rotated)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.journal.count("auth:ok"), 2);
     fixture.stop().await;
 }
 #[tokio::test]

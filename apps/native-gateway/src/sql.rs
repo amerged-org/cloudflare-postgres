@@ -268,6 +268,9 @@ struct Backend {
     postgres: UnixStream,
     database: String,
     user: String,
+    /// The generation of the database the session was admitted at. A role change moves it on the
+    /// unit that runs, and the session proved a password PostgreSQL may no longer accept.
+    generation: u64,
     /// What PostgreSQL proved; none when it asked for no password, and then it is not pooled.
     verifier: Option<Verifier>,
     authenticated: Instant,
@@ -688,9 +691,11 @@ enum Checkout {
     /// login uses when PostgreSQL asks for the same salt and iterations.
     Missed(Option<Salted>),
 }
-/// An idle session of the route's database and role on the same writer whose verifier the
-/// password matches. Only the newest session's verifier is derived, once: the
-/// sessions of one role share it unless its password was rotated.
+/// An idle session of the route's database and role on the same writer and at the route's
+/// generation whose verifier the password matches. A session of another generation proved its
+/// password before a role change and is ended; the route's revision does not matter, since the
+/// page that carries the claim of a wake moves only that. Only the newest session's verifier is
+/// derived, once: the sessions of one role share it unless its password was rotated.
 async fn checkout(
     gateway: &Gateway,
     claims: &Route,
@@ -734,7 +739,8 @@ async fn checkout(
         let Ok(backend) = taken.await else {
             continue;
         };
-        if backend.lease.target == *target
+        if backend.generation == claims.generation
+            && backend.lease.target == *target
             && backend.authenticated.elapsed() < LIFETIME
             && gateway.permits(&claims.db, &backend.lease.target).await
         {
@@ -789,6 +795,7 @@ async fn open(
         postgres,
         database: database.clone(),
         user: claims.user.clone(),
+        generation: claims.generation,
         verifier: None,
         authenticated: Instant::now(),
         _memory: memory,

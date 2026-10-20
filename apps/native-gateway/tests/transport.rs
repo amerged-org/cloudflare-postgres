@@ -255,10 +255,13 @@ impl Double {
 }
 /// One session of the double: the StartupMessage, the login, then a ReadyForQuery for every
 /// message until Terminate or the end of the stream. `slow` reads each message only after 200 ms.
+/// While `gate` is closed the login waits after the StartupMessage: the test opens it when it
+/// wants the login to go on.
 async fn postgres_session(
     mut stream: UnixStream,
     double: Double,
     slow: bool,
+    mut gate: watch::Receiver<bool>,
     send: mpsc::Sender<Vec<u8>>,
     ended: mpsc::Sender<()>,
 ) {
@@ -271,6 +274,9 @@ async fn postgres_session(
     let mut startup_bytes = length.to_be_bytes().to_vec();
     startup_bytes.extend(raw);
     send.send(startup_bytes).await.unwrap();
+    if gate.wait_for(|open| *open).await.is_err() {
+        return;
+    }
     if !double.authenticate(&mut stream).await {
         return;
     }
@@ -320,6 +326,8 @@ struct Fixture {
     upstream: mpsc::Receiver<Vec<u8>>,
     /// One per upstream session whose stream the gateway ended.
     ends: mpsc::Receiver<()>,
+    /// While it is closed, the double does not log a session in after its StartupMessage.
+    gate: watch::Sender<bool>,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     _directory: Directory,
@@ -398,6 +406,7 @@ impl Fixture {
         let (stop, receiver) = watch::channel(false);
         let (send, received) = mpsc::channel(16);
         let (ended, ends) = mpsc::channel(16);
+        let (gate, open) = watch::channel(true);
         let mut shutdown = receiver.clone();
         let counted = calls.clone();
         let upstream_task = tokio::spawn(async move {
@@ -408,7 +417,7 @@ impl Fixture {
                     accepted = upstream.accept() => {
                         let (stream, _) = accepted.unwrap();
                         counted.fetch_add(1, Ordering::SeqCst);
-                        tasks.spawn(postgres_session(stream, double.clone(), slow, send.clone(), ended.clone()));
+                        tasks.spawn(postgres_session(stream, double.clone(), slow, open.clone(), send.clone(), ended.clone()));
                     }
                 }
             }
@@ -451,6 +460,7 @@ impl Fixture {
             observe,
             upstream: received,
             ends,
+            gate,
             stop,
             tasks: vec![upstream_task, gateway_task],
             _directory: directory,
@@ -1019,6 +1029,39 @@ async fn a_held_wake_released_before_the_claim_reaches_the_agent_goes_on_to_its_
         .send(Message::Binary(password[3..].to_vec().into()))
         .await
         .unwrap();
+    assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+    assert_eq!(next_message(&mut client).await, authenticated());
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn the_gateway_s_login_to_postgres_goes_on_when_the_claim_of_the_wake_reaches_the_table() {
+    // The Neon driver's default: the password behind the StartupMessage, so the gateway logs in
+    // to PostgreSQL itself, which takes as long as PostgreSQL needs (68-467 ms live). The claim
+    // of the wake reaches the agent in that time: its entry changes in the route revision, and
+    // the sessions are told `Running`, which interrupts nothing.
+    let mut fixture = Fixture::scram(false, Double::Scram(PASSWORD)).await;
+    fixture.gate.send(false).unwrap();
+    let mut client = fixture.upgrade(&wake_token(1509, 2)).await.unwrap();
+    client
+        .send(Message::Binary(
+            [startup("app"), password_message(PASSWORD.as_bytes())]
+                .concat()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    fixture.release(2).await;
+    // PostgreSQL has the StartupMessage and holds the login at its gate.
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        startup("app")
+    );
+    fixture.claimed(2, &wake_operation()).await;
+    fixture.gate.send(true).unwrap();
     assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
     assert_eq!(next_message(&mut client).await, authenticated());
     client.close(None).await.unwrap();
