@@ -58,6 +58,7 @@ that systemd starts the new one.
 | Fencing                    | `fence.rs`                                                                                                                                             |
 | Gateway channel            | `gateway.rs`: the writer table, the wakes, quiesce, close, status and activity                                                                         |
 | Metrics and diagnostics    | `usage.rs`, `sample.rs`, `events.rs`, `cache.rs`, `diagnostics/`                                                                                       |
+| Cold page cache            | `prefetch.rs`: readahead of the catalog set and the autoprewarm list with its own accounting; `cache.rs`: how files of the data directory are opened and counted |
 | Updates                    | `update.rs`, `release.rs`                                                                                                                              |
 | The loops                  | `service.rs`: what feeds the core and what it feeds                                                                                                    |
 
@@ -118,6 +119,18 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   background after the next start, where it competes with the first queries for the disk. Two of
   the worker slots are its leader and its worker; the sleep guard does not count its worker as a
   session.
+- **Readahead** (`prefetch.rs`, built, not called by any flow yet). Before a request the agent can
+  ask the kernel to read a sleeping database's hot files ahead with `posix_fadvise(WILLNEED)`:
+  the catalog set (`pg_control`, 256 KiB of WAL at the latest checkpoint, `global/`, and in each
+  user database its `PG_VERSION`, `pg_filenode.map` and the login's catalogs with their indexes
+  and forks, found through the map where `VACUUM FULL` moved them; about 5 MB) and the autoprewarm
+  list (blocks merged where contiguous, the relations with the fewest listed blocks first, system
+  databases left out). A plan is built first (blocking: directories, `pg_control`, the maps and
+  the list are read, each file is opened once for its length), then issued in pieces of at most
+  128 KiB, because the kernel reads only the first `read_ahead_kb` of a range per call. Issuing
+  stops at a time budget, a byte bound or a cancel and returns the counts, the bytes the cache
+  already held and the timings that replace the residency diagnostic of `cache.rs` once a flow
+  calls it. `pg_internal.init` is left out: PostgreSQL removes it at every start.
 - **Login.** The node's root reaches the cluster's superuser `postgres` by peer authentication
   through `pg_ident.conf`; the backup role `pgcf_backup` is reached by the database's own Linux user
   the same way; every other role logs in over the socket with SCRAM-SHA-256. Replication connections

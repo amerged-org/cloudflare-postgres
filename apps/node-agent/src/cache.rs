@@ -9,6 +9,11 @@
 //! data directory, the ones a first request touches: `global/`, `pg_xact/`, the newest WAL segment
 //! and the files of the user databases below `base/`, newest-modified first, at most `MAX_FILES`
 //! of them and `MAX_LENGTH` bytes of file length together.
+//!
+//! The reading opens and lists files while the wake runs; on cold dentries that is disk reads of
+//! its own, at a cost nobody has measured (plan 11.2). `prefetch` counts the pages of the files it
+//! advises with its own accounting, off this reading, and shares this module's rules for opening
+//! a file of the data directory: `is_directory`, `names`, `open` and `cachestat_range`.
 use crate::sleep::is_segment;
 use std::{
     fs::{File, OpenOptions},
@@ -59,8 +64,26 @@ struct Candidate {
 
 /// Whether `path` is a directory and no link to one. The data directory is the database user's,
 /// who can put a link in place of any directory of it, and the agent reads as root.
-fn is_directory(path: &Path) -> bool {
+pub(crate) fn is_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// The names of the entries of `directory`, sorted: none if it is no directory or is a link. At
+/// most `MAX_ENTRIES` entries are looked at, and an entry is not examined (its name is all the
+/// listing reads), so a directory of many files costs its blocks and no inode.
+pub(crate) fn names(directory: &Path) -> Vec<String> {
+    if !is_directory(directory) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .take(MAX_ENTRIES)
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 /// The regular files of `directory`, which is none if it is a link. A link among them is none:
@@ -155,7 +178,7 @@ pub(crate) fn page_size() -> u64 {
 /// a link at the file is not followed (`O_NOFOLLOW` covers the last part of the path, the
 /// directories were checked when they were listed), and a pipe or a device is not opened for
 /// reading.
-fn open(path: &Path) -> io::Result<File> {
+pub(crate) fn open(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -206,6 +229,13 @@ pub fn host(_data: &Path) -> Option<Residency> {
 /// `cachestat(file, {0, 0}, &status, 0)`: the pages of the whole file.
 #[cfg(target_os = "linux")]
 fn cachestat(file: &File, _length: u64) -> io::Result<Pages> {
+    cachestat_range(file, 0, 0)
+}
+
+/// `cachestat(file, {offset, length}, &status, 0)`: the pages of a range of the file, to its end
+/// where `length` is 0. The kernel looks the pages up in the page cache and reads nothing.
+#[cfg(target_os = "linux")]
+pub(crate) fn cachestat_range(file: &File, offset: u64, length: u64) -> io::Result<Pages> {
     use std::os::fd::AsRawFd;
     /// The same number on every architecture that has the call (Linux 6.5).
     const SYS_CACHESTAT: libc::c_long = 451;
@@ -225,7 +255,10 @@ fn cachestat(file: &File, _length: u64) -> io::Result<Pages> {
         nr_evicted: u64,
         nr_recently_evicted: u64,
     }
-    let range = Range { off: 0, len: 0 };
+    let range = Range {
+        off: offset,
+        len: length,
+    };
     let mut status = Status::default();
     let flags: libc::c_long = 0;
     // SAFETY: the kernel reads the range and writes the status, both of the layout it defines and
@@ -419,6 +452,24 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_is_sorted_and_a_link_a_file_or_nothing_lists_as_empty() {
+        let data = data("cache-names");
+        file(data.join("base/16384/20002"), 1, 100);
+        file(data.join("base/16384/20001"), 1, 100);
+        file(data.join("base/16384/9"), 1, 100);
+        assert_eq!(
+            super::names(&data.join("base/16384")),
+            ["20001", "20002", "9"]
+        );
+        let outside = crate::testpg::directory("cache-names-outside");
+        file(outside.join("20001"), 1, 100);
+        std::os::unix::fs::symlink(&outside, data.join("pg_link")).unwrap();
+        assert!(super::names(&data.join("pg_link")).is_empty());
+        assert!(super::names(&data.join("base/16384/20001")).is_empty());
+        assert!(super::names(&data.join("missing")).is_empty());
+    }
+
+    #[test]
     fn the_residency_is_the_sum_over_the_files_and_none_where_nothing_was_counted() {
         let data = data("cache-sum");
         file(data.join("global/pg_control"), 8192, 900);
@@ -508,6 +559,17 @@ mod tests {
             return;
         }
         assert_eq!(dropped.resident, 0, "{dropped:?}");
+
+        // A range counts its own pages: only the second half is read, and the first half, the
+        // second half and "to the end of the file from the middle" say so.
+        let half = 128 * 4096;
+        file.seek(std::io::SeekFrom::Start(half)).unwrap();
+        file.read_exact(&mut vec![0u8; half as usize]).unwrap();
+        let resident = |offset, length| cachestat_range(&file, offset, length).unwrap().resident;
+        assert_eq!(resident(0, half), 0);
+        assert_eq!(resident(half, half), half / page);
+        assert_eq!(resident(half, 0), half / page);
+        assert_eq!(resident(0, 0), half / page);
 
         // Read again: every page is back. The whole reading finds the file below a data
         // directory and counts it the same way.
