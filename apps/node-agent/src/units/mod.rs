@@ -226,6 +226,14 @@ pub enum Error {
     /// The unit finished starting but PostgreSQL is not the ready main process. The reason is one
     /// of `ready::ready_socket` or `unit_not_active`, `no_main_pid`, `no_uid`, `no_invocation_id`.
     NotReady(&'static str),
+    /// The unit is not running but its cgroup still holds a process of an earlier start: a backend
+    /// that outlived its postmaster, or one that no signal could end ("Processes still around
+    /// after final SIGKILL"). systemd starts a unit over such a process ("Found left-over process
+    /// ... Ignoring"), and the new postmaster could not find it: the unit has an IPC namespace of
+    /// its own at every start, so PostgreSQL's check of the shared memory segment named in
+    /// `postmaster.pid` sees nothing, and the old backend would run beside the new postmaster on
+    /// one data directory.
+    StrayProcesses,
     /// systemd did something the agent does not understand.
     Unexpected(&'static str),
 }
@@ -236,6 +244,7 @@ impl std::fmt::Display for Error {
             Self::Bus(error) => write!(f, "systemd: {error}"),
             Self::Job { unit, result } => write!(f, "the job of {unit} ended with {result}"),
             Self::NotReady(reason) => write!(f, "PostgreSQL is not ready: {reason}"),
+            Self::StrayProcesses => f.write_str("the unit's cgroup still holds a process"),
             Self::Unexpected(what) => write!(f, "unexpected from systemd: {what}"),
         }
     }
@@ -303,15 +312,37 @@ fn monotonic_micros() -> Option<u64> {
     None
 }
 
-/// The `cpu.stat` of a database's unit in the cgroup tree, where its throttling is counted;
-/// `None` for an argument that is no database ID.
-pub fn cpu_stat_path(database: &str) -> Option<PathBuf> {
+/// A file of a database's unit in the cgroup tree; `None` for an argument that is no database ID.
+fn cgroup_file(database: &str, file: &str) -> Option<PathBuf> {
     valid_pattern("database", database).then(|| {
         PathBuf::from(format!(
-            "/sys/fs/cgroup/{SLICE}/{}/cpu.stat",
+            "/sys/fs/cgroup/{SLICE}/{}/{file}",
             unit_name(database)
         ))
     })
+}
+
+/// The `cpu.stat` of a database's unit in the cgroup tree, where its throttling is counted;
+/// `None` for an argument that is no database ID.
+pub fn cpu_stat_path(database: &str) -> Option<PathBuf> {
+    cgroup_file(database, "cpu.stat")
+}
+
+/// The `cgroup.events` of a database's unit: its `populated` line says whether any process is in
+/// the cgroup. The directory exists while the unit runs, and while a process of it remains.
+fn cgroup_events_path(database: &str) -> Option<PathBuf> {
+    cgroup_file(database, "cgroup.events")
+}
+
+/// Whether the text of a `cgroup.events` says that the cgroup, or one below it, holds a process.
+fn populated(events: &str) -> bool {
+    events.lines().any(|line| line.trim() == "populated 1")
+}
+
+/// A process of the cgroup that the unit's state does not account for: the unit is not awake (no
+/// main process, no job that starts or stops one) and the cgroup is populated.
+fn stray_processes(active: ActiveState, events: &str) -> bool {
+    populated(events) && !active.awake()
 }
 
 #[derive(Clone, Copy)]
@@ -514,10 +545,34 @@ impl Units {
     }
 
     /// Starts the unit and returns when PostgreSQL accepts connections. Dropping the future does
-    /// not stop the start.
+    /// not stop the start. A unit that is not running but whose cgroup holds a process is not
+    /// started (`Error::StrayProcesses`).
     pub async fn start(&self, database: &str) -> Result<Started, Error> {
-        let requested = self.job(&Self::unit_of(database)?, JobKind::Start).await?;
+        let unit = Self::unit_of(database)?;
+        self.refuse_stray_processes(database).await?;
+        let requested = self.job(&unit, JobKind::Start).await?;
         self.started(database, requested).await
+    }
+
+    /// Refuses a start over a process that outlived the last one. The cgroup of a unit that is
+    /// stopped does not exist, so the common case is one failed `open`; the state is read only
+    /// where the cgroup is populated, because a unit that runs, or is starting or stopping, holds
+    /// processes of its own.
+    async fn refuse_stray_processes(&self, database: &str) -> Result<(), Error> {
+        let path = cgroup_events_path(database).ok_or(Error::InvalidDatabase)?;
+        let events = match std::fs::read_to_string(path) {
+            Ok(events) => events,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(Error::Unexpected("the unit's cgroup cannot be read")),
+        };
+        if !populated(&events) {
+            return Ok(());
+        }
+        let active = self.state(database).await?.active;
+        if stray_processes(active, &events) {
+            return Err(Error::StrayProcesses);
+        }
+        Ok(())
     }
 
     /// Waits for a unit that is starting, one the agent found `activating` when it started, and
@@ -655,6 +710,44 @@ mod tests {
         }
         assert_eq!(answered, 300);
         assert_eq!(most.load(Ordering::SeqCst), CALLS_IN_FLIGHT);
+    }
+
+    #[test]
+    fn a_cgroup_that_holds_a_process_is_populated() {
+        assert!(populated("populated 1\nfrozen 0\n"));
+        assert!(!populated("populated 0\nfrozen 0\n"));
+        assert!(!populated(""));
+        assert!(!populated("populated 10\n"), "the value is exactly 1");
+    }
+
+    #[test]
+    fn a_process_is_a_stray_when_the_unit_is_not_awake_and_the_cgroup_is_populated() {
+        let (held, empty) = ("populated 1\nfrozen 0\n", "populated 0\nfrozen 0\n");
+        for (active, awake) in [
+            (ActiveState::Active, true),
+            (ActiveState::Reloading, true),
+            (ActiveState::Inactive, false),
+            (ActiveState::Failed, false),
+            (ActiveState::Activating, true),
+            (ActiveState::Deactivating, true),
+            (ActiveState::Maintenance, false),
+            (ActiveState::Refreshing, true),
+        ] {
+            assert_eq!(stray_processes(active, held), !awake, "{active:?}");
+            assert!(!stray_processes(active, empty), "{active:?}");
+        }
+    }
+
+    #[test]
+    fn the_cgroup_files_of_a_unit_are_below_the_databases_slice() {
+        assert_eq!(
+            cgroup_events_path("abcdefghij0123456789"),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/pgcf.slice/pgcf-pg@abcdefghij0123456789.service/cgroup.events"
+            ))
+        );
+        assert_eq!(cgroup_events_path("../x"), None);
+        assert_eq!(cpu_stat_path("not a database"), None);
     }
 
     #[test]

@@ -61,23 +61,34 @@ ProtectSystem=strict
 ReadWritePaths=/run/pgcf/%i
 MountImages=/run/pgcf/dev/%i:/var/lib/pgcf/db/%i:root:nosuid,nodev,noexec,noatime
 ProtectHome=yes
-PrivateTmp=yes
 PrivateDevices=yes
-# PostgreSQL maps its segments here read-write only; nothing in it may run, carry setuid or be a device.
+# PostgreSQL maps its segments in /dev/shm read-write only; nothing in it may run, carry setuid or be
+# a device. /tmp and /var/tmp are small tmpfs of the unit's own, and not PrivateTmp=yes, which puts
+# both on the host's root filesystem (8 GiB, no quota, and disk blocks are no memory that MemoryMax
+# counts): one awake tenant filled it and stopped the journal and the agent's state writes for the
+# whole node. PostgreSQL uses neither directory, and what is written in them is the unit's memory.
 TemporaryFileSystem=/dev/shm:size=64M,mode=1777,noexec,nosuid,nodev
+TemporaryFileSystem=/tmp:size=16M,nr_inodes=1024,mode=1777,noexec,nosuid,nodev
+TemporaryFileSystem=/var/tmp:size=16M,nr_inodes=1024,mode=1777,noexec,nosuid,nodev
 # Nothing writable is shared with another unit. The unit has its own IPC namespace (its own SysV
 # segments and its own POSIX queue mount: PostgreSQL's segment is in it, and no other unit's is).
-# Three places stay outside the unit's view. /run/lock is a tmpfs for the whole node and
+# Four places stay outside the unit's view. /run/lock is a tmpfs for the whole node and
 # /dev/mqueue is mode 1777: both were mounted read-write in every unit, a place where one
 # database's user leaves what another reads, and files that outlive the unit. /dev/pts is the
 # host's devpts, which PrivateDevices= binds into the private /dev: its ptmx gave one user 3072
 # of the node's 4096 ptys, and its listing showed the ptys of every unit. PostgreSQL uses none of
 # them. The filter below denies mq_open, but creating a file in /dev/mqueue makes the same queue,
-# so the directory is out of reach as well. The PID namespace stays shared, because the pid half of
-# PostgreSQL's interlock (a second postmaster on the directory finds the first with kill(pid, 0))
-# needs it; the segment half does not reach across IPC namespaces.
+# so the directory is out of reach as well. The journal directories are the fourth: journald keeps a
+# file user-<uid>.journal for every database uid, readable by that uid (a POSIX ACL), and the agent
+# hands a uid to a later database once its database has left the node, so the new tenant would read
+# the former one's log lines. The unit logs through /run/systemd/journal/stdout, which stays. The PID
+# namespace stays shared, because the pid half of PostgreSQL's interlock (a second postmaster on the
+# directory finds the first with kill(pid, 0)) needs it; the segment half does not reach across IPC
+# namespaces, and the agent therefore refuses to start the unit while a process of an earlier start
+# is still in its cgroup (units/mod.rs): a backend that outlives its postmaster would otherwise run
+# beside the next one.
 PrivateIPC=yes
-InaccessiblePaths=-/run/lock -/dev/mqueue -/dev/pts
+InaccessiblePaths=-/run/lock -/dev/mqueue -/dev/pts -/var/log/journal -/run/log/journal
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

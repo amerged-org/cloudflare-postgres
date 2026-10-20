@@ -591,6 +591,89 @@ async fn a_start_that_fails_names_the_jobs_result() {
     within(units.stop(&database.id)).await.unwrap();
 }
 
+/// Whether a database's unit has a cgroup that holds a process.
+fn cgroup_populated(database: &str) -> bool {
+    fs::read_to_string(super::cgroup_events_path(database).unwrap())
+        .is_ok_and(|events| super::populated(&events))
+}
+
+/// A process of the last start that stays in the unit's cgroup after the unit stopped is a stray:
+/// systemd starts a unit over it ("Found left-over process ... Ignoring"), and the unit's IPC
+/// namespace is new at every start, so PostgreSQL's interlock cannot find the old backend by the
+/// shared memory segment it holds. The agent refuses the start, and starts at once when the cgroup
+/// is empty.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
+async fn a_start_is_refused_while_a_process_of_an_earlier_start_is_in_the_units_cgroup() {
+    if !lab() {
+        return;
+    }
+    let database = Database::new(13);
+    let id = database.id.as_str();
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    // systemd does not kill what remains after the stop, as for a backend in uninterruptible sleep
+    // that no signal ends. The drop-in goes again before the start: the template kills.
+    let dropin = format!("/run/systemd/system/{}.d", database.unit());
+    fs::create_dir_all(&dropin).unwrap();
+    fs::write(
+        format!("{dropin}/stray.conf"),
+        "[Service]\nSendSIGKILL=no\nTimeoutStopSec=1\n",
+    )
+    .unwrap();
+    run("systemctl", &["daemon-reload"]);
+    let first = within(units.start(id)).await.unwrap();
+    assert!(cgroup_populated(id));
+    // A backend that does not end (it is stopped), and its postmaster gone.
+    let children =
+        fs::read_to_string(format!("/proc/{0}/task/{0}/children", first.main_pid)).unwrap();
+    let backend = children.split_whitespace().next().unwrap().to_string();
+    run("kill", &["-STOP", &backend]);
+    run("kill", &["-KILL", &first.main_pid.to_string()]);
+    for _ in 0..200 {
+        if !units.state(id).await.unwrap().active.awake() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let failed = units.state(id).await.unwrap();
+    assert_eq!(failed.active, ActiveState::Failed);
+    assert!(
+        cgroup_populated(id),
+        "the stopped backend is still in the cgroup"
+    );
+    fs::remove_file(format!("{dropin}/stray.conf")).unwrap();
+    run("systemctl", &["daemon-reload"]);
+
+    // The start is refused, and nothing was started: the invocation is the one that was killed.
+    let refused = within(units.start(id)).await.unwrap_err();
+    assert!(matches!(refused, Error::StrayProcesses), "{refused:?}");
+    let after = units.state(id).await.unwrap();
+    assert_eq!(after.active, ActiveState::Failed);
+    assert_eq!(after.main_pid, None);
+    assert_eq!(
+        after.invocation_id.as_deref(),
+        Some(first.invocation_id.as_str())
+    );
+
+    // The backend ends, the cgroup is empty, and the start goes through.
+    run("kill", &["-KILL", &backend]);
+    for _ in 0..200 {
+        if !cgroup_populated(id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!cgroup_populated(id));
+    let second = within(units.start(id)).await.unwrap();
+    assert_ne!(second.invocation_id, first.invocation_id);
+    // A start of a unit that runs finds its cgroup populated and joins it: no refusal.
+    assert_eq!(
+        same_unit(within(units.start(id)).await.unwrap()),
+        same_unit(second)
+    );
+    within(units.stop(id)).await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
 async fn write_limits_of_a_device_are_accepted() {

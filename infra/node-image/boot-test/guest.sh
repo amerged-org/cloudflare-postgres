@@ -483,11 +483,12 @@ database_user_reaches_no_block_device() {
 # - a SysV segment of the host is not in its IPC namespace, and the segment PostgreSQL made is there
 #   and not in the host's;
 # - every directory and regular file it can write is its own: its volume, its socket directory, the
-#   private /tmp, /var/tmp and /dev/shm and its own cgroup's pressure files. Sockets (the journal's,
-#   systemd's and D-Bus's service endpoints; each service checks its caller), the character devices
-#   of the private /dev (null, zero, full, random, urandom, tty) and symbolic links hold no data.
+#   private /tmp, /var/tmp and /dev/shm and its own cgroup's pressure files. The character devices
+#   of the private /dev (null, zero, full, random, urandom, tty) and symbolic links hold no data;
+# - every socket and FIFO it can write is on an explicit list of endpoints that check their caller
+#   (see $endpoints below); a FIFO of any kind, or a socket not on the list, is a finding.
 database_user_shares_nothing_writable() {
-	local id=pgcfcheckscratch0000 pid uid gid own marker place segment owners listing leftover result=0
+	local id=pgcfcheckscratch0000 pid uid gid own marker place segment owners listing found leftover endpoints result=0
 	pid=$(systemctl show --property=MainPID --value "pgcf-pg@$id.service")
 	[ "${pid:-0}" -gt 0 ] || {
 		echo "the scratch database does not run"
@@ -548,12 +549,118 @@ database_user_shares_nothing_writable() {
 		result=1
 	fi
 	# /efi is an automount of the ESP (mode 0700 for root): the search must not mount it.
-	leftover=$(as_user find / \( -path /proc -o -path /efi -o -path "$own" \) -prune -o \( -type d -o -type f \) -writable -print 2>/dev/null |
+	found=$(as_user find / \( -path /proc -o -path /efi -o -path "$own" \) -prune -o \
+		\( -type d -o -type f -o -type s -o -type p \) -writable -printf '%y %p\n' 2>/dev/null)
+	# /run/pgcf/<id> is the unit's own and the one place here that nothing bounds (plan 11.2).
+	leftover=$(grep -E '^[df] ' <<<"$found" | cut -c3- |
 		grep -vE "^(/dev/shm|/tmp|/var/tmp)(/|$)|^/run/pgcf/$id(/|$)|^/sys/fs/cgroup/pgcf\.slice/pgcf-pg@$id\.service/")
 	[ -z "$leftover" ] || {
 		echo "writable and not the unit's own: $leftover"
 		result=1
 	}
+	# The endpoints a database's user may connect to, each with the service that checks its caller:
+	# - the socket PostgreSQL made in the socket directory (its own, the gateway's way in);
+	# - journald's three sockets, systemd's notify socket and systemd's varlink sockets
+	#   (io.systemd.*, in /run/systemd and below it in userdb, netif and resolve, where the image's
+	#   networkd and PID 1 make them): the notify socket accepts only the unit's main process
+	#   (NotifyAccess=main), the varlink services answer by the caller's rights;
+	# - D-Bus's system bus socket, where the bus policy and polkit refuse a change;
+	# - the agent's archive socket (mode 0666): the archive command of every database calls it, and it
+	#   authorizes by the kernel's report of the caller's uid alone (SO_PEERCRED).
+	# A FIFO is never expected.
+	endpoints=$(grep -E '^[sp] ' <<<"$found" | cut -c3- |
+		grep -vE "^/run/pgcf/$id/\.s\.PGSQL\.5432$|^/run/systemd/journal/(socket|dev-log|stdout)$|^/run/systemd/notify$|^/run/systemd/(userdb/|netif/|resolve/)?io\.systemd\.[A-Za-z.]+$|^/run/dbus/system_bus_socket$|^/run/pgcf/agent/archive\.sock$")
+	[ -z "$endpoints" ] || {
+		echo "a socket or FIFO the user can write and no one checks: $endpoints"
+		result=1
+	}
+	[ "$result" = 0 ]
+}
+
+# A database's journal is its own to nobody. journald's SplitMode=uid (the default) keeps a
+# user-<uid>.journal file for every database uid with a POSIX ACL that grants that uid read access,
+# in a directory every user may traverse. The file holds PostgreSQL's log lines, DETAIL lines with
+# data values included. The agent frees a uid when its database leaves the node, and hands it to a
+# later database whose preferred or probed uid it is; the file stays, so the new tenant would read
+# the former one's log. The unit cannot see the journal directories (PostgreSQL logs through
+# /run/systemd/journal/stdout, which stays). The control: journald does keep the user's file.
+database_user_reads_no_journal() {
+	local id=pgcfcheckscratch0000 pid uid gid file own place result=0
+	pid=$(systemctl show --property=MainPID --value "pgcf-pg@$id.service")
+	[ "${pid:-0}" -gt 0 ] || {
+		echo "the scratch database does not run"
+		return 1
+	}
+	uid=$(stat -c %u "/proc/$pid")
+	gid=$(stat -c %g "/proc/$pid")
+	as_user() {
+		nsenter --target "$pid" --mount --ipc -- setpriv --reuid="$uid" --regid="$gid" --clear-groups \
+			--bounding-set=-all --inh-caps=-all --no-new-privs -- "$@"
+	}
+	own=$(find /var/log/journal /run/log/journal -name "user-$uid.journal" 2>/dev/null | head -n 1)
+	[ -n "$own" ] || {
+		echo "journald keeps no per-uid journal of the unit's user: the probe proves nothing"
+		return 1
+	}
+	while IFS= read -r file; do
+		if as_user test -r "$file"; then
+			echo "the user reads a journal file: $file"
+			result=1
+		fi
+	done < <(find /var/log/journal /run/log/journal -name 'user-*.journal*' 2>/dev/null)
+	for place in /var/log/journal /run/log/journal; do
+		[ -e "$place" ] || continue
+		if ! grep -q 'Permission denied' <<<"$(as_user ls -A "$place" 2>&1)"; then
+			echo "$place is not refused"
+			result=1
+		fi
+	done
+	[ "$result" = 0 ]
+}
+
+# A database's scratch space is bounded. The private /tmp and /var/tmp used to be directories on the
+# host's root filesystem (8 GiB, no quota, and disk blocks are not memory the unit's MemoryMax
+# counts): one awake tenant could fill it, which stops the journal and the agent's state writes
+# for the whole node. They are small tmpfs of the unit's own now, and /dev/shm is one already.
+# As the unit's user: each is a tmpfs within its limit, and a write past it fails.
+database_scratch_space_is_bounded() {
+	local id=pgcfcheckscratch0000 pid uid gid spec place limit_bytes limit_inodes type blocks size inodes result=0
+	pid=$(systemctl show --property=MainPID --value "pgcf-pg@$id.service")
+	[ "${pid:-0}" -gt 0 ] || {
+		echo "the scratch database does not run"
+		return 1
+	}
+	uid=$(stat -c %u "/proc/$pid")
+	gid=$(stat -c %g "/proc/$pid")
+	as_user() {
+		nsenter --target "$pid" --mount --ipc -- setpriv --reuid="$uid" --regid="$gid" --clear-groups \
+			--bounding-set=-all --inh-caps=-all --no-new-privs -- "$@"
+	}
+	for spec in /tmp:16777216:1024 /var/tmp:16777216:1024 /dev/shm:67108864:0; do
+		IFS=: read -r place limit_bytes limit_inodes <<<"$spec"
+		read -r type blocks size inodes < <(as_user stat -f -c '%T %b %S %c' "$place")
+		if [ "$type" != tmpfs ] || [ $((blocks * size)) -gt "$limit_bytes" ]; then
+			echo "$place is $type of $((blocks * size)) bytes, not a tmpfs of at most $limit_bytes"
+			result=1
+		fi
+		if [ "$limit_inodes" -gt 0 ] && [ "$inodes" -gt "$limit_inodes" ]; then
+			echo "$place holds up to $inodes files, more than $limit_inodes"
+			result=1
+		fi
+		# The directory is writable, and a write past the limit fails (the 64 MiB of /dev/shm are left
+		# out: they are memory of the unit, which the scratch database's own limit is not made for).
+		[ "$place" != /dev/shm ] || continue
+		as_user dd if=/dev/zero of="$place/fill" bs=1M count=1 2>/dev/null || {
+			echo "the user cannot write $place: its limit proves nothing"
+			result=1
+			continue
+		}
+		if as_user dd if=/dev/zero of="$place/fill" bs=1M count=$((limit_bytes / 1048576 + 1)) 2>/dev/null; then
+			echo "the user wrote more than $limit_bytes bytes to $place"
+			result=1
+		fi
+		as_user rm -f "$place/fill"
+	done
 	[ "$result" = 0 ]
 }
 
@@ -633,6 +740,8 @@ if [ "$phase" = 1 ]; then
 	check scratch_database_runs_across_an_agent_restart scratch_database_runs_across_an_agent_restart
 	check database_user_reaches_no_block_device database_user_reaches_no_block_device
 	check database_user_shares_nothing_writable database_user_shares_nothing_writable
+	check database_user_reads_no_journal database_user_reads_no_journal
+	check database_scratch_space_is_bounded database_scratch_space_is_bounded
 	check database_second_postmaster_is_refused database_second_postmaster_is_refused
 else
 	check scratch_database_was_stopped_cleanly scratch_database_was_stopped_cleanly

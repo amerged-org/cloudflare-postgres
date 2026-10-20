@@ -150,11 +150,48 @@ test("a database unit shares no IPC namespace and no writable directory with ano
   // the filter denies mq_open, and a file created in the directory is the same queue.
   assert.deepEqual(assignments(unit, "PrivateIPC"), ["yes"]);
   const inaccessible = assignments(unit, "InaccessiblePaths").flatMap((line) => line.split(/\s+/));
-  assert.deepEqual(inaccessible.sort(), ["-/dev/mqueue", "-/dev/pts", "-/run/lock"]);
+  for (const path of ["-/run/lock", "-/dev/mqueue", "-/dev/pts"]) {
+    assert.ok(inaccessible.includes(path), path);
+  }
   // PostgreSQL's pid interlock stays: a second unit on a data directory finds the first postmaster
   // with kill(pid, 0) only while the units share the PID namespace. The segment half of the interlock
   // is blind across IPC namespaces, so this half is what refuses the second postmaster.
   assert.deepEqual(assignments(unit, "PrivatePIDs"), []);
+});
+
+test("a database's user cannot read a journal file: journald's per-uid files outlive the uid's database", () => {
+  const unit = readFileSync(new URL("pgcf-pg@.service", units), "utf8");
+  // journald (SplitMode=uid, the default) keeps /var/log/journal/<machine>/user-<uid>.journal with a
+  // POSIX ACL that grants the uid read access. The agent frees a uid when its database leaves the
+  // node and hands it to a later database; the file stays, and the new tenant would read the former
+  // one's log lines (DETAIL lines carry data). The unit logs through /run/systemd/journal/stdout,
+  // which these paths do not touch.
+  const inaccessible = assignments(unit, "InaccessiblePaths").flatMap((line) => line.split(/\s+/));
+  for (const path of ["-/var/log/journal", "-/run/log/journal"]) {
+    assert.ok(inaccessible.includes(path), path);
+  }
+  assert.deepEqual(
+    inaccessible.sort(),
+    ["-/dev/mqueue", "-/dev/pts", "-/run/lock", "-/run/log/journal", "-/var/log/journal"],
+    "no other path is made inaccessible",
+  );
+});
+
+test("a database's /tmp and /var/tmp are small tmpfs of its own: no tenant fills the node's root filesystem", () => {
+  const unit = readFileSync(new URL("pgcf-pg@.service", units), "utf8");
+  // PrivateTmp=yes puts both directories on the host's root filesystem (8 GiB, no quota), and disk
+  // blocks are no memory that MemoryMax counts: one awake tenant filled it, which stops the journal
+  // and the agent's state writes for the whole node. PostgreSQL uses neither directory.
+  assert.deepEqual(assignments(unit, "PrivateTmp"), []);
+  const mounts = assignments(unit, "TemporaryFileSystem");
+  for (const path of ["/tmp", "/var/tmp"]) {
+    const mount = mounts.find((value) => value.startsWith(`${path}:`));
+    assert.ok(mount, `the unit mounts ${path}`);
+    const options = mount.slice(path.length + 1).split(",");
+    for (const option of ["noexec", "nosuid", "nodev", "mode=1777", "size=16M", "nr_inodes=1024"]) {
+      assert.ok(options.includes(option), `${option} in ${mount}`);
+    }
+  }
 });
 
 test("the kernel refuses io_uring and line-discipline autoload: a database's user gets no module surface", () => {

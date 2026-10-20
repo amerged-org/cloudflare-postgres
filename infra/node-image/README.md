@@ -411,54 +411,98 @@ package from creating a default cluster.
   `PG_OOM_ADJUST_VALUE=0`: the postmaster is protected, backends are not.
 - **Sandbox:** `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
   `ProtectSystem=strict` with only the unit's own volume (a mount of its own) and the socket
-  directory writable; `ProtectHome`, `PrivateTmp`, `PrivateDevices`, a private `/dev/shm` of 64 MiB
-  mounted `noexec,nosuid,nodev`
-  (`TemporaryFileSystem`; a database's own size goes in a drop-in that applies at its next start);
+  directory writable; `ProtectHome`, `PrivateDevices`, and a private `/dev/shm` of 64 MiB, `/tmp`
+  and `/var/tmp` of 16 MiB and 1,024 files each, mounted `noexec,nosuid,nodev` (`TemporaryFileSystem`,
+  not `PrivateTmp`, which is a directory on the host's disk; a database's own `/dev/shm` size goes
+  in a drop-in that applies at its next start);
   `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`,
   `ProtectProc=invisible`, `ProcSubset=pid`; `RestrictNamespaces`, `RestrictRealtime`,
   `RestrictSUIDSGID`, `LockPersonality`, `NoNewPrivileges`, an empty `CapabilityBoundingSet`,
-  `RemoveIPC`, `PrivateIPC` and `InaccessiblePaths=-/run/lock -/dev/mqueue -/dev/pts` (below);
+  `RemoveIPC`, `PrivateIPC` and `InaccessiblePaths=-/run/lock -/dev/mqueue -/dev/pts
+  -/var/log/journal -/run/log/journal` (below);
   `SystemCallFilter=@system-service` minus `@privileged @resources` and minus what
   kernel exploits use as a second stage and PostgreSQL does not need (`@keyring`,
   `io_uring_setup/enter/register`, `userfaultfd`, the SysV message queues and semaphores `msg*` and
   `sem*`, the POSIX message queues `mq_*`; `shmget`, `shmat`, `shmdt` and `shmctl` stay; a forbidden
   call kills the process), `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`.
-- **Nothing writable is shared with another unit** (`PrivateIPC=yes` and `InaccessiblePaths=-/run/lock
-  -/dev/mqueue -/dev/pts`). Found on EU1 by the node lab, 2026-10-20: inside the full directive set a
-  database's user could create files in `/run/lock` (a 5 MiB tmpfs of the whole node, mode 1777) and
-  in `/dev/mqueue` (the host's queues, mode 1777). The enumeration of what the user can write, made
-  in the lab for this change, found a third: `/dev/pts` is the host's devpts, bound into the private
+- **Nothing writable is shared with another unit** (`PrivateIPC=yes`, `InaccessiblePaths=-/run/lock
+  -/dev/mqueue -/dev/pts -/var/log/journal -/run/log/journal`, and `/tmp` and `/var/tmp` as tmpfs of
+  the unit). Found on EU1 by the node lab, 2026-10-20: inside the full directive set a database's
+  user could create files in `/run/lock` (a 5 MiB tmpfs of the whole node, mode 1777) and in
+  `/dev/mqueue` (the host's queues, mode 1777). The enumeration of what the user can write, made in
+  the lab for this change, found a third: `/dev/pts` is the host's devpts, bound into the private
   `/dev`, and one user allocated 3072 of the kernel's 4096 ptys from it (the listing shows every
   unit's). Every unit shared them: a place where one tenant leaves what another reads, files that
   outlive the unit in a tmpfs that LVM keeps its lock directory in, and a pty table one tenant can
-  fill. PostgreSQL uses none of them. Measured on systemd 257.13 (Debian 13, privileged
-  container with systemd as PID 1, the repository's unit with the volume bound from a directory):
+  fill. PostgreSQL uses none of them. Measured on systemd 257.13 (Debian 13, privileged container
+  with systemd as PID 1, the repository's unit with the volume bound from a directory):
   `PrivateIPC=yes` gives the unit a new IPC namespace and a mqueue instance of its own (a different
   `st_dev`, a file made in one is not in the other) but leaves the directory writable, so
   `/dev/mqueue` is inaccessible as well: the filter denies `mq_open`, and creating a file in the
-  directory makes the same queue. The inaccessible directories answer `EACCES`, and `/var/lock`, a link
-  to `/run/lock`, with them. PostgreSQL 18.6 starts and serves in the unit (DDL, DML, a parallel query
-  through dynamic shared memory in the private `/dev/shm`, a clean stop and a start after it): its SysV
-  segment (56 bytes) is in the unit's namespace and in no other, and semaphores are the unnamed POSIX
-  ones in shared memory. `RemoveIPC=yes` stays: it removes the objects of the user in the host's
-  namespace, where a job of the same user could leave some. Cost: fork to handoff 32.0 against
-  31.4 ms and 29.3 against 28.9 ms at p50 in two runs of 40 interleaved pairs each on the laptop's
-  Docker VM (arm64), so about 0.5 ms; EU1 is measured by the acceptance in the plan (11.2).
+  directory makes the same queue. The inaccessible directories answer `EACCES`, and `/var/lock`, a
+  link to `/run/lock`, with them. PostgreSQL 18.6 starts and serves in the unit (DDL, DML, a
+  parallel query through dynamic shared memory in the private `/dev/shm`, a clean stop and a start
+  after it): its SysV segment (56 bytes) is in the unit's namespace and in no other, and semaphores
+  are the unnamed POSIX ones in shared memory. `RemoveIPC=yes` stays: it removes the objects of the
+  user in the host's namespace, where a job of the same user could leave some. What
+  `PrivateIPC=yes` costs the interlock is under Not set below.
+  **The journal.** journald's `SplitMode=uid` (the default) keeps
+  `/var/log/journal/<machine>/user-<uid>.journal` (and `/run/log/journal/...` before the flush) for
+  every database uid, with a POSIX ACL that grants that uid read access, in a directory every user
+  may traverse (EU1: 371 files, read-only check of 2026-10-20). The unit's user reads its own file
+  (the lab shows it): its PostgreSQL log, DETAIL lines with data values included. That is a leak
+  between tenants as soon as a uid is used twice, and the agent does that: `Users::release` frees a
+  database's uid when the database leaves the node, `remove_account` deletes no journal file, and
+  `allocate` gives the uid to a later database whose SHA-256 preference or linear probe lands on
+  it, which then reads the former owner's `user-<uid>.journal` and its archived files by the
+  numeric ACL (in the lab the deleted databases left eight such files behind, and a process with
+  the uid of one read it while another uid could not). Both journal directories
+  are inaccessible in the unit now; PostgreSQL logs through `/run/systemd/journal/stdout`, which
+  stays (the lab shows its lines in the journal by invocation, the way the agent reads them). The
+  pool removes the files at the source with `SplitMode=none` (plan 11.2, package P).
+  **Scratch space.** `PrivateTmp=yes` made `/tmp` and `/var/tmp` directories on the host's root
+  filesystem (8 GiB, no quota), and disk blocks are no memory that `MemoryMax` counts: an awake
+  tenant could fill the root filesystem, which stops the journal and the agent's state writes for the
+  whole node. They are tmpfs of the unit now, 16 MiB and 1,024 files each (`TemporaryFileSystem`,
+  `noexec,nosuid,nodev`, as the 64 MiB of `/dev/shm`), their pages count in the unit's memory, and
+  a write past the limit fails (the boot test writes 17 MiB). PostgreSQL uses neither directory.
+  **Not bounded: the socket directory.** `/run/pgcf/<id>` is a directory on the node's `/run`
+  tmpfs, and the unit's user writes there (the socket and its lock file). Lab, 2026-10-20 (a unit
+  with `MemoryMax` 256 MiB, `MemoryHigh` 230 MiB and no swap): a file a tenant writes there is the
+  unit's memory while the unit runs (the writer is throttled at `MemoryHigh` and stops near
+  245 MiB), and it stays when the unit stops, charged to `pgcf.slice` and counted in `/run` (215
+  MiB used after the stop). A tenant can leave up to its `MemoryMax` in `/run` for good, and enough
+  databases fill `/run`: the device links under `/run/pgcf/dev`, systemd's runtime files and LVM's
+  locks stop working, and no database on the node can wake. This is open (plan 11.2): the files
+  have to leave with the unit, either by the agent emptying the directory at every stop or by a
+  tmpfs of its own with a size and an inode limit; a tmpfs per database in PID 1's namespace would
+  cost every start about 1 ms per database (Stage 1), so the pool's design (package P)
+  decides.
   **What a database's user can still write**, enumerated inside the running unit as that user
-  (`find / -writable`, symbolic links resolved): its own volume, its socket directory and the lock file
-  in it, the private `/tmp`, `/var/tmp` and `/dev/shm`, and the pressure file of its own cgroup (systemd
-  hands it to the unit's user); the character devices of the private `/dev` (`null`, `zero`, `full`,
-  `random`, `urandom`, `tty`), which hold nothing; and the sockets of services that check their
-  caller: the journal's (`dev-log`, `socket`, `stdout`), systemd's notify socket (only the main process
-  of a unit with `NotifyAccess=main` counts) and its varlink sockets, and D-Bus's system bus socket,
-  where the bus policy and polkit refuse a change. The backup jobs (`archive/job.rs`) run as the
-  database's user with a smaller set and still see the host's `/run/lock` and `/dev/mqueue`; they run
-  the node's barman, not a tenant's code, so they are not closed here. The boot test enumerates the
-  directories and regular files a database's user can write and fails on any other than the unit's
-  own. journald's `SplitMode=uid` keeps a `user-<uid>.journal` file with a read ACL for each database
-  uid, and the unit's user can read its own (the lab shows it); with one fixed uid per database that
-  is the database's own log, and it is why a uid used by two databases would need `SplitMode=none`
-  first (plan, section 8).
+  (`find / -writable`, symbolic links resolved): its own volume, its socket directory and the socket
+  and lock file in it, the private `/tmp`, `/var/tmp` and `/dev/shm`, and the pressure file of its
+  own cgroup (systemd hands it to the unit's user); the character devices of the private `/dev`
+  (`null`, `zero`, `full`, `random`, `urandom`, `tty`), which hold nothing; and sockets, each on the
+  boot test's explicit list and each answered by a service that checks its caller:
+  - journald's `/run/systemd/journal/socket`, `dev-log` and `stdout` (the unit's log goes there);
+  - systemd's notify socket `/run/systemd/notify` (only the main process of a unit with
+    `NotifyAccess=main` counts) and its varlink sockets, `io.systemd.*` in `/run/systemd` and in its
+    `userdb`, `netif` and `resolve` directories (PID 1, networkd and hostnamed make them; each
+    answers by the caller's rights);
+  - D-Bus's system bus socket `/run/dbus/system_bus_socket`, where the bus policy and polkit refuse
+    a change;
+  - **the agent's archive socket `/run/pgcf/agent/archive.sock`** (mode 0666 in the agent's
+    `RuntimeDirectory=pgcf/agent`, mode 0755; `archive/server.rs`). It is the endpoint every
+    database's archive command calls (`pgcf-archive`, `pgcf-wal-fetch`), and it authorizes a call by
+    the kernel's report of the caller's uid (`SO_PEERCRED`) alone, which names one database while a
+    uid belongs to one. A uid used by a second database (the pool, plan 11.2) needs more than the
+    uid: the slot's cgroup and invocation.
+  The gateway's socket `/run/pgcf/agent/gateway.sock` is mode 0600 and not on the list. The boot
+  test enumerates the directories, regular files, sockets and FIFOs a database's user can write and
+  fails on any other than the unit's own or those on the list (a FIFO is never expected), so the
+  image's sockets and the next one anyone adds are seen. The backup jobs (`archive/job.rs`) run as
+  the database's user with a smaller set and still see the host's `/run/lock` and `/dev/mqueue`;
+  they run the node's barman, not a tenant's code, so they are not closed here.
 - **Device policy:** with `PrivateDevices=yes` the policy is closed, and systemd adds to the policy of
   every unit with `MountImages=` the devices that image dissection touches: `block-device-mapper`,
   `block-blkext` and `block-loop` (`rwm`), `/dev/mapper/control` and `/dev/loop-control` (`rw`), next
@@ -486,14 +530,35 @@ package from creating a default cluster.
   (see the rollout below).
 - **Not set:** `PrivatePIDs`, because PostgreSQL's `postmaster.pid` interlock needs the units to
   share the PID namespace: a second postmaster on a running database's directory finds the first
-  with `kill(pid, 0)`. `PrivateIPC` is set although the other half of the interlock, the check of the
-  SysV segment named in `postmaster.pid`, cannot reach across IPC namespaces (a segment of another
-  namespace is not found, so it counts as gone); the pid half refuses a second postmaster of the same
-  user at once ("lock file postmaster.pid already exists", measured in the lab and asserted by the boot
-  test). It would not refuse one of another user: `kill` answers `EPERM`, which PostgreSQL reads as a
-  stale file, and the segment of another user as foreign. A database has one user, so the agent's one
-  writer per database is what stops a second start today. `unix_socket_group`, because PostgreSQL
-  would call `chown`, which the filter kills.
+  with `kill(pid, 0)`. `unix_socket_group`, because PostgreSQL would call `chown`, which the filter
+  kills.
+- **What `PrivateIPC=yes` takes from the interlock, and what replaces it.** PostgreSQL refuses a
+  second postmaster on a data directory in two ways: the pid in `postmaster.pid` is alive
+  (`kill(pid, 0)`), and the SysV segment named there is still attached. The second way is what
+  protects a database from a backend that outlives its postmaster, and a new IPC namespace at every
+  start blinds it. Lab (systemd 257.13, PostgreSQL 18.6): a backend was stopped (`SIGSTOP`), its
+  postmaster killed (`SIGKILL`), and the segment stayed attached (`nattch` 1). A second postmaster in
+  the same IPC namespace was refused ("pre-existing shared memory block ... is still in use"); one
+  in a new IPC namespace, which `PrivateIPC=yes` gives every start, ran "database system was not
+  properly shut down; automatic recovery in progress" while the old backend was alive. The real path
+  to it is a backend in uninterruptible sleep through both stop timeouts ("Processes still around
+  after final SIGKILL"): the unit is `failed` with a process in its cgroup, the sleep proof fails,
+  the agent starts the unit to recover the database, and systemd starts a unit over a process of its
+  cgroup ("Found left-over process ... while starting unit. Ignoring."; reproduced in the lab, where
+  the new postmaster recovered the data directory beside the stopped backend). **The agent refuses
+  that start:** `Units::start` reads the unit's `cgroup.events`, and a unit that is not running
+  (`failed` or `inactive`) whose cgroup says `populated 1` is not started (`Error::StrayProcesses`,
+  the diagnostic class `units_stray_processes`); the wake or the recovery fails like any failed
+  start, is tried again, and goes through when the process is gone. A stopped unit has no cgroup,
+  so the common case is one failed `open`. The lab test
+  `a_start_is_refused_while_a_process_of_an_earlier_start_is_in_the_units_cgroup` (`units/lab.rs`)
+  fails without it (the start succeeds beside the stopped backend) and passes with it. The pid half
+  still refuses a second postmaster of the same user
+  while a postmaster lives (the boot test asserts it). Neither half refuses one of another user:
+  `kill` answers `EPERM`, which PostgreSQL reads as a stale file (`miscinit.c`), and an unreadable
+  segment as foreign (`sysv_shmem.c`, `EACCES`): a database has one user, so the agent's one writer
+  per database is what stops a second start today, and a pooled slot user needs the supervisor's
+  lock (plan 11.2, package P).
 
 ### The agent unit
 
@@ -628,6 +693,10 @@ token or the route keyring changed.
   starts, because `/run` is empty after a boot. It clears the database's `CPUQuota` (`CPUQuota=`)
   whenever the database stops and, when the agent itself starts, for every stopped `pgcf-pg@` unit:
   a quota that outlived a stop or an agent crash would throttle the next start.
+- It does not start a database's unit while the unit is not running and its cgroup still holds a
+  process (`cgroup.events` says `populated 1`): the unit has a new IPC namespace at every start, so
+  PostgreSQL could not find a backend that outlived its postmaster by its shared memory segment
+  (see Not set, above).
 - Its sockets are `/run/pgcf/agent/gateway.sock` (gateway only) and `/run/pgcf/agent/archive.sock`
   (databases, identified by uid); the archive clients are reached as
   `/usr/libexec/pgcf/pgcf-archive` and `/usr/libexec/pgcf/pgcf-wal-fetch`.
