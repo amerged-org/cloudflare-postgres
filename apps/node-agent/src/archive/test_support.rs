@@ -206,7 +206,8 @@ printf ']}}\n'
     fn store(&self, file: &str) -> PathBuf {
         self.root.join("store").join(file)
     }
-    /// Switches a behaviour of the commands on (`fail`, `fetch-fail`) or sets it (`delay`).
+    /// Switches a behaviour of the commands on (`fail`, `fetch-fail`, `backup-fail`) or sets it
+    /// (`delay` of the WAL commands and `backup-delay` of the base backup, in seconds).
     pub fn set(&self, flag: &str, value: &str) {
         fs::write(self.store(flag), value).unwrap();
     }

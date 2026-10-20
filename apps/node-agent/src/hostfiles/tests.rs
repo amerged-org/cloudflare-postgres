@@ -178,13 +178,20 @@ fn the_page_of_the_contract_is_read_and_its_lines_are_the_manifests() {
     // A page of any other shape is no host file.
     for broken in [
         serde_json::json!({"path": "/etc/sysctl.d/a.conf", "kind": "link", "apply": "daemon_reload"}),
-        serde_json::json!({"path": "/etc/sysctl.d/a.conf", "kind": "file", "apply": "daemon_reload", "url": "https://x.example/a"}),
         serde_json::json!({"kind": "file", "apply": "daemon_reload"}),
         serde_json::json!("a path"),
         Value::Null,
     ] {
         assert_eq!(HostFile::parse(&broken), None, "{broken}");
     }
+    // A property the page adds is ignored: a file is read by its signed digest from beside the
+    // agent's binary, so a URL or bytes that come with an entry are never used.
+    let plain = serde_json::json!({"path": "/etc/sysctl.d/a.conf", "kind": "file", "apply": "daemon_reload"});
+    let mut later = plain.clone();
+    later["url"] = "https://x.example/a".into();
+    later["content"] = "kernel.panic=0".into();
+    assert!(HostFile::parse(&plain).is_some());
+    assert_eq!(HostFile::parse(&later), HostFile::parse(&plain));
 }
 
 #[test]

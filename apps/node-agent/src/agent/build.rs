@@ -335,6 +335,9 @@ impl<M: Machine> Core<M> {
         if !backup_due(held.as_ref(), Some(timeline), now) {
             return Ok(false);
         }
+        // Minutes for a large database, under the flow of a database that is served: a burst of a
+        // wake does not wait behind it (plan 4.4).
+        self.end_burst(db).await;
         let taken = async {
             let account = self.machine.account(&db.id).ok_or("backup_failed")?;
             let store = self

@@ -269,6 +269,15 @@ signer accepts (`ReleaseManifestFields`, the signer builds the text itself), the
 its page, the text the API rebuilds from a spec, and the page the API serves. The order that never leaves
 a push to `main` unsigned for long and never installs a release nobody could verify is:
 
+**Two releases first.** An agent builds the signed text from its page, so a node whose agent builds
+the older text refuses a release signed for the new one (`release_signature_invalid`) and only a hand
+replacement of its agent moves it. A change of the manifest is therefore two releases (the last
+row of the table in plan 9.3, "Changing the page"): the first ships an agent that verifies both
+texts (the page carries the new fact as an optional property, which agents that do not know it
+ignore), registered and signed in the older format; when every node runs it (`converged`), the
+steps below switch the signer, the API and CI to the new text. Doing the steps below for a node
+that has not taken the first release is the case that needs the hand replacement.
+
 1. Deploy the signer from a checkout of the branch tip that is about to be merged (`cd
    apps/release-signer && npx wrangler deploy`). The signer bundles the manifest's contract
    (`ReleaseManifestFields`), so the checkout has to hold the new one even where the signer's own files
@@ -289,9 +298,10 @@ a push to `main` unsigned for long and never installs a release nobody could ver
 4. Download the two artifacts of that run, check out the commit that was built, register the release
    (`register-node-image.ts`, `--signature`) and assign it to the region from revision 0
    ([infra/node-image/README.md](../../infra/node-image/README.md)). The API refuses a release signed for
-   the older format with 400, and a node of an older build that cannot read the new page needs the one-time
-   replacement of its agent ([operator-installation.md](operator-installation.md), "Replacing the agent by
-   hand"); the agent of this release is the one to put there.
+   the older format with 400, and a node whose agent builds only the older text refuses this release
+   (`release_signature_invalid`) and needs the one-time replacement of its agent
+   ([operator-installation.md](operator-installation.md), "Replacing the agent by hand"); the agent of
+   this release is the one to put there.
 
 ## Rotating the key
 

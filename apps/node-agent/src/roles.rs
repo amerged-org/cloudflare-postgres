@@ -7,6 +7,7 @@
 
 use crate::{
     Error,
+    node_link::constant,
     postgres::{
         DEPENDENCIES_QUERY, MEMBERSHIP_QUERY, ROLE_CATALOG_QUERY, SESSIONS_QUERY, Session,
         TERMINATE_QUERY,
@@ -48,6 +49,21 @@ pub enum Wanted {
     Absent(String),
 }
 
+/// Whether a role entry of the page is a removal (`DesiredRoleRemoval`): `state: "absent"` and no
+/// property of a present role. The schema the node holds is open, so that a property it does not
+/// know is ignored; a present role that also says `state: "absent"` is then valid to it (it
+/// matches either variant), and the removal would set it NOLOGIN, end its sessions and drop it.
+/// The contract refuses such a role, and so does the node.
+pub(crate) fn removal(role: &Value) -> bool {
+    role["state"] == "absent"
+        && constant("PRESENT_ROLE_PROPERTIES")
+            .as_array()
+            .expect("generated role properties")
+            .iter()
+            .filter_map(Value::as_str)
+            .all(|property| role.get(property).is_none())
+}
+
 /// A role name as the contract allows it (`^[a-z][a-z0-9_]{0,62}$`), which needs no quoting.
 fn role_name(name: &str) -> bool {
     (1..=63).contains(&name.len())
@@ -65,7 +81,7 @@ pub fn parse(roles: &[Value]) -> Option<Vec<Wanted>> {
         .map(|role| {
             let name = role["name"].as_str().filter(|name| role_name(name))?;
             if role.get("state").is_some() {
-                return (role["state"] == "absent").then(|| Wanted::Absent(name.into()));
+                return removal(role).then(|| Wanted::Absent(name.into()));
             }
             let member_of = role["member_of"]
                 .as_array()
@@ -448,6 +464,46 @@ mod tests {
         ] {
             assert!(parse(std::slice::from_ref(&broken)).is_none(), "{broken}");
         }
+    }
+
+    #[test]
+    fn a_role_is_present_or_removed_never_both() {
+        let properties: Vec<&str> = constant("PRESENT_ROLE_PROPERTIES")
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|property| property.as_str())
+            .collect();
+        assert_eq!(
+            properties,
+            [
+                "owner",
+                "password",
+                "revision",
+                "valid_until",
+                "connection_limit",
+                "member_of",
+                "bypass_rls"
+            ]
+        );
+        let mut present = json!({"name":"reader","owner":false,"password":pw(),"revision":2,
+            "valid_until":"2031-01-02T03:04:05.678Z","connection_limit":5,"bypass_rls":true});
+        assert!(matches!(
+            wanted(json!([present.clone()]))[0],
+            Wanted::Present(_)
+        ));
+        // With `state: "absent"` added it is not read as a removal that drops the role.
+        present["state"] = json!("absent");
+        assert!(parse(std::slice::from_ref(&present)).is_none());
+        // A removal that names any one property of a present role is refused, whatever its value.
+        for property in properties {
+            let removal = json!({"name":"gone","state":"absent",property:null});
+            assert!(parse(std::slice::from_ref(&removal)).is_none(), "{removal}");
+        }
+        assert_eq!(
+            wanted(json!([{"name":"gone","state":"absent"}])),
+            [Wanted::Absent("gone".into())]
+        );
     }
 
     #[test]
