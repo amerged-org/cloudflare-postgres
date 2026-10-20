@@ -6,7 +6,9 @@
 -- lacks the field, so that the burst is on from the first wake once the nodes run an agent that
 -- applies it; a policy that has the field keeps its value. The agent of main `1ace7446` refuses a
 -- page that carries the field, so the release whose agent ignores unknown properties is assigned
--- before this migration is deployed (plan 11.2, CPU burst).
+-- before this migration is deployed (plan 11.2, CPU burst). A rollback of the API Worker alone does
+-- not undo this migration, and the older API refuses a stored policy with the field: the recovery is
+-- in operator-installation.md, "If an agent cannot read the page".
 UPDATE node_region_policies
 SET node_policy_json = json_set(node_policy_json, '$.admission.cpu_boost_ms', 5000)
 WHERE node_policy_json IS NOT NULL

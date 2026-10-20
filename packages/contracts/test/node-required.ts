@@ -1,20 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * The required properties of every object of the node's schemas (`native/node.generated.json`),
- * by the path of the object: `.name` for a property, `[]` for the items of a list, `|type=wake`
- * (or the index) for a variant. `node-compat.test.ts` fails when a schema has a required property
- * that is not listed, or a listed one that is not required, so that a new required property is a
- * decision of the author and a line in this file.
+ * by the path of the object (the paths are explained in `node-schema-walk.ts`). `node-compat.test.ts`
+ * fails when a schema has a required property that is not listed, or a listed one that is not
+ * required, so that a new required property is a decision of the author and a line in this file.
  *
- * THE RULE (ULTRA plan 9.3 and docs/operations/operator-installation.md, "Changing the page"). The
- * API deploys before the nodes, so for a release a running agent meets an API that is newer, and
- * the API meets agents that are older. A property that is required from the start breaks one of
- * them: an agent refuses the page of an API that does not send it yet, and an API refuses the
- * hello or the report of an agent that does not send it yet. So a property starts optional
- * (`.optional()` or `.default(...)` in `src/node-link.ts`, the default written in its comment),
- * which changes nothing here, and a line is added below only in the release after every node
- * runs an agent that knows it. A line added in the release that adds the property is a breaking
- * change, and the plan's row for the release says why it is safe.
+ * When a line may be added is the rule of the plan, 9.3 "Changing the page" (its table), which
+ * is written there once. In short: a property starts optional, `.optional()` or `.default(...)`,
+ * and its line is added only in a later release, when every node knows it. A line added in the
+ * release that adds the property is a breaking change, and the plan's row for the release says why
+ * it is safe.
  */
 export const NODE_REQUIRED: Record<string, string[]> = {
   "AgentLinkMessage|type=hello": [
@@ -147,13 +142,13 @@ export const NODE_REQUIRED: Record<string, string[]> = {
     "memory_mib",
     "storage_gib",
   ],
-  "NodeDesiredPage.databases[].roles[]|bypass_rls=true": [
+  "NodeDesiredPage.databases[].roles[]|0": [
     "name",
     "owner",
     "password",
     "revision",
   ],
-  "NodeDesiredPage.databases[].roles[]|state=absent": ["name", "state"],
+  "NodeDesiredPage.databases[].roles[]|1": ["name", "state"],
   "NodeDesiredPage.databases[].settings": [
     "archive_timeout_seconds",
     "max_connections",

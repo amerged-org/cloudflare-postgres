@@ -638,47 +638,62 @@ assign such a release to a region that has running nodes; the change reaches EU1
 The desired page (a field of the policy, the release, an entry, a role, an order or a probe), the
 credentials and the API's answers are read by the agent with every object open: **a property the
 agent does not know is ignored**, so a release that adds one reaches a running node by the release
-path, with no replacement of the agent (plan 9.3, "Changing the page"). What the agent still
-refuses, whole, is a page it cannot read: a missing required property, a wrong type, a number out
-of bound, a value outside a closed set (an enum, a type of order, a kind of origin or host file, a
-link message), and a property of the other kind of origin (a move with a `target_time`, a restore
-with an `end`). The contract stays strict on the API's side, so the API never sends or accepts a
-property by accident. The rules for the author of a change are in the header of
-`packages/contracts/src/node-link.ts` and in `packages/contracts/test/node-required.ts`, which fails
-until a required property is a line of it:
+path, with no replacement of the agent. What the agent still refuses, whole, is a page it cannot
+read: a missing required property, a wrong type, a number out of bound, a value outside a closed
+set (an enum, a type of order, a kind of origin or host file, a link message), and a property of the
+other kind of origin (a move with a `target_time`, a restore with an `end`). The contract stays
+strict on the API's side, so the API never sends or accepts a property by accident, and what the
+agent sends is held to it.
 
-1. **A new property is optional, with its default.** `.optional()` or `.default(...)` in the
-   contract, the default written in its comment, vectors with and without it, the Rust consumer
-   with `#[serde(default)]` or `get`, and the generated files (`node packages/contracts/native/generate-node.ts`).
-   The API sends it at once; an agent that does not know it ignores it and an agent that does uses
-   the default when a page leaves it out. A property that would change what an old agent does when it
-   is ignored (a restriction, another way to read a time) is not additive: use rule 3.
-2. **It becomes required only in the release after every node runs the agent that knows it**
-   (`GET /v1/nodes/{id}/release`: `converged` on every node of every region), by adding its line to
-   `node-required.ts`. A property the agent sends (the hello, the reports) follows the same rule:
-   the API deploys first and knows it as optional, the agent sends it from its release, and the API
-   requires it only in the release after every agent sends it. The API serves no answer in an old
-   form for the hello of an older agent, because it never requires what the agent in the field does
-   not send. The facts the release key signs (`release.image`, `release.binaries`, `release.os` and
-   its host files) and the digests of them that the hello reports stay required: the agent builds the
-   signed text from them.
-3. **A rename, a removal, a type change, a new value of a closed set, a new type of order and a new
-   kind of origin, host file or link message go in two releases, agent first.** The first release
-   ships an agent that reads the old and the new form; assign it and wait until every node is
-   `converged` on it; only then deploy the API of the second release, which changes what it sends.
-   A change of the signed manifest (a new line of it) is the same: the first agent verifies the old
-   and the new text while the signer still signs the old, and the second switches the signer.
-4. **The order of deploy** for an additive change does not matter: deploy the API, then register
-   and assign the release (the usual order), or the other way round. For rule 3 the order is the
-   rule.
+**The rule for the author of a change is the table in
+[plan 9.3, "Changing the page"](../architecture/cloudflare-convergence-and-serverless-plan.md); it is
+written there once, by the kind of change and by the direction (what the node receives, what it
+sends), and nothing of it is repeated here.** What an operator does with it:
 
-If an agent meets a page it cannot read it applies none of it (no entry, no order, no release; what
-runs keeps running) and logs `desired_pull_failed` with the class `cloudflare_desired_page_invalid`,
-or `cloudflare_desired_page_has_an_order_this_agent_does_not_know` for an order of a type it does
-not read. Read it with the `journal` probe ([recovery](recovery.md#looking-at-a-node)), roll the
-API Worker back to the version before the change, assign the release whose agent reads the page,
-wait until the node is `converged`, and deploy again. Replacing the agent by hand is the last
-resort.
+- Before a release or an API deploy, find the row of its change in the table and keep its order.
+  Where the row says "the release after every node runs it", that is `converged` on every node of
+  every region (`GET /v1/nodes/{id}/release`), not a time that has passed.
+- **EU1 today** runs the agent of main `1ace7446`, which is strict: the rule starts with the agent
+  that ignores unknown properties, so the first change after it is not "any order". Register and
+  assign that release first, while the API is still the older one, and deploy the API (with migration
+  `0081`) after the node runs it: the order of the plan's row for the CPU burst (11.2). The API first
+  would leave the agent unable to read the page that assigns the release, which is the hand
+  replacement above.
+- A change of the signed manifest is two releases as well
+  ([release-signing.md](release-signing.md#changing-the-manifest)).
+
+#### If an agent cannot read the page
+
+It applies none of the page (no entry, no order, no release; what runs keeps running) and reports
+`desired_pull_failed` with the class `cloudflare_desired_page_invalid`, or
+`cloudflare_desired_page_has_an_order_this_agent_does_not_know` for an order of a type it does not
+read. A rule of the table was broken, or the API sent a page that does not match its own contract.
+
+1. **Read the refusal in Workers Logs,** not with a probe. The line has `event` `node_event`,
+   `node_event` `desired_pull_failed`, the `node_id` and the `class`. Probe requests (`journal` and
+   the others) travel on the desired page, which the agent refuses, and it answers a probe only after
+   it has pulled a page, so none is answered. The event does reach Cloudflare: the agent posts its
+   event ring by itself, with no page.
+2. **Make the API send a page the agent reads.** Rolling forward with a fix is the safe way. A
+   rollback of the API Worker alone is not: **it does not undo what the newer API wrote to D1**, and
+   the older API refuses or misreads that, so check what it left before rolling back.
+   - *A stored policy with a field the older API does not know.* The next deploy is the case:
+     migration `0081` writes `policy.admission.cpu_boost_ms` into `node_region_policies`, and the API
+     of `1ace7446` parses the stored policy with its strict `NodePolicy`, so after a Worker-only
+     rollback `GET /v1/regions/{id}/node-policy` and every page of the region return 500 and no
+     release reaches the node. With the rollback, `PUT /v1/regions/{id}/node-policy` the policy
+     without `cpu_boost_ms` through the older API (it replaces the stored policy without reading it);
+     after rolling forward, `PUT` it with `cpu_boost_ms` `5000` again, because migration `0081` is
+     applied once and does not run a second time.
+   - *Open orders of a type the older API does not know.* It reads every open order that is neither a
+     `move` nor `maintenance` as `superseded`, which retires the storage generation the row names (the
+     node never starts or archives it again), or it fails the page when the row has none. List them
+     first (`SELECT type, count(*) FROM lifecycle_orders WHERE closed_at IS NULL GROUP BY type`) and do
+     not roll back while orders of the new type are open: closing them is a write to D1 that needs the
+     owner's go, and the order is lost.
+3. **Then the release path works again:** assign the release whose agent reads the page, wait until
+   the node is `converged`, and deploy the API again, with the `PUT` of step 2 where it applies.
+   Replacing the agent by hand is the last resort.
 
 ## API-only resource profiles and regional configuration
 

@@ -8,7 +8,9 @@ import node from "../native/node.generated.json" with { type: "json" };
 import vectors from "../native/node-vectors.generated.json" with { type: "json" };
 import { nodeReceives, nodeSchemas } from "../native/node-vectors.ts";
 import { NodeDesiredPage, NodePolicy } from "../src/node-link.ts";
+import { NODE_CLOSED_SETS } from "./node-closed-sets.ts";
 import { NODE_REQUIRED } from "./node-required.ts";
+import { closedSets, requiredProperties } from "./node-schema-walk.ts";
 
 type Schema = {
   required?: string[];
@@ -60,28 +62,6 @@ const opened = (schema: unknown): unknown =>
       key === "additionalProperties" && value === false ? undefined : value,
     ),
   );
-
-/**
- * The required properties of every object of a schema, by the path of the object: `.name` for a
- * property, `[]` for the items of a list and `|type=wake` (or the index) for a variant.
- */
-function requiredProperties(schema: Schema, path: string) {
-  const out: Record<string, string[]> = {};
-  if (schema.required?.length) out[path] = [...schema.required].sort();
-  for (const [key, child] of Object.entries(schema.properties ?? {}))
-    Object.assign(out, requiredProperties(child, `${path}.${key}`));
-  if (schema.items)
-    Object.assign(out, requiredProperties(schema.items, `${path}[]`));
-  for (const variants of [schema.anyOf, schema.oneOf])
-    variants?.forEach((variant, index) => {
-      const tag = Object.entries(variant.properties ?? {}).find(
-        ([, child]) => child.const !== undefined,
-      );
-      const label = tag ? `${tag[0]}=${String(tag[1].const)}` : index;
-      Object.assign(out, requiredProperties(variant, `${path}|${label}`));
-    });
-  return out;
-}
 
 /** The example page of the contract with one property of its own added at `path`. */
 function withExtra(path: Path) {
@@ -201,12 +181,10 @@ describe("a property of the page starts optional", () => {
   });
 
   it("lists every property that is required, so that a new one is a decision", () => {
-    // A property added to a schema the node sends or reads as REQUIRED breaks the other end
-    // while the nodes and the API run different releases: an API that requires a field of the
-    // hello refuses every agent that does not send it yet, and an agent that requires a field of
-    // the page refuses the page of an API that does not send it yet. The release that adds a
-    // property adds it optional (`.optional()` or `.default(...)`); `test/node-required.ts` takes
-    // a name only in the release after every node runs the agent that knows it.
+    // While the nodes and the API run different releases, a REQUIRED property breaks the other
+    // end: an API refuses the hello of an agent that does not send it yet, and an agent refuses
+    // the page of an API that does not send it yet. When a line may be added here is the table in
+    // plan 9.3.
     const found: Record<string, string[]> = {};
     for (const [name, schema] of Object.entries(schemas))
       Object.assign(found, requiredProperties(schema, name));
@@ -219,13 +197,42 @@ describe("a property of the page starts optional", () => {
           .filter((name) => !to[path]?.includes(name))
           .map((name) => `${path}.${name}`),
       );
+    const added = diff(found, NODE_REQUIRED);
+    const ofReceived = (entry: string) => received(entry.split(/[.|[]/)[0]!);
     expect(
-      diff(found, NODE_REQUIRED),
-      "required properties added: make each optional with a default first (operator-installation.md, 'Changing the page')",
+      added.filter(ofReceived),
+      "required properties of what the node receives: a property starts optional with a default; read the table of plan 9.3, 'Changing the page', before taking a line in test/node-required.ts",
+    ).toEqual([]);
+    expect(
+      added.filter((entry) => !ofReceived(entry)),
+      "required properties of what the node sends: the API refuses a hello or a report without one, so a property starts optional; read the table of plan 9.3, 'Changing the page', before taking a line in test/node-required.ts",
     ).toEqual([]);
     expect(
       diff(NODE_REQUIRED, found),
-      "required properties gone: remove them from test/node-required.ts",
+      "required properties gone: remove them from test/node-required.ts, after reading the rows for a removal and a rename in the table of plan 9.3, 'Changing the page' (an agent in the field may still send what the API stops accepting)",
+    ).toEqual([]);
+  });
+
+  it("lists every value of a closed set the node reads, so that a new one is a decision", () => {
+    // The node refuses a page with a value outside a closed set (an enum, a constant such as the
+    // type of an order or the kind of an origin), and the API deploys before the nodes. The order
+    // of releases for a new value is the table in plan 9.3; this list makes it a deliberate line.
+    const found: Record<string, unknown[]> = {};
+    for (const name of nodeReceives)
+      Object.assign(found, closedSets(schemas[name]!, name));
+    const values = (set: Record<string, unknown[]>, other: typeof set) =>
+      Object.entries(set).flatMap(([path, list]) =>
+        list
+          .filter((value) => !other[path]?.includes(value))
+          .map((value) => `${path}=${JSON.stringify(value)}`),
+      );
+    expect(
+      values(found, NODE_CLOSED_SETS),
+      "values added to a closed set the node reads: read the row for a new value in the table of plan 9.3, 'Changing the page', before taking a line in test/node-closed-sets.ts",
+    ).toEqual([]);
+    expect(
+      values(NODE_CLOSED_SETS, found),
+      "values gone from a closed set: remove them from test/node-closed-sets.ts",
     ).toEqual([]);
   });
 });

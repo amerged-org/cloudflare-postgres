@@ -271,13 +271,12 @@ a push to `main` unsigned for long and never installs a release nobody could ver
 
 **Two releases first.** An agent builds the signed text from its page, so a node whose agent builds
 the older text refuses a release signed for the new one (`release_signature_invalid`) and only a hand
-replacement of its agent moves it. A change of the manifest is therefore two releases
-([operator-installation.md](operator-installation.md#changing-the-page-no-hand-step), rule 3): the
-first ships an agent that verifies both texts (the page carries the new fact as an optional property,
-which agents that do not know it ignore), registered and signed in the older format; when every node
-runs it (`converged`), the steps below switch the signer, the API and CI to the new text. Doing the
-steps below for a node that has not taken the first release is the case that needs the hand
-replacement.
+replacement of its agent moves it. A change of the manifest is therefore two releases (the last
+row of the table in plan 9.3, "Changing the page"): the first ships an agent that verifies both
+texts (the page carries the new fact as an optional property, which agents that do not know it
+ignore), registered and signed in the older format; when every node runs it (`converged`), the
+steps below switch the signer, the API and CI to the new text. Doing the steps below for a node
+that has not taken the first release is the case that needs the hand replacement.
 
 1. Deploy the signer from a checkout of the branch tip that is about to be merged (`cd
    apps/release-signer && npx wrangler deploy`). The signer bundles the manifest's contract
