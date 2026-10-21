@@ -25,10 +25,12 @@ export const imageTree = join(import.meta.dirname, "mkosi.extra");
  * restarted (the agent's own last, by exiting), the template of the per-database unit gives a
  * running database its stop settings (`KillSignal=`, `TimeoutStopSec=`, `ExecStop=`) at its next
  * stop and everything else (the process, `ExecStart=`, `MountImages=`, `PrivateMounts=` and the
- * limits of its cgroup, which systemd does not re-apply at a reload) at its next start, a mask or a
- * slice needs nothing beyond the reload, and a sysusers or tmpfiles file is run through its tool
- * (systemd makes users at a boot only when /usr is newer than /etc/.updated, which a changed file
- * in /usr/lib/sysusers.d does not make it, so a reboot would not apply it).
+ * limits of its cgroup, which systemd does not re-apply at a reload) at its next start, the
+ * template of a slot likewise (and the agent stops the idle slots after the reload and builds them
+ * again from the new file), a mask or a slice needs nothing beyond the reload, and a sysusers or
+ * tmpfiles file is run through its tool (systemd makes users at a boot only when /usr is newer than
+ * /etc/.updated, which a changed file in /usr/lib/sysusers.d does not make it, so a reboot would
+ * not apply it).
  */
 export const HOST_FILE_APPLY: Record<string, HostFile["apply"]> = {
   "/etc/ssh/sshd_config.d/10-pgcf.conf": "restart_unit:ssh.service",
@@ -37,11 +39,13 @@ export const HOST_FILE_APPLY: Record<string, HostFile["apply"]> = {
   "/etc/systemd/system/modprobe@loop.service": "daemon_reload",
   "/usr/lib/sysctl.d/90-pgcf.conf": "restart_unit:systemd-sysctl.service",
   "/usr/lib/sysusers.d/pgcf.conf": "sysusers",
+  "/usr/lib/systemd/journald.conf.d/pgcf-split.conf": "restart_unit:systemd-journald.service",
   "/usr/lib/systemd/journald.conf.d/pgcf.conf": "restart_unit:systemd-journald.service",
   "/usr/lib/systemd/system/pgcf-agent.service": "restart_unit:pgcf-agent.service",
   "/usr/lib/systemd/system/pgcf-cloudflared.service": "restart_unit:pgcf-cloudflared.service",
   "/usr/lib/systemd/system/pgcf-gateway.service": "restart_unit:pgcf-gateway.service",
   "/usr/lib/systemd/system/pgcf-pg@.service": "next_start",
+  "/usr/lib/systemd/system/pgcf-slot@.service": "next_start",
   "/usr/lib/systemd/system/pgcf.slice": "daemon_reload",
   "/usr/lib/systemd/system/pgcfbackup.slice": "daemon_reload",
   "/usr/lib/tmpfiles.d/pgcf.conf": "tmpfiles",

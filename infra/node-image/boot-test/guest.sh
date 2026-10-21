@@ -158,6 +158,16 @@ journal_sync_interval() {
 	systemd-analyze cat-config systemd/journald.conf | grep -qx 'SyncIntervalSec=15s'
 }
 
+# A slot's uid is used by one database after another, and journald keeps a user-<uid>.journal file
+# with a read ACL for the uid of every user outside systemd's system, dynamic and container ranges
+# (SplitMode=uid, the default), so the image turns the split off.
+journal_not_split() {
+	# Read whole first: grep -q would end the pipe at the first match and pipefail would report the
+	# writer's SIGPIPE, which the drop-in before pgcf.conf makes likely.
+	local config
+	config=$(systemd-analyze cat-config systemd/journald.conf) && grep -qx 'SplitMode=none' <<<"$config"
+}
+
 inbound_dropped() {
 	nft list chain inet pgcf input | grep -q 'policy drop;'
 }
@@ -291,16 +301,33 @@ database_unit_sandbox() {
 	systemd-analyze security --no-pager pgcf-pg@pgcfboottest0000000.service | tail -n 1 | grep -q 'SAFE'
 }
 
+# D13: a slot is as closed as a database unit, so it rates SAFE and no worse than the database unit.
+slot_unit_sandbox() {
+	local slot database
+	slot=$(systemd-analyze security --no-pager pgcf-slot@boottest.service | tail -n 1) || return 1
+	database=$(systemd-analyze security --no-pager pgcf-pg@pgcfboottest0000000.service | tail -n 1) || return 1
+	grep -q 'SAFE' <<<"$slot" || {
+		echo "$slot"
+		return 1
+	}
+	awk -v slot="$slot" -v database="$database" '
+		function exposure(line) { sub(/^.*: /, "", line); return line + 0 }
+		BEGIN { exit !(exposure(slot) <= exposure(database)) }' || {
+		echo "the slot is exposed more than the database unit: $slot / $database"
+		return 1
+	}
+}
+
 # PostgreSQL reports ready only after crash recovery or a restore's replay, which Stage 1 measured
 # above systemd's default 90 s start timeout; the agent owns the deadline.
 database_unit_waits_for_recovery() {
-	[ "$(systemctl show --property=TimeoutStartUSec --value pgcf-pg@pgcfboottest0000000.service)" = infinity ]
+	[ "$(systemctl show --property=TimeoutStartUSec --value "$1")" = infinity ]
 }
 
 # The unit starts the postmaster alone: an ExecStartPre= process costs about 35 ms on every wake,
 # so the agent creates the socket directory instead (socket_directory).
 database_unit_has_no_start_pre() {
-	[ -z "$(systemctl show --property=ExecStartPre --value pgcf-pg@pgcfboottest0000000.service)" ]
+	[ -z "$(systemctl show --property=ExecStartPre --value "$1")" ]
 }
 
 # Plan 8: the filter is an allow-list (@system-service) with the deny lines subtracted, and systemd
@@ -308,7 +335,7 @@ database_unit_has_no_start_pre() {
 # the message queues or the SysV semaphores; PostgreSQL's shared memory calls must stay.
 database_unit_syscall_filter() {
 	local allowed name
-	allowed=$(systemctl show --property=SystemCallFilter --value pgcf-pg@pgcfboottest0000000.service | tr ' ' '\n')
+	allowed=$(systemctl show --property=SystemCallFilter --value "$1" | tr ' ' '\n')
 	for name in shmget shmat shmdt shmctl; do
 		grep -qx "$name" <<<"$allowed" || {
 			echo "denied $name"
@@ -382,6 +409,25 @@ database_unit_device_allow() {
 	[ "$(systemctl show --property=DevicePolicy --value pgcf-pg@pgcfboottest0000000.service)" = closed ] &&
 		[ "$(systemctl show --property=PrivateDevices --value pgcf-pg@pgcfboottest0000000.service)" = yes ] &&
 		[ -z "$(systemctl show --property=CapabilityBoundingSet --value pgcf-pg@pgcfboottest0000000.service | tr -d ' ')" ] ||
+		{
+			echo "the policy is not closed, the /dev not private or a capability is left"
+			return 1
+		}
+}
+
+# A slot has no MountImages=, so its policy has no block device: only the clock, from ProtectClock.
+# The volume it serves is a mount that the agent moves in, and it is as closed as the database
+# unit's: a private /dev and no capability.
+slot_unit_device_allow() {
+	local unit=pgcf-slot@boottest.service actual
+	actual=$(systemctl show --property=DeviceAllow --value "$unit" | grep -v '^$')
+	[ "$actual" = 'char-rtc r' ] || {
+		echo "DeviceAllow: $actual"
+		return 1
+	}
+	[ "$(systemctl show --property=DevicePolicy --value "$unit")" = closed ] &&
+		[ "$(systemctl show --property=PrivateDevices --value "$unit")" = yes ] &&
+		[ -z "$(systemctl show --property=CapabilityBoundingSet --value "$unit" | tr -d ' ')" ] ||
 		{
 			echo "the policy is not closed, the /dev not private or a capability is left"
 			return 1
@@ -471,6 +517,10 @@ database_user_reaches_no_block_device() {
 	*) echo "the probe in the unit failed" && return 1 ;;
 	esac
 }
+
+# The sockets that every unit of the image may reach, each answered by a service that checks its
+# caller (the list below, in database_user_shares_nothing_writable): an extended regular expression.
+checked_endpoints='^/run/systemd/journal/(socket|dev-log|stdout)$|^/run/systemd/notify$|^/run/systemd/(userdb/|netif/|resolve/)?io\.systemd\.[A-Za-z.]+$|^/run/dbus/system_bus_socket$|^/run/pgcf/agent/archive\.sock$'
 
 # Plan 8: nothing a database's user can write is shared with another unit. /run/lock (a tmpfs for the
 # whole node) and /dev/mqueue (the host's queues) are mode 1777 and were mounted read-write in every
@@ -569,7 +619,7 @@ database_user_shares_nothing_writable() {
 	#   authorizes by the kernel's report of the caller's uid alone (SO_PEERCRED).
 	# A FIFO is never expected.
 	endpoints=$(grep -E '^[sp] ' <<<"$found" | cut -c3- |
-		grep -vE "^/run/pgcf/$id/\.s\.PGSQL\.5432$|^/run/systemd/journal/(socket|dev-log|stdout)$|^/run/systemd/notify$|^/run/systemd/(userdb/|netif/|resolve/)?io\.systemd\.[A-Za-z.]+$|^/run/dbus/system_bus_socket$|^/run/pgcf/agent/archive\.sock$")
+		grep -vE "^/run/pgcf/$id/\.s\.PGSQL\.5432$|$checked_endpoints")
 	[ -z "$endpoints" ] || {
 		echo "a socket or FIFO the user can write and no one checks: $endpoints"
 		result=1
@@ -577,15 +627,38 @@ database_user_shares_nothing_writable() {
 	[ "$result" = 0 ]
 }
 
-# A database's journal is its own to nobody. journald's SplitMode=uid (the default) keeps a
+# A journal file as journald made it before the image turned the split off (journald.conf.d/
+# pgcf-split.conf): user-<uid>.journal, mode 0640 root:systemd-journal, with a POSIX ACL entry that
+# grants the uid read access. EU1 holds 371 of them and journald vacuums them only by age. The image
+# has no setfacl, so the ACL is written as the extended attribute that journald's own files carry.
+legacy_journal_file() {
+	local uid=$1 directory file
+	directory=$(find /var/log/journal /run/log/journal -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1)
+	[ -n "$directory" ] || return 1
+	file=$directory/user-$uid.journal
+	install -m 0640 -o root -g systemd-journal /dev/null "$file" || return 1
+	python3 -c '
+import os, struct, sys
+entry = lambda tag, perm, ident=0xFFFFFFFF: struct.pack("<HHI", tag, perm, ident)
+acl = struct.pack("<I", 2) + entry(0x01, 6) + entry(0x02, 4, int(sys.argv[2])) + entry(0x04, 4) + entry(0x10, 4) + entry(0x20, 0)
+os.setxattr(sys.argv[1], "system.posix_acl_access", acl)' "$file" "$uid" || {
+		rm -f "$file"
+		return 1
+	}
+	echo "$file"
+}
+
+# A database's journal is its own to nobody. journald's SplitMode=uid (the default) kept a
 # user-<uid>.journal file for every database uid with a POSIX ACL that grants that uid read access,
 # in a directory every user may traverse. The file holds PostgreSQL's log lines, DETAIL lines with
 # data values included. The agent frees a uid when its database leaves the node, and hands it to a
 # later database whose preferred or probed uid it is; the file stays, so the new tenant would read
-# the former one's log. The unit cannot see the journal directories (PostgreSQL logs through
-# /run/systemd/journal/stdout, which stays). The control: journald does keep the user's file.
+# the former one's log. The image has turned the split off, so journald makes no new file (the slot
+# test below), but the files it made stay: the unit cannot see the journal directories (PostgreSQL
+# logs through /run/systemd/journal/stdout, which stays). The control is such a file, made as
+# journald made them (legacy_journal_file): the user's uid reads it on the host.
 database_user_reads_no_journal() {
-	local id=pgcfcheckscratch0000 pid uid gid file own place result=0
+	local id=pgcfcheckscratch0000 pid uid gid fixture file place result=0
 	pid=$(systemctl show --property=MainPID --value "pgcf-pg@$id.service")
 	[ "${pid:-0}" -gt 0 ] || {
 		echo "the scratch database does not run"
@@ -597,10 +670,13 @@ database_user_reads_no_journal() {
 		nsenter --target "$pid" --mount --ipc -- setpriv --reuid="$uid" --regid="$gid" --clear-groups \
 			--bounding-set=-all --inh-caps=-all --no-new-privs -- "$@"
 	}
-	own=$(find /var/log/journal /run/log/journal -name "user-$uid.journal" 2>/dev/null | head -n 1)
-	[ -n "$own" ] || {
-		echo "journald keeps no per-uid journal of the unit's user: the probe proves nothing"
+	fixture=$(legacy_journal_file "$uid") || {
+		echo "no journal file could be made: the probe proves nothing"
 		return 1
+	}
+	setpriv --reuid="$uid" --regid="$gid" --clear-groups -- test -r "$fixture" || {
+		echo "the uid does not read the journal file on the host: the probe proves nothing"
+		result=1
 	}
 	while IFS= read -r file; do
 		if as_user test -r "$file"; then
@@ -615,6 +691,7 @@ database_user_reads_no_journal() {
 			result=1
 		fi
 	done
+	rm -f "$fixture"
 	[ "$result" = 0 ]
 }
 
@@ -689,6 +766,238 @@ database_second_postmaster_is_refused() {
 	[ "$(systemctl is-active "pgcf-pg@$id.service")" = active ]
 }
 
+# ---- The slot (pgcf-slot@.service; plan 11.2, package P).
+# A slot is the sandbox of a database unit with a pooled user, and that user's uid (300000 + n) is
+# used by one database after another, so these checks are about everything that keeps something by
+# uid: every mount, every file the uid can write or read, the IPC namespace, the POSIX queues, the
+# keyrings and the journal. The agent does not start slots yet, and the supervisor is not under
+# test: a runtime drop-in swaps ExecStart= for a process that logs one line and waits, and every
+# other directive is the template's. The users are made the way the agent makes them.
+slot_test_n=1000
+slot_control_n=1001
+# A uid in the slots' range that no slot has: what an unrelated tenant can read.
+slot_reference_uid=390000
+
+slot_account() {
+	groupadd -g $((300000 + $1)) "pgcf-slot-$1" &&
+		useradd -u $((300000 + $1)) -g "pgcf-slot-$1" -M -s /usr/sbin/nologin -d /nonexistent "pgcf-slot-$1"
+}
+
+# The slot's unit running with a drop-in; further arguments are settings of its [Service] section.
+slot_up() {
+	local n=$1 dropin=/run/systemd/system/pgcf-slot@$1.service.d
+	mkdir -p "$dropin" || return 1
+	printf '%s\n' '[Service]' 'Type=simple' 'ExecStart=' \
+		'ExecStart=/bin/sh -c "echo pgcf-slot-boot-test; exec sleep infinity"' "${@:2}" >"$dropin/boot-test.conf"
+	systemctl daemon-reload && systemctl start "pgcf-slot@$n.service" || return 1
+	# Type=simple is active before the shell has become sleep, and the line has to be in the journal.
+	wait_for 10 slot_runs "$n" && wait_for 10 slot_has_logged "$n"
+}
+slot_runs() {
+	local pid
+	pid=$(systemctl show --property=MainPID --value "pgcf-slot@$1.service")
+	[ "${pid:-0}" -gt 0 ] && [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = sleep ]
+}
+slot_has_logged() {
+	[ -n "$(journalctl --unit="pgcf-slot@$1.service" --no-pager --output=cat 2>/dev/null | grep pgcf-slot-boot-test)" ]
+}
+slot_down() {
+	systemctl stop "pgcf-slot@$1.service"
+}
+slot_forget() {
+	systemctl stop "pgcf-slot@$1.service" 2>/dev/null
+	rm -rf "/run/systemd/system/pgcf-slot@$1.service.d"
+	systemctl daemon-reload
+	userdel "pgcf-slot-$1" 2>/dev/null
+	groupdel "pgcf-slot-$1" 2>/dev/null
+	true
+}
+
+# The slot's user, in the mount and IPC namespaces of its unit, with no capability: $1 is the unit's
+# main process, $2 and $3 are the uid and the gid.
+slot_as() {
+	local pid=$1 uid=$2 gid=$3
+	shift 3
+	nsenter --target "$pid" --mount --ipc -- setpriv --reuid="$uid" --regid="$gid" --clear-groups \
+		--bounding-set=-all --inh-caps=-all --no-new-privs -- "$@"
+}
+
+# Every file, directory and socket a uid can read, from outside the sandbox or, with a command
+# that enters it, from inside; /sys, /proc and the ESP's automount are left out.
+readable_by() {
+	local uid=$1
+	shift
+	"$@" setpriv --reuid="$uid" --regid="$uid" --clear-groups --bounding-set=-all --inh-caps=-all --no-new-privs -- \
+		find / \( -path /proc -o -path /sys -o -path /efi \) -prune -o -readable -print 2>/dev/null | sort
+}
+
+# What the uid reads and an unrelated tenant does not: what is kept by uid. The arguments are a
+# command that enters the sandbox, or none.
+kept_by_uid() {
+	local uid=$1
+	shift
+	comm -23 <(readable_by "$uid" "$@") <(readable_by "$slot_reference_uid" "$@")
+}
+
+# One line for each finding, nothing for a slot that shares and keeps nothing by uid.
+slot_findings() {
+	local n=$1 unit=pgcf-slot@$1.service pid uid gid own cgroup place listing segment objects found mount kept
+	pid=$(systemctl show --property=MainPID --value "$unit")
+	if [ "${pid:-0}" -le 0 ]; then
+		echo "the slot does not run"
+		return 0
+	fi
+	uid=$(stat -c %u "/proc/$pid")
+	gid=$(stat -c %g "/proc/$pid")
+	own=/run/pgcf/slot/$n
+	cgroup=/sys/fs/cgroup$(sed -n 's/^0:://p' "/proc/$pid/cgroup")
+	[ "$uid:$gid" = "$((300000 + n)):$((300000 + n))" ] || echo "the slot runs as $uid:$gid"
+	[ "$(stat -c %U:%G:%a "$own" 2>/dev/null)" = "pgcf-slot-$n:pgcf-slot-$n:700" ] || echo "the control directory is not pgcf-slot-$n:pgcf-slot-$n:700"
+	# Places that every unit of the node shares.
+	for place in /run/lock /dev/mqueue /dev/pts; do
+		if slot_as "$pid" "$uid" "$gid" sh -c 'touch "$1/probe" 2>/dev/null && rm "$1/probe"' sh "$place"; then
+			echo "a file can be created in $place"
+		fi
+		listing=$(slot_as "$pid" "$uid" "$gid" ls -A "$place" 2>&1)
+		grep -q 'Permission denied' <<<"$listing" || echo "$place is not refused: ${listing//$'\n'/ }"
+	done
+	# The journal directories, where journald keeps files by uid.
+	for place in /var/log/journal /run/log/journal; do
+		[ -e "$place" ] || continue
+		listing=$(slot_as "$pid" "$uid" "$gid" ls -A "$place" 2>&1)
+		grep -q 'Permission denied' <<<"$listing" || echo "$place is not refused: ${listing//$'\n'/ }"
+	done
+	# SysV shared memory, semaphores and queues, and the POSIX queues: an IPC namespace of the unit's
+	# own, empty when the slot starts and without the host's segment.
+	[ "$(readlink "/proc/$pid/ns/ipc")" != "$(readlink /proc/1/ns/ipc)" ] || echo "the slot is in PID 1's IPC namespace"
+	segment=$(ipcmk --shmem 4096 | awk '{ print $NF }')
+	if [ -z "$segment" ]; then
+		echo "no SysV segment could be made on the host: the probe proves nothing"
+	elif nsenter --target "$pid" --ipc -- awk -v id="$segment" 'FNR > 1 && $2 == id { found = 1 } END { exit !found }' /proc/sysvipc/shm; then
+		echo "the host's SysV segment $segment is in the slot's namespace"
+	fi
+	[ -z "$segment" ] || ipcrm --shmem-id "$segment"
+	objects=$(nsenter --target "$pid" --ipc -- awk 'FNR > 1 { count++ } END { print count + 0 }' /proc/sysvipc/shm /proc/sysvipc/msg /proc/sysvipc/sem)
+	[ "$objects" = 0 ] || echo "the slot's IPC namespace holds $objects SysV objects at its start"
+	# Every mount of the unit's mount namespace that the slot's user can write.
+	while IFS= read -r mount; do
+		slot_as "$pid" "$uid" "$gid" test -w "$mount" || continue
+		case $mount in
+		/tmp | /var/tmp | /dev/shm | "$own" | "$cgroup"/*) ;;
+		*) echo "a mount the slot's user can write: $mount" ;;
+		esac
+	done < <(nsenter --target "$pid" --mount -- awk '{ print $5 }' /proc/self/mountinfo)
+	# Every directory, file, socket and FIFO it can write: its own, or an endpoint that checks its caller.
+	found=$(slot_as "$pid" "$uid" "$gid" find / \( -path /proc -o -path /efi \) -prune -o \
+		\( -type d -o -type f -o -type s -o -type p \) -writable -printf '%y %p\n' 2>/dev/null)
+	kept=$(grep -E '^[df] ' <<<"$found" | cut -c3- | grep -vE "^(/dev/shm|/tmp|/var/tmp|$own)(/|$)|^$cgroup/")
+	[ -z "$kept" ] || echo "writable and not the slot's own: ${kept//$'\n'/ }"
+	kept=$(grep -E '^[sp] ' <<<"$found" | cut -c3- | grep -vE "^$own/|$checked_endpoints")
+	[ -z "$kept" ] || echo "a socket or FIFO the slot's user can write and no one checks: ${kept//$'\n'/ }"
+	# Every file it can read and an unrelated tenant cannot: only its own control directory.
+	kept=$(kept_by_uid "$uid" nsenter --target "$pid" --mount --ipc -- | grep -vE "^$own(/|$)")
+	[ -z "$kept" ] || echo "kept by the slot's uid and readable by it: ${kept//$'\n'/ }"
+}
+
+# What the first database leaves for the next one in every place it can write: a file in each, and
+# a SysV segment. Queues, keys and the journal are closed to it, and the host is searched for them
+# after the stop (slot_leftovers).
+slot_mark() {
+	local n=$1 pid uid gid own=/run/pgcf/slot/$1 place
+	pid=$(systemctl show --property=MainPID --value "pgcf-slot@$n.service")
+	uid=$(stat -c %u "/proc/$pid")
+	gid=$(stat -c %g "/proc/$pid")
+	for place in /tmp /var/tmp /dev/shm "$own"; do
+		slot_as "$pid" "$uid" "$gid" touch "$place/pgcf-slot-marker" || echo "the slot's user cannot write $place: the marker proves nothing"
+	done
+	slot_as "$pid" "$uid" "$gid" ipcmk --shmem 4096 >/dev/null || echo "the slot's user cannot make a SysV segment: the marker proves nothing"
+}
+slot_marker_left() {
+	local n=$1 pid uid gid left
+	pid=$(systemctl show --property=MainPID --value "pgcf-slot@$n.service")
+	uid=$(stat -c %u "/proc/$pid")
+	gid=$(stat -c %g "/proc/$pid")
+	left=$(slot_as "$pid" "$uid" "$gid" find /tmp /var/tmp /dev/shm "/run/pgcf/slot/$n" -name pgcf-slot-marker 2>/dev/null)
+	[ -z "$left" ] || echo "the former incarnation's files are there: ${left//$'\n'/ }"
+}
+
+# After the stop, on the host: nothing is kept by the slot's uid.
+slot_leftovers() {
+	local n=$1 uid=$((300000 + $1)) kept
+	[ ! -e "/run/pgcf/slot/$n" ] || echo "the control directory is still there"
+	kept=$(kept_by_uid "$uid")
+	[ -z "$kept" ] || echo "kept by uid $uid and readable by it: ${kept//$'\n'/ }"
+	kept=$(find / \( -path /proc -o -path /sys -o -path /efi \) -prune -o \( -uid "$uid" -o -gid "$uid" \) -print 2>/dev/null)
+	[ -z "$kept" ] || echo "owned by uid $uid: ${kept//$'\n'/ }"
+	kept=$(find /var/log/journal /run/log/journal -name "user-$uid.journal*" 2>/dev/null)
+	[ -z "$kept" ] || echo "journald keeps a journal file of uid $uid: ${kept//$'\n'/ }"
+	kept=$(awk -v uid="$uid" 'FILENAME ~ /sem$/ { if ($5 == uid) found = 1; next } FNR > 1 && $8 == uid { found = 1 } END { if (found) print "yes" }' \
+		/proc/sysvipc/shm /proc/sysvipc/msg /proc/sysvipc/sem)
+	[ -z "$kept" ] || echo "the host's IPC namespace holds a SysV object of uid $uid"
+	[ -r /proc/keys ] || echo "/proc/keys cannot be read: the keyring probe proves nothing"
+	wait_for 10 slot_has_no_key "$uid" || echo "the kernel keeps a key of uid $uid"
+}
+slot_has_no_key() {
+	! awk -v uid="$1" '$6 == uid { found = 1 } END { exit !found }' /proc/keys
+}
+
+# Two incarnations of one slot, as two databases in turn: the first writes what it can, the second
+# finds nothing of it, and after each stop nothing is kept by the uid.
+slot_isolation() {
+	local n=$slot_test_n findings
+	slot_account "$n" || return 1
+	mkdir -p /run/pgcf/slot/boot-test-neighbour
+	findings=$(
+		if slot_up "$n"; then
+			slot_findings "$n"
+			slot_mark "$n"
+			slot_down "$n"
+			slot_leftovers "$n"
+			if slot_up "$n"; then
+				slot_findings "$n"
+				slot_marker_left "$n"
+			else
+				echo "the slot does not start again"
+			fi
+			slot_down "$n"
+			slot_leftovers "$n"
+		else
+			echo "the slot does not start"
+		fi
+		# The control directory is the leaf of /run/pgcf/slot/<n>: the stop removes it and not the
+		# directories of the other slots.
+		[ -d /run/pgcf/slot/boot-test-neighbour ] || echo "the stop of a slot removed the control directory of another"
+	)
+	rmdir /run/pgcf/slot/boot-test-neighbour 2>/dev/null
+	slot_forget "$n"
+	[ -z "$findings" ] || {
+		echo "$findings"
+		return 1
+	}
+}
+
+# The enumeration is not vacuous: against the same unit without the additions (no private IPC
+# namespace, no inaccessible path) it must find every shared place.
+slot_enumeration_sees_an_open_unit() {
+	local n=$slot_control_n findings missing= place
+	slot_account "$n" || return 1
+	if slot_up "$n" PrivateIPC=no InaccessiblePaths=; then
+		findings=$(slot_findings "$n")
+	else
+		findings="the control unit does not start"
+	fi
+	slot_forget "$n"
+	for place in 'a file can be created in /run/lock' 'a file can be created in /dev/mqueue' '/dev/pts is not refused' \
+		'/var/log/journal is not refused' "the slot is in PID 1's IPC namespace" 'SysV segment'; do
+		grep -qF "$place" <<<"$findings" || missing="$missing [$place]"
+	done
+	[ -z "$missing" ] || {
+		echo "not seen in a unit without the additions:$missing"
+		echo "$findings"
+		return 1
+	}
+}
+
 # After the reboot with that database awake: the unit stopped on its own, cleanly, before the node
 # went down, and neither PostgreSQL nor ext4 had anything to recover at this start.
 scratch_database_was_stopped_cleanly() {
@@ -711,6 +1020,7 @@ check no_failed_units no_failed_units
 check loopback_only loopback_only
 check no_ssh_socket no_ssh_socket
 check journal_sync_interval journal_sync_interval
+check journal_not_split journal_not_split
 check inbound_dropped inbound_dropped
 check binaries binaries
 check io_uring_disabled sysctl_is kernel.io_uring_disabled 2
@@ -720,9 +1030,13 @@ if [ "$phase" = 1 ]; then
 	check root_grown root_grown
 	check lvm_partition lvm_partition
 	check database_unit_sandbox database_unit_sandbox
-	check database_unit_waits_for_recovery database_unit_waits_for_recovery
-	check database_unit_has_no_start_pre database_unit_has_no_start_pre
-	check database_unit_syscall_filter database_unit_syscall_filter
+	check slot_unit_sandbox slot_unit_sandbox
+	check database_unit_waits_for_recovery database_unit_waits_for_recovery pgcf-pg@pgcfboottest0000000.service
+	check slot_unit_waits_for_recovery database_unit_waits_for_recovery pgcf-slot@boottest.service
+	check database_unit_has_no_start_pre database_unit_has_no_start_pre pgcf-pg@pgcfboottest0000000.service
+	check slot_unit_has_no_start_pre database_unit_has_no_start_pre pgcf-slot@boottest.service
+	check database_unit_syscall_filter database_unit_syscall_filter pgcf-pg@pgcfboottest0000000.service
+	check slot_unit_syscall_filter database_unit_syscall_filter pgcf-slot@boottest.service
 	check sshd_policy sshd_policy
 	check sshd_certificate_only sshd_certificate_only
 	check backup_slice_top_level backup_slice_top_level
@@ -736,6 +1050,7 @@ check no_volume_in_pid_1_namespace no_volume_in_pid_1_namespace
 if [ "$phase" = 1 ]; then
 	check scratch_filesystem_gap scratch_filesystem_gap
 	check database_unit_device_allow database_unit_device_allow
+	check slot_unit_device_allow slot_unit_device_allow
 	check database_unit_needs_the_link database_unit_needs_the_link
 	check scratch_database_runs_across_an_agent_restart scratch_database_runs_across_an_agent_restart
 	check database_user_reaches_no_block_device database_user_reaches_no_block_device
@@ -743,6 +1058,8 @@ if [ "$phase" = 1 ]; then
 	check database_user_reads_no_journal database_user_reads_no_journal
 	check database_scratch_space_is_bounded database_scratch_space_is_bounded
 	check database_second_postmaster_is_refused database_second_postmaster_is_refused
+	check slot_isolation slot_isolation
+	check slot_enumeration_sees_an_open_unit slot_enumeration_sees_an_open_unit
 else
 	check scratch_database_was_stopped_cleanly scratch_database_was_stopped_cleanly
 fi
