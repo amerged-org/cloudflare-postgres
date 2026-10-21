@@ -32,7 +32,12 @@ const report = (
   nodeId: string,
   volumes: number,
   pool: typeof OPEN_POOL = OPEN_POOL,
-) => seedSamples(nodeId, steady(Date.now() + ++clock, 40, { volumes, pool }));
+  ramPpm = 0,
+) =>
+  seedSamples(
+    nodeId,
+    steady(Date.now() + ++clock, 40, { volumes, pool, ramPpm }),
+  );
 const nodeOf = async (f: Awaited<ReturnType<typeof fixture>>, now: number) =>
   (await placementNodes(env.DB, f.region, now)).find((n) => n.id === f.node)!;
 
@@ -59,7 +64,8 @@ describe("the technical volume bound of a node (plan 4.8, 4.11)", () => {
 
   it("takes the next node when the fullest one is at the bound", async () => {
     const f = await fixture(4096);
-    await report(f.node, 1000);
+    // Fuller than the other node, so only the bound keeps it from winning.
+    await report(f.node, 1000, OPEN_POOL, 300_000);
     const other = await addNode(f.region, 4096);
     await report(other, 10);
     const nodes = await placementNodes(env.DB, f.region, Date.now());

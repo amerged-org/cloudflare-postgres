@@ -117,8 +117,10 @@ type PoolState =
  * of its data and 50 % of its metadata, with the sold storage below the logical cap, and with
  * fewer than `MAX_VOLUMES_PER_NODE` volumes. The sold storage is what the node reported plus the
  * databases it has not counted yet, and `needGib` more must fit under the cap as well. The pool of
- * an offline node is judged by its last sample. The volume count is checked last: it closes the
- * node for new volumes only, so a state that stops a resize keeps its own name.
+ * an offline node is judged by its last sample. The states that stop a resize that grows storage
+ * (no reading, no room, the cap) come first and keep their names whatever else has closed the
+ * node; data, metadata and the volume count close it for new databases only and come after them,
+ * the volume count last.
  */
 function poolState(
   pool: Pick<
@@ -144,7 +146,11 @@ function poolState(
   )
     return "unavailable";
   if (pool.room !== 1) return "no_room";
-  const dataTotal = BigInt(pool.pool_data_total_bytes);
+  const dataTotal = BigInt(pool.pool_data_total_bytes),
+    cap = dataTotal * BigInt(LOGICAL_CAP_FACTOR),
+    sold =
+      BigInt(pool.pool_nominal_bytes) + BigInt(pool.pending_storage_gib) * GIB;
+  if (sold >= cap || sold + BigInt(needGib) * GIB > cap) return "cap";
   // used / total >= limit, in integers.
   if (
     BigInt(pool.pool_data_used_bytes) * PPM >=
@@ -156,10 +162,6 @@ function poolState(
     BigInt(pool.pool_metadata_total_bytes) * BigInt(POOL_METADATA_CLOSED_PPM)
   )
     return "metadata";
-  const cap = dataTotal * BigInt(LOGICAL_CAP_FACTOR),
-    sold =
-      BigInt(pool.pool_nominal_bytes) + BigInt(pool.pending_storage_gib) * GIB;
-  if (sold >= cap || sold + BigInt(needGib) * GIB > cap) return "cap";
   return pool.volumes_total >= MAX_VOLUMES_PER_NODE ? "volumes" : "open";
 }
 
@@ -233,8 +235,10 @@ interface PlacementGrowth {
 /**
  * Whether the node an existing database stays on can take its growth (plan 3.5): online, with
  * the cores the database may use, below 80 % active RAM after the extra memory, and with the
- * extra storage inside its logical cap. Growth of nothing needs only the cores. A node at the
- * volume bound can still grow its databases: a resize creates no volume.
+ * extra storage inside its logical cap. Growth of nothing needs only the cores. Only the cap
+ * (or a pool with no reading or no room) refuses storage growth: a node closed for new databases
+ * by its pool data, its metadata or the volume bound can still grow its databases, because a
+ * resize creates no volume and takes no real space.
  */
 export function growthFits(
   node: PlacementNode,
