@@ -31,7 +31,12 @@
 -- once such a role exists, a node below R-2 accepts no new connection for any of its databases from
 -- its next start on (a release install, a reboot, a crash, or a rollback to a release below R-2).
 -- Pulls after the start only log the refusal, and a targeted pull for another database of the node
--- is applied and carries the release.
+-- is applied and carries the release. A rollback of the API Worker below this change costs the
+-- same: the old API builds the node page with RoleName and refineRoles, which refuse `cnpg_*`,
+-- `streaming_replica` and `pgcf_maintenance`, so once such a role is in D1 every full pull of the
+-- node answers 500 and the node accepts no new connection from its next agent start on. The API
+-- Worker is not rolled back below this change while such a role exists, unless those rows are
+-- deleted in D1 first.
 -- Until the Edge Worker is redeployed, a role of a released name is created but every connection
 -- as it answers 28P01. The names it frees were refused before; the three above are the whole
 -- narrowing of this change.
