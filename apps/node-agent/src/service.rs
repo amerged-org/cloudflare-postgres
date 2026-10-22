@@ -3287,8 +3287,12 @@ mod tests {
             machine.running_definition("ssh.service").is_some()
         })
         .await;
+        // The record is finished a moment after the unit runs, as in the test above.
         let boot = machine.boot().unwrap().id;
-        assert!(!crate::hostfiles::State::load(&machine.layout().host_files()).unfinished(&boot));
+        eventually(30, "the host files to be recorded as done", || {
+            !crate::hostfiles::State::load(&machine.layout().host_files()).unfinished(&boot)
+        })
+        .await;
         second.stop();
     }
 

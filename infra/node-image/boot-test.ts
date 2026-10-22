@@ -20,6 +20,18 @@ export function smbiosCredential(name: string, content: string | Buffer): string
   return `io.systemd.credential.binary:${name}=${Buffer.from(content).toString("base64")}`;
 }
 
+// QEMU puts every SMBIOS table of an x86 machine into 64 KiB. Measured with QEMU 8.2.2 (the CI's):
+// type 11 strings of 62 KB arrive whole, those of 66 KB corrupt the table ("[Firmware Bug]: Corrupted
+// DMI table" in the guest's kernel log) and the guest gets none of the credentials, which showed as
+// a boot test that waited 900 s for a result it never wrote. QEMU's own tables take about 3 KB; the
+// budget keeps more than a quarter of the space free.
+export const smbiosBudget = 48 * 1024;
+
+// The bytes the type 11 strings of `credentials` take in the table: each string and its NUL.
+export function smbiosSize(credentials: string[]): number {
+  return credentials.reduce((total, credential) => total + Buffer.byteLength(credential) + 1, 0);
+}
+
 export function parseResults(text: string): BootTestResult {
   const phases = new Map<number, "ok" | "fail">();
   const failedChecks: string[] = [];
@@ -66,6 +78,17 @@ Gateway=10.0.2.2
 GatewayOnLink=yes
 `;
 
+// What the guest is given: the unit that runs the test, the drop-in that wants it, the test and the
+// network configuration.
+export function bootCredentials(guest: string): string[] {
+  return [
+    smbiosCredential("systemd.extra-unit.pgcf-boot-test.service", testUnit),
+    smbiosCredential("systemd.unit-dropin.multi-user.target~pgcf-boot-test", "[Unit]\nWants=pgcf-boot-test.service\n"),
+    guestCredential(guest),
+    smbiosCredential("network.network.10-pgcf", network),
+  ];
+}
+
 function option(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`);
   return index === -1 ? undefined : process.argv[index + 1];
@@ -89,12 +112,12 @@ async function main(): Promise<void> {
   await truncate(disk, (await stat(disk)).size + 40 * 1024 ** 3);
 
   const guest = await readFile(join(import.meta.dirname, "boot-test", "guest.sh"), "utf8");
-  const credentials = [
-    smbiosCredential("systemd.extra-unit.pgcf-boot-test.service", testUnit),
-    smbiosCredential("systemd.unit-dropin.multi-user.target~pgcf-boot-test", "[Unit]\nWants=pgcf-boot-test.service\n"),
-    guestCredential(guest),
-    smbiosCredential("network.network.10-pgcf", network),
-  ];
+  const credentials = bootCredentials(guest);
+  const size = smbiosSize(credentials);
+  if (size > smbiosBudget) {
+    console.error(`the credentials take ${size} bytes of SMBIOS, more than the budget of ${smbiosBudget}: QEMU would not hand them to the guest`);
+    process.exit(2);
+  }
   const smbios: string[] = [];
   for (const [index, credential] of credentials.entries()) {
     const path = join(work, `credential-${index}`);
