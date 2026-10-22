@@ -1771,6 +1771,16 @@
                         "minimum": 0,
                         "maximum": 600000
                       },
+                      "slot": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
+                      "bind": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
                       "start": {
                         "type": "integer",
                         "minimum": 0,
@@ -2387,7 +2397,7 @@
     "NODE_LINK_MESSAGE_MAX_BYTES": 65536,
     "NODE_DESIRED_PAGE_LIMIT_MAX": 200,
     "NODE_REPORT_EVENTS_MAX": 64,
-    "NODE_REPORT_EVENT_FIELDS_MAX": 16,
+    "NODE_REPORT_EVENT_FIELDS_MAX": 24,
     "NODE_BOOT_REPORT_ENTRIES_MAX": 1000,
     "NODE_BOOT_REPORT_MESSAGE_MAX_BYTES": 2048,
     "NODE_BOOT_REPORT_MAX_BYTES": 1048576,

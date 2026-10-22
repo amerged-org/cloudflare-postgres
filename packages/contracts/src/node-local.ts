@@ -41,8 +41,17 @@ export const WAKE_REDELIVER_MS = 3_000;
 /**
  * Phases of a wake on the node; wake results and wake events time them in ms. `admission` is the
  * whole check before the start: `volume_check` to `archive`, in the order the agent takes them.
- * `release` is the time from the end of `start` to the writer in the gateway's table, and holds
- * `roles`, the page's roles written before anyone logs in.
+ * `slot` is the time to get the slot PostgreSQL runs in, and `bind` is what binds it to the
+ * database (its properties, mounts and exec order). A slot taken from the pool was built before
+ * the wake; one built on demand is built inside `slot`, sandbox included.
+ * `start` has two meanings. Without the slot path it runs from the order to start the unit to
+ * ready, the queue wait taken out, and holds systemd's fork and the sandbox. On the slot path it
+ * runs from the exec order to ready, and the sandbox is in `slot` (built on demand) or not in the
+ * wake at all (a pool hit). So `start` alone is not comparable across the agent release that has
+ * the slot path: compare the earlier `start` with `slot` + `bind` + `start`. Every phase is
+ * optional: an agent that has no slot path reports neither `slot` nor `bind`. `release` is the
+ * time from the end of `start` to the writer in the gateway's table, and holds `roles`, the
+ * page's roles written before anyone logs in.
  */
 export const WAKE_PHASES = [
   "admission",
@@ -53,6 +62,8 @@ export const WAKE_PHASES = [
   "config",
   "archive",
   "queue_wait",
+  "slot",
+  "bind",
   "start",
   "roles",
   "release",
