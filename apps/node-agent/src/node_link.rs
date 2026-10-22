@@ -401,7 +401,7 @@ fn roles_valid(db: &Value) -> bool {
         let Some(name) = role["name"].as_str() else {
             return false;
         };
-        if !names.insert(name) || reserved_role(name) || name == text("MAINTENANCE_ROLE") {
+        if !names.insert(name) || reserved_role(name) {
             return false;
         }
         if role.get("state").is_some() {

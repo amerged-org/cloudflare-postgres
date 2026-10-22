@@ -33,7 +33,6 @@ import {
   RoleCreate,
   roleExpiryInstant,
   SizeClassUpsert,
-  MAINTENANCE_ROLE,
 } from "../src/index.ts";
 import { FleetReleaseId } from "../src/releases.ts";
 
@@ -77,11 +76,23 @@ it("has no PostgreSQL scheduling share beside the hard CPU limit", () => {
   ).toBe(false);
 });
 
-it("reserves only the exact internal maintenance role in customer creation", () => {
-  expect(RoleCreate.safeParse({ name: MAINTENANCE_ROLE }).success).toBe(false);
-  expect(RoleCreate.parse({ name: "pgcf_customer" }).name).toBe(
+it("refuses only the names PostgreSQL reserves in customer creation", () => {
+  for (const name of ["postgres", "pg_monitor"])
+    expect(RoleCreate.safeParse({ name }).success, name).toBe(false);
+  // The names of the Kubernetes runtime are ordinary customer roles now.
+  for (const name of [
     "pgcf_customer",
-  );
+    "pgcf_maintenance",
+    "streaming_replica",
+    "cnpg_app",
+  ])
+    expect(RoleCreate.parse({ name }).name).toBe(name);
+  expect(
+    RoleCreate.parse({
+      name: "report_job",
+      member_of: ["cnpg_app", "streaming_replica", "pgcf_maintenance"],
+    }).member_of,
+  ).toEqual(["cnpg_app", "streaming_replica", "pgcf_maintenance"]);
 });
 
 describe("role lifecycle attributes", () => {
@@ -118,10 +129,8 @@ describe("role lifecycle attributes", () => {
       { member_of: ["a", "b", "c", "d", "e", "f", "g", "h", "i"] },
       { member_of: ["reader", "reader"] },
       { member_of: ["app"] },
-      { member_of: [MAINTENANCE_ROLE] },
       { member_of: ["pg_read_all_data"] },
       { member_of: ["pg_execute_server_program"] },
-      { member_of: ["cnpg_internal"] },
       { member_of: ["postgres"] },
       { member_of: ["report_job"] },
       { member_of: "reader" },

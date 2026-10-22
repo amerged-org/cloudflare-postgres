@@ -39,7 +39,6 @@ import {
   RegionId,
   RoleName,
 } from "./ids.ts";
-import { MAINTENANCE_ROLE } from "./maintenance.ts";
 import {
   FleetReleaseBinaries,
   FleetReleaseId,
@@ -609,9 +608,8 @@ export function presentRoles(db: {
   return db.roles.filter((role): role is DesiredRole => !isRoleRemoval(role));
 }
 /**
- * The rules of a database's roles: unique names, never the internal maintenance role, the owner
- * is `app` and is never removed, a database that exists has exactly one owner, and a membership
- * names another present role.
+ * The rules of a database's roles: unique names, the owner is `app` and is never removed, a
+ * database that exists has exactly one owner, and a membership names another present role.
  */
 export function refineRoles(
   roles: readonly (DesiredRole | DesiredRoleRemoval)[],
@@ -621,12 +619,6 @@ export function refineRoles(
   const names = new Set<string>();
   let owners = 0;
   for (const role of roles) {
-    if (role.name === MAINTENANCE_ROLE)
-      ctx.addIssue({
-        code: "custom",
-        path: ["roles"],
-        message: "Internal maintenance role cannot be a customer role",
-      });
     if (names.has(role.name))
       ctx.addIssue({
         code: "custom",

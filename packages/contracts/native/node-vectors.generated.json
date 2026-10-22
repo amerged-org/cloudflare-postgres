@@ -13088,10 +13088,10 @@
     },
     {
       "schema": "NodeDesiredPage",
-      "name": "maintenance-role",
-      "valid": false,
-      "node_valid": false,
-      "refinement": true,
+      "name": "roles-named-as-the-kubernetes-runtime-named-its-own",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
       "value": {
         "node": {
           "id": "nod_nnnnnnnnnnnnnnnnnnnn",
@@ -13204,6 +13204,24 @@
                 "owner": true,
                 "password": "ppppppppppppppppppppppppppppppppppppppppppp",
                 "revision": 1
+              },
+              {
+                "name": "cnpg_app",
+                "owner": false,
+                "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "revision": 2,
+                "valid_until": "2031-01-02T03:04:05.678Z",
+                "connection_limit": 5,
+                "bypass_rls": true
+              },
+              {
+                "name": "streaming_replica",
+                "owner": false,
+                "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "revision": 2,
+                "valid_until": "2031-01-02T03:04:05.678Z",
+                "connection_limit": 5,
+                "bypass_rls": true
               },
               {
                 "name": "pgcf_maintenance",

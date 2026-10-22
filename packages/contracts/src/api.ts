@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { MAINTENANCE_ROLE } from "./maintenance.ts";
 import { AdminScope, ApiKeyScope, ApiKeyString } from "./auth.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 import { Timestamp } from "./timestamp.ts";
@@ -586,7 +585,7 @@ export const RoleCreate = z
       .meta({
         uniqueItems: true,
         description:
-          "Distinct live roles of this database the role becomes a member of, at most 8; never `app`, `pgcf_maintenance`, `pg_*` or `cnpg_*`.",
+          "Distinct live roles of this database the role becomes a member of, at most 8; never `app`, the role itself, `postgres` or `pg_*`.",
       })
       .optional(),
     bypass_rls: z
@@ -594,22 +593,15 @@ export const RoleCreate = z
       .describe("PostgreSQL BYPASSRLS; defaults to false.")
       .optional(),
   })
-  .refine((role) => role.name !== MAINTENANCE_ROLE, {
-    path: ["name"],
-    message: "Role name is reserved for internal maintenance",
-  })
   .refine(
     (role) =>
       (role.member_of ?? []).every(
-        (target) =>
-          target !== OWNER_ROLE_NAME &&
-          target !== MAINTENANCE_ROLE &&
-          target !== role.name,
+        (target) => target !== OWNER_ROLE_NAME && target !== role.name,
       ) && new Set(role.member_of).size === (role.member_of ?? []).length,
     {
       path: ["member_of"],
       message:
-        "member_of names distinct roles other than the owner, the maintenance role and the role itself",
+        "member_of names distinct roles other than the owner and the role itself",
     },
   )
   .meta({

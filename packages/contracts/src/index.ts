@@ -8,7 +8,6 @@ export * from "./encoding.ts";
 export * from "./errors.ts";
 export * from "./ids.ts";
 export * from "./database-resources.ts";
-export * from "./maintenance.ts";
 export * from "./costs.ts";
 
 export * from "./nodes.ts";

@@ -1185,9 +1185,15 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     [
-      "maintenance-role",
-      withDatabase({ roles: [owner, { ...reader, name: "pgcf_maintenance" }] }),
-      false,
+      "roles-named-as-the-kubernetes-runtime-named-its-own",
+      withDatabase({
+        roles: [
+          owner,
+          { ...reader, name: "cnpg_app" },
+          { ...reader, name: "streaming_replica" },
+          { ...reader, name: "pgcf_maintenance" },
+        ],
+      }),
       true,
     ],
     [

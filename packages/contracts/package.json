@@ -13,7 +13,6 @@
     "./edge-policy": "./src/edge-policy.ts",
     "./edge-sql": "./src/edge-sql.ts",
     "./usage": "./src/usage.ts",
-    "./maintenance": "./src/maintenance.ts",
     "./route-token": "./src/route-token.ts",
     "./route-token-core": "./src/route-token-core.ts",
     "./pg-wire": "./src/pg-wire.ts",

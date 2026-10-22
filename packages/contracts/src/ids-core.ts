@@ -12,11 +12,11 @@ export const REGION_ID_PATTERN = /^[a-z][a-z0-9-]{1,30}[a-z0-9]$/;
 export const SIZE_CLASS_ID_PATTERN = /^[a-z][a-z0-9-]{0,30}[a-z0-9]$/;
 export const ROLE_NAME_PATTERN = /^[a-z][a-z0-9_]{0,62}$/;
 
-export const RESERVED_ROLE_NAMES: ReadonlySet<string> = new Set([
-  "postgres",
-  "streaming_replica",
-]);
-export const RESERVED_ROLE_PREFIXES = ["pg_", "cnpg_"] as const;
+// What PostgreSQL itself reserves: the superuser the node agent runs as, and the `pg_` prefix of the
+// predefined roles. The role names of the Kubernetes runtime (`streaming_replica`, `cnpg_*`,
+// `pgcf_maintenance`) mean nothing on a node and are ordinary names.
+export const RESERVED_ROLE_NAMES: ReadonlySet<string> = new Set(["postgres"]);
+export const RESERVED_ROLE_PREFIXES = ["pg_"] as const;
 
 export function isReservedRoleName(name: string): boolean {
   return (
