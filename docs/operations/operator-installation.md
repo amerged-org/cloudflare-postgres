@@ -194,6 +194,21 @@ every awake database to sleep with the proof. WAL segment keys are written once 
 so the union of both buckets holds every segment, and a last copy of what exists only in the old
 bucket, made after the last write into it, closes any gap.
 
+The files of the cutover. Make one directory for the whole cutover, `D=$(mktemp -d)` (mode 0700), and keep
+it until the move is over; delete it at the end, and delete a file that holds a secret (the D1 export of
+step 4, the rewrite of step 6) as soon as it has served. The tool writes a list (`--copied-file`,
+`--missing-file`, `--extras-file`, and the `--out` of `sql`) only as a new 0600 file in a directory that
+only its owner can enter, and it never overwrites: it refuses a file that exists, before it lists or
+copies anything, so a name that is used twice stops the second pass at once and leaves the first pass's
+file as it was. Every pass therefore names its own files, `"$D/copied-<pass>.txt"`,
+`"$D/missing-<pass>.txt"` and `"$D/extras-<pass>.txt"`, where `<pass>` is the step and the number of the
+pass: `3-1` for the first round of step 3, `8`, `10-1`, `10-2` and so on, and `rb4-1`, `rb4-2`, ... for
+the passes of the rollback's step 4 (its step 7 repeats them). A pass that is run again (it failed, or its
+check is repeated after a gap repair or a mirror) takes a `<pass>` of its own, `10-1b` or `rb4-1b`, and
+the file of the first run stays as it was. A pass that finds no key writes no file, so an absent file
+means that the pass found nothing, not that nobody read it; a file that exists holds every key of its own
+pass, which a name used twice would not.
+
 1. Make `0084` the only pending migration before anything is deployed. `wrangler d1 migrations
    apply` (and a deploy script's `--migrate`, which runs it before the deploy) takes every pending
    file, and `0082` and `0084` need opposite orders: `0082` (the dead capacity fields, D-1 of the plan)
@@ -232,7 +247,8 @@ bucket, made after the last write into it, closes any gap.
    token that is the parent key now, or create a second token whose policy names both buckets and set
    `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY` to it, both in one `wrangler secret
    bulk` (two separate `secret put` calls deploy twice and leave a mismatched key pair live between
-   them). Keep the previous token, and keep
+   them), and note the time the deploy ended (T_STEP2): that token is then in production, as the
+   window below says. Keep the previous token, and keep
    the old bucket in every token that is a parent key, until step 11 revokes them: until step 6 every
    node archives into old-bucket paths with the credentials it holds, each signed by the previous
    token (the access key of a credential is the parent's), so deleting or narrowing that token ends all
@@ -241,7 +257,7 @@ bucket, made after the last write into it, closes any gap.
    signs for the old bucket with these tokens too.
 3. Copy what a database that is not deleted needs while everything runs, in rounds, and repeat
    until a round copies only what changed. A round starts with the list of prefixes, made
-   read-only into a 0600 file in a 0700 directory that is deleted afterwards, and copies each line:
+   read-only into a new file of the cutover's directory (`"$D/prefixes-<round>.txt"`, 0600), and copies each line:
    ```sql
    SELECT substr(archive_path,length('s3://<old>/')+1) FROM databases
      WHERE deleted_at IS NULL AND substr(archive_path,1,length('s3://<old>/'))='s3://<old>/';
@@ -327,7 +343,7 @@ bucket, made after the last write into it, closes any gap.
    modified since a time a little before the last warm round, the `next_since` of the earliest pass of
    the last warm round (an hour before it began, so before that round's list was made (step 3), and no
    earlier, so that a key the new bucket's retention has deleted before is not brought back):
-   `copy --since <next_since> --allow-extra-destination-keys`. The flag is not
+   `copy --since <next_since> --allow-extra-destination-keys --copied-file "$D/copied-<pass>.txt"`. The flag is not
    optional here: step 7's cycle archived the final WAL of every awake database into the new bucket
    only, and a database created after the deploy exists only there, so without it the copy refuses
    and copies nothing. Then compare: `verify --from <old> --to <new> --since <next_since>` (the same
@@ -351,7 +367,7 @@ bucket, made after the last write into it, closes any gap.
 10. Repeat the copy and the check for new keys in the old bucket after an hour, a day and after the
     last credential for the old bucket has expired (`max(expires_at)` of the rows that name it, at
     most seven days). Each pass is `copy --since <next_since> --allow-extra-destination-keys
-    --copied-file <file>`, with no prefix, and takes as `--since` the `next_since` its previous pass
+    --copied-file "$D/copied-<pass>.txt"`, with no prefix, and takes as `--since` the `next_since` its previous pass
     printed (its listing start minus an hour; the first pass takes the one that step 8's copy printed),
     never an earlier one. The flag is not optional: the new bucket holds what the Worker and the nodes
     wrote into it since step 5, which the old bucket lacks, so without it every pass refuses and copies
@@ -370,15 +386,15 @@ bucket, made after the last write into it, closes any gap.
     key that retention deletes again, or a purged prefix that the check below finds unnamed. Run
     after each pass also the tripwire, `inventory --from <old> --since <T_REWRITE>` (how many keys the
     old bucket received since step 6's file ended, with the first ten), and `verify --from <old>
-    --to <new> --since <T_REWRITE> --sample-heads 0 --missing-file <file>`: every key the old bucket received since step 6's file ended, compared with
-    the new bucket whatever the chain skipped. In the passes of an hour and a day it finds nothing
+    --to <new> --since <T_REWRITE> --sample-heads 0 --missing-file "$D/missing-<pass>.txt"`: every key the old bucket received since step 6's file ended, compared with
+    the new bucket whatever the chain skipped (the keys of a pass are in its own file, and a pass that finds none writes none). In the passes of an hour and a day it finds nothing
     missing (the new bucket's retention cannot have acted on keys that young). After the last
     credential has expired a missing key is no gap only if no row names its prefix (below) or if it is
     older than the `backup_retention_days` of its database's size class (the line shows `modified=`:
     retention may have deleted it); any other is a gap, copied with `copy --since <T_REWRITE> --prefix
     <its prefix> --allow-extra-destination-keys` (a live prefix always needs the flag: the new bucket
     holds that database's WAL from after the switch, which the old bucket lacks), after which the check
-    runs again. A pass that copies a key is real, not noise (`--copied-file` holds all of them): check
+    runs again (under a `<pass>` of its own, such as `10-1b`). A pass that copies a key is real, not noise (`"$D/copied-<pass>.txt"` holds all of them): check
     that the key's prefix is still named by a row that the Worker has not purged yet. No row of
     `databases` or `database_moves` is ever deleted: the purge of a retained archive deletes only its
     `retained_archives` row and the deleted database keeps its `archive_path` (`deleted_at` set), and
@@ -462,13 +478,29 @@ there, and paths in D1 that can be swapped back. The steps end them one after th
 answer differs from step to step:
 
 - **Step 1.** The Worker with `ARCHIVE_ENDPOINT_URL` can be redeployed to its earlier version until
-  `0084` is applied. `0084` cannot be rolled back: it drops two columns with their data, only D1
+  `0084` is applied (with the `ARCHIVE_US` binding and the `ARCHIVE_BINDINGS` variable put back in the
+  private configuration, which step 1 removed). `0084` cannot be rolled back: it drops two columns with their data, only D1
   Time Travel brings them back, and after it only a Worker of this change or a later one runs. Every
   rollback below therefore runs on the new Worker, with the old bucket in its configuration.
-- **Steps 2 to 4.** Nothing in production uses the new bucket or the new token yet. A failed copy is
-  repeated, and the move can be given up by leaving the new bucket to the owner. What must not be
-  undone is step 2's rule: the previous parent token stays alive (and is not narrowed) until step
-  11.4, because every node archives into the old bucket with credentials that token signed.
+- **Steps 2 to 4.** What is in production depends on how step 2 gave the Worker its parent key.
+  - *The new bucket added to the policy of the token that is the parent key.* No secret changed and
+    nothing signs for the new bucket: the copies of step 3 run with the move's own token. Giving up
+    takes the new bucket out of that token's policy again only once the bucket is unused (no copy
+    runs and step 5 was never deployed), or leaves it there. The old bucket stays in the policy, whatever else is done: until
+    step 11.4 every node archives into it with credentials that token signed.
+  - *A second token set as `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`.* That token
+    is in production from step 2 on. It is the Worker's parent key and so the access key of every
+    credential the Worker delivers from then on (for old-bucket paths too), and the nodes hold those
+    credentials for up to seven days. It does not go with the empty bucket: deleting it ends them,
+    archiving fails (`database_archive_failing`) and no database can sleep until their rows renew.
+    Giving up therefore has two roads. Either keep the second token as the parent key and retire the
+    previous token instead; or put the previous token back with both secrets in one `secret bulk`
+    (T_BACK, the time that deploy ended) and retire the second token. The token the Worker no longer
+    signs with is retired as step 11.2 retires the earlier parent keys, with T_STEP2 (the first road)
+    or T_BACK (the second) in place of T_KEY: after one credential lifetime, or after the forced
+    refresh with the barrier. Only then delete that token. Until then both tokens stay alive, with the
+    old bucket in their policies.
+  A failed copy is repeated, and the move is given up by leaving the new bucket to the owner.
 - **Steps 5 to 10.** The whole rollback applies (its steps 1 to 7). Redeploying the old
   configuration alone undoes nothing: the paths in D1 and the nodes' credentials name the new bucket
   until the rollback's step 2 and 3.
@@ -488,7 +520,9 @@ answer differs from step to step:
   new bucket.
 - **Step 12.** Deleting the old bucket cannot be undone.
 
-If a step fails. Before step 5, nothing in production changed (a failed copy is repeated). From step 5
+If a step fails. Before step 5, the Worker's bucket, the stored paths and the bucket every credential names are
+unchanged (a failed copy is repeated), except that a second parent token set at step 2 is in production
+and signs every credential delivered since (the windows above). From step 5
 until step 11.4 revokes the earlier parent tokens, every rollback is the same whole procedure,
 because nothing records whether a node switched and a check that no credential names the new bucket
 races the nodes' pulls every 60 seconds (after the revocation nothing signs for the old bucket and
@@ -524,7 +558,7 @@ only fixing forward is left):
    database has a credential row for its path issued after T_R2. Note the time the check passed
    (T_R3).
 4. Compare the other way round, read-only (`verify --from <new> --to <old> --since <S> --sample-heads 0
-   --missing-file <file> --extras-file <file>`, files in a 0700 directory and deleted afterwards).
+   --missing-file "$D/missing-<pass>.txt" --extras-file "$D/extras-<pass>.txt"`, with `<pass>` = `rb4-1` for the first pass, in the cutover's directory).
    The first pass takes `<S>` = T_B; it prints `listing_started_at` and `next_since` (its listing
    start minus an hour), which the next pass takes (step 7). It answers two questions.
    - *Missing*: keys the new bucket received that the old one lacks (a node wrote WAL, a base backup
@@ -559,19 +593,19 @@ only fixing forward is left):
    afterwards.
    (a) Mirror the missing keys of a named prefix: a copy that only adds missing keys and never
    replaces one (`copy --from <new> --to <old> --since <S> --add-only --allow-extra-destination-keys
-   --copied-file <file>`). The flag is not optional: the old bucket holds the archives that step 3
+   --copied-file "$D/copied-<pass>.txt"`). The flag is not optional: the old bucket holds the archives that step 3
    never copied, which the new bucket lacks, so without it the copy refuses and mirrors nothing.
    Check each copied key's prefix with the rollback's prefix check: a purge there since step 1 may
    have deleted an archive whose copy the new bucket still holds, and that copy must not stay (the
    owner deletes those few keys by hand, because (b) does not take a key that the new bucket also
-   holds). Run the comparison again with the same `<S>`: nothing missing, or only keys of unnamed
+   holds). Run the comparison again with the same `<S>` (under a `<pass>` of its own, `rb4-1b`): nothing missing, or only keys of unnamed
    prefixes.
    (b) Clean the old bucket: take the extras file and the prefix
    `<region>/<database>/g<generation>-<operation>` of each key (its first three path segments), run
    the rollback's prefix check for each, and write the keys of the prefixes that no row names, and
-   only those, into a 0600 file in a 0700 directory (extras of other classes, `node-images/` and
+   only those, into a new 0600 file of the cutover's directory, `"$D/clean-<pass>.txt"` (extras of other classes, `node-images/` and
    `infrastructure/`, are none of this: tell the owner). `prune --from <new> --to <old> --before
-   <T_R2> --keys-file <file>` is the dry run, the same with `--execute` deletes. It deletes in the old
+   <T_R2> --keys-file "$D/clean-<pass>.txt"` is the dry run, the same with `--execute` deletes. It deletes in the old
    bucket only the listed keys that the new bucket lacks and that were written at or before T_R2, and
    it refuses a list that names a key outside the archive layout. A prefix that a row names stays: a
    database wrote into it, or the old Worker's retention owns it. T_R2 and not T_R3 bounds the
@@ -597,8 +631,8 @@ only fixing forward is left):
    that still refuses its uploads is restarted (`pgcf-agent` forgets what it was delivered and reads
    every credential again).
 6. Point `PGCF_R2_BUCKET` back at the old bucket.
-7. Repeat step 4 (and its mirror when it says so) as chained passes, one hour and one day after step
-   3 and once more after X_NEW, when no credential for the new bucket is alive any more. The first
+7. Repeat step 4 (and its mirror when it says so) as chained passes, each with its own `<pass>` (`rb4-2`,
+   `rb4-3`, ...), one hour and one day after step 3 and once more after X_NEW, when no credential for the new bucket is alive any more. The first
    pass is step 4 with `<S>` = T_B; each later pass takes as `<S>` the `next_since` that the
    previous pass's verify printed (its listing start minus an hour: keep the hour, because nodes may
    still upload into the new bucket until X_NEW and a multipart object can carry its start time). A

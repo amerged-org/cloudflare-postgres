@@ -430,9 +430,9 @@ it("says what can and what cannot be rolled back at each step of the cutover", (
   expect(WINDOWS.get("Step 1.")).toMatch(/until `0084` is applied/);
   expect(WINDOWS.get("Step 1.")).toMatch(/`0084` cannot be rolled back/);
   expect(WINDOWS.get("Step 1.")).toMatch(/Time Travel/);
-  // Before anything reads the new bucket, giving up needs no rollback; the previous token must live on.
+  // Before anything reads the new bucket, giving up needs no rollback; the old bucket stays in every parent token.
   expect(WINDOWS.get("Steps 2 to 4.")).toMatch(
-    /previous parent token stays alive/,
+    /old bucket stays in the policy/,
   );
   // From the deploy of step 5 the whole procedure applies; the old configuration alone undoes nothing.
   expect(WINDOWS.get("Steps 5 to 10.")).toMatch(/whole rollback applies/);
@@ -457,6 +457,84 @@ it("says what can and what cannot be rolled back at each step of the cutover", (
     /fixed forward/,
   );
   expect(WINDOWS.get("Step 12.")).toMatch(/cannot be undone/);
+});
+
+const PLAN = readFileSync(
+  new URL(
+    "../../../docs/architecture/cloudflare-convergence-and-serverless-plan.md",
+    import.meta.url,
+  ),
+  "utf8",
+);
+
+it("says that a second parent token set at step 2 is in production from then on, and how a given-up move retires it", () => {
+  // Option (b) of step 2 sets R2_PARENT_* to a second token, which is the access key of every credential
+  // delivered from then on (crypto/r2-credentials.ts). "Nothing uses the new token" is false for it:
+  // an operator who gives the move up before step 5 and deletes that token with the empty bucket ends every
+  // credential issued since step 2, archiving fails and no database can sleep until the rows renew.
+  const window = WINDOWS.get("Steps 2 to 4.")!;
+  expect(window).not.toMatch(/Nothing in production uses the new/i);
+  expect(window).toMatch(
+    /depends on how step 2 gave the Worker its parent key/,
+  );
+  // (b): the token is in production, as the parent key and as the access key of the credentials.
+  expect(window).toMatch(/in production from step 2 on/);
+  expect(window).toMatch(/access key of every credential the Worker delivers/);
+  expect(window).toMatch(/database_archive_failing/);
+  // Giving up keeps it as the parent key, or puts the previous token back in one `secret bulk`, and retires the
+  // token the Worker stops signing with as 11.2 does: one credential lifetime, or the forced refresh with the barrier.
+  expect(window).toMatch(/keep the second token as the parent key/i);
+  expect(window).toMatch(
+    /puts? the previous token back[^.]*one `secret bulk`/i,
+  );
+  expect(window).toMatch(/one credential lifetime/);
+  expect(window).toMatch(/forced refresh[^.]*barrier/);
+  expect(window).toMatch(/Only then delete that token/);
+  // (a): the new bucket leaves the policy only once nothing uses it, and the old bucket never does.
+  expect(window).toMatch(/only once the bucket is unused/);
+  expect(window).toMatch(/old bucket stays in the policy/);
+  // Step 1's way back puts the bindings that step 1 removed back.
+  expect(WINDOWS.get("Step 1.")).toMatch(/`ARCHIVE_US`/);
+  expect(WINDOWS.get("Step 1.")).toMatch(/`ARCHIVE_BINDINGS`/);
+  // Neither the runbook nor the plan repeats the false sentence.
+  for (const [name, text] of [
+    ["the runbook", RUNBOOK],
+    ["the plan", PLAN],
+  ] as const) {
+    const flat = text.replace(/\s+/g, " ");
+    expect(flat, name).not.toMatch(
+      /nothing (in production )?uses the new bucket or (the )?(new )?token/i,
+    );
+    expect(flat, name).not.toMatch(/nothing uses the new bucket yet/i);
+  }
+  expect(PLAN.replace(/\s+/g, " ")).toMatch(/in production from step 2 on/);
+});
+
+it("gives every pass of the cutover its own output files in the one directory made for it, because the tool refuses a file that exists", () => {
+  // The tool writes a list only as a new 0600 file (it never overwrites), so a fixed name for a repeated pass
+  // died with FileExistsError after the copy had been done, and the file still held the first pass's keys.
+  const text = MOVE.replace(/\s+/g, " ");
+  expect(text).toMatch(/one directory for the whole cutover/);
+  expect(text).toMatch(
+    /refuses a file that exists, before it lists or copies anything/,
+  );
+  expect(text).toMatch(/delete it at the end/);
+  // Every output file of a command names the pass, so no two passes share one.
+  const flags = [...text.matchAll(/--(copied|missing|extras)-file (\S+)/g)].map(
+    (match) => match[2]!,
+  );
+  expect(flags.length).toBeGreaterThanOrEqual(6);
+  for (const argument of flags)
+    expect(argument).toMatch(/^"\$D\/[a-z-]+<pass>\.txt"[`.,;:)]*$/);
+  // The steps that repeat a pass name them: step 8, step 10, the rollback's step 4 (verify, mirror) and its step 7.
+  expect(FORWARD.get(8)).toMatch(/--copied-file "\$D\/copied-<pass>\.txt"/);
+  expect(FORWARD.get(10)).toMatch(/--copied-file "\$D\/copied-<pass>\.txt"/);
+  expect(FORWARD.get(10)).toMatch(/--missing-file "\$D\/missing-<pass>\.txt"/);
+  expect(ROLLBACK.get(4)).toMatch(/--missing-file "\$D\/missing-<pass>\.txt"/);
+  expect(ROLLBACK.get(4)).toMatch(/--extras-file "\$D\/extras-<pass>\.txt"/);
+  expect(ROLLBACK.get(4)).toMatch(/--copied-file "\$D\/copied-<pass>\.txt"/);
+  // A pass that wrote no file found no key: an absent file is no unread one.
+  expect(text).toMatch(/a pass that finds no key writes no file/i);
 });
 
 it("puts the parent key back in the rollback's first step whenever step 11.1 has run, and keeps the new key until the new credentials expire", () => {
