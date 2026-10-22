@@ -929,6 +929,8 @@ impl<M: Machine> Core<M> {
             match self.sleep_locked(&db, Why::Order).await {
                 Slept::Proven => Ok(()),
                 Slept::Refused(refusal) => Err(refusal.observation()),
+                // Only an idle sleep waits for a base backup; an order never does.
+                Slept::BackupPutOff => Err("power_busy"),
                 Slept::Unproven(_) => Err("power_archive"),
                 Slept::NotRunning => Ok(()),
             }

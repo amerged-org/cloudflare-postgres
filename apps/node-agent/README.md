@@ -191,11 +191,16 @@ A base backup is due when the newest of the database's timeline is a day old (pl
 at the database's idle sleep, and daily for an always-warm database, never by waking one. It is put
 off while a start is queued or in flight on the node, and in the first minute after the database's
 own wake, so that the first requests of a cold database do not share the disk and the CPU with it
-(`backup_waits`, `backup_put_off` in the agent's log). Ten minutes after it was first put off (the
-wait after a failed backup) it is taken whatever the node does, at the next idle pass or idle sleep
-of the database. WAL archiving goes on meanwhile, so only the age of the newest base backup, and
-the WAL a restore replays, grow. The disk side is in `pgcfbackup.slice` (`infra/node-image`): the
-read and write bandwidth of the jobs on the data disk is capped.
+(`backup_waits`, `backup_put_off` in the agent's log). A database whose idle sleep is put off is not
+put to sleep: nothing would wake it for the backup later, so the wait would last until its next
+wake. It stays up and the next idle pass (every five seconds) asks again; an early sleep, which
+takes no backup, can still reclaim it for a wake that waits for room. Ten minutes after the first
+put-off of an awake session (the wait after a failed backup) the backup is taken whatever the node
+does, so a database that stays idle has it within ten minutes and one pass of the first put-off.
+WAL archiving goes on meanwhile, so only the age of the newest base backup, and the WAL a restore
+replays, grow. The disk side is in `pgcfbackup.slice` (`infra/node-image`): the read and write
+bandwidth of the jobs on the data disk is capped. A release that lifts the cap writes `infinity` as
+the size; deleting the two lines leaves a running node capped until it reboots.
 
 ## Fencing, updates and diagnostics
 

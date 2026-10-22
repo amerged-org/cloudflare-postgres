@@ -58,10 +58,24 @@ pub(crate) const BACKUP_RETRY_MS: i64 = 600_000;
 /// How long after its own wake a database's due base backup waits, so that the first requests of a
 /// cold database do not share the disk and the CPU with its backup.
 pub(crate) const BACKUP_AFTER_WAKE_MS: i64 = 60_000;
-/// The longest a due base backup is put off, counted from the first time it was: the same wait as
-/// after a failed one. WAL archiving goes on meanwhile, so the archive's RPO does not change; only
-/// the age of the newest base backup, and with it the WAL a restore replays, grows by this much.
+/// The longest a due base backup is put off, counted from the first time it was in an awake
+/// session: the same wait as after a failed one. A database whose idle sleep is put off is not put
+/// to sleep, because nothing wakes a database for a backup later, and the idle pass (`idle_poll`)
+/// asks again, so a database that stays idle has its backup within this wait and one pass. WAL
+/// archiving goes on meanwhile, so the archive's RPO does not change; only the age of the newest
+/// base backup, and with it the WAL a restore replays, grows by this much.
 pub(crate) const BACKUP_PUT_OFF_MAX_MS: i64 = BACKUP_RETRY_MS;
+
+/// What `backup_if_due` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backup {
+    /// A base backup was taken.
+    Taken,
+    /// None is due, or one failed a short while ago and is not tried again yet.
+    NotTaken,
+    /// One is due and waits for a wake (`backup_waits`).
+    PutOff,
+}
 
 /// Whether a due base backup is put off now (`backup_if_due`): the database woke less than a
 /// minute ago (`awake_since_ms`), or a start is queued or in flight on the node (`wakes`), unless
@@ -335,13 +349,17 @@ impl<M: Machine> Core<M> {
     }
 
     /// The base backup that is due of a database that runs (plan 7.6): before an idle sleep, and
-    /// daily for an always-warm database. A database is never woken for one. `Ok(false)` when
-    /// none is due, or one failed a short while ago, or it is put off: not in the first minute
-    /// after the database's own wake, and not while a start is queued or in flight on the node, so
-    /// that the first requests of a cold database do not share the disk and the CPU with a
-    /// backup (`backup_waits`). A put-off backup is asked again at the next idle pass, and at the
-    /// next idle sleep of a database that sleeps; WAL archiving goes on meanwhile.
-    pub(crate) async fn backup_if_due(&self, db: &Db, entry: &Entry) -> Result<bool, &'static str> {
+    /// daily for an always-warm database. A database is never woken for one. It is put off, and
+    /// the database is not put to sleep without it (`Backup::PutOff`), in the first minute after
+    /// the database's own wake and while a start is queued or in flight on the node, so that the
+    /// first requests of a cold database do not share the disk and the CPU with a backup
+    /// (`backup_waits`); the next idle pass asks again, and after the longest wait the backup is
+    /// taken whatever the node does. WAL archiving goes on meanwhile.
+    pub(crate) async fn backup_if_due(
+        &self,
+        db: &Db,
+        entry: &Entry,
+    ) -> Result<Backup, &'static str> {
         let now = super::now_ms();
         let (held, failed, awake_since, put_off) = {
             let view = db.view();
@@ -353,7 +371,7 @@ impl<M: Machine> Core<M> {
             )
         };
         if failed.is_some_and(|failed| now - failed < BACKUP_RETRY_MS) {
-            return Ok(false);
+            return Ok(Backup::NotTaken);
         }
         let socket = self.layout().socket_directory(&db.id);
         let session = postgres::agent(&socket)
@@ -366,7 +384,7 @@ impl<M: Machine> Core<M> {
             if put_off.is_some() {
                 self.set(db, |view| view.backup_put_off_ms = None);
             }
-            return Ok(false);
+            return Ok(Backup::NotTaken);
         }
         let wakes = self
             .admission
@@ -382,7 +400,7 @@ impl<M: Machine> Core<M> {
                     "age_of_wake_ms": awake_since.map(|since| now - since),
                 }));
             }
-            return Ok(false);
+            return Ok(Backup::PutOff);
         }
         // Minutes for a large database, under the flow of a database that is served: a burst of a
         // wake does not wait behind it (plan 4.4).
@@ -404,7 +422,7 @@ impl<M: Machine> Core<M> {
             view.backup_failed_ms = taken.is_err().then_some(now);
             view.backup_put_off_ms = None;
         });
-        taken.map(|()| true)
+        taken.map(|()| Backup::Taken)
     }
 
     /// Builds the storage generation `entry.origin` names. Ready follows only the first base

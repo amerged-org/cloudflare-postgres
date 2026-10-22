@@ -180,8 +180,8 @@ pub(crate) struct View {
     pub awake_since_ms: Option<i64>,
     /// When the last base backup that was due failed (`backup_if_due`).
     pub backup_failed_ms: Option<i64>,
-    /// When the base backup that is due was first put off for a wake (`backup_if_due`): the start
-    /// of the longest wait it may have.
+    /// When the base backup that is due was first put off for a wake in this awake session
+    /// (`backup_if_due`): the start of the longest wait it may have. A sleep forgets it.
     pub backup_put_off_ms: Option<i64>,
     /// The node has decided on this database in this run.
     pub adopted: bool,

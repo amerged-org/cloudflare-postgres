@@ -25,5 +25,12 @@ MemorySwapMax=0
 # 8.5 MB/s a base backup moved in the lab and 30 % of the 106 MB/s that EU1's disk reads at random
 # (units count K, M, G in thousands). A change of this file reaches the slice with the next job
 # that starts in it, not at the reload.
+# Deleting the two lines below does not lift the cap: systemd writes io.max only for the devices
+# that a unit lists, so a node that runs keeps 32 MB/s until it reboots (lab, systemd 257.13: a
+# reload and the next job left io.max as it was). A release that lifts the cap keeps both lines and
+# writes infinity as the size on the same device; the next job in the slice applies it. At once, on
+# one node: systemctl set-property --runtime pgcfbackup.slice
+# "IOReadBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm infinity"
+# "IOWriteBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm infinity".
 IOReadBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm 32M
 IOWriteBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm 32M

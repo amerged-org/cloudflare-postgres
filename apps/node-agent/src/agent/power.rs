@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Starting and stopping PostgreSQL (plan 4.6, 4.7, 5.9, 7.9, 7.10): a wake, the sleep with its
 //! proof, the recovery of a database that stopped without one, and the watches that start them.
-use super::{Claim, Core, Db, Desired, Entry, Phase, View, now_ms, report::uuid};
+use super::{Claim, Core, Db, Desired, Entry, Phase, View, build::Backup, now_ms, report::uuid};
 use crate::{
     Error,
     admission::{AdmitError, EarlySleep, Request},
@@ -862,13 +862,17 @@ impl<M: Machine> Core<M> {
             (entry, generation)
         };
         // The idle time is when a due base backup is taken, while the database still runs: it
-        // is never woken for one.
-        if matches!(why, Why::Idle)
-            && let Err(error) = self.backup_if_due(db, &entry).await
-        {
-            crate::timing::emit_event(json!({
-                "event": "backup_failed", "database_id": db.id, "error": error,
-            }));
+        // is never woken for one. One that is put off for a wake keeps the database up, since
+        // nothing would ask for the backup before its next idle sleep; the next idle pass asks
+        // again, and an early sleep, which takes none, can still reclaim the database.
+        if matches!(why, Why::Idle) {
+            match self.backup_if_due(db, &entry).await {
+                Ok(Backup::PutOff) => return Slept::BackupPutOff,
+                Ok(Backup::Taken | Backup::NotTaken) => {}
+                Err(error) => crate::timing::emit_event(json!({
+                    "event": "backup_failed", "database_id": db.id, "error": error,
+                })),
+            }
         }
         let proof = self.proof(&entry);
         let steps = Quiet {
@@ -942,6 +946,7 @@ impl<M: Machine> Core<M> {
             view.phase = Phase::Asleep;
             view.writer = None;
             view.awake_since_ms = None;
+            view.backup_put_off_ms = None;
             view.refusal = None;
         });
         if let Some(volume) = Self::volume_id(entry) {
@@ -1259,6 +1264,9 @@ pub(crate) enum Slept {
     /// Refused: the database runs and is wakeable.
     Refused(Refusal),
     Unproven(&'static str),
+    /// An idle sleep that was not taken: the base backup that is due waits for a wake
+    /// (`Core::backup_if_due`), and the database runs until the next idle pass asks again.
+    BackupPutOff,
     /// There was nothing to put to sleep.
     NotRunning,
 }
@@ -2810,38 +2818,181 @@ mod tests {
         eventually(30, "the daily backup", || newest() != second).await;
     }
 
+    /// A start that waits for room on the node, because there is none: what a queued wake looks
+    /// like to the scheduler of the base backups. It leaves the queue when its task ends.
+    async fn queued_wake_on_the_node(rig: &Rig) -> tokio::task::JoinHandle<()> {
+        let mut policy = rig.core.policy();
+        policy.admission.admission.queue_wait_ms = 60_000;
+        rig.core.set_policy(policy);
+        rig.machine.set_available_bytes(0);
+        let admission = rig.core.admission.clone();
+        let waiting = {
+            let admission = admission.clone();
+            tokio::spawn(async move {
+                let _ = admission
+                    .admit(crate::admission::Request {
+                        database: "another-database".into(),
+                        memory_mib: 64,
+                        always_warm: false,
+                    })
+                    .await;
+            })
+        };
+        let started = std::time::Instant::now();
+        loop {
+            let node = admission.snapshot().await.expect("the admission loop runs");
+            if node.queued == 1 {
+                assert_eq!(node.starting, 0, "the wake is queued, none is in flight");
+                return waiting;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "timed out: the start that waits for room"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A database that nobody uses for longer than its idle time, with a base backup due.
+    async fn idle_with_a_backup_due(
+        rig: &Rig,
+    ) -> (Entry, Arc<Db>, crate::agent::testing::FakeGateway) {
+        let gateway = rig.connect_gateway().await;
+        let (entry, db) = rig.create().await;
+        age_backup(rig, &db);
+        db.view().awake_since_ms = Some(now_ms() - 2 * BACKUP_AFTER_WAKE_MS);
+        gateway.sessions.lock().unwrap().last_activity_ms = Some(now_ms() - 61_000);
+        (entry, db, gateway)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_idle_sleep_leaves_the_backup_that_is_due_while_a_wake_runs_but_takes_it_after_its_longest_wait()
+    async fn an_idle_database_stays_awake_while_a_wake_runs_and_its_backup_is_taken_at_the_next_pass_after_it()
      {
         let Some(rig) = Rig::new("backup-idle-wake").await else {
             return;
         };
-        let (entry, db) = rig.create().await;
+        let (entry, db, _gateway) = idle_with_a_backup_due(&rig).await;
         let first = db.state().unwrap().backup.unwrap();
-        age_backup(&rig, &db);
-        db.view().awake_since_ms = Some(now_ms() - 2 * BACKUP_AFTER_WAKE_MS);
 
-        // Another database is waking: the idle sleep goes on without the backup, which waits.
+        // Another database is waking: the backup that is due waits and the database is not put to
+        // sleep without it (it would not be woken for it later), but stays up for the next pass.
         let wake = wake_on_the_node(&rig).await;
-        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Ready);
+        assert!(rig.machine.running(&entry.id));
         assert_eq!(
             db.state().unwrap().backup.unwrap().backup_id,
             first.backup_id
         );
-        assert!(db.view().backup_put_off_ms.is_some());
-        wake.failed();
+        let put_off = db.view().backup_put_off_ms.expect("the backup is put off");
 
-        // Woken again, a wake is in flight again, and the backup has waited for as long as it may:
-        // the idle sleep takes it.
+        // It is asked again, and the longest wait stays counted from the first time.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Ready);
+        assert_eq!(db.view().backup_put_off_ms, Some(put_off));
+
+        // The wake is over: the next pass takes the backup, then puts the database to sleep.
+        wake.failed();
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Asleep);
+        assert_ne!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+        assert_eq!(db.view().backup_put_off_ms, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_that_waits_for_room_puts_off_the_backup_of_an_idle_database_too() {
+        let Some(rig) = Rig::new("backup-idle-queued").await else {
+            return;
+        };
+        let (entry, db, _gateway) = idle_with_a_backup_due(&rig).await;
+        let first = db.state().unwrap().backup.unwrap();
+
+        let waiting = queued_wake_on_the_node(&rig).await;
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Ready);
+        assert!(rig.machine.running(&entry.id));
+        assert!(db.view().backup_put_off_ms.is_some());
+        assert_eq!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+
+        // The wake leaves the queue: the next pass takes the backup.
+        waiting.abort();
+        let _ = waiting.await;
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Asleep);
+        assert_ne!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_idle_sleep_takes_the_backup_whatever_the_node_does_once_it_was_put_off_the_longest()
+    {
+        let Some(rig) = Rig::new("backup-idle-longest").await else {
+            return;
+        };
+        let (_entry, db, _gateway) = idle_with_a_backup_due(&rig).await;
+        let first = db.state().unwrap().backup.unwrap();
+
+        let wake = wake_on_the_node(&rig).await;
+        // A moment short of the longest wait: still put off.
+        db.view().backup_put_off_ms = Some(now_ms() - BACKUP_PUT_OFF_MAX_MS + 30_000);
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Ready);
+        // The longest wait has passed, and a wake is in flight still: the backup is taken.
+        db.view().backup_put_off_ms = Some(now_ms() - BACKUP_PUT_OFF_MAX_MS);
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Asleep);
+        assert_ne!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+        assert_eq!(db.view().backup_put_off_ms, None);
+        wake.failed();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_that_sleeps_without_its_backup_waits_anew_at_its_next_wake() {
+        let Some(rig) = Rig::new("backup-put-off-forgotten").await else {
+            return;
+        };
+        let (entry, db, _gateway) = idle_with_a_backup_due(&rig).await;
+        let first = db.state().unwrap().backup.unwrap();
+
+        // Put off, and reclaimed for a wake that waits for room after the longest wait: asleep
+        // without its backup.
+        let wake = wake_on_the_node(&rig).await;
+        rig.core.idle_pass().await;
+        assert!(db.view().backup_put_off_ms.is_some());
+        db.view().backup_put_off_ms = Some(now_ms() - 2 * BACKUP_PUT_OFF_MAX_MS);
+        let early = Why::Early {
+            for_database: "another-database".into(),
+        };
+        assert_eq!(rig.core.sleep(&db, early).await, Slept::Proven);
+        assert_eq!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+
+        // What it waited in that session is not counted in the next: put off again, though a
+        // wake is in flight and the old wait is over.
         let woken = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(woken.outcome, WakeOutcome::Started, "{woken:?}");
         db.view().awake_since_ms = Some(now_ms() - 2 * BACKUP_AFTER_WAKE_MS);
-        db.view().backup_put_off_ms = Some(now_ms() - BACKUP_PUT_OFF_MAX_MS);
-        let wake = wake_on_the_node(&rig).await;
-        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
-        let second = db.state().unwrap().backup.unwrap();
-        assert_ne!(second.backup_id, first.backup_id);
-        assert_eq!(db.view().backup_put_off_ms, None);
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Ready);
+        assert!(
+            db.view()
+                .backup_put_off_ms
+                .is_some_and(|since| { now_ms() - since < BACKUP_PUT_OFF_MAX_MS })
+        );
         wake.failed();
     }
 
