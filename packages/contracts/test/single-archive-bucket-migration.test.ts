@@ -374,3 +374,86 @@ it("makes the prefix list again for the last warm round, so a database created a
     /they catch a database created after the list was made/,
   );
 });
+
+/** The numbered steps of a runbook section: the ones that start a line, keyed by their number. */
+function numberedSteps(section: string) {
+  const steps = new Map<number, string>();
+  for (const chunk of section.split(/\n(?=\d+\. )/)) {
+    const match = /^\s*(\d+)\. /.exec(chunk);
+    if (match) steps.set(Number(match[1]), chunk.replace(/\s+/g, " ").trim());
+  }
+  return steps;
+}
+const FORWARD = numberedSteps(
+  MOVE.slice(MOVE.search(/\n1\. /), MOVE.indexOf("If a step fails.")),
+);
+const ROLLBACK = numberedSteps(MOVE.slice(MOVE.indexOf("If a step fails.")));
+
+it("names the flag that lets a copy go on where the destination holds keys the source lacks", () => {
+  // The copy refuses (exit 2, "Nothing was copied") when the destination holds a key the source lacks. That
+  // is true of step 8 (the maintenance cycle archived the final WAL into the new bucket only, and a
+  // database created after the deploy exists only there), of every chained pass of step 10 and of its gap
+  // repair, of every warm round after the first, and of the rollback's mirror into the old bucket.
+  const flag = "--allow-extra-destination-keys";
+  const copyNaming = new RegExp(`\`copy [^\`]*${flag}[^\`]*\``);
+  for (const [name, step] of [
+    ["step 3", FORWARD.get(3)],
+    ["step 8", FORWARD.get(8)],
+    ["step 10", FORWARD.get(10)],
+    ["the rollback's step 4", ROLLBACK.get(4)],
+  ] as const) {
+    expect(step, name).toMatch(copyNaming);
+  }
+  // No inline copy command of a pass by time or of the mirror leaves it out.
+  const spans = [...MOVE.replace(/\s+/g, " ").matchAll(/`copy [^`]*`/g)].map(
+    (match) => match[0],
+  );
+  expect(spans.length).toBeGreaterThanOrEqual(4);
+  for (const span of spans)
+    if (/--since|--add-only/.test(span)) expect(span).toContain(flag);
+  // The copies of the first round alone go without it, so that each refuses a bucket that already holds keys.
+  expect(FORWARD.get(3)).toMatch(/copies of the first round take no flag/);
+  // Step 10's chain and its gap repair both name it, and so does the second attempt's warm copy.
+  expect(
+    FORWARD.get(10)!.match(new RegExp(flag, "g"))?.length,
+  ).toBeGreaterThanOrEqual(2);
+  expect(FORWARD.get(3)).toMatch(/second attempt/);
+});
+
+it("applies 0082 with its Worker before this move's Worker, so that 0083 is the only pending migration", () => {
+  // `wrangler d1 migrations apply` takes every pending file. 0082 needs its own Worker straight after it
+  // (and a fresh D1 export before it); 0083 needs its Worker before it. One command cannot do both.
+  const step = FORWARD.get(1)!;
+  expect(step).toMatch(/`0082`/);
+  expect(step).toMatch(/wrangler d1 migrations list/);
+  expect(step).toMatch(/only `0083`/);
+  expect(step).toMatch(/every pending (migration|file)/);
+  expect(step).toMatch(/fresh (daily )?D1 export/);
+  // The check comes before the Worker is deployed, and 0083 after it.
+  const at = (text: RegExp) => step.search(text);
+  expect(at(/migrations list/)).toBeGreaterThan(-1);
+  expect(at(/migrations list/)).toBeLessThan(at(/Then deploy the Worker/));
+  expect(at(/Then deploy the Worker/)).toBeGreaterThan(-1);
+  expect(at(/Then deploy the Worker/)).toBeLessThan(
+    at(/only then apply `0083`/),
+  );
+});
+
+it("keeps the previous parent token alive until step 11 and retires every earlier parent token there", () => {
+  // Until step 6 every node archives into old-bucket paths with credentials signed by the previous token (a
+  // credential's access key is the parent's), so deleting it at step 2 ends them all.
+  const two = FORWARD.get(2)!;
+  expect(two).toMatch(/keep the previous token/i);
+  expect(two).toMatch(/database_archive_failing/);
+  expect(two).not.toMatch(/Replace the parent key/);
+  expect(two).toMatch(/step 11/);
+  // Step 11 names both earlier parent tokens, not "the parent key that names the old bucket".
+  const eleven = FORWARD.get(11)!;
+  expect(eleven).not.toMatch(/the parent key that names the old bucket/);
+  expect(eleven).toMatch(/previous (parent )?token/);
+  expect(eleven).toMatch(/step 2/);
+  expect(FORWARD.get(10)!).not.toMatch(/revoking the old parent key/);
+  expect(MOVE.replace(/\s+/g, " ")).not.toMatch(
+    /until step 11 revokes the old parent key,/,
+  );
+});

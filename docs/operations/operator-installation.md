@@ -183,18 +183,31 @@ every awake database to sleep with the proof. WAL segment keys are written once 
 so the union of both buckets holds every segment, and a last copy of what exists only in the old
 bucket, made after the last write into it, closes any gap.
 
-1. Deploy the Worker with the single `ARCHIVE` binding still naming the old bucket, then apply
-   migration `0083` (the old Worker cannot run on the new schema, the new one runs on the old).
-   Then run the endpoint check of the deployment inputs above: no region row may name another
-   endpoint than the bucket's. A region made while it had a bucket of its own (`us-dev`) is the
-   likely one: the earlier runbook gave it the account's general endpoint, and the new bucket is in
-   the EU jurisdiction, so its first node (US1) would get credentials for a host without the
-   bucket. Correct a row that answers with the file of that section before the region's first node
-   reads a credential; for a node that already holds one, the same file makes it read a new one.
-2. With the owner's costed go, create the new bucket (same jurisdiction). Replace the parent key
-   (`R2_PARENT_ACCESS_KEY_ID`, `R2_PARENT_SECRET_ACCESS_KEY`) by a token whose policy names both
-   buckets, and keep the old bucket in it until step 11 revokes it: a rollback signs for the old
-   bucket with it.
+1. Make `0083` the only pending migration before anything is deployed. `wrangler d1 migrations
+   apply` (and a deploy script's `--migrate`, which runs it before the deploy) takes every pending
+   file, and `0082` and `0083` need opposite orders: `0082` (the dead capacity fields, D-1 of the plan)
+   goes first, with a fresh daily D1 export in place and its Worker straight after it, while `0083`
+   needs its Worker first. So D-1 is live before this move starts, and `wrangler d1 migrations list
+   <database> --remote` shows only `0083` pending; if `0082` is pending, finish D-1 first and run no
+   `migrations apply` and no deploy with `--migrate` from this commit meanwhile. Then deploy the
+   Worker with the single `ARCHIVE` binding still naming the old bucket, and only then apply `0083`
+   (the old Worker cannot run on the new schema, the new one runs on the old). Then run the endpoint
+   check of the deployment inputs above: no region row may name another endpoint than the bucket's.
+   A region made while it had a bucket of its own (`us-dev`) is the likely one: the earlier runbook
+   gave it the account's general endpoint, and the new bucket is in the EU jurisdiction, so its first
+   node (US1) would get credentials for a host without the bucket. Correct a row that answers with the
+   file of that section before the region's first node reads a credential; for a node that already
+   holds one, the same file makes it read a new one.
+2. With the owner's costed go, create the new bucket (same jurisdiction). Then give the Worker a
+   parent key that names both buckets, in one of two ways: add the new bucket to the policy of the
+   token that is the parent key now, or create a second token whose policy names both buckets and set
+   `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY` to it. Keep the previous token, and keep
+   the old bucket in every token that is a parent key, until step 11 revokes them: until step 6 every
+   node archives into old-bucket paths with the credentials it holds, each signed by the previous
+   token (the access key of a credential is the parent's), so deleting or narrowing that token ends all
+   of them. Archiving then fails (`database_archive_failing`) and no database can sleep until the
+   rewrite of step 6 has given every path a new credential id and the nodes have read it. A rollback
+   signs for the old bucket with these tokens too.
 3. Copy what a database that is not deleted needs while everything runs, in rounds, and repeat
    until a round copies only what changed. A round starts with the list of prefixes, made
    read-only into a 0600 file in a 0700 directory that is deleted afterwards, and copies each line:
@@ -204,8 +217,18 @@ bucket, made after the last write into it, closes any gap.
    ```
    The copy and the compare take one `--prefix` a call, so run each once for every line of the list
    (`<region>/<database>/g<generation>-<operation>/`) and once each for `node-images/` and
-   `infrastructure/v1/`. The last round, the one that ends before step 5, makes its own list at its
-   start and starts its first copy within an hour of making the list. That is what covers a
+   `infrastructure/v1/`. `copy` lists the destination under the same prefix as the source and
+   refuses (it prints `refused ... Nothing was copied` and exits 2) when the destination holds a key
+   that the source lacks. The copies of the first round take no flag, so that each refuses a bucket
+   that already holds keys under its prefix (the wrong bucket, or one that is already serving). Every
+   other copy of the move names `--allow-extra-destination-keys` (`copy --prefix <prefix>
+   --allow-extra-destination-keys`) and would otherwise refuse: each later round, where a key that
+   the old bucket's retention deleted since the last round is an extra in the new bucket; the warm
+   copy of a second attempt after a rollback, where the new bucket holds the first attempt's keys;
+   and the copies of steps 8 and 10 and of the rollback's mirror below. The flag only lifts the
+   refusal: the copy never deletes, step 8 removes the extras that retention explains, and the check
+   of step 10 judges the others. The last round, the one that ends before step 5, makes its own list
+   at its start and starts its first copy within an hour of making the list. That is what covers a
    database created after the list: it is not on it, so no per-prefix copy brings its first base
    backup or its WAL, and only the passes by time of steps 8 and 10 can. They reach the keys
    modified since their `--since`, which step 8 takes an hour before the earliest pass of the last
@@ -217,7 +240,7 @@ bucket, made after the last write into it, closes any gap.
    one. The passes by time take no prefix: they copy whatever was written since, and a deleted
    database writes nothing, so they bring none of the left-behind archives along, and they catch
    a database created after the last round's list was made.
-A key counts as copied when its size and ETag, or its size and a LastModified not older
+   A key counts as copied when its size and ETag, or its size and a LastModified not older
    than the source's, match, because R2 may recompute a multipart ETag on a copy. Compare sizes and
    ETags of every key of the list, the bodies of the ones whose ETag differs, and the stored sha256
    and custom metadata of the node images and infrastructure exports (a HEAD returns a checksum
@@ -270,10 +293,14 @@ A key counts as copied when its size and ETag, or its size and a LastModified no
    ```
    Databases that were asleep stay asleep. If a cycle fails or
    a node is offline, do not go on: that node's awake databases may still write into the old bucket.
-8. Copy again what the old bucket received since the warm copy (only keys modified since a time a
-   little before the last warm round, the `next_since` of the earliest pass of the last warm round: an
-   hour before it began, so before that round's list was made (step 3), and no earlier, so that
-   a key the new bucket's retention has deleted before is not brought back), and compare. Then delete from the new bucket the copies of what the old bucket's
+8. Copy again what the old bucket received since the warm copy: with no prefix and only the keys
+   modified since a time a little before the last warm round, the `next_since` of the earliest pass of
+   the last warm round (an hour before it began, so before that round's list was made (step 3), and no
+   earlier, so that a key the new bucket's retention has deleted before is not brought back):
+   `copy --since <next_since> --allow-extra-destination-keys`. The flag is not
+   optional here: step 7's cycle archived the final WAL of every awake database into the new bucket
+   only, and a database created after the deploy exists only there, so without it the copy refuses
+   and copies nothing. Then compare. Then delete from the new bucket the copies of what the old bucket's
    retention deleted before step 5 (written there at or before T_B, absent in the old bucket), or
    a deleted database's data outlives its recovery window. T_B was noted before the deploy of step 5,
    so a database created after it is never touched. After a rollback (a second attempt) this delete
@@ -290,9 +317,12 @@ A key counts as copied when its size and ETag, or its size and a LastModified no
    backup.
 10. Repeat the copy and the check for new keys in the old bucket after an hour, a day and after the
     last credential for the old bucket has expired (`max(expires_at)` of the rows that name it, at
-    most seven days). Each pass takes as `--since` the `next_since` its previous pass printed (its
-    listing start minus an hour; the first pass takes the one that step 8's copy printed), never an
-    earlier one: the old bucket gets no deletion after step 5 while the new bucket's retention goes
+    most seven days). Each pass is `copy --since <next_since> --allow-extra-destination-keys
+    --copied-file <file>`, with no prefix, and takes as `--since` the `next_since` its previous pass
+    printed (its listing start minus an hour; the first pass takes the one that step 8's copy printed),
+    never an earlier one. The flag is not optional: the new bucket holds what the Worker and the nodes
+    wrote into it since step 5, which the old bucket lacks, so without it every pass refuses and copies
+    nothing. The old bucket gets no deletion after step 5 while the new bucket's retention goes
     on, so a pass with an earlier time copies back what the new bucket deleted legitimately, such as
     the purged archive of a deleted database, and nothing deletes it again. The hour of overlap is
     needed, because uploads into the old bucket do not stop at step 7's barrier: a node whose read of
@@ -312,14 +342,17 @@ A key counts as copied when its size and ETag, or its size and a LastModified no
     credential has expired a missing key is no gap only if no row names its prefix (below) or if it is
     older than the `backup_retention_days` of its database's size class (the line shows `modified=`:
     retention may have deleted it); any other is a gap, copied with `copy --since <T_REWRITE> --prefix
-    <its prefix>`, after which the check runs again. A pass that copies a key is real, not noise:
-    check that the key's prefix is still named by a row that the Worker has not purged yet. No row of `databases` or `database_moves` is ever deleted: the purge of
-    a retained archive deletes only its `retained_archives` row and the deleted database keeps its
-    `archive_path` (`deleted_at` set), and the expiry of a superseded archive only sets
-    `source_archive_deleted_at` or `target_archive_deleted_at`. So the prefix counts while a database
-    that is not deleted is on it, while a `retained_archives` row names it, while the source of a done
-    move or the staged target of a failed move is not marked deleted, and while it is the target of a
-    move in flight. As a read-only query, where `<bucket>` is the bucket whose name the rows carry (the
+    <its prefix> --allow-extra-destination-keys` (a live prefix always needs the flag: the new bucket
+    holds that database's WAL from after the switch, which the old bucket lacks), after which the check
+    runs again. A pass that copies a key is real, not noise (`--copied-file` holds all of them): check
+    that the key's prefix is still named by a row that the Worker has not purged yet. No row of
+    `databases` or `database_moves` is ever deleted: the purge of a retained archive deletes only its
+    `retained_archives` row and the deleted database keeps its `archive_path` (`deleted_at` set), and
+    the expiry of a superseded archive only sets `source_archive_deleted_at` or
+    `target_archive_deleted_at`. So the prefix counts while a database that is not deleted is on it,
+    while a `retained_archives` row names it, while the source of a done move or the staged target of a
+    failed move is not marked deleted, and while it is the target of a move in flight. As a read-only
+    query, where `<bucket>` is the bucket whose name the rows carry (the
     new bucket after step 6; the old one after the rollback's step 2) and `<prefix>` is
     `<region>/<database>/g<generation>-<operation>`, a row answers when the prefix is named:
     ```sql
@@ -334,13 +367,15 @@ A key counts as copied when its size and ETag, or its size and a LastModified no
     gap; the owner deletes it from the new bucket. For a real gap, find the node whose credential read
     failed (usually a parent key that lacks the new bucket) and wake its databases again. The last
     pass is the one after the last credential for the old bucket has expired. Step 11 ends that wait
-    at once: the access key of a temporary credential is the parent key's, so revoking the old parent
-    key ends every credential signed with it, and the last pass then runs after the revocation.
-11. Retire the old keys: the parent key that names the old bucket, the token of the copy, the mirror
-    token if there was one, and every bucket-wide key. The Worker signs every credential a node holds
-    from the parent key and never stores one, a credential's access key is the parent's, and a node
-    reads a credential only when its page names a new id (the API renews a row after a third of its
-    seven days). Deleting the old parent key before the nodes hold credentials signed with the new one
+    at once: the access key of a temporary credential is the parent key's, so revoking the earlier
+    parent keys (step 2's) ends every credential signed with them, and the last pass then runs after
+    the revocation.
+11. Retire the old keys: the previous parent token (the one that was the parent key before step 2),
+    the token that step 2 made when it made a second one, the token of the copy, the mirror token if
+    there was one, and every bucket-wide key. The Worker signs every credential a node holds from the
+    parent key and never stores one, a credential's access key is the parent's, and a node reads a
+    credential only when its page names a new id (the API renews a row after a third of its seven
+    days). Deleting an earlier parent token before the nodes hold credentials signed with the new one
     ends the credentials they hold and archiving fails until they read new ones
     (`database_archive_failing`). So, in this order:
     1. Create the new parent token: object read and write on the new bucket and no other. Set
@@ -369,8 +404,11 @@ A key counts as copied when its size and ETag, or its size and a LastModified no
        and the archive summary `GET /v1/databases/<id>/archive` lists it) and a restore read (restore
        a database to a point in time as a new database and compare its rows: the restore reads the base
        backup and the WAL with a read-only credential).
-    4. Only when all three pass, revoke the old keys (delete the tokens). From here there is no
-       rollback to the old bucket: nothing can sign for it any more. Note the time (T_REVOKE).
+    4. Only when all three pass, revoke the old keys (delete the tokens): both earlier parent tokens,
+       the previous one and the one of step 2 (a single token when step 2 only added the new bucket to
+       the policy of the previous one), with the token of the copy, the mirror token and every
+       bucket-wide key. From here there is no rollback to the old bucket: nothing can sign for it any
+       more. Note the time (T_REVOKE).
     5. After the revocation, repeat the WAL archive check once, and run step 10's last pass, its
        cross-check and the tripwire: every credential for the old bucket is dead, so nothing is written
        into it after T_REVOKE and the pass copies what had arrived until then. A database that now
@@ -381,7 +419,7 @@ A key counts as copied when its size and ETag, or its size and a LastModified no
     and with the owner's word, delete the old bucket.
 
 If a step fails. Before step 5, nothing in production changed (a failed copy is repeated). From step 5
-until step 11 revokes the old parent key, every rollback is the same whole procedure, because nothing
+until step 11 revokes the earlier parent keys, every rollback is the same whole procedure, because nothing
 records whether a node switched and a check that no credential names the new bucket races the nodes'
 pulls every 60 seconds (after the revocation nothing signs for the old bucket and only fixing forward
 is left):
@@ -442,8 +480,10 @@ is left):
    delete work in the new bucket lets this one delete in the old), use it for both and delete it
    afterwards.
    (a) Mirror the missing keys of a named prefix: a copy that only adds missing keys and never
-   replaces one (`copy --from <new> --to <old> --since <S> --add-only --copied-file <file>`). Check
-   each copied key's prefix with the rollback's prefix check: a purge there since step 1 may
+   replaces one (`copy --from <new> --to <old> --since <S> --add-only --allow-extra-destination-keys
+   --copied-file <file>`). The flag is not optional: the old bucket holds the archives that step 3
+   never copied, which the new bucket lacks, so without it the copy refuses and mirrors nothing.
+   Check each copied key's prefix with the rollback's prefix check: a purge there since step 1 may
    have deleted an archive whose copy the new bucket still holds, and that copy must not stay (the
    owner deletes those few keys by hand, because (b) does not take a key that the new bucket also
    holds). Run the comparison again with the same `<S>`: nothing missing, or only keys of unnamed
