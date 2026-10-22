@@ -31,7 +31,6 @@ export const keyRow = (row: Row): ApiKey =>
 export const sizeRow = (row: Row): SizeClass =>
   SizeClass.parse({
     ...row,
-    cpu_request_millicores: row.cpu_request_millicores ?? undefined,
     enabled: row.enabled === 1,
   });
 export const regionRow = (row: Row): Region =>
@@ -58,7 +57,6 @@ export const nodeRow = (row: Row): Node =>
     ready: row.ready === 1,
     schedulable: row.schedulable === 1,
     database_placement_enabled: row.database_placement_enabled === 1,
-    memory_window_valid: row.memory_window_valid === 1,
   });
 
 export function nodeInventoryRow(row: Row, fleet: NodeFleet): NodeInventory {

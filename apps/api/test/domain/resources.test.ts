@@ -135,15 +135,9 @@ describe("resources of a database", () => {
           .bind(id, kind)
           .all<{ resource_snapshot: string }>()
       ).results.map((row) => JSON.parse(row.resource_snapshot));
-    // Every event reserves exactly the limits, whichever event it is.
+    // Every event keeps exactly the limits, whichever event it is, and nothing else.
     expect(await snapshots("created")).toEqual([
-      {
-        memory_mib: 1536,
-        cpu_millicores: 500,
-        reserved_memory_mib: 1536,
-        reserved_cpu_millicores: 500,
-        storage_allocated_bytes: 20 * 2 ** 30,
-      },
+      { memory_mib: 1536, cpu_millicores: 500 },
     ]);
     expect(await snapshots("ready")).toEqual(await snapshots("created"));
     await put(
@@ -153,13 +147,7 @@ describe("resources of a database", () => {
     );
     await applied(f, id, 2);
     expect(await snapshots("resized")).toEqual([
-      {
-        memory_mib: 1024,
-        cpu_millicores: 750,
-        reserved_memory_mib: 1024,
-        reserved_cpu_millicores: 750,
-        storage_allocated_bytes: 24 * 2 ** 30,
-      },
+      { memory_mib: 1024, cpu_millicores: 750 },
     ]);
   });
 

@@ -197,13 +197,9 @@ remains the integrator's responsibility.
 
 ### Optional infrastructure notifications
 
-Warnings are disabled by default. Use authenticated
-`PUT /v1/regions/{region_id}/capacity-policy` to set `ram_warning_threshold_ppm` to the desired
-parts-per-million RAM threshold (for example, `800000` means 80%). Set it to `null` to disable
-RAM warnings. A cap notice additionally requires both a finite `max_nodes` and
-`cap_warning_enabled: true`; set the flag to `false` to disable it. The regional RAM warning needs
-a complete regional RAM window of ten fresh one-minute samples from every node; no node reports
-one yet, so it stays unknown and never fires. The per-node warnings below do not depend on it.
+Warnings are disabled by default. A cap notice, set through authenticated
+`PUT /v1/regions/{region_id}/capacity-policy`, requires both a finite `max_nodes` and
+`cap_warning_enabled: true`; set the flag to `false` to disable it.
 
 Per-node warnings use the same route and scale: `node_ram_warning_threshold_ppm`,
 `node_cpu_warning_threshold_ppm` and `node_storage_warning_threshold_ppm` each take an integer

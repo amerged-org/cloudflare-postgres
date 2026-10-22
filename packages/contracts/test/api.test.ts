@@ -60,11 +60,10 @@ it("assigns database RAM in 256 MiB increments", () => {
   );
 });
 
-it("separates a PostgreSQL scheduling share from its hard CPU limit", () => {
+it("has no PostgreSQL scheduling share beside the hard CPU limit", () => {
   const body = {
     memory_mib: 256,
     cpu_millicores: 250,
-    cpu_request_millicores: 25,
     storage_gib: 1,
     max_connections: 50,
     sleep_after_seconds: 60,
@@ -72,16 +71,10 @@ it("separates a PostgreSQL scheduling share from its hard CPU limit", () => {
     backup_retention_days: 7,
     enabled: true,
   };
-  expect(SizeClassUpsert.parse(body).cpu_request_millicores).toBe(25);
-  for (const request of [0, -1, 0.5, 251]) {
-    expect(
-      SizeClassUpsert.safeParse({ ...body, cpu_request_millicores: request })
-        .success,
-    ).toBe(false);
-  }
-  const legacy: Record<string, unknown> = { ...body };
-  delete legacy.cpu_request_millicores;
-  expect(SizeClassUpsert.parse(legacy)).toEqual(legacy);
+  expect(SizeClassUpsert.parse(body)).toEqual(body);
+  expect(
+    SizeClassUpsert.safeParse({ ...body, cpu_request_millicores: 25 }).success,
+  ).toBe(false);
 });
 
 it("reserves only the exact internal maintenance role in customer creation", () => {
@@ -219,6 +212,13 @@ describe("node CPU measurement compatibility", () => {
       updated_at: now,
     };
     expect(Node.parse(node).node_uid).toBeUndefined();
+    for (const window of [
+      { memory_window_valid: false },
+      { memory_window_observed_at: null },
+      { memory_utilization_ppm: null },
+      { memory_expansion_triggered_at: null },
+    ])
+      expect(Node.safeParse({ ...node, ...window }).success).toBe(false);
     const uid = randomUUID();
     expect(Node.parse({ ...node, node_uid: uid }).node_uid).toBe(uid);
     expect(Node.parse({ ...node, node_uid: null }).node_uid).toBeNull();

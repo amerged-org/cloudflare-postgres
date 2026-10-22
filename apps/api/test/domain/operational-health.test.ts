@@ -219,7 +219,6 @@ it("reports every infrastructure alert kind of a region", async () => {
       "regional_node_ram_warning",
       "regional_node_stale",
       "regional_node_storage_warning",
-      "regional_ram_warning",
       "thin_storage_blocked",
     ];
   await env.DB.batch(

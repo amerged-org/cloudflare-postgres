@@ -80,15 +80,14 @@ export async function updateResourceProfile(
           SELECT ?,0,?,? WHERE ?=0 ON CONFLICT(id) DO NOTHING`,
         ).bind(id, now, now, body.expected_revision),
         c.env.DB.prepare(
-          `INSERT INTO size_classes(id,memory_mib,cpu_millicores,cpu_request_millicores,
+          `INSERT INTO size_classes(id,memory_mib,cpu_millicores,
           storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,
           enabled,created_at,updated_at)
-          SELECT ?,?,?,?,?,?,?,?,?,?,?,? FROM resource_profiles WHERE id=? AND revision=?`,
+          SELECT ?,?,?,?,?,?,?,?,?,?,? FROM resource_profiles WHERE id=? AND revision=?`,
         ).bind(
           size,
           value.memory_mib,
           value.cpu_millicores,
-          value.cpu_request_millicores ?? null,
           value.storage_gib,
           value.max_connections,
           value.sleep_after_seconds,

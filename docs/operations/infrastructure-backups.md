@@ -192,7 +192,6 @@ the same error has the same event ID and a new `occurred_at`.
 
 | Kind | Fires when | Rule | Action |
 | --- | --- | --- | --- |
-| `regional_ram_warning` | regional ten-minute RAM utilization reaches the threshold | `ram_warning_threshold_ppm`, off by default; it needs a regional RAM window of ten fresh one-minute samples from every node, which no node reports yet, so it stays unknown | Read `GET /v1/regions/{id}/capacity-decision`; add a node or reduce awake databases |
 | `regional_node_cap_reached` | allocated nodes reached `max_nodes` | `cap_warning_enabled` with a finite `max_nodes` | Raise `max_nodes` in the capacity policy or free a slot |
 | `regional_node_ram_warning` | a node's 30-minute average of active RAM, (MemTotal - MemAvailable) / MemTotal, reaches the threshold | `node_ram_warning_threshold_ppm`; judged from at least ten minutes of samples | Reduce awake databases on the listed node or add capacity |
 | `regional_node_cpu_warning` | a node's 30-minute average CPU load, busy time over all its cores, reaches the threshold | `node_cpu_warning_threshold_ppm`; judged from at least ten minutes of samples | Reduce awake databases on the listed node or add capacity |

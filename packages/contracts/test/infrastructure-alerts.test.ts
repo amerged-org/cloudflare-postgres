@@ -50,6 +50,28 @@ it("lists at most 20 failing cron steps and keeps the longest such alert under t
   expect(InfraAlert.safeParse(alert(21)).success).toBe(false);
 });
 
+it("has no regional RAM warning and sends the RAM utilization field only as null", () => {
+  expect(InfraAlertKind.options).not.toContain("regional_ram_warning");
+  // The field stays in the event so a receiver that reads it keeps working; nothing measures it.
+  expect(
+    InfraAlert.safeParse({ ...base, kind: "regional_node_stale" }).success,
+  ).toBe(true);
+  expect(
+    InfraAlert.safeParse({
+      ...base,
+      kind: "regional_node_stale",
+      regional_ram_utilization_ppm: 760000,
+    }).success,
+  ).toBe(false);
+  expect(
+    InfraAlert.safeParse({
+      ...base,
+      kind: "regional_node_stale",
+      regional_ram_utilization_ppm: undefined,
+    }).success,
+  ).toBe(false);
+});
+
 it("covers the database, Thin storage and cron conditions beside the infrastructure ones", () => {
   expect(InfraAlertKind.options).toEqual(
     expect.arrayContaining([
