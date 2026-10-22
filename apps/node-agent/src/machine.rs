@@ -371,6 +371,9 @@ pub trait Machine: Send + Sync + 'static {
         &self,
         target: usize,
     ) -> impl Future<Output = Result<Option<u32>, units::Error>> + Send;
+    /// Makes the user of the lowest slot number that has none, ahead of any wake (a wake never
+    /// makes one); its number, or `None` when every number has one.
+    fn make_slot_user(&self) -> impl Future<Output = Result<Option<u32>, units::Error>> + Send;
     /// Stops every idle slot: a fence, a maintenance order, a release of the slot's unit.
     fn drain_idle_slots(&self) -> impl Future<Output = usize> + Send;
     /// What the pool holds.

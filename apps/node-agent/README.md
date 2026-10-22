@@ -84,12 +84,17 @@ which takes one order, from root. Every start takes one path: the admission perm
    that `start_concurrency` bounds the builds as it bounds the starts. The claim is one step under
    the table's lock: no slot holds the database in any state, and then an idle slot becomes the
    database's, or a free number is entered as being built for it (a slot being built already holds
-   its database). A wake makes no slot user (`groupadd` and `useradd` cost about 75 ms each and
-   lock the node's account files): a miss takes only a free number that has a user, and fails with
-   `no slot` where none has. The refill makes the users, lowest number first, up to twice
-   `start_concurrency` above the highest slot in use. A build that fails (the unit refuses its
-   start over a process left in its cgroup, a user that cannot be made) keeps its number out of the
-   next builds while another is free and is reported as `slot_build_failed`.
+   its database). A wake makes no slot user (`groupadd` and `useradd` cost about 75 ms per user
+   and lock the node's account files): a miss takes only a free number that has a user. The
+   refill makes the users of the whole range, lowest number first, one at a time in its quiet
+   passes once the idle slots are in place (they persist in `/etc/passwd`, so a node makes them
+   once), so that no storm runs out of numbers: a number is in use only while its database is
+   awake, and using up the 1023 numbers would take over a thousand awake databases of at least
+   256 MiB each. A node that was just installed has only the users the refill has made so far
+   (the first minutes of its life: 75 ms each), and a miss that finds no free number with a user
+   fails with `no slot` (a `release_failed` wake) until the next quiet pass. A build that fails (the unit
+   refuses its start over a process left in its cgroup, a user that cannot be made) keeps its
+   number out of the next builds while another is free and is reported as `slot_build_failed`.
 2. **Bind**, in parallel: the database's limits as runtime properties of the slot, its volume and
    its socket directory moved into the slot's mount namespace as idmapped clones (`units/idmap.rs`),
    and a check that no unit of its own (`pgcf-pg@`) holds the database.
@@ -131,6 +136,34 @@ starting; one that is stopping is waited for, and its database is then decided b
 The units of their own that an earlier agent started are served and put to sleep as before, and the
 archive socket knows their callers by uid until they sleep; the release after the one that finds
 none left deletes that path.
+
+**Rolling back to an earlier release.** An agent of a release before this one knows no slots, and
+a release assigned to a region as a rollback (plan 9.3: how a bad release is rolled back) must not
+be assigned while a slot holds a database. That agent starts, reads `pgcf-pg@<id>` as not awake and
+takes the database for asleep (`adopt_asleep`); its sleep check fails, because `pg_control` says
+"in production" while the slot's PostgreSQL runs (`proof::wake_check`), so the database goes to
+recovery (`go_unproven`), and recovery starts `pgcf-pg@<id>`: a second postmaster on the data
+directory. Nothing in that agent refuses it. Its refusal to start over a stray process reads only
+that unit's own cgroup, not the slot's. PostgreSQL's own guard fails across the two users (see
+**One writer**). And it never takes the supervisor's `flock`. The slot lab shows PostgreSQL
+accepting exactly that second postmaster
+(`postgresql_alone_accepts_a_second_postmaster_of_another_slot_on_the_same_directory`). Two
+writers corrupt the cluster.
+
+**The rule:** before an older release is assigned to a node's region, every database on the node
+sleeps with its proof, so that no slot holds a database, and none wakes before the older agent
+runs. Idle slots hold no database and cannot corrupt one: the older agent ignores them (its host
+files drop the slot template, and units that run keep running), and the first release that runs
+slots again adopts them. The order that exists for it is `maintenance`
+(`POST /v1/nodes/{id}/maintenance`): it holds new wakes with `57P03`, puts every awake database
+to sleep with the proof (the sleep stops its slot and waits until the unit is inactive), stops the
+idle slots and builds none while it is open. Its hold ends when the cycle is answered, within
+seconds when the node holds the release's packages already, and no order holds the wakes across
+the swap of the agent; a manual suspension reaches only `ready` databases, not a database that
+hibernates. So run the order, wait for `done`, read that every database of the node is
+`hibernated`, assign the older release at once, and do it in a window in which nothing connects (a
+connection in between wakes a database in a slot). The agent that installs the older release is
+this one: it does not look at its slots before it switches its link.
 
 **The health check** runs the scratch database in the slot of its own (number 1023), so it takes no
 idle slot of the agent's pool and leaves none; it builds that slot (and makes its user) with its own

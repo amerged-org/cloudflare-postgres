@@ -535,6 +535,9 @@ impl Machine for Node {
     async fn refill_slot(&self, target: usize) -> Result<Option<u32>, units::Error> {
         self.pool.refill(target).await
     }
+    async fn make_slot_user(&self) -> Result<Option<u32>, units::Error> {
+        self.pool.make_user().await
+    }
     async fn drain_idle_slots(&self) -> usize {
         self.pool.drain_idle().await
     }

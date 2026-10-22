@@ -411,7 +411,9 @@ impl<M: Machine> Core<M> {
     }
 
     /// One pass of the pool's refill (`slots`): while the node takes no start and waits for none,
-    /// one idle slot at a time up to `start_concurrency`. A fenced node and one in maintenance
+    /// one idle slot at a time up to `start_concurrency`, and then the users of the numbers that
+    /// have none, one at a time, to the end of the pool's range, so that a storm of wakes never
+    /// finds a number without its user (a wake makes none). A fenced node and one in maintenance
     /// have no idle slots.
     pub async fn refill_pass(self: &Arc<Self>) {
         loop {
@@ -420,12 +422,18 @@ impl<M: Machine> Core<M> {
                 return;
             }
             // The build costs the node about 80 ms of CPU, which a wake must not wait for: it is
-            // made only when no start is in flight or waits.
+            // made only when no start is in flight or waits. So is a user, which locks the node's
+            // account files for about 75 ms.
             if !self.admission.quiet().await {
                 return;
             }
             let target = self.policy().admission.admission.start_concurrency;
             match self.machine.refill_slot(target).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(_) => return,
+            }
+            match self.machine.make_slot_user().await {
                 Ok(Some(_)) => {}
                 _ => return,
             }
@@ -3209,6 +3217,47 @@ mod tests {
         rig.core.fences.fence("op_ffffffffffffffffffff").unwrap();
         rig.core.refill_pass().await;
         assert_eq!(rig.machine.slots().idle, 0);
+    }
+
+    /// The refill makes the users of the whole range once the idle slots are in place, one at a
+    /// time and only while the node is quiet: a start in flight makes none, and then a storm of
+    /// wakes cannot run out of numbers with a user, which a wake never makes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_refill_makes_the_users_of_the_whole_range_while_the_node_is_quiet() {
+        let Some(rig) = Rig::new("refill-users").await else {
+            return;
+        };
+        rig.core
+            .set_policy(crate::agent::testing::policy_with_start_concurrency(Some(
+                2,
+            )));
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        rig.machine.drain_idle_slots().await;
+        // A node just installed: the users of the first four numbers exist.
+        rig.machine.limit_slot_users(4).await;
+        assert_eq!(rig.machine.slot_users(), 4);
+
+        // A start is in flight: the refill makes no slot and no user.
+        rig.machine.delay_next_start(Duration::from_millis(1200));
+        let (core, ticket) = (rig.core.clone(), Rig::ticket(&entry));
+        let waking = tokio::spawn(async move { core.wake(&ticket).await });
+        eventually(10, "the start to be ordered", || {
+            rig.machine.running(&entry.id)
+        })
+        .await;
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slot_users(), 4, "a start is in flight");
+        assert_eq!(waking.await.unwrap().outcome, WakeOutcome::Started);
+
+        // Quiet: the idle slots first, then every number of the range has its user.
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slots().idle, 2);
+        assert_eq!(
+            rig.machine.slot_users(),
+            crate::units::slots::POOL.len(),
+            "the users of the whole range, and none for the health check's slot"
+        );
     }
 
     /// A bind that cannot move the mounts in leaves the database asleep with its proof: the order

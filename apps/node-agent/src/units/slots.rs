@@ -783,14 +783,16 @@ impl<H: Host> Pool<H> {
 
     /// Builds one idle slot if fewer than `target` are idle or being built; the number of the
     /// slot it built. The caller decides when: the build costs the node about 80 ms of CPU, and it
-    /// must not take it from a wake. The refill also makes the slot users a wake may need ahead of
-    /// it ([`Pool::make_users`]), because a wake never makes one.
+    /// must not take it from a wake. A build needs a number with a user: where none that is free
+    /// has one (a node that never made a slot), the refill makes the lowest one first.
     pub async fn refill(&self, target: usize) -> Result<Option<u32>, Error> {
         self.sweep().await;
-        self.make_users(target).await?;
         let counted = self.snapshot();
         if counted.idle + counted.spawning >= target {
             return Ok(None);
+        }
+        if self.table().free_number(&self.range).is_none() {
+            self.make_user().await?;
         }
         let slot = self.table().reserve(&self.range, None)?;
         let spawned = self.build(slot, None).await?;
@@ -809,43 +811,36 @@ impl<H: Host> Pool<H> {
         Ok(Some(slot))
     }
 
-    /// Makes the users a start may need, ahead of it: every number below the highest in use plus
-    /// twice `target`, lowest first, so that the numbers a wake takes first have theirs first.
-    /// `groupadd` and `useradd` take node-wide locks on `/etc/passwd` and `/etc/group` and cost
-    /// about 75 ms each (lab, Debian 13), so a wake never makes a user: one that finds no free
-    /// number with a user fails with `NoSlot`, and the refill that its failure asks for makes the
-    /// users. A user that cannot be made keeps its number out of every later build, and ends this
-    /// pass with the error.
-    async fn make_users(&self, target: usize) -> Result<(), Error> {
-        let end = {
+    /// Makes the user of the lowest number of the range that has none, and says which; `None`
+    /// when every number has one. The refill calls it, one user at a time, in its quiet passes
+    /// after the idle slots are in place: it makes the users of the whole range ahead of any need
+    /// (they persist in `/etc/passwd`, so a node makes them once), because a wake never makes one
+    /// (`groupadd` and `useradd` take node-wide locks on `/etc/passwd` and `/etc/group` and cost
+    /// about 75 ms for a user, lab, Debian 13) and a storm takes a number for every wake it holds:
+    /// a wake that finds no free number with a user fails with `NoSlot`. A user that cannot be made
+    /// keeps its number out of every later build and of this call, and ends this pass with the
+    /// error.
+    pub async fn make_user(&self) -> Result<Option<u32>, Error> {
+        let slot = {
             let table = self.table();
-            let highest = table
-                .slots
-                .keys()
-                .next_back()
-                .map_or(self.range.start, |slot| slot + 1);
-            let ahead = u32::try_from(target.saturating_mul(2)).unwrap_or(u32::MAX);
-            highest.saturating_add(ahead).min(self.range.end)
+            self.range
+                .clone()
+                .find(|slot| !table.users.contains(slot) && !table.failed.contains(slot))
         };
-        for slot in self.range.start..end {
-            {
-                let table = self.table();
-                if table.users.contains(&slot) || table.failed.contains(&slot) {
-                    continue;
-                }
+        let Some(slot) = slot else {
+            return Ok(None);
+        };
+        match self.host.ensure_user(slot).await {
+            Ok(()) => {
+                self.table().users.insert(slot);
+                Ok(Some(slot))
             }
-            match self.host.ensure_user(slot).await {
-                Ok(()) => {
-                    self.table().users.insert(slot);
-                }
-                Err(error) => {
-                    self.table().failed.insert(slot);
-                    build_failed(slot, "user", None, &error);
-                    return Err(error);
-                }
+            Err(error) => {
+                self.table().failed.insert(slot);
+                build_failed(slot, "user", None, &error);
+                Err(error)
             }
         }
-        Ok(())
     }
 
     /// Stops every idle slot, and the ones that were left behind by a stop that failed.
@@ -1825,8 +1820,8 @@ mod tests {
 
     /// A wake makes no slot user (`groupadd` and `useradd` lock the node's account files, and a
     /// storm of builds on a new node would contend for them): a miss takes only a number that has
-    /// one, and fails where none has. The refill makes the users, lowest number first, ahead of
-    /// the highest slot in use by twice the target.
+    /// one, and fails where none has. The refill makes the user it needs for an idle slot and then,
+    /// in its quiet passes, the users of the whole range, lowest number first.
     #[tokio::test]
     async fn a_miss_never_makes_a_user_and_the_refill_makes_them_ahead() {
         let (sim, data) = (Sim::fresh(), data_directory("users"));
@@ -1837,7 +1832,6 @@ mod tests {
             "cdefghijkl2345678901",
             "defghijklm3456789012",
             "efghijklmn4567890123",
-            "fghijklmno5678901234",
         ];
         let bind = |database: &'static str| {
             let (pool, data) = (&pool, data.clone());
@@ -1853,21 +1847,29 @@ mod tests {
             "a failed claim holds nothing"
         );
 
-        // The refill: users 0 to 3 (twice the target of 2, from slot 0), then the first idle slot;
-        // the second refill is ahead of slot 0, so one more.
+        // The refill makes the one user an idle slot needs, and no more than that: the first idle
+        // slot is number 0 with its user, the second number 1 with its own.
         assert_eq!(pool.refill(2).await.unwrap(), Some(0));
-        assert_eq!(
-            sim.calls()[..4],
-            ["user 0", "user 1", "user 2", "user 3"],
-            "{:?}",
-            sim.calls()
-        );
+        assert_eq!(sim.state().users, BTreeSet::from([0]), "{:?}", sim.calls());
         assert_eq!(pool.refill(2).await.unwrap(), Some(1));
-        assert_eq!(sim.state().users, BTreeSet::from([0, 1, 2, 3, 4]));
+        assert_eq!(sim.state().users, BTreeSet::from([0, 1]));
+        assert_eq!(pool.refill(2).await.unwrap(), None, "the pool is full");
+        assert_eq!(sim.state().users, BTreeSet::from([0, 1]));
+        // Then the quiet passes: one user per call, lowest number first, to the end of the range.
+        for expected in 2..6 {
+            assert_eq!(pool.make_user().await.unwrap(), Some(expected));
+        }
+        while pool.make_user().await.unwrap().is_some() {}
+        assert_eq!(sim.state().users, POOL.collect::<BTreeSet<u32>>());
+        assert_eq!(
+            pool.make_user().await.unwrap(),
+            None,
+            "nothing left to make"
+        );
         sim.clear();
-        // Two hits, then three misses on the numbers whose users the refill made: no user on a wake.
+        // Two hits, then misses on numbers whose users the refill made: no user on a wake.
         let mut taken = Vec::new();
-        for (at, database) in databases[..5].iter().enumerate() {
+        for (at, database) in databases.iter().enumerate() {
             let bound = bind(database).await.unwrap();
             let from = if at < 2 {
                 SlotFrom::Pool
@@ -1883,24 +1885,20 @@ mod tests {
             "{:?}",
             sim.calls()
         );
-        // Past the numbers that have a user, a miss fails; the next refill makes more users, ahead
-        // of the highest number in use (4 + 1 + 4 = 9, so up to 8).
-        assert!(matches!(bind(databases[5]).await, Err(Error::NoSlot)));
-        assert_eq!(pool.refill(2).await.unwrap(), Some(5));
-        assert_eq!(sim.state().users, (0..9).collect::<BTreeSet<u32>>());
     }
 
-    /// A user that cannot be made keeps its number out of the builds, and the refill goes on with
-    /// the numbers above it on its next pass.
+    /// A user that cannot be made keeps its number out of the builds and of the later passes of
+    /// the refill, which go on with the numbers above it.
     #[tokio::test]
     async fn a_number_whose_user_cannot_be_made_is_skipped() {
         let (sim, data) = (Sim::fresh(), data_directory("no-user"));
         sim.state().no_user.insert(1);
         let pool = pool(&sim);
-        assert!(pool.refill(1).await.is_err(), "user 1 fails");
+        assert_eq!(pool.refill(1).await.unwrap(), Some(0));
+        // The quiet pass meets number 1 and fails; the pass ends with the error.
+        assert!(pool.make_user().await.is_err(), "user 1 fails");
         assert!(sim.state().users.contains(&0));
         assert!(!sim.state().users.contains(&1));
-        assert_eq!(pool.refill(1).await.unwrap(), Some(0));
         let hit = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
         assert_eq!(hit.slot, 0);
         // Number 0 is in use and number 1 has no user: a wake finds nothing to take, and makes none.
@@ -1908,9 +1906,10 @@ mod tests {
             pool.bind(D2, &bind_of(D2, 1, &data)).await,
             Err(Error::NoSlot)
         ));
-        // The refill goes past number 1 and makes the user of number 2, and no attempt is made at 1.
+        // The next pass goes past number 1 and makes the user of number 2, and no attempt is made
+        // at 1 again.
         sim.clear();
-        assert_eq!(pool.refill(1).await.unwrap(), Some(2));
+        assert_eq!(pool.make_user().await.unwrap(), Some(2));
         assert!(
             sim.calls().iter().any(|call| call == "user 2"),
             "{:?}",
@@ -1919,6 +1918,55 @@ mod tests {
         assert!(
             !sim.calls().iter().any(|call| call == "user 1"),
             "{:?}",
+            sim.calls()
+        );
+        // The refill that needs a number goes past it too.
+        assert_eq!(pool.refill(1).await.unwrap(), Some(2));
+    }
+
+    /// A storm of wakes larger than the idle slots and twice the target still finds a number for
+    /// every wake, and not one of them makes a user. A node that never made a slot starts with the
+    /// refill, which fills the pool and then makes the users of the whole range in its quiet
+    /// passes (they persist in `/etc/passwd`), so no storm the admission queue can hold runs out.
+    #[tokio::test]
+    async fn a_storm_larger_than_the_idle_slots_and_twice_the_target_finds_a_number_for_every_wake()
+    {
+        let (sim, data) = (Sim::fresh(), data_directory("storm"));
+        let pool = pool(&sim);
+        while pool.refill(8).await.unwrap().is_some() {}
+        assert_eq!(pool.snapshot().idle, 8);
+        // The quiet passes go on after the pool is full, one user at a time, to the whole range.
+        while pool.make_user().await.unwrap().is_some() {}
+        assert_eq!(
+            sim.state().users,
+            POOL.collect::<BTreeSet<u32>>(),
+            "every number of the range has its user"
+        );
+        sim.clear();
+        let mut failed = Vec::new();
+        let mut taken = BTreeSet::new();
+        for number in 0..30 {
+            let database = format!("s{number:019}");
+            match pool.bind(&database, &bind_of(&database, 1, &data)).await {
+                Ok(bound) => {
+                    assert!(taken.insert(bound.slot), "slot {} taken twice", bound.slot);
+                    assert_eq!(
+                        bound.from,
+                        if number < 8 {
+                            SlotFrom::Pool
+                        } else {
+                            SlotFrom::Demand
+                        },
+                        "wake {number}"
+                    );
+                }
+                Err(error) => failed.push((number, error.to_string())),
+            }
+        }
+        assert!(failed.is_empty(), "wakes that failed: {failed:?}");
+        assert!(
+            !sim.calls().iter().any(|call| call.starts_with("user")),
+            "a wake made a user: {:?}",
             sim.calls()
         );
     }

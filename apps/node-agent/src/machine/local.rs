@@ -466,6 +466,16 @@ impl Local {
             .map(|(name, version)| (name.to_string(), version.to_string()))
             .collect();
     }
+    /// How many slot numbers have a user on this machine.
+    pub fn slot_users(&self) -> usize {
+        self.state().slot_users.len()
+    }
+    /// A node that made the users of the first `count` slot numbers only, as one just installed
+    /// has: the pool reads them again, as an agent that starts does.
+    pub async fn limit_slot_users(&self, count: u32) {
+        self.state().slot_users = (0..count).collect();
+        self.pool.adopt().await.unwrap();
+    }
     /// Whether `database` has a postmaster running, in a slot or as a unit of its own.
     pub fn running(&self, database: &str) -> bool {
         let mut state = self.state();
@@ -1211,6 +1221,9 @@ impl Machine for Local {
     }
     async fn refill_slot(&self, target: usize) -> Result<Option<u32>, units::Error> {
         self.pool.refill(target).await
+    }
+    async fn make_slot_user(&self) -> Result<Option<u32>, units::Error> {
+        self.pool.make_user().await
     }
     async fn drain_idle_slots(&self) -> usize {
         self.pool.drain_idle().await
