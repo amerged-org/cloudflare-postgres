@@ -122,6 +122,41 @@ describe("the next capacity step of a region", () => {
     expect(await additions(f)).toBe(1);
   });
 
+  it("reserves no order when purchases are turned off between the policy read and the reservation, and says so", async () => {
+    const f = await region(4096, { order: true, purchases: true });
+    await seedSamples(f.node, steady(Date.now(), 40, { ramPpm: 900_000 }));
+    const start = vi
+      .spyOn(env.ADD_NODE, "create")
+      .mockResolvedValue({} as Awaited<ReturnType<typeof env.ADD_NODE.create>>);
+    // An operator PUT lands while the run checks for maintenance, after it read the policy.
+    const prepare = env.DB.prepare.bind(env.DB);
+    let turnedOff = false;
+    vi.spyOn(env.DB, "prepare").mockImplementation((sql: string) => {
+      const statement = prepare(sql);
+      if (!sql.includes("lifecycle_orders o JOIN nodes n")) return statement;
+      const bind = statement.bind.bind(statement);
+      statement.bind = (...values) => {
+        const bound = bind(...values),
+          first = bound.first.bind(bound);
+        bound.first = (async (...args: unknown[]) => {
+          turnedOff = true;
+          await prepare(
+            "UPDATE node_region_policies SET purchases_enabled=0 WHERE region_id=?",
+          )
+            .bind(f.region)
+            .run();
+          return (first as (...a: unknown[]) => Promise<unknown>)(...args);
+        }) as typeof bound.first;
+        return bound;
+      };
+      return statement;
+    });
+    expect(await decide(f, false)).toBe("purchases_disabled");
+    expect(turnedOff).toBe(true);
+    expect(await additions(f)).toBe(0);
+    expect(start).not.toHaveBeenCalled();
+  });
+
   it("reserves nothing while autoscale is off, even with purchases on and an order", async () => {
     const f = await region(4096, {
       autoscale: false,

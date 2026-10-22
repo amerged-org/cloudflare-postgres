@@ -381,10 +381,12 @@ function automaticCapacityOrderKey(key: string): boolean {
   );
 }
 /**
- * The authority of an automatic purchase, for the policy row `policy`: the region's autoscale
- * switch. A `capacity-headroom-` order was placed by the capacity cron because no node fits (ULTRA
- * plan 9.7), so nothing more is read; the older `capacity-ram-` and `capacity-order-` keys also
- * need the regional RAM window. `headroom` is the SQL that says the key is a headroom key.
+ * The authority of an automatic purchase, for the policy row `policy`: the region's purchase and
+ * autoscale switches, read in the same statement that reserves, approves or dispatches, so a switch
+ * turned off after the capacity cron read the policy still stops the order. A `capacity-headroom-`
+ * order was placed by the capacity cron because no node fits (ULTRA plan 9.7), so nothing more is
+ * read; the older `capacity-ram-` and `capacity-order-` keys also need the regional RAM window.
+ * `headroom` is the SQL that says the key is a headroom key.
  */
 function automaticAuthoritySql(
   policy: string,
@@ -392,7 +394,7 @@ function automaticAuthoritySql(
   key: string,
   headroom = `${key} LIKE 'capacity-headroom-%'`,
 ): string {
-  return `(${policy}.autoscale_enabled=1 AND (${headroom} OR ${regionalRamExpansionSql(region, key)}))`;
+  return `(${policy}.purchases_enabled=1 AND ${policy}.autoscale_enabled=1 AND (${headroom} OR ${regionalRamExpansionSql(region, key)}))`;
 }
 export async function reserveNodeAddition(
   db: D1Database,

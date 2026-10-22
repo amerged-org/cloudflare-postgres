@@ -261,9 +261,10 @@ describe("which node takes a new database", () => {
 
 /**
  * What closes a node's pool for new databases (plan 4.3, 4.8): 80 % of its data, 50 % of its
- * metadata, the sold storage at four times its data (the cap) and 1,000 volumes. Only the cap
- * stops a resize that grows storage, whatever else has closed the node: a resize creates no
- * volume and takes no real space (handover 2.5).
+ * metadata, the sold storage at four times its data (the cap) and 1,000 volumes. While the pool
+ * has room, only the cap stops a resize that grows storage, whatever else has closed the node: a
+ * resize creates no volume and takes no real space (handover 2.5). A pool with no room (the agent
+ * reports `room: false` below the free-data reserve or at 75 % of the metadata) stops it too.
  */
 interface Closers {
   cap?: true;
@@ -326,6 +327,19 @@ describe("which node takes the storage growth of a database it holds (plan 3.5)"
       );
     },
   );
+
+  it("refuses storage growth, and nothing else, on a node whose pool has no room", () => {
+    // At 75 % of its metadata the agent reports room: false (plan 4.3), though the cap is far off.
+    const noRoom = node({
+      room: 0,
+      pool_metadata_total_bytes: GIB,
+      pool_metadata_used_bytes: (GIB * 3) / 4,
+    });
+    expect(growthFits(noRoom, GROW, NOW)).toBe(false);
+    expect(
+      growthFits(noRoom, { ...GROW, storage_gib: 0, memory_mib: 256 }, NOW),
+    ).toBe(true);
+  });
 
   it("lets a node at 80 % of its data grow storage up to the cap and no further", () => {
     const full = (nominal: number) =>

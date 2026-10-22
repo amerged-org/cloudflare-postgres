@@ -749,6 +749,27 @@ it("authorizes a headroom purchase by the autoscale switch alone, without the re
   ).not.toBeNull();
 });
 
+it("refuses to reserve a headroom purchase while purchases are off, though autoscale is on", async () => {
+  const f = await withoutRamWindow();
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET purchases_enabled=0 WHERE region_id=?",
+  )
+    .bind(f.region)
+    .run();
+  // The switches are read at the reservation itself, so a purchase turned off after the capacity
+  // cron read the policy still reserves nothing that purchases would dispatch when turned on again.
+  await expect(headroom(f)).rejects.toMatchObject({
+    code: "capacity_unavailable",
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) n FROM node_additions WHERE region_id=?",
+    )
+      .bind(f.region)
+      .first("n"),
+  ).toBe(0);
+});
+
 it("revokes an undispatched headroom purchase when automatic expansion is disabled", async () => {
   const f = await withoutRamWindow();
   const approved = await approveStandingNodePurchase(

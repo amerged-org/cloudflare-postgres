@@ -307,8 +307,21 @@ export async function runNodeCapacity(
     if (
       error instanceof NodeStateError &&
       error.code === "capacity_unavailable"
-    )
-      return { ...result, action: "cap_reached" };
+    ) {
+      // An order is also refused when purchases were turned off after the policy was read above.
+      const now = await env.DB.prepare(
+        "SELECT purchases_enabled FROM node_region_policies WHERE region_id=?",
+      )
+        .bind(regionId)
+        .first<{ purchases_enabled: number }>();
+      return {
+        ...result,
+        action:
+          request.mode === "order" && !now?.purchases_enabled
+            ? "purchases_disabled"
+            : "cap_reached",
+      };
+    }
     throw error;
   }
 }
