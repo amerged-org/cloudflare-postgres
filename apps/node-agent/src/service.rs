@@ -3060,8 +3060,13 @@ mod tests {
                 "restart pgcf-gateway.service"
             ]
         );
+        // The unit's definition changes when the restart is done; the record that the host files are
+        // done is written just after it, so the test waits for it as well.
         let boot = machine.boot().unwrap().id;
-        assert!(!crate::hostfiles::State::load(&machine.layout().host_files()).unfinished(&boot));
+        eventually(30, "the host files to be recorded as done", || {
+            !crate::hostfiles::State::load(&machine.layout().host_files()).unfinished(&boot)
+        })
+        .await;
         service.stop();
     }
 
