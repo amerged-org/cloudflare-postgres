@@ -2,6 +2,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, expect, it } from "vitest";
+import { z } from "zod";
 import { SizeClass } from "../src/index.ts";
 
 // The rollback below migration 0082 is SQL in docs/operations/infrastructure-backups.md. An operator
@@ -30,19 +31,67 @@ const RESERVED = [
   "reserved_memory_mib_seconds",
   "reserved_storage_byte_seconds",
 ];
+// The contract of the API Worker from before 0082, as packages/contracts/src/usage.ts had it: the part that
+// reads a stored hour (strict, the three reserved_* metrics required) and the resource snapshot of an event
+// (strict, five fields). A copy, because the current contract no longer has them.
+const Count = z.number().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const OLDER_METRICS = [
+  "provisioned_seconds",
+  "awake_seconds",
+  "memory_mib_seconds",
+  "cpu_millicore_seconds",
+  "reserved_memory_mib_seconds",
+  "reserved_cpu_millicore_seconds",
+  "reserved_storage_byte_seconds",
+  "storage_used_bytes_max",
+  "storage_allocated_bytes",
+  "backup_bytes_max",
+  "ingress_bytes",
+  "egress_bytes",
+  "connections",
+  "connection_seconds",
+] as const;
+const OlderUsageRow = z.strictObject({
+  final: z.boolean(),
+  metrics: z.strictObject(
+    Object.fromEntries(OLDER_METRICS.map((name) => [name, Count.nullable()])),
+  ),
+  gaps: z
+    .array(
+      z.enum([
+        ...OLDER_METRICS,
+        "lifecycle",
+        "resource_snapshot",
+        "traffic_coverage",
+        "rollup_pending",
+      ]),
+    )
+    .max(OLDER_METRICS.length + 4),
+});
+const OlderResourceSnapshot = z.strictObject({
+  memory_mib: Count.int(),
+  cpu_millicores: Count.int(),
+  reserved_memory_mib: Count.int(),
+  reserved_cpu_millicores: Count.int(),
+  storage_allocated_bytes: Count.int().nullable(),
+});
 const open: DatabaseSync[] = [];
 afterEach(() => {
   for (const database of open.splice(0)) database.close();
 });
 
-/** The fenced `sql` blocks of the runbook's rollback section: schema, hourly usage, snapshots, roll forward. */
-function sections(): [string, string, string, string] {
+/** The runbook's rollback section. */
+function section(): string {
   const text = readFileSync(RUNBOOK, "utf8");
   const start = text.indexOf(HEADING);
   expect(start, "the runbook has the rollback section").toBeGreaterThan(-1);
   const end = text.indexOf("\n## ", start + HEADING.length);
-  const section = text.slice(start, end === -1 ? undefined : end);
-  const blocks = [...section.matchAll(/```sql\n([\s\S]*?)```/g)].map(
+  return text.slice(start, end === -1 ? undefined : end);
+}
+
+/** The fenced `sql` blocks of the runbook's rollback section: schema, hourly usage, snapshots, roll forward. */
+function sections(): [string, string, string, string] {
+  const blocks = [...section().matchAll(/```sql\n([\s\S]*?)```/g)].map(
     (match) => match[1]!,
   );
   expect(
@@ -88,19 +137,58 @@ const byFirstLetter = (statement: string) => {
     .join("\n");
 };
 
+// Every metric of a stored hour that stays after 0082, the way the rollup writes it (all keys, null when unknown).
 const kept = {
   provisioned_seconds: 3600,
   awake_seconds: 1800,
   memory_mib_seconds: 5,
   cpu_millicore_seconds: 6,
+  storage_used_bytes_max: 4,
   storage_allocated_bytes: 7,
+  backup_bytes_max: null,
+  ingress_bytes: 8,
+  egress_bytes: 9,
   connections: 3,
+  connection_seconds: 12,
 };
 const reserved = {
   reserved_memory_mib_seconds: 640,
   reserved_cpu_millicore_seconds: 600,
   reserved_storage_byte_seconds: 7,
 };
+
+/** A final hourly row, as the rollup of either Worker stores it. */
+const insertHour = (
+  target: DatabaseSync,
+  id: string,
+  at: string,
+  metrics: object,
+  gaps: string[],
+) =>
+  target
+    .prepare(
+      "INSERT INTO usage_hourly(database_id,hour,metrics,gaps,final,computed_at) VALUES(?,?,?,?,1,?)",
+    )
+    .run(id, at, JSON.stringify(metrics), JSON.stringify(gaps), NOW);
+/** A lifecycle event with the resource snapshot the Worker keeps for usage. */
+const insertEvent = (
+  target: DatabaseSync,
+  id: string,
+  kind: string,
+  snapshot: object | null,
+) =>
+  target
+    .prepare(
+      `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
+       VALUES(?,?,?,'small',1,?,?)`,
+    )
+    .run(
+      id,
+      kind,
+      node,
+      NOW,
+      snapshot === null ? null : JSON.stringify(snapshot),
+    );
 
 /** A control database before 0082: the dropped columns in use, the old usage shape stored. */
 function before(): DatabaseSync {
@@ -118,24 +206,9 @@ function after(): DatabaseSync {
   const run = (sql: string, ...params: (string | number | null)[]) =>
     db.prepare(sql).run(...params);
   const hour = (id: string, at: string, metrics: object, gaps: string[]) =>
-    run(
-      "INSERT INTO usage_hourly(database_id,hour,metrics,gaps,final,computed_at) VALUES(?,?,?,?,1,?)",
-      id,
-      at,
-      JSON.stringify(metrics),
-      JSON.stringify(gaps),
-      NOW,
-    );
+    insertHour(db, id, at, metrics, gaps);
   const event = (id: string, kind: string, snapshot: object | null) =>
-    run(
-      `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-       VALUES(?,?,?,'small',1,?,?)`,
-      id,
-      kind,
-      node,
-      NOW,
-      snapshot === null ? null : JSON.stringify(snapshot),
-    );
+    insertEvent(db, id, kind, snapshot);
   run(
     "INSERT INTO projects(id,name,created_at,updated_at) VALUES(?,?,?,?)",
     project,
@@ -226,9 +299,12 @@ const hours = (db: DatabaseSync) =>
     )
     .all()
     .map((row) => ({
-      ...row,
-      metrics: JSON.parse(String(row.metrics)),
-      gaps: JSON.parse(String(row.gaps)),
+      database_id: String(row.database_id),
+      hour: String(row.hour),
+      metrics: JSON.parse(String(row.metrics)) as Record<string, unknown>,
+      gaps: JSON.parse(String(row.gaps)) as string[],
+      final: row.final,
+      computed_at: row.computed_at,
     }));
 const snapshots = (db: DatabaseSync) =>
   db
@@ -240,6 +316,40 @@ const snapshots = (db: DatabaseSync) =>
         ? null
         : JSON.parse(String(row.resource_snapshot)),
     ]);
+
+/**
+ * What a Worker of the release before 0082 refuses in this database, by its own contract: the hours
+ * (`GET /v1/usage` answers 500 for a range that covers one) and the snapshots (its rollup reads one as a
+ * `resource_snapshot` gap and loses the awake-time metrics of the span).
+ */
+const refused = (target: DatabaseSync) => ({
+  hours: target
+    .prepare(
+      "SELECT database_id,hour,metrics,gaps,final FROM usage_hourly ORDER BY database_id,hour",
+    )
+    .all()
+    .filter(
+      (row) =>
+        !OlderUsageRow.safeParse({
+          final: row.final === 1,
+          metrics: JSON.parse(String(row.metrics)),
+          gaps: JSON.parse(String(row.gaps)),
+        }).success,
+    )
+    .map((row) => `${row.database_id}|${row.hour}`),
+  snapshots: target
+    .prepare(
+      "SELECT database_id,kind,resource_snapshot FROM lifecycle_events WHERE resource_snapshot IS NOT NULL ORDER BY id",
+    )
+    .all()
+    .filter(
+      (row) =>
+        !OlderResourceSnapshot.safeParse(
+          JSON.parse(String(row.resource_snapshot)),
+        ).success,
+    )
+    .map((row) => `${row.database_id}|${row.kind}`),
+});
 
 let db: DatabaseSync;
 beforeEach(() => {
@@ -363,7 +473,18 @@ const rolledBack = (target: DatabaseSync, chunked: boolean) => {
 it("gives every hourly row and snapshot the keys the older release requires and keeps what they hold", () => {
   const rows = hours(db).length;
   const events = snapshots(db).length;
+  // After 0082 the older contract refuses what the newer Worker stored, and accepts the rows the older Worker
+  // wrote in between; after the migration it refuses nothing.
+  expect(refused(db)).toEqual({
+    hours: [
+      `${first}|2026-10-19T08:00:00.000Z`,
+      `${first}|2026-10-19T09:00:00.000Z`,
+      `${last}|2026-10-19T08:00:00.000Z`,
+    ],
+    snapshots: [`${first}|created`, `${last}|woke`],
+  });
   rolledBack(db, false);
+  expect(refused(db)).toEqual({ hours: [], snapshots: [] });
   const gaps = (names: string[]) =>
     [...new Set([...names, ...RESERVED])].sort();
   const unknown = Object.fromEntries(RESERVED.map((name) => [name, null]));
@@ -454,4 +575,61 @@ it("gives the same rows when the usage statements run one first letter of the da
   expect(() =>
     other.exec("UPDATE lifecycle_events SET generation=2 WHERE kind='created'"),
   ).toThrow(/immutable/);
+});
+
+const NEWER_HOUR = "2026-10-19T10:00:00.000Z";
+it("leaves what the newer Worker writes before the older Worker is live refused until the usage statements run again", () => {
+  const [, usage, lifecycle] = rollbackBlocks();
+  rolledBack(db, false);
+  // The first migration has run and the older Worker is not deployed yet: the newer Worker keeps going.
+  // Its rollup stores an hour without the three metrics, and a wake keeps the two limits only.
+  insertHour(db, first, NEWER_HOUR, { ...kept }, ["traffic_coverage"]);
+  insertEvent(db, first, "woke", { memory_mib: 512, cpu_millicores: 500 });
+  // With the older Worker live, its strict contract refuses both, and nothing else repairs them.
+  expect(refused(db)).toEqual({
+    hours: [`${first}|${NEWER_HOUR}`],
+    snapshots: [`${first}|woke`],
+  });
+  const settledHours = hours(db).filter((row) => row.hour !== NEWER_HOUR);
+  const settledSnapshots = snapshots(db).slice(0, -1);
+  // The second migration: the two usage statements again, right after the older Worker is live.
+  transaction(db, [usage, lifecycle].join("\n"));
+  expect(refused(db)).toEqual({ hours: [], snapshots: [] });
+  const unknown = Object.fromEntries(RESERVED.map((name) => [name, null]));
+  expect(hours(db).find((row) => row.hour === NEWER_HOUR)).toEqual({
+    database_id: first,
+    hour: NEWER_HOUR,
+    metrics: { ...kept, ...unknown },
+    gaps: [
+      "reserved_cpu_millicore_seconds",
+      "reserved_memory_mib_seconds",
+      "reserved_storage_byte_seconds",
+      "traffic_coverage",
+    ],
+    final: 1,
+    computed_at: NOW,
+  });
+  expect(snapshots(db).at(-1)).toEqual([
+    "woke",
+    {
+      memory_mib: 512,
+      cpu_millicores: 500,
+      reserved_memory_mib: 512,
+      reserved_cpu_millicores: 500,
+      storage_allocated_bytes: null,
+    },
+  ]);
+  // What the first migration repaired stays as it is: both statements only touch rows that lack the keys.
+  expect(hours(db).filter((row) => row.hour !== NEWER_HOUR)).toEqual(
+    settledHours,
+  );
+  expect(snapshots(db).slice(0, -1)).toEqual(settledSnapshots);
+});
+
+it("tells the operator to run the usage statements again as a second migration right after the older Worker is live", () => {
+  const text = section().replace(/\s+/g, " ");
+  expect(text).toMatch(/second migration file/);
+  expect(text).toMatch(/right after the older Worker is live/i);
+  // The residual window between the deploy and the second migration is stated.
+  expect(text).toMatch(/finalizes/);
 });

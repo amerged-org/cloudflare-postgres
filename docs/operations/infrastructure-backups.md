@@ -37,8 +37,9 @@ Worker back below this release first needs
 because the earlier release's health route does not parse those kinds. Migration
 `0082_drop_dead_capacity_fields.sql` is not undone by rolling the Worker back either: an older
 Worker reads columns and a table it dropped. A rollback below it needs the forward migration of
-[Rolling back below migration 0082](#rolling-back-below-migration-0082); the export taken before
-the migration is not a substitute for it.
+[Rolling back below migration 0082](#rolling-back-below-migration-0082) before the older Worker is
+deployed and its two usage statements again as a second migration right after the older Worker is
+live; the export taken before the migration is not a substitute for it.
 
 Use the administrator API, replacing every placeholder with this installation's
 actual values:
@@ -89,15 +90,40 @@ explicitly authorized step of [recovery](recovery.md#control-plane).
 
 The forward migration adds back what `0082` dropped, with the definitions of migrations `0018`,
 `0024`, `0038` and `0041`. The columns held only dead data with no producer, so the restored values
-are the old defaults (none, `reserved`, `0`) and the older Worker reads them as it did before. Save
-the three blocks below as one migration file in `apps/api/migrations`, numbered after the highest
-migration the installation has applied, and apply it with `wrangler d1 migrations apply`, which runs
-it as one transaction. Apply it first and deploy the older Worker straight after: the older Worker
-fails without the migration, and the newer Worker that runs in between writes statements that name
-none of the restored columns and reads the restored usage shape. That newer Worker fails one route
-family while `size_classes.cpu_request_millicores` exists: it parses a whole size class row with a
-strict schema that does not know the column, so `GET /v1/size-classes` and `PUT /v1/size-classes/{id}`
-(after it stored the class) answer 500 until the older Worker runs.
+are the old defaults (none, `reserved`, `0`) and the older Worker reads them as it did before. The
+usage keys need a second run, because the newer Worker keeps writing the newer shape until the older
+Worker is live. The order is:
+
+1. Save the three blocks below as one migration file in `apps/api/migrations`, numbered after the
+   highest migration the installation has applied, and apply it with `wrangler d1 migrations apply`,
+   which runs it as one transaction.
+2. Deploy the older Worker straight after: it fails without this migration.
+3. Right after the older Worker is live, apply the usage block and the lifecycle block again,
+   unchanged, as a second migration file numbered after the first. Both statements select only the
+   rows that lack the keys, so the second run leaves every row the first one repaired as it is.
+
+Between the first migration and the deploy, the newer Worker writes rows that the first migration has
+already passed. Its rollup stores hourly usage rows without the three `reserved_*` metrics, including
+for the hours it finalizes, and every wake and every sleep stores a lifecycle snapshot of
+`memory_mib` and `cpu_millicores` only. The older Worker's strict usage contract refuses both. For
+any range that covers such an hour `GET /v1/usage` answers 500 and keeps answering it, because a
+final hour is never recomputed. Its rollup reads such a snapshot as a `resource_snapshot` gap, so
+`memory_mib_seconds` and `cpu_millicore_seconds` of that database are null until its next lifecycle
+event, and are lost for good once those hours finalize. The second migration gives those rows the
+keys, which is what makes the older Worker work again.
+
+A short window remains: from the moment the older Worker is live until the second migration has run.
+In it `GET /v1/usage` still answers 500 for a range that covers a newer-shape hour, and an hour that
+finalizes in it (two hours after the hour ends) while its resource snapshot is still the newer shape
+keeps null `memory_mib_seconds` and `cpu_millicore_seconds` for good. An hour that is still open is
+computed again from the repaired snapshots. Keep the second migration file ready before the deploy
+and apply it without a pause.
+
+The newer Worker that runs between steps 1 and 2 writes statements that name none of the restored
+columns and reads the restored usage shape. It fails one route family while
+`size_classes.cpu_request_millicores` exists: it parses a whole size class row with a strict schema
+that does not know the column, so `GET /v1/size-classes` and `PUT /v1/size-classes/{id}` (after it
+stored the class) answer 500 until the older Worker runs.
 
 ```sql
 -- The dropped columns and the empty RAM sample table, as 0018, 0024, 0038 and 0041 created them.
@@ -174,9 +200,10 @@ BEGIN SELECT RAISE(ABORT, 'lifecycle events are immutable'); END;
 On an installation with many hourly rows or lifecycle events, run each of the two `UPDATE`
 statements once for each first letter of the database ID, as `0082` does: add
 `AND database_id>='a' AND database_id<'b'` to its `WHERE`, then the same for `'b'` and `'c'` up to
-`'y'` and `'z'`, and `AND database_id>='z'` alone for the last, all inside the same migration.
+`'y'` and `'z'`, and `AND database_id>='z'` alone for the last, all inside the same migration, in the
+second file as in the first.
 
-What the migration does not restore, and why the older Worker still works:
+What the migrations do not restore, and why the older Worker works once the second one has run:
 
 - **Approval hashes.** The hashes that `0082` cleared stay cleared, and the older Worker reads the
   restored threshold as none, so a standing profile with a trigger no longer matches its stored hash.
@@ -187,7 +214,8 @@ What the migration does not restore, and why the older Worker still works:
   older Worker raises it only for a non-null `ram_warning_threshold_ppm` and a measured window, and
   the restored threshold is none and the restored table empty.
 - **Reserved usage figures.** They stay unknown for every hour and snapshot written before the
-  rollback; the older Worker meters new hours from the limits as before.
+  second migration, those of the newer Worker included; the older Worker meters new hours from the
+  limits as before.
 
 To roll forward again, deploy the newer Worker and then run the statement below; the size-class
 routes answer 500 as above until it has run. It drops the one restored column that the newer Worker's
@@ -256,8 +284,8 @@ in four of six nightly runs, a stall of at least 37 s in three of them and none 
 contradicts it. On the node runtime the export of the window test below ran 6.1 s from start to
 completion; that is the length of the job and not a measurement of the stall inside it, which no
 test has timed. A wake admits from the DatabaseActor's own state and commits its claim to D1 after
-the answer, so it is not expected to wait for the export; the window test below found no wake that
-did.
+the answer, so by design it does not wait for the export. The window test below found no failed
+wake; whether a wake that fell inside the export was slower than the others was not measured.
 
 **Window test (go-live gate G6), passed 2026-10-22.** The test does not wait for the nightly run: a
 private operator tool starts the same raw D1 export of the control database that the nightly backup
@@ -269,12 +297,16 @@ URL is never read), and the traffic around it runs from 60 s before to 120 s aft
   afterwards, 0 lost, 0 refused, the slowest write 1,767 ms;
 - 37 sleeping small test databases, never the databases of the cold-path measurement, were woken one
   every 5 s with one HTTP `/sql` request each under the integrators' retry rule: 37 answered, 0 failed,
-  0 retries, WAKE plus request p50 750 ms and p95 1,486 ms;
+  0 retries, WAKE plus request p50 750 ms and p95 1,486 ms. The record has no maximum and no time of
+  each wake against the 6.1 s of the export. At one wake every 5 s, one or two of the 37 fell inside
+  the export, and those are exactly the samples that can sit above p95;
 - the API Worker's logs in the window: 32 ticket claims, the longest actor gate held 3.3 s (the limit
-  is 30 s), no `admission_refused`.
+  is 30 s), no `admission_refused`. A gate of 3.3 s fits a D1 commit that the export stalled; the
+  logs do not say whether it was one.
 
 The test database and its temporary key were removed afterwards. The pass rule is no failed wake
-after the integrators' 1/2/4/8 s retry rule and no actor gate held above 30 s. Together with the
+after the integrators' 1/2/4/8 s retry rule and no actor gate held above 30 s; the test meets it, and
+it does not show that a wake inside the export is as fast as any other. Together with the
 [restore drill](#restore-drill) of 2026-10-21 this meets gate G6; the full record is in the ULTRA
 plan (11.1).
 
