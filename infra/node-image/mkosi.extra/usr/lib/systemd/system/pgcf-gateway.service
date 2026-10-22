@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# The gateway in local mode: listens on loopback for cloudflared, takes its table of writers from
-# the agent's socket (/run/pgcf/agent/gateway.sock) and dials each database's Unix socket. The
-# agent writes the node's region and route key to the environment file after enrollment and then
-# starts this unit; before that the condition keeps it inactive.
+# The gateway in local mode: serves the loopback socket systemd holds for it (pgcf-gateway.socket)
+# to cloudflared, takes its table of writers from the agent's socket (/run/pgcf/agent/gateway.sock)
+# and dials each database's Unix socket. The agent writes the node's region and route key to the
+# environment file after enrollment and then starts this unit; before that the condition keeps it
+# inactive. A stop drains it: it stops accepting, closes its idle sessions, gives the busy ones
+# 10 s and exits, and the connections that arrive meanwhile wait in the socket for the next start.
 [Unit]
 Description=PGCF gateway
 Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
-After=network.target pgcf-agent.service
+After=network.target pgcf-agent.service pgcf-gateway.socket
+Requires=pgcf-gateway.socket
 ConditionPathExists=/var/lib/pgcf/credentials/gateway.env
 StartLimitIntervalSec=0
 

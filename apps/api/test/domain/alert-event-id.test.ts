@@ -8,11 +8,11 @@ const A = "daaaaaaaaaaaaaaaaaaa",
 
 it("derives the id of an alert from the error: its region, its kind and the set of subjects that fail", async () => {
   // Known answers. Receivers keep these ids, so the derivation must never change.
-  expect(await alertEventId("eu1", "regional_ram_warning")).toBe(
-    "51aa091f-07e2-826d-af90-de2060fd291f",
+  expect(await alertEventId("eu1", "regional_node_cap_reached")).toBe(
+    "d63209cf-249d-8f47-b3e9-af9915ccc1f5",
   );
-  expect(await alertEventId("eu2", "regional_ram_warning")).toBe(
-    "d37856f8-f023-83bb-b971-17799ea4e024",
+  expect(await alertEventId("eu2", "regional_node_cap_reached")).toBe(
+    "5720bd3d-7c7a-8435-8e97-cf415f507d0d",
   );
   const both = "c3e0b73e-882a-8f2c-8722-8827cc503f74";
   expect(await alertEventId("eu1", "database_archive_failing", [B, A])).toBe(

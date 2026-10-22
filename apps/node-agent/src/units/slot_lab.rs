@@ -564,6 +564,10 @@ async fn the_kernel_lets_one_slot_run_a_postmaster_on_a_data_directory_and_postg
     let host = pool.host();
     pool.refill(2).await.unwrap();
     pool.refill(2).await.unwrap();
+    // The quiet passes of the refill have made the users of the whole range, as on a node that
+    // has run for a while: a wake makes none, so a number that failed is left out only while
+    // another with a user is free.
+    while pool.make_user().await.unwrap().is_some() {}
     let first = pool.bind(&database.id, &database.bind(512)).await.unwrap();
     let started = pool.exec(&first).await.unwrap();
 

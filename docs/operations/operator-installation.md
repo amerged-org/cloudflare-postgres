@@ -364,6 +364,15 @@ is refused with `53300` "connection admission unavailable"), and `DATABASE_ACTOR
 which must equal the API Worker's value; the hint places only DatabaseActor objects created after
 it is set.
 
+A fresh Edge isolate parses and evaluates the whole bundle before it answers its first request, so
+the bundle holds no zod: it was 487.65 KiB (gzip 107.22 KiB) with it and is 25.48 KiB (gzip 9.63
+KiB) without. The Edge imports the zod-free modules of `@pgcf/contracts` (`ids-core`,
+`route-token-core`, `edge-policy`, `edge-sql`, `pg-wire`) and no module that imports zod;
+`apps/edge/test/bundle.node-test.ts` builds the Edge as the example configuration deploys it and
+fails when a zod file is in the bundle or the bundle is over 64 KiB. To profile the startup phase
+in workerd on your machine, run `wrangler check startup --args="--config <your configuration>"` in
+`apps/edge`; `wrangler deploy` prints Cloudflare's own startup time.
+
 Two optional Worker secrets, `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET`, are the Cloudflare
 Access service token that the Edge presents (headers `CF-Access-Client-Id` and
 `CF-Access-Client-Secret`) to a gateway on a public hostname, once Access guards it; the Access

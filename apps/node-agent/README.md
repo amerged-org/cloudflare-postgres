@@ -95,6 +95,9 @@ which takes one order, from root. Every start takes one path: the admission perm
    fails with `no slot` (a `release_failed` wake) until the next quiet pass. A build that fails (the unit
    refuses its start over a process left in its cgroup, a user that cannot be made) keeps its
    number out of the next builds while another is free and is reported as `slot_build_failed`.
+   Where every free number with a user has failed, the refill makes the next user first and builds
+   there, and a failed build does not end the pass before that user is made, so a node that has
+   only the users of the slots it built is not stuck on a number that fails.
 2. **Bind**, in parallel: the database's limits as runtime properties of the slot, its volume and
    its socket directory moved into the slot's mount namespace as idmapped clones (`units/idmap.rs`),
    and a check that no unit of its own (`pgcf-pg@`) holds the database.
@@ -154,16 +157,32 @@ writers corrupt the cluster.
 sleeps with its proof, so that no slot holds a database, and none wakes before the older agent
 runs. Idle slots hold no database and cannot corrupt one: the older agent ignores them (its host
 files drop the slot template, and units that run keep running), and the first release that runs
-slots again adopts them. The order that exists for it is `maintenance`
-(`POST /v1/nodes/{id}/maintenance`): it holds new wakes with `57P03`, puts every awake database
-to sleep with the proof (the sleep stops its slot and waits until the unit is inactive), stops the
-idle slots and builds none while it is open. Its hold ends when the cycle is answered, within
-seconds when the node holds the release's packages already, and no order holds the wakes across
-the swap of the agent; a manual suspension reaches only `ready` databases, not a database that
-hibernates. So run the order, wait for `done`, read that every database of the node is
-`hibernated`, assign the older release at once, and do it in a window in which nothing connects (a
-connection in between wakes a database in a slot). The agent that installs the older release is
-this one: it does not look at its slots before it switches its link.
+slots again adopts them. Two things do the two halves of it.
+
+- **The drain is the `maintenance` order** (`POST /v1/nodes/{id}/maintenance`): it holds new wakes
+  with `57P03`, puts every database that is `ready` to sleep with the proof (the sleep stops its
+  slot and waits until the unit is inactive), stops the idle slots and builds none while it is open.
+  It sleeps only the databases in `Phase::Ready` (`obey_maintenance`): a wake that is in flight
+  when the order arrives ends awake, in a slot, after the order has looked at it.
+- **The hold across the swap is a manual suspension of every database on the node**
+  (`POST /v1/databases/{id}/suspend`). The order's hold ends when its cycle is answered, within
+  seconds when the node holds the release's packages already, and no order holds the wakes across
+  the swap of the agent. A manual suspension is a desired state, and a connection never wakes a
+  database in it, whatever agent is running. It reaches every database: one that is `ready` goes
+  through the sleep proof, and one that hibernates (a verified idle sleeper) is claimed by the API
+  with no action of the node (`verifiedIdle` in `apps/api/src/domain/lifecycle.ts`; the test
+  "manual suspension can claim an already verified idle sleeper and keeps connect auto-wake
+  disabled" proves it). Its costs: an integrator's `resume` of one of these databases wakes it
+  (the integrator has to be told), the operator resumes every database afterwards, one by one, and
+  a resume answers `409` with `node_capacity` where the node cannot hold what is resumed at once.
+
+The order of the operator: suspend every database of the node, run the `maintenance` order and wait
+for `done`, **then read that no slot holds a database**: every database of the node reports
+`observed_power` `hibernated`, and one that does not (a wake that began before the suspension
+reached it, or one the order missed because it was not `ready` yet) is suspended again or waited
+for before anything goes on. This check is mandatory and no formality, since the drain never looks
+at a database that is not `ready`. Then assign the older release. The agent that installs the older
+release is this one: it does not look at its slots before it switches its link.
 
 **The health check** runs the scratch database in the slot of its own (number 1023), so it takes no
 idle slot of the agent's pool and leaves none; it builds that slot (and makes its user) with its own
@@ -210,8 +229,9 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   and crash recovery syncs the filesystem once (`recovery_init_sync_method = syncfs`).
 - **Small databases** (512 MiB and below) run one autovacuum worker out of two slots, one I/O
   worker, no parallel query or maintenance workers, four background worker slots and no replication.
-  A restore runs with more during its recovery, because a recovery checks these values against its
-  source's.
+  A restore runs with the larger of the backup's and the class's values during its recovery,
+  because a recovery checks `max_connections`, the process, sender, prepared transaction and lock
+  settings against its source's, and restarts onto the class's own afterwards.
 - **Autoprewarm** runs in every database (`shared_preload_libraries = 'pg_prewarm'`,
   `pg_prewarm.autoprewarm = on`, `autoprewarm_interval = 0`): the list of the shared buffers is
   written at each clean stop only, so a running database pays nothing, and read again in the
@@ -280,7 +300,9 @@ plan 9.3, "Changing the page"; it is written there once.
   list ahead and reports the phases of the wake as events; about 2 s later a `wake_detail` event adds
   the slot's origin and what the bind and the order took, the split of the start, the CPU quota's
   throttling and the steal time. A wake it already serves is answered `wake_in_progress`, which is
-  no result.
+  no result. A start that fails writes a `unit_start_failed` event with the class of the error and
+  answers `release_failed`; a slot that is awake or cannot be read at that point is stopped without a
+  proof and recovered, so no database stays `starting`.
 - **Sleep.** After the database's idle time the agent runs the sleep proof (plan 7.9): the gateway
   quiesces and closes idle sessions, the guard refuses while a session is busy or a transaction is
   prepared (`power_busy`), a checkpoint and a WAL switch close the last segment, the upload log must
@@ -288,9 +310,10 @@ plan 9.3, "Changing the page"; it is written there once.
   `pg_control` must then say shut down, with the recorded identity and a checkpoint after the
   switched segment, and the record is written and fsynced before the sleep is reported. A refused
   proof leaves the database running and wakeable. After a clean sleep the agent trims the volume.
-- **Recovery.** At boot, after a failed proof and after an unexpected stop, a database without a
-  matching record is unproven: the agent starts it through admission, lets it archive and proves its
-  sleep, retrying until it holds. Nothing is replayed to a client.
+- **Recovery.** At boot, after a failed proof, after an unexpected stop and after a failed start
+  whose unit is awake or cannot be read, a database without a matching record is unproven: the
+  agent starts it through admission, lets it archive and proves its sleep, retrying until it
+  holds. Nothing is replayed to a client.
 - **Create.** User, volume, filesystem, `initdb`, configuration, a check that the database's R2
   prefix is empty, the roles and the first base backup. The database is ready only when that backup
   is DONE. A create that a restart interrupted resumes when every backup in the archive belongs to the
@@ -298,8 +321,13 @@ plan 9.3, "Changing the page"; it is written there once.
 - **Restore and move target.** `barman-cloud-restore` as the new database's user, recovery through
   the archive socket (`pgcf-recovery.conf`, included by `postgresql.conf` and removed afterwards),
   promotion on a later timeline with the backup's system identifier, then the first base backup of
-  the new timeline. A move target replays through the segment named in the source's proven-sleep
-  record before it may promote.
+  the new timeline. The recovery runs with the larger of the settings in the backup's `pg_control`
+  and the class's (`settings::Capacity`); when that is more than the class's, the database restarts
+  onto the class's own before the first backup, and a source whose settings the class has no memory
+  for is refused before it starts. A recovery that PostgreSQL pauses (the source's WAL raised a
+  setting above both the backup's and the class's) fails the restore with `no_recovery_point`. A
+  move target replays through the segment named in the source's proven-sleep record before it may
+  promote.
 
 ## Backups
 
@@ -309,6 +337,30 @@ reports, runs barman-cloud as that database's user in `pgcfbackup.slice` with on
 to the database's own prefix, and answers `ok` to an archive request only when the object is durably in
 R2 and the segment is in the fsynced upload log. The agent never deletes in R2; retention runs in the
 Worker. The concurrency and memory limits of the jobs come from the policy.
+
+A base backup is due when the newest of the database's timeline is a day old (plan 7.6). It is taken
+at the database's idle sleep, and daily for an always-warm database, never by waking one. It is put
+off while a start is queued or in flight on the node, and in the first minute after any database on
+the node became ready (a wake, a build, the adoption of a unit that runs), so that the first
+statements of a cold database do not share the disk and the CPU with the backup of another one
+(`backup_waits`, `backup_put_off` in the agent's log). The minute is node-wide because a database's
+idle time is at least a minute: its own first minute is over before its own idle sleep. A database
+whose idle sleep is put off is not put to sleep: nothing would wake it for the backup later. It
+stays up and the next idle pass (every five seconds) asks again. Ten minutes after the first
+put-off of an awake session (the wait after a failed backup) the backup is taken whatever the node
+does: at the idle sleep of a database that stays idle, and, for one that is used meanwhile and so
+never idles, while it serves, as the daily backup of an always-warm database is. So a database that
+stays up has it within ten minutes and one idle pass of the first put-off. One case is not bounded:
+an early sleep, which a wake that waits for room orders and which picks the database unused
+longest, usually the one that was put off, takes no backup and ends the session with the wait; the
+backup is then taken at the idle sleep after the database's next wake, which may be days away. WAL
+archiving goes on meanwhile, so only the age of the newest base backup, and the WAL a restore
+replays, grow. The disk side is in `pgcfbackup.slice` (`infra/node-image`): the read and write
+bandwidth of the jobs on the data disk is capped. A release that lifts the cap writes `infinity` as
+the size; deleting the two lines leaves a running node capped until it reboots. A runtime change
+(`systemctl set-property --runtime`, such as an `infinity` or another size for a measurement on one
+node) leaves a drop-in that overrides every later release of the slice until the node reboots, so
+it ends with `systemctl revert pgcfbackup.slice`; the next job in the slice then applies the file.
 
 ## Fencing, updates and diagnostics
 

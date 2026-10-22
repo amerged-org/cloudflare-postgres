@@ -12,13 +12,13 @@ use super::{
     test_support::{ARCHIVE, CREDENTIAL_CHECK, Node, credential, database, store},
     upload_log::UploadLog,
 };
-use crate::credentials::Access;
+use crate::{credentials::Access, settings::Capacity};
 use std::{
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -275,7 +275,22 @@ async fn postgresql_marks_a_segment_archived_only_after_the_agent_has_it_in_r2_a
 /// with `pg_ctl` and `psql`.
 struct ClusterHost<'a> {
     pg: &'a Postgres,
+    /// The settings of the class it runs in, which its configuration has before the recovery's.
+    class: Capacity,
     abandoned: AtomicBool,
+    restarts: AtomicUsize,
+}
+impl ClusterHost<'_> {
+    fn class_settings(&self) -> String {
+        format!(
+            "max_connections = {}\nmax_worker_processes = {}\nmax_wal_senders = {}\nmax_prepared_transactions = {}\nmax_locks_per_transaction = {}\n",
+            self.class.max_connections,
+            self.class.max_worker_processes,
+            self.class.max_wal_senders,
+            self.class.max_prepared_transactions,
+            self.class.max_locks_per_transaction,
+        )
+    }
 }
 impl Host for ClusterHost<'_> {
     async fn start(&self) -> Result<(), Failed> {
@@ -283,8 +298,10 @@ impl Host for ClusterHost<'_> {
         // included from the file the agent writes and later removes.
         fs::write(
             self.pg.data().join("postgresql.conf"),
-            self.pg
-                .settings("include_if_exists = 'pgcf-recovery.conf'\n"),
+            self.pg.settings(&format!(
+                "{}include_if_exists = 'pgcf-recovery.conf'\n",
+                self.class_settings()
+            )),
         )
         .unwrap();
         self.pg.start().map_err(|_| Failed)
@@ -313,6 +330,11 @@ impl Host for ClusterHost<'_> {
                 .unwrap(),
         })
     }
+    async fn restart(&self) -> Result<(), Failed> {
+        self.restarts.fetch_add(1, Ordering::SeqCst);
+        self.pg.stop();
+        self.pg.start().map_err(|_| Failed)
+    }
     async fn abandon(&self) {
         self.pg.stop();
         self.abandoned.store(true, Ordering::SeqCst);
@@ -335,16 +357,26 @@ fn new_database(node: &Node, bin: &Path, name: &str) -> Postgres {
         volume,
     }
 }
+/// The class of a database: its memory in MiB and its `max_connections`.
+type Class = (u64, u32);
+/// PostgreSQL's own defaults, which the clusters of these tests run with: a restore of one into
+/// another needs no restart.
+const DEFAULTS: Class = (1024, 100);
+/// The catalog's xs.
+const XS: Class = (256, 20);
+
 /// A restore of `BACKUP` of `ARCHIVE` into `pg` by the executor, with the database's own archive
-/// at generation `generation`; whether the database was abandoned comes with the result.
+/// at generation `generation`; whether the database was abandoned and how often it was restarted
+/// come with the result.
 async fn restore(
     node: &Node,
     pg: &Postgres,
+    class: Class,
     fetch_client: &Path,
     generation: u32,
     target_time: Option<&str>,
     end: Option<&End>,
-) -> (Result<Backup, &'static str>, bool) {
+) -> (Result<Backup, &'static str>, bool, usize) {
     let own = store(
         &format!("s3://pgcf-eu/eu-dev/zyxwvutsrqponmlkjihg/g{generation}-{OPERATION}"),
         Access::ReadWrite,
@@ -356,6 +388,8 @@ async fn restore(
     let database = database(&pg.volume);
     let order = Order {
         database: &database,
+        memory_mib: class.0,
+        max_connections: class.1,
         uid: owner.uid(),
         gid: owner.gid(),
         source: &source,
@@ -368,7 +402,9 @@ async fn restore(
     };
     let host = ClusterHost {
         pg,
+        class: Capacity::of_class(class.0, class.1),
         abandoned: AtomicBool::new(false),
+        restarts: AtomicUsize::new(0),
     };
     let restorer = Restorer {
         table: &node.table,
@@ -377,21 +413,43 @@ async fn restore(
         fetch_command: fetch_client.to_str().unwrap(),
     };
     let result = restorer.run(&order, &host).await;
-    (result, host.abandoned.load(Ordering::SeqCst))
+    (
+        result,
+        host.abandoned.load(Ordering::SeqCst),
+        host.restarts.load(Ordering::SeqCst),
+    )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restore_of_a_real_cluster_recovers_to_a_point_in_time_or_to_the_end_and_takes_its_first_backup()
- {
-    let Some(bin) = bin_directory() else { return };
-    let node = Node::start("pitr", AGENT_BOUND).await;
+/// What a source cluster left in the node's archive: its base backup (as barman lists it), the
+/// WAL after it, a point in time between two batches of rows, and the digests of its rows then
+/// and at the end.
+struct Archived {
+    fetch_client: PathBuf,
+    system_identifier: String,
+    timeline: u32,
+    /// Between batch A and batch B, as a contract timestamp.
+    target: String,
+    /// The last segment of the source's archive.
+    last: String,
+    /// The digest of batch A, and of both batches.
+    digest_a: String,
+    digest: String,
+}
+/// The digest of the rows of `t`, the same for equal rows.
+const DIGEST: &str = "SELECT md5(string_agg(id::text || batch, ',' ORDER BY id)) FROM t";
+
+/// A source cluster with `settings` besides the archiving, whose base backup of batch-less `t`
+/// and archive of batches A and B the node holds, as the backup `BACKUP` of `ARCHIVE`. It also
+/// installs the barman that takes the first backup of a new timeline: it connects as the backup
+/// role to the socket it was given and lists what it saw there.
+async fn archived_source(node: &Node, bin: &Path, settings: &str) -> Archived {
     let (archive_client, fetch_client) = clients(&node.root, &node.socket);
     let source = Postgres {
-        bin: bin.clone(),
+        bin: bin.into(),
         volume: node.volume(),
     };
     let _ = fs::remove_dir_all(source.data());
-    source.init(&archiving(&archive_client));
+    source.init(&format!("{}{settings}", archiving(&archive_client)));
     source.start().unwrap();
     source.sql("CREATE ROLE pgcf_backup LOGIN");
     source.sql("CREATE TABLE t(id int PRIMARY KEY, batch text)");
@@ -418,19 +476,19 @@ async fn a_restore_of_a_real_cluster_recovers_to_a_point_in_time_or_to_the_end_a
         .parse()
         .unwrap();
     source.sql("INSERT INTO t SELECT g, 'A' FROM generate_series(1, 1000) g");
+    let digest_a = source.sql(DIGEST);
     std::thread::sleep(Duration::from_millis(300));
     let target =
         source.sql("SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')");
     std::thread::sleep(Duration::from_millis(300));
     source.sql("INSERT INTO t SELECT g, 'B' FROM generate_series(1001, 2000) g");
+    let digest = source.sql(DIGEST);
     let last = source.sql("SELECT pg_walfile_name(pg_switch_wal())");
     wait_until("the last segment to be archived", || {
         node.log().contains(&last).unwrap()
     });
     source.stop();
-    // The archive as barman lists it, with the base backup in it; and the barman that takes the
-    // first backup of a new timeline: it connects as the backup role to the socket it was given
-    // and lists what it saw there.
+    // The archive as barman lists it, with the base backup in it.
     node.fixture.put_backup(
         ARCHIVE,
         BACKUP,
@@ -461,6 +519,30 @@ printf '{{"backup_id":"%s","status":"%s","timeline":%s,"systemid":"%s","end_wal"
             CREDENTIAL_CHECK = CREDENTIAL_CHECK,
         ),
     );
+    Archived {
+        fetch_client,
+        system_identifier,
+        timeline,
+        target,
+        last,
+        digest_a,
+        digest,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_of_a_real_cluster_recovers_to_a_point_in_time_or_to_the_end_and_takes_its_first_backup()
+ {
+    let Some(bin) = bin_directory() else { return };
+    let node = Node::start("pitr", AGENT_BOUND).await;
+    let Archived {
+        fetch_client,
+        system_identifier,
+        timeline,
+        target,
+        last,
+        ..
+    } = archived_source(&node, &bin, "").await;
     let end = |last_segment: &str, system_identifier: &str| End {
         system_identifier: system_identifier.into(),
         timeline,
@@ -471,9 +553,20 @@ printf '{{"backup_id":"%s","status":"%s","timeline":%s,"systemid":"%s","end_wal"
     // A point in time: batch A only; the same database, promoted onto timeline 2, and its first
     // base backup on that timeline in its own archive.
     let pitr = new_database(&node, &bin, "r1");
-    let (result, abandoned) = restore(&node, &pitr, &fetch_client, 2, Some(&target), None).await;
+    let (result, abandoned, restarts) = restore(
+        &node,
+        &pitr,
+        DEFAULTS,
+        &fetch_client,
+        2,
+        Some(&target),
+        None,
+    )
+    .await;
     let backup = result.unwrap();
     assert!(!abandoned);
+    // The recovery ran with the class's own settings: no restart.
+    assert_eq!(restarts, 0);
     assert_eq!(pitr.sql("SELECT count(*) FROM t"), "1000");
     assert_eq!(pitr.sql("SELECT count(*) FROM t WHERE batch = 'B'"), "0");
     assert_eq!(
@@ -497,9 +590,10 @@ printf '{{"backup_id":"%s","status":"%s","timeline":%s,"systemid":"%s","end_wal"
     // To the end of the archive, as a move target that must reach the source's last segment: all
     // of batch B, and the archive's end is told to PostgreSQL only after that segment.
     let moved = new_database(&node, &bin, "r2");
-    let (result, abandoned) = restore(
+    let (result, abandoned, _) = restore(
         &node,
         &moved,
+        DEFAULTS,
         &fetch_client,
         3,
         None,
@@ -521,9 +615,10 @@ printf '{{"backup_id":"%s","status":"%s","timeline":%s,"systemid":"%s","end_wal"
         u32::from_str_radix(&last[16..], 16).unwrap() + 1
     );
     let short = new_database(&node, &bin, "r3");
-    let (result, abandoned) = restore(
+    let (result, abandoned, _) = restore(
         &node,
         &short,
+        DEFAULTS,
         &fetch_client,
         4,
         None,
@@ -549,9 +644,10 @@ printf '{{"backup_id":"%s","status":"%s","timeline":%s,"systemid":"%s","end_wal"
 
     // A record of another database: this one recovered to the end of the archive, and is not it.
     let other = new_database(&node, &bin, "r4");
-    let (result, abandoned) = restore(
+    let (result, abandoned, _) = restore(
         &node,
         &other,
+        DEFAULTS,
         &fetch_client,
         5,
         None,
@@ -564,7 +660,66 @@ printf '{{"backup_id":"%s","status":"%s","timeline":%s,"systemid":"%s","end_wal"
     // The first backup counts when the listing shows it DONE, whatever barman's exit status was.
     node.fixture.set("backup-failed", "");
     let unbacked = new_database(&node, &bin, "r5");
-    let (result, abandoned) = restore(&node, &unbacked, &fetch_client, 6, None, None).await;
+    let (result, abandoned, _) =
+        restore(&node, &unbacked, DEFAULTS, &fetch_client, 6, None, None).await;
     assert_eq!(result.unwrap_err(), "build_failed");
     assert!(abandoned);
+}
+
+/// The settings of a source of the larger class: the catalog's md has 200 connections, and this
+/// one more of everything else than xs (4 workers, no sender, no prepared transaction, 64 locks).
+const LARGER_CLASS: &str = "max_connections = 200\nmax_worker_processes = 10\nmax_wal_senders = 12\nmax_prepared_transactions = 4\nmax_locks_per_transaction = 128\n";
+
+/// PostgreSQL aborts an archive recovery with hot standby whose `max_connections`, process,
+/// sender, prepared transaction or lock settings are below its source's ("recovery aborted
+/// because of insufficient parameter settings"). A restore and a point in time restore of a
+/// larger class's backup into a smaller class promote all the same, hold the source's rows, and
+/// run on the smaller class's settings before they count as built.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_and_a_pitr_of_a_larger_classs_backup_promote_in_a_smaller_class() {
+    let Some(bin) = bin_directory() else { return };
+    let node = Node::start("smaller-class", AGENT_BOUND).await;
+    let source = archived_source(&node, &bin, LARGER_CLASS).await;
+
+    let pitr = new_database(&node, &bin, "s1");
+    let (result, abandoned, restarts) = restore(
+        &node,
+        &pitr,
+        XS,
+        &source.fetch_client,
+        2,
+        Some(&source.target),
+        None,
+    )
+    .await;
+    assert_eq!(
+        result.map(|backup| backup.timeline),
+        Ok(source.timeline + 1),
+        "{}",
+        pitr.log()
+    );
+    assert!(!abandoned);
+    assert_eq!(pitr.sql(DIGEST), source.digest_a);
+    // It restarted once, and already runs on the class's settings, not on the recovery's.
+    assert_eq!(restarts, 1);
+    assert_eq!(pitr.sql("SHOW max_connections"), "20");
+    assert_eq!(pitr.sql("SHOW max_worker_processes"), "4");
+    assert_eq!(pitr.sql("SHOW max_wal_senders"), "0");
+    pitr.stop();
+
+    let full = new_database(&node, &bin, "s2");
+    let (result, abandoned, restarts) =
+        restore(&node, &full, XS, &source.fetch_client, 3, None, None).await;
+    assert_eq!(
+        result.map(|backup| backup.timeline),
+        Ok(source.timeline + 1),
+        "{}",
+        full.log()
+    );
+    assert!(!abandoned);
+    assert_eq!(full.sql(DIGEST), source.digest);
+    assert_eq!(restarts, 1);
+    assert_eq!(full.sql("SHOW max_connections"), "20");
+    assert_eq!(full.sql("SHOW max_prepared_transactions"), "0");
+    assert_eq!(full.sql("SHOW max_locks_per_transaction"), "64");
 }

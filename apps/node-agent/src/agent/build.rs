@@ -55,6 +55,55 @@ const TASKS_MAX: u64 = 64;
 const BACKUP_MAX_AGE_MS: i64 = 24 * 3_600_000;
 /// How long a base backup that failed waits before it is tried again.
 pub(crate) const BACKUP_RETRY_MS: i64 = 600_000;
+/// How long after the newest database on the node became ready (a wake, a build, or the agent's
+/// adoption of a unit that runs) a due base backup of any database waits: the statements that
+/// follow a wake run in this minute and need the disk and the CPU that a backup takes. It is
+/// node-wide because a database's idle time is at least a minute, so the minute after a database's
+/// own wake is over before its own idle sleep.
+pub(crate) const BACKUP_AFTER_WAKE_MS: i64 = 60_000;
+/// The longest a due base backup is put off, counted from the first time it was in an awake
+/// session: the same wait as after a failed one. WAL archiving goes on meanwhile, so the archive's
+/// RPO does not change; only the age of the newest base backup, and with it the WAL a restore
+/// replays, grows. A put-off idle sleep keeps the database up (nothing wakes a database for a
+/// backup later) and the idle pass asks again, so a database that stays up has its backup within
+/// this wait and one idle pass: idle, at its idle sleep; used meanwhile, while it serves, as the
+/// daily backup of an always-warm database is (`Core::idle_pass`). The bound does not cover an
+/// early sleep, which a wake that waits for room orders, usually of the database that was put off
+/// (the one unused longest): it takes no backup and ends the session with the wait, so the backup
+/// is taken at the idle sleep after the database's next wake, which may be days away.
+pub(crate) const BACKUP_PUT_OFF_MAX_MS: i64 = BACKUP_RETRY_MS;
+
+/// What `backup_if_due` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backup {
+    /// A base backup was taken.
+    Taken,
+    /// None is due, or one failed a short while ago and is not tried again yet.
+    NotTaken,
+    /// One is due and waits for a wake (`backup_waits`).
+    PutOff,
+}
+
+/// Whether a due base backup has been put off for the longest it may be (`put_off_since_ms`: when
+/// it first was).
+pub(crate) fn put_off_for_the_longest(put_off_since_ms: Option<i64>, now_ms: i64) -> bool {
+    put_off_since_ms.is_some_and(|since| now_ms - since >= BACKUP_PUT_OFF_MAX_MS)
+}
+
+/// Whether a due base backup is put off now (`backup_if_due`): a database on the node became ready
+/// less than a minute ago (`newest_ready_ms`), or a start is queued or in flight on the node
+/// (`wakes`), unless it has been put off for the longest it may be.
+pub(crate) fn backup_waits(
+    newest_ready_ms: Option<i64>,
+    wakes: usize,
+    put_off_since_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    if put_off_for_the_longest(put_off_since_ms, now_ms) {
+        return false;
+    }
+    wakes > 0 || newest_ready_ms.is_some_and(|since| now_ms - since < BACKUP_AFTER_WAKE_MS)
+}
 
 /// Whether a base backup is due (plan 7.6): there is none of the timeline the database runs on
 /// (`None`: not asked), or the newest is older than a day. It is asked only of a database that
@@ -317,18 +366,30 @@ impl<M: Machine> Core<M> {
             .ok_or_else(|| build_failed!())
     }
 
-    /// The base backup that is due of a database that runs (plan 7.6): before an idle sleep, and
-    /// daily for an always-warm database. A database is never woken for one. `Ok(false)` when
-    /// none is due, or one failed a short while ago.
-    pub(crate) async fn backup_if_due(&self, db: &Db, entry: &Entry) -> Result<bool, &'static str> {
+    /// The base backup that is due of a database that runs (plan 7.6): before an idle sleep, daily
+    /// for an always-warm database, and for one that was put off the longest while it is used. A
+    /// database is never woken for one. It is put off, and the database is not put to sleep
+    /// without it (`Backup::PutOff`), in the first minute after any database on the node became
+    /// ready and while a start is queued or in flight on the node, so that the first statements
+    /// of a cold database do not share the disk and the CPU with a backup (`backup_waits`); the
+    /// next idle pass asks again, and after the longest wait the backup is taken whatever the
+    /// node does. WAL archiving goes on meanwhile.
+    pub(crate) async fn backup_if_due(
+        &self,
+        db: &Db,
+        entry: &Entry,
+    ) -> Result<Backup, &'static str> {
         let now = super::now_ms();
-        let (held, failed) = {
+        let (held, failed, put_off) = {
             let view = db.view();
-            let held = view.state.as_ref().and_then(|state| state.backup.clone());
-            (held, view.backup_failed_ms)
+            (
+                view.state.as_ref().and_then(|state| state.backup.clone()),
+                view.backup_failed_ms,
+                view.backup_put_off_ms,
+            )
         };
         if failed.is_some_and(|failed| now - failed < BACKUP_RETRY_MS) {
-            return Ok(false);
+            return Ok(Backup::NotTaken);
         }
         let socket = self.layout().socket_directory(&db.id);
         let session = postgres::agent(&socket)
@@ -338,7 +399,27 @@ impl<M: Machine> Core<M> {
         drop(session);
         let timeline = u32::try_from(identity.timeline).map_err(|_| "backup_failed")?;
         if !backup_due(held.as_ref(), Some(timeline), now) {
-            return Ok(false);
+            if put_off.is_some() {
+                self.set(db, |view| view.backup_put_off_ms = None);
+            }
+            return Ok(Backup::NotTaken);
+        }
+        let wakes = self
+            .admission
+            .snapshot()
+            .await
+            .map_or(0, |awake| awake.starting + awake.queued);
+        let newest_ready = self.newest_ready_ms();
+        if backup_waits(newest_ready, wakes, put_off, now) {
+            if put_off.is_none() {
+                self.set(db, |view| view.backup_put_off_ms = Some(now));
+                crate::timing::emit_event(serde_json::json!({
+                    "event": "backup_put_off", "database_id": db.id,
+                    "wakes_on_node": wakes,
+                    "age_of_newest_ready_ms": newest_ready.map(|since| now - since),
+                }));
+            }
+            return Ok(Backup::PutOff);
         }
         // Minutes for a large database, under the flow of a database that is served: a burst of a
         // wake does not wait behind it (plan 4.4).
@@ -358,8 +439,9 @@ impl<M: Machine> Core<M> {
         .await;
         self.set(db, |view| {
             view.backup_failed_ms = taken.is_err().then_some(now);
+            view.backup_put_off_ms = None;
         });
-        taken.map(|()| true)
+        taken.map(|()| Backup::Taken)
     }
 
     /// Builds the storage generation `entry.origin` names. Ready follows only the first base
@@ -592,6 +674,8 @@ impl<M: Machine> Core<M> {
         };
         let order = Order {
             database: &job_database,
+            memory_mib: entry.memory_mib,
+            max_connections: entry.max_connections,
             uid: account.uid,
             gid: account.gid,
             source: &from,
@@ -670,13 +754,11 @@ impl<M: Machine> Rebuild<M> {
         }
     }
 }
-impl<M: Machine> Host for Rebuild<M> {
-    async fn start(&self) -> Result<(), Failed> {
-        let core = &self.core;
-        // The restored files are the source's: the agent's own replace them before the start.
-        core.write_configuration(&self.entry, &self.account)
-            .map_err(|_| Failed)?;
-        let started = core
+impl<M: Machine> Rebuild<M> {
+    /// Starts the unit, through admission, and keeps who started.
+    async fn start_unit(&self) -> Result<(), Failed> {
+        let started = self
+            .core
             .start_unit(
                 &self.db,
                 &self.entry,
@@ -695,6 +777,26 @@ impl<M: Machine> Host for Rebuild<M> {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(started.0);
         Ok(())
     }
+}
+impl<M: Machine> Host for Rebuild<M> {
+    async fn start(&self) -> Result<(), Failed> {
+        // The restored files are the source's: the agent's own replace them before the start.
+        self.core
+            .write_configuration(&self.entry, &self.account)
+            .map_err(|_| Failed)?;
+        self.start_unit().await
+    }
+
+    async fn restart(&self) -> Result<(), Failed> {
+        // The database stays admitted, so that no other start takes its memory in between, and
+        // the unit's new invocation is the one the route names.
+        self.core
+            .machine
+            .stop(&self.entry.id)
+            .await
+            .map_err(|_| Failed)?;
+        self.start_unit().await
+    }
 
     async fn promoted(&self) -> Result<Restored, Failed> {
         let core = &self.core;
@@ -707,6 +809,17 @@ impl<M: Machine> Host for Rebuild<M> {
                 .map_err(|_| Failed)?;
             if !rows[0].try_get::<_, bool>(0).map_err(|_| Failed)? {
                 break;
+            }
+            // PostgreSQL pauses a recovery whose WAL raises a parameter above the settings it
+            // runs with, and its postmaster stays up and ready: nothing resumes it, as the
+            // recovery never targets a pause. The query fails when the recovery ended since the
+            // one above, and the next pass finds that.
+            if let Ok(rows) = session
+                .query("SELECT pg_catalog.pg_get_wal_replay_pause_state()", &[])
+                .await
+                && rows[0].try_get::<_, String>(0).map_err(|_| Failed)? != "not paused"
+            {
+                return Err(Failed);
             }
             // The unit may have ended: a recovery that died is not promoted.
             if core
@@ -786,6 +899,32 @@ mod tests {
 
     fn report(observation: Value) -> Value {
         json!({"observed_at": "2026-10-18T10:11:12.345Z", "databases": [observation], "orders": []})
+    }
+
+    #[test]
+    fn a_due_base_backup_waits_for_a_wake_on_the_node_and_the_first_minute_after_one_but_not_for_ever()
+     {
+        let now = 50_000_000;
+        let hours_ago = |hours: i64| Some(now - hours * 3_600_000);
+        // A quiet node and a database that woke long ago, or whose wake is not known: it starts.
+        assert!(!backup_waits(hours_ago(1), 0, None, now));
+        assert!(!backup_waits(None, 0, None, now));
+        // The minute after the newest database became ready: 59.999 s is inside it, 60 s is not.
+        assert!(backup_waits(Some(now - 59_999), 0, None, now));
+        assert!(!backup_waits(
+            Some(now - BACKUP_AFTER_WAKE_MS),
+            0,
+            None,
+            now
+        ));
+        // A start queued or in flight on the node, whichever database it is for.
+        assert!(backup_waits(hours_ago(1), 1, None, now));
+        assert!(backup_waits(hours_ago(1), 7, None, now));
+        // Put off for the longest it may be, it starts whatever the node does; a moment less, not.
+        let since = now - BACKUP_PUT_OFF_MAX_MS;
+        assert!(!backup_waits(Some(now - 1), 3, Some(since), now));
+        assert!(backup_waits(Some(now - 1), 3, Some(since + 1), now));
+        assert!(!backup_waits(hours_ago(1), 0, Some(since + 1), now));
     }
 
     #[test]

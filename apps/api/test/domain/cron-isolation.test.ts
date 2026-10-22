@@ -10,7 +10,6 @@ import {
   cronErrorMessage,
 } from "../../src/domain/cron-health.ts";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
-import { recordNodeMemoryObservation } from "./memory-fixture.ts";
 import { infrastructureAlertStatus } from "../../src/domain/infrastructure-alerts.ts";
 import { configureInfrastructureBackups } from "../../src/domain/infrastructure-backups.ts";
 import type { Env } from "../../src/env.ts";
@@ -206,46 +205,18 @@ it("counts consecutive failed runs per step and forgets a step once it succeeds"
 it("evaluates a region's alerts even when its capacity decision fails", async () => {
   const f = await fixture(8192, 40),
     at = Date.now(),
-    uid = crypto.randomUUID(),
     provider = String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!);
-  await env.DB.prepare(
-    "UPDATE nodes SET node_uid=?,provider_instance_id=? WHERE id=?",
-  )
-    .bind(uid, provider, f.node)
+  await env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?")
+    .bind(provider, f.node)
     .run();
+  // The one provider-assigned node is the cap of 1.
   await configureNodeRegionPolicy(env.DB, {
     region_id: f.region,
-    max_nodes: 3,
+    max_nodes: 1,
     purchases_enabled: false,
-    ram_warning_threshold_ppm: 750000,
-    cap_warning_enabled: false,
-    placement_mode: "actual_ram",
+    cap_warning_enabled: true,
     maximum_database_memory_mib: 4096,
-    postgres_memory_request_mib: 128,
   });
-  const capacity = 8 * 1024 ** 3;
-  for (let minute = 9; minute >= 0; minute--) {
-    const observed_at = new Date(at - minute * 60_000).toISOString();
-    await recordNodeMemoryObservation(
-      env.DB,
-      f.region,
-      {
-        node_id: f.node,
-        node_uid: uid,
-        provider_instance_id: provider,
-        memory: {
-          node_uid: uid,
-          observed_at,
-          capacity_memory_bytes: capacity,
-          working_set_bytes: Math.floor(capacity * 0.8),
-          available_bytes: Math.floor(capacity * 0.2),
-          memory_pressure: false,
-        },
-      },
-      observed_at,
-      at - minute * 60_000,
-    );
-  }
   vi.spyOn(console, "error").mockImplementation(() => {});
   const result = await runCron(
     failing("SELECT * FROM node_region_policies WHERE region_id=?"),
@@ -255,7 +226,10 @@ it("evaluates a region's alerts even when its capacity decision fails", async ()
     "node_capacity",
   ]);
   expect(await infrastructureAlertStatus(env.DB, f.region)).toContainEqual(
-    expect.objectContaining({ kind: "regional_ram_warning", active: true }),
+    expect.objectContaining({
+      kind: "regional_node_cap_reached",
+      active: true,
+    }),
   );
 });
 

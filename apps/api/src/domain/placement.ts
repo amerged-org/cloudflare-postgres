@@ -2,9 +2,10 @@
 //
 // Placement by measured activity (ULTRA plan 4.8). A node takes new databases until its active
 // RAM or its CPU load reaches 80 %, each as the highest 30-minute average of the last seven days;
-// among the nodes that qualify the fullest wins, and a node is added only when none does. Cloudflare
-// reads only what the node reports: its newest sample (`nodes.last_sample_json`) and its per-minute
-// rollups (`node_minutes`); the node decides every start itself.
+// among the nodes that qualify the fullest wins, and a node is added only when none does. A node
+// holding `MAX_VOLUMES_PER_NODE` volumes takes no more (plan 4.11). Cloudflare reads only what the
+// node reports: its newest sample (`nodes.last_sample_json`) and its per-minute rollups
+// (`node_minutes`); the node decides every start itself.
 import { NODE_SAMPLE_INTERVAL_MS } from "@pgcf/contracts";
 
 /** A node whose newest sample is older than this is offline (`regional_node_stale`). */
@@ -18,6 +19,14 @@ const POOL_DATA_CLOSED_PPM = 800_000;
 const POOL_METADATA_CLOSED_PPM = 500_000;
 /** The sold storage of a node stays within this many times its pool's data (plan 4.3). */
 const LOGICAL_CAP_FACTOR = 4;
+/**
+ * The technical volume bound (plan 4.8, 4.11): from this many thin volumes a node is closed for
+ * create, restore and move, and counts as full for the purchase signal. It is the largest count
+ * Stage 1 measured, and it rises only after a measurement at a higher count; the 64 MiB LVM
+ * metadata area the agent creates would hold far more. Volumes created between two samples can
+ * take a node a little past it. A resize adds no volume and is not stopped by it.
+ */
+export const MAX_VOLUMES_PER_NODE = 1000;
 /** The averaging window of a load figure, and how far back its highest value counts. */
 export const AVERAGE_WINDOW_SECONDS = 1800;
 export const PEAK_WINDOW_MS = 7 * 86_400_000;
@@ -52,6 +61,8 @@ export interface PlacementNode {
   pool_metadata_total_bytes: number | null;
   pool_metadata_used_bytes: number | null;
   pool_nominal_bytes: number | null;
+  /** Every thin volume of the node in that sample, mounted or not. */
+  volumes_total: number | null;
   /** Highest 30-minute average of active RAM and of CPU load in the last seven days. */
   ram_peak_ppm: number | null;
   cpu_peak_ppm: number | null;
@@ -100,12 +111,16 @@ function nodeOpen(node: PlacementNode): boolean {
 }
 
 type PoolState =
-  "unavailable" | "no_room" | "data" | "metadata" | "cap" | "open";
+  "unavailable" | "no_room" | "data" | "metadata" | "cap" | "volumes" | "open";
 /**
  * Whether the node's thin pool is open for placement (plan 4.3): readable, with room, below 80 %
- * of its data and 50 % of its metadata, and with the sold storage below the logical cap. The sold
- * storage is what the node reported plus the databases it has not counted yet, and `needGib` more
- * must fit under the cap as well. The pool of an offline node is judged by its last sample.
+ * of its data and 50 % of its metadata, with the sold storage below the logical cap, and with
+ * fewer than `MAX_VOLUMES_PER_NODE` volumes. The sold storage is what the node reported plus the
+ * databases it has not counted yet, and `needGib` more must fit under the cap as well. The pool of
+ * an offline node is judged by its last sample. The states that stop a resize that grows storage
+ * (no reading, no room, the cap) come first and keep their names whatever else has closed the
+ * node; data, metadata and the volume count close it for new databases only and come after them,
+ * the volume count last.
  */
 function poolState(
   pool: Pick<
@@ -116,6 +131,7 @@ function poolState(
     | "pool_metadata_total_bytes"
     | "pool_metadata_used_bytes"
     | "pool_nominal_bytes"
+    | "volumes_total"
     | "pending_storage_gib"
   >,
   needGib = 0,
@@ -125,11 +141,16 @@ function poolState(
     pool.pool_data_used_bytes === null ||
     pool.pool_metadata_total_bytes === null ||
     pool.pool_metadata_used_bytes === null ||
-    pool.pool_nominal_bytes === null
+    pool.pool_nominal_bytes === null ||
+    pool.volumes_total === null
   )
     return "unavailable";
   if (pool.room !== 1) return "no_room";
-  const dataTotal = BigInt(pool.pool_data_total_bytes);
+  const dataTotal = BigInt(pool.pool_data_total_bytes),
+    cap = dataTotal * BigInt(LOGICAL_CAP_FACTOR),
+    sold =
+      BigInt(pool.pool_nominal_bytes) + BigInt(pool.pending_storage_gib) * GIB;
+  if (sold >= cap || sold + BigInt(needGib) * GIB > cap) return "cap";
   // used / total >= limit, in integers.
   if (
     BigInt(pool.pool_data_used_bytes) * PPM >=
@@ -141,10 +162,7 @@ function poolState(
     BigInt(pool.pool_metadata_total_bytes) * BigInt(POOL_METADATA_CLOSED_PPM)
   )
     return "metadata";
-  const cap = dataTotal * BigInt(LOGICAL_CAP_FACTOR),
-    sold =
-      BigInt(pool.pool_nominal_bytes) + BigInt(pool.pending_storage_gib) * GIB;
-  return sold >= cap || sold + BigInt(needGib) * GIB > cap ? "cap" : "open";
+  return pool.volumes_total >= MAX_VOLUMES_PER_NODE ? "volumes" : "open";
 }
 
 /** `mib` of `total` bytes in parts per million, rounded up. */
@@ -174,9 +192,10 @@ function load(
 }
 
 /**
- * The node a new database goes to: of the nodes that are online, open, with an open pool, below
- * 80 % CPU and below 80 % active RAM after the database, the one with the most load; ties go to
- * the lower ID. Null when none qualifies and the database waits for capacity.
+ * The node a new database goes to: of the nodes that are online, open, with an open pool (below
+ * the volume bound as well), below 80 % CPU and below 80 % active RAM after the database, the one
+ * with the most load; ties go to the lower ID. Null when none qualifies and the database waits for
+ * capacity.
  */
 export function choosePlacement(
   nodes: readonly PlacementNode[],
@@ -216,7 +235,10 @@ interface PlacementGrowth {
 /**
  * Whether the node an existing database stays on can take its growth (plan 3.5): online, with
  * the cores the database may use, below 80 % active RAM after the extra memory, and with the
- * extra storage inside its logical cap. Growth of nothing needs only the cores.
+ * extra storage inside its logical cap. Growth of nothing needs only the cores. Only the cap
+ * (or a pool with no reading or no room) refuses storage growth: a node closed for new databases
+ * by its pool data, its metadata or the volume bound can still grow its databases, because a
+ * resize creates no volume and takes no real space.
  */
 export function growthFits(
   node: PlacementNode,
@@ -268,7 +290,8 @@ export const LATEST_SAMPLES_SQL = `SELECT n.id node_id,n.region_id,n.last_observ
     json_extract(n.last_sample_json,'$.pool.data_used_bytes') pool_data_used_bytes,
     json_extract(n.last_sample_json,'$.pool.metadata_total_bytes') pool_metadata_total_bytes,
     json_extract(n.last_sample_json,'$.pool.metadata_used_bytes') pool_metadata_used_bytes,
-    json_extract(n.last_sample_json,'$.pool.nominal_bytes') pool_nominal_bytes
+    json_extract(n.last_sample_json,'$.pool.nominal_bytes') pool_nominal_bytes,
+    json_extract(n.last_sample_json,'$.volumes.total') volumes_total
   FROM nodes n WHERE n.last_sample_json IS NOT NULL AND n.last_observed_at IS NOT NULL`;
 const MINUTE_MS = 60_000;
 /** The minute rollup a time falls in, as `node_minutes.minute` counts it. */
@@ -313,7 +336,7 @@ export async function placementNodes(
       )
       SELECT n.id,n.region_id,n.ready,n.schedulable,n.lost_at,n.database_placement_enabled,n.database_placement_closed_at,
         l.observed_at sampled_at,l.memory_total_bytes,l.cpu_cores,l.room,
-        l.pool_data_total_bytes,l.pool_data_used_bytes,l.pool_metadata_total_bytes,l.pool_metadata_used_bytes,l.pool_nominal_bytes,
+        l.pool_data_total_bytes,l.pool_data_used_bytes,l.pool_metadata_total_bytes,l.pool_metadata_used_bytes,l.pool_nominal_bytes,l.volumes_total,
         p.ram_peak_ppm,p.cpu_peak_ppm,
         CASE WHEN l.memory_total_bytes>0 AND l.memory_available_bytes IS NOT NULL
           THEN (l.memory_total_bytes-l.memory_available_bytes)*1000000/l.memory_total_bytes END ram_now_ppm,
@@ -338,9 +361,10 @@ export async function placementNodes(
 }
 
 /**
- * The nodes of a region, not lost, whose thin pool the newest sample closes for placement: its
- * data or metadata is too full, or the storage sold has reached the logical cap (plan 4.3). A pool
- * without room or without a reading is another alarm's.
+ * The nodes of a region, not lost, that the newest sample closes for placement: the thin pool's
+ * data or metadata is too full, the storage sold has reached the logical cap (plan 4.3), or the
+ * node holds `MAX_VOLUMES_PER_NODE` volumes. A pool without room or without a reading is another
+ * alarm's.
  */
 export async function closedPools(
   db: D1Database,
@@ -349,14 +373,16 @@ export async function closedPools(
   const result = await db
     .prepare(
       `SELECT n.id,l.room,l.pool_data_total_bytes,l.pool_data_used_bytes,l.pool_metadata_total_bytes,l.pool_metadata_used_bytes,
-        l.pool_nominal_bytes,${pendingStorageSql("n", "l.observed_at")} pending_storage_gib
+        l.pool_nominal_bytes,l.volumes_total,${pendingStorageSql("n", "l.observed_at")} pending_storage_gib
       FROM nodes n JOIN (${LATEST_SAMPLES_SQL}) l ON l.node_id=n.id
       WHERE n.region_id=? AND n.lost_at IS NULL ORDER BY n.id`,
     )
     .bind(regionId)
     .all<Parameters<typeof poolState>[0] & { id: string }>();
   return result.results
-    .filter((node) => ["data", "metadata", "cap"].includes(poolState(node)))
+    .filter((node) =>
+      ["data", "metadata", "cap", "volumes"].includes(poolState(node)),
+    )
     .map((node) => node.id);
 }
 

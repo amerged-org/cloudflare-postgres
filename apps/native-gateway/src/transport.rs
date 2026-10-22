@@ -19,16 +19,15 @@ use pgcf_native_protocol::{
 };
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    future::Future,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UnixStream},
-    sync::{Notify, OwnedSemaphorePermit, RwLock, mpsc, watch},
+    net::{TcpListener, TcpStream, UnixStream},
+    sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch},
+    task::JoinSet,
     time::timeout,
 };
 use tokio_tungstenite::{
@@ -86,7 +85,9 @@ pub struct Gateway {
     pub table: Arc<RwLock<LocalTable>>,
     pub sessions: SharedSessions,
     pub measurements: Arc<Mutex<GatewayMeasurements>>,
-    pub draining: AtomicBool,
+    /// When the drain ends, once it has begun ([`Gateway::drain`]): a session that is still
+    /// busy then is cut.
+    drain_until: OnceLock<Instant>,
     /// The held connections of sleeping databases and their wake tickets.
     pub wakes: Arc<WakeQueue>,
     /// The stage marks of those connections, on their way to the agent.
@@ -104,7 +105,7 @@ impl Gateway {
             table: Arc::default(),
             sessions: Arc::new(Mutex::new(Sessions::default())),
             measurements: Arc::new(Mutex::new(GatewayMeasurements::new())),
-            draining: AtomicBool::new(false),
+            drain_until: OnceLock::new(),
             wakes: WakeQueue::new(),
             stage_marks: local::StageQueue::default(),
             sql: crate::sql::Pool::default(),
@@ -160,9 +161,38 @@ impl Gateway {
             actions,
         ))
     }
+    /// Begins the drain: from now on the gateway admits no new work, and a session that is still
+    /// busy after `bound` is cut. Only the first call counts.
+    pub fn drain(&self, bound: Duration) {
+        let _ = self.drain_until.set(Instant::now() + bound);
+    }
+    pub fn draining(&self) -> bool {
+        self.drain_until.get().is_some()
+    }
+    /// The end of the drain, once it has begun.
+    pub(crate) fn drain_until(&self) -> Option<Instant> {
+        self.drain_until.get().copied()
+    }
+    /// Waits until the agent's table has arrived, at most `bound`; whether it has.
+    async fn table_arrived(&self, bound: Duration) -> bool {
+        timeout(bound, async {
+            loop {
+                // The wait is registered before the table is read, so that a table that arrives
+                // in between wakes it.
+                let changed = self.changed().await;
+                let notified = changed.notified();
+                if self.table.read().await.synchronized() {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
     /// Whether the gateway admits new work: the agent's table is current and it is not draining.
     pub(crate) async fn ready(&self) -> bool {
-        self.table.read().await.synchronized() && !self.draining.load(Ordering::Acquire)
+        self.table.read().await.synchronized() && !self.draining()
     }
     /// The writer a route the Edge signed is admitted on, or the `conn_stages` outcome it is
     /// refused with. The route names the revision it was signed under, and no other is admitted.
@@ -192,7 +222,10 @@ impl Gateway {
     /// revision of its release and is admitted under that revision or a later one.
     async fn admit_route(&self, claims: &Route, released: bool) -> Result<Writer, &'static str> {
         let table = self.table.read().await;
-        if self.draining.load(Ordering::Acquire) || !table.synchronized() {
+        if self.draining() {
+            return Err("gateway_draining");
+        }
+        if !table.synchronized() {
             return Err("fenced");
         }
         let Some(record) = table.record(&claims.db) else {
@@ -439,6 +472,78 @@ fn upgrade(head: &HttpHead) -> bool {
             .is_some_and(valid_websocket_key)
         && head.count("x-pgcf-route") <= 1
 }
+/// How long a session that is still busy when the gateway drains is given: what a transaction in
+/// flight may take to end, and so the longest a new connection waits for the gateway that
+/// replaces this one. It stays well under the integrators' retry rule (1, 2, 4 and 8 s).
+pub const DRAIN_BOUND: Duration = Duration::from_secs(10);
+/// How long a new gateway waits for the agent's table before it accepts. The agent sends it as
+/// soon as the gateway connects, so the wait is as long as the connect takes; the bound is for a
+/// gateway that starts while the agent does not serve its channel (a boot), which then answers
+/// `fenced` as it does whenever it has no table, instead of leaving connections without an answer.
+pub const FIRST_TABLE_BOUND: Duration = Duration::from_secs(5);
+/// The time the sessions have to close after the drain's bound.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// The connections whose request is being read at one time.
+pub const HANDSHAKES: usize = 128;
+/// Serves the connections of `listener` until `shutdown` completes, then drains: the gateway
+/// stops accepting and admitting new work (`Gateway::drain`), the sessions are told, and the
+/// function returns when the last of them has ended or `bound` and the grace after it are over.
+/// The listening socket stays open until the function returns, so that a connection that arrives
+/// meanwhile waits in its queue instead of being refused. It is also not accepted before the
+/// agent's table has arrived (for `first_table` at most): without the table every route is
+/// refused as `fenced`, and the connections that waited through a swap are the ones the new
+/// gateway must serve.
+pub async fn serve(
+    listener: TcpListener,
+    gateway: Arc<Gateway>,
+    stop: watch::Sender<bool>,
+    shutdown: impl Future<Output = ()>,
+    bound: Duration,
+    first_table: Duration,
+) -> std::io::Result<()> {
+    let pending = Arc::new(Semaphore::new(HANDSHAKES));
+    let mut sessions = JoinSet::new();
+    tokio::pin!(shutdown);
+    let stopped = tokio::select! {
+        _ = &mut shutdown => true,
+        _ = gateway.table_arrived(first_table) => false,
+    };
+    let accepting = if stopped {
+        Ok(())
+    } else {
+        loop {
+            // A slot first, then the connection: when every slot is taken, a connection waits in the
+            // socket's queue and is served in its turn, instead of being accepted and reset. The
+            // burst that meets a new gateway after a swap is the connections that waited for it.
+            let permit = tokio::select! {
+                _ = &mut shutdown => break Ok(()),
+                Some(_) = sessions.join_next() => continue,
+                permit = pending.clone().acquire_owned() => permit.expect("the semaphore is never closed"),
+            };
+            tokio::select! {
+                _ = &mut shutdown => break Ok(()),
+                Some(_) = sessions.join_next() => {},
+                accepted = listener.accept() => match accepted {
+                    Ok((socket, _)) => {
+                        let (gateway, receiver) = (gateway.clone(), stop.subscribe());
+                        sessions.spawn(async move {
+                            let _ = serve_socket(socket, gateway, receiver, permit).await;
+                        });
+                    }
+                    Err(error) => break Err(error),
+                },
+            }
+        }
+    };
+    gateway.drain(bound);
+    let _ = stop.send(true);
+    let _ = timeout(bound + DRAIN_GRACE, async {
+        while sessions.join_next().await.is_some() {}
+    })
+    .await;
+    sessions.abort_all();
+    accepting
+}
 pub async fn serve_socket(
     mut socket: TcpStream,
     gateway: Arc<Gateway>,
@@ -464,10 +569,10 @@ pub async fn serve_socket(
             } else {
                 200
             },
-            if path == "/healthz" || ready {
-                "ok\n"
-            } else if gateway.draining.load(Ordering::Acquire) {
+            if gateway.draining() {
                 "draining\n"
+            } else if path == "/healthz" || ready {
+                "ok\n"
             } else {
                 "unsynchronized\n"
             },
@@ -697,7 +802,7 @@ async fn held_state(
     held: &Held,
     stop: &watch::Receiver<bool>,
 ) -> Option<Result<(String, u64), HeldEnd>> {
-    if gateway.draining.load(Ordering::Acquire) || *stop.borrow() {
+    if gateway.draining() || *stop.borrow() {
         return Some(Err(HeldEnd::Draining));
     }
     if let Some(result) = held
@@ -787,9 +892,14 @@ async fn serve_held(
     mut stages: Stages,
 ) -> Result<(), Failure> {
     let database = ticket.db.clone();
-    if gateway.draining.load(Ordering::Acquire) {
-        stages.outcome = "fenced";
-        return http::reply(&mut socket, 503, serde_json::json!({"error":"fenced"})).await;
+    if gateway.draining() {
+        stages.outcome = "gateway_draining";
+        return http::reply(
+            &mut socket,
+            503,
+            serde_json::json!({"error":"gateway_draining"}),
+        )
+        .await;
     }
     let Some(base) = session_memory(&gateway, &database) else {
         stages.outcome = "memory_capacity";
@@ -1483,6 +1593,26 @@ async fn early_dial(gateway: &Gateway, claims: &Route, bound: &Writer) -> Option
         }),
     })
 }
+/// What a session that is still busy when the drain ends is told before it is closed. Ending the
+/// gateway's connection to PostgreSQL rolls back a session that is idle in a transaction, as
+/// PostgreSQL tells a client when it shuts down (57P01). It does not stop a statement in flight:
+/// PostgreSQL finishes it, and the COMMIT the client sent behind it, and notices that the client
+/// is gone only when it writes its answer, so the statement may commit after this message. Its
+/// outcome is unknown (08007, as for a COMMIT whose answer was lost).
+fn drain_cut(activity: &PostgresActivity) -> Vec<u8> {
+    if activity.in_flight() {
+        error_response_with(
+            "08007",
+            "gateway restarting during a statement; its outcome is unknown",
+            Some("PostgreSQL goes on with the statement and may commit it after this error."),
+            Some(
+                "Repeat only a write that is idempotent, or check its effect after the statement's run time.",
+            ),
+        )
+    } else {
+        error_response_with("57P01", "gateway restarting", None, None)
+    }
+}
 /// `held` is what the client sent that waits for the session to run: the bytes it pipelined
 /// behind a password the gateway logged in with.
 #[allow(clippy::too_many_arguments)]
@@ -1504,7 +1634,6 @@ async fn relay(
     let mut alive = true;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.tick().await;
-    let mut drain_at = None;
     let mut physical_timer = tokio::time::interval(Duration::from_millis(100));
     let database = id.split_once('/').expect("bound session identity").0;
     update(gateway, id, activity, false, false);
@@ -1543,11 +1672,29 @@ async fn relay(
             }
             mode = Action::Quiesce;
         }
-        let deadline =
-            drain_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
+        // A draining gateway keeps a session only while it is busy, and for no longer than the
+        // drain lasts.
+        if gateway.draining() && !activity.busy() && !wire.busy() && held.is_none() {
+            stages.outcome = "gateway_draining";
+            close(websocket, CloseCode::Restart, "gateway restarting").await;
+            break;
+        }
+        let deadline = gateway
+            .drain_until()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
         tokio::select! {
-            _=stop.changed()=>{if *stop.borrow(){drain_at=Some(Instant::now()+Duration::from_secs(29));}},
-            _=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))=>{stages.outcome="gateway_draining";close(websocket,CloseCode::Restart,"gateway restarting").await;break;},
+            _=stop.changed()=>{},
+            _=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))=>{
+                stages.outcome="gateway_draining";
+                // Cut with a transaction or a statement open: the client is told what became of it,
+                // unless a message of PostgreSQL's is half delivered, which nothing may be inserted into.
+                if !activity.backend_partial(){
+                    let error=drain_cut(activity);
+                    let _=timeout(Duration::from_millis(500),websocket.send(Message::Binary(error.into()))).await;
+                }
+                close(websocket,CloseCode::Restart,"gateway restarting").await;
+                break;
+            },
             _=actions.changed()=>{},
             _=physical_timer.tick()=>{},
             _=heartbeat.tick(),if mode==Action::Running=>{if !alive{stages.outcome="heartbeat_timeout";break;}alive=false;send_client(websocket,Message::Ping(Vec::new().into()),stages).await?;},

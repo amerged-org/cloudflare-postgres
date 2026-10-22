@@ -318,7 +318,7 @@ export function registerNodes(app: ApiApp): void {
       tags: ["Nodes"],
       summary: "Read a region's capacity policy",
       description:
-        "Returns the stored policy: node ceiling, purchase and autoscale switches, placement settings and the infrastructure alert thresholds. Unset values are null or false, so the body can be edited and sent back with PUT. 404 until a policy has been created with PUT.",
+        "Returns the stored policy: node ceiling, purchase and autoscale switches, the per-database memory maximum and the infrastructure alert thresholds. Unset values are null or false, so the body can be edited and sent back with PUT. 404 until a policy has been created with PUT.",
       request: { params: regionParams },
       responses: responses(NodeCapacityPolicy, 200, "Stored capacity policy"),
     },
@@ -334,9 +334,9 @@ export function registerNodes(app: ApiApp): void {
       summary: "Replace a region's capacity policy and alert thresholds",
       description: [
         "Replaces the policy and returns it as stored. Read it with GET, change fields and send the complete object back; region_id must equal the path id.",
-        "Omitted fields with a default are reset to it: purchases_enabled, autoscale_enabled, adopt_instance_ids, order, placement_mode, maximum_database_memory_mib, postgres_memory_request_mib and standing_cost_profile. Omitted max_nodes, ram_expansion_threshold_ppm, the four *_warning_threshold_ppm fields and cap_warning_enabled keep their stored values; send null (false for cap_warning_enabled) to clear them.",
+        "Omitted fields with a default are reset to it: purchases_enabled, autoscale_enabled, adopt_instance_ids, order, maximum_database_memory_mib and standing_cost_profile. Omitted max_nodes, the three node_*_warning_threshold_ppm fields and cap_warning_enabled keep their stored values; send null (false for cap_warning_enabled) to clear them.",
         "Thresholds are integers in parts per million (ppm): 1000000 = 100 %, 800000 = 80 %, valid 1 to 1000000; null disables. A warning is active while its measured value is at or above the threshold. Unknown measurements neither start nor clear an episode; disabling a warning clears it. The minute cron evaluates the first four regions with a policy, in region ID order, and delivers each new episode at least once through the alert webhook or email (see PUT /v1/infrastructure-backups/config); GET /v1/operational-health?scope=regions shows each episode. Alert kinds without a threshold (node heartbeats, daily backups, a database's WAL archive and base backup, the thin pool and the cron heartbeat) are not part of this policy: they follow fixed rules in every region and are described there.",
-        "400: invalid body, including purchases_enabled without order, actual_ram without a valid memory range, a standing_cost_profile bound to another order, or a region_id that differs from the path. 404: unknown or non-Contabo region. 409: autoscale_enabled, purchases_enabled and order without an effective ram_expansion_threshold_ppm, or a placement_mode or actual_ram postgres_memory_request_mib change while databases are assigned (and not manually suspended) or starting, or an actual_ram memory range that excludes existing databases.",
+        "400: invalid body, including purchases_enabled without order, a standing_cost_profile bound to another order, or a region_id that differs from the path. 404: unknown or non-Contabo region.",
       ].join("\n\n"),
       request: { params: regionParams, body: body(NodeCapacityPolicy) },
       responses: responses(
@@ -377,7 +377,7 @@ export function registerNodes(app: ApiApp): void {
           action: z
             .string()
             .describe(
-              "Next capacity step: unconfigured (no policy); idle (a node can take the smallest size class, and no database waits); waiting_for_approval or addition_in_progress (a held node addition, see operation_id); maintenance (an open maintenance cycle holds a node's placement closed; nothing is bought until it ends); observations_stale (a placement-enabled node has no sample within 180 s); size_policy_unavailable (the waiting database's size class is disabled, or its memory is above the region's per-database maximum); placement_pending (a node can take the waiting database now; the next run places it); disabled (autoscale_enabled is false); cap_reached (max_nodes reached); selection_unconfigured (no unused adopt_instance_ids entry and no order); adopt or order (the next cron run starts this kind of addition).",
+              "Next capacity step: unconfigured (no policy); idle (a node can take the smallest size class, and no database waits); waiting_for_approval or addition_in_progress (a held node addition, see operation_id); maintenance (an open maintenance cycle holds a node's placement closed; nothing is bought until it ends); observations_stale (a placement-enabled node has no sample within 180 s); size_policy_unavailable (the waiting database's size class is disabled, or its memory is above the region's per-database maximum); placement_pending (a node can take the waiting database now; the next run places it); disabled (autoscale_enabled is false); cap_reached (max_nodes reached); selection_unconfigured (no unused adopt_instance_ids entry and no order); purchases_disabled (no unused adopt_instance_ids entry, and an order is configured but purchases_enabled is false: no order is reserved); adopt or order (the next cron run starts this kind of addition).",
             ),
           operation_id: OperationId.nullable().describe(
             "Held node addition for waiting_for_approval and addition_in_progress; otherwise null.",

@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -115,6 +115,10 @@ fn invalid(message: &str) -> Refused {
     refused("invalid_request", "08P01", message)
 }
 fn not_accepting(outcome: &'static str) -> Refused {
+    if outcome == "gateway_draining" {
+        // Nothing reached PostgreSQL: an integrator retries it, as it retries 57P03.
+        return refused(outcome, "08006", "gateway restarting");
+    }
     refused(outcome, "57P03", "database is not accepting connections")
 }
 fn connection_failed(outcome: &'static str) -> Refused {
@@ -246,6 +250,8 @@ struct Stages {
     /// waited for its database's wake; none for one refused before either.
     wake_path: Option<&'static str>,
     statements: usize,
+    /// The statements were handed to PostgreSQL, which may have run them.
+    sent: bool,
     received: Instant,
     dial: Option<Duration>,
     authentication: Option<Duration>,
@@ -305,12 +311,36 @@ pub async fn serve(
         pooled: false,
         wake_path: None,
         statements: 0,
+        sent: false,
         received,
         dial: None,
         authentication: None,
         query: None,
     };
-    let (answer, backend) = handle(&mut socket, head, &gateway, &stop, permit, &mut stages).await;
+    // A request that is still running when the drain is over is not cut silently: it is answered.
+    let handled = {
+        let handling = handle(&mut socket, head, &gateway, &stop, permit, &mut stages);
+        tokio::select! {
+            handled = handling => Some(handled),
+            _ = drain_over(&gateway, stop.clone()) => None,
+        }
+    };
+    let (answer, backend) = handled.unwrap_or_else(|| {
+        // Dropping the request ended the gateway's connection to PostgreSQL, which does not stop
+        // what PostgreSQL was given: it finishes the statements and the COMMIT sent with them and
+        // notices the lost client only when it writes, so a request whose statements were sent
+        // may commit after this answer. Its outcome is unknown.
+        let refusal = if stages.sent {
+            refused(
+                "gateway_draining",
+                "08007",
+                "gateway restarting during the request; PostgreSQL may still complete it; its outcome is unknown and it was not retried",
+            )
+        } else {
+            not_accepting("gateway_draining")
+        };
+        (Err(refusal), None)
+    });
     // The answer's memory stays leased until it was sent.
     let (status, bytes, _memory) = match answer {
         Ok(answer) => {
@@ -335,6 +365,18 @@ pub async fn serve(
         tokio::spawn(recycle(gateway, backend, status, stop));
     }
     sent
+}
+/// Resolves when the gateway's drain is over.
+async fn drain_over(gateway: &Gateway, mut stop: watch::Receiver<bool>) {
+    loop {
+        if let Some(until) = gateway.drain_until() {
+            tokio::time::sleep_until(until.into()).await;
+            return;
+        }
+        if stop.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
 }
 async fn respond(socket: &mut TcpStream, status: u16, body: &[u8]) -> Result<(), Failure> {
     let reason = if status == 200 { "OK" } else { "Bad Request" };
@@ -414,6 +456,7 @@ async fn handle(
     } = request;
     drop(password);
     let started = Instant::now();
+    stages.sent = true;
     let executed = execute(gateway, &mut backend, &statements, transaction.as_ref()).await;
     stages.query = Some(started.elapsed());
     match executed {
@@ -632,8 +675,8 @@ async fn wake(
         let changed = table.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        if gateway.draining.load(Ordering::Acquire) || *stop.borrow() {
-            return Err(refused("gateway_draining", "08006", "gateway restarting"));
+        if gateway.draining() || *stop.borrow() {
+            return Err(not_accepting("gateway_draining"));
         }
         if let Some(result) = held
             .verdict()
@@ -673,7 +716,7 @@ async fn wake(
                 return Err(refused("wake_timeout", "57P03", "database did not wake in time"));
             }
             changed = stop.changed() => if changed.is_err() {
-                return Err(refused("gateway_draining", "08006", "gateway restarting"));
+                return Err(not_accepting("gateway_draining"));
             },
         }
     }

@@ -25,13 +25,18 @@ type Fixture = Awaited<ReturnType<typeof fixture>>;
 /** A region whose only node (fixture memory) reports now; the policy buys by adoption or order. */
 async function region(
   memory = 4096,
-  policy: { autoscale?: boolean; adopt?: string[]; order?: boolean } = {},
+  policy: {
+    autoscale?: boolean;
+    adopt?: string[];
+    order?: boolean;
+    purchases?: boolean;
+  } = {},
 ) {
   const f = await fixture(memory);
   await configureNodeRegionPolicy(env.DB, {
     region_id: f.region,
     max_nodes: 3,
-    purchases_enabled: false,
+    purchases_enabled: policy.purchases ?? false,
     order: policy.order ? order : null,
   });
   await env.DB.prepare(
@@ -65,7 +70,11 @@ describe("the next capacity step of a region", () => {
   });
 
   it("buys when no node can take the smallest size class: by adoption first, else by order", async () => {
-    const f = await region(4096, { adopt: [providerId()], order: true });
+    const f = await region(4096, {
+      adopt: [providerId()],
+      order: true,
+      purchases: true,
+    });
     // The node runs at 90 % active RAM, so another 512 MiB would not stay under 80 %.
     await seedSamples(f.node, steady(Date.now(), 40, { ramPpm: 900_000 }));
     expect(await decide(f)).toBe("adopt");
@@ -79,7 +88,7 @@ describe("the next capacity step of a region", () => {
   });
 
   it("reserves an order when no node fits, without any regional RAM window, and waits for the owner's approval", async () => {
-    const f = await region(4096, { order: true });
+    const f = await region(4096, { order: true, purchases: true });
     await seedSamples(f.node, steady(Date.now(), 40, { ramPpm: 900_000 }));
     const start = vi
       .spyOn(env.ADD_NODE, "create")
@@ -90,6 +99,78 @@ describe("the next capacity step of a region", () => {
     // The same hour's key binds the same addition: a second run reserves nothing more.
     expect(await decide(f, false)).toBe("waiting_for_approval");
     expect(await additions(f)).toBe(1);
+  });
+
+  it("reserves no order and starts no AddNode while purchases are off, and says so", async () => {
+    // Adoption is no purchase and still goes first; with nothing to adopt the order is not reserved.
+    const f = await region(4096, { order: true, purchases: false });
+    await seedSamples(f.node, steady(Date.now(), 40, { ramPpm: 900_000 }));
+    const start = vi
+      .spyOn(env.ADD_NODE, "create")
+      .mockResolvedValue({} as Awaited<ReturnType<typeof env.ADD_NODE.create>>);
+    expect(await decide(f, true)).toBe("purchases_disabled");
+    expect(await decide(f, false)).toBe("purchases_disabled");
+    expect(await additions(f)).toBe(0);
+    expect(start).not.toHaveBeenCalled();
+    // Turning purchases on later buys for a shortage that exists then, not for one that is gone.
+    await env.DB.prepare(
+      "UPDATE node_region_policies SET purchases_enabled=1 WHERE region_id=?",
+    )
+      .bind(f.region)
+      .run();
+    expect(await decide(f, false)).toBe("waiting_for_approval");
+    expect(await additions(f)).toBe(1);
+  });
+
+  it("reserves no order when purchases are turned off between the policy read and the reservation, and says so", async () => {
+    const f = await region(4096, { order: true, purchases: true });
+    await seedSamples(f.node, steady(Date.now(), 40, { ramPpm: 900_000 }));
+    const start = vi
+      .spyOn(env.ADD_NODE, "create")
+      .mockResolvedValue({} as Awaited<ReturnType<typeof env.ADD_NODE.create>>);
+    // An operator PUT lands while the run checks for maintenance, after it read the policy.
+    const prepare = env.DB.prepare.bind(env.DB);
+    let turnedOff = false;
+    vi.spyOn(env.DB, "prepare").mockImplementation((sql: string) => {
+      const statement = prepare(sql);
+      if (!sql.includes("lifecycle_orders o JOIN nodes n")) return statement;
+      const bind = statement.bind.bind(statement);
+      statement.bind = (...values) => {
+        const bound = bind(...values),
+          first = bound.first.bind(bound);
+        bound.first = (async (...args: unknown[]) => {
+          turnedOff = true;
+          await prepare(
+            "UPDATE node_region_policies SET purchases_enabled=0 WHERE region_id=?",
+          )
+            .bind(f.region)
+            .run();
+          return (first as (...a: unknown[]) => Promise<unknown>)(...args);
+        }) as typeof bound.first;
+        return bound;
+      };
+      return statement;
+    });
+    expect(await decide(f, false)).toBe("purchases_disabled");
+    expect(turnedOff).toBe(true);
+    expect(await additions(f)).toBe(0);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("reserves nothing while autoscale is off, even with purchases on and an order", async () => {
+    const f = await region(4096, {
+      autoscale: false,
+      order: true,
+      purchases: true,
+      adopt: [providerId()],
+    });
+    await seedSamples(f.node, steady(Date.now(), 40, { ramPpm: 900_000 }));
+    const start = vi
+      .spyOn(env.ADD_NODE, "create")
+      .mockResolvedValue({} as Awaited<ReturnType<typeof env.ADD_NODE.create>>);
+    expect(await decide(f, false)).toBe("disabled");
+    expect(await additions(f)).toBe(0);
+    expect(start).not.toHaveBeenCalled();
   });
 
   it("buys when the CPU load of every node is at 80 %", async () => {

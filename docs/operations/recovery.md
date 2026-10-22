@@ -207,10 +207,10 @@ created at full size at first boot and does not grow.
   sample no older than the policy's `sample_max_age_seconds`, free data of at least the policy's
   `reserve_bytes` and metadata below `metadata_no_room_percent`. The refusal is `57P03` with the
   DETAIL "storage"; running databases keep running. Cloudflare places no new database or restore on
-  a node whose pool is at 80 % of its data or 50 % of its metadata, or whose sold storage reached
-  four times its data (`regional_node_pool_closed`). Sold sizes do not reserve space.
-  `thin_storage_blocked` fires when the pool has no room. Free space by deleting databases on the
-  node.
+  a node whose pool is at 80 % of its data or 50 % of its metadata, whose sold storage reached
+  four times its data, or that holds 1,000 volumes (`regional_node_pool_closed`). Sold sizes do not
+  reserve space. `thin_storage_blocked` fires when the pool has no room. Free space by deleting
+  databases on the node.
 - **A full pool.** Writes fail at once (`--errorwhenfull y`) and no commit is acknowledged without
   durable WAL. ext4 on the affected volumes then aborts its journal and remounts read-only, so
   those databases stop. Once space is back above the reserve, the agent recovers each affected

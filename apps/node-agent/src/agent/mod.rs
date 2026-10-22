@@ -179,10 +179,14 @@ pub(crate) struct View {
     pub roles_blocked: Vec<String>,
     /// A recovery runs or waits for its retry.
     pub recovering: bool,
-    /// Since when the unit runs, for the usage meter.
+    /// Since when the unit runs: the usage meter's, and the first minute after which a due base
+    /// backup on the node may start (`Core::newest_ready_ms`).
     pub awake_since_ms: Option<i64>,
     /// When the last base backup that was due failed (`backup_if_due`).
     pub backup_failed_ms: Option<i64>,
+    /// When the base backup that is due was first put off for a wake in this awake session
+    /// (`backup_if_due`): the start of the longest wait it may have. A sleep forgets it.
+    pub backup_put_off_ms: Option<i64>,
     /// The node has decided on this database in this run.
     pub adopted: bool,
     /// A task runs the decision again, with growing waits, until the node has made it
@@ -217,6 +221,7 @@ impl View {
             recovering: false,
             awake_since_ms: None,
             backup_failed_ms: None,
+            backup_put_off_ms: None,
             adopted: false,
             retrying: false,
             queued: false,
@@ -527,6 +532,15 @@ impl<M: Machine> Core<M> {
             .collect();
         dbs.sort_by(|a, b| a.id.cmp(&b.id));
         dbs
+    }
+
+    /// When the newest awake database on the node became ready (`View::awake_since_ms`): a wake, a
+    /// build, or the adoption of a unit that runs. A database that sleeps has none.
+    pub(crate) fn newest_ready_ms(&self) -> Option<i64> {
+        self.all()
+            .iter()
+            .filter_map(|db| db.view().awake_since_ms)
+            .max()
     }
 
     /// The agent's files of a database.

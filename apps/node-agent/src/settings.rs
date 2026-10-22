@@ -22,8 +22,7 @@ const SMALL_DATABASE_MEMORY_MIB: u64 = 512;
 /// caps the workers, which come from the free slots, and none is planned. Nothing replicates:
 /// `pg_hba.conf` refuses replication connections and barman's base backup uses the backup API, so
 /// no WAL sender, slot or logical worker (and no logical replication launcher process) is ever
-/// needed. A recovery compares `max_worker_processes` and `max_wal_senders` with the source's, so
-/// a restore runs with more (`archive::recovery::settings`).
+/// needed. A recovery compares these with the source's (`Capacity`), so a restore runs with more.
 const SMALL_DATABASE_SETTINGS: &str = "\
 autovacuum_max_workers = 1\n\
 autovacuum_worker_slots = 2\n\
@@ -57,6 +56,83 @@ pub fn tuning(memory_mib: u64) -> Tuning {
         },
         maintenance_work_mem_mib: (memory_mib / 16).max(16),
         small: memory_mib <= SMALL_DATABASE_MEMORY_MIB,
+    }
+}
+
+/// The settings that size PostgreSQL's process and lock slots. `pg_control` records them, and an
+/// archive recovery with hot standby aborts when its own are lower than the source's ("recovery
+/// aborted because of insufficient parameter settings"), so a restore into a smaller class runs
+/// its recovery with the larger of each (`archive::recovery::settings`) and restarts on the
+/// class's own afterwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capacity {
+    pub max_connections: u32,
+    pub max_worker_processes: u32,
+    pub max_wal_senders: u32,
+    pub max_prepared_transactions: u32,
+    pub max_locks_per_transaction: u32,
+}
+impl Capacity {
+    /// What a database of `memory_mib` and `max_connections` runs (`postgresql_conf`): a small
+    /// database the trimmed `SMALL_DATABASE_SETTINGS`, any other and every setting `postgresql_conf`
+    /// does not write PostgreSQL 18's defaults.
+    pub fn of_class(memory_mib: u64, max_connections: u32) -> Self {
+        let small = tuning(memory_mib).small;
+        Self {
+            max_connections,
+            max_worker_processes: if small { 4 } else { 8 },
+            max_wal_senders: if small { 0 } else { 10 },
+            max_prepared_transactions: 0,
+            max_locks_per_transaction: 64,
+        }
+    }
+    /// The larger of each setting of the two.
+    pub fn at_least(self, other: Self) -> Self {
+        Self {
+            max_connections: self.max_connections.max(other.max_connections),
+            max_worker_processes: self.max_worker_processes.max(other.max_worker_processes),
+            max_wal_senders: self.max_wal_senders.max(other.max_wal_senders),
+            max_prepared_transactions: self
+                .max_prepared_transactions
+                .max(other.max_prepared_transactions),
+            max_locks_per_transaction: self
+                .max_locks_per_transaction
+                .max(other.max_locks_per_transaction),
+        }
+    }
+    /// Whether a database of `memory_mib` can run with these settings: its shared memory, which
+    /// the kernel cannot reclaim without swap, stays within half of the memory limit, and the
+    /// other half is left to the processes' own memory and the page cache.
+    pub fn fits(&self, memory_mib: u64) -> bool {
+        self.shared_memory_bytes(tuning(memory_mib).shared_buffers_mib)
+            <= memory_mib.saturating_mul(MIB) / 2
+    }
+    /// An upper bound of the shared memory a PostgreSQL 18 with these settings and
+    /// `shared_buffers_mib` allocates. Shared memory is what the kernel cannot reclaim without
+    /// swap, so a recovery that needs more of it than a class has to give fails before it starts
+    /// (`archive::restore`). The model is linear in the slots (a process and its lock table
+    /// entries, the predicate locks the default `max_pred_locks_per_transaction` of 64 adds) and
+    /// 10 % above the buffers (their descriptors and the mapping table: 2.6 % measured at 16 GiB,
+    /// 7 % at 256 MiB, 12.5 % at 16 MiB, where the fixed 8 MiB covers it). It is checked against
+    /// the server's own `shared_memory_size`
+    /// (`the_shared_memory_model_is_an_upper_bound_of_the_servers_own`).
+    pub fn shared_memory_bytes(&self, shared_buffers_mib: u64) -> u64 {
+        const SLOT_BYTES: u64 = 28 << 10;
+        const LOCK_BYTES: u64 = 416;
+        const FIXED_BYTES: u64 = 8 * MIB;
+        // The autovacuum slots, the launcher and the auxiliary processes.
+        const OTHER_SLOTS: u64 = 32;
+        let slots = u64::from(self.max_connections)
+            + u64::from(self.max_worker_processes)
+            + u64::from(self.max_wal_senders)
+            + u64::from(self.max_prepared_transactions)
+            + OTHER_SLOTS;
+        let per_slot = SLOT_BYTES + u64::from(self.max_locks_per_transaction) * LOCK_BYTES;
+        let buffers = shared_buffers_mib.saturating_mul(MIB);
+        buffers
+            .saturating_add(buffers / 10)
+            .saturating_add(FIXED_BYTES)
+            .saturating_add(slots.saturating_mul(per_slot))
     }
 }
 
@@ -681,5 +757,141 @@ mod tests {
                 .lines()
                 .any(|l| l == "pgcf_backup pgcf-abcdefghij0123456789 pgcf_backup")
         );
+    }
+
+    #[test]
+    fn a_recovery_runs_with_the_larger_of_each_setting_of_the_source_and_the_class() {
+        let xs = Capacity::of_class(256, 20);
+        assert_eq!(
+            xs,
+            Capacity {
+                max_connections: 20,
+                max_worker_processes: 4,
+                max_wal_senders: 0,
+                max_prepared_transactions: 0,
+                max_locks_per_transaction: 64,
+            }
+        );
+        let md = Capacity::of_class(1024, 200);
+        assert_eq!(
+            (
+                md.max_connections,
+                md.max_worker_processes,
+                md.max_wal_senders
+            ),
+            (200, 8, 10)
+        );
+        // Each setting on its own: the source's lock table is larger, the class's connections.
+        let source = Capacity {
+            max_connections: 10,
+            max_prepared_transactions: 5,
+            max_locks_per_transaction: 128,
+            ..Capacity::of_class(256, 10)
+        };
+        assert_eq!(
+            xs.at_least(source),
+            Capacity {
+                max_connections: 20,
+                max_prepared_transactions: 5,
+                max_locks_per_transaction: 128,
+                ..xs
+            }
+        );
+        assert_eq!(md.at_least(xs), md);
+        assert_eq!(xs.at_least(md), md);
+    }
+
+    #[test]
+    fn a_class_has_the_memory_for_a_source_of_the_catalog_but_not_for_a_far_larger_one() {
+        let xs = Capacity::of_class(256, 20);
+        // The enabled classes' largest, lg (300 connections), into the smallest.
+        assert!(xs.at_least(Capacity::of_class(4096, 300)).fits(256));
+        // The contract's largest `max_connections` needs about 500 MiB of shared memory.
+        assert!(!xs.at_least(Capacity::of_class(4096, 10_000)).fits(256));
+        assert!(Capacity::of_class(4096, 10_000).fits(4096));
+        // Overflowing counts do not wrap into a fit.
+        let huge = Capacity {
+            max_connections: u32::MAX,
+            max_worker_processes: u32::MAX,
+            max_wal_senders: u32::MAX,
+            max_prepared_transactions: u32::MAX,
+            max_locks_per_transaction: u32::MAX,
+        };
+        assert!(!huge.fits(u64::MAX / 4));
+    }
+
+    /// The model is the upper bound the check relies on, and not a loose one: the server's own
+    /// `shared_memory_size` (`postgres -C`, PostgreSQL 18.6) never exceeds it, over the settings of
+    /// a class, of a larger source and of far larger ones.
+    #[test]
+    fn the_shared_memory_model_is_an_upper_bound_of_the_servers_own() {
+        let Some(cluster) = Cluster::create("shared-memory") else {
+            return;
+        };
+        let measured = |capacity: &Capacity, shared_buffers_mib: u64, autovacuum_slots: u32| {
+            let output = std::process::Command::new(cluster.layout.postgres_bin.join("postgres"))
+                .arg("-D")
+                .arg(cluster.data())
+                .args(["-C", "shared_memory_size"])
+                .arg("-c")
+                .arg(format!("shared_buffers={shared_buffers_mib}MB"))
+                .arg("-c")
+                .arg(format!("autovacuum_worker_slots={autovacuum_slots}"))
+                .arg("-c")
+                .arg(format!("max_connections={}", capacity.max_connections))
+                .arg("-c")
+                .arg(format!(
+                    "max_worker_processes={}",
+                    capacity.max_worker_processes
+                ))
+                .arg("-c")
+                .arg(format!("max_wal_senders={}", capacity.max_wal_senders))
+                .arg("-c")
+                .arg(format!(
+                    "max_prepared_transactions={}",
+                    capacity.max_prepared_transactions
+                ))
+                .arg("-c")
+                .arg(format!(
+                    "max_locks_per_transaction={}",
+                    capacity.max_locks_per_transaction
+                ))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+                * MIB
+        };
+        let capacity = |connections, workers, senders, prepared, locks| Capacity {
+            max_connections: connections,
+            max_worker_processes: workers,
+            max_wal_senders: senders,
+            max_prepared_transactions: prepared,
+            max_locks_per_transaction: locks,
+        };
+        for (settings, shared_buffers_mib, autovacuum_slots) in [
+            (capacity(20, 4, 0, 0, 64), 32, 2),
+            (capacity(200, 10, 12, 4, 128), 32, 2),
+            (capacity(300, 8, 10, 0, 64), 512, 16),
+            (capacity(20, 4, 0, 0, 1024), 32, 2),
+            (capacity(100, 8, 10, 2000, 64), 16, 16),
+            (capacity(10_000, 8, 10, 0, 64), 128, 16),
+            (capacity(10_000, 8, 10, 0, 256), 16, 16),
+        ] {
+            let real = measured(&settings, shared_buffers_mib, autovacuum_slots);
+            let model = settings.shared_memory_bytes(shared_buffers_mib);
+            assert!(
+                model >= real,
+                "{settings:?} with {shared_buffers_mib} MiB of buffers: the model gives {model}, the server {real}"
+            );
+            // Not loose: twice as much would refuse restores that fit.
+            assert!(
+                model <= real * 2,
+                "{settings:?}: the model gives {model}, the server {real}"
+            );
+        }
     }
 }

@@ -113,6 +113,9 @@ struct State {
     /// The slot numbers whose user exists. A node that has run for a while has them all; the
     /// process of the health check starts with none, and its refill makes the one it needs.
     slot_users: BTreeSet<u32>,
+    /// The slot numbers whose unit refuses to start, as one does with a process left in its
+    /// cgroup (`StrayProcesses`).
+    stray_slots: BTreeSet<u32>,
     quotas: HashMap<String, Option<NonZeroU32>>,
     /// Every `set_cpu_quota` the agent made, in order: (database, quota). A stop lifts a quota
     /// without a call, as systemd's does.
@@ -129,6 +132,9 @@ struct State {
     start_fails: bool,
     /// The handoff of the next bind fails once.
     handoff_fails: bool,
+    /// The order fails once after PostgreSQL is up, as the real one can (EU1, 2026-10-20): the
+    /// slot runs on.
+    start_fails_after_up: bool,
     /// `reboot` fails once, and the node keeps running.
     reboot_fails: bool,
     /// `purge_packages` fails once, as dpkg does for a package that others depend on.
@@ -206,13 +212,31 @@ fn tool_failed(program: &str, file: &str) -> io::Error {
     ))
 }
 
+/// The parent of process `pid` as `/proc/<pid>/stat` names it, `None` for a process that is gone.
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The name may hold spaces and parentheses: the fields follow its last one.
+    let after = stat.get(stat.rfind(')')? + 1..)?;
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// What a read of a unit fails with when the bus refuses the call, as dbus-daemon does past its
-/// limit of calls that are not answered yet.
+/// limit of calls that are not answered yet: an error reply named `LimitsExceeded`, which is what
+/// `Units::state` gets from `GetUnit` (a method call's refusal is a `MethodError`).
 fn bus_refused() -> units::Error {
-    units::Error::Bus(zbus::Error::Failure(
-        "org.freedesktop.DBus.Error.LimitsExceeded: the maximum number of pending replies per \
-         connection has been reached"
-            .into(),
+    let name = "org.freedesktop.DBus.Error.LimitsExceeded";
+    let call = zbus::message::Message::method_call("/org/freedesktop/systemd1", "GetUnit")
+        .unwrap()
+        .build(&())
+        .unwrap();
+    let reply = zbus::message::Message::error(&call.header(), name.to_string())
+        .unwrap()
+        .build(&())
+        .unwrap();
+    units::Error::Bus(zbus::Error::MethodError(
+        name.try_into().unwrap(),
+        Some("the maximum number of pending replies per connection has been reached".into()),
+        reply,
     ))
 }
 
@@ -476,6 +500,10 @@ impl Local {
         self.state().slot_users = (0..count).collect();
         self.pool.adopt().await.unwrap();
     }
+    /// The unit of slot `number` refuses to start until the process in its cgroup ends.
+    pub fn stray_slot(&self, number: u32) {
+        self.state().stray_slots.insert(number);
+    }
     /// Whether `database` has a postmaster running, in a slot or as a unit of its own.
     pub fn running(&self, database: &str) -> bool {
         let mut state = self.state();
@@ -597,6 +625,10 @@ impl Local {
     /// The next bind cannot move the database's mounts into its slot.
     pub fn fail_next_handoff(&self) {
         self.state().handoff_fails = true;
+    }
+    /// The next start fails after the unit is up and keeps running.
+    pub fn fail_next_start_after_up(&self) {
+        self.state().start_fails_after_up = true;
     }
     pub fn fail_next_reboot(&self) {
         self.state().reboot_fails = true;
@@ -1136,7 +1168,11 @@ impl Machine for Local {
     }
     async fn exec(&self, bound: &Bound) -> Result<Started, units::Error> {
         self.state().calls.push(format!("start {}", bound.database));
-        self.pool.exec(bound).await
+        let started = self.pool.exec(bound).await?;
+        if std::mem::take(&mut self.state().start_fails_after_up) {
+            return Err(bus_refused());
+        }
+        Ok(started)
     }
     /// Neither systemd nor a journal runs here: nothing was recorded.
     async fn start_timeline(&self, _: &str, _: &Started) -> Result<Timeline, units::Error> {
@@ -1231,11 +1267,31 @@ impl Machine for Local {
     fn slots(&self) -> Snapshot {
         self.pool.snapshot()
     }
-    /// The processes of the machine all run as one user: the one database a slot holds, if there
-    /// is exactly one, is the caller's. (A node tells slots apart by their uids, cgroups and
-    /// invocations.)
-    fn caller(&self, _uid: u32, _pid: u32) -> Option<String> {
-        match self.pool.databases().as_slice() {
+    /// The processes of the machine all run as one user, so a caller is the database whose
+    /// postmaster is an ancestor of its process (a node tells slots apart by their uids, cgroups
+    /// and invocations). A caller that is none of them (the test's own process) is the one
+    /// database a slot holds, if there is exactly one.
+    fn caller(&self, _uid: u32, pid: u32) -> Option<String> {
+        let databases = self.pool.databases();
+        let postmasters: Vec<(String, u32)> = {
+            let state = self.state();
+            databases
+                .iter()
+                .filter_map(|database| {
+                    let slot = self.pool.slot_of(database)?;
+                    let main = state.slots.get(&slot)?.child.as_ref()?.id();
+                    Some((database.clone(), main))
+                })
+                .collect()
+        };
+        let mut at = pid;
+        while at > 1 {
+            if let Some((database, _)) = postmasters.iter().find(|(_, main)| *main == at) {
+                return Some(database.clone());
+            }
+            at = parent_of(at)?;
+        }
+        match databases.as_slice() {
             [database] => Some(database.clone()),
             _ => None,
         }
@@ -1870,6 +1926,9 @@ impl Host for LocalHost {
 
     /// The unit starts with a process that waits, which stands for the supervisor.
     async fn start(&self, slot: u32) -> Result<Spawned, units::Error> {
+        if self.0.state().stray_slots.contains(&slot) {
+            return Err(units::Error::StrayProcesses);
+        }
         let child = Command::new("sleep")
             .arg("3600")
             .stdin(Stdio::null())

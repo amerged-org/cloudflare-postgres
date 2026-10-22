@@ -44,10 +44,9 @@ describe("pending capacity on real D1", () => {
       .all<{ resource_snapshot: string }>();
     expect(events.results).toHaveLength(2);
     for (const row of events.results)
-      expect(JSON.parse(row.resource_snapshot)).toMatchObject({
+      expect(JSON.parse(row.resource_snapshot)).toEqual({
         memory_mib: 512,
         cpu_millicores: 500,
-        storage_allocated_bytes: 5 * 2 ** 30,
       });
   });
 

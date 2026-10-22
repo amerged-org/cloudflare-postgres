@@ -8,7 +8,7 @@ import {
   parseRouteKeyring,
   signNodeRouteToken,
   signWakeRouteToken,
-} from "@pgcf/contracts/route-token";
+} from "@pgcf/contracts/route-token-core";
 import type { DatabaseWakeAdmission, Env } from "./env.ts";
 import type { GatewayRegion } from "./gateway.ts";
 import { ADMISSION_DEADLINE_MS, connectionRateKey } from "./session-policy.ts";

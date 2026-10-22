@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 use pgcf_native_gateway::{
-    local,
+    activation, local,
     transport::{self, Config, Gateway},
 };
 use pgcf_native_protocol::{agent, constant, route::Keyring, valid_pattern};
-use std::{
-    net::Ipv4Addr,
-    path::PathBuf,
-    sync::{Arc, atomic::Ordering},
-};
-use tokio::{
-    net::TcpListener,
-    sync::{Semaphore, watch},
-    task::JoinSet,
-};
+use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
+use tokio::{net::TcpListener, sync::watch};
 fn positive(
     name: &str,
     fallback: usize,
@@ -69,32 +61,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         socket,
         receiver.clone(),
     ));
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
-    let pending = Arc::new(Semaphore::new(128));
-    let mut sessions = JoinSet::new();
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-    println!("{{\"event\":\"gateway_listening\",\"port\":{port}}}");
-    loop {
-        tokio::select! {
-            _=&mut shutdown=>break,
-            Some(_)=sessions.join_next()=>{},
-            accepted=listener.accept()=>{
-                let(socket,_)=accepted?;let Ok(permit)=pending.clone().try_acquire_owned()else{drop(socket);continue;};
-                let(gateway,receiver)=(gateway.clone(),receiver.clone());
-                sessions.spawn(async move{let _=transport::serve_socket(socket,gateway,receiver,permit).await;});
-            }
-        }
-    }
-    gateway.draining.store(true, Ordering::Release);
-    stop.send(true)?;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        while sessions.join_next().await.is_some() {}
-    })
+    // Under systemd the socket is the unit's, which outlives this process; by hand the gateway
+    // binds its own.
+    let (listener, inherited) = match activation::inherited()? {
+        Some(listener) => (TcpListener::from_std(listener)?, true),
+        None => (TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?, false),
+    };
+    let port = listener.local_addr()?.port();
+    println!("{{\"event\":\"gateway_listening\",\"port\":{port},\"inherited\":{inherited}}}");
+    let served = transport::serve(
+        listener,
+        gateway,
+        stop,
+        shutdown_signal(),
+        transport::DRAIN_BOUND,
+        transport::FIRST_TABLE_BOUND,
+    )
     .await;
-    sessions.abort_all();
     let _ = synchronizer.await;
-    Ok(())
+    Ok(served?)
 }
 async fn shutdown_signal() {
     #[cfg(unix)]

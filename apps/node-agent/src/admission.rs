@@ -745,7 +745,6 @@ impl Admission {
         let _ = self.events.send(Event::Policy(policy));
     }
 
-    /// The awake set, or `None` when the loop is gone.
     /// No start waits for room and none is in flight: the node has the CPU to build a slot that no
     /// wake is waiting for.
     pub async fn quiet(&self) -> bool {
@@ -754,6 +753,7 @@ impl Admission {
             .is_some_and(|snapshot| snapshot.queued == 0 && snapshot.starting == 0)
     }
 
+    /// The awake set, or `None` when the loop is gone.
     pub async fn snapshot(&self) -> Option<Snapshot> {
         let (reply, answer) = oneshot::channel();
         self.events.send(Event::Snapshot(reply)).ok()?;

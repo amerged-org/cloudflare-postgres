@@ -71,6 +71,8 @@ function closure(entry: string) {
   };
 }
 
+// The three zod-free modules are the cores that ids.ts, route-token.ts and database-admission.ts
+// re-export (the Edge loads the cores and no zod); they define constants and functions only.
 test("a cold DatabaseActor evaluates only its admission modules", () => {
   const graph = closure("apps/api/src/database-actor.ts");
   assert.deepEqual(graph.packages, ["cloudflare:workers", "zod"]);
@@ -78,8 +80,11 @@ test("a cold DatabaseActor evaluates only its admission modules", () => {
     "apps/api/src/database-actor.ts",
     "apps/api/src/domain/admission-state.ts",
     "packages/contracts/src/database-admission.ts",
+    "packages/contracts/src/edge-policy.ts",
     "packages/contracts/src/encoding.ts",
+    "packages/contracts/src/ids-core.ts",
     "packages/contracts/src/ids.ts",
+    "packages/contracts/src/route-token-core.ts",
     "packages/contracts/src/route-token.ts",
     "packages/contracts/src/timestamp.ts",
   ]);

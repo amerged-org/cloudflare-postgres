@@ -8,8 +8,10 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 import {
   CLOCK_SKEW_MS,
+  MAX_VOLUMES_PER_NODE,
   PLACEMENT_LIMIT_PPM,
   choosePlacement,
+  growthFits,
   placementNodes,
   type PlacementNeed,
   type PlacementNode,
@@ -54,6 +56,7 @@ function node(overrides: Partial<PlacementNode> = {}): PlacementNode {
     pool_metadata_total_bytes: OPEN_POOL.metadataTotal,
     pool_metadata_used_bytes: OPEN_POOL.metadataUsed,
     pool_nominal_bytes: OPEN_POOL.nominal,
+    volumes_total: 0,
     ram_peak_ppm: 0,
     cpu_peak_ppm: 0,
     ram_now_ppm: 0,
@@ -253,6 +256,101 @@ describe("which node takes a new database", () => {
 
   it("answers nothing when no node qualifies", () => {
     expect(pick([])).toBeNull();
+  });
+});
+
+/**
+ * What closes a node's pool for new databases (plan 4.3, 4.8): 80 % of its data, 50 % of its
+ * metadata, the sold storage at four times its data (the cap) and 1,000 volumes. While the pool
+ * has room, only the cap stops a resize that grows storage, whatever else has closed the node: a
+ * resize creates no volume and takes no real space (handover 2.5). A pool with no room (the agent
+ * reports `room: false` below the free-data reserve or at 75 % of the metadata) stops it too.
+ */
+interface Closers {
+  cap?: true;
+  data?: true;
+  metadata?: true;
+  volumes?: true;
+}
+const closedBy = (closers: Closers) =>
+  node({
+    pool_data_total_bytes: 100 * GIB,
+    pool_data_used_bytes: closers.data ? 80 * GIB : OPEN_POOL.dataUsed,
+    pool_metadata_total_bytes: GIB,
+    pool_metadata_used_bytes: closers.metadata
+      ? GIB / 2
+      : OPEN_POOL.metadataUsed,
+    pool_nominal_bytes: (closers.cap ? 400 : 50) * GIB,
+    volumes_total: closers.volumes ? MAX_VOLUMES_PER_NODE : 10,
+  });
+const GROW = { memory_mib: 0, cpu_millicores: 0, storage_gib: 1 };
+
+describe("which node takes the storage growth of a database it holds (plan 3.5)", () => {
+  const cases: [string, Closers][] = [
+    ["nothing closes it", {}],
+    ["its pool data is at 80 %", { data: true }],
+    ["its pool metadata is at 50 %", { metadata: true }],
+    ["its pool data and metadata are full", { data: true, metadata: true }],
+    ["it holds 1,000 volumes", { volumes: true }],
+    [
+      "its data and metadata are full and it holds 1,000 volumes",
+      { data: true, metadata: true, volumes: true },
+    ],
+    ["the sold storage is at the cap", { cap: true }],
+    [
+      "the cap is reached and the pool data is at 80 %",
+      { cap: true, data: true },
+    ],
+    [
+      "the cap is reached and the pool metadata is at 50 %",
+      { cap: true, metadata: true },
+    ],
+    [
+      "the cap is reached and data and metadata are full",
+      { cap: true, data: true, metadata: true },
+    ],
+    [
+      "the cap is reached and it holds 1,000 volumes",
+      { cap: true, volumes: true },
+    ],
+    [
+      "the cap is reached and everything else is full",
+      { cap: true, data: true, metadata: true, volumes: true },
+    ],
+  ];
+  it.each(cases)(
+    "refuses it only at the cap, and a new database never: %s",
+    (_, closers) => {
+      expect(growthFits(closedBy(closers), GROW, NOW)).toBe(!closers.cap);
+      expect(pick([closedBy(closers)])).toBe(
+        Object.keys(closers).length === 0 ? closedBy(closers).id : null,
+      );
+    },
+  );
+
+  it("refuses storage growth, and nothing else, on a node whose pool has no room", () => {
+    // At 75 % of its metadata the agent reports room: false (plan 4.3), though the cap is far off.
+    const noRoom = node({
+      room: 0,
+      pool_metadata_total_bytes: GIB,
+      pool_metadata_used_bytes: (GIB * 3) / 4,
+    });
+    expect(growthFits(noRoom, GROW, NOW)).toBe(false);
+    expect(
+      growthFits(noRoom, { ...GROW, storage_gib: 0, memory_mib: 256 }, NOW),
+    ).toBe(true);
+  });
+
+  it("lets a node at 80 % of its data grow storage up to the cap and no further", () => {
+    const full = (nominal: number) =>
+      node({
+        pool_data_total_bytes: 100 * GIB,
+        pool_data_used_bytes: 80 * GIB,
+        pool_nominal_bytes: nominal * GIB,
+      });
+    expect(growthFits(full(399), GROW, NOW)).toBe(true);
+    expect(growthFits(full(399), { ...GROW, storage_gib: 2 }, NOW)).toBe(false);
+    expect(growthFits(full(400), GROW, NOW)).toBe(false);
   });
 });
 

@@ -496,9 +496,6 @@ describe("manual in-place resize on real Workers D1", () => {
     expect(JSON.parse(events[0]!.resource_snapshot)).toEqual({
       memory_mib: 1024,
       cpu_millicores: 750,
-      reserved_memory_mib: 1024,
-      reserved_cpu_millicores: 750,
-      storage_allocated_bytes: 5 * 2 ** 30,
     });
     await send(2);
     expect(

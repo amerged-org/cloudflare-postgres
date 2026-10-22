@@ -68,9 +68,9 @@
             "symbol": "dispatchNodeOrder"
           },
           {
-            "line": 764,
+            "line": 665,
             "path": "apps/api/src/domain/node-state.ts",
-            "sha256": "e11f651e427bdcc706202b84ac2c92acfa4d808c2cbdbcb689bc6b26db2828d9",
+            "sha256": "6f59b5f38206f55a8cd8c8f22fd81d8880f91a38ec65f75b56bb93a9f297e0f6",
             "symbol": "claimNodeDispatch"
           },
           {

@@ -408,15 +408,23 @@ impl Table {
             .map(|(number, _)| *number)
             .collect()
     }
-    /// The number a build takes: the lowest of `range` that is free and has a user, one that
-    /// failed last. A number without a user is never taken, since a user is made by the refill
-    /// and not by a wake.
+    /// The lowest number of `range` that is free, has a user and did not fail last. A number
+    /// without a user is never taken, since a user is made by the refill and not by a wake.
+    fn fresh_number(&self, range: &Range<u32>) -> Option<u32> {
+        range.clone().find(|slot| {
+            self.users.contains(slot)
+                && !self.slots.contains_key(slot)
+                && !self.failed.contains(slot)
+        })
+    }
+    /// The number a build takes: a fresh one, or where every free number with a user failed last,
+    /// the lowest of those, which may work by now.
     fn free_number(&self, range: &Range<u32>) -> Option<u32> {
-        let mut free = range
-            .clone()
-            .filter(|slot| self.users.contains(slot) && !self.slots.contains_key(slot));
-        let first = free.clone().find(|slot| !self.failed.contains(slot));
-        first.or_else(|| free.next())
+        self.fresh_number(range).or_else(|| {
+            range
+                .clone()
+                .find(|slot| self.users.contains(slot) && !self.slots.contains_key(slot))
+        })
     }
     /// Enters a slot that is being built, for the database a start waits for or for none.
     fn reserve(&mut self, range: &Range<u32>, database: Option<&str>) -> Result<u32, Error> {
@@ -783,18 +791,29 @@ impl<H: Host> Pool<H> {
 
     /// Builds one idle slot if fewer than `target` are idle or being built; the number of the
     /// slot it built. The caller decides when: the build costs the node about 80 ms of CPU, and it
-    /// must not take it from a wake. A build needs a number with a user: where none that is free
-    /// has one (a node that never made a slot), the refill makes the lowest one first.
+    /// must not take it from a wake. A build needs a number with a user that did not fail last:
+    /// where none that is free has one (a node that never made a slot, or one whose free numbers
+    /// all failed on a process left in their cgroups), the refill makes the next user first. A
+    /// user that cannot be made does not stop it from building on a failed number, which may work
+    /// by now; it says why only where no number is left.
     pub async fn refill(&self, target: usize) -> Result<Option<u32>, Error> {
         self.sweep().await;
         let counted = self.snapshot();
         if counted.idle + counted.spawning >= target {
             return Ok(None);
         }
-        if self.table().free_number(&self.range).is_none() {
-            self.make_user().await?;
-        }
-        let slot = self.table().reserve(&self.range, None)?;
+        let fresh = self.table().fresh_number(&self.range).is_some();
+        let made = if fresh {
+            Ok(None)
+        } else {
+            self.make_user().await
+        };
+        let reserved = self.table().reserve(&self.range, None);
+        let slot = match (reserved, made) {
+            (Ok(slot), _) => slot,
+            (Err(Error::NoSlot), Err(error)) => return Err(error),
+            (Err(error), _) => return Err(error),
+        };
         let spawned = self.build(slot, None).await?;
         self.set_state(slot, State::Idle);
         let mut event = json!({
@@ -2119,6 +2138,68 @@ mod tests {
         sim.fail_next("start");
         assert!(pool.refill(1).await.is_err());
         assert_eq!(pool.refill(1).await.unwrap(), Some(1), "not slot 0 again");
+    }
+
+    /// A node that has only the users of the slots it built, and whose number failed on a stray
+    /// process: every free number with a user has failed, so the refill makes the next user and
+    /// builds there. Without that the refill takes the failed number again and again, makes no
+    /// user, and every wake after it fails the same way for as long as the process lives.
+    #[tokio::test]
+    async fn a_refill_makes_a_user_when_every_free_number_with_one_has_failed() {
+        let (sim, data) = (Sim::fresh(), data_directory("failed-only"));
+        let pool = pool(&sim);
+        assert_eq!(pool.refill(1).await.unwrap(), Some(0));
+        assert_eq!(sim.state().users, BTreeSet::from([0]));
+        // The slot ends, and a process of its cgroup outlives it: its unit refuses every start.
+        assert_eq!(pool.drain_idle().await, 1);
+        sim.state().stuck.insert(0);
+        assert!(matches!(pool.refill(1).await, Err(Error::StrayProcesses)));
+        assert_eq!(sim.state().users, BTreeSet::from([0]));
+        // Number 0 is the only free one with a user, and it failed: the next refill makes the
+        // user of number 1 and builds there, not on 0 once more.
+        sim.clear();
+        assert_eq!(pool.refill(1).await.unwrap(), Some(1), "{:?}", sim.calls());
+        assert_eq!(sim.state().users, BTreeSet::from([0, 1]));
+        assert!(
+            !sim.calls().iter().any(|call| call == "start 0"),
+            "{:?}",
+            sim.calls()
+        );
+        // The wake after it takes that idle slot.
+        let bound = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
+        assert_eq!((bound.slot, bound.from), (1, SlotFrom::Pool));
+    }
+
+    /// A user that cannot be made does not leave the refill with nothing: it builds on the failed
+    /// number, the last that has a user, and its next pass goes past the number whose user failed.
+    #[tokio::test]
+    async fn a_refill_that_cannot_make_the_next_user_still_tries_the_failed_number() {
+        let sim = Sim::fresh();
+        let pool = pool(&sim);
+        assert_eq!(pool.refill(1).await.unwrap(), Some(0));
+        assert_eq!(pool.drain_idle().await, 1);
+        sim.state().stuck.insert(0);
+        sim.state().no_user.insert(1);
+        assert!(matches!(pool.refill(1).await, Err(Error::StrayProcesses)));
+        // User 1 cannot be made; 0 is tried again and fails the same way.
+        assert!(matches!(pool.refill(1).await, Err(Error::StrayProcesses)));
+        assert!(!sim.state().users.contains(&1));
+        // The next pass goes past number 1, whose user failed, and builds on the one it makes.
+        assert_eq!(pool.refill(1).await.unwrap(), Some(2));
+        assert_eq!(sim.state().users, BTreeSet::from([0, 2]));
+    }
+
+    /// Where no number has a user and none can be made, the refill says why and not that no slot
+    /// is free.
+    #[tokio::test]
+    async fn a_refill_where_no_user_can_be_made_names_the_user() {
+        let sim = Sim::fresh();
+        sim.state().no_user.insert(0);
+        let pool = pool(&sim);
+        assert!(matches!(
+            pool.refill(1).await,
+            Err(Error::Unexpected("useradd"))
+        ));
     }
 
     // 7. The refill.

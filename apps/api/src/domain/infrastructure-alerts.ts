@@ -30,7 +30,6 @@ import {
 } from "./cron-health.ts";
 import { purgeNodeDiagnostics } from "./node-diagnostics.ts";
 import type { Env } from "../env.ts";
-import { regionalRamWindowSql } from "./memory-capacity.ts";
 import { regionalNodeCountSql } from "./node-capacity-count.ts";
 
 interface AlertRow {
@@ -47,14 +46,8 @@ interface AlertCondition {
   snapshot: { sql: string; bindings: (string | number | null)[] };
   /** Lets arming replace a still active episode, evaluated against the stored row. */
   takeover?: { sql: string; bindings: (string | number | null)[] };
-  /** Payload fields that replace the regional RAM and cap values. */
-  detail?: Pick<
-    InfraAlert,
-    | "regional_ram_utilization_ppm"
-    | "node_ids"
-    | "threshold_ppm"
-    | "utilization_ppm"
-  >;
+  /** Payload fields of a per-node warning. */
+  detail?: Pick<InfraAlert, "node_ids" | "threshold_ppm" | "utilization_ppm">;
 }
 const retryMs = 60_000;
 
@@ -188,7 +181,6 @@ async function nodeWarning(
         bindings: [...fresh, threshold],
       },
       detail: {
-        regional_ram_utilization_ppm: null,
         node_ids: exceeding.results.map((node) => node.id),
         threshold_ppm: threshold,
         utilization_ppm: exceeding.results[0]!.utilization_ppm,
@@ -288,63 +280,22 @@ export async function runInfrastructureAlerts(
   deadline?: number,
 ): Promise<{ delivered: number; pending: number }> {
   const policy = await env.DB.prepare(
-    "SELECT max_nodes,ram_warning_threshold_ppm,cap_warning_enabled,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm FROM node_region_policies WHERE region_id=?",
+    "SELECT max_nodes,cap_warning_enabled,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm FROM node_region_policies WHERE region_id=?",
   )
     .bind(regionId)
     .first<{
       max_nodes: number | null;
-      ram_warning_threshold_ppm: number | null;
       cap_warning_enabled: number;
       node_ram_warning_threshold_ppm: number | null;
       node_cpu_warning_threshold_ppm: number | null;
       node_storage_warning_threshold_ppm: number | null;
     }>();
   if (!policy) return { delivered: 0, pending: 0 };
-  const window = await env.DB.prepare(regionalRamWindowSql("?"))
-    .bind(regionId)
-    .first<{
-      minute: number;
-      working_set_bytes: number;
-      capacity_memory_bytes: number;
-    }>();
   const allocated = await allocatedRegionalNodes(env.DB, regionId);
-  const utilization =
-    window === null
-      ? null
-      : Number(
-          (BigInt(window.working_set_bytes) * 1_000_000n) /
-            BigInt(window.capacity_memory_bytes),
-        );
   const timestamp = new Date(now).toISOString();
   const capConfigured =
     policy.cap_warning_enabled === 1 && policy.max_nodes !== null;
-  const ramSnapshot: AlertCondition["snapshot"] = {
-    sql: "EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=? AND p.ram_warning_threshold_ppm IS ?)",
-    bindings: [regionId, policy.ram_warning_threshold_ppm],
-  };
-  if (policy.ram_warning_threshold_ppm !== null && window !== null) {
-    ramSnapshot.sql += ` AND EXISTS(SELECT 1 FROM (${regionalRamWindowSql("?")}) measured
-      WHERE measured.minute=? AND measured.working_set_bytes=? AND measured.capacity_memory_bytes=?)`;
-    ramSnapshot.bindings.push(
-      regionId,
-      window.minute,
-      window.working_set_bytes,
-      window.capacity_memory_bytes,
-    );
-  }
   const conditions: AlertCondition[] = [
-    {
-      kind: "regional_ram_warning",
-      active:
-        policy.ram_warning_threshold_ppm === null
-          ? false
-          : window === null
-            ? null
-            : BigInt(window.working_set_bytes) * 1_000_000n >=
-              BigInt(window.capacity_memory_bytes) *
-                BigInt(policy.ram_warning_threshold_ppm),
-      snapshot: ramSnapshot,
-    },
     {
       kind: "regional_node_cap_reached",
       active:
@@ -386,7 +337,7 @@ export async function runInfrastructureAlerts(
       kind,
       region_id: regionId,
       occurred_at: timestamp,
-      regional_ram_utilization_ppm: utilization,
+      regional_ram_utilization_ppm: null,
       allocated_nodes: allocated,
       max_nodes: policy.max_nodes,
       action: INFRA_ALERT_ACTIONS[kind],

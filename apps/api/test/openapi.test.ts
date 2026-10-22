@@ -633,6 +633,30 @@ describe("actual generated API references in the Workers runtime", () => {
     });
   });
 
+  it("documents none of the removed capacity fields, alert kind or usage metrics", async () => {
+    const text = JSON.stringify(await document("/v1/openapi.json"));
+    for (const gone of [
+      "ram_expansion_threshold_ppm",
+      "ram_warning_threshold_ppm",
+      "placement_mode",
+      "postgres_memory_request_mib",
+      "cpu_request_millicores",
+      "memory_window_observed_at",
+      "memory_window_valid",
+      "memory_utilization_ppm",
+      "memory_expansion_triggered_at",
+      "regional_ram_warning",
+      "reserved_memory_mib_seconds",
+      "reserved_cpu_millicore_seconds",
+      "reserved_storage_byte_seconds",
+    ])
+      expect(text, gone).not.toMatch(
+        new RegExp(`(?<![a-z_])${gone}(?![a-z_])`),
+      );
+    // The alert event keeps the field a receiver may read; it is always null.
+    expect(text).toMatch(/regional_ram_utilization_ppm/);
+  });
+
   it("documents the rules the validators apply beyond the field types", async () => {
     const doc = await document("/v1/openapi.json");
     const schemas = doc.components!.schemas as Record<
@@ -643,10 +667,8 @@ describe("actual generated API references in the Workers runtime", () => {
       /integrator.*project_id/s,
     );
     expect(schemas.RoleName!.description).toMatch(/pgcf_maintenance/);
-    expect(schemas.SizeClass!.description).toMatch(/cpu_request_millicores/);
-    expect(schemas.SizeClassUpsert!.description).toMatch(
-      /cpu_request_millicores/,
-    );
+    expect(schemas.SizeClass!.description).toMatch(/multiple of 256/);
+    expect(schemas.SizeClassUpsert!.description).toMatch(/multiple of 256/);
     const usage = operation(doc, "/v1/usage", "get");
     expect(usage.description).toMatch(/exactly one/);
     expect(usage.description).toMatch(/31 days/);
