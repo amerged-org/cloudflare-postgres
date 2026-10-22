@@ -3060,8 +3060,13 @@ mod tests {
                 "restart pgcf-gateway.service"
             ]
         );
+        // The agent takes the restart out of its record after systemd has done it, so the record
+        // is finished a moment after the unit runs the new definition, not at the same time.
         let boot = machine.boot().unwrap().id;
-        assert!(!crate::hostfiles::State::load(&machine.layout().host_files()).unfinished(&boot));
+        eventually(30, "the record to be finished", || {
+            !crate::hostfiles::State::load(&machine.layout().host_files()).unfinished(&boot)
+        })
+        .await;
         service.stop();
     }
 
@@ -3282,8 +3287,12 @@ mod tests {
             machine.running_definition("ssh.service").is_some()
         })
         .await;
+        // The record is finished a moment after the unit runs, as in the test above.
         let boot = machine.boot().unwrap().id;
-        assert!(!crate::hostfiles::State::load(&machine.layout().host_files()).unfinished(&boot));
+        eventually(30, "the record to be finished", || {
+            !crate::hostfiles::State::load(&machine.layout().host_files()).unfinished(&boot)
+        })
+        .await;
         second.stop();
     }
 
