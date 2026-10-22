@@ -409,10 +409,6 @@ pub trait Machine: Send + Sync + 'static {
     fn cpu(&self) -> Option<CpuTimes>;
     /// The throttling of the database's unit since it started; `None` where it has no cgroup.
     fn throttle(&self, database: &str) -> Option<Throttle>;
-    /// How much of the database's files the page cache holds (`cache`); `None` where the kernel
-    /// cannot say. It reads the directory and the files, so it blocks: callers run it in a task
-    /// of its own.
-    fn cache_residency(&self, database: &str) -> Option<crate::cache::Residency>;
 }
 
 /// This boot of the node and the kernel it runs (SEC-03).
