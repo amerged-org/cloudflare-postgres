@@ -63,6 +63,15 @@ impl StartFailure {
     }
 }
 
+/// A start that failed, with one event that names the class of the error. No caller kept the
+/// error, and a start that failed after its unit was up left nothing to say why (EU1, 2026-10-20).
+fn failed(db: &Db, start: StartAs<'_>, class: &str) -> StartFailure {
+    crate::timing::emit_event(json!({
+        "event": "unit_start_failed", "database_id": db.id, "kind": start.kind, "class": class,
+    }));
+    StartFailure::Failed
+}
+
 /// How a wake ticket does not match the entry of the page the node holds: the reason behind a
 /// `desired_stale` refusal, named in the wake event's `stale` (`WAKE_STALE` of the contract).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,14 +305,12 @@ impl<M: Machine> Core<M> {
             // The database is awake, starting or already waiting: it is admitted.
             Err(AdmitError::Duplicate) => {
                 let mark = (Instant::now(), self.machine.cpu());
-                let started = self
-                    .machine
-                    .start(&db.id)
-                    .await
-                    .map_err(|_| StartFailure::Failed)?;
+                let started = self.machine.start(&db.id).await.map_err(|error| {
+                    failed(db, start, &crate::diagnostics::error_code(&error.into()))
+                })?;
                 return Ok((started, Duration::ZERO, mark));
             }
-            Err(AdmitError::Stopped) => return Err(StartFailure::Failed),
+            Err(AdmitError::Stopped) => return Err(failed(db, start, "admission_stopped")),
         };
         let waited = permit.waited;
         self.event(event("admitted", waited, None));
@@ -318,14 +325,18 @@ impl<M: Machine> Core<M> {
                 permit.ready();
                 Ok((started, waited, mark))
             }
-            Ok(Err(_)) => {
+            Ok(Err(error)) => {
                 // A unit that is awake still holds its memory: the permit stays counted until its
                 // unit is reported stopped. One that is not awake never started.
                 let awake = self.unit_awake(&db.id, true).await;
                 if !awake {
                     permit.failed();
                 }
-                Err(StartFailure::Failed)
+                Err(failed(
+                    db,
+                    start,
+                    &crate::diagnostics::error_code(&error.into()),
+                ))
             }
             Err(_) => {
                 // The start goes on: the agent waits for it, and a database that comes up late is
@@ -392,17 +403,12 @@ impl<M: Machine> Core<M> {
         self.after_wake(db).await;
     }
 
-    /// A start that outlasted its wake and gave no database that accepts connections: a unit that
-    /// is down leaves the database as the wake found it, one that runs anyway is stopped.
+    /// A start that outlasted its wake and gave no database that accepts connections: see
+    /// `after_failed_start`.
     async fn late_failure(self: &Arc<Self>, db: &Arc<Db>) {
         let _flow = db.lock.lock().await;
-        if db.phase() != Phase::Starting {
-            return;
-        }
-        if self.unit_awake(&db.id, true).await {
-            self.stop_unproven(db).await;
-        } else {
-            self.set(db, |view| view.phase = Phase::Asleep);
+        if db.phase() == Phase::Starting {
+            self.after_failed_start(db).await;
         }
     }
 
@@ -707,12 +713,15 @@ impl<M: Machine> Core<M> {
         let (started, waited, steal) = match started {
             Ok(started) => started,
             Err(failure) => {
-                if !matches!(failure, StartFailure::Timeout) {
-                    self.after_failed_start(&db).await;
-                }
-                if let StartFailure::Refused(refused) = &failure {
-                    steps.insert("queue_wait".into(), millis(refused.waited));
-                    self.set(&db, |view| view.phase = Phase::Asleep);
+                match &failure {
+                    // The unit was never asked to start.
+                    StartFailure::Refused(refused) => {
+                        steps.insert("queue_wait".into(), millis(refused.waited));
+                        self.set(&db, |view| view.phase = Phase::Asleep);
+                    }
+                    StartFailure::Failed => self.after_failed_start(&db).await,
+                    // The start goes on, and its task ends the phase (`late_start`, `late_failure`).
+                    StartFailure::Timeout => {}
                 }
                 return Err(failure.wake_reason());
             }
@@ -828,14 +837,17 @@ impl<M: Machine> Core<M> {
         });
     }
 
-    /// A start that failed: the database is not awake. What it was before is what it is now.
-    async fn after_failed_start(&self, db: &Db) {
-        if self.unit_awake(&db.id, false).await {
-            return;
+    /// A start that failed. A unit that is awake, or that cannot be read, may run a PostgreSQL
+    /// that nobody released (the start failed after the unit was up): it is stopped without a
+    /// proof, so that recovery proves the sleep. One that is stopped leaves the database as it was
+    /// before the start; a start that fails for a unit that crashed in recovery leaves the data
+    /// directory as it was, and the next wake finds it unproven by `pg_control`.
+    async fn after_failed_start(self: &Arc<Self>, db: &Arc<Db>) {
+        if self.unit_awake(&db.id, true).await {
+            self.stop_unproven(db).await;
+        } else {
+            self.set(db, |view| view.phase = Phase::Asleep);
         }
-        // A start that fails for a unit that crashed in recovery leaves the data directory as it
-        // was: the next wake finds it unproven by `pg_control`.
-        self.set(db, |view| view.phase = Phase::Asleep);
     }
 
     // ---- sleep
@@ -2369,6 +2381,96 @@ mod tests {
         let result = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
         assert_eq!(db.phase(), Phase::Ready);
+    }
+
+    /// A wake whose start returns an error after its unit is up, so the node never sees PostgreSQL
+    /// released (EU1, 2026-10-20: a resume answered `release_failed` while its PostgreSQL ran for
+    /// 83 s). The node may neither take the database for asleep nor leave it starting for ever:
+    /// the unit is stopped without a proof, and recovery proves the sleep before the next wake.
+    /// `units_readable` says whether the node can read the unit's state after the failure.
+    async fn a_start_fails_after_its_unit_is_up(label: &str, units_readable: bool) {
+        let Some(rig) = Rig::new(label).await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let data = tenant(&rig, &entry.id).await;
+        data.batch("CREATE TABLE t AS SELECT generate_series(1, 3000) AS a")
+            .await
+            .unwrap();
+        drop(data);
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        rig.core.take_events();
+
+        rig.machine.fail_next_start_after_up();
+        rig.machine.set_units_unreadable(!units_readable);
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (WakeOutcome::Refused, Some("release_failed")),
+            "{result:?}"
+        );
+        // Starting for ever is the phase of a unit that is awake and read; asleep with PostgreSQL
+        // running, that of a unit that could not be read.
+        assert_ne!(db.phase(), Phase::Starting);
+        eventually(10, "the unit to be stopped and its sleep proven", || {
+            db.phase() == Phase::Asleep && !rig.machine.running(&entry.id)
+        })
+        .await;
+        assert!(
+            rig.core
+                .take_events()
+                .iter()
+                .any(|e| e["type"] == "admission" && e["start"] == "recovery"),
+            "recovery proved the sleep"
+        );
+        // The memory of the unit that ran was given back.
+        let waited = std::time::Instant::now();
+        while !rig
+            .core
+            .admission
+            .snapshot()
+            .await
+            .unwrap()
+            .awake
+            .is_empty()
+        {
+            assert!(
+                waited.elapsed() < Duration::from_secs(5),
+                "timed out: the memory to be given back"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The failure left a line with the class of the error, which no caller keeps.
+        let failures: Vec<Value> = crate::events::seen()
+            .into_iter()
+            .filter(|e| e["event"] == "unit_start_failed" && e["database_id"] == entry.id.as_str())
+            .collect();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            (
+                failures[0]["fields"]["kind"].as_str(),
+                failures[0]["fields"]["class"].as_str()
+            ),
+            (Some("wake"), Some("units_bus"))
+        );
+
+        // Nothing acknowledged was lost: the next wake finds the proven database and its rows.
+        let woke = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(woke.outcome, WakeOutcome::Started, "{woke:?}");
+        let data = tenant(&rig, &entry.id).await;
+        let rows = data.query("SELECT count(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 3000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_that_fails_after_its_unit_is_up_and_is_read_awake_is_proven_asleep() {
+        a_start_fails_after_its_unit_is_up("start-fails-awake", true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_that_fails_after_its_unit_is_up_and_cannot_be_read_is_proven_asleep() {
+        a_start_fails_after_its_unit_is_up("start-fails-unread", false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
