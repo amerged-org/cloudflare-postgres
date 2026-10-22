@@ -15182,13 +15182,7 @@
               "nr_throttled": 2,
               "throttled_usec": 7500,
               "steal_ms": 30,
-              "steal_window_ms": 2000,
-              "cache_files": 41,
-              "cache_pages": 16384,
-              "cache_resident": 10240,
-              "cache_dirty": 7,
-              "cache_evicted": 5900,
-              "cache_recently_evicted": 310
+              "steal_window_ms": 2000
             }
           }
         ]

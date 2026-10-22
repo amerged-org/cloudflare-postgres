@@ -57,7 +57,8 @@ that systemd starts the new one.
 | Backups                    | `archive/`: the archive socket, the barman-cloud jobs, restore and PITR recovery, the upload log                                                       |
 | Fencing                    | `fence.rs`                                                                                                                                             |
 | Gateway channel            | `gateway.rs`: the writer table, the wakes, quiesce, close, status and activity                                                                         |
-| Metrics and diagnostics    | `usage.rs`, `sample.rs`, `events.rs`, `cache.rs`, `diagnostics/`                                                                                       |
+| Metrics and diagnostics    | `usage.rs`, `sample.rs`, `events.rs`, `diagnostics/`                                                                                       |
+| Cold page cache            | `prefetch.rs`: readahead of the catalog set and the autoprewarm list with its own accounting; `cache.rs`: how files of the data directory are opened and counted |
 | Updates                    | `update.rs`, `release.rs`                                                                                                                              |
 | The loops                  | `service.rs`: what feeds the core and what it feeds                                                                                                    |
 
@@ -119,6 +120,24 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   background after the next start, where it competes with the first queries for the disk. Two of
   the worker slots are its leader and its worker; the sleep guard does not count its worker as a
   session.
+- **Readahead** (`prefetch.rs`, built, not called by any flow yet). Before a request the agent can
+  ask the kernel to read a sleeping database's hot files ahead with `posix_fadvise(WILLNEED)`:
+  the catalog set (`pg_control`, 256 KiB of WAL at the latest checkpoint, `global/`, and in each
+  user database its `PG_VERSION`, `pg_filenode.map` and the login's catalogs with their indexes
+  and forks; about 5 MB) and the autoprewarm list (blocks merged where contiguous, the relations
+  with the fewest listed blocks first, system databases left out). The mapped catalogs
+  (`pg_class`, `pg_attribute`, `pg_proc`, `pg_type` and their indexes) are found through the map
+  where `VACUUM FULL` moved them; the others are read at their OID, so a rewrite of one drops it
+  from the set, and the report's `missing` counts it. A plan is built first (blocking:
+  directories, `pg_control`, the maps and the list are read, each file is opened once for its
+  length), then issued in pieces of at most 128 KiB, because the kernel reads only the first
+  `read_ahead_kb` of a range per call. The data directory is the database user's, so a plan reads
+  only the real directories of `base/` (at most 32 databases) whatever the list names, stops after
+  512 files of a list that are not there, and stops at a budget and a cancel as the issuing does.
+  Issuing stops at a time budget, a byte bound or a cancel and returns the counts, the bytes the
+  cache already held and the timings; they take the place of the residency diagnostic that
+  `cache.rs` made while a wake ran (deleted) once a flow calls it. `pg_internal.init` is left out:
+  PostgreSQL removes it at every start.
 - **Login.** The node's root reaches the cluster's superuser `postgres` by peer authentication
   through `pg_ident.conf`; the backup role `pgcf_backup` is reached by the database's own Linux user
   the same way; every other role logs in over the socket with SCRAM-SHA-256. Replication connections
@@ -156,8 +175,8 @@ plan 9.3, "Changing the page"; it is written there once.
   the writer table, applies the database's CPU quota `cpu_boost_ms` after the release (at once when
   that is 0; a build and a restart of the agent apply it at once, and a base backup that begins
   inside the burst applies it first) and reports the phases of the wake as events; about 2 s later
-  a `wake_detail` event adds the split of the start and the share of the database's files that the
-  page cache held before the start (`cache.rs`). A wake it already serves is answered
+  a `wake_detail` event adds the split of the start, the CPU quota's throttling and the steal time.
+  A wake it already serves is answered
   `wake_in_progress`, which is no result.
 - **Sleep.** After the database's idle time the agent runs the sleep proof (plan 7.9): the gateway
   quiesces and closes idle sessions, the guard refuses while a session is busy or a transaction is

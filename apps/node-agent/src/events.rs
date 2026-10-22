@@ -466,12 +466,6 @@ mod tests {
             "throttled_usec",
             "steal_ms",
             "steal_window_ms",
-            "cache_files",
-            "cache_pages",
-            "cache_resident",
-            "cache_dirty",
-            "cache_evicted",
-            "cache_recently_evicted",
         ];
         for (n, name) in numbers.iter().enumerate() {
             line[*name] = (n as u64 + 1).into();

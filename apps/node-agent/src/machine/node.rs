@@ -706,10 +706,6 @@ impl Machine for Node {
         let text = std::fs::read_to_string(units::cpu_stat_path(database)?).ok()?;
         crate::sample::throttle(&text)
     }
-
-    fn cache_residency(&self, database: &str) -> Option<crate::cache::Residency> {
-        crate::cache::host(&self.layout.data(database))
-    }
 }
 
 #[cfg(test)]

@@ -283,15 +283,15 @@ describe("a phase of a wake event starts optional", () => {
 describe("the fields of an event reach the API within a bound it reads first", () => {
   // `events::sanitize` of the agent keeps the first NODE_REPORT_EVENT_FIELDS_MAX fields by key
   // order and drops the rest without a word, so the bound has to hold what the agent emits: a
-  // wake that came up on the slot path emits 19. A bound that is raised is an API first change
+  // wake that came up on the slot path emits 13. A bound that is raised is an API first change
   // (plan 9.3): an API with the old bound refuses the whole report that carries such an event.
-  it("holds the 19 fields of the wake_detail of a wake on the slot path", () => {
+  it("holds the 13 fields of the wake_detail of a wake on the slot path", () => {
     const v = vector(
       "NodeObservationReport",
       "event-with-the-fields-of-a-wake-on-the-slot-path",
     );
     const { fields } = (v.value as { events: { fields: object }[] }).events[0]!;
-    expect(Object.keys(fields)).toHaveLength(19);
+    expect(Object.keys(fields)).toHaveLength(13);
     expect(Object.keys(fields)).toEqual(
       expect.arrayContaining(["steal_ms", "steal_window_ms", "throttled_usec"]),
     );

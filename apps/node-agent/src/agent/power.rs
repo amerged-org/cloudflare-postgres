@@ -6,7 +6,6 @@ use crate::{
     Error,
     admission::{AdmitError, EarlySleep, Request},
     archive::server::{Registration, Table},
-    cache::Residency,
     layout::Layout,
     machine::{CpuTimes, Machine, Throttle},
     proof::{self, Outcome, Proof, Steps, WakeRefusal},
@@ -27,11 +26,6 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
-
-/// How long the `wake_detail` waits for the reading of the page cache, which began with the wake,
-/// seconds before: one that is not done by then is stuck on a slow disk, and the event goes
-/// without its numbers.
-const CACHE_WAIT: Duration = Duration::from_millis(50);
 
 /// What a start is for, in the admission event and the wake's phases.
 #[derive(Clone, Copy, Debug)]
@@ -182,14 +176,12 @@ fn steal_since(from: CpuMark, now: Option<CpuTimes>) -> Option<(u64, u64)> {
 
 /// The log line of a started wake's detail (plan 11.1): numbers only, and none for what could not
 /// be read. `throttle` is the throttling since the release, `steal` the stolen CPU time and the
-/// window it was counted over, `cache` what the page cache held of the database's files before
-/// its unit started.
+/// window it was counted over.
 fn detail_line(
     database: &str,
     timeline: &Timeline,
     throttle: Option<Throttle>,
     steal: Option<(u64, u64)>,
-    cache: Option<Residency>,
 ) -> serde_json::Value {
     let mut line = json!({"event": "wake_detail", "database_id": database});
     let startup = timeline.startup.as_ref();
@@ -212,15 +204,6 @@ fn detail_line(
         ("throttled_usec", throttle.map(|t| t.throttled_usec)),
         ("steal_ms", steal.map(|(steal_ms, _)| steal_ms)),
         ("steal_window_ms", steal.map(|(_, window_ms)| window_ms)),
-        ("cache_files", cache.map(|c| c.files)),
-        ("cache_pages", cache.map(|c| c.pages)),
-        ("cache_resident", cache.map(|c| c.cached.resident)),
-        ("cache_dirty", cache.map(|c| c.cached.dirty)),
-        ("cache_evicted", cache.map(|c| c.cached.evicted)),
-        (
-            "cache_recently_evicted",
-            cache.map(|c| c.cached.recently_evicted),
-        ),
     ] {
         if let Some(value) = value {
             line[name] = value.into();
@@ -622,9 +605,6 @@ impl<M: Machine> Core<M> {
             Phase::Unproven => return refuse("unproven"),
             _ => return refuse("wake_in_progress"),
         }
-        // What the page cache holds of the database's files is read before the unit starts, in a
-        // task the wake does not wait for; its numbers join the detail event (`detail_later`).
-        let cache = self.read_cache(&db.id);
         let volume = Self::volume_id(&entry).ok_or(("volume_missing", None))?;
         let began = Instant::now();
         let exists = self.machine.has_volume(&volume).await;
@@ -742,59 +722,35 @@ impl<M: Machine> Core<M> {
             view.refusal = None;
         });
         steps.insert("release".into(), millis(releasing.elapsed()));
-        self.detail_later(&db, started, steal, cache);
+        self.detail_later(&db, started, steal);
         self.after_wake(&db).await;
         Ok(())
-    }
-
-    /// Reads what the page cache holds of the database's files in a task of its own, which holds
-    /// no lock of the wake and which the wake never waits for.
-    fn read_cache(&self, database: &str) -> tokio::task::JoinHandle<Option<Residency>> {
-        let (machine, database) = (self.machine.clone(), database.to_string());
-        tokio::task::spawn_blocking(move || machine.cache_residency(&database))
     }
 
     /// Off the path of a wake, once its writer is released: one `wake_detail` event, read
     /// `Timing::detail` later, when the login and the first statements are over. The throttling
     /// since the release is in the event: that of the quota where it came with the release
-    /// (`cpu_boost_ms` 0) or before the event is read, and none inside a burst. `cache` is
-    /// the reading of the page cache that began before the start; it is joined here, for at most
-    /// `CACHE_WAIT`.
-    fn detail_later(
-        self: &Arc<Self>,
-        db: &Db,
-        started: Started,
-        steal: CpuMark,
-        cache: tokio::task::JoinHandle<Option<Residency>>,
-    ) {
+    /// (`cpu_boost_ms` 0) or before the event is read, and none inside a burst.
+    fn detail_later(self: &Arc<Self>, db: &Db, started: Started, steal: CpuMark) {
         let (core, database) = (self.clone(), db.id.clone());
         tokio::spawn(async move {
             let throttle = core.machine.throttle(&database);
             tokio::time::sleep(core.timing.detail).await;
-            let cache = tokio::time::timeout(CACHE_WAIT, cache)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .flatten();
-            let line = core
-                .wake_detail(&database, &started, steal, throttle, cache)
-                .await;
+            let line = core.wake_detail(&database, &started, steal, throttle).await;
             crate::timing::emit_event(line);
         });
     }
 
     /// What the unit, the journal and the kernel say of a start that was released: the time to
     /// the fork, to the handoff and to the three messages of PostgreSQL's start, the CPU quota's
-    /// throttling since the release, the steal time since the unit was asked to start, and the
-    /// page cache's share of the database's files before the start. `steal`, `throttle` and
-    /// `cache` are the readings from then.
+    /// throttling since the release, and the steal time since the unit was asked to start.
+    /// `steal` and `throttle` are the readings from then.
     async fn wake_detail(
         &self,
         database: &str,
         started: &Started,
         steal: CpuMark,
         throttle: Option<Throttle>,
-        cache: Option<Residency>,
     ) -> serde_json::Value {
         let timeline = self
             .machine
@@ -806,7 +762,6 @@ impl<M: Machine> Core<M> {
             &timeline,
             throttle_since(throttle, self.machine.throttle(database)),
             steal_since(steal, self.machine.cpu()),
-            cache,
         )
     }
 
@@ -1374,7 +1329,6 @@ impl<M: Machine> Steps for Alone<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::Pages;
     use crate::{
         agent::testing::{Rig, eventually},
         node_link::contract_valid,
@@ -1658,18 +1612,7 @@ mod tests {
         assert_eq!(throttled, throttle(2, 7_500));
         let (steal_ms, _window) = stolen.unwrap();
         assert_eq!(steal_ms, 30);
-        // Before the start 10,240 of the 16,384 pages of 41 files were in the page cache.
-        let cached = Some(Residency {
-            files: 41,
-            pages: 16_384,
-            cached: Pages {
-                resident: 10_240,
-                dirty: 7,
-                evicted: 5_900,
-                recently_evicted: 310,
-            },
-        });
-        let line = detail_line("abcdefghijklmnopqrst", &timeline, throttled, stolen, cached);
+        let line = detail_line("abcdefghijklmnopqrst", &timeline, throttled, stolen);
         assert_eq!(
             line,
             json!({
@@ -1679,29 +1622,20 @@ mod tests {
                 "shut_down_to_ready_us": 1_522,
                 "nr_throttled": 2, "throttled_usec": 7_500, "steal_ms": 30,
                 "steal_window_ms": line["steal_window_ms"],
-                "cache_files": 41, "cache_pages": 16_384, "cache_resident": 10_240,
-                "cache_dirty": 7, "cache_evicted": 5_900, "cache_recently_evicted": 310,
             })
         );
-        // What the node sends of it is what Cloudflare accepts: all 15 fields, within the bound.
+        // What the node sends of it is what Cloudflare accepts: all 9 of its fields, within the bound.
         let at = "2026-10-18T10:11:12.345Z";
         let event = crate::events::sanitize(&line, at).unwrap();
-        assert_eq!(event["fields"].as_object().unwrap().len(), 15);
+        assert_eq!(event["fields"].as_object().unwrap().len(), 9);
         assert!(contract_valid(
             "NodeObservationReport",
             &json!({"observed_at": at, "databases": [], "orders": [], "events": [event]})
         ));
 
-        // A journal that could not be read, a unit that is gone, a machine without a clock and a
-        // page cache that was not read leave their numbers out; the counters that went back are
-        // no reading.
-        let bare = detail_line(
-            "abcdefghijklmnopqrst",
-            &Timeline::default(),
-            None,
-            None,
-            None,
-        );
+        // A journal that could not be read, a unit that is gone and a machine without a clock
+        // leave their numbers out; the counters that went back are no reading.
+        let bare = detail_line("abcdefghijklmnopqrst", &Timeline::default(), None, None);
         assert_eq!(
             bare,
             json!({"event": "wake_detail", "database_id": "abcdefghijklmnopqrst"})
@@ -1737,73 +1671,17 @@ mod tests {
         assert_eq!(db.phase(), Phase::Ready);
         assert!(details().is_empty());
 
-        // This machine has no journal and no cgroup: the steal time of the window and the six
-        // numbers of the page cache are all it reads. The cache numbers are those of the files of
-        // the cluster the test made, counted before its start: the database was proven asleep
-        // just before, so its files are in memory, written back and none evicted.
+        // This machine has no journal and no cgroup: the steal time of the window is all it reads.
         eventually(10, "the detail", || !details().is_empty()).await;
         let detail = details().remove(0);
         let fields = detail["fields"].as_object().unwrap();
         assert!(fields["steal_ms"].is_u64() && fields["steal_window_ms"].as_u64() >= Some(1));
-        let (files, pages) = (
-            fields["cache_files"].as_u64(),
-            fields["cache_pages"].as_u64(),
-        );
-        let resident = fields["cache_resident"].as_u64();
-        assert!(
-            files >= Some(3) && pages >= resident && resident >= Some(1),
-            "{detail}"
-        );
-        for field in ["cache_dirty", "cache_evicted", "cache_recently_evicted"] {
-            assert_eq!(fields[field], 0, "{field}");
-        }
-        assert_eq!(fields.len(), 8, "{detail}");
+        assert_eq!(fields.len(), 2, "{detail}");
 
         // The same wake again finds the database released: no start, no detail.
         assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
         tokio::time::sleep(Duration::from_millis(1000)).await;
         assert_eq!(details().len(), 1);
-    }
-
-    /// The reading of the page cache is not on the path of a wake and is not waited for: a disk
-    /// that is slow to list its files delays neither the release nor the event, which then goes
-    /// without the numbers of the cache.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_slow_reading_of_the_page_cache_holds_neither_the_wake_nor_its_detail() {
-        let timing = crate::agent::Timing {
-            detail: Duration::from_millis(600),
-            ..crate::agent::testing::timing()
-        };
-        let Some(rig) = Rig::with_timing("wake-detail-slow-cache", timing).await else {
-            return;
-        };
-        let (entry, db) = rig.create().await;
-        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
-        rig.machine.slow_cache(Duration::from_secs(6));
-
-        let began = Instant::now();
-        let result = rig.core.wake(&Rig::ticket(&entry)).await;
-        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
-        assert!(
-            began.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            began.elapsed()
-        );
-        let details = || -> Vec<Value> {
-            crate::events::seen()
-                .into_iter()
-                .filter(|e| e["event"] == "wake_detail" && e["database_id"] == entry.id.as_str())
-                .collect()
-        };
-        eventually(10, "the detail", || !details().is_empty()).await;
-        let detail = details().remove(0);
-        let fields = detail["fields"].as_object().unwrap();
-        assert!(fields["steal_ms"].is_u64());
-        assert!(
-            fields.keys().all(|name| !name.starts_with("cache_")),
-            "{detail}"
-        );
-        assert_eq!(fields.len(), 2, "{detail}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
