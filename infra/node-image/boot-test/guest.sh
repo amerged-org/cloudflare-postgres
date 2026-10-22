@@ -785,6 +785,8 @@ slot_test_n=1000
 slot_control_n=1001
 # A uid in the slots' range that no slot has: what an unrelated tenant can read.
 slot_reference_uid=390000
+# The uid that holds the key the keyring probe must report (slot_keyring_probe_sees_a_key).
+slot_key_control_uid=390001
 
 slot_account() {
 	groupadd -g $((300000 + $1)) "pgcf-slot-$1" &&
@@ -942,11 +944,21 @@ slot_leftovers() {
 	kept=$(awk -v uid="$uid" 'FILENAME ~ /sem$/ { if ($5 == uid) found = 1; next } FNR > 1 && $8 == uid { found = 1 } END { if (found) print "yes" }' \
 		/proc/sysvipc/shm /proc/sysvipc/msg /proc/sysvipc/sem)
 	[ -z "$kept" ] || echo "the host's IPC namespace holds a SysV object of uid $uid"
-	[ -r /proc/keys ] || echo "/proc/keys cannot be read: the keyring probe proves nothing"
-	wait_for 10 slot_has_no_key "$uid" || echo "the kernel keeps a key of uid $uid"
+	keys_of_uid "$uid" >/dev/null || echo "/proc/keys cannot be read as uid $uid: the keyring probe proves nothing"
+	wait_for 10 slot_has_no_key "$uid" || echo "the kernel keeps a key of uid $uid: $(keys_of_uid "$uid" | awk '{ print $8 ":" $9 }' | tr '\n' ' ')"
 }
+# The lines of /proc/keys that belong to a uid. /proc/keys lists only the keys that its reader may
+# view, and root may view none of another uid's (the user keyring _uid.<uid> and the keys in it
+# stay in the kernel after the last process of the uid has gone), so it is read as the uid itself.
+keys_of_uid() {
+	local uid=$1 listing
+	listing=$(setpriv --reuid="$uid" --regid="$uid" --clear-groups --bounding-set=-all --inh-caps=-all --no-new-privs -- cat /proc/keys) || return 1
+	awk -v uid="$uid" '$6 == uid' <<<"$listing"
+}
+# A read that fails is no answer: it is never "no key".
 slot_has_no_key() {
-	! awk -v uid="$1" '$6 == uid { found = 1 } END { exit !found }' /proc/keys
+	local keys
+	keys=$(keys_of_uid "$1") && [ -z "$keys" ]
 }
 
 # Two incarnations of one slot, as two databases in turn: the first writes what it can, the second
@@ -1002,6 +1014,31 @@ slot_enumeration_sees_an_open_unit() {
 	[ -z "$missing" ] || {
 		echo "not seen in a unit without the additions:$missing"
 		echo "$findings"
+		return 1
+	}
+}
+
+# A key in the user keyring of a uid, added by a process of that uid with no capability. glibc has no
+# add_key; the call is the kernel's, and its number differs by architecture.
+plant_key() {
+	setpriv --reuid="$1" --regid="$1" --clear-groups --bounding-set=-all --inh-caps=-all --no-new-privs -- python3 -c '
+import ctypes, os, sys
+add_key = {"x86_64": 248, "aarch64": 217}[os.uname().machine]
+KEY_SPEC_USER_KEYRING = -4
+key = ctypes.CDLL(None).syscall(ctypes.c_long(add_key), b"user", b"pgcf-boot-test", b"x", ctypes.c_size_t(1), ctypes.c_long(KEY_SPEC_USER_KEYRING))
+sys.exit(0 if key > 0 else 1)'
+}
+
+# The keyring probe is not blind: a key that a process of an unrelated uid adds to its user keyring
+# stays in the kernel after the process has gone, and slot_has_no_key has to report it.
+slot_keyring_probe_sees_a_key() {
+	local uid=$slot_key_control_uid
+	plant_key "$uid" || {
+		echo "no key could be added as uid $uid: the control proves nothing"
+		return 1
+	}
+	! slot_has_no_key "$uid" || {
+		echo "the probe sees no key of uid $uid although one was added"
 		return 1
 	}
 }
@@ -1068,6 +1105,7 @@ if [ "$phase" = 1 ]; then
 	check database_second_postmaster_is_refused database_second_postmaster_is_refused
 	check slot_isolation slot_isolation
 	check slot_enumeration_sees_an_open_unit slot_enumeration_sees_an_open_unit
+	check slot_keyring_probe_sees_a_key slot_keyring_probe_sees_a_key
 else
 	check scratch_database_was_stopped_cleanly scratch_database_was_stopped_cleanly
 fi

@@ -619,14 +619,18 @@ slot lab (`apps/node-agent/src/units/slot_lab.rs`) runs the pool against the uni
   is the process, which runs under a uid that a second database uses after the first. That is
   acceptable only while nothing keeps something by uid for the next tenant to find, and that is
   what the rest of this section closes and the boot test enumerates. It asserts the same of a
-  second incarnation as of the first: the closed places below, journald's split, and
-  `/proc/keys`.
+  second incarnation as of the first: the closed places below, journald's split, and the kernel
+  keyrings read as the uid.
 - **What keeps things by uid, and how each is closed.** The IPC namespace (`PrivateIPC=yes`, and
   `RemoveIPC=yes` for the host's); `/run/lock` and `/dev/mqueue` (inaccessible); `/dev/pts`
   (inaccessible); the journal (`SplitMode=none` as a host file, and the two directories
-  inaccessible in the unit); the kernel keyrings (`@keyring` is denied by the filter, `/proc/keys`
-  shows no key of the uid while a slot runs in the lab, and the boot test requires none after it
-  stops); the writable
+  inaccessible in the unit); the kernel keyrings (`@keyring` is denied by the filter, so no process
+  of the unit adds a key; the one keyring the uid holds while a slot runs is the anonymous session
+  keyring `_ses` that systemd gives every service (`KeyringMode=private`) and the kernel frees
+  after the stop. The user keyring `_uid.<uid>` and every key in it would stay in the kernel after
+  the last process of the uid has exited, and `/proc/keys` lists only the keys that its reader may
+  view, root none of another uid's: the boot test reads it **as the uid** and requires none after
+  each stop); the writable
   mounts and files (`/tmp`, `/var/tmp` and `/dev/shm` are tmpfs of the unit, the control directory
   is its `RuntimeDirectory=`, which systemd removes at the stop; only the leaf goes, the
   directories above it belong to the other slots); files in the cgroup tree (the unit's own
@@ -639,9 +643,10 @@ slot lab (`apps/node-agent/src/units/slot_lab.rs`) runs the pool against the uni
 - **Boot test.** `slot_unit_sandbox` (rated SAFE and no worse than the database unit),
   `slot_unit_device_allow`, the start and system-call-filter checks of the database unit run against
   the slot as well (`database_unit_waits_for_recovery`, `database_unit_has_no_start_pre`,
-  `database_unit_syscall_filter`), `journal_not_split`, and two that start the real template with
-  a runtime drop-in that replaces `ExecStart=` with a process that logs a line and waits (the
-  supervisor is not under test):
+  `database_unit_syscall_filter`), `journal_not_split`, and three that
+  enumerate what a uid keeps. Two start the real template with a runtime drop-in that replaces
+  `ExecStart=` with a process that logs a line and waits (the supervisor is not under test); the
+  third needs no unit:
   - `slot_isolation` starts slot 1000 twice, as two databases in turn. In each incarnation, as the
     slot's user in the namespaces of its unit with no capability: `/run/lock`, `/dev/mqueue` and
     `/dev/pts` refuse a file and a listing, both journal directories refuse a listing, the unit is
@@ -656,11 +661,15 @@ slot lab (`apps/node-agent/src/units/slot_lab.rs`) runs the pool against the uni
     host: the control directory is gone and its neighbour is not, no file the uid can read and the
     unrelated uid cannot, no file owned by the uid or its gid on any mounted filesystem (`/dev/mqueue`
     included), no journal file of the uid in `/var/log/journal` or `/run/log/journal`, no SysV
-    object of the uid in the host's namespace and no key of the uid in `/proc/keys`.
+    object of the uid in the host's namespace and no key of the uid in `/proc/keys`, read as the uid.
   - `slot_enumeration_sees_an_open_unit` runs the enumeration against the same template with
     `InaccessiblePaths=` reset and `PrivateIPC=no`, and requires that it reports a file created in
     `/run/lock` and in `/dev/mqueue`, `/dev/pts` and the journal directory not refused, PID 1's IPC
     namespace and the host's SysV segment, so that the enumeration is not vacuous.
+  - `slot_keyring_probe_sees_a_key` is the same control for the keyring probe: a process of an
+    unrelated uid (390001) adds a key to its user keyring, and the probe that `slot_isolation` uses
+    after each stop must report it. Read as root the probe reports nothing of it, which is why it
+    reads as the uid.
   The checks ran in a Debian 13 container with systemd 257.13 as PID 1 (the image's units and
   journald files, the boot test's functions); the KVM boot test has not run them yet (plan 11.2).
   A journal file as journald made them before the split was turned off, and which stay on a node,
