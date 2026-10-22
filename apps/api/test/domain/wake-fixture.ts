@@ -22,7 +22,7 @@ export async function sleeping() {
   expect((await report(f, id, 1, "asleep")).status).toBe(200);
   return { ...f, id };
 }
-export async function untilWake(id: string) {
+export async function untilWake(id: string, generation = 3) {
   for (let i = 0; i < 400; i++) {
     const row = await env.DB.prepare(
       "SELECT generation,power_operation,desired_state FROM databases WHERE id=?",
@@ -33,7 +33,8 @@ export async function untilWake(id: string) {
         power_operation: string;
         desired_state: string;
       }>();
-    if (row?.desired_state === "running" && row.generation === 3) return row;
+    if (row?.desired_state === "running" && row.generation === generation)
+      return row;
     await sleep(5);
   }
   throw new Error("wake_not_started");
