@@ -16,14 +16,22 @@
 -- key is in play.
 --
 -- Deploy order: this migration first, then the node release that accepts these names (R-2), then
--- the API Worker, then the Edge Worker. Check first, as the last act before the apply, that no row of
--- `roles`, tombstones included, is named `pgcf_backup`, `public` or `none`; the CHECK below refuses
--- the copy of such a row, the migration stops and the table stays as it was, so a row that appears
--- after the check delays the apply and is deleted in D1 first. The migration opens nothing: the
--- Workers of today still refuse `cnpg_*`, `streaming_replica` and `pgcf_maintenance`, and a restore
--- copies only names that D1 already holds. What it closes are the three names above, which the old
--- API accepted until now. The old API's insert of one of them fails on the CHECK, an error
--- `isConstraintError` does not map (it matches only UNIQUE), so it answers 500 and creates nothing.
+-- the API Worker, then the Edge Worker. Apply it from the commit that merged this change:
+-- `wrangler d1 migrations apply` applies every pending file of the directory it runs from, so
+-- `wrangler d1 migrations list` shows this file as the only pending migration just before the apply.
+-- The migration of an API change that merges after this one is not applied with it. `0085` of the
+-- single archive bucket change (plan W2-F) drops `regions.backup_bucket` and
+-- `regions.backup_endpoint_url`, which the deployed Worker reads, and its Worker has to be live
+-- first. That change waits, Worker and migration alike, until the API Worker of this change is out,
+-- and its migration runs after its own Worker (plan W2-C, Freeze). Check first, as the last act
+-- before the apply, that no row of `roles`, tombstones included, is named `pgcf_backup`, `public` or
+-- `none`; the CHECK below refuses the copy of such a row, the migration stops and the table stays as
+-- it was, so a row that appears after the check delays the apply and is deleted in D1 first. The
+-- migration opens nothing: the Workers of today still refuse `cnpg_*`, `streaming_replica` and
+-- `pgcf_maintenance`, and a restore copies only names that D1 already holds. What it closes are the
+-- three names above, which the old API accepted until now. The old API's insert of one of them fails
+-- on the CHECK, an error `isConstraintError` does not map (it matches only UNIQUE), so it answers 500
+-- and creates nothing.
 -- The API Worker of this change waits until R-2 is observed on every node and every image a node can
 -- be installed or recovered from holds R-2 or newer. A node below R-2 refuses a whole desired page
 -- that names a role it still holds reserved, and applies nothing of it. The agent's start asks for
