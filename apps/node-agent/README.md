@@ -154,10 +154,10 @@ accepting exactly that second postmaster
 writers corrupt the cluster.
 
 **The rule:** before an older release is assigned to a node's region, every database on the node
-sleeps with its proof, so that no slot holds a database, and none wakes before the older agent
-runs. Idle slots hold no database and cannot corrupt one: the older agent ignores them (its host
-files drop the slot template, and units that run keep running), and the first release that runs
-slots again adopts them. Two things do the two halves of it.
+sleeps with its proof, so that no slot holds a database, none wakes and nothing is placed on the
+node before the older agent runs. Idle slots hold no database and cannot corrupt one: the older
+agent ignores them (its host files drop the slot template, and units that run keep running), and
+the first release that runs slots again adopts them. Three things do it.
 
 - **The drain is the `maintenance` order** (`POST /v1/nodes/{id}/maintenance`): it holds new wakes
   with `57P03`, puts every database that is `ready` to sleep with the proof (the sleep stops its
@@ -176,16 +176,39 @@ slots again adopts them. Two things do the two halves of it.
   disabled" proves it). Its costs: an integrator's `resume` of one of these databases wakes it
   (the integrator has to be told), the operator resumes every database afterwards, one by one, and
   a resume answers `409` with `node_capacity` where the node cannot hold what is resumed at once.
+- **Closed placement across the swap** (`PUT /v1/nodes/{id}/database-placement` with
+  `expected_node_uid` and `database_placement_enabled: false`). A node that is open for placement
+  takes new databases: the API places a create, a restore (which makes a new database) or a move on
+  it, and a move reads the same rule (`targetOpen` in `apps/api/src/domain/database-moves.ts`). The
+  agent builds the database and starts its PostgreSQL in a slot, and the older agent then finds
+  `pgcf-pg@<id>` inactive and runs `adopt_asleep`: the database has no sleep record, or `pg_control`
+  says "in production", so it goes unproven and recovery starts `pgcf-pg@<id>` beside the slot's
+  postmaster, the second writer that this rule exists to prevent, and over a tenant's real data
+  when the database is a restore or a move. The `maintenance` order does not keep placement closed
+  for the swap: a cycle that ends `done` opens placement again if the cycle closed it itself
+  (`recordOrderResults` in `apps/api/src/domain/lifecycle-orders.ts`). So the operator closes it
+  first: the cycle then records no closure of its own and leaves this one closed (test "keeps
+  closed the placement that an operator closed, before the cycle or during it" in
+  `apps/api/test/domain/node-maintenance.test.ts`). A move that began before the closure is the
+  other way in, and the check cannot see it (step 3).
 
 **The order of the operator.**
 
-1. Suspend every database of the node (`POST /v1/databases/{id}/suspend`). A database whose wake is
-   under way, or whose idle sleep has not ended, answers `409` `not_ready` and stays as it was (the
-   claim of a wake has set its `desired_state` to `running`): suspend it again when the node has
-   reported the wake `ready` or the sleep `asleep`.
+1. Close the node's placement first (`PUT /v1/nodes/{id}/database-placement`,
+   `database_placement_enabled: false`), and then suspend every database of the node
+   (`POST /v1/databases/{id}/suspend`). A database whose wake is under way, or whose idle sleep has
+   not ended, answers `409` `not_ready` and stays as it was (the claim of a wake has set its
+   `desired_state` to `running`): suspend it again when the node has reported the wake `ready` or
+   the sleep `asleep`.
 2. Run the `maintenance` order and wait for `done`. The drain sleeps only the databases that are
-   `ready`: what it leaves is what the next two steps read.
-3. **Read the node's own count.** In D1, the two newest complete minutes of the node in
+   `ready`: what it leaves is what the next two steps read. The cycle leaves placement closed,
+   because step 1 closed it.
+3. **Read the moves, and the node's own count.** In D1, no row of `database_moves` with `status` in
+   `proving` or `restoring` names the node as `source_node_id` or `target_node_id`. A move whose
+   target is the node restores its database in a slot of the node, and D1 lists that database
+   under its source node until the move is done, so step 4 does not see it; a move whose source is
+   the node still has the node prove a sleep and remove a volume. Wait until the move is `done` or
+   `failed` and read again. Then the two newest complete minutes of the node in
    `node_minutes` (folded from its 15 s samples) have `samples` of at least 3 and `awake_max` 0: no
    sample counted a database whose PostgreSQL is active or starting. The node's admission counts
    every wake and every start of a recovery (`Admitter::snapshot`).
@@ -194,9 +217,13 @@ slots again adopts them. Two things do the two halves of it.
    `manual`. In D1 that is
    `desired_state='suspended' AND suspension_reason='manual' AND observed_generation=generation AND observed_power='hibernated'`.
    A database that fails is suspended again or waited for, and steps 3 and 4 are read again.
-5. Assign the older release. Until the older agent runs, no integrator resumes a database of the
-   node and nothing restarts the agent but the swap. The agent that installs the older release is
-   this one: it does not look at its slots before it switches its link.
+5. Assign the older release. Until the older agent runs, nothing is placed on the node (placement
+   stays closed: `GET /v1/nodes/{id}` reads `database_placement_enabled` `false`, and no one starts
+   a move), no integrator resumes a database of the node and nothing restarts the agent but the
+   swap. The agent that installs the older release is this one: it does not look at its slots
+   before it switches its link. Reopen placement (`database_placement_enabled: true`, if the node
+   was open before step 1) only after the older agent has reported its release
+   (`GET /v1/nodes/{id}/release` reads `converged` for the older release).
 
 **Why `observed_power` is not the check.** It is the power of the node's last report, and no report
 comes while a wake runs. The claim of a wake (an integrator's `resume`, or a connection's wake
@@ -221,7 +248,9 @@ of a database (`adopt_asleep`), it reports `unproven`, the API keeps the power, 
 the state as they were, and the recovery starts PostgreSQL in a slot while D1 still reads
 `hibernated` (the third test of `rollback-check.test.ts` shows it). Only the node's count sees that
 recovery; a database whose delete was requested is no longer listed either, and the count keeps its
-unit until the agent has stopped it. This is a rule for the operator and no guard, and it follows from reading
+unit until the agent has stopped it. A database that a move restores on the node is listed under
+its source node until the move is done: the read of the moves in step 3 sees it, and so does the
+count once its PostgreSQL runs. This is a rule for the operator and no guard, and it follows from reading
 the agent of `origin/main`; it was not run on a node.
 
 **The health check** runs the scratch database in the slot of its own (number 1023), so it takes no

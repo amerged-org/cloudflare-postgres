@@ -402,9 +402,9 @@ holder of the key can also sign a transition release that carries their own key.
   older signed image. That is how a bad release is rolled back, so it stays possible; an old release
   with a known flaw is as installable as it was when it was signed. A rollback past the release that
   introduced the pool of slots is also unsafe while a database runs in a slot: the older agent knows
-  no slots and starts a second postmaster on its data directory. Every database of the node must
-  sleep first ([the rule](../../apps/node-agent/README.md#slots), under "Rolling back to an earlier
-  release").
+  no slots and starts a second postmaster on its data directory. Placement on the node must be
+  closed and every database of the node must sleep first ([the rule](../../apps/node-agent/README.md#slots),
+  under "Rolling back to an earlier release").
 - **The trust root.** Three things, and nothing smaller.
   - *The workflow on `main`.* The signer authenticates the workflow, not the bytes. The identity token's
     credential is in the environment of every step of `sign-release`, so what can sign is the file
