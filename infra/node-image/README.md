@@ -466,9 +466,7 @@ package from creating a default cluster.
   `SplitMode=none` and removes the files at the source: journald makes no new per-uid file (lab,
   systemd 257.13: without the file `user-301000.journal` appears with the first line a slot logs,
   readable by uid 301000 and not by an unrelated uid; with it the line is in the system journal). The files
-  made before stay until journald vacuums them by age, and the unit does not see them. The boot test
-  has the scratch database's user log a line and requires it in a `system.journal` file and no
-  `user-*.journal` file in either directory, and requires the agent's own lines in `journalctl --boot=0`.
+  made before stay until journald vacuums them by age, and the unit does not see them.
   **Scratch space.** `PrivateTmp=yes` made `/tmp` and `/var/tmp` directories on the host's root
   filesystem (8 GiB, no quota), and disk blocks are no memory that `MemoryMax` counts: an awake
   tenant could fill the root filesystem, which stops the journal and the agent's state writes for the
