@@ -14,6 +14,13 @@ are free for public repositories under the
 This procedure needs no extra VPS or paid runner. It is an acceptance tool, not a completed live
 acceptance result.
 
+The job probes the nodes' public IP addresses on TCP/25 and nothing else. The nodes' gateway
+hostnames are a different surface: they sit behind Cloudflare Access, which refuses a request without
+the Edge's service token, and that refusal is checked by `setup-access.ts apply --verify`
+([Cloudflare Access for node gateways and shells](operator-installation.md#cloudflare-access-for-node-gateways-and-shells)),
+not by this job. The job holds no Cloudflare credential and no Access token, and it must not get one:
+it carries the grants for an identity token and an attestation.
+
 ## Prepare the run
 
 The operator performs the following steps once the node is installed. Use only the approved node
@@ -76,12 +83,11 @@ artifact to the ignored evidence directory:
 
 ```sh
 gh run download "$PGCF_E2E_EXTERNAL_PROBE_RUN_ID" \
-  --repo "$PGCF_E2E_REPOSITORY" --name pgcf-e6-native \
-  --dir .local/evidence/phase1
+  --repo "$PGCF_E2E_REPOSITORY" --name pgcf-node-external-probe \
+  --dir .local/evidence/node-external-probe
 ```
 
-Preserve `pgcf-e6-native.json` exactly as downloaded (the `phase1` directory and the `e6` name are
-the harness's historical names for this report). Do not parse and rewrite, pretty-print or
+Preserve `pgcf-node-external-probe.json` exactly as downloaded. Do not parse and rewrite, pretty-print or
 combine it with another report before verification. It contains HMAC-SHA256 identifiers scoped
 by the private key and nonce, timestamps, address families and TCP states. Raw addresses, CIDRs
 and the HMAC key are omitted. Plain unsalted address hashes would permit address enumeration and
@@ -114,7 +120,7 @@ digests, and rejection of self-hosted runners. It binds the parsed original byte
 It also checks the GitHub OIDC issuer, public source repository, hosted runner, manual trigger,
 workflow identity, commit, run ID and attempt, and verified signing timestamps. A separate GitHub
 API check requires that exact run to have completed successfully and retain its unexpired
-`pgcf-e6-native` artifact. The local checkout must be `main` at the same commit.
+`pgcf-node-external-probe` artifact. The local checkout must be `main` at the same commit.
 
 The report must start after configuration creation, finish before its expiry, be no older than
 15 minutes and use a source-pool observation no more than 10 seconds before it starts. Verification

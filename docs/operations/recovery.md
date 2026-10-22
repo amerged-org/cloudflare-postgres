@@ -71,7 +71,9 @@ database moves (plan 7.11, 9.4).
    Loss is terminal, repeated calls preserve the original record, and metadata, archives and
    historical provider receipts remain available. Heartbeats cannot make the node healthy again.
 3. The minute cron finishes the fence one step per run and retries each step until it holds: it
-   deletes the node's Tunnel (its token dies with it), orders the instance powered off through the
+   deletes the node's Tunnel (its token dies with it) and then the node's DNS records that point at
+   that Tunnel (`pgcf-node-<id>`, `pgcf-shell-<id>` and the former `pgcf-node-<id>-ssh`; no other
+   record of the zone), orders the instance powered off through the
    Contabo API, and reads the instance until the provider says stopped. `GET /v1/nodes/{id}/loss`
    shows `fencing` or `fenced`, the time of each step, the class of the step that failed last (a
    fence stuck for days raises `control_cron_step_failing`) and, for each database of the node, the

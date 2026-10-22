@@ -3273,10 +3273,15 @@ mod tests {
         );
         let state = crate::hostfiles::State::load(&machine.layout().host_files());
         assert_eq!(state.restarts, ["ssh.service"]);
-        assert!(crate::events::seen().iter().any(|event| {
-            event["event"] == "host_files_not_applied"
-                && event["fields"]["release"] == "r1-one-fails"
-        }));
+        // The agent asks to leave while the step that failed is still returning, so the event
+        // that names the class comes a moment after the request.
+        eventually(30, "the failed restart to be reported", || {
+            crate::events::seen().iter().any(|event| {
+                event["event"] == "host_files_not_applied"
+                    && event["fields"]["release"] == "r1-one-fails"
+            })
+        })
+        .await;
         // Pages that come at once do not try the unit again.
         first.stop();
         drop(first);

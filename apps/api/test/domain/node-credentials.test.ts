@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
-import { NodeCredentials } from "@pgcf/contracts";
+import { NodeCredentials, NodeDesiredPage } from "@pgcf/contracts";
 import {
   deriveNodeKeyring,
   parseRouteKeyring,
   serializeRouteKeyring,
 } from "@pgcf/contracts/route-token";
 import { nodeAdditionHostname, nodeShellHostname } from "@pgcf/contracts/nodes";
-import { cleanupFixtures, fixture, nodeRequest } from "./fixtures.ts";
+import {
+  cleanupFixtures,
+  fixture,
+  nodeRequest,
+  setNodePolicy,
+} from "./fixtures.ts";
 import {
   ACCOUNT,
   DOMAIN,
@@ -184,6 +189,68 @@ it("names a revision that matches its own shell state, so that a Worker version 
   const back = await ask(on);
   expect(back).toMatchObject({ revision: 7, shell_ca_public_key: SHELL_CA });
   expect(await shellStateOf(f.node)).toEqual({ r: 7, s: `on ${SHELL_CA}` });
+});
+
+it("raises the revision once for a changed route keyring, and the page and the read name the same one whichever sees the change first; a changed Tunnel token raises nothing", async () => {
+  const f = await fixture(0);
+  await setNodePolicy(f);
+  await accountRegion(f.region);
+  const api = cloudflare();
+  let token = TUNNEL_TOKEN;
+  // The double hands out one token; the Tunnel's token is read through a path of its own.
+  vi.stubGlobal(
+    "fetch",
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await api.fetcher(input, init);
+      return new URL(String(input)).pathname.endsWith("/token")
+        ? Response.json({ success: true, result: token })
+        : response;
+    },
+  );
+  const read = async (bindings: Record<string, string | undefined> = {}) => {
+    const response = await nodeRequest(f, CREDENTIALS, {
+      bindings: { ...configured, ...bindings },
+    });
+    expect(response.status).toBe(200);
+    return NodeCredentials.parse(await response.json());
+  };
+  const page = async (bindings: Record<string, string | undefined> = {}) => {
+    const response = await nodeRequest(f, "/node/v1/desired", { bindings });
+    expect(response.status).toBe(200);
+    return NodeDesiredPage.parse(await response.json()).credentials_revision;
+  };
+  expect((await read()).revision).toBe(1);
+  expect((await read()).revision).toBe(1);
+  // A Tunnel token that is not the one handed out before: the read hands out the new token at the
+  // revision it had. A node learns of the token only by reading, and every read hands it the
+  // current one, so no revision could make it read sooner.
+  token = "tunnel-token-" + "r".repeat(40);
+  expect(await read()).toMatchObject({ revision: 1, tunnel_token: token });
+  expect(await page()).toBe(1);
+  // A key added beside the old one: the page sees it first, and the read that follows names the
+  // revision the page named, so a node that read at it is not told to read again.
+  const first = JSON.parse(env.ROUTE_MASTER_KEYS) as {
+    active: string;
+    keys: Record<string, string>;
+  };
+  const added = {
+    ROUTE_MASTER_KEYS: JSON.stringify({
+      active: first.active,
+      keys: { ...first.keys, v2: "B".repeat(42) + "w" },
+    }),
+  };
+  expect(await page(added)).toBe(2);
+  const keyed = await read(added);
+  expect(keyed.revision).toBe(2);
+  expect(Object.keys(keyed.route_keyring.keys).sort()).toEqual(["v1", "v2"]);
+  expect(await page(added)).toBe(2);
+  // The same the other way round: the read sees the retired key first, and the page agrees.
+  expect((await read()).revision).toBe(3);
+  expect(await page()).toBe(3);
+  // A Tunnel token that changes together with the keyring is one revision, for the keyring.
+  token = "tunnel-token-" + "s".repeat(40);
+  expect((await read(added)).revision).toBe(4);
+  expect(await page(added)).toBe(4);
 });
 
 it("answers a node whose Tunnel cannot be made with a failure, and writes no gateway", async () => {

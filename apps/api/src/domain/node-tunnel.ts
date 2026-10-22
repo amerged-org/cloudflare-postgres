@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { nodeAdditionHostname, nodeShellHostname } from "@pgcf/contracts/nodes";
-import { cloudflareApi } from "../providers/cloudflare.ts";
+import { cloudflareApi, type CloudflareCall } from "../providers/cloudflare.ts";
 
 /**
  * The Tunnel of a node (ULTRA plan 5.8): one remotely managed Tunnel, named like the node's
@@ -12,7 +12,7 @@ import { cloudflareApi } from "../providers/cloudflare.ts";
  * (`pgcf-shell-<id>`) hostnames are two families that Cloudflare Access guards with a wildcard each
  * (`scripts/operations/setup-access.ts`), so no hostname of one may match the other's wildcard.
  * Fencing (`fence-actions.ts`) deletes the Tunnel by the same name, because nothing else ties the
- * Tunnel to the node.
+ * Tunnel to the node, and then the DNS records under `nodeHostnames` that point at it.
  */
 export const nodeTunnelName = nodeAdditionHostname;
 
@@ -26,6 +26,45 @@ const HOSTNAME_DOMAIN =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/;
 /** What `NodeCredentials.tunnel_token` takes. */
 const TUNNEL_TOKEN = /^[A-Za-z0-9+/=_-]{32,4096}$/;
+
+/** What a DNS record points at to reach a Tunnel. */
+export const tunnelTarget = (tunnelId: string) =>
+  `${tunnelId}.cfargotunnel.com`;
+
+/** Whether the zone and its domain can hold a node's hostnames. */
+export function isNodeZone(zoneId: string, domain: string): boolean {
+  return CLOUDFLARE_ID.test(zoneId) && HOSTNAME_DOMAIN.test(domain);
+}
+
+/**
+ * The hostnames a node has, or had, under the domain of its zone: the gateway's, the shell's and
+ * the shell's former one, from before it had a family of its own (`pgcf-node-*` would cover it).
+ * Credentials make and remove the records under these names and fencing deletes them.
+ */
+export function nodeHostnames(nodeId: string, domain: string) {
+  const name = nodeTunnelName(nodeId);
+  return {
+    gateway: `${name}.${domain}`,
+    shell: `${nodeShellHostname(nodeId)}.${domain}`,
+    legacyShell: `${name}-ssh.${domain}`,
+  };
+}
+
+/** The CNAME record of a hostname in a zone, if it has one. */
+export async function cnameRecord(
+  call: CloudflareCall,
+  zoneId: string,
+  hostname: string,
+) {
+  const records = await call(
+    "GET",
+    `/zones/${zoneId}/dns_records?type=CNAME&name=${encodeURIComponent(hostname)}`,
+  );
+  if (!Array.isArray(records)) throw new Error("cloudflare_api_failed");
+  return (
+    records as { id?: unknown; content?: unknown; proxied?: unknown }[]
+  )[0];
+}
 
 /** The Cloudflare account of a region: the one its R2 endpoint names. */
 export function accountOf(endpoint: string): string | null {
@@ -76,15 +115,11 @@ export async function ensureNodeTunnel(
 ): Promise<NodeTunnel> {
   if (
     !CLOUDFLARE_ID.test(services.accountId) ||
-    !CLOUDFLARE_ID.test(services.zoneId) ||
-    !HOSTNAME_DOMAIN.test(services.domain)
+    !isNodeZone(services.zoneId, services.domain)
   )
     throw new Error("invalid node tunnel configuration");
   const name = nodeTunnelName(nodeId),
-    gateway = `${name}.${services.domain}`,
-    shell = `${nodeShellHostname(nodeId)}.${services.domain}`,
-    // The shell's hostname before it had a family of its own: `pgcf-node-*` would cover it.
-    legacyShell = `${name}-ssh.${services.domain}`,
+    { gateway, shell, legacyShell } = nodeHostnames(nodeId, services.domain),
     call = cloudflareApi(services.token, services.fetcher),
     base = `/accounts/${services.accountId}/cfd_tunnel`;
   const listed = await call(
@@ -101,21 +136,13 @@ export async function ensureNodeTunnel(
   if (typeof id !== "string" || !TUNNEL_ID.test(id))
     throw new Error("cloudflare_api_failed");
   const dns = `/zones/${services.zoneId}/dns_records`;
-  const recordOf = async (hostname: string) => {
-    const records = await call(
-      "GET",
-      `${dns}?type=CNAME&name=${encodeURIComponent(hostname)}`,
-    );
-    if (!Array.isArray(records)) throw new Error("cloudflare_api_failed");
-    return (
-      records as { id?: unknown; content?: unknown; proxied?: unknown }[]
-    )[0];
-  };
+  const recordOf = (hostname: string) =>
+    cnameRecord(call, services.zoneId, hostname);
   const point = async (hostname: string) => {
     const wanted = {
       type: "CNAME",
       name: hostname,
-      content: `${id}.cfargotunnel.com`,
+      content: tunnelTarget(id),
       proxied: true,
       ttl: 1,
     };

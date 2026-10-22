@@ -3,12 +3,15 @@ import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { createServer } from "node:net";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 import type { TestContext } from "node:test";
 import {
+  PROBE_ARTIFACT,
+  PROBE_EVIDENCE_DIRECTORY,
+  PROBE_REPORT_FILE,
   assertExternalReport,
   assertProbeProvenance,
   cidrPoolsDisjoint,
@@ -535,10 +538,10 @@ async function consumerFixture(t: TestContext, targets: string[]) {
   report.finished_at = new Date(instant - 1).toISOString();
   const raw = `  ${JSON.stringify(report, null, 2)}\n`;
   let signedDigest = createHash("sha256").update(raw).digest("hex");
-  const root = await mkdtemp(resolve(tmpdir(), "pgcf-e6-test-"));
+  const root = await mkdtemp(resolve(tmpdir(), "pgcf-node-probe-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const path = resolve(root, ".local/evidence/phase1/pgcf-e6-native.json");
-  await mkdir(resolve(root, ".local/evidence/phase1"), { recursive: true });
+  const path = resolve(root, PROBE_EVIDENCE_DIRECTORY, PROBE_REPORT_FILE);
+  await mkdir(resolve(root, PROBE_EVIDENCE_DIRECTORY), { recursive: true });
   await writeFile(path, raw);
   let verifications = 0;
   const io: ProbeIo = {
@@ -592,7 +595,7 @@ async function consumerFixture(t: TestContext, targets: string[]) {
           `repos/${context.repository}/actions/runs/${context.run_id}/artifacts`,
         );
         return JSON.stringify({
-          artifacts: [{ name: "pgcf-e6-native", expired: false }],
+          artifacts: [{ name: PROBE_ARTIFACT, expired: false }],
         });
       }
       assert.equal(
@@ -653,4 +656,51 @@ test("actual consumer rejects a signature digest for reserialized JSON instead o
     message: "external_probe_attestation_mismatch",
   });
   assert.equal(fixture.verifications(), 1);
+});
+
+const repositoryFile = (path: string) =>
+  readFile(new URL(`../../../${path}`, import.meta.url), "utf8");
+
+test("the report names are the node runtime's, and the CI job, the script and the runbook agree on them", async () => {
+  assert.deepEqual(
+    [PROBE_ARTIFACT, PROBE_REPORT_FILE, PROBE_EVIDENCE_DIRECTORY],
+    [
+      "pgcf-node-external-probe",
+      "pgcf-node-external-probe.json",
+      ".local/evidence/node-external-probe",
+    ],
+  );
+  const workflow = await repositoryFile(".github/workflows/ci.yml");
+  const start = workflow.indexOf("\n  external_probe:\n");
+  const end = workflow.indexOf("\n  node-image:\n");
+  assert(start > 0 && end > start, "the external_probe job is found");
+  const job = workflow.slice(start, end);
+  const report = "${{ runner.temp }}/" + PROBE_REPORT_FILE;
+  // The attestation subject and the uploaded file are the file the script writes into RUNNER_TEMP.
+  const lines = job.split("\n").map((line) => line.trim());
+  const count = (line: string) => lines.filter((x) => x === line).length;
+  assert.equal(count(`subject-path: ${report}`), 1);
+  assert.equal(count(`path: ${report}`), 1);
+  assert.equal(count(`name: ${PROBE_ARTIFACT}`), 1);
+  assert(job.includes(`rm -f "$RUNNER_TEMP/${PROBE_REPORT_FILE}"`));
+  // The runbook downloads that artifact into the directory that the consumer reads.
+  const runbook = await repositoryFile(
+    "docs/operations/native-external-probe.md",
+  );
+  assert(runbook.includes(`--name ${PROBE_ARTIFACT}`));
+  assert(runbook.includes(`--dir ${PROBE_EVIDENCE_DIRECTORY}`));
+  assert(runbook.includes(`\`${PROBE_REPORT_FILE}\``));
+  assert(workflow.includes("      external_probe:\n"));
+  assert(runbook.includes("-f external_probe=true"));
+  // Nothing of the Kubernetes-era names is left in the three places that carried them.
+  const legacy =
+    /phase1|e6-native|pgcf-e6|\be6\b|approved Dev targets|supplemental Dev/;
+  const script = await repositoryFile("scripts/e2e/src/external-probe.ts");
+  for (const [name, text] of [
+    ["the external_probe job", job],
+    ["the input description", workflow.slice(0, workflow.indexOf("\njobs:\n"))],
+    ["the script", script],
+    ["the runbook", runbook],
+  ] as const)
+    assert.doesNotMatch(text, legacy, name);
 });
