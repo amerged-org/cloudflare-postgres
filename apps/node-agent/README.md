@@ -212,6 +212,30 @@ to the database's own prefix, and answers `ok` to an archive request only when t
 R2 and the segment is in the fsynced upload log. The agent never deletes in R2; retention runs in the
 Worker. The concurrency and memory limits of the jobs come from the policy.
 
+A base backup is due when the newest of the database's timeline is a day old (plan 7.6). It is taken
+at the database's idle sleep, and daily for an always-warm database, never by waking one. It is put
+off while a start is queued or in flight on the node, and in the first minute after any database on
+the node became ready (a wake, a build, the adoption of a unit that runs), so that the first
+statements of a cold database do not share the disk and the CPU with the backup of another one
+(`backup_waits`, `backup_put_off` in the agent's log). The minute is node-wide because a database's
+idle time is at least a minute: its own first minute is over before its own idle sleep. A database
+whose idle sleep is put off is not put to sleep: nothing would wake it for the backup later. It
+stays up and the next idle pass (every five seconds) asks again. Ten minutes after the first
+put-off of an awake session (the wait after a failed backup) the backup is taken whatever the node
+does: at the idle sleep of a database that stays idle, and, for one that is used meanwhile and so
+never idles, while it serves, as the daily backup of an always-warm database is. So a database that
+stays up has it within ten minutes and one idle pass of the first put-off. One case is not bounded:
+an early sleep, which a wake that waits for room orders and which picks the database unused
+longest, usually the one that was put off, takes no backup and ends the session with the wait; the
+backup is then taken at the idle sleep after the database's next wake, which may be days away. WAL
+archiving goes on meanwhile, so only the age of the newest base backup, and the WAL a restore
+replays, grow. The disk side is in `pgcfbackup.slice` (`infra/node-image`): the read and write
+bandwidth of the jobs on the data disk is capped. A release that lifts the cap writes `infinity` as
+the size; deleting the two lines leaves a running node capped until it reboots. A runtime change
+(`systemctl set-property --runtime`, such as an `infinity` or another size for a measurement on one
+node) leaves a drop-in that overrides every later release of the slice until the node reboots, so
+it ends with `systemctl revert pgcfbackup.slice`; the next job in the slice then applies the file.
+
 ## Fencing, updates and diagnostics
 
 - **Fencing** (`fence.rs`). A `fence` order and the `superseded` orders of a lost node are written
