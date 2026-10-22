@@ -82,14 +82,13 @@ database moves (plan 7.11, 9.4).
    **DNS records.** The step deletes the node's proxied CNAME records after its Tunnel:
    `pgcf-node-<id>`, `pgcf-shell-<id>` and the former `pgcf-node-<id>-ssh` under
    `NODE_GATEWAY_DOMAIN` (`<id>` is the node's ID without its `nod_` prefix), each only if it points
-   at a Tunnel of that node (a deleted one included).
-   A record of that name that points elsewhere, and every other record of the zone, stays. The
-   Worker's `CLOUDFLARE_API_TOKEN` needs Zone: DNS: Edit on that zone for it
-   ([permissions](operator-installation.md#reviewed-deployment-inputs)). Without it, or without a
-   usable `NODE_GATEWAY_ZONE_ID` and `NODE_GATEWAY_DOMAIN`, the Tunnel is gone and the step fails
-   (`tunnel_delete_failed`, or `fence_unconfigured` for the zone); the cron repeats it whole each
-   minute and orders the instance off only when it holds. A node fenced by an API Worker without this
-   step, and every node until the Worker that has it is deployed, leaves its records pointing at the
+   at a Tunnel of that node (a deleted one included). A record of that name that points elsewhere,
+   and every other record of the zone, stays. The Worker's `CLOUDFLARE_API_TOKEN` needs Zone: DNS:
+   Edit on that zone for it ([permissions](operator-installation.md#reviewed-deployment-inputs)).
+   Without it, or without a usable `NODE_GATEWAY_ZONE_ID` and `NODE_GATEWAY_DOMAIN`, the Tunnel is
+   gone and the step fails (`tunnel_delete_failed`, or `fence_unconfigured` for the zone); the cron
+   repeats it whole each minute and orders the instance off only when it holds. A node fenced by an
+   API Worker from before 2026-10-22, which lacked this step, left its records pointing at the
    deleted Tunnel. Delete them by hand, with the `CLOUDFLARE_API_TOKEN` of the Worker from private
    custody: list the zone's CNAME records of that exact name
    (`GET /zones/{zone}/dns_records?type=CNAME&name=<hostname>`), check that each one's target is
