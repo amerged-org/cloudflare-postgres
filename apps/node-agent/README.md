@@ -110,8 +110,9 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   and crash recovery syncs the filesystem once (`recovery_init_sync_method = syncfs`).
 - **Small databases** (512 MiB and below) run one autovacuum worker out of two slots, one I/O
   worker, no parallel query or maintenance workers, four background worker slots and no replication.
-  A restore runs with more during its recovery, because a recovery checks these values against its
-  source's.
+  A restore runs with the larger of the backup's and the class's values during its recovery,
+  because a recovery checks `max_connections`, the process, sender, prepared transaction and lock
+  settings against its source's, and restarts onto the class's own afterwards.
 - **Autoprewarm** runs in every database (`shared_preload_libraries = 'pg_prewarm'`,
   `pg_prewarm.autoprewarm = on`, `autoprewarm_interval = 0`): the list of the shared buffers is
   written at each clean stop only, so a running database pays nothing, and read again in the
@@ -175,8 +176,13 @@ plan 9.3, "Changing the page"; it is written there once.
 - **Restore and move target.** `barman-cloud-restore` as the new database's user, recovery through
   the archive socket (`pgcf-recovery.conf`, included by `postgresql.conf` and removed afterwards),
   promotion on a later timeline with the backup's system identifier, then the first base backup of
-  the new timeline. A move target replays through the segment named in the source's proven-sleep
-  record before it may promote.
+  the new timeline. The recovery runs with the larger of the settings in the backup's `pg_control`
+  and the class's (`settings::Capacity`); when that is more than the class's, the database restarts
+  onto the class's own before the first backup, and a source whose settings the class has no memory
+  for is refused before it starts. A recovery that PostgreSQL pauses (the source's WAL raised a
+  setting above both the backup's and the class's) fails the restore with `no_recovery_point`. A
+  move target replays through the segment named in the source's proven-sleep record before it may
+  promote.
 
 ## Backups
 

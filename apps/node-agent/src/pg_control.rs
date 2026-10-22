@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! PostgreSQL 18 `pg_control`: the data directory's identity and whether it shut down cleanly.
+//! PostgreSQL 18 `pg_control`: the data directory's identity, whether it shut down cleanly, and
+//! the settings it ran with.
+use crate::settings::Capacity;
 use serde::{Deserialize, Serialize};
 
 /// `pg_control` below the volume's root.
@@ -88,6 +90,31 @@ pub fn parse_control_file(bytes: &[u8]) -> Result<ControlFile, &'static str> {
     })
 }
 
+/// The offset of `MaxConnections` in PostgreSQL 18's `ControlFileData`, followed by
+/// `max_worker_processes`, `max_wal_senders`, `max_prepared_xacts` and `max_locks_per_xact`, each
+/// an `int`.
+const CAPACITY_OFFSET: usize = 180;
+/// The settings the server that wrote `pg_control` ran with (see `Capacity`). A copy of the file in
+/// a base backup has the source's.
+pub fn parse_capacity(bytes: &[u8]) -> Result<Capacity, &'static str> {
+    parse_control(bytes)?;
+    let setting = |index: usize| {
+        let offset = CAPACITY_OFFSET + 4 * index;
+        let word = bytes.get(offset..offset + 4)?;
+        u32::try_from(i32::from_le_bytes([word[0], word[1], word[2], word[3]])).ok()
+    };
+    let read = || {
+        Some(Capacity {
+            max_connections: setting(0)?,
+            max_worker_processes: setting(1)?,
+            max_wal_senders: setting(2)?,
+            max_prepared_transactions: setting(3)?,
+            max_locks_per_transaction: setting(4)?,
+        })
+    };
+    read().ok_or("control_unreadable")
+}
+
 /// Parses the first bytes of a PostgreSQL 18 `pg_control`.
 pub fn parse_control(bytes: &[u8]) -> Result<Control, &'static str> {
     if bytes.len() < 52 {
@@ -116,6 +143,32 @@ pub fn parse_control(bytes: &[u8]) -> Result<Control, &'static str> {
         system_identifier: u64::from_le_bytes(identifier).to_string(),
         timeline,
     })
+}
+
+/// A `pg_control` of PostgreSQL 18 as a server that ran with `capacity` left it: one block, shut
+/// down, on timeline 1. The test double of a restored backup's file; the offsets are those a real
+/// server's file is read at (`the_settings_a_real_server_ran_with_are_in_its_control_file`).
+#[cfg(test)]
+pub(crate) fn control_file(capacity: &Capacity) -> Vec<u8> {
+    let mut bytes = vec![0u8; 8192];
+    bytes[..8].copy_from_slice(&7_431_215_993_172_011_234u64.to_le_bytes());
+    bytes[8..12].copy_from_slice(&PG_CONTROL_VERSION.to_le_bytes());
+    bytes[16..20].copy_from_slice(&DB_SHUTDOWNED.to_le_bytes());
+    bytes[48..52].copy_from_slice(&1u32.to_le_bytes());
+    for (index, setting) in [
+        capacity.max_connections,
+        capacity.max_worker_processes,
+        capacity.max_wal_senders,
+        capacity.max_prepared_transactions,
+        capacity.max_locks_per_transaction,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offset = CAPACITY_OFFSET + 4 * index;
+        bytes[offset..offset + 4].copy_from_slice(&setting.to_le_bytes());
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -199,5 +252,62 @@ mod tests {
             parse_control(&control(1800, 1, 1, 40)),
             Err("control_unreadable")
         );
+    }
+
+    #[test]
+    fn the_settings_of_a_control_file_are_its_five_ints_and_nothing_else_is_accepted() {
+        let capacity = Capacity {
+            max_connections: 213,
+            max_worker_processes: 11,
+            max_wal_senders: 7,
+            max_prepared_transactions: 5,
+            max_locks_per_transaction: 77,
+        };
+        assert_eq!(parse_capacity(&control_file(&capacity)), Ok(capacity));
+        let mut other_version = control_file(&capacity);
+        other_version[8..12].copy_from_slice(&1700u32.to_le_bytes());
+        assert_eq!(parse_capacity(&other_version), Err("control_version"));
+        // A file that stops before the settings, and a setting that is no count.
+        assert_eq!(
+            parse_capacity(&control_file(&capacity)[..190]),
+            Err("control_unreadable")
+        );
+        let mut negative = control_file(&capacity);
+        negative[CAPACITY_OFFSET..CAPACITY_OFFSET + 4].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(parse_capacity(&negative), Err("control_unreadable"));
+    }
+
+    /// The offsets are PostgreSQL 18's `ControlFileData` (checked against 18.6): a server that ran
+    /// with the settings of a class, or with others, leaves exactly those in its control file.
+    #[test]
+    fn the_settings_a_real_server_ran_with_are_in_its_control_file() {
+        use crate::testpg::Cluster;
+        let unusual = "max_connections = 213\nmax_worker_processes = 11\nmax_wal_senders = 7\n\
+                       max_prepared_transactions = 5\nmax_locks_per_transaction = 77\n";
+        for (memory_mib, extra, expected) in [
+            (256, "", Capacity::of_class(256, 25)),
+            (1024, "", Capacity::of_class(1024, 25)),
+            (
+                256,
+                unusual,
+                Capacity {
+                    max_connections: 213,
+                    max_worker_processes: 11,
+                    max_wal_senders: 7,
+                    max_prepared_transactions: 5,
+                    max_locks_per_transaction: 77,
+                },
+            ),
+        ] {
+            let Some(cluster) = Cluster::create("control-settings") else {
+                return;
+            };
+            cluster.configure(memory_mib, None);
+            cluster.append_conf(extra);
+            cluster.start();
+            cluster.stop();
+            let bytes = crate::proof::read_control(&cluster.volume()).unwrap();
+            assert_eq!(parse_capacity(&bytes), Ok(expected), "{memory_mib} MiB");
+        }
     }
 }

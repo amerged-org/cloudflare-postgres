@@ -593,6 +593,8 @@ impl<M: Machine> Core<M> {
         };
         let order = Order {
             database: &job_database,
+            memory_mib: entry.memory_mib,
+            max_connections: entry.max_connections,
             uid: account.uid,
             gid: account.gid,
             source: &from,
@@ -671,13 +673,11 @@ impl<M: Machine> Rebuild<M> {
         }
     }
 }
-impl<M: Machine> Host for Rebuild<M> {
-    async fn start(&self) -> Result<(), Failed> {
-        let core = &self.core;
-        // The restored files are the source's: the agent's own replace them before the start.
-        core.write_configuration(&self.entry, &self.account)
-            .map_err(|_| Failed)?;
-        let started = core
+impl<M: Machine> Rebuild<M> {
+    /// Starts the unit, through admission, and keeps who started.
+    async fn start_unit(&self) -> Result<(), Failed> {
+        let started = self
+            .core
             .start_unit(
                 &self.db,
                 &self.entry,
@@ -696,6 +696,26 @@ impl<M: Machine> Host for Rebuild<M> {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(started.0);
         Ok(())
     }
+}
+impl<M: Machine> Host for Rebuild<M> {
+    async fn start(&self) -> Result<(), Failed> {
+        // The restored files are the source's: the agent's own replace them before the start.
+        self.core
+            .write_configuration(&self.entry, &self.account)
+            .map_err(|_| Failed)?;
+        self.start_unit().await
+    }
+
+    async fn restart(&self) -> Result<(), Failed> {
+        // The database stays admitted, so that no other start takes its memory in between, and
+        // the unit's new invocation is the one the route names.
+        self.core
+            .machine
+            .stop(&self.entry.id)
+            .await
+            .map_err(|_| Failed)?;
+        self.start_unit().await
+    }
 
     async fn promoted(&self) -> Result<Restored, Failed> {
         let core = &self.core;
@@ -708,6 +728,17 @@ impl<M: Machine> Host for Rebuild<M> {
                 .map_err(|_| Failed)?;
             if !rows[0].try_get::<_, bool>(0).map_err(|_| Failed)? {
                 break;
+            }
+            // PostgreSQL pauses a recovery whose WAL raises a parameter above the settings it
+            // runs with, and its postmaster stays up and ready: nothing resumes it, as the
+            // recovery never targets a pause. The query fails when the recovery ended since the
+            // one above, and the next pass finds that.
+            if let Ok(rows) = session
+                .query("SELECT pg_catalog.pg_get_wal_replay_pause_state()", &[])
+                .await
+                && rows[0].try_get::<_, String>(0).map_err(|_| Failed)? != "not paused"
+            {
+                return Err(Failed);
             }
             // The unit may have ended: a recovery that died is not promoted.
             if core
