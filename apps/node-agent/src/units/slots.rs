@@ -192,13 +192,6 @@ pub struct Snapshot {
     pub held: usize,
 }
 
-/// What a start of a slot cost, for the journal event and the wake's detail.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Spawn {
-    /// When the agent asked systemd to start the unit (`CLOCK_MONOTONIC`).
-    pub requested_us: Option<u64>,
-}
-
 /// systemd's account of a slot unit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotUnit {
@@ -1899,7 +1892,10 @@ mod tests {
         assert_eq!(hit.from, SlotFrom::Pool);
         let started = pool.exec(&hit).await.unwrap();
         let timeline = pool.timeline(D2, &started).await.unwrap();
-        assert_eq!((timeline.job_to_fork_us, timeline.fork_to_handoff_us), (None, None));
+        assert_eq!(
+            (timeline.job_to_fork_us, timeline.fork_to_handoff_us),
+            (None, None)
+        );
         // A start that is another invocation's has no timeline: the slot started again since.
         let other = Started {
             invocation_id: "00000000-0000-4000-8000-0000000000ff".into(),

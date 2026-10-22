@@ -367,7 +367,7 @@ mod tests {
     /// the measured variant; the text follows the constant.
     #[test]
     fn the_build_ships_autoprewarm_on_and_the_configuration_follows_it() {
-        assert!(AUTOPREWARM);
+        const { assert!(AUTOPREWARM) };
         let text = conf(256, 1);
         let line = text
             .lines()

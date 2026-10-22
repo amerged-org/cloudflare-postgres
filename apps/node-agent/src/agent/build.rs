@@ -950,6 +950,9 @@ mod tests {
     /// agent comes back with the unbuilt state of the generation, the cluster on the volume and the
     /// backup in the archive.
     async fn after_a_crash_before_built(rig: Rig, entry: &Entry) -> (Rig, Arc<Db>) {
+        // No PostgreSQL survives the node going down, and the build writes the configuration
+        // only where none holds the cluster (`write_configuration` takes the data lock).
+        rig.machine.stop(&entry.id).await.unwrap();
         rig.core
             .files(&entry.id)
             .save(&DatabaseState::new(entry.storage_generation))

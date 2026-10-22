@@ -21,9 +21,7 @@
 //! and the users `pgcf-lab-*`, and is removed again. A database, a slot or a user of the node is
 //! never touched: the lab's pool has its own numbers.
 use super::{
-    ActiveState, DB_ROOT, Error, Units,
-    limits,
-    ready,
+    ActiveState, DB_ROOT, Error, Units, limits, ready,
     slots::{self, Bind, Host, Pool, SlotFrom, slot_uid, slot_unit},
     system::System,
 };
@@ -43,7 +41,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -132,7 +130,7 @@ impl CommandRunner for LabLvm {
 }
 
 /// The lab runs one test at a time: the users, the scratch directory and the units are shared.
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static LABS: AtomicU64 = AtomicU64::new(0);
 
 /// A database of the lab: a volume (an ext4 on a loop device, named as the node's thin volume is,
@@ -157,7 +155,10 @@ impl Database {
         let dir = Path::new(SCRATCH).join(&id);
         fs::create_dir_all(&dir).unwrap();
         let image = dir.join("volume.img");
-        fs::File::create(&image).unwrap().set_len(256 << 20).unwrap();
+        fs::File::create(&image)
+            .unwrap()
+            .set_len(256 << 20)
+            .unwrap();
         let loop_device = sh("losetup", &["-f", "--show", image.to_str().unwrap()]);
         if !Path::new(&loop_device).exists() {
             let number = loop_device.trim_start_matches("/dev/loop");
@@ -319,12 +320,12 @@ fn group_gid(name: &str) -> u32 {
 struct Lab {
     pool: Pool<System<LabLvm>>,
     made_gateway_group: bool,
-    _one_at_a_time: MutexGuard<'static, ()>,
+    _one_at_a_time: tokio::sync::MutexGuard<'static, ()>,
 }
 impl Lab {
     /// The host and a database, in that order: the database goes first at the end.
     async fn new(label: &str) -> (Lab, Database) {
-        let guard = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = ONE_AT_A_TIME.lock().await;
         assert_ne!(
             fs::read_link("/proc/1/ns/mnt").unwrap(),
             fs::read_link("/proc/self/ns/mnt").unwrap(),
@@ -395,14 +396,6 @@ impl Drop for Lab {
     }
 }
 
-/// The processes of a unit's cgroup.
-fn processes(unit: &str) -> Vec<u32> {
-    fs::read_to_string(format!("/sys/fs/cgroup/pgcf.slice/{unit}/cgroup.procs"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect()
-}
 fn signal(pid: u32, name: &str) {
     sh("kill", &[&format!("-{name}"), &pid.to_string()]);
 }
@@ -465,7 +458,12 @@ async fn a_database_runs_in_a_pooled_slot_with_its_limits_set_before_the_order()
         fs::read_link(format!("/proc/{}/exe", started.main_pid)).unwrap(),
         Path::new(POSTGRES).join("postgres")
     );
-    assert_eq!(fs::metadata(format!("/proc/{}", started.main_pid)).unwrap().uid(), slot_uid(900));
+    assert_eq!(
+        fs::metadata(format!("/proc/{}", started.main_pid))
+            .unwrap()
+            .uid(),
+        slot_uid(900)
+    );
     let session = database.agent().await;
     assert_eq!(
         session
@@ -517,9 +515,17 @@ async fn a_database_runs_in_a_pooled_slot_with_its_limits_set_before_the_order()
     assert_eq!(cgroup.as_deref(), Some(slots::slot_cgroup(900).as_str()));
     assert_eq!(invocation.as_deref(), Some(started.invocation_id.as_str()));
     let holder = pool.holder(slot_uid(900)).unwrap();
-    assert!(slots::is_holder(&holder, cgroup.as_deref(), invocation.as_deref()));
+    assert!(slots::is_holder(
+        &holder,
+        cgroup.as_deref(),
+        invocation.as_deref()
+    ));
     let (here, there) = super::system::peer_unit(std::process::id());
-    assert!(!slots::is_holder(&holder, here.as_deref(), there.as_deref()));
+    assert!(!slots::is_holder(
+        &holder,
+        here.as_deref(),
+        there.as_deref()
+    ));
 
     // A second bind of the database is refused while the slot holds it.
     assert!(matches!(
@@ -556,7 +562,10 @@ async fn the_kernel_lets_one_slot_run_a_postmaster_on_a_data_directory_and_postg
     let refused = host.order(other, &database.id).await.unwrap_err();
     assert!(matches!(refused, Error::Refused("held")), "{refused}");
     assert!(
-        started.main_pid == show(&slot_unit(first.slot), "MainPID").parse::<u32>().unwrap(),
+        started.main_pid
+            == show(&slot_unit(first.slot), "MainPID")
+                .parse::<u32>()
+                .unwrap(),
         "the first postmaster runs on"
     );
     // The supervisor that refused ends: the slot may hold mounts and is not used again.
@@ -581,7 +590,10 @@ async fn the_kernel_lets_one_slot_run_a_postmaster_on_a_data_directory_and_postg
         match pool.bind(&database.id, &bind).await {
             Ok(again) => break pool.exec(&again).await.unwrap(),
             Err(Error::Held) => {
-                assert!(began.elapsed() < Duration::from_secs(40), "the unit never ended");
+                assert!(
+                    began.elapsed() < Duration::from_secs(40),
+                    "the unit never ended"
+                );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(error) => panic!("{error}"),
@@ -590,7 +602,11 @@ async fn the_kernel_lets_one_slot_run_a_postmaster_on_a_data_directory_and_postg
     assert_ne!(restarted.invocation_id, started.invocation_id);
     assert_eq!(
         show(&slot_unit(first.slot), "ActiveState"),
-        if first.slot == restarted.slot.unwrap().slot { "active" } else { "inactive" },
+        if first.slot == restarted.slot.unwrap().slot {
+            "active"
+        } else {
+            "inactive"
+        },
     );
     let session = database.agent().await;
     session.query("SELECT 1::int4", &[]).await.unwrap();
@@ -636,7 +652,10 @@ async fn postgresql_alone_accepts_a_second_postmaster_of_another_slot_on_the_sam
             ])
             .arg(database.data())
             .args(["-c", "listen_addresses=", "-c"])
-            .arg(format!("unix_socket_directories={}", database.sockets.display()))
+            .arg(format!(
+                "unix_socket_directories={}",
+                database.sockets.display()
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -709,7 +728,10 @@ async fn readiness_by_inotify_is_no_later_than_the_postmasters_ready_to_the_noti
             .arg("-D")
             .arg(database.data())
             .args(["-c", "listen_addresses=", "-c"])
-            .arg(format!("unix_socket_directories={}", database.sockets.display()))
+            .arg(format!(
+                "unix_socket_directories={}",
+                database.sockets.display()
+            ))
             .env("NOTIFY_SOCKET", &notify)
             .uid(DB_ID)
             .gid(DB_ID)
@@ -733,10 +755,9 @@ async fn readiness_by_inotify_is_no_later_than_the_postmasters_ready_to_the_noti
                 }
             }
         };
-        let ((observed, _), notified) = tokio::time::timeout(
-            Duration::from_secs(30),
-            async { tokio::join!(waiting, notified) },
-        )
+        let ((observed, _), notified) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(waiting, notified)
+        })
         .await
         .expect("PostgreSQL did not become ready");
         // Negative: the agent knew before systemd would have.
@@ -767,9 +788,12 @@ async fn a_slot_that_served_has_the_idle_limits_again_after_its_refill() {
     let bound = pool.bind(&database.id, &database.bind(512)).await.unwrap();
     pool.exec(&bound).await.unwrap();
     assert!(
-        pool.set(&database.id, &[limits::cpu_quota(std::num::NonZeroU32::new(250))])
-            .await
-            .unwrap()
+        pool.set(
+            &database.id,
+            &[limits::cpu_quota(std::num::NonZeroU32::new(250))]
+        )
+        .await
+        .unwrap()
     );
     let unit = slot_unit(bound.slot);
     assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "250ms");
@@ -813,7 +837,10 @@ async fn eight_idle_slots_cost_less_than_the_idle_ceiling_each() {
     for slot in 900..908 {
         let bytes: u64 = read(slot, "memory.current").trim().parse().unwrap();
         let peak: u64 = read(slot, "memory.peak").trim().parse().unwrap_or(0);
-        assert!(peak < 16 << 20, "the build of a slot peaked at {peak} bytes");
+        assert!(
+            peak < 16 << 20,
+            "the build of a slot peaked at {peak} bytes"
+        );
         println!(
             "slot_lab idle slot {slot}: memory.current={} KiB memory.peak={} KiB anon={} KiB file={} KiB slab={} KiB kernel={} KiB pids={}",
             bytes / 1024,
@@ -829,7 +856,10 @@ async fn eight_idle_slots_cost_less_than_the_idle_ceiling_each() {
     let (_, p95) = report("idle slot memory.current in MiB", current.clone());
     // The ceiling of the unit file (32 MiB) holds each with room to spare.
     assert!(current.iter().all(|mib| *mib < 28.0), "{current:?}");
-    println!("slot_lab eight idle slots together: {:.1} MiB (p95 of one: {p95:.1})", current.iter().sum::<f64>());
+    println!(
+        "slot_lab eight idle slots together: {:.1} MiB (p95 of one: {p95:.1})",
+        current.iter().sum::<f64>()
+    );
 }
 
 /// An agent that dies loses its table and nothing else: the slots run on, and the next agent reads
@@ -851,7 +881,9 @@ async fn slots_are_adopted_after_the_agent_dies_and_a_boot_leaves_nothing_to_ado
         units.sort_by_key(|unit| unit.slot);
         units
             .into_iter()
-            .filter(|unit| POOL.contains(&unit.slot) && !matches!(unit.active, ActiveState::Inactive))
+            .filter(|unit| {
+                POOL.contains(&unit.slot) && !matches!(unit.active, ActiveState::Inactive)
+            })
             .map(|unit| (unit.slot, unit.main_pid, unit.invocation_id))
             .collect()
     };
@@ -860,7 +892,7 @@ async fn slots_are_adopted_after_the_agent_dies_and_a_boot_leaves_nothing_to_ado
     // database's PostgreSQL serving, the same processes and the same invocations.
     let next = lab.another_pool(&database).await;
     let adopted = next.adopt().await.unwrap();
-    assert_eq!(adopted.serving, [database.id.clone()]);
+    assert_eq!(adopted.serving, std::slice::from_ref(&database.id));
     assert_eq!(adopted.idle.len(), 3, "{adopted:?}");
     assert!(adopted.tainted.is_empty());
     let after: Vec<_> = {
@@ -868,7 +900,9 @@ async fn slots_are_adopted_after_the_agent_dies_and_a_boot_leaves_nothing_to_ado
         units.sort_by_key(|unit| unit.slot);
         units
             .into_iter()
-            .filter(|unit| POOL.contains(&unit.slot) && !matches!(unit.active, ActiveState::Inactive))
+            .filter(|unit| {
+                POOL.contains(&unit.slot) && !matches!(unit.active, ActiveState::Inactive)
+            })
             .map(|unit| (unit.slot, unit.main_pid, unit.invocation_id))
             .collect()
     };
@@ -876,7 +910,11 @@ async fn slots_are_adopted_after_the_agent_dies_and_a_boot_leaves_nothing_to_ado
     let again = next.wait_started(&database.id).await.unwrap();
     assert_eq!(
         (again.main_pid, again.invocation_id.as_str(), again.uid),
-        (started.main_pid, started.invocation_id.as_str(), started.uid)
+        (
+            started.main_pid,
+            started.invocation_id.as_str(),
+            started.uid
+        )
     );
     assert!(matches!(
         next.bind(&database.id, &database.bind(512)).await,
@@ -893,7 +931,10 @@ async fn slots_are_adopted_after_the_agent_dies_and_a_boot_leaves_nothing_to_ado
     let adopted = latest.adopt().await.unwrap();
     assert_eq!(adopted.tainted, [(half.slot, database.id.clone())]);
     assert_eq!(show(&slot_unit(half.slot), "ActiveState"), "inactive");
-    latest.bind(&database.id, &database.bind(512)).await.unwrap();
+    latest
+        .bind(&database.id, &database.bind(512))
+        .await
+        .unwrap();
     assert!(latest.stop(&database.id).await.unwrap());
 
     // A boot: what lived in `/run` and in memory is gone, and the users of the slots stay.
@@ -907,7 +948,10 @@ async fn slots_are_adopted_after_the_agent_dies_and_a_boot_leaves_nothing_to_ado
     assert_eq!(adopted, slots::Adopted::default());
     assert!(booted.host().users().contains(&900), "the users stay");
     assert!(booted.refill(2).await.unwrap().is_some());
-    let bound = booted.bind(&database.id, &database.bind(512)).await.unwrap();
+    let bound = booted
+        .bind(&database.id, &database.bind(512))
+        .await
+        .unwrap();
     assert_eq!(bound.from, SlotFrom::Pool);
     booted.exec(&bound).await.unwrap();
     assert!(booted.stop(&database.id).await.unwrap());

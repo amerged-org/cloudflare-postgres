@@ -218,7 +218,10 @@ mod tests {
         let fields = event["fields"].as_object().unwrap();
         assert_eq!(fields.len(), 12, "{event}");
         assert_eq!(fields["stop"], "budget");
-        assert_eq!((fields["set"].as_str(), fields["hook"].as_str()), (Some("list"), Some("ready")));
+        assert_eq!(
+            (fields["set"].as_str(), fields["hook"].as_str()),
+            (Some("list"), Some("ready"))
+        );
         assert!(crate::node_link::contract_valid(
             "NodeObservationReport",
             &json!({"observed_at": at, "databases": [], "orders": [], "events": [event]})
@@ -240,7 +243,7 @@ mod tests {
     /// and says what it did; the catalogs are not read at the bind in the variant a build ships.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_wake_reads_the_hot_list_ahead_from_ready_and_the_catalogs_only_when_the_variant_says_so()
-    {
+     {
         let Some(rig) = Rig::with_timing("readahead-default", timing()).await else {
             return;
         };
@@ -273,46 +276,59 @@ mod tests {
         assert_eq!(db.phase(), Phase::Ready);
     }
 
-    /// The variant that reads the catalogs at the bind does, before the database is ready and
-    /// whatever the list says; the variant that reads nothing reads nothing.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_catalogs_are_read_at_the_bind_in_their_variant_and_nothing_in_the_variant_off() {
-        for (variant, label, sets) in [
-            (Prefetch::CatalogsAndHotList, "readahead-both", vec!["catalog", "list"]),
-            (Prefetch::Off, "readahead-off", vec![]),
-        ] {
-            let Some(rig) = Rig::with_prefetch(label, variant).await else {
-                return;
-            };
-            let (entry, db) = rig.create().await;
-            assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
-            let before = events(&entry.id, "prefetch").len();
-            let result = rig.core.wake(&Rig::ticket(&entry)).await;
-            assert_eq!(result.outcome, Outcome::Started, "{result:?}");
-            if sets.is_empty() {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            } else {
-                eventually(10, "the readings", || {
-                    events(&entry.id, "prefetch").len() >= before + sets.len()
-                })
-                .await;
-            }
-            let mut found: Vec<String> = events(&entry.id, "prefetch")
-                .iter()
-                .skip(before)
-                .map(|event| event["fields"]["set"].as_str().unwrap().to_string())
-                .collect();
-            found.sort();
-            assert_eq!(found, sets, "{variant:?}");
-            if sets.contains(&"catalog") {
-                let catalog = events(&entry.id, "prefetch")
-                    .into_iter()
-                    .find(|event| event["fields"]["set"] == "catalog")
-                    .unwrap();
-                assert_eq!(catalog["fields"]["hook"], "bind");
-                assert!(catalog["fields"]["files"].as_u64() >= Some(3), "{catalog}");
-            }
+    /// A wake in `variant` reads ahead exactly the `sets`, in this order of names. One rig, one
+    /// test: a second rig in the same test ends the first one's machine on a worker of the
+    /// runtime, which waits for its PostgreSQL to stop and starves the second rig's jobs.
+    async fn wake_in(variant: Prefetch, label: &str, sets: &[&str]) {
+        let Some(rig) = Rig::with_prefetch(label, variant).await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let before = events(&entry.id, "prefetch").len();
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(result.outcome, Outcome::Started, "{result:?}");
+        if sets.is_empty() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        } else {
+            eventually(10, "the readings", || {
+                events(&entry.id, "prefetch").len() >= before + sets.len()
+            })
+            .await;
         }
+        let mut found: Vec<String> = events(&entry.id, "prefetch")
+            .iter()
+            .skip(before)
+            .map(|event| event["fields"]["set"].as_str().unwrap().to_string())
+            .collect();
+        found.sort();
+        assert_eq!(found, sets, "{variant:?}");
+        if sets.contains(&"catalog") {
+            let catalog = events(&entry.id, "prefetch")
+                .into_iter()
+                .find(|event| event["fields"]["set"] == "catalog")
+                .unwrap();
+            assert_eq!(catalog["fields"]["hook"], "bind");
+            assert!(catalog["fields"]["files"].as_u64() >= Some(3), "{catalog}");
+        }
+    }
+
+    /// The variant that reads the catalogs at the bind does, before the database is ready and
+    /// whatever the list says.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_catalogs_are_read_at_the_bind_in_their_variant() {
+        wake_in(
+            Prefetch::CatalogsAndHotList,
+            "readahead-both",
+            &["catalog", "list"],
+        )
+        .await;
+    }
+
+    /// The variant that reads nothing reads nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nothing_is_read_ahead_in_the_variant_off() {
+        wake_in(Prefetch::Off, "readahead-off", &[]).await;
     }
 
     /// A database that never stopped cleanly has no list, and the agent says so instead of
