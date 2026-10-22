@@ -65,10 +65,12 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
   Declaring a node lost deletes, after its Tunnel, the node's records under `NODE_GATEWAY_DOMAIN`:
   the gateway's `pgcf-node-<id>`, the shell's `pgcf-shell-<id>` and the shell's former
   `pgcf-node-<id>-ssh`, each only if it points at one of the node's own Tunnels; a record with that
-  name that points elsewhere, and every other record of the zone, is left. Without the DNS
-  permission, or without `NODE_GATEWAY_ZONE_ID` and `NODE_GATEWAY_DOMAIN`, the Tunnel step of the
-  fence fails (`tunnel_delete_failed`, or `fence_unconfigured` when the zone is missing) and is
-  retried each minute, and the node is not ordered off until it holds. The Access setup script
+  name that points elsewhere, and every other record of the zone, is left. The Tunnel is deleted
+  first and whatever the zone is: it is what fences the node. Without the DNS permission, or
+  without `NODE_GATEWAY_ZONE_ID` and `NODE_GATEWAY_DOMAIN` (or with values that are not a zone and
+  its domain), the records of the same step fail after the Tunnel is gone (`tunnel_delete_failed`,
+  or `fence_unconfigured` when the zone is missing); the step is retried whole each minute, and the
+  node is not ordered off until it holds. The Access setup script
   below takes its own token (`PGCF_CLOUDFLARE_API_TOKEN`), and `INFRASTRUCTURE_BACKUP_CF_TOKEN` is
   a third one; neither is this one.
 - `NODE_SHELL_HOSTNAME` is off unless it is the string `true`. The node's shell hostname

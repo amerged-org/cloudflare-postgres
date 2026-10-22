@@ -29,9 +29,10 @@ import type { FenceActions } from "./node-loss.ts";
  * the node's own Tunnels, deleted ones included: a record that has the node's name but points
  * elsewhere is not the node's. They are deleted after the Tunnel, which is what fences the node,
  * and a Tunnel that is already deleted is found by the same listing, so a step whose records
- * failed is repeated whole and a repeat of a finished one changes nothing. The zone is needed
- * before anything is deleted, for a node that made a Tunnel: with none the step fails closed
- * (`fence_unconfigured`) and the node's records would be left.
+ * failed is repeated whole and a repeat of a finished one changes nothing. The Tunnel is deleted
+ * whatever the zone is, because it is what fences the node: a node that has a Tunnel and no usable
+ * zone has its Tunnel deleted, and then the step fails (`fence_unconfigured`) and is repeated until
+ * the zone is there to look for the node's records.
  */
 
 export interface FenceServices {
@@ -62,8 +63,6 @@ export function fenceActions(services: FenceServices): FenceActions {
         isNodeZone(cloudflare.zone.id, cloudflare.zone.domain)
           ? cloudflare.zone
           : null;
-      if (zone === null && target.tunnelMade)
-        throw new Error("fence_unconfigured");
       const call = cloudflareApi(cloudflare.token, cloudflare.fetcher);
       const base = `/accounts/${target.accountId}/cfd_tunnel`,
         name = nodeTunnelName(target.nodeId);
@@ -93,7 +92,9 @@ export function fenceActions(services: FenceServices): FenceActions {
         await call("DELETE", `${base}/${tunnel.id}`);
       }
       if (found === 0 && target.tunnelMade) throw new Error("tunnel_unknown");
-      if (zone === null || targets.size === 0) return;
+      if (targets.size === 0) return;
+      // The Tunnel is deleted whatever the zone is; records that cannot be looked for fail the step.
+      if (zone === null) throw new Error("fence_unconfigured");
       const { gateway, shell, legacyShell } = nodeHostnames(
         target.nodeId,
         zone.domain,

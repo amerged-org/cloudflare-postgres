@@ -182,18 +182,27 @@ it("finishes the records of a Tunnel an earlier run deleted, and then changes no
   expect(api.calls.slice(calls).filter((c) => c.method !== "GET")).toEqual([]);
 });
 
-it("does not look for records of a node without any Tunnel, and fails closed before deleting anything when it cannot", async () => {
+it("looks for no records of a node without any Tunnel, and needs no zone for it", async () => {
   const none = cloudflareState({ records: [cname("rec0", GATEWAY, TUNNEL)] });
   // A node that never read its credentials made no Tunnel and no record.
   await withZone(none.fetcher).deleteTunnel({ ...target, tunnelMade: false });
   expect(none.calls.every((c) => !c.url.includes("/dns_records"))).toBe(true);
   expect(none.records).toHaveLength(1);
-  // A node that made its Tunnel needs the zone that holds its records: without it nothing is
-  // deleted, so the step is not half done.
+  const unused = cloudflareState();
+  await fenceActions({
+    cloudflare: { token: TOKEN, zone: null, fetcher: unused.fetcher },
+    contabo: null,
+  }).deleteTunnel({ ...target, tunnelMade: false });
+  expect(unused.calls.every((c) => c.method === "GET")).toBe(true);
+});
+
+it("deletes the Tunnel of a node whatever the zone is, and then fails for the records, so that the step is repeated whole", async () => {
+  // The Tunnel is what fences the node: a zone that is missing or unusable (a configuration slip,
+  // or a gateway that has no public hostname any more) must not leave it alive.
   for (const unusable of [null, { id: "not-a-zone", domain: DOMAIN }]) {
     const api = cloudflareState({
       tunnels: [{ id: TUNNEL, name: nodeTunnelName(NODE) }],
-      records: [cname("rec0", GATEWAY, TUNNEL)],
+      records: [cname("rec0", GATEWAY, TUNNEL), cname("rec1", SHELL, TUNNEL)],
     });
     await expect(
       fenceActions({
@@ -201,15 +210,25 @@ it("does not look for records of a node without any Tunnel, and fails closed bef
         contabo: null,
       }).deleteTunnel(target),
     ).rejects.toThrow("fence_unconfigured");
-    expect(api.calls).toEqual([]);
-    expect(api.tunnels[0]!.deleted_at).toBeUndefined();
+    expect(api.tunnels[0]!.deleted_at).toBeDefined();
+    // No record is looked at, let alone deleted, in a zone that is not known.
+    expect(api.calls.every((c) => !c.url.includes("/dns_records"))).toBe(true);
+    expect(api.records).toHaveLength(2);
+    // The repeat, once the zone is there, finds the deleted Tunnel and deletes the records.
+    await withZone(api.fetcher).deleteTunnel(target);
+    expect(api.records).toEqual([]);
   }
-  // A node that never read its credentials needs no zone.
-  const unused = cloudflareState();
-  await fenceActions({
-    cloudflare: { token: TOKEN, zone: null, fetcher: unused.fetcher },
-    contabo: null,
-  }).deleteTunnel({ ...target, tunnelMade: false });
+});
+
+it("fails for the Tunnel before it fails for the zone: a Tunnel that is not found is unknown, with or without the zone", async () => {
+  const api = cloudflareState({ records: [cname("rec0", GATEWAY, TUNNEL)] });
+  await expect(
+    fenceActions({
+      cloudflare: { token: TOKEN, zone: null, fetcher: api.fetcher },
+      contabo: null,
+    }).deleteTunnel(target),
+  ).rejects.toThrow("tunnel_unknown");
+  expect(api.calls.every((c) => c.method === "GET")).toBe(true);
 });
 
 it("names the Tunnel like the node's addition, so that enrollment and fencing agree", () => {
@@ -310,7 +329,7 @@ it("fails on an answer it cannot trust, without the token or the answer in the e
   }
 });
 
-it("takes the zone of the records from the Worker's variables, and fails closed without them", async () => {
+it("takes the zone of the records from the Worker's variables, and keeps the records for a repeat without them", async () => {
   const api = cloudflareState({
     tunnels: [{ id: TUNNEL, name: nodeTunnelName(NODE) }],
     records: [cname("rec0", GATEWAY, TUNNEL), cname("rec1", SHELL, TUNNEL)],
@@ -318,10 +337,12 @@ it("takes the zone of the records from the Worker's variables, and fails closed 
   vi.stubGlobal("fetch", api.fetcher);
   try {
     const env = { CLOUDFLARE_API_TOKEN: TOKEN } as Env;
+    // Without the variables the Tunnel is deleted all the same, and the step fails for the records.
     await expect(fenceActionsFromEnv(env).deleteTunnel(target)).rejects.toThrow(
       "fence_unconfigured",
     );
-    expect(api.calls).toEqual([]);
+    expect(api.tunnels[0]!.deleted_at).toBeDefined();
+    expect(api.records).toHaveLength(2);
     await fenceActionsFromEnv({
       ...env,
       NODE_GATEWAY_ZONE_ID: ZONE,
