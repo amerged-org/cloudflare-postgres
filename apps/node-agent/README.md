@@ -187,6 +187,16 @@ to the database's own prefix, and answers `ok` to an archive request only when t
 R2 and the segment is in the fsynced upload log. The agent never deletes in R2; retention runs in the
 Worker. The concurrency and memory limits of the jobs come from the policy.
 
+A base backup is due when the newest of the database's timeline is a day old (plan 7.6). It is taken
+at the database's idle sleep, and daily for an always-warm database, never by waking one. It is put
+off while a start is queued or in flight on the node, and in the first minute after the database's
+own wake, so that the first requests of a cold database do not share the disk and the CPU with it
+(`backup_waits`, `backup_put_off` in the agent's log). Ten minutes after it was first put off (the
+wait after a failed backup) it is taken whatever the node does, at the next idle pass or idle sleep
+of the database. WAL archiving goes on meanwhile, so only the age of the newest base backup, and
+the WAL a restore replays, grow. The disk side is in `pgcfbackup.slice` (`infra/node-image`): the
+read and write bandwidth of the jobs on the data disk is capped.
+
 ## Fencing, updates and diagnostics
 
 - **Fencing** (`fence.rs`). A `fence` order and the `superseded` orders of a lost node are written

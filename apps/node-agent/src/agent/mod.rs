@@ -175,10 +175,14 @@ pub(crate) struct View {
     pub roles_blocked: Vec<String>,
     /// A recovery runs or waits for its retry.
     pub recovering: bool,
-    /// Since when the unit runs, for the usage meter.
+    /// Since when the unit runs: the usage meter's, and the first minute that a due base backup
+    /// waits for (`backup_if_due`).
     pub awake_since_ms: Option<i64>,
     /// When the last base backup that was due failed (`backup_if_due`).
     pub backup_failed_ms: Option<i64>,
+    /// When the base backup that is due was first put off for a wake (`backup_if_due`): the start
+    /// of the longest wait it may have.
+    pub backup_put_off_ms: Option<i64>,
     /// The node has decided on this database in this run.
     pub adopted: bool,
     /// A task runs the decision again, with growing waits, until the node has made it
@@ -213,6 +217,7 @@ impl View {
             recovering: false,
             awake_since_ms: None,
             backup_failed_ms: None,
+            backup_put_off_ms: None,
             adopted: false,
             retrying: false,
             queued: false,

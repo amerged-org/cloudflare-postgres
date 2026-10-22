@@ -14,3 +14,16 @@ MemoryAccounting=yes
 TasksAccounting=yes
 MemoryMax=512M
 MemorySwapMax=0
+# The data disk's I/O scheduler is none, so IOWeight= above divides nothing: a base backup, a WAL
+# upload or a restore meets a cold database's start on the disk without a limit. The kernel
+# (Debian 13, 6.12) has no io.latency (CONFIG_BLK_CGROUP_IOLATENCY is unset) and io.cost needs a
+# cost model per device; the byte limits of blk-throttle (io.max) need neither. The device is the
+# disk of the LVM partition that the first boot labels pgcf-lvm (repart.d/30-lvm.conf): systemd
+# follows the link to the partition and takes its whole disk, which also holds the root
+# filesystem where barman spools, and the limits count the jobs of the slice together. One big job
+# runs at a time (BIG_JOBS), so reads and writes seldom peak together. 32 MB/s is 3.8 times the
+# 8.5 MB/s a base backup moved in the lab and 30 % of the 106 MB/s that EU1's disk reads at random
+# (units count K, M, G in thousands). A change of this file reaches the slice with the next job
+# that starts in it, not at the reload.
+IOReadBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm 32M
+IOWriteBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm 32M

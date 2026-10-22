@@ -55,6 +55,28 @@ const TASKS_MAX: u64 = 64;
 const BACKUP_MAX_AGE_MS: i64 = 24 * 3_600_000;
 /// How long a base backup that failed waits before it is tried again.
 pub(crate) const BACKUP_RETRY_MS: i64 = 600_000;
+/// How long after its own wake a database's due base backup waits, so that the first requests of a
+/// cold database do not share the disk and the CPU with its backup.
+pub(crate) const BACKUP_AFTER_WAKE_MS: i64 = 60_000;
+/// The longest a due base backup is put off, counted from the first time it was: the same wait as
+/// after a failed one. WAL archiving goes on meanwhile, so the archive's RPO does not change; only
+/// the age of the newest base backup, and with it the WAL a restore replays, grows by this much.
+pub(crate) const BACKUP_PUT_OFF_MAX_MS: i64 = BACKUP_RETRY_MS;
+
+/// Whether a due base backup is put off now (`backup_if_due`): the database woke less than a
+/// minute ago (`awake_since_ms`), or a start is queued or in flight on the node (`wakes`), unless
+/// it has been put off for the longest it may (`put_off_since_ms`: when it first was).
+pub(crate) fn backup_waits(
+    awake_since_ms: Option<i64>,
+    wakes: usize,
+    put_off_since_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    if put_off_since_ms.is_some_and(|since| now_ms - since >= BACKUP_PUT_OFF_MAX_MS) {
+        return false;
+    }
+    wakes > 0 || awake_since_ms.is_some_and(|since| now_ms - since < BACKUP_AFTER_WAKE_MS)
+}
 
 /// Whether a base backup is due (plan 7.6): there is none of the timeline the database runs on
 /// (`None`: not asked), or the newest is older than a day. It is asked only of a database that
@@ -314,13 +336,21 @@ impl<M: Machine> Core<M> {
 
     /// The base backup that is due of a database that runs (plan 7.6): before an idle sleep, and
     /// daily for an always-warm database. A database is never woken for one. `Ok(false)` when
-    /// none is due, or one failed a short while ago.
+    /// none is due, or one failed a short while ago, or it is put off: not in the first minute
+    /// after the database's own wake, and not while a start is queued or in flight on the node, so
+    /// that the first requests of a cold database do not share the disk and the CPU with a
+    /// backup (`backup_waits`). A put-off backup is asked again at the next idle pass, and at the
+    /// next idle sleep of a database that sleeps; WAL archiving goes on meanwhile.
     pub(crate) async fn backup_if_due(&self, db: &Db, entry: &Entry) -> Result<bool, &'static str> {
         let now = super::now_ms();
-        let (held, failed) = {
+        let (held, failed, awake_since, put_off) = {
             let view = db.view();
-            let held = view.state.as_ref().and_then(|state| state.backup.clone());
-            (held, view.backup_failed_ms)
+            (
+                view.state.as_ref().and_then(|state| state.backup.clone()),
+                view.backup_failed_ms,
+                view.awake_since_ms,
+                view.backup_put_off_ms,
+            )
         };
         if failed.is_some_and(|failed| now - failed < BACKUP_RETRY_MS) {
             return Ok(false);
@@ -333,6 +363,25 @@ impl<M: Machine> Core<M> {
         drop(session);
         let timeline = u32::try_from(identity.timeline).map_err(|_| "backup_failed")?;
         if !backup_due(held.as_ref(), Some(timeline), now) {
+            if put_off.is_some() {
+                self.set(db, |view| view.backup_put_off_ms = None);
+            }
+            return Ok(false);
+        }
+        let wakes = self
+            .admission
+            .snapshot()
+            .await
+            .map_or(0, |awake| awake.starting + awake.queued);
+        if backup_waits(awake_since, wakes, put_off, now) {
+            if put_off.is_none() {
+                self.set(db, |view| view.backup_put_off_ms = Some(now));
+                crate::timing::emit_event(serde_json::json!({
+                    "event": "backup_put_off", "database_id": db.id,
+                    "wakes_on_node": wakes,
+                    "age_of_wake_ms": awake_since.map(|since| now - since),
+                }));
+            }
             return Ok(false);
         }
         // Minutes for a large database, under the flow of a database that is served: a burst of a
@@ -353,6 +402,7 @@ impl<M: Machine> Core<M> {
         .await;
         self.set(db, |view| {
             view.backup_failed_ms = taken.is_err().then_some(now);
+            view.backup_put_off_ms = None;
         });
         taken.map(|()| true)
     }
@@ -787,6 +837,32 @@ mod tests {
 
     fn report(observation: Value) -> Value {
         json!({"observed_at": "2026-10-18T10:11:12.345Z", "databases": [observation], "orders": []})
+    }
+
+    #[test]
+    fn a_due_base_backup_waits_for_a_wake_on_the_node_and_the_first_minute_of_its_database_but_not_for_ever()
+     {
+        let now = 50_000_000;
+        let hours_ago = |hours: i64| Some(now - hours * 3_600_000);
+        // A quiet node and a database that woke long ago, or whose wake is not known: it starts.
+        assert!(!backup_waits(hours_ago(1), 0, None, now));
+        assert!(!backup_waits(None, 0, None, now));
+        // The database's first minute is its own: 59.999 s is inside it, 60 s is not.
+        assert!(backup_waits(Some(now - 59_999), 0, None, now));
+        assert!(!backup_waits(
+            Some(now - BACKUP_AFTER_WAKE_MS),
+            0,
+            None,
+            now
+        ));
+        // A start queued or in flight on the node, whichever database it is for.
+        assert!(backup_waits(hours_ago(1), 1, None, now));
+        assert!(backup_waits(hours_ago(1), 7, None, now));
+        // Put off for the longest it may be, it starts whatever the node does; a moment less, not.
+        let since = now - BACKUP_PUT_OFF_MAX_MS;
+        assert!(!backup_waits(Some(now - 1), 3, Some(since), now));
+        assert!(backup_waits(Some(now - 1), 3, Some(since + 1), now));
+        assert!(!backup_waits(hours_ago(1), 0, Some(since + 1), now));
     }
 
     #[test]
