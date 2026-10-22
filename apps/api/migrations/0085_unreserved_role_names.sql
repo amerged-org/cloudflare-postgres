@@ -1,16 +1,19 @@
 -- SPDX-License-Identifier: Apache-2.0
--- Contract: the role names of the Kubernetes runtime are ordinary customer roles, and the node's own
--- backup role is not (plan W2-C).
+-- Contract: the role names of the Kubernetes runtime are ordinary customer roles, and the names the
+-- node or PostgreSQL itself refuses are not (plan W2-C).
 --
--- `roles.name` refused `streaming_replica` and `cnpg_*` in a column CHECK, next to what PostgreSQL
--- reserves itself. SQLite cannot change a CHECK in place, so the table is built again without those
--- two terms and with one new one, `pgcf_backup`: the role barman's base backups log in as, which the
--- node agent creates and never restores. A customer role of that name would be altered, lose the
--- privileges of the backup role and, because PostgreSQL cannot drop it, leave that database without
--- base backups for good. Every row is copied unchanged: the credential, the attributes, the
--- tombstones. What the name still refuses is `postgres`, `pgcf_backup`, the `pg_` prefix and
--- anything that is not a lower-case identifier of 1 to 63 characters. Nothing references `roles`,
--- so no foreign key is in play.
+-- `roles.name` refused `streaming_replica` and `cnpg_*` in a column CHECK, next to `postgres` and
+-- the `pg_` prefix. SQLite cannot change a CHECK in place, so the table is built again without those
+-- two terms and with three new ones. `pgcf_backup` is the role barman's base backups log in as,
+-- which the node agent creates and never restores: a customer role of that name would be altered,
+-- lose the privileges of the backup role and, because PostgreSQL cannot drop it, leave that
+-- database without base backups for good. `public` and `none` are names PostgreSQL itself refuses
+-- in CREATE ROLE ("role name is reserved"), quoted or not; D1 took them until now, and a role of
+-- either name stops its database from waking, because the node's role step fails at every start.
+-- Every row is copied unchanged: the credential, the attributes, the tombstones. What the name
+-- still refuses is `postgres`, `pgcf_backup`, `public`, `none`, the `pg_` prefix and anything that
+-- is not a lower-case identifier of 1 to 63 characters. Nothing references `roles`, so no foreign
+-- key is in play.
 --
 -- Deploy order. This migration, the API Worker and the Edge Worker come after the node release that
 -- accepts these names (R-2) is observed on every node, and every image a node can be installed or
@@ -21,15 +24,17 @@
 -- change until R-2 is observed on every node, deploy no API Worker from main and apply no
 -- `wrangler d1 migrations apply`, which applies every pending migration, this one included.
 -- Check before R-2 and again before this migration that no row of `roles`, tombstones included, is
--- named `pgcf_backup`: the CHECK below refuses the copy of such a row and the migration stops, and
--- a node on R-2 refuses the page of its database.
+-- named `pgcf_backup`, `public` or `none`: R-2 refuses the page of a database that holds one (the
+-- node cannot create it, or it would take the backup role), and the CHECK below refuses the copy of
+-- such a row and the migration stops. These three names are the whole narrowing of this change; the
+-- names it frees were refused before.
 
 CREATE TABLE roles_next (
   database_id TEXT NOT NULL REFERENCES databases(id),
   name TEXT NOT NULL
     CHECK (length(name) BETWEEN 1 AND 63 AND substr(name, 1, 1) BETWEEN 'a' AND 'z'
       AND NOT name GLOB '*[^a-z0-9_]*'
-      AND name NOT IN ('postgres', 'pgcf_backup') AND name NOT GLOB 'pg_*'),
+      AND name NOT IN ('postgres', 'pgcf_backup', 'public', 'none') AND name NOT GLOB 'pg_*'),
   owner INTEGER NOT NULL DEFAULT 0 CHECK (owner IN (0, 1)),
   -- AES-GCM ciphertext and IV (base64url), key ID; AAD is "<database_id>|<name>|<kid>".
   password_ciphertext TEXT NOT NULL CHECK (length(password_ciphertext) BETWEEN 1 AND 512),

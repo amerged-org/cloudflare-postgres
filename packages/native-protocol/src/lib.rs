@@ -71,7 +71,15 @@ mod tests {
 
     #[test]
     fn the_gateway_refuses_the_reserved_roles_and_nothing_else() {
-        for name in ["postgres", "pg_monitor", "pgcf_backup", "App", ""] {
+        for name in [
+            "postgres",
+            "pg_monitor",
+            "pgcf_backup",
+            "public",
+            "none",
+            "App",
+            "",
+        ] {
             assert!(!valid_role(name), "{name}");
         }
         for name in [
@@ -80,6 +88,8 @@ mod tests {
             "streaming_replica",
             "pgcf_maintenance",
             "pgcf_backups",
+            "public_reader",
+            "nonesuch",
         ] {
             assert!(valid_role(name), "{name}");
         }

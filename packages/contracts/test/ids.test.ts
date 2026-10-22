@@ -79,8 +79,15 @@ describe("ids", () => {
     expect(RegionId.safeParse("a".repeat(33)).success).toBe(false);
   });
 
-  it("rejects the names the node needs for itself: postgres, pg_* and the backup role", () => {
-    for (const name of ["postgres", "pg_monitor", "pg_", "pgcf_backup"]) {
+  it("rejects the names the node needs for itself and the names PostgreSQL refuses: postgres, pg_*, the backup role, public and none", () => {
+    for (const name of [
+      "postgres",
+      "pg_monitor",
+      "pg_",
+      "pgcf_backup",
+      "public",
+      "none",
+    ]) {
       expect(isReservedRoleName(name)).toBe(true);
       expect(isRoleName(name)).toBe(false);
       expect(RoleName.safeParse(name).success).toBe(false);
@@ -97,6 +104,13 @@ describe("ids", () => {
       "cnpg_pooler_pgbouncer",
       "pgcf_maintenance",
       "pgcf_backup2",
+      // PostgreSQL refuses `CREATE ROLE public` and `none` by exact name; near misses are fine, and
+      // so are the keywords it accepts as a quoted role name.
+      "public_reader",
+      "nonesuch",
+      "current_user",
+      "session_user",
+      "current_role",
       "a" + "b".repeat(62),
     ]) {
       expect(isReservedRoleName(name)).toBe(false);

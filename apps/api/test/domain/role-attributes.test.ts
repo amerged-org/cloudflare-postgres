@@ -173,6 +173,11 @@ describe("role attributes", () => {
       { name: "postgres" },
       { name: "pg_monitor" },
       { name: "pgcf_backup" },
+      // PostgreSQL refuses `CREATE ROLE public` and `none`: such a role would be registered, fail at
+      // the node and stop its database from waking.
+      { name: "public" },
+      { name: "none" },
+      { name: "boss", member_of: ["public"] },
     ]) {
       const response = await createRole(f, id, body);
       expect(response.status, JSON.stringify(body)).toBe(400);

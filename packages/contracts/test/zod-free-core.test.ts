@@ -90,6 +90,8 @@ describe("the zod-free IDs", () => {
     "reader",
     "postgres",
     "pgcf_backup",
+    "public",
+    "none",
     "streaming_replica",
     "pg_monitor",
     "pg_",

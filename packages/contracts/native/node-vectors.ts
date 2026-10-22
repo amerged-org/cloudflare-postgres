@@ -1190,6 +1190,20 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       false,
       true,
     ],
+    // PostgreSQL refuses `CREATE ROLE "public"` and `"none"`: a page that named one would fail the
+    // role step of its database at every start.
+    [
+      "role-public",
+      withDatabase({ roles: [owner, { ...reader, name: "public" }] }),
+      false,
+      true,
+    ],
+    [
+      "role-none",
+      withDatabase({ roles: [owner, { ...reader, name: "none" }] }),
+      false,
+      true,
+    ],
     [
       "roles-named-as-the-kubernetes-runtime-named-its-own",
       withDatabase({

@@ -94,10 +94,14 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
-it("accepts the role names of the Kubernetes runtime and still refuses what PostgreSQL reserves", () => {
+it("accepts the role names of the Kubernetes runtime and refuses what the node and PostgreSQL reserve", () => {
   insertRole("app", { owner: 1 });
   for (const name of ["streaming_replica", "cnpg_app", "cnpg_pooler"])
     expect(() => insertRole(name), `${name} before`).toThrow(/CHECK/);
+  // `public` and `none` are what `CREATE ROLE` refuses by exact name, and D1 took them until now.
+  for (const name of ["public", "none"])
+    expect(() => insertRole(name), `${name} before`).not.toThrow();
+  run("DELETE FROM roles WHERE name IN ('public', 'none')");
   apply(MIGRATION);
   for (const name of [
     "streaming_replica",
@@ -111,31 +115,46 @@ it("accepts the role names of the Kubernetes runtime and still refuses what Post
     "pg_monitor",
     "pg_",
     "pgcf_backup",
+    "public",
+    "none",
     "App",
     "_x",
     "a-b",
   ])
     expect(() => insertRole(name), `${name} after`).toThrow(/CHECK/);
-  expect(() => insertRole("pgcf_backup2")).not.toThrow();
+  // Exact names, not prefixes, and the keywords PostgreSQL accepts as a quoted role name stay.
+  for (const name of [
+    "pgcf_backup2",
+    "public_reader",
+    "nonesuch",
+    "current_user",
+  ])
+    expect(() => insertRole(name), `${name} after`).not.toThrow();
   expect(() => insertRole("a".repeat(64))).toThrow(/CHECK/);
 });
 
-it("does not run while a role holds the backup role's name, and leaves the table as it was", () => {
-  // D1 accepts the name today: the node's own backup role, which a customer role would alter.
-  insertRole("app", { owner: 1 });
-  insertRole("pgcf_backup");
-  const before = { rows: roles(), shape: shape() };
-  expect(() => apply(MIGRATION)).toThrow(/CHECK/);
-  expect(roles()).toEqual(before.rows);
-  expect(shape()).toEqual(before.shape);
-  expect(
-    db.prepare("SELECT name FROM sqlite_master WHERE name='roles_next'").all(),
-  ).toEqual([]);
-  // The deploy step "no role holds the name" is what makes it run.
-  run("DELETE FROM roles WHERE name='pgcf_backup'");
-  expect(() => apply(MIGRATION)).not.toThrow();
-  expect(roles()).toHaveLength(1);
-});
+// D1 accepts these names today: the node's own backup role, which a customer role would alter, and
+// the two names PostgreSQL refuses, which stop the database from waking.
+it.each(["pgcf_backup", "public", "none"])(
+  "does not run while a role is named %s, and leaves the table as it was",
+  (name) => {
+    insertRole("app", { owner: 1 });
+    insertRole(name);
+    const before = { rows: roles(), shape: shape() };
+    expect(() => apply(MIGRATION)).toThrow(/CHECK/);
+    expect(roles()).toEqual(before.rows);
+    expect(shape()).toEqual(before.shape);
+    expect(
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE name='roles_next'")
+        .all(),
+    ).toEqual([]);
+    // The deploy step "no role holds one of the names" is what makes it run.
+    run("DELETE FROM roles WHERE name=?", name);
+    expect(() => apply(MIGRATION)).not.toThrow();
+    expect(roles()).toHaveLength(1);
+  },
+);
 
 it("keeps every role with its credential, attributes and tombstone, and the shape of the table", () => {
   insertRole("app", { owner: 1, password_revision: 3 });
