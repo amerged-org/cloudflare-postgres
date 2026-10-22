@@ -9,8 +9,10 @@ records those.
 
 `PGCF_REGION_ID`, `PGCF_NODE_ID`, the node's derived `PGCF_ROUTE_KEY`, `PGCF_GATEWAY_PORT`,
 `PGCF_GATEWAY_MEMORY_BYTES`, `PGCF_GATEWAY_DATABASE_MEMORY_BYTES` and `PGCF_AGENT_SOCKET`
-(default `/run/pgcf/agent/gateway.sock`). The gateway listens on `127.0.0.1:PGCF_GATEWAY_PORT` only, for
-cloudflared. It holds no provider credentials and no PostgreSQL credentials of its own.
+(default `/run/pgcf/agent/gateway.sock`). The gateway listens on loopback only, for cloudflared. On a
+node it serves the socket that `pgcf-gateway.socket` holds and passes to it as descriptor 3
+(`LISTEN_PID`, `LISTEN_FDS`; a socket that is not on loopback is refused, and `PGCF_GATEWAY_PORT` is
+not read); started by hand it binds `127.0.0.1:PGCF_GATEWAY_PORT` itself. It holds no provider credentials and no PostgreSQL credentials of its own.
 
 ## The agent's table
 
@@ -62,6 +64,70 @@ archive socket.
   ordinary messages support the existing 32 MiB limit and outbound frames are at most 64 KiB.
   Authenticated activity history preserves unknown/partial values and never invents zero usage.
 - There is no PostgreSQL write retry, credential replay or query replay after transport handoff.
+
+## Restart and drain
+
+A release that changes the gateway's binary, a change of its credentials and a reboot stop the
+gateway with SIGTERM. It drains:
+
+- It stops accepting. The listening socket is systemd's, so a connection that arrives until the next
+  gateway starts waits in the socket's queue and is accepted by that one, which accepts nothing
+  before the agent's first table has arrived (`FIRST_TABLE_BOUND`, 5 s; after the bound it accepts
+  and refuses with `fenced`, as it always did without a table): nothing that waited is refused or
+  reset. (A gateway that bound its own socket loses that queue with its process.) The connections
+  that waited meet the new gateway at once; those beyond the 128 whose request is being read wait
+  for a slot in the socket instead of being accepted and reset. The one exception is a connection
+  the old gateway had accepted and not yet read when the signal arrived: it gets the refusal below
+  and is retried.
+- Work that was accepted before and is read after the drain began is refused with a defined error:
+  HTTP 503 `gateway_draining` for a WebSocket upgrade, `08006` "gateway restarting" for HTTP SQL and
+  for a held wake. `/healthz` answers `draining` (200) and `/readyz` 503.
+- A session that is not busy is closed at once with WebSocket close code 1012 "gateway restarting".
+  A busy one (a transaction open, a statement running, COPY, half a message) keeps its time and is
+  closed the same way as soon as it is idle, so a transaction that commits is kept.
+- A session that is still busy after `DRAIN_BOUND` (10 s) is told what became of it and closed
+  (nothing is sent while half a message of PostgreSQL's is on its way). Ending the gateway's
+  connection to PostgreSQL does not stop a statement that is running: PostgreSQL finishes it, and the
+  `COMMIT` the client sent behind it, and notices that the client is gone only when it writes its
+  answer. So a session with a statement in flight (`PostgresActivity::in_flight`) gets a FATAL
+  `08007` (transaction_resolution_unknown) and the close, and its work may commit after that
+  message, up to the statement's run time later; an HTTP SQL request still running then is answered
+  `08007` in the same way if its statements were sent (it is not retried), else `08006`. Only a
+  session idle in a transaction, where PostgreSQL waits for the client and the end of the
+  connection ends the transaction, gets `57P01` (admin_shutdown), and that transaction is rolled
+  back. The outcome of an `08007` is settled only when PostgreSQL has finished the statement:
+  repeat only an idempotent write, or check its effect after the statement's run time has passed.
+  A cancel (`CancelRequest` with the session's `BackendKeyData`) would shorten that window but not
+  close it, because PostgreSQL may have run the statement's `COMMIT` before it arrives or ignore it;
+  it is not built.
+- The process exits when the last session has ended. For a new connection the gap is therefore the
+  longest busy session, at most `DRAIN_BOUND` plus the start of the next gateway and its first
+  table, inside the integrators' retry rule (1, 2, 4 and 8 s). `tests/drain.rs` holds each of these
+  against a real PostgreSQL, and the gap against the real binary with the socket passed as systemd
+  passes it, with WebSocket upgrades as the new connections: they pass only if the new gateway
+  admits the route, which it does only with the table.
+
+The release that brings the drain and the socket does not get either itself. The agent installs the
+binaries and restarts the gateway at once, before it writes the host files (the unit files), so the
+first restart stops the previous binary, which has the old drain: it holds every WebSocket for up to
+29 s, also an idle one, keeps its port without accepting for up to 30 s and then resets the
+connections that waited. The second restart, after the unit files, stops the new binary that bound
+its own port: the shorter drain, but no handover (a connection that arrives meanwhile waits in that
+process's queue and is reset when it exits, at most `DRAIN_BOUND` plus the grace later). Only the
+restart of the release after that one hands the socket over. The gap of the first restart is a
+one-time outage of up to 30 s for new connections, longer than the integrators' retry rule, and it
+is recorded in `docs/operations/integrator-handover.md` (7.1).
+
+A rollback to a release older than the socket unit, and a roll forward after it, need care. The old
+binary does not take the socket, so under the current units it exits at once (address in use) and
+`Restart=always` restarts it every second until the old release's host files are applied; the reload
+that removes the socket file closes the socket, and the old gateway then binds its own port. Do not stop
+`pgcf-gateway.socket` first: that stops the gateway, and the install restart starts the socket again.
+After the roll forward the socket unit is active without a descriptor and the new gateway binds its own
+port (`"inherited":false` in its `gateway_listening` line), without the handover, until
+`systemctl restart pgcf-gateway.socket` (which restarts the gateway too) or a reboot. A release applies a
+changed socket file with the reload only, so the same holds after any later change of that file.
+(Measured with systemd 257.13, the plan's section 11.1, `gateway-drain-proof`.)
 
 ## Wakes
 
