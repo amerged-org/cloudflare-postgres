@@ -32,6 +32,9 @@ pub mod idmap;
 pub mod journal;
 pub mod limits;
 pub mod ready;
+pub mod slots;
+#[cfg(target_os = "linux")]
+pub mod system;
 pub mod users;
 
 mod dbus;
@@ -173,6 +176,49 @@ impl ActiveState {
     }
 }
 
+/// What systemd says of a unit by its name, before it is anyone's database.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Raw {
+    pub active: ActiveState,
+    /// The main process; `None` while the unit has none.
+    pub main_pid: Option<u32>,
+    /// The invocation ID of the unit's current or last start, as a UUID.
+    pub invocation_id: Option<String>,
+    /// The uid the unit's process runs as.
+    pub uid: Option<u32>,
+    /// `MemoryMax` in bytes; `None` for no ceiling.
+    pub memory_max_bytes: Option<u64>,
+}
+impl Raw {
+    /// A unit that systemd has not loaded: it has no process.
+    fn not_loaded() -> Self {
+        Self {
+            active: ActiveState::Inactive,
+            main_pid: None,
+            invocation_id: None,
+            uid: None,
+            memory_max_bytes: None,
+        }
+    }
+    /// From the raw values of the unit's D-Bus properties, which spell "none" as zero, `u32::MAX`
+    /// and `u64::MAX`.
+    pub fn from_properties(
+        active_state: &str,
+        main_pid: u32,
+        invocation_id: &[u8],
+        uid: u32,
+        memory_max: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            active: ActiveState::parse(active_state)?,
+            main_pid: (main_pid != 0).then_some(main_pid),
+            invocation_id: invocation_uuid(invocation_id),
+            uid: (uid != u32::MAX).then_some(uid),
+            memory_max_bytes: (memory_max != u64::MAX).then_some(memory_max),
+        })
+    }
+}
+
 /// What the agent reads of a database's unit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnitState {
@@ -186,17 +232,25 @@ pub struct UnitState {
     pub uid: Option<u32>,
     /// `MemoryMax` in bytes; `None` for no ceiling. The agent sets it to the database's memory.
     pub memory_max_bytes: Option<u64>,
+    /// The slot the database runs in; `None` for a unit of its own (`pgcf-pg@`), which a node
+    /// that began before the slots may still run.
+    pub slot: Option<u32>,
 }
 impl UnitState {
     /// A unit that systemd has not loaded: it has no process.
     fn not_loaded(database: &str) -> Self {
+        Self::of(database, Raw::not_loaded())
+    }
+    /// The database's unit of its own (`pgcf-pg@`), as systemd says it is.
+    pub fn of(database: &str, raw: Raw) -> Self {
         Self {
             database: database.to_string(),
-            active: ActiveState::Inactive,
-            main_pid: None,
-            invocation_id: None,
-            uid: None,
-            memory_max_bytes: None,
+            active: raw.active,
+            main_pid: raw.main_pid,
+            invocation_id: raw.invocation_id,
+            uid: raw.uid,
+            memory_max_bytes: raw.memory_max_bytes,
+            slot: None,
         }
     }
     /// From the raw values of the unit's D-Bus properties, which spell "none" as zero, `u32::MAX`
@@ -209,14 +263,8 @@ impl UnitState {
         uid: u32,
         memory_max: u64,
     ) -> Option<Self> {
-        Some(Self {
-            database: database.to_string(),
-            active: ActiveState::parse(active_state)?,
-            main_pid: (main_pid != 0).then_some(main_pid),
-            invocation_id: invocation_uuid(invocation_id),
-            uid: (uid != u32::MAX).then_some(uid),
-            memory_max_bytes: (memory_max != u64::MAX).then_some(memory_max),
-        })
+        Raw::from_properties(active_state, main_pid, invocation_id, uid, memory_max)
+            .map(|raw| Self::of(database, raw))
     }
 }
 
@@ -244,6 +292,16 @@ pub enum Error {
     /// `postmaster.pid` sees nothing, and the old backend would run beside the new postmaster on
     /// one data directory.
     StrayProcesses,
+    /// The database is held: a slot (or its unit of its own) has it, or has not yet ended with it.
+    /// A second PostgreSQL on the data directory is what this keeps from running.
+    Held,
+    /// Every number of the pool's range is in use.
+    NoSlot,
+    /// The slot's supervisor refused the order to execute PostgreSQL: one of its words (`order`,
+    /// `id`, `major`, `unbound`, `held`, `lock`). The slot is gone with it.
+    Refused(&'static str),
+    /// A kernel call, a file or the supervisor's socket failed.
+    Io(std::io::Error),
     /// systemd did something the agent does not understand.
     Unexpected(&'static str),
 }
@@ -255,6 +313,10 @@ impl std::fmt::Display for Error {
             Self::Job { unit, result } => write!(f, "the job of {unit} ended with {result}"),
             Self::NotReady(reason) => write!(f, "PostgreSQL is not ready: {reason}"),
             Self::StrayProcesses => f.write_str("the unit's cgroup still holds a process"),
+            Self::Held => f.write_str("the database is held by a unit that has not ended"),
+            Self::NoSlot => f.write_str("every slot is in use"),
+            Self::Refused(word) => write!(f, "the slot refused the order: {word}"),
+            Self::Io(error) => write!(f, "{error}"),
             Self::Unexpected(what) => write!(f, "unexpected from systemd: {what}"),
         }
     }
@@ -263,6 +325,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Bus(error) => Some(error),
+            Self::Io(error) => Some(error),
             _ => None,
         }
     }
@@ -270,6 +333,11 @@ impl std::error::Error for Error {
 impl From<zbus::Error> for Error {
     fn from(error: zbus::Error) -> Self {
         Self::Bus(error)
+    }
+}
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
@@ -284,9 +352,12 @@ pub struct Started {
     pub uid: u32,
     /// The Unix socket it listens on, as its `postmaster.pid` says.
     pub socket: PathBuf,
-    /// When the agent asked systemd to start the unit, in microseconds of `CLOCK_MONOTONIC`;
-    /// `None` for a start the agent only waited for, and where the clock is not read.
+    /// When the agent asked for the start, in microseconds of `CLOCK_MONOTONIC`: the order to
+    /// execute PostgreSQL on the slot path, the `StartUnit` of a unit of its own. `None` for a
+    /// start the agent only waited for, and where the clock is not read.
     pub requested_us: Option<u64>,
+    /// What the slot path took, step by step; `None` for a start the agent only waited for.
+    pub slot: Option<slots::Report>,
 }
 
 /// What systemd and the journal recorded of one start (`Units::timeline`), in microseconds.
@@ -322,26 +393,32 @@ fn monotonic_micros() -> Option<u64> {
     None
 }
 
-/// A file of a database's unit in the cgroup tree; `None` for an argument that is no database ID.
-fn cgroup_file(database: &str, file: &str) -> Option<PathBuf> {
-    valid_pattern("database", database).then(|| {
-        PathBuf::from(format!(
-            "/sys/fs/cgroup/{SLICE}/{}/{file}",
-            unit_name(database)
-        ))
-    })
+/// A file of a unit in the cgroup tree below the databases' slice.
+fn unit_cgroup_file(unit: &str, file: &str) -> PathBuf {
+    PathBuf::from(format!("/sys/fs/cgroup/{SLICE}/{unit}/{file}"))
 }
 
-/// The `cpu.stat` of a database's unit in the cgroup tree, where its throttling is counted;
-/// `None` for an argument that is no database ID.
+/// A file of a database's unit of its own in the cgroup tree; `None` for an argument that is no
+/// database ID.
+fn cgroup_file(database: &str, file: &str) -> Option<PathBuf> {
+    valid_pattern("database", database).then(|| unit_cgroup_file(&unit_name(database), file))
+}
+
+/// The `cpu.stat` of a database's unit of its own in the cgroup tree, where its throttling is
+/// counted; `None` for an argument that is no database ID.
 pub fn cpu_stat_path(database: &str) -> Option<PathBuf> {
     cgroup_file(database, "cpu.stat")
 }
 
-/// The `cgroup.events` of a database's unit: its `populated` line says whether any process is in
-/// the cgroup. The directory exists while the unit runs, and while a process of it remains.
-fn cgroup_events_path(database: &str) -> Option<PathBuf> {
-    cgroup_file(database, "cgroup.events")
+/// The `cpu.stat` of a slot, where the throttling of the database that runs in it is counted.
+pub fn slot_cpu_stat_path(slot: u32) -> PathBuf {
+    unit_cgroup_file(&slots::slot_unit(slot), "cpu.stat")
+}
+
+/// The `cgroup.events` of a unit: its `populated` line says whether any process is in the
+/// cgroup. The directory exists while the unit runs, and while a process of it remains.
+fn unit_cgroup_events(unit: &str) -> PathBuf {
+    unit_cgroup_file(unit, "cgroup.events")
 }
 
 /// Whether the text of a `cgroup.events` says that the cgroup, or one below it, holds a process.
@@ -462,28 +539,34 @@ impl Units {
             .await?)
     }
 
-    /// The state of a database's unit. A unit that is not loaded has no process and is `inactive`,
-    /// and systemd is not asked to load it: reading a property of an unloaded unit loads it, which
-    /// reads the unit's files, and a node has hundreds of databases that are asleep (lab: 3.7 ms
-    /// for each of 300 against 0.2 ms to be told it is not loaded). The reads wait for a place
-    /// among `CALLS_IN_FLIGHT`.
+    /// The state of a database's unit of its own. A unit that is not loaded has no process and is
+    /// `inactive`, and systemd is not asked to load it: reading a property of an unloaded unit
+    /// loads it, which reads the unit's files, and a node has hundreds of databases that are
+    /// asleep (lab: 3.7 ms for each of 300 against 0.2 ms to be told it is not loaded). The reads
+    /// wait for a place among `CALLS_IN_FLIGHT`.
     pub async fn state(&self, database: &str) -> Result<UnitState, Error> {
         let unit_name = Self::unit_of(database)?;
+        let raw = self.raw(&unit_name).await?;
+        Ok(UnitState::of(database, raw))
+    }
+
+    /// What systemd says of the unit `unit_name`, by its name; the same rules as `state`.
+    pub(crate) async fn raw(&self, unit_name: &str) -> Result<Raw, Error> {
         self.calls
             .within(async {
                 let began = std::time::Instant::now();
-                let state = self.read_state(database, &unit_name).await;
+                let raw = self.read_raw(unit_name).await;
                 crate::timing::UNIT_READ.add(began.elapsed());
-                state
+                raw
             })
             .await
     }
 
-    async fn read_state(&self, database: &str, unit_name: &str) -> Result<UnitState, Error> {
+    async fn read_raw(&self, unit_name: &str) -> Result<Raw, Error> {
         match self.manager.get_unit(unit_name).await {
             Ok(_) => {}
             Err(zbus::Error::MethodError(name, ..)) if name.as_str() == NO_SUCH_UNIT => {
-                return Ok(UnitState::not_loaded(database));
+                return Ok(Raw::not_loaded());
             }
             Err(error) => return Err(error.into()),
         }
@@ -496,27 +579,35 @@ impl Units {
             service.uid(),
             service.memory_max(),
         );
-        UnitState::from_properties(database, &active?, pid?, &invocation?, uid?, memory?)
+        Raw::from_properties(&active?, pid?, &invocation?, uid?, memory?)
             .ok_or(Error::Unexpected("an active state systemd does not define"))
     }
 
-    /// Every loaded database unit, whatever its state: the agent rebuilds from these at start.
-    pub async fn running(&self) -> Result<Vec<UnitState>, Error> {
-        let pattern = format!("{UNIT_PREFIX}*{UNIT_SUFFIX}");
+    /// The names of the loaded units that match `pattern` (`ListUnitsByPatterns`), whatever their
+    /// state.
+    pub(crate) async fn loaded(&self, pattern: &str) -> Result<Vec<String>, Error> {
         let listed = self
             .manager
-            .list_units_by_patterns(&[], &[pattern.as_str()])
+            .list_units_by_patterns(&[], &[pattern])
             .await?;
+        Ok(listed.into_iter().map(|row| row.0).collect())
+    }
+
+    /// Every loaded database unit of its own, whatever its state: the agent rebuilds from these at
+    /// start.
+    pub async fn running(&self) -> Result<Vec<UnitState>, Error> {
+        let pattern = format!("{UNIT_PREFIX}*{UNIT_SUFFIX}");
+        let listed = self.loaded(&pattern).await?;
         futures_util::future::try_join_all(
             listed
                 .iter()
-                .filter_map(|row| database_of(&row.0))
+                .filter_map(|name| database_of(name))
                 .map(|database| self.state(database)),
         )
         .await
     }
 
-    /// The facts of a unit that finished starting.
+    /// The facts of a unit of its own that finished starting.
     async fn started(&self, database: &str, requested_us: Option<u64>) -> Result<Started, Error> {
         let state = self.state(database).await?;
         if state.active != ActiveState::Active {
@@ -533,23 +624,31 @@ impl Units {
             uid: state.uid.ok_or(Error::NotReady("no_uid"))?,
             socket,
             requested_us,
+            slot: None,
         })
     }
 
-    /// What systemd and the journal recorded of the start that gave `started`: the time from the
-    /// agent's request to the fork of the main process, from the fork to the handoff (the
-    /// executor's sandbox), and from the handoff to the three messages of PostgreSQL's start.
-    /// Empty where the unit started again since, so that its times and its journal are another
-    /// invocation's. A journal that cannot be read leaves the last part out.
-    pub async fn timeline(&self, database: &str, started: &Started) -> Result<Timeline, Error> {
-        let unit_name = Self::unit_of(database)?;
-        let state = self.state(database).await?;
-        let service = self.service_proxy(&unit_name).await?;
+    /// What systemd recorded of the last start of `unit`: the fork of its main process and the
+    /// handoff to the program, in microseconds of `CLOCK_MONOTONIC`; 0 before the first. For a
+    /// unit that runs systemd-executor first, these two bound the executor's setup of the sandbox.
+    pub(crate) async fn exec_timestamps(&self, unit: &str) -> Result<(u64, u64), Error> {
+        let service = self.service_proxy(unit).await?;
         let (fork_us, handoff_us) = tokio::join!(
             service.exec_main_start_timestamp_monotonic(),
             service.exec_main_handoff_timestamp_monotonic(),
         );
-        let (fork_us, handoff_us) = (fork_us?, handoff_us?);
+        Ok((fork_us?, handoff_us?))
+    }
+
+    /// What systemd and the journal recorded of the start of a unit of its own that gave `started`:
+    /// the time from the agent's request to the fork of the main process, from the fork to the
+    /// handoff (the executor's sandbox), and from the handoff to the three messages of
+    /// PostgreSQL's start. Empty where the unit started again since, so that its times and its
+    /// journal are another invocation's. A journal that cannot be read leaves the last part out.
+    pub async fn timeline(&self, database: &str, started: &Started) -> Result<Timeline, Error> {
+        let unit_name = Self::unit_of(database)?;
+        let state = self.state(database).await?;
+        let (fork_us, handoff_us) = self.exec_timestamps(&unit_name).await?;
         if fork_us == 0
             || handoff_us == 0
             || state.invocation_id.as_deref() != Some(started.invocation_id.as_str())
@@ -566,23 +665,25 @@ impl Units {
         })
     }
 
-    /// Starts the unit and returns when PostgreSQL accepts connections. Dropping the future does
-    /// not stop the start. A unit that does not run (`inactive`, `failed`, `deactivating`) but
-    /// whose cgroup holds a process is not started (`Error::StrayProcesses`).
-    pub async fn start(&self, database: &str) -> Result<Started, Error> {
-        let unit = Self::unit_of(database)?;
-        self.refuse_stray_processes(database).await?;
-        let requested = self.job(&unit, JobKind::Start).await?;
-        self.started(database, requested).await
+    /// Starts the unit `unit` and returns when its job is done, with the time the job was asked
+    /// for. A unit that does not run (`inactive`, `failed`, `deactivating`) but whose cgroup holds
+    /// a process is not started (`Error::StrayProcesses`).
+    pub(crate) async fn start_job(&self, unit: &str) -> Result<Option<u64>, Error> {
+        self.refuse_stray_processes(unit).await?;
+        self.job(unit, JobKind::Start).await
+    }
+
+    /// Stops the unit `unit` and returns when its job is done.
+    pub(crate) async fn stop_job(&self, unit: &str) -> Result<(), Error> {
+        self.job(unit, JobKind::Stop).await.map(drop)
     }
 
     /// Refuses a start over a process that outlived the last one. The cgroup of a unit that is
     /// stopped does not exist, so the common case is one failed `open`; the state is read only
     /// where the cgroup is populated, because a unit that runs, or is starting, holds processes
     /// of its own (`stray_processes`).
-    async fn refuse_stray_processes(&self, database: &str) -> Result<(), Error> {
-        let path = cgroup_events_path(database).ok_or(Error::InvalidDatabase)?;
-        let events = match std::fs::read_to_string(path) {
+    async fn refuse_stray_processes(&self, unit: &str) -> Result<(), Error> {
+        let events = match std::fs::read_to_string(unit_cgroup_events(unit)) {
             Ok(events) => events,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(_) => return Err(Error::Unexpected("the unit's cgroup cannot be read")),
@@ -590,15 +691,15 @@ impl Units {
         if !populated(&events) {
             return Ok(());
         }
-        let active = self.state(database).await?.active;
+        let active = self.raw(unit).await?.active;
         if stray_processes(active, &events) {
             return Err(Error::StrayProcesses);
         }
         Ok(())
     }
 
-    /// Waits for a unit that is starting, one the agent found `activating` when it started, and
-    /// returns when PostgreSQL accepts connections.
+    /// Waits for a unit of its own that is starting, one the agent found `activating` when it
+    /// started, and returns when PostgreSQL accepts connections.
     pub async fn wait_started(&self, database: &str) -> Result<Started, Error> {
         // The proxy keeps the unit's properties up to date from systemd's change signals, which is
         // what its change stream needs.
@@ -619,14 +720,15 @@ impl Units {
         }
     }
 
-    /// Stops the unit (a fast shutdown, systemd's `KillSignal=SIGINT`), waits until it is stopped
-    /// and lifts its CPU quota. A unit that is not running is stopped already.
+    /// Stops the unit of its own (a fast shutdown, systemd's `KillSignal=SIGINT`), waits until it
+    /// is stopped and lifts its CPU quota. A unit that is not running is stopped already.
     pub async fn stop(&self, database: &str) -> Result<(), Error> {
-        self.job(&Self::unit_of(database)?, JobKind::Stop).await?;
+        self.stop_job(&Self::unit_of(database)?).await?;
         self.set_cpu_quota(database, None).await
     }
 
-    async fn set_properties(
+    /// Sets properties on `unit`, loaded or not; `runtime` keeps them until the next boot.
+    pub(crate) async fn set_properties(
         &self,
         unit: &str,
         runtime: bool,
@@ -639,7 +741,8 @@ impl Units {
         Ok(())
     }
 
-    /// Sets a database's size limits on its unit, running or not, and keeps them across a reboot.
+    /// Sets a database's size limits on its unit of its own, running or not, and keeps them
+    /// across a reboot.
     pub async fn set_limits(&self, database: &str, limits: &Limits) -> Result<(), Error> {
         self.set_properties(&Self::unit_of(database)?, false, &limits.properties())
             .await
@@ -772,13 +875,23 @@ mod tests {
     #[test]
     fn the_cgroup_files_of_a_unit_are_below_the_databases_slice() {
         assert_eq!(
-            cgroup_events_path("abcdefghij0123456789"),
-            Some(PathBuf::from(
+            unit_cgroup_events("pgcf-pg@abcdefghij0123456789.service"),
+            PathBuf::from(
                 "/sys/fs/cgroup/pgcf.slice/pgcf-pg@abcdefghij0123456789.service/cgroup.events"
+            )
+        );
+        assert_eq!(
+            cgroup_file("abcdefghij0123456789", "cpu.stat"),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/pgcf.slice/pgcf-pg@abcdefghij0123456789.service/cpu.stat"
             ))
         );
-        assert_eq!(cgroup_events_path("../x"), None);
+        assert_eq!(cgroup_file("../x", "cpu.stat"), None);
         assert_eq!(cpu_stat_path("not a database"), None);
+        assert_eq!(
+            slot_cpu_stat_path(12),
+            PathBuf::from("/sys/fs/cgroup/pgcf.slice/pgcf-slot@12.service/cpu.stat")
+        );
     }
 
     #[test]

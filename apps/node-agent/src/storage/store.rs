@@ -204,6 +204,34 @@ impl<R: CommandRunner> Storage<R> {
         let table = fs::read_to_string(format!("/proc/{pid}/mountinfo"))?;
         self.volume_of_mount(database, &mountinfo::parse(&table)?)
     }
+    /// The database volumes mounted at their directories in the mount table of the process `pid`,
+    /// with the database each is for: what a slot holds. Read from its mount table alone, and
+    /// no mount of the agent's own is needed (the agent has none when it starts).
+    pub fn volumes_held_by(&self, pid: u32) -> Result<Vec<(String, VolumeId)>, Error> {
+        let table = fs::read_to_string(format!("/proc/{pid}/mountinfo"))?;
+        Ok(self.volumes_in(&mountinfo::parse(&table)?))
+    }
+    fn volumes_in(&self, mounts: &[Mount]) -> Vec<(String, VolumeId)> {
+        let mut found: Vec<(String, VolumeId)> = Vec::new();
+        for mount in mounts {
+            let Some(database) = mount
+                .mount_point
+                .strip_prefix(&self.config.mount_root)
+                .ok()
+                .and_then(|rest| rest.to_str())
+                .filter(|rest| pgcf_native_protocol::valid_pattern("database", rest))
+            else {
+                continue;
+            };
+            if found.iter().any(|(held, _)| held == database) {
+                continue;
+            }
+            if let Ok(Some(volume)) = self.volume_of_mount(database, mounts) {
+                found.push((database.to_string(), volume));
+            }
+        }
+        found
+    }
     fn volume_of_mount(&self, database: &str, mounts: &[Mount]) -> Result<Option<VolumeId>, Error> {
         let dir = self.config.mount_root.join(database);
         let Some(mount) = mounts.iter().rev().find(|mount| mount.mount_point == dir) else {
@@ -1297,6 +1325,49 @@ mod tests {
         );
         // A device that is no volume of the database is no answer, and no guess.
         assert!(serves(&[mount(11, &at)]).is_err());
+    }
+
+
+    /// A process that holds database volumes is told by its mount table alone: every mount
+    /// directly below the databases' directory that is the volume of the database it is named for.
+    /// The agent adopts a slot from this when it starts, with no mount of its own.
+    #[test]
+    fn the_volumes_a_process_holds_are_read_from_its_mount_table_alone() {
+        let mut storage = Storage::new(Listed::new(&two_generations()), Config::default());
+        storage.kernel = Kernel {
+            minor: |device| match device {
+                device if device.ends_with("_g1") => Ok(7),
+                device if device.ends_with("_g2") => Ok(9),
+                _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+            },
+            ext4_errors: |_| Ok(0),
+        };
+        let mount = |minor: u32, at: &str| Mount {
+            major: 252,
+            minor,
+            mount_point: at.into(),
+            fstype: "ext4".into(),
+            source: format!("/dev/dm-{minor}"),
+        };
+        let at = format!("/var/lib/pgcf/db/{LISTED}");
+        let tmpfs = Mount {
+            major: 0,
+            minor: 64,
+            mount_point: "/var/lib/pgcf/db/k1l2m3n4o5p6q7r8s9t0".into(),
+            fstype: "tmpfs".into(),
+            source: "tmpfs".into(),
+        };
+        let held = storage.volumes_in(&[
+            mount(7, "/var"),
+            mount(9, &at),
+            tmpfs,
+            mount(7, "/var/lib/pgcf/db/not-a-database-id"),
+            mount(7, &format!("{at}/data")),
+        ]);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].0, LISTED);
+        assert_eq!(held[0].1.generation(), 2);
+        assert!(storage.volumes_in(&[]).is_empty());
     }
 
     /// A storage whose kernel has a filesystem alive on the first generation's device only: the

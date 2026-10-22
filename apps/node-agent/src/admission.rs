@@ -1537,6 +1537,7 @@ mod tests {
             invocation_id: None,
             uid: Some(200_001),
             memory_max_bytes,
+            slot: None,
         };
         let running = |active, memory_max_bytes, always_warm| {
             Running::from_unit(&unit(active, memory_max_bytes), always_warm)

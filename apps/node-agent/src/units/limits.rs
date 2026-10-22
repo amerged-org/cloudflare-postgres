@@ -9,6 +9,11 @@ const IO_BASE_MEMORY_MIB: u64 = 256;
 /// `CPUWeight` is 1..=10000; a database gets 100 per core of its CPU size, the default of one core.
 const CPU_WEIGHT_MIN: u64 = 1;
 const CPU_WEIGHT_MAX: u64 = 10_000;
+/// The limits of an idle slot (`pgcf-slot@.service`).
+const IDLE_MEMORY_MIB: u64 = 32;
+const IDLE_MEMORY_HIGH_MIB: u64 = 28;
+const IDLE_CPU_WEIGHT: u64 = 10;
+const IDLE_TASKS_MAX: u64 = 64;
 
 /// A unit property in the form systemd's cgroup settings take it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +30,10 @@ pub enum Property {
     IoWriteIopsMax(String, u64),
     /// Microseconds of CPU per second; `u64::MAX` is no quota.
     CpuQuotaPerSecUsec(u64),
+    /// No write limit on any device: the empty array, which clears the limits of every device that
+    /// an earlier incarnation of the unit set. Setting one device's limit again does not.
+    IoWriteBandwidthMaxNone,
+    IoWriteIopsMaxNone,
 }
 impl Property {
     /// The property's name on the unit's D-Bus interfaces.
@@ -34,8 +43,8 @@ impl Property {
             Self::MemoryHigh(_) => "MemoryHigh",
             Self::CpuWeight(_) => "CPUWeight",
             Self::TasksMax(_) => "TasksMax",
-            Self::IoWriteBandwidthMax(..) => "IOWriteBandwidthMax",
-            Self::IoWriteIopsMax(..) => "IOWriteIOPSMax",
+            Self::IoWriteBandwidthMax(..) | Self::IoWriteBandwidthMaxNone => "IOWriteBandwidthMax",
+            Self::IoWriteIopsMax(..) | Self::IoWriteIopsMaxNone => "IOWriteIOPSMax",
             Self::CpuQuotaPerSecUsec(_) => "CPUQuotaPerSecUSec",
         }
     }
@@ -101,6 +110,22 @@ impl Limits {
     }
 }
 
+/// What an idle slot holds, the limits of `pgcf-slot@.service` as it is written: a supervisor
+/// with no database. A runtime property outlives the stop of its unit (until the next boot), so the
+/// agent sets these again whenever it builds a slot, and they take back what the database of its
+/// last incarnation set: the memory ceiling, the CPU weight, the CPU quota and the write limits.
+pub fn idle() -> Vec<Property> {
+    vec![
+        Property::MemoryMax(IDLE_MEMORY_MIB * MIB),
+        Property::MemoryHigh(IDLE_MEMORY_HIGH_MIB * MIB),
+        Property::CpuWeight(IDLE_CPU_WEIGHT),
+        Property::TasksMax(IDLE_TASKS_MAX),
+        cpu_quota(None),
+        Property::IoWriteBandwidthMaxNone,
+        Property::IoWriteIopsMaxNone,
+    ]
+}
+
 /// The memory ceiling of the slice that holds every database: the operator's awake-database budget
 /// (plan 4.5). The kernel enforces it as the backstop under either memory rule (plan 4.6).
 pub fn slice_memory(awake_budget_mib: u64) -> Property {
@@ -118,6 +143,7 @@ pub fn cpu_quota(millicores: Option<NonZeroU32>) -> Property {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::dbus;
 
     fn limits(memory_mib: u64, cpu_millicores: u32, io: Option<Io>) -> Limits {
         Limits {
@@ -212,6 +238,42 @@ mod tests {
         // The contract's largest budget, 1 TiB.
         assert_eq!(slice_memory(1_048_576), Property::MemoryMax(1 << 40));
         assert_eq!(slice_memory(9913).name(), "MemoryMax");
+    }
+
+
+    #[test]
+    fn an_idle_slot_holds_the_units_idle_limits_and_none_of_a_database() {
+        let idle = idle();
+        // The file of `pgcf-slot@.service` says MemoryMax=32M, MemoryHigh=28M, TasksMax=64 and
+        // CPUWeight=10; what a database set at its bind is reset to these, and to nothing else.
+        assert_eq!(
+            idle,
+            [
+                Property::MemoryMax(32 * MIB),
+                Property::MemoryHigh(28 * MIB),
+                Property::CpuWeight(10),
+                Property::TasksMax(64),
+                Property::CpuQuotaPerSecUsec(u64::MAX),
+                Property::IoWriteBandwidthMaxNone,
+                Property::IoWriteIopsMaxNone,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_write_limits_of_every_device_are_reset_with_an_empty_array() {
+        // A runtime property outlives the stop of the unit, and a per-device limit that is set
+        // again for another device adds to the first: an empty `a(st)` clears them all.
+        for property in [Property::IoWriteBandwidthMaxNone, Property::IoWriteIopsMaxNone] {
+            let (name, value) = dbus::encode(&property);
+            assert_eq!(value.value_signature().to_string(), "a(st)");
+            match value {
+                zbus::zvariant::Value::Array(array) => assert!(array.is_empty(), "{name}"),
+                other => panic!("{name} is not an array: {other:?}"),
+            }
+        }
+        assert_eq!(Property::IoWriteBandwidthMaxNone.name(), "IOWriteBandwidthMax");
+        assert_eq!(Property::IoWriteIopsMaxNone.name(), "IOWriteIOPSMax");
     }
 
     #[test]

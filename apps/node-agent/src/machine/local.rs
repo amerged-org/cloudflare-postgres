@@ -921,6 +921,7 @@ impl Machine for Local {
             invocation_id,
             uid: (active == ActiveState::Active).then_some(self.uid),
             memory_max_bytes: memory_max.or(Some(256 << 20)),
+            slot: None,
         })
     }
     async fn units(&self) -> Result<Vec<UnitState>, units::Error> {
@@ -1502,6 +1503,7 @@ impl Local {
             uid: self.uid,
             socket,
             requested_us: None,
+            slot: None,
         })
     }
 }

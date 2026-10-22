@@ -27,6 +27,18 @@ use zbus::proxy::CacheProperties;
 
 const BIN: &str = "/usr/lib/postgresql/18/bin";
 
+impl Units {
+    /// Starts a database's unit of its own (`pgcf-pg@`), which only an agent of an earlier release
+    /// did: the agent starts slots now and adopts the units of its own that it finds running
+    /// (`wait_started`). The lab keeps starting them, to test what it still does with them. A unit
+    /// that does not run but whose cgroup holds a process is not started (`StrayProcesses`).
+    pub(crate) async fn start(&self, database: &str) -> Result<super::Started, Error> {
+        let unit = Self::unit_of(database)?;
+        let requested = self.start_job(&unit).await?;
+        self.started(database, requested).await
+    }
+}
+
 fn run(program: &str, args: &[&str]) {
     let output = Command::new(program).args(args).output().unwrap();
     assert!(
@@ -593,7 +605,7 @@ async fn a_start_that_fails_names_the_jobs_result() {
 
 /// Whether a database's unit has a cgroup that holds a process.
 fn cgroup_populated(database: &str) -> bool {
-    fs::read_to_string(super::cgroup_events_path(database).unwrap())
+    fs::read_to_string(super::unit_cgroup_events(&super::unit_name(database)))
         .is_ok_and(|events| super::populated(&events))
 }
 
@@ -619,7 +631,7 @@ impl Drop for Frozen {
 
 /// The processes in a database's unit cgroup.
 fn cgroup_processes(database: &str) -> Vec<u32> {
-    let events = super::cgroup_events_path(database).unwrap();
+    let events = super::unit_cgroup_events(&super::unit_name(database));
     fs::read_to_string(events.with_file_name("cgroup.procs"))
         .unwrap_or_default()
         .split_whitespace()
