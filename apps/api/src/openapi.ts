@@ -51,6 +51,7 @@ const nodeRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "POST /node/v1/enroll": [400, 401, 403, 409, 500],
   "POST /node/v1/installer/progress": [400, 401, 409, 500],
   "GET /node/v1/releases/{version}/pgcf-node.raw.zst": [401, 404, 416, 500],
+  "GET /node/v1/releases/{version}/host-files/{sha256}": [404, 416, 500],
   "GET /node/v1/releases/{version}/{file}": [404, 416, 500],
   "GET /node/v1/link": [401, 403, 500],
   "GET /node/v1/desired": [400, 401, 403, 404, 409, 500],

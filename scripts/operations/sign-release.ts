@@ -3,12 +3,14 @@
 //
 //   node scripts/operations/sign-release.ts sign --image-dir DIR --binaries DIR [--lock FILE]
 //
-// It takes the release's manifest (the digests the registration states, `ReleaseManifestFields`)
-// and has the signer Worker (`apps/release-signer`) sign it. The job holds no key and no secret:
+// It takes the release's manifest (the digests the registration states, `ReleaseManifestFields`:
+// the image's compressed and raw sha256 and size from the build summary `pgcf-node.json`, the four
+// binaries, the package lock, the snapshot and the host files) and has the signer Worker
+// (`apps/release-signer`) sign it. The job holds no key and no secret:
 // it proves who it is to the signer with the identity token of its own GitHub Actions run, which
 // the runner hands to a job that has `id-token: write`, requested here for the signer's address
 // as its audience. The signature is written to DIR/release.sig, which the registration reads and
-// the API stores. The options are those of register-node-image.ts, and the files are checked the
+// the API verifies and stores. The options are those of register-node-image.ts, and the files are checked the
 // same way. The signer's address is the variable RELEASE_SIGNER_URL (the repository variable of
 // that name, an origin). The step fails, and writes nothing, while the committed public key is
 // still the placeholder, while the signer cannot be reached, and when it answers with anything
@@ -114,7 +116,7 @@ export async function signBuild(
   const fetchImpl = options.fetchImpl ?? fetch;
   if (options.committedKey === PLACEHOLDER_RELEASE_KEY)
     throw new Error(
-      "apps/node-agent/release-signing.pub still holds the placeholder key, so the agent of this build trusts a key that nobody holds: commit the public key that `release-signing.ts provision` wrote before this commit reaches main (docs/operations/release-signing.md)",
+      "apps/node-agent/release-signing.pub still holds the placeholder key, so the agent of this build trusts a key that nobody holds: commit the public key that `release-signing.ts provision` wrote, with the constant `generate-release-key.ts` makes of it, before this commit reaches main (docs/operations/release-signing.md)",
     );
   const origin = signerOrigin(options.environment);
   const fields = signedFields(manifest);

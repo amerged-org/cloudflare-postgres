@@ -13,6 +13,7 @@ import {
   FleetReleaseRegistration,
   FleetReleaseVersion,
   RELEASE_FILE_PATH,
+  RELEASE_HOST_FILES_DIRECTORY,
   RELEASE_IMAGE_FILE,
   ReleaseSignature,
   FleetRegionReleaseUpdate,
@@ -30,6 +31,7 @@ import {
   getFleetNodeRelease,
 } from "../domain/fleet-releases.ts";
 import {
+  serveHostFile,
   serveInstallerImage,
   serveReleaseFile,
 } from "../domain/release-files.ts";
@@ -100,7 +102,7 @@ export function registerFleetReleases(app: ApiApp): void {
       method: "put",
       path: "/v1/fleet/releases/{id}",
       description:
-        "Registers an immutable release: one node image with its binaries and package lock, the same for every node. The body holds the digest and size of each file the build produced and the signature CI made of the release with the release key (64 bytes as 128 hex digits, required): the API holds no key, so it stores the signature and shows it as `spec.signature` and cannot check it, and a node refuses a release whose signature its agent's key does not verify. The files must already be in the archive bucket under `node-images/{id}/`, uploaded with their sha256 for R2 to verify, and the Worker names every URL of the stored spec itself. The id is the image version the node enrolls as. This records desired configuration; assigning it to a region makes the region's nodes pull it.",
+        "Registers an immutable release: one node image with its binaries, package lock and host files, the same for every node. The body holds the digest and size of each file the build produced, the host files of the image's tree (the systemd units, masks and configuration a release changes on a running node, each with its path, mode, digest and the way it takes effect, ascending by path) with the digest a node that holds them reports, and the signature CI made of the release with the release key (64 bytes as 128 hex digits, required). The signature covers the release's id, its image (the sha256 and size of the compressed image and of the raw image), the four binaries, the package lock, the Debian snapshot and the host files. The API verifies it with the release public key, a constant of this Worker's code that no request changes, against the manifest rebuilt from the registration's own facts, and answers 400 and stores nothing for a signature that is missing, made by another key, made for another release, or made for other digests than these; the stored signature is shown as `spec.signature`. The same check runs again when a node is installed from the release, and a node refuses a release whose signature its agent's key does not verify. The files must already be in the archive bucket under `node-images/{id}/` (each host file under `host-files/` by its sha256), uploaded with their sha256 for R2 to verify, and the Worker names every URL of the stored spec itself. The id is the image version the node enrolls as. This records desired configuration; assigning it to a region makes the region's nodes pull it.",
       request: {
         headers,
         params: z.object({ id: FleetReleaseVersion }),
@@ -164,7 +166,7 @@ export function registerFleetReleases(app: ApiApp): void {
       method: "get",
       path: "/v1/nodes/{id}/release",
       description:
-        "Reports how the node stands against its region's release: whether its last hello named the release and its link is fresh.",
+        "Reports how the node stands against its region's release: whether its last hello named the release (its binaries) and its link is fresh. The operating system, which is the kernel, the packages and the host files, is `os_converged` of the node: a maintenance cycle that installs the packages needs a node that runs the release's binaries, so the two are told apart.",
       request: { params: z.object({ id: NodeId }) },
       responses: responses(FleetNodeReleaseStatus),
     },
@@ -190,6 +192,25 @@ export function registerFleetReleases(app: ApiApp): void {
   };
   const method =
     "GET and HEAD answer with the size, ETag and `Accept-Ranges: bytes`; a single `Range` of bytes is answered with 206.";
+  // A host file is named by its digest: no path, no wildcard.
+  register(
+    app,
+    {
+      ...delivery,
+      method: "get",
+      path: `${RELEASE_FILE_PATH}/{version}/${RELEASE_HOST_FILES_DIRECTORY}/{sha256}`,
+      description: `A host file of a registered release (a systemd unit or a configuration file of the image, which the agent writes in place), streamed from the archive bucket by its sha256. Only a digest that the release's own list holds is found. The agent reads these without a credential and checks the size and sha256 its signed desired page pins; they are open artifacts. ${method}`,
+      request: {
+        params: z.object({ version: z.string(), sha256: z.string() }),
+      },
+      responses: {
+        ...errors,
+        ...bytes,
+      },
+    },
+    async (c) =>
+      serveHostFile(c, c.req.param("version")!, c.req.param("sha256")!),
+  );
   // The image has its own route: it alone needs the installer's token, and OpenAPI shows that.
   register(
     app,

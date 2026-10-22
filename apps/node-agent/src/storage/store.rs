@@ -22,9 +22,12 @@ use std::{
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     slice,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::{Duration, Instant},
 };
+
+/// How many volumes the agent unmounts at once when it exits (`Storage::unmount_all`).
+const UNMOUNTS_AT_ONCE: usize = 16;
 
 /// A volume is a whole number of extents; the volume group is made with lvm2's 4 MiB.
 const EXTENT_BYTES: u64 = 4 << 20;
@@ -45,8 +48,12 @@ pub struct Storage<R = SystemRunner> {
     runner: R,
     config: Config,
     latest: Mutex<Option<PoolSample>>,
-    /// Serializes everything that changes the group, the pool or a volume.
-    changes: Mutex<()>,
+    /// Serializes everything that changes the group, the pool or a volume. The mounts of volumes of
+    /// different databases only share it: they change nothing of the others.
+    changes: RwLock<()>,
+    /// One read of the volume list at a time for the questions that any read answers
+    /// (`read_lvs_shared`).
+    refreshing: Mutex<()>,
     listing: Listing,
     kernel: Kernel,
 }
@@ -64,7 +71,8 @@ impl<R: CommandRunner> Storage<R> {
             runner,
             config,
             latest: Mutex::new(None),
-            changes: Mutex::new(()),
+            changes: RwLock::new(()),
+            refreshing: Mutex::new(()),
             listing: Listing::new(VOLUME_LIST_MAX_AGE),
             kernel: Kernel {
                 minor: host::block_minor,
@@ -80,9 +88,16 @@ impl<R: CommandRunner> Storage<R> {
         commands::device(&self.config, id)
     }
 
-    fn lock(&self) -> MutexGuard<'_, ()> {
+    fn lock(&self) -> RwLockWriteGuard<'_, ()> {
         // The lock guards no data: a panic while holding it leaves nothing half-updated in memory.
-        self.changes.lock().unwrap_or_else(PoisonError::into_inner)
+        self.changes.write().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// The lock of an operation that changes one database's volume alone and leaves the pool, the
+    /// group and the other volumes as they are: the mount. Many hold it at once, none while
+    /// something exclusive runs. The caller keeps the operations on one database apart; the
+    /// agent's flow of a database does.
+    fn lock_shared(&self) -> RwLockReadGuard<'_, ()> {
+        self.changes.read().unwrap_or_else(PoisonError::into_inner)
     }
     fn run(&self, command: Vec<String>) -> Result<Output, Error> {
         let output = self.runner.run(&command);
@@ -103,11 +118,36 @@ impl<R: CommandRunner> Storage<R> {
     /// The volumes now, from lvm2. The reading is kept for a wake's questions.
     fn read_lvs(&self) -> Result<Arc<Vec<LogicalVolume>>, Error> {
         let read = self.listing.begin();
-        let lvs = Arc::new(lvm::parse_lvs(
-            &self.run(commands::lvs(&self.config))?.stdout,
-        )?);
+        let began = Instant::now();
+        let output = self.run(commands::lvs(&self.config));
+        crate::timing::LVS.add(began.elapsed());
+        let lvs = Arc::new(lvm::parse_lvs(&output?.stdout)?);
         self.listing.keep(read, &lvs);
         Ok(lvs)
+    }
+    /// The volumes, for a question that any read answers that began after the question was asked
+    /// (`Listing::since`): the read that is running for another question, or one that ended since
+    /// the question began, serves it, and a burst of questions runs `lvs` once or twice and not
+    /// once each. The agent decides on every database at its start, and each decision asks.
+    fn read_lvs_shared(&self) -> Result<Arc<Vec<LogicalVolume>>, Error> {
+        let asked = Instant::now();
+        let _turn = self
+            .refreshing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(lvs) = self.listing.since(asked) {
+            return Ok(lvs);
+        }
+        self.read_lvs()
+    }
+    /// The volumes for a mount: the recent list answers it, as it answers a wake's questions (any
+    /// command that changed a volume or a tag made it old), and when there is none, one read for
+    /// all that ask.
+    fn volumes_for_mount(&self) -> Result<Arc<Vec<LogicalVolume>>, Error> {
+        match self.listing.recent() {
+            Some(lvs) => Ok(lvs),
+            None => self.read_lvs_shared(),
+        }
     }
     fn read_group(&self) -> Result<lvm::VolumeGroup, Error> {
         lvm::parse_vgs(&self.run(commands::vgs())?.stdout)?
@@ -298,7 +338,7 @@ impl<R: CommandRunner> Storage<R> {
     }
 
     /// `poll_pool` inside a change, which holds the lock.
-    fn sample_pool(&self, held: &MutexGuard<'_, ()>) -> Result<PoolSample, Error> {
+    fn sample_pool(&self, held: &RwLockWriteGuard<'_, ()>) -> Result<PoolSample, Error> {
         let sample = self.read_pool()?;
         if !sample.writable() {
             self.mark_suspects(held)?;
@@ -314,7 +354,7 @@ impl<R: CommandRunner> Storage<R> {
     /// or a job mounts the volume in a namespace of its own. The tag is LVM metadata, so it
     /// outlives the agent and the node, and it stays until `recover_volume` has repaired the
     /// volume.
-    fn mark_suspects(&self, _held: &MutexGuard<'_, ()>) -> Result<(), Error> {
+    fn mark_suspects(&self, _held: &RwLockWriteGuard<'_, ()>) -> Result<(), Error> {
         let lvs = self.read_lvs()?;
         let open: Vec<(VolumeId, bool)> = self
             .database_volumes(&lvs)
@@ -476,7 +516,7 @@ impl<R: CommandRunner> Storage<R> {
         if self.listed(id).is_some() {
             return Ok(true);
         }
-        match self.volume(&self.read_lvs()?, id) {
+        match self.volume(&self.read_lvs_shared()?, id) {
             Ok(_) => Ok(true),
             Err(Error::Missing) => Ok(false),
             Err(error) => Err(error),
@@ -493,7 +533,10 @@ impl<R: CommandRunner> Storage<R> {
         {
             return Ok(errors > 0);
         }
-        if self.volume(&self.read_lvs()?, id)?.has_tag(SUSPECT_TAG) {
+        if self
+            .volume(&self.read_lvs_shared()?, id)?
+            .has_tag(SUSPECT_TAG)
+        {
             return Ok(true);
         }
         self.fs_errors(id)
@@ -606,7 +649,10 @@ impl<R: CommandRunner> Storage<R> {
             Err(error) if error.kind() != ErrorKind::AlreadyExists => return Err(error.into()),
             _ => {}
         }
-        host::mount_ext4(&device, &dir)?;
+        let began = Instant::now();
+        let mounted = host::mount_ext4(&device, &dir);
+        crate::timing::MOUNT.add(began.elapsed());
+        mounted?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         // Last: the link is the unit's permission to start, and exists only for what is mounted.
         self.install_link(id)
@@ -673,22 +719,23 @@ impl<R: CommandRunner> Storage<R> {
     }
 
     pub fn mount_volume(&self, id: &VolumeId) -> Result<(), Error> {
-        let _guard = self.lock();
-        let lvs = self.read_lvs()?;
+        let _guard = self.lock_shared();
+        let lvs = self.volumes_for_mount()?;
         let suspect = self.formatted(&lvs, id)?.has_tag(SUSPECT_TAG);
         self.attach(id, suspect, &lvs)
     }
 
     /// After a boot, and after an agent's restart, which ends its mount namespace and with it every
-    /// mount it made: mounts the formatted volume of every database in `current`, as sleeping
-    /// databases keep theirs mounted. `current` is the storage generation the persisted desired
-    /// state names for each database: an older generation that has not been removed yet is never
-    /// mounted, and the unit would start its data. A volume that does not mount is returned and
-    /// the others still are. One that does not exist, or whose create stopped before its
-    /// filesystem, is the create's to finish. The agent serves no wake before this is done.
+    /// mount it made: mounts the formatted volume of each database in `current`, as sleeping
+    /// databases keep theirs mounted. `current` is the storage generation the page names for each
+    /// database: an older generation that has not been removed yet is never mounted, and the unit
+    /// would start its data. A volume that does not mount is returned and the others still are.
+    /// One that does not exist, or whose create stopped before its filesystem, is the create's to
+    /// finish. The agent mounts a database's volume when it decides on the database, many at once
+    /// (each mount waits for the disk), and a wake attaches the volume it needs.
     pub fn mount_all(&self, current: &[VolumeId]) -> Result<Vec<(VolumeId, Error)>, Error> {
-        let _guard = self.lock();
-        let lvs = self.read_lvs()?;
+        let _guard = self.lock_shared();
+        let lvs = self.volumes_for_mount()?;
         let mut failures = Vec::new();
         for id in current {
             let lv = match self.volume(&lvs, id) {
@@ -742,6 +789,53 @@ impl<R: CommandRunner> Storage<R> {
             return Err(Error::Busy);
         }
         Ok(())
+    }
+
+    /// The agent's exit: unmounts the volumes it has mounted, many at once. A process that exits
+    /// leaves its mount namespace, and the kernel unmounts what the namespace holds one after the
+    /// other, each as slow as the disk's flushes (lab: 89 ms each, and EU1's agent took 14 s to
+    /// stop with 301 volumes). The process is not gone until it has, and systemd starts the next
+    /// agent after it. A mount that is busy stays for the kernel, as does everything when an
+    /// operation that changes volumes does not end in two seconds. The databases run on: a unit
+    /// has a mount of its own, and the superblock stays.
+    pub fn unmount_all(&self) {
+        let mut waited = 0;
+        let _guard = loop {
+            match self.changes.try_write() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) if waited < 100 => {
+                    waited += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            }
+        };
+        let Ok(mounts) = self.mounts() else {
+            return;
+        };
+        let mut ours: Vec<PathBuf> = mounts
+            .iter()
+            .filter(|mount| {
+                mount.mount_point.parent() == Some(self.config.mount_root.as_path())
+                    && self.volume_of_device(&mount.source).is_some()
+            })
+            .map(|mount| mount.mount_point.clone())
+            .collect();
+        ours.sort();
+        ours.dedup();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..UNMOUNTS_AT_ONCE.min(ours.len()) {
+                scope.spawn(|| {
+                    while let Some(directory) =
+                        ours.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    {
+                        let _ = host::unmount(directory);
+                    }
+                });
+            }
+        });
     }
 
     pub fn unmount_volume(&self, id: &VolumeId) -> Result<(), Error> {
@@ -1020,6 +1114,44 @@ mod tests {
     }
     fn listed_volume() -> VolumeId {
         VolumeId::new(LISTED, 1).unwrap()
+    }
+
+    /// `lvs` that takes a while, as it does on a node with hundreds of volumes.
+    struct SlowLvs(Listed);
+    impl CommandRunner for SlowLvs {
+        fn run(&self, command: &[String]) -> io::Result<Output> {
+            if command[0] == "lvs" {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            self.0.run(command)
+        }
+    }
+
+    /// The agent decides on every database of the node at once when it starts, and each decision
+    /// asks whether the volume exists. While the list is old each of them would run `lvs`: the
+    /// read that one of them runs answers the others, which asked before it began.
+    #[test]
+    fn a_burst_of_questions_about_volumes_runs_lvs_a_few_times_and_not_once_each() {
+        let mut storage = Storage::new(SlowLvs(Listed::new(LVS)), Config::default());
+        storage.kernel = Kernel {
+            minor: |_| Ok(7),
+            ext4_errors: |_| Ok(0),
+        };
+        storage.listing = Listing::new(Duration::ZERO);
+        let id = listed_volume();
+        let together = std::sync::Barrier::new(24);
+        std::thread::scope(|scope| {
+            for _ in 0..24 {
+                scope.spawn(|| {
+                    together.wait();
+                    assert!(storage.exists(&id).unwrap());
+                });
+            }
+        });
+        // The first read answers the questions that asked before it began, a second the ones that
+        // asked while it ran; a third is a thread that the machine kept waiting for 50 ms.
+        let ran = storage.runner.0.ran("lvs");
+        assert!((1..=3).contains(&ran), "{ran} runs of lvs for 24 questions");
     }
 
     #[test]

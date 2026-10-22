@@ -98,6 +98,16 @@ impl Node {
     pub async fn reset_device_links(&self) -> Result<(), storage::Error> {
         self.storage(|storage| storage.reset_device_links()).await
     }
+    /// The agent's exit: its mounts of the volumes go, many at once, before the kernel would end
+    /// them one by one with the namespace (`Storage::unmount_all`).
+    pub async fn release_mounts(&self) {
+        let _ = self
+            .storage(|storage| {
+                storage.unmount_all();
+                Ok(())
+            })
+            .await;
+    }
     /// The user of the scratch database that `pgcf-agent check` makes, or finds: a system account
     /// of the system's own uid range. The agent's table of uids stays the running agent's alone;
     /// a second process, the check, never writes it.
@@ -487,6 +497,18 @@ impl Machine for Node {
         self.units.start_service(unit, true).await
     }
 
+    async fn daemon_reload(&self) -> Result<(), units::Error> {
+        self.units.reload().await
+    }
+
+    async fn run_sysusers(&self, file: &str) -> io::Result<()> {
+        run("systemd-sysusers", &[file]).await
+    }
+
+    async fn run_tmpfiles(&self, file: &str) -> io::Result<()> {
+        run("systemd-tmpfiles", &["--create", file]).await
+    }
+
     async fn installed_packages(&self) -> io::Result<BTreeMap<String, String>> {
         let output = tokio::process::Command::new("dpkg-query")
             .args(["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n"])
@@ -683,10 +705,6 @@ impl Machine for Node {
     fn throttle(&self, database: &str) -> Option<Throttle> {
         let text = std::fs::read_to_string(units::cpu_stat_path(database)?).ok()?;
         crate::sample::throttle(&text)
-    }
-
-    fn cache_residency(&self, database: &str) -> Option<crate::cache::Residency> {
-        crate::cache::host(&self.layout.data(database))
     }
 }
 

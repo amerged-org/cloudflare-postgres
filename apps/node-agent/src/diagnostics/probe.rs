@@ -36,9 +36,9 @@ pub enum Probe {
     Pool,
 }
 
-/// A request of the desired page (`NodeDiagnosticRequest`).
+/// A request of the desired page (`NodeDiagnosticRequest`). A property it does not name is ignored,
+/// a command included: the agent builds the command of every probe itself.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Request {
     pub id: String,
     pub probe: Probe,
@@ -550,13 +550,26 @@ mod tests {
             .unwrap_or_else(|error| panic!("{name}: {error}"));
             assert!(source(&request).is_ok(), "{name}");
         }
-        // No command, path or unit comes with a request, and no probe the contract lacks.
+        // No probe the contract lacks, and no request without what it needs.
         for broken in [
             json!({"id": ID, "probe": "shell", "boot": 0, "since_seconds": 60, "lines": 1}),
-            json!({"id": ID, "probe": "pool", "boot": 0, "since_seconds": 60, "lines": 1, "command": "id"}),
+            json!({"id": ID, "probe": "pool", "boot": 0, "since_seconds": 60}),
         ] {
             assert!(serde_json::from_value::<Request>(broken).is_err());
         }
+        // A command, a path or a unit that comes with a request is no part of it: the agent builds
+        // every command itself, so what is read is the same with or without the property.
+        let plain: Request = serde_json::from_value(
+            json!({"id": ID, "probe": "pool", "boot": 0, "since_seconds": 60, "lines": 1}),
+        )
+        .unwrap();
+        let with_command: Request = serde_json::from_value(json!({
+            "id": ID, "probe": "pool", "boot": 0, "since_seconds": 60, "lines": 1,
+            "command": "id", "unit": "ssh.service", "path": "/etc/shadow"
+        }))
+        .unwrap();
+        assert_eq!(with_command, plain);
+        assert_eq!(source(&with_command).unwrap(), source(&plain).unwrap());
     }
 
     /// The captured outputs of a systemd 257 lab on Debian trixie, as `Local` serves them.

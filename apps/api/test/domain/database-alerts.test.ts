@@ -4,6 +4,7 @@ import {
   DatabaseWithOperation,
   INFRA_ALERT_ACTIONS,
   InfraAlert,
+  NODE_DATABASE_STALE_MS,
   newNodeId,
   type InfraAlertKind,
 } from "@pgcf/contracts";
@@ -339,6 +340,16 @@ it("alarms a base backup older than 36 h of awake time and excludes hibernated, 
   )
     .bind(ago(now, HOUR), stale)
     .run();
+  // Unchanged, so its node named it ten minutes ago and will again within the anti-entropy period.
+  const quiet = await database(
+    f,
+    "quiet",
+    awake(now, {
+      backup_health: "ok",
+      backup_observed_at: ago(now, 10 * 60_000),
+      backup_last_completed_at: ago(now, 40 * HOUR),
+    }),
+  );
   // Slept through its 03:00 backup and woke an hour ago: the 36 h count starts at the wake.
   const woke = await database(
     f,
@@ -373,7 +384,7 @@ it("alarms a base backup older than 36 h of awake time and excludes hibernated, 
     "old-sample",
     awake(now, {
       backup_health: "ok",
-      backup_observed_at: ago(now, 600_000),
+      backup_observed_at: ago(now, NODE_DATABASE_STALE_MS + 60_000),
       backup_last_completed_at: ago(now, 90 * HOUR),
     }),
   );
@@ -386,14 +397,15 @@ it("alarms a base backup older than 36 h of awake time and excludes hibernated, 
   expect(hook.events).toHaveLength(1);
   expect(hook.events[0]!.event).toMatchObject({
     kind: "database_base_backup_stale",
-    database_ids: [stale],
+    database_ids: expect.arrayContaining([stale, quiet]),
     action: INFRA_ALERT_ACTIONS.database_base_backup_stale,
   });
+  expect(hook.events[0]!.event.database_ids).toHaveLength(2);
   // The next completed backup clears the episode.
   await env.DB.prepare(
-    "UPDATE databases SET backup_last_completed_at=? WHERE id=?",
+    "UPDATE databases SET backup_last_completed_at=? WHERE id IN(?,?)",
   )
-    .bind(ago(now, 1000), stale)
+    .bind(ago(now, 1000), stale, quiet)
     .run();
   await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
   expect(await status(f, "database_base_backup_stale")).toMatchObject({

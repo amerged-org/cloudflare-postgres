@@ -269,10 +269,29 @@ impl Link {
     }
 
     /// Posts what the node observed of its databases and how its orders ended
-    /// (`NodeObservationReport`). The agent builds a new report from its state when this fails.
-    pub async fn post_observation(&self, report: &Value) -> Result<(), Error> {
-        self.post("observations", "NodeObservationReport", report)
-            .await
+    /// (`NodeObservationReport`). Returns the databases whose observation Cloudflare took (the
+    /// verdict `accept`), which it holds from then on; the others, `stale` or in `conflict`, it
+    /// does not hold, and the node reports them again from the page it pulls next. The agent builds
+    /// a new report from its state when this fails.
+    pub async fn post_observation(&self, report: &Value) -> Result<Vec<String>, Error> {
+        if !contract_valid("NodeObservationReport", report) {
+            return Err("native observations report invalid".into());
+        }
+        let answer = self
+            .inner
+            .api
+            .post_answer(path("observations")?, report)
+            .await?;
+        if !contract_valid("NodeObservationAnswer", &answer) {
+            return Err("native observations answer invalid".into());
+        }
+        Ok(answer["databases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|database| database["verdict"] == "accept")
+            .filter_map(|database| database["id"].as_str().map(str::to_string))
+            .collect())
     }
 
     /// Posts the journal of the previous boot (`NodeBootReport`), once after a reboot.
@@ -441,10 +460,34 @@ mod tests {
         assert_eq!(archive["id"], "crd_kkkkkkkkkkkkkkkkkkkk");
         // Posts, the sample over the link.
         let observation = vector("NodeObservationReport", "asleep");
-        link.post_observation(&observation).await.unwrap();
+        let id = observation["databases"][0]["id"].as_str().unwrap();
+        // Cloudflare's verdict on each database of the report: the node holds what it accepted.
+        assert_eq!(link.post_observation(&observation).await.unwrap(), [id]);
+        cloud.with(|inner| {
+            inner.verdicts.insert(id.to_string(), "conflict");
+        });
+        assert!(
+            link.post_observation(&observation)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        cloud.with(|inner| {
+            inner.verdicts.insert(id.to_string(), "stale");
+        });
+        assert!(
+            link.post_observation(&observation)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        cloud.with(|inner| inner.verdicts.clear());
         let volumes = vector("NodeVolumeReport", "volumes");
         link.post_volumes(&volumes).await.unwrap();
-        assert_eq!(cloud.acknowledged("/node/v1/observations"), [observation]);
+        assert_eq!(
+            cloud.acknowledged("/node/v1/observations"),
+            vec![observation.clone(); 3]
+        );
         assert_eq!(cloud.acknowledged("/node/v1/volumes"), [volumes]);
         let sample = vector("NodeSample", "sample");
         link.post_samples(&sample).await.unwrap();
@@ -488,6 +531,56 @@ mod tests {
         assert!(link.post_samples(&json!({"memory":1})).await.is_err());
         assert!(link.archive_credential("../credentials").await.is_err());
         assert_eq!(cloud.requests().len(), before);
+    }
+
+    /// An API of a later release adds a property to every document it sends. The node enrolls,
+    /// links, pulls and reads exactly as it does without it, and the property changes nothing it
+    /// does (plan 9.3, "Changing the page").
+    #[tokio::test]
+    async fn an_api_of_a_later_release_adds_properties_and_the_node_works_as_before() {
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        // The seed of an installer of a later release carries one too.
+        std::fs::create_dir_all(base.join("enrollment")).unwrap();
+        std::fs::write(
+            base.join("enrollment/seed.json"),
+            json!({"node_id":test_server::NODE_ID,"region":"eu-dev","api_url":cloud.origin,
+                "enrollment_token":test_server::TOKEN,test_server::UNKNOWN_PROPERTY:1})
+            .to_string(),
+        )
+        .unwrap();
+        cloud.with(|inner| {
+            inner.unknown_properties = true;
+            inner.databases = vec![database(&database_id(1)), database(&database_id(2))];
+            inner.orders =
+                vec![json!({"type":"maintenance","operation":"op_tttttttttttttttttttt"})];
+        });
+        let (link, mut events) = start(&cloud, &base).await;
+        assert_eq!(link.node().id, test_server::NODE_ID);
+        // The welcome has one, and so has a hint to pull.
+        assert_eq!(next(&mut events).await, Some(LinkEvent::Desired(None)));
+        cloud
+            .push(json!({"type":"desired","ids":[database_id(2)],test_server::UNKNOWN_PROPERTY:1}));
+        assert_eq!(
+            next(&mut events).await,
+            Some(LinkEvent::Desired(Some(vec![database_id(2)])))
+        );
+        let desired = link.desired_page(None).await.unwrap();
+        assert_eq!(desired.databases.len(), 2);
+        assert_eq!(desired.orders.len(), 1);
+        assert_eq!(link.credentials().await.unwrap()["revision"], 3);
+        let archive = link
+            .archive_credential("crd_kkkkkkkkkkkkkkkkkkkk")
+            .await
+            .unwrap();
+        assert_eq!(archive["id"], "crd_kkkkkkkkkkkkkkkkkkkk");
+        let observation = vector("NodeObservationReport", "asleep");
+        let id = observation["databases"][0]["id"].as_str().unwrap();
+        assert_eq!(link.post_observation(&observation).await.unwrap(), [id]);
+        // A node it declared lost is still known as lost.
+        cloud.with(|inner| inner.fenced = true);
+        cloud.drop_links();
+        assert_eq!(next(&mut events).await, Some(LinkEvent::Fenced));
     }
 
     #[tokio::test]
@@ -603,9 +696,13 @@ mod tests {
         assert_eq!(next(&mut events).await, Some(LinkEvent::Desired(None)));
         let desired = link.desired_page(None).await.unwrap();
         assert!(matches!(desired.orders[0], Order::Fence { .. }));
-        link.post_observation(&vector("NodeObservationReport", "asleep"))
-            .await
-            .unwrap();
+        // The observations of a fenced node are read for its orders alone: no database is taken.
+        assert!(
+            link.post_observation(&vector("NodeObservationReport", "asleep"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             link.post_volumes(&vector("NodeVolumeReport", "volumes"))
                 .await

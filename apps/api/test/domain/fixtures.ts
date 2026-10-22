@@ -10,6 +10,8 @@ import {
   RELEASE_FILES,
   bytesToHex,
   hashApiKey,
+  hostFileObjectKey,
+  hostFilesSha256,
   newApiKey,
   newApiKeyId,
   newNodeId,
@@ -20,12 +22,14 @@ import {
   releaseObjectKey,
   signNodeRequest,
   type FleetReleaseRegistration,
+  type HostFile,
   type NodeKey,
   type ReleaseFile,
 } from "@pgcf/contracts";
 import { expect } from "vitest";
 import { createApp } from "../../src/app.ts";
 import type { Env } from "../../src/env.ts";
+import { signRelease } from "../release-key.ts";
 import { reportStatements } from "./node-samples.ts";
 
 /** The origin the Worker under test names in the URLs of a release and in an installer's userData. */
@@ -522,6 +526,7 @@ export const nodePolicy = () => ({
     start_concurrency: 4,
     queue_wait_ms: 10_000,
     retry_after_seconds: 5,
+    cpu_boost_ms: 5000,
   },
   early_sleep: { enabled: true, min_idle_seconds: 30 },
   storage: {
@@ -619,10 +624,43 @@ const pinned = (name: string) => ({
   sha256: "a".repeat(64),
   size_bytes: 4096,
 });
+const sha256Of = async (bytes: Uint8Array) =>
+  bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+/** The host files of the fixtures' releases: a mask and two files, ascending by path, and the bytes of each file. */
+export const HOST_FILE_BODIES = {
+  gateway: new TextEncoder().encode("[Service]\n# gateway\n"),
+  database: new TextEncoder().encode("[Service]\n# database\n"),
+};
+/** The digest of the gateway unit's bytes: the object a test leaves out or replaces. */
+export const GATEWAY_UNIT_SHA256 = await sha256Of(HOST_FILE_BODIES.gateway);
+export const HOST_FILES: HostFile[] = [
+  {
+    path: "/etc/systemd/system/modprobe@loop.service",
+    kind: "symlink-to-dev-null",
+    apply: "daemon_reload",
+  },
+  {
+    path: "/usr/lib/systemd/system/pgcf-gateway.service",
+    kind: "file",
+    mode: "0644",
+    sha256: GATEWAY_UNIT_SHA256,
+    size_bytes: HOST_FILE_BODIES.gateway.byteLength,
+    apply: "restart_unit:pgcf-gateway.service",
+  },
+  {
+    path: "/usr/lib/systemd/system/pgcf-pg@.service",
+    kind: "file",
+    mode: "0644",
+    sha256: await sha256Of(HOST_FILE_BODIES.database),
+    size_bytes: HOST_FILE_BODIES.database.byteLength,
+    apply: "next_start",
+  },
+];
 /** What a node that runs the fixtures' releases reports of its operating system. */
 export const RELEASE_OS = {
   kernel_release: "6.12.113+deb13-amd64",
   packages_sha256: "d".repeat(64),
+  host_files_sha256: await hostFilesSha256(HOST_FILES),
 };
 /** The boot and operating system in a node's hello: those of the fixtures' releases unless changed. */
 export const nodeOs = (change: Record<string, unknown> = {}) => ({
@@ -631,21 +669,31 @@ export const nodeOs = (change: Record<string, unknown> = {}) => ({
   ...RELEASE_OS,
   ...change,
 });
-/** A signature of the form the API stores for a version: another for each, made by no key. */
-export const signatureOf = async (version: string) => {
-  const digest = bytesToHex(
-    new Uint8Array(
-      await crypto.subtle.digest(
-        "SHA-256",
-        new TextEncoder().encode(`signature/${version}`),
-      ),
-    ),
-  );
-  return digest + digest;
-};
+/**
+ * A registration signed the way CI's signer signs a release: the manifest rebuilt from its own
+ * facts under the id, signed by the key the API verifies with in these tests (../release-key.ts).
+ */
+export async function signed(
+  version: string,
+  registration: Omit<FleetReleaseRegistration, "signature">,
+): Promise<FleetReleaseRegistration> {
+  return {
+    ...registration,
+    signature: await signRelease({ id: version, ...registration }),
+  };
+}
+/** `registration` signed again, after a test changed what it holds. */
+export function resigned(
+  version: string,
+  registration: FleetReleaseRegistration,
+): Promise<FleetReleaseRegistration> {
+  const { signature, ...unsigned } = registration;
+  void signature;
+  return signed(version, unsigned);
+}
 /** The spec of a release: a node image, its four binaries and the package lock. */
 export const releaseSpec = (version = "1.2.0") => ({
-  version: 2,
+  version: 3,
   image: {
     url: `https://${["releases", "invalid"].join(".")}/pgcf-node-${version}.raw.zst`,
     sha256: "b".repeat(64),
@@ -664,6 +712,7 @@ export const releaseSpec = (version = "1.2.0") => ({
     image_version: version,
     debian_snapshot: "20261015T000000Z",
     package_lock: pinned("packages.lock.json"),
+    host_files: HOST_FILES,
     ...RELEASE_OS,
   },
   signature: "e".repeat(128),
@@ -679,6 +728,8 @@ export async function stageRelease(
   options: {
     skip?: readonly ReleaseFile[];
     bodies?: Partial<Record<ReleaseFile, Uint8Array>>;
+    /** Host files (by path) whose object is left out of the bucket. */
+    skipHostFiles?: readonly string[];
   } = {},
 ): Promise<FleetReleaseRegistration> {
   const text = new TextEncoder();
@@ -697,7 +748,18 @@ export async function stageRelease(
     await env.ARCHIVE.put(key, body, { sha256 });
     stagedObjects.push(key);
   }
-  return {
+  for (const file of HOST_FILES) {
+    if (file.kind !== "file" || options.skipHostFiles?.includes(file.path))
+      continue;
+    const body =
+      file.path === HOST_FILES[1]!.path
+        ? HOST_FILE_BODIES.gateway
+        : HOST_FILE_BODIES.database;
+    const key = hostFileObjectKey(version, file.sha256);
+    await env.ARCHIVE.put(key, body, { sha256: file.sha256 });
+    stagedObjects.push(key);
+  }
+  return signed(version, {
     image: {
       ...digests["pgcf-node.raw.zst"],
       raw_sha256: bytesToHex(
@@ -716,10 +778,10 @@ export async function stageRelease(
     os: {
       debian_snapshot: "20261015T000000Z",
       package_lock: digests["packages.lock.json"],
+      host_files: structuredClone(HOST_FILES),
       ...RELEASE_OS,
     },
-    signature: await signatureOf(version),
-  };
+  });
 }
 /** Registers a release and assigns it to the region. */
 export async function assignRelease(

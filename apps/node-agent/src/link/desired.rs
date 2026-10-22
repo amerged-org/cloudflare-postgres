@@ -17,9 +17,10 @@ const MAX_PAGES: usize = 50;
 const PULL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// An explicit order of Cloudflare (`NodeOrder`). Nothing else stops or removes what runs. Each
-/// is open on every page until its result is reported.
+/// is open on every page until its result is reported. A property of an order that this build does
+/// not name is ignored; a type of order it does not name is no order (`ORDER_TYPES`).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Order {
     /// Start the database now, through admission, as a connection's wake would (resume).
     Wake {
@@ -45,6 +46,25 @@ pub enum Order {
     /// Hold new wakes, prove every sleep, install the release's packages, check.
     Maintenance { operation: String },
 }
+/// The types of order this build reads: the variants of `Order`, which are the contract's
+/// `NODE_ORDER_TYPES` (a test holds the two equal). A page with another type is refused whole.
+const ORDER_TYPES: [&str; 5] = ["wake", "move", "superseded", "fence", "maintenance"];
+
+/// Whether a page holds an order of a type this build does not read. An order the agent does not
+/// understand is never skipped as done, and it is never acted on beside the rest of its page: the
+/// orders of a page carry the meaning of the entries beside them (a fenced node's page holds no
+/// database, a `superseded` order retires what the page does not serve), so the agent that cannot
+/// read every order of a page acts on none of it, keeps what runs, and says why. The API sends a
+/// new type only in the release after every node reads it (plan 9.3, "Changing the page").
+fn has_unknown_order(page: &Value) -> bool {
+    page["orders"].as_array().is_some_and(|orders| {
+        orders
+            .iter()
+            .filter_map(|order| order["type"].as_str())
+            .any(|kind| !ORDER_TYPES.contains(&kind))
+    })
+}
+
 impl Order {
     pub fn operation(&self) -> &str {
         match self {
@@ -130,6 +150,9 @@ pub(super) async fn pull(api: &Api, ids: Option<&[String]>) -> Result<Desired, E
 /// One page, checked as the contract and the node's own rules require, and its cursor.
 async fn page(api: &Api, target: &str) -> Result<(Desired, Option<String>), Error> {
     let page = api.get(target).await?;
+    if has_unknown_order(&page) {
+        return Err("Cloudflare desired page has an order this agent does not know".into());
+    }
     if !desired_page_valid(&page) {
         return Err("Cloudflare desired page invalid".into());
     }
@@ -318,8 +341,23 @@ mod tests {
             pull(&api, None).await.unwrap_err().to_string(),
             "Cloudflare desired page invalid"
         );
-        cloud.with(|inner| inner.diagnostics[0]["command"] = "id".into());
-        assert!(pull(&api, None).await.is_err());
+        // A property the contract does not have is no command either: the agent builds the command
+        // of a probe itself, and a request is its name and three integers.
+        cloud.with(|inner| {
+            inner.diagnostics[0]["probe"] = "kernel".into();
+            inner.diagnostics[0]["command"] = "id".into();
+        });
+        let desired = pull(&api, None).await.unwrap();
+        assert_eq!(
+            desired.diagnostics[0],
+            Request {
+                id: "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81".into(),
+                probe: Probe::Kernel,
+                boot: -1,
+                since_seconds: 600,
+                lines: 50,
+            }
+        );
     }
 
     /// The largest database entry the contract allows: 100 roles with every attribute, each a
@@ -444,16 +482,205 @@ mod tests {
         );
     }
 
+    /// The agent comes first when the contract names a new type of order: this fails until the
+    /// agent reads it (and `Order` has its variant), which is the first of the two releases.
     #[test]
-    fn every_order_of_the_contract_parses_and_nothing_else_does() {
+    fn the_types_of_order_this_build_reads_are_the_contracts() {
+        let contract: Vec<&str> = crate::node_link::constant("NODE_ORDER_TYPES")
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|kind| kind.as_str().unwrap())
+            .collect();
+        assert_eq!(ORDER_TYPES.to_vec(), contract);
+        for kind in ORDER_TYPES {
+            let order = json!({"type": kind, "operation": "op_oooooooooooooooooooo",
+                "database": database_id(0), "generation": 1, "storage_generation": 1,
+                "remove_volume": false});
+            assert!(
+                !has_unknown_order(&json!({"orders": [order.clone()]})),
+                "{kind}"
+            );
+            assert!(serde_json::from_value::<Order>(order).is_ok(), "{kind}");
+        }
+        assert!(has_unknown_order(&json!({"orders": [{"type": "reboot"}]})));
+    }
+
+    #[test]
+    fn every_order_of_the_contract_parses_and_a_type_it_does_not_have_does_not() {
         let page = vector("NodeDesiredPage", "full-page");
         let orders: Vec<Order> = serde_json::from_value(page["orders"].clone()).unwrap();
         assert_eq!(orders.len(), 4);
+        // A property it does not know is ignored; a type it does not know is no order.
         let mut extra = page["orders"][0].clone();
         extra["slot"] = 1.into();
-        assert!(serde_json::from_value::<Order>(extra).is_err());
+        assert_eq!(serde_json::from_value::<Order>(extra).unwrap(), orders[0]);
         assert!(
             serde_json::from_value::<Order>(json!({"type":"reboot","operation":"op_x"})).is_err()
         );
+    }
+
+    /// A page of a later release carries a property this build does not know on its objects: the
+    /// page, the policy and its groups, the release and its parts, an entry, a role, an order and
+    /// a probe. Everything the node reads of it is what it reads of the page without them
+    /// (plan 9.3, "Changing the page").
+    #[tokio::test]
+    async fn a_page_with_properties_this_build_does_not_know_is_pulled_and_they_change_nothing() {
+        let cloud = Cloud::start().await;
+        let (api, _) = enrolled(&cloud).await;
+        cloud.with(|inner| {
+            inner.databases = (0..3).map(|i| database(&database_id(i))).collect();
+            inner.orders = vec![
+                json!({"type":"wake","operation":"op_wwwwwwwwwwwwwwwwwwww","database":database_id(1),"generation":6}),
+                json!({"type":"superseded","operation":"op_ssssssssssssssssssss","database":"zzzzzzzzzzzzzzzzzzzz","storage_generation":2,"remove_volume":true}),
+                json!({"type":"move","operation":"op_vvvvvvvvvvvvvvvvvvvv","database":database_id(2),"storage_generation":1}),
+                json!({"type":"maintenance","operation":"op_tttttttttttttttttttt"}),
+            ];
+            inner.diagnostics = vec![json!({"id": "5b1f0c2e-7d34-4a8b-9e61-0c3d2a4f6b81", "probe": "kernel", "boot": -1, "since_seconds": 600, "lines": 50})];
+        });
+        let plain = pull(&api, None).await.unwrap();
+        cloud.with(|inner| inner.unknown_properties = true);
+        let later = pull(&api, None).await.unwrap();
+        let unknown = crate::link::test_server::UNKNOWN_PROPERTY;
+        // The properties are on the page, down to a role and a part of the release ...
+        assert_eq!(later.release[unknown], 1);
+        assert_eq!(later.release["binaries"]["pgcf-agent"][unknown], 1);
+        assert_eq!(later.release["os"]["host_files"][0][unknown], 1);
+        assert_eq!(later.policy[unknown], 1);
+        assert_eq!(later.policy["admission"][unknown], 1);
+        assert_eq!(later.databases[0][unknown], 1);
+        assert_eq!(later.databases[0]["roles"][0][unknown], 1);
+        // ... and the node reads what it reads without them.
+        assert_eq!(later.orders, plain.orders);
+        assert_eq!(later.orders.len(), 4);
+        assert_eq!(later.diagnostics, plain.diagnostics);
+        assert_eq!(later.diagnostics.len(), 1);
+        assert_eq!(later.credentials_revision, plain.credentials_revision);
+        assert_eq!(
+            crate::update::Release::parse(&later.release),
+            crate::update::Release::parse(&plain.release)
+        );
+        assert!(crate::update::Release::parse(&later.release).is_some());
+        assert_eq!(
+            format!("{:?}", crate::agent::Policy::parse(&later.policy)),
+            format!("{:?}", crate::agent::Policy::parse(&plain.policy))
+        );
+        assert!(crate::agent::Policy::parse(&later.policy).is_some());
+        assert_eq!(later.databases.len(), plain.databases.len());
+        for (later, plain) in later.databases.iter().zip(&plain.databases) {
+            assert_eq!(
+                crate::agent::Entry::parse(later),
+                crate::agent::Entry::parse(plain)
+            );
+            assert!(crate::agent::Entry::parse(later).is_some());
+        }
+    }
+
+    /// What the node cannot read it refuses whole, as before: a type, a kind or a value it does
+    /// not know, a property it needs that is missing, and one of the wrong type or out of bound.
+    /// An order it does not know is never skipped as done, and the refusal says so.
+    #[tokio::test]
+    async fn a_page_the_node_cannot_read_is_refused_whole_and_an_unknown_order_says_so() {
+        let cloud = Cloud::start().await;
+        let (api, _) = enrolled(&cloud).await;
+        cloud.with(|inner| inner.databases = vec![database(&database_id(0))]);
+        let refused = |what: &str, error: Error, text: &str, class: &str| {
+            assert_eq!(error.to_string(), text, "{what}");
+            assert_eq!(crate::diagnostics::error_code(&error), class, "{what}");
+        };
+        let invalid = |what: &str, error: Error| {
+            refused(
+                what,
+                error,
+                "Cloudflare desired page invalid",
+                "cloudflare_desired_page_invalid",
+            )
+        };
+        // An order of a type this build does not have, whatever else the page holds.
+        for order in [
+            json!({"type":"reboot","operation":"op_rrrrrrrrrrrrrrrrrrrr"}),
+            json!({"type":"quarantine","operation":"op_qqqqqqqqqqqqqqqqqqqq","database":database_id(0)}),
+            json!({"type":"future"}),
+        ] {
+            cloud.with(|inner| {
+                inner.orders = vec![
+                    json!({"type":"maintenance","operation":"op_tttttttttttttttttttt"}),
+                    order.clone(),
+                ]
+            });
+            refused(
+                "unknown order",
+                pull(&api, None).await.unwrap_err(),
+                "Cloudflare desired page has an order this agent does not know",
+                "cloudflare_desired_page_has_an_order_this_agent_does_not_know",
+            );
+        }
+        // An order it knows, with what it needs missing, of the wrong type or out of bound.
+        for order in [
+            json!({"type":"wake","database":database_id(1),"generation":6}),
+            json!({"type":"wake","operation":"op_wwwwwwwwwwwwwwwwwwww","database":database_id(1),"generation":"6"}),
+            json!({"type":"wake","operation":"op_wwwwwwwwwwwwwwwwwwww","database":database_id(1),"generation":0}),
+            json!({"type":"superseded","operation":"op_ssssssssssssssssssss","database":database_id(1),"storage_generation":2}),
+        ] {
+            cloud.with(|inner| inner.orders = vec![order.clone()]);
+            invalid("order", pull(&api, None).await.unwrap_err());
+        }
+        cloud.with(|inner| inner.orders.clear());
+        // A value of a closed set it does not know.
+        for change in [
+            |db: &mut Value| db["desired_state"] = "paused".into(),
+            |db: &mut Value| db["origin"] = json!({"kind":"clone"}),
+            |db: &mut Value| db["pg_major"] = 19.into(),
+        ] {
+            cloud.with(|inner| change(&mut inner.databases[0]));
+            invalid("entry", pull(&api, None).await.unwrap_err());
+            cloud.with(|inner| inner.databases = vec![database(&database_id(0))]);
+        }
+        // A policy without a property it needs, with one of the wrong type, out of bound or a rule
+        // it does not know.
+        let example = vector("NodeDesiredPage", "full-page")["policy"].clone();
+        for change in [
+            |p: &mut Value| {
+                p["admission"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("start_concurrency");
+            },
+            |p: &mut Value| p["admission"]["queue_wait_ms"] = "10000".into(),
+            |p: &mut Value| p["admission"]["start_concurrency"] = 65.into(),
+            |p: &mut Value| p["admission"]["cpu_boost_ms"] = 60_001.into(),
+            |p: &mut Value| p["admission"]["memory_rule"] = "elastic".into(),
+            |p: &mut Value| {
+                p.as_object_mut().unwrap().remove("io");
+            },
+        ] {
+            let mut policy = example.clone();
+            change(&mut policy);
+            cloud.with(|inner| inner.policy = Some(policy));
+            invalid("policy", pull(&api, None).await.unwrap_err());
+        }
+        // A release without a binary it installs, or with a host file of a kind it does not have.
+        let release = vector("NodeDesiredPage", "full-page")["release"].clone();
+        for change in [
+            |r: &mut Value| {
+                r["binaries"].as_object_mut().unwrap().remove("pgcf-agent");
+            },
+            |r: &mut Value| r["binaries"]["pgcf-archive"]["size_bytes"] = "1000".into(),
+            |r: &mut Value| r["os"]["host_files"][0]["kind"] = "directory".into(),
+            |r: &mut Value| {
+                r.as_object_mut().unwrap().remove("image");
+            },
+        ] {
+            let mut release = release.clone();
+            change(&mut release);
+            cloud.with(|inner| {
+                inner.policy = None;
+                inner.release = Some(release)
+            });
+            invalid("release", pull(&api, None).await.unwrap_err());
+        }
+        // The page that was read stays readable: nothing above left the double changed.
+        cloud.with(|inner| inner.release = None);
+        assert!(pull(&api, None).await.is_ok());
     }
 }

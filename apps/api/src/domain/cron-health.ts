@@ -22,6 +22,7 @@ export const CRON_STEPS = [
   "idempotency_purge",
   "node_hints",
   "database_actors",
+  "actor_warmers",
   "usage",
   "node_capacity",
   "retained_archives",

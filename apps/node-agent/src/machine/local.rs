@@ -39,6 +39,10 @@ struct Unit {
     /// The volume the unit mounted when it started, from the agent's link: what it runs on until
     /// it stops, whatever the agent has attached since.
     volume: Option<VolumeId>,
+    /// systemd has the unit's start job open: the unit is `activating`, as a `Type=notify` unit is
+    /// until its postmaster says it is ready (`READY=1`, which `postmaster.pid`'s status line
+    /// precedes). The instant is the earliest the job may end (`delay_next_start`).
+    activating: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -54,6 +58,9 @@ struct State {
     accounts: Vec<String>,
     limits: HashMap<String, Limits>,
     quotas: HashMap<String, Option<NonZeroU32>>,
+    /// Every `set_cpu_quota` the agent made, in order: (database, quota). A stop lifts a quota
+    /// without a call, as systemd's does.
+    quota_calls: Vec<(String, Option<NonZeroU32>)>,
     /// Calls the tests assert on, in order: `start <id>`, `stop <id>`, `trim <id>`, `remove <id>`.
     calls: Vec<String>,
     no_room: bool,
@@ -64,6 +71,9 @@ struct State {
     volume_error: Option<storage::Error>,
     /// `start` fails once.
     start_fails: bool,
+    /// `start` fails once after its unit is up, as the real one can (EU1, 2026-10-20): the unit
+    /// runs on.
+    start_fails_after_up: bool,
     /// `reboot` fails once, and the node keeps running.
     reboot_fails: bool,
     /// `purge_packages` fails once, as dpkg does for a package that others depend on.
@@ -78,6 +88,12 @@ struct State {
     unit_reads_fail: u32,
     volume_reads: u64,
     unit_reads: u64,
+    /// The databases whose unit reads wait for `release_unit_reads`: a systemd that is slow to
+    /// answer about them.
+    held_units: BTreeSet<String>,
+    /// The next this many waits for a unit to be ready cannot read it, as a bus does that refuses
+    /// the call (`LimitsExceeded`).
+    wait_reads_fail: u32,
     /// Every volume must be repaired before its database starts again.
     needs_repair: bool,
     units_unreadable: bool,
@@ -97,8 +113,62 @@ struct State {
     pool_lost: bool,
     /// A journal file is damaged: `journalctl` prints the entries it read, then fails.
     journal_damaged: bool,
-    /// How long reading the page cache takes: a disk that is slow to list.
-    cache_delay: Option<Duration>,
+    /// What systemd has loaded of each unit file, as of its last reload (or of the boot): the
+    /// definition (`None` for a mask) that the next start of the unit takes.
+    loaded: BTreeMap<String, Option<Vec<u8>>>,
+    /// The definition each unit runs with: that of its last restart.
+    running: BTreeMap<String, Vec<u8>>,
+    /// `daemon_reload` fails once.
+    reload_fails: bool,
+    /// `restart_service` fails once, as a job that ends with `failed`.
+    restart_fails: bool,
+    /// `restart_service` fails for this unit every time, as a unit that cannot start.
+    restart_fails_for: BTreeSet<String>,
+    /// The users `systemd-sysusers` made, and the directories (with their mode) `systemd-tmpfiles`
+    /// made.
+    users: BTreeSet<String>,
+    directories: BTreeMap<String, String>,
+    /// The next `run_sysusers` or `run_tmpfiles` fails, as the tools do with exit status 1.
+    run_fails: bool,
+}
+
+/// The units of the image that a release restarts, as the packages and the image leave them: the
+/// files `systemd` loaded at the boot. A test that changes one writes the new file below the
+/// machine's root and has the release do it.
+const IMAGE_UNITS: [&str; 6] = [
+    "pgcf-agent.service",
+    "pgcf-cloudflared.service",
+    "pgcf-gateway.service",
+    "ssh.service",
+    "systemd-journald.service",
+    "systemd-sysctl.service",
+];
+
+/// A tool of systemd that ended with exit status 1, as `run` of the node reports it.
+fn tool_failed(program: &str, file: &str) -> io::Error {
+    io::Error::other(format!(
+        "{program} ended with exit status: 1: Failed to read '{file}'"
+    ))
+}
+
+/// What a read of a unit fails with when the bus refuses the call, as dbus-daemon does past its
+/// limit of calls that are not answered yet: an error reply named `LimitsExceeded`, which is what
+/// `Units::state` gets from `GetUnit` (a method call's refusal is a `MethodError`).
+fn bus_refused() -> units::Error {
+    let name = "org.freedesktop.DBus.Error.LimitsExceeded";
+    let call = zbus::message::Message::method_call("/org/freedesktop/systemd1", "GetUnit")
+        .unwrap()
+        .build(&())
+        .unwrap();
+    let reply = zbus::message::Message::error(&call.header(), name.to_string())
+        .unwrap()
+        .build(&())
+        .unwrap();
+    units::Error::Bus(zbus::Error::MethodError(
+        name.try_into().unwrap(),
+        Some("the maximum number of pending replies per connection has been reached".into()),
+        reply,
+    ))
 }
 
 /// The kernel's boot ID of the node's `boots`th boot.
@@ -112,6 +182,10 @@ pub struct Local {
     uid: u32,
     gid: u32,
     state: Mutex<State>,
+    /// `false` while the reads of `held_units` wait.
+    unit_gate: tokio::sync::watch::Sender<bool>,
+    /// `false` while the agent's mounts wait: a disk that answers late.
+    mount_gate: tokio::sync::watch::Sender<bool>,
 }
 
 impl Local {
@@ -124,6 +198,7 @@ impl Local {
             state: root.join("s"),
             run: root.join("r"),
             postgres_bin: bin,
+            host_root: root.join("h"),
             ..Layout::default()
         };
         let (uid, gid) = {
@@ -131,7 +206,28 @@ impl Local {
             let metadata = fs::metadata(&root).unwrap();
             (metadata.uid(), metadata.gid())
         };
-        Some(Self {
+        // The directories of the image's units and its configuration, and its own units in them.
+        for directory in crate::node_link::constant("HOST_FILE_DIRECTORIES")
+            .as_array()
+            .unwrap()
+        {
+            fs::create_dir_all(
+                layout
+                    .host_root
+                    .join(directory.as_str().unwrap().trim_start_matches('/')),
+            )
+            .unwrap();
+        }
+        // `/run/systemd` is there at every boot; its `system` directory is made when a unit needs it.
+        fs::create_dir_all(layout.host_root.join("run/systemd")).unwrap();
+        for unit in IMAGE_UNITS {
+            fs::write(
+                layout.host_root.join("usr/lib/systemd/system").join(unit),
+                format!("[Service]\n# {unit} of the image\n"),
+            )
+            .unwrap();
+        }
+        let machine = Self {
             layout,
             user: testpg::current_user(),
             uid,
@@ -141,7 +237,98 @@ impl Local {
                 kernel_release: "6.12.111+deb13-amd64".into(),
                 ..State::default()
             }),
-        })
+            unit_gate: tokio::sync::watch::channel(true).0,
+            mount_gate: tokio::sync::watch::channel(true).0,
+        };
+        machine.load_units();
+        Some(machine)
+    }
+
+    /// The unit files below the root, as systemd's search path finds them: `/etc` before
+    /// `/usr/lib`. A mask (a link to `/dev/null`) is `None`; anything but a file or a mask is no
+    /// unit.
+    fn unit_files(&self) -> BTreeMap<String, Option<Vec<u8>>> {
+        let mut found = BTreeMap::new();
+        // systemd's search path: the administrator's directory, then the runtime one, then the
+        // vendor's (a boot empties the runtime one).
+        for directory in [
+            "etc/systemd/system",
+            "run/systemd/system",
+            "usr/lib/systemd/system",
+        ] {
+            let Ok(entries) = fs::read_dir(self.layout.host_root.join(directory)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !(name.ends_with(".service") || name.ends_with(".slice"))
+                    || found.contains_key(&name)
+                {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(meta) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    if fs::read_link(&path).is_ok_and(|to| to == Path::new("/dev/null")) {
+                        found.insert(name, None);
+                    }
+                } else if meta.is_file() {
+                    found.insert(name, fs::read(&path).ok());
+                }
+            }
+        }
+        found
+    }
+    /// What systemd does at a boot: it loads every unit file there is.
+    pub fn load_units(&self) {
+        let files = self.unit_files();
+        self.state().loaded = files;
+    }
+    /// The file a tool of systemd (`sysusers`, `tmpfiles`) is asked to read, below the machine's
+    /// root. The call is kept, and a tool that was told to fail does.
+    fn config_file(&self, tool: &str, file: &str) -> io::Result<String> {
+        let mut state = self.state();
+        state.calls.push(format!("{tool} {file}"));
+        if std::mem::take(&mut state.run_fails) {
+            return Err(tool_failed(&format!("systemd-{tool}"), file));
+        }
+        drop(state);
+        fs::read_to_string(self.layout.host_root.join(file.trim_start_matches('/')))
+            .map_err(|_| tool_failed(&format!("systemd-{tool}"), file))
+    }
+    /// The definition `unit` runs with: its file as it was loaded when it last restarted.
+    pub fn running_definition(&self, unit: &str) -> Option<String> {
+        self.state()
+            .running
+            .get(unit)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    }
+    pub fn fail_next_reload(&self) {
+        self.state().reload_fails = true;
+    }
+    pub fn fail_next_restart(&self) {
+        self.state().restart_fails = true;
+    }
+    /// Every restart of `unit` fails, as a unit does that cannot start.
+    pub fn fail_restarts_of(&self, unit: &str) {
+        self.state().restart_fails_for.insert(unit.to_string());
+    }
+    /// Restarts of `unit` work again.
+    pub fn mend_restarts_of(&self, unit: &str) {
+        self.state().restart_fails_for.remove(unit);
+    }
+    pub fn fail_next_run(&self) {
+        self.state().run_fails = true;
+    }
+    /// The users `systemd-sysusers` made.
+    pub fn created_users(&self) -> Vec<String> {
+        self.state().users.iter().cloned().collect()
+    }
+    /// The directories `systemd-tmpfiles` made, with the mode the file gave them.
+    pub fn created_directories(&self) -> BTreeMap<String, String> {
+        self.state().directories.clone()
     }
     pub fn with_layout(mut self, change: impl FnOnce(&mut Layout)) -> Self {
         change(&mut self.layout);
@@ -210,6 +397,15 @@ impl Local {
     pub fn quota(&self, database: &str) -> Option<Option<NonZeroU32>> {
         self.state().quotas.get(database).copied()
     }
+    /// The quotas the agent set on the database, in order.
+    pub fn quota_calls(&self, database: &str) -> Vec<Option<NonZeroU32>> {
+        self.state()
+            .quota_calls
+            .iter()
+            .filter(|(id, _)| id == database)
+            .map(|(_, quota)| *quota)
+            .collect()
+    }
     pub fn credentials_applied(&self) -> Vec<(String, String, u64, bool)> {
         self.state().credentials.clone()
     }
@@ -233,15 +429,15 @@ impl Local {
     pub fn direct_archive(&self) {
         self.state().direct_archive = true;
     }
-    /// Reading what the page cache holds takes `delay` from now on.
-    pub fn slow_cache(&self, delay: Duration) {
-        self.state().cache_delay = Some(delay);
-    }
     pub fn delay_next_start(&self, delay: Duration) {
         self.state().start_delay = Some(delay);
     }
     pub fn fail_next_start(&self) {
         self.state().start_fails = true;
+    }
+    /// The next start fails after the unit is up and keeps running.
+    pub fn fail_next_start_after_up(&self) {
+        self.state().start_fails_after_up = true;
     }
     pub fn fail_next_reboot(&self) {
         self.state().reboot_fails = true;
@@ -266,6 +462,25 @@ impl Local {
     pub fn fail_next_unit_reads(&self, count: u32) {
         self.state().unit_reads_fail = count;
     }
+    /// The reads of these databases' units wait until `release_unit_reads`.
+    pub fn hold_unit_reads(&self, databases: impl IntoIterator<Item = String>) {
+        self.state().held_units = databases.into_iter().collect();
+        self.unit_gate.send_replace(false);
+    }
+    pub fn release_unit_reads(&self) {
+        self.unit_gate.send_replace(true);
+    }
+    /// The agent's mounts of volumes wait until `release_mounts`.
+    pub fn hold_mounts(&self) {
+        self.mount_gate.send_replace(false);
+    }
+    pub fn release_mounts(&self) {
+        self.mount_gate.send_replace(true);
+    }
+    /// The next `count` waits for a unit to be ready fail as a bus does that refuses the call.
+    pub fn fail_next_waits(&self, count: u32) {
+        self.state().wait_reads_fail = count;
+    }
     /// How often `has_volume` was asked, and how often `unit` was.
     pub fn reads(&self) -> (u64, u64) {
         let state = self.state();
@@ -281,6 +496,7 @@ impl Local {
                 invocations: 0,
                 invocation_id: None,
                 volume: None,
+                activating: None,
             },
         );
     }
@@ -457,6 +673,12 @@ impl Machine for Local {
         &self,
         current: &[VolumeId],
     ) -> Result<Vec<(VolumeId, storage::Error)>, storage::Error> {
+        let mut gate = self.mount_gate.subscribe();
+        while !*gate.borrow_and_update() {
+            if gate.changed().await.is_err() {
+                break;
+            }
+        }
         let mut failures = Vec::new();
         for id in current {
             let other_held = self.other_generation_held(id);
@@ -681,11 +903,23 @@ impl Machine for Local {
     }
 
     async fn unit(&self, database: &str) -> Result<UnitState, units::Error> {
+        let held = {
+            let mut state = self.state();
+            state.unit_reads += 1;
+            state.held_units.contains(database)
+        };
+        if held {
+            let mut gate = self.unit_gate.subscribe();
+            while !*gate.borrow_and_update() {
+                if gate.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
         let mut state = self.state();
-        state.unit_reads += 1;
         if state.units_unreadable || state.unit_reads_fail > 0 {
             state.unit_reads_fail = state.unit_reads_fail.saturating_sub(1);
-            return Err(units::Error::NotReady("bus"));
+            return Err(bus_refused());
         }
         let memory_max = state.limits.get(database).and_then(|limits| {
             limits
@@ -696,30 +930,7 @@ impl Machine for Local {
                     _ => None,
                 })
         });
-        let unit = state.units.get_mut(database);
-        let (active, main_pid, invocation_id) = match unit {
-            Some(unit) => {
-                let alive = unit
-                    .child
-                    .as_mut()
-                    .is_some_and(|child| child.try_wait().ok().flatten().is_none());
-                if !alive && unit.child.is_some() {
-                    // The postmaster ended on its own.
-                    unit.child = None;
-                    unit.crashed = true;
-                }
-                match (&unit.child, unit.crashed) {
-                    (Some(child), _) => (
-                        ActiveState::Active,
-                        Some(child.id()),
-                        unit.invocation_id.clone(),
-                    ),
-                    (None, true) => (ActiveState::Failed, None, unit.invocation_id.clone()),
-                    (None, false) => (ActiveState::Inactive, None, unit.invocation_id.clone()),
-                }
-            }
-            None => (ActiveState::Inactive, None, None),
-        };
+        let (active, main_pid, invocation_id) = self.unit_facts(&mut state, database);
         Ok(UnitState {
             database: database.to_string(),
             active,
@@ -791,43 +1002,42 @@ impl Machine for Local {
             .stderr(log)
             .spawn()
             .map_err(|error| units::Error::Bus(zbus::Error::Failure(error.to_string())))?;
-        let pid = child.id();
         {
             let mut state = self.state();
+            // A start that takes long, as a recovery does, goes on in systemd whether or not the
+            // caller still waits for it: the unit is activating until the job ends.
+            let delay = state.start_delay.take().unwrap_or_default();
             let unit = state.units.entry(database.to_string()).or_insert(Unit {
                 child: None,
                 crashed: false,
                 invocations: 0,
                 invocation_id: None,
                 volume: None,
+                activating: None,
             });
             unit.volume = Some(attached);
             unit.invocations += 1;
             unit.crashed = false;
             unit.child = Some(child);
             unit.invocation_id = Some(format!("00000000-0000-4000-8000-{:012x}", unit.invocations));
-        }
-        // A start that takes long, as a recovery does, goes on in systemd whether or not the caller
-        // still waits for it.
-        let delay = self.state().start_delay.take();
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
+            unit.activating = Some(Instant::now() + delay);
         }
         let started = Instant::now();
         loop {
-            if ready::ready_socket(&volume, pid).is_ok() {
-                return self.started(database);
-            }
-            if !self.running(database) {
-                let mut state = self.state();
-                if let Some(unit) = state.units.get_mut(database) {
-                    unit.child = None;
-                    unit.crashed = true;
+            match self.active_state(database) {
+                ActiveState::Active => {
+                    if std::mem::take(&mut self.state().start_fails_after_up) {
+                        return Err(bus_refused());
+                    }
+                    return self.started(database);
                 }
-                return Err(units::Error::Job {
-                    unit: units::unit_name(database),
-                    result: "failed".into(),
-                });
+                ActiveState::Activating => {}
+                _ => {
+                    return Err(units::Error::Job {
+                        unit: units::unit_name(database),
+                        result: "failed".into(),
+                    });
+                }
             }
             if started.elapsed() > Duration::from_secs(60) {
                 return Err(units::Error::NotReady("postmaster_not_ready"));
@@ -840,12 +1050,20 @@ impl Machine for Local {
         Ok(Timeline::default())
     }
     async fn wait_started(&self, database: &str) -> Result<Started, units::Error> {
-        let waited = Instant::now();
+        {
+            let mut state = self.state();
+            if state.wait_reads_fail > 0 {
+                state.wait_reads_fail -= 1;
+                return Err(bus_refused());
+            }
+        }
+        // As the unit's own answer does: it waits while the unit is activating, reads the files
+        // once when the unit is active, and a unit that is not active is not ready.
         loop {
-            match self.started(database) {
-                Err(units::Error::NotReady(_))
-                    if self.running(database) && waited.elapsed() < Duration::from_secs(60) => {}
-                other => return other,
+            match self.active_state(database) {
+                ActiveState::Activating => {}
+                ActiveState::Active => return self.started(database),
+                _ => return Err(units::Error::NotReady("unit_not_active")),
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -887,7 +1105,9 @@ impl Machine for Local {
         database: &str,
         millicores: Option<NonZeroU32>,
     ) -> Result<(), units::Error> {
-        self.state().quotas.insert(database.to_string(), millicores);
+        let mut state = self.state();
+        state.quotas.insert(database.to_string(), millicores);
+        state.quota_calls.push((database.to_string(), millicores));
         Ok(())
     }
     async fn set_slice_memory(&self, awake_budget_mib: u64) -> Result<(), units::Error> {
@@ -910,8 +1130,92 @@ impl Machine for Local {
         Ok(())
     }
 
+    /// `systemctl restart`: the unit starts with the definition systemd has loaded, which is its
+    /// file as of the last reload and not as it is now; a unit with no file, or a mask, cannot be
+    /// started.
     async fn restart_service(&self, unit: &str) -> Result<(), units::Error> {
-        self.state().calls.push(format!("restart {unit}"));
+        let files = self.unit_files();
+        let mut state = self.state();
+        state.calls.push(format!("restart {unit}"));
+        let job = |result: &str| units::Error::Job {
+            unit: unit.to_string(),
+            result: result.to_string(),
+        };
+        if std::mem::take(&mut state.restart_fails) || state.restart_fails_for.contains(unit) {
+            return Err(job("failed"));
+        }
+        // systemd loads a unit it has not loaded yet when it is asked for it.
+        if !state.loaded.contains_key(unit)
+            && let Some(file) = files.get(unit)
+        {
+            state.loaded.insert(unit.to_string(), file.clone());
+        }
+        match state.loaded.get(unit).cloned() {
+            Some(Some(definition)) => {
+                state.running.insert(unit.to_string(), definition);
+                Ok(())
+            }
+            Some(None) => Err(job("masked")),
+            None => Err(job("not-found")),
+        }
+    }
+
+    /// `systemctl daemon-reload`: every unit file is read again, and no unit restarts.
+    async fn daemon_reload(&self) -> Result<(), units::Error> {
+        let files = self.unit_files();
+        let mut state = self.state();
+        state.calls.push("daemon-reload".into());
+        if std::mem::take(&mut state.reload_fails) {
+            return Err(units::Error::Unexpected("the reload failed"));
+        }
+        state.loaded = files;
+        Ok(())
+    }
+
+    /// `systemd-sysusers <file>`: reads the file as given and makes the users and groups it lists;
+    /// a file it cannot read or parse is exit status 1, and a user that exists stays as it is.
+    async fn run_sysusers(&self, file: &str) -> io::Result<()> {
+        let text = self.config_file("sysusers", file)?;
+        let mut users = Vec::new();
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                ["u" | "g" | "m", name, ..] => users.push((*name).to_string()),
+                _ => return Err(tool_failed("systemd-sysusers", file)),
+            }
+        }
+        self.state().users.extend(users);
+        Ok(())
+    }
+
+    /// `systemd-tmpfiles --create <file>`: makes the directories (`d`) it lists with the mode it
+    /// gives, and leaves one that exists as it is; another type of line is not modelled and a
+    /// line that is none is exit status 1.
+    async fn run_tmpfiles(&self, file: &str) -> io::Result<()> {
+        let text = self.config_file("tmpfiles", file)?;
+        let mut directories = Vec::new();
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                ["d", path, mode, ..] => {
+                    directories.push(((*path).to_string(), (*mode).to_string()))
+                }
+                [kind, _, ..] if kind.len() == 1 => {}
+                _ => return Err(tool_failed("systemd-tmpfiles", file)),
+            }
+        }
+        let mut state = self.state();
+        for (path, mode) in directories {
+            state.directories.entry(path).or_insert(mode);
+        }
         Ok(())
     }
 
@@ -970,6 +1274,18 @@ impl Machine for Local {
             ));
         }
         state.boots += 1;
+        // A boot empties /run, which holds the units of the runtime directory, and systemd reads
+        // every unit file again and starts the units with them.
+        let runtime = self.layout.host_root.join("run/systemd/system");
+        let _ = fs::remove_dir_all(&runtime);
+        drop(state);
+        let files = self.unit_files();
+        let mut state = self.state();
+        state.running = files
+            .iter()
+            .filter_map(|(unit, definition)| Some((unit.clone(), definition.clone()?)))
+            .collect();
+        state.loaded = files;
         // GRUB boots the highest version, which is not the last name: 6.12.99 is below 6.12.113.
         let numbers = |abi: &str| -> Vec<u64> {
             abi.split(|c: char| !c.is_ascii_digit())
@@ -1114,56 +1430,69 @@ impl Machine for Local {
     fn throttle(&self, _: &str) -> Option<Throttle> {
         None
     }
-    /// The resident pages of the real files of the database's directory, as `mincore` says; the
-    /// kernel of a laptop has no `cachestat`, and the other counts are not known to `mincore`.
-    fn cache_residency(&self, database: &str) -> Option<crate::cache::Residency> {
-        let delay = self.state().cache_delay;
-        if let Some(delay) = delay {
-            std::thread::sleep(delay);
-        }
-        crate::cache::read(&self.layout.data(database), mincore)
-    }
-}
-
-/// The pages of `file` that `mincore` finds in memory, of a private mapping of its `length` bytes.
-fn mincore(file: &fs::File, length: u64) -> io::Result<crate::cache::Pages> {
-    use std::os::fd::AsRawFd;
-    let length = usize::try_from(length).map_err(io::Error::other)?;
-    if length == 0 {
-        return Ok(crate::cache::Pages::default());
-    }
-    let page = usize::try_from(crate::cache::page_size()).map_err(io::Error::other)?;
-    let mut vector = vec![0u8; length.div_ceil(page)];
-    // SAFETY: a read-only mapping of an open file, unmapped before the function returns, and
-    // `mincore` writes one byte a page into `vector`, which has room for that many.
-    let (mapped, failure) = unsafe {
-        let map = libc::mmap(
-            std::ptr::null_mut(),
-            length,
-            libc::PROT_READ,
-            libc::MAP_PRIVATE,
-            file.as_raw_fd(),
-            0,
-        );
-        if map == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let result = libc::mincore(map, length, vector.as_mut_ptr().cast());
-        let failure = io::Error::last_os_error();
-        libc::munmap(map, length);
-        (result == 0, failure)
-    };
-    if !mapped {
-        return Err(failure);
-    }
-    Ok(crate::cache::Pages {
-        resident: vector.iter().filter(|byte| *byte & 1 == 1).count() as u64,
-        ..crate::cache::Pages::default()
-    })
 }
 
 impl Local {
-    /// The facts of a unit that is ready.
+    /// What systemd says of a unit: its active state, its main process and its invocation. A
+    /// postmaster that ended on its own is a crash. A unit whose start job is open is
+    /// `activating`: until its postmaster is ready, and, for a start that takes long
+    /// (`delay_next_start`), not before the job may end, ready or failed.
+    fn unit_facts(
+        &self,
+        state: &mut State,
+        database: &str,
+    ) -> (ActiveState, Option<u32>, Option<String>) {
+        let Some(unit) = state.units.get_mut(database) else {
+            return (ActiveState::Inactive, None, None);
+        };
+        if unit.child.is_none() {
+            unit.activating = None;
+        }
+        if unit
+            .activating
+            .is_some_and(|earliest| Instant::now() < earliest)
+        {
+            let pid = unit.child.as_ref().map(Child::id);
+            return (ActiveState::Activating, pid, unit.invocation_id.clone());
+        }
+        let alive = unit
+            .child
+            .as_mut()
+            .is_some_and(|child| child.try_wait().ok().flatten().is_none());
+        if !alive && unit.child.is_some() {
+            // The postmaster ended on its own.
+            unit.child = None;
+            unit.crashed = true;
+            unit.activating = None;
+        }
+        let Some(pid) = unit.child.as_ref().map(Child::id) else {
+            let active = if unit.crashed {
+                ActiveState::Failed
+            } else {
+                ActiveState::Inactive
+            };
+            return (active, None, unit.invocation_id.clone());
+        };
+        if unit.activating.is_some()
+            && ready::ready_socket(&self.layout.volume(database), pid).is_ok()
+        {
+            unit.activating = None;
+        }
+        let active = if unit.activating.is_some() {
+            ActiveState::Activating
+        } else {
+            ActiveState::Active
+        };
+        (active, Some(pid), unit.invocation_id.clone())
+    }
+
+    /// The unit's active state, which reading it counts as no read of the test.
+    pub fn active_state(&self, database: &str) -> ActiveState {
+        self.unit_facts(&mut self.state(), database).0
+    }
+
+    /// The facts of a unit that is ready, read as the agent reads them: through its own mount of
+    /// the volume, where an agent that has not attached it finds an empty directory.
     fn started(&self, database: &str) -> Result<Started, units::Error> {
         let mut state = self.state();
         let unit = state
@@ -1179,7 +1508,14 @@ impl Local {
             .invocation_id
             .clone()
             .ok_or(units::Error::NotReady("no_invocation_id"))?;
+        let mounted = state
+            .attached
+            .iter()
+            .any(|volume| volume.database() == database);
         drop(state);
+        if !mounted {
+            return Err(units::Error::NotReady("postmaster_pid_missing"));
+        }
         let socket = ready::ready_socket(&self.layout.volume(database), main_pid)
             .map_err(units::Error::NotReady)?;
         Ok(Started {
@@ -1189,28 +1525,5 @@ impl Local {
             socket,
             requested_us: None,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The double's counts are those of the kernel: a file that was just written is in memory, and
-    /// an empty one holds no page.
-    #[test]
-    fn mincore_finds_the_pages_of_a_file_that_was_just_written() {
-        let directory = testpg::directory("mincore");
-        let bytes = 64 * 4096;
-        fs::write(directory.join("full"), vec![7u8; bytes]).unwrap();
-        fs::write(directory.join("empty"), b"").unwrap();
-        let full = fs::File::open(directory.join("full")).unwrap();
-        let pages = mincore(&full, bytes as u64).unwrap();
-        assert_eq!(
-            pages.resident,
-            (bytes as u64).div_ceil(crate::cache::page_size())
-        );
-        let empty = fs::File::open(directory.join("empty")).unwrap();
-        assert_eq!(mincore(&empty, 0).unwrap().resident, 0);
     }
 }

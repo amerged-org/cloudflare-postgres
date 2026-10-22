@@ -28,9 +28,9 @@ policy, and reports each decision (plan 1.6, 5.2):
   proven again (below).
 
 Cloudflare sets the policy with `PUT /v1/regions/{id}/node-policy`: the admission rule, floor,
-awake budget and queue, early sleep, the pool reserve, the backup concurrency and memory limits, and
-the write limits of a 256 MiB database. Every node's desired page carries it, and a region whose
-policy is not set serves no page.
+awake budget and queue, the CPU burst after a wake, early sleep, the pool reserve, the backup
+concurrency and memory limits, and the write limits of a 256 MiB database. Every node's desired page
+carries it, and a region whose policy is not set serves no page.
 
 ## Commands
 
@@ -57,7 +57,8 @@ that systemd starts the new one.
 | Backups                    | `archive/`: the archive socket, the barman-cloud jobs, restore and PITR recovery, the upload log                                                       |
 | Fencing                    | `fence.rs`                                                                                                                                             |
 | Gateway channel            | `gateway.rs`: the writer table, the wakes, quiesce, close, status and activity                                                                         |
-| Metrics and diagnostics    | `usage.rs`, `sample.rs`, `events.rs`, `cache.rs`, `diagnostics/`                                                                                       |
+| Metrics and diagnostics    | `usage.rs`, `sample.rs`, `events.rs`, `diagnostics/`                                                                                       |
+| Cold page cache            | `prefetch.rs`: readahead of the catalog set and the autoprewarm list with its own accounting; `cache.rs`: how files of the data directory are opened and counted |
 | Updates                    | `update.rs`, `release.rs`                                                                                                                              |
 | The loops                  | `service.rs`: what feeds the core and what it feeds                                                                                                    |
 
@@ -110,14 +111,33 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   and crash recovery syncs the filesystem once (`recovery_init_sync_method = syncfs`).
 - **Small databases** (512 MiB and below) run one autovacuum worker out of two slots, one I/O
   worker, no parallel query or maintenance workers, four background worker slots and no replication.
-  A restore runs with more during its recovery, because a recovery checks these values against its
-  source's.
+  A restore runs with the larger of the backup's and the class's values during its recovery,
+  because a recovery checks `max_connections`, the process, sender, prepared transaction and lock
+  settings against its source's, and restarts onto the class's own afterwards.
 - **Autoprewarm** runs in every database (`shared_preload_libraries = 'pg_prewarm'`,
   `pg_prewarm.autoprewarm = on`, `autoprewarm_interval = 0`): the list of the shared buffers is
   written at each clean stop only, so a running database pays nothing, and read again in the
   background after the next start, where it competes with the first queries for the disk. Two of
   the worker slots are its leader and its worker; the sleep guard does not count its worker as a
   session.
+- **Readahead** (`prefetch.rs`, built, not called by any flow yet). Before a request the agent can
+  ask the kernel to read a sleeping database's hot files ahead with `posix_fadvise(WILLNEED)`:
+  the catalog set (`pg_control`, 256 KiB of WAL at the latest checkpoint, `global/`, and in each
+  user database its `PG_VERSION`, `pg_filenode.map` and the login's catalogs with their indexes
+  and forks; about 5 MB) and the autoprewarm list (blocks merged where contiguous, the relations
+  with the fewest listed blocks first, system databases left out). The mapped catalogs
+  (`pg_class`, `pg_attribute`, `pg_proc`, `pg_type` and their indexes) are found through the map
+  where `VACUUM FULL` moved them; the others are read at their OID, so a rewrite of one drops it
+  from the set, and the report's `missing` counts it. A plan is built first (blocking:
+  directories, `pg_control`, the maps and the list are read, each file is opened once for its
+  length), then issued in pieces of at most 128 KiB, because the kernel reads only the first
+  `read_ahead_kb` of a range per call. The data directory is the database user's, so a plan reads
+  only the real directories of `base/` (at most 32 databases) whatever the list names, stops after
+  512 files of a list that are not there, and stops at a budget and a cancel as the issuing does.
+  Issuing stops at a time budget, a byte bound or a cancel and returns the counts, the bytes the
+  cache already held and the timings; they take the place of the residency diagnostic that
+  `cache.rs` made while a wake ran (deleted) once a flow calls it. `pg_internal.init` is left out:
+  PostgreSQL removes it at every start.
 - **Login.** The node's root reaches the cluster's superuser `postgres` by peer authentication
   through `pg_ident.conf`; the backup role `pgcf_backup` is reached by the database's own Linux user
   the same way; every other role logs in over the socket with SCRAM-SHA-256. Replication connections
@@ -135,16 +155,31 @@ the gateway's keyring and the Tunnel token from `GET /node/v1/credentials` when 
 when the page names a higher credentials revision, and R2 temporary credentials from
 `GET /node/v1/archive-credentials/{id}` as the page names them. A node never holds the R2 parent key.
 
+The agent reads what Cloudflare sends it (the page, the credentials, the answers, the link's
+messages and the enrollment seed) with every object open: a property it does not name is ignored,
+so that the API can send one before every node knows it. It still refuses a page whole for a missing
+property, a wrong type, a number out of bound, a value outside a closed set (an enum, a kind of
+origin or host file) and an order of a type it does not read (`link/desired.rs`, event
+`desired_pull_failed`, class `cloudflare_desired_page_has_an_order_this_agent_does_not_know`):
+nothing of that page is applied. A new property of the page is optional with a default
+(`cpu_boost_ms` is 0 when left out). What the agent sends stays closed to the contract. The rule
+for changing the page, with the order of releases by kind of change and direction, is the table in
+plan 9.3, "Changing the page"; it is written there once.
+
 ## A wake, a sleep and a recovery
 
 - **Wake.** The gateway holds the client's startup and sends the agent the wake before it answers
   the upgrade. The agent checks the ticket against its page and volume, reads `pg_control` and
   compares it with the proven-sleep record, passes admission, starts the unit and waits for the job
   that ends at `READY=1`. It hands the gateway the unit's socket, uid, main PID and invocation ID in
-  the writer table, applies the database's CPU quota after ready and reports the phases of the wake
-  as events; about 2 s later a `wake_detail` event adds the split of the start and the share of the
-  database's files that the page cache held before the start (`cache.rs`). A wake it already
-  serves is answered `wake_in_progress`, which is no result.
+  the writer table, applies the database's CPU quota `cpu_boost_ms` after the release (at once when
+  that is 0; a build and a restart of the agent apply it at once, and a base backup that begins
+  inside the burst applies it first) and reports the phases of the wake as events; about 2 s later
+  a `wake_detail` event adds the split of the start, the CPU quota's throttling and the steal time.
+  A wake it already serves is answered
+  `wake_in_progress`, which is no result. A start that fails writes a `unit_start_failed` event with
+  the class of the error and answers `release_failed`; a unit that is awake or cannot be read at that
+  point is stopped without a proof and recovered, so no database stays `starting`.
 - **Sleep.** After the database's idle time the agent runs the sleep proof (plan 7.9): the gateway
   quiesces and closes idle sessions, the guard refuses while a session is busy or a transaction is
   prepared (`power_busy`), a checkpoint and a WAL switch close the last segment, the upload log must
@@ -152,9 +187,10 @@ when the page names a higher credentials revision, and R2 temporary credentials 
   `pg_control` must then say shut down, with the recorded identity and a checkpoint after the
   switched segment, and the record is written and fsynced before the sleep is reported. A refused
   proof leaves the database running and wakeable. After a clean sleep the agent trims the volume.
-- **Recovery.** At boot, after a failed proof and after an unexpected stop, a database without a
-  matching record is unproven: the agent starts it through admission, lets it archive and proves its
-  sleep, retrying until it holds. Nothing is replayed to a client.
+- **Recovery.** At boot, after a failed proof, after an unexpected stop and after a failed start
+  whose unit is awake or cannot be read, a database without a matching record is unproven: the
+  agent starts it through admission, lets it archive and proves its sleep, retrying until it
+  holds. Nothing is replayed to a client.
 - **Create.** User, volume, filesystem, `initdb`, configuration, a check that the database's R2
   prefix is empty, the roles and the first base backup. The database is ready only when that backup
   is DONE. A create that a restart interrupted resumes when every backup in the archive belongs to the
@@ -162,8 +198,13 @@ when the page names a higher credentials revision, and R2 temporary credentials 
 - **Restore and move target.** `barman-cloud-restore` as the new database's user, recovery through
   the archive socket (`pgcf-recovery.conf`, included by `postgresql.conf` and removed afterwards),
   promotion on a later timeline with the backup's system identifier, then the first base backup of
-  the new timeline. A move target replays through the segment named in the source's proven-sleep
-  record before it may promote.
+  the new timeline. The recovery runs with the larger of the settings in the backup's `pg_control`
+  and the class's (`settings::Capacity`); when that is more than the class's, the database restarts
+  onto the class's own before the first backup, and a source whose settings the class has no memory
+  for is refused before it starts. A recovery that PostgreSQL pauses (the source's WAL raised a
+  setting above both the backup's and the class's) fails the restore with `no_recovery_point`. A
+  move target replays through the segment named in the source's proven-sleep record before it may
+  promote.
 
 ## Backups
 
@@ -174,6 +215,30 @@ to the database's own prefix, and answers `ok` to an archive request only when t
 R2 and the segment is in the fsynced upload log. The agent never deletes in R2; retention runs in the
 Worker. The concurrency and memory limits of the jobs come from the policy.
 
+A base backup is due when the newest of the database's timeline is a day old (plan 7.6). It is taken
+at the database's idle sleep, and daily for an always-warm database, never by waking one. It is put
+off while a start is queued or in flight on the node, and in the first minute after any database on
+the node became ready (a wake, a build, the adoption of a unit that runs), so that the first
+statements of a cold database do not share the disk and the CPU with the backup of another one
+(`backup_waits`, `backup_put_off` in the agent's log). The minute is node-wide because a database's
+idle time is at least a minute: its own first minute is over before its own idle sleep. A database
+whose idle sleep is put off is not put to sleep: nothing would wake it for the backup later. It
+stays up and the next idle pass (every five seconds) asks again. Ten minutes after the first
+put-off of an awake session (the wait after a failed backup) the backup is taken whatever the node
+does: at the idle sleep of a database that stays idle, and, for one that is used meanwhile and so
+never idles, while it serves, as the daily backup of an always-warm database is. So a database that
+stays up has it within ten minutes and one idle pass of the first put-off. One case is not bounded:
+an early sleep, which a wake that waits for room orders and which picks the database unused
+longest, usually the one that was put off, takes no backup and ends the session with the wait; the
+backup is then taken at the idle sleep after the database's next wake, which may be days away. WAL
+archiving goes on meanwhile, so only the age of the newest base backup, and the WAL a restore
+replays, grow. The disk side is in `pgcfbackup.slice` (`infra/node-image`): the read and write
+bandwidth of the jobs on the data disk is capped. A release that lifts the cap writes `infinity` as
+the size; deleting the two lines leaves a running node capped until it reboots. A runtime change
+(`systemctl set-property --runtime`, such as an `infinity` or another size for a measurement on one
+node) leaves a drop-in that overrides every later release of the slice until the node reboots, so
+it ends with `systemctl revert pgcfbackup.slice`; the next job in the slice then applies the file.
+
 ## Fencing, updates and diagnostics
 
 - **Fencing** (`fence.rs`). A `fence` order and the `superseded` orders of a lost node are written
@@ -183,11 +248,34 @@ Worker. The concurrency and memory limits of the jobs come from the policy.
 - **Updates** (`update.rs`). A release the page names changes the four binaries without a reboot:
   they are downloaded into the release's directory, checked against the pinned size and sha256, and
   only then does `current` move. A maintenance order installs the release's package lock through
-  apt, reboots when a kernel or core library changed, runs `pgcf-agent check` and answers. The
-  exact steps are in the [node image README](../../infra/node-image/README.md#what-the-image-expects-from-the-agent).
+  apt, reboots when a kernel or core library changed, runs `pgcf-agent check` and answers. The exact steps are in the
+  [node image README](../../infra/node-image/README.md#what-the-image-expects-from-the-agent).
+- **Host files** (`hostfiles.rs`). The image's systemd units and masks and its sshd, journald,
+  sysctl, tmpfiles, sysusers and modprobe configuration ship with the release too, after its
+  binaries and written by the agent that runs the release's own binary. The agent holds the signed
+  list to its own rules just before it writes (a list they do not allow is refused for its files,
+  once, and the binaries are installed all the same), and the files that differ are written
+  atomically below `/` (hidden file, `fsync`, rename, `fsync` of the directory) in the allow-listed
+  directories only, never through a link. `systemd-sysusers` and `systemd-tmpfiles --create` run on
+  the files that say so, systemd reads its units again once, and what changed is restarted, the
+  agent's own unit last (the agent leaves); a failure is tried again after a growing wait and keeps
+  no other unit from its restart. The agent's own unit is written to `/run/systemd/system` first,
+  and the agent that runs it moves it to its place after it has read its first page: a node whose
+  new unit cannot start is restarted from the API and runs the unit it had. `agent/host-files.json`
+  records the paths the agent may touch and what is left to do before the first write, so a crash
+  at any point is finished by the next start. The hello reports the digest of what the disk holds
+  (`os.host_files_sha256`), which is the release's only when systemd has been told everything. See
+  the [node image README](../../infra/node-image/README.md#what-ships-with-the-image-what-with-a-release).
 - **Events and logs** (`timing.rs`, `events.rs`). The agent logs one JSON line per event to stderr
   and names a failure by its class, never by an error's text, which can carry an address or a path.
   The lines also travel in the next observation report, reduced to the contract's fields.
+- **Observations** (`agent/report.rs`). A database's observation goes to Cloudflare when what the
+  API stores of it differs from what the API last accepted (its answer's verdict `accept`, one per
+  database), and again once in each anti-entropy period (`NODE_OBSERVATION_RESEND_MS`, 15 minutes) at
+  a point of the period that the database's identifier fixes. A refused, lost or `stale` and
+  `conflict` answer keeps the database unaccepted. While Cloudflare waits for a database (an entry
+  with an origin, or a move order that holds it) every pull says it. A restarted agent holds
+  nothing, so its first pull says every database once.
 - **Boot report and probes** (`diagnostics/`). After a reboot the agent posts the sanitized tail of
   the previous boot's journal; on request it runs one of eight read-only probes, each a fixed
   command with no shell. Neither ever reports the lines of a database's unit or of a backup job.
@@ -210,6 +298,15 @@ alone (the mount API, for example).
 The lab tests need a Debian 13 host with systemd as PID 1, root, LVM and the image's units
 (`units/lab.rs`, `machine/node.rs`), or a privileged container with loop devices for
 `storage/lab_tests.rs`, which is built only with `RUSTFLAGS='--cfg pgcf_storage_lab'`.
+`units/idmap_lab.rs` runs the idmapped handoff of a database's volume and socket directory into
+a systemd sandbox (`units/idmap.rs`); it is built only with `RUSTFLAGS='--cfg pgcf_idmap_lab'` and
+runs as root on a systemd host inside `systemd-run --wait --pipe -p PrivateMounts=yes`, the mount
+namespace and propagation of `pgcf-agent.service`, where every mount is shared (its header says
+how). A namespace made with `unshare --mount --propagation slave` has private mounts and hides a
+clone that is still a peer of the agent's mount, so the lab refuses it.
+`start_lab.rs` is the agent's start on a node with 300 databases, on the same real parts and with a
+disk that is slow to flush (its header says how to run it); the numbers it gave are in the plan
+(11.1, "Agent start and stop at 300 databases").
 
 The contract with Cloudflare is `packages/contracts/src/node-link.ts`. `node_link.rs` reads its
 generated JSON Schemas, and conformance tests hold the agent and the API to the same vectors.

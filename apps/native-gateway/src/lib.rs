@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Native data transport. Lifecycle control/activity parity is a release gate.
+pub mod activation;
 pub mod auth;
 pub mod budget;
 pub mod hold;

@@ -24,8 +24,8 @@ use crate::{
     budget::{Lease, WireBudget},
     http::{self, HttpHead},
     local,
-    sessions::Action,
-    transport::{self, Blocked, Epoch, Gateway, SessionLease, WakeState},
+    sessions::{self, Action},
+    transport::{self, Blocked, Gateway, SessionLease, WakeState},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use pgcf_native_protocol::{
@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -115,6 +115,10 @@ fn invalid(message: &str) -> Refused {
     refused("invalid_request", "08P01", message)
 }
 fn not_accepting(outcome: &'static str) -> Refused {
+    if outcome == "gateway_draining" {
+        // Nothing reached PostgreSQL: an integrator retries it, as it retries 57P03.
+        return refused(outcome, "08006", "gateway restarting");
+    }
     refused(outcome, "57P03", "database is not accepting connections")
 }
 fn connection_failed(outcome: &'static str) -> Refused {
@@ -246,6 +250,8 @@ struct Stages {
     /// waited for its database's wake; none for one refused before either.
     wake_path: Option<&'static str>,
     statements: usize,
+    /// The statements were handed to PostgreSQL, which may have run them.
+    sent: bool,
     received: Instant,
     dial: Option<Duration>,
     authentication: Option<Duration>,
@@ -268,8 +274,9 @@ struct Backend {
     postgres: UnixStream,
     database: String,
     user: String,
-    /// The table epoch the session was admitted at.
-    epoch: Epoch,
+    /// The generation of the database the session was admitted at. A role change moves it on the
+    /// unit that runs, and the session proved a password PostgreSQL may no longer accept.
+    generation: u64,
     /// What PostgreSQL proved; none when it asked for no password, and then it is not pooled.
     verifier: Option<Verifier>,
     authenticated: Instant,
@@ -304,12 +311,36 @@ pub async fn serve(
         pooled: false,
         wake_path: None,
         statements: 0,
+        sent: false,
         received,
         dial: None,
         authentication: None,
         query: None,
     };
-    let (answer, backend) = handle(&mut socket, head, &gateway, &stop, permit, &mut stages).await;
+    // A request that is still running when the drain is over is not cut silently: it is answered.
+    let handled = {
+        let handling = handle(&mut socket, head, &gateway, &stop, permit, &mut stages);
+        tokio::select! {
+            handled = handling => Some(handled),
+            _ = drain_over(&gateway, stop.clone()) => None,
+        }
+    };
+    let (answer, backend) = handled.unwrap_or_else(|| {
+        // Dropping the request ended the gateway's connection to PostgreSQL, which does not stop
+        // what PostgreSQL was given: it finishes the statements and the COMMIT sent with them and
+        // notices the lost client only when it writes, so a request whose statements were sent
+        // may commit after this answer. Its outcome is unknown.
+        let refusal = if stages.sent {
+            refused(
+                "gateway_draining",
+                "08007",
+                "gateway restarting during the request; PostgreSQL may still complete it; its outcome is unknown and it was not retried",
+            )
+        } else {
+            not_accepting("gateway_draining")
+        };
+        (Err(refusal), None)
+    });
     // The answer's memory stays leased until it was sent.
     let (status, bytes, _memory) = match answer {
         Ok(answer) => {
@@ -334,6 +365,18 @@ pub async fn serve(
         tokio::spawn(recycle(gateway, backend, status, stop));
     }
     sent
+}
+/// Resolves when the gateway's drain is over.
+async fn drain_over(gateway: &Gateway, mut stop: watch::Receiver<bool>) {
+    loop {
+        if let Some(until) = gateway.drain_until() {
+            tokio::time::sleep_until(until.into()).await;
+            return;
+        }
+        if stop.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
 }
 async fn respond(socket: &mut TcpStream, status: u16, body: &[u8]) -> Result<(), Failure> {
     let reason = if status == 200 { "OK" } else { "Bad Request" };
@@ -377,33 +420,23 @@ async fn handle(
     let request_bytes = body.len();
     drop(body);
     stages.statements = request.statements.len();
-    let (claims, released) = match route {
-        Presented::Admitted(claims) => (claims, None),
-        Presented::Wake(ticket) => {
-            let (claims, unit) = attempt!(wake(gateway, &ticket, stop, stages).await);
-            (claims, Some(unit))
+    let (claims, target) = match route {
+        Presented::Admitted(claims) => {
+            let target = attempt!(gateway.admit(&claims).await.map_err(not_accepting));
+            (claims, target)
         }
+        Presented::Wake(ticket) => attempt!(wake(gateway, &ticket, stop, stages).await),
     };
-    let (target, epoch) = attempt!(current(gateway, &claims, released.as_deref()).await);
     // Admitted without a hold: the database was running when the request arrived.
     stages.wake_path.get_or_insert("warm");
-    let mut backend = match checkout(gateway, &claims, &target, epoch, &request.password).await {
+    let mut backend = match checkout(gateway, &claims, &target, &request.password).await {
         Checkout::Taken(backend) => {
             stages.pooled = true;
             *backend
         }
-        Checkout::Missed(known) => attempt!(
-            open(
-                gateway,
-                &claims,
-                &target,
-                epoch,
-                &request.password,
-                known,
-                stages
-            )
-            .await
-        ),
+        Checkout::Missed(known) => {
+            attempt!(open(gateway, &claims, &target, &request.password, known, stages).await)
+        }
     };
     {
         let id = &backend.lease.id;
@@ -423,6 +456,7 @@ async fn handle(
     } = request;
     drop(password);
     let started = Instant::now();
+    stages.sent = true;
     let executed = execute(gateway, &mut backend, &statements, transaction.as_ref()).await;
     stages.query = Some(started.elapsed());
     match executed {
@@ -613,17 +647,18 @@ async fn wake(
     ticket: &WakeClaims,
     stop: &watch::Receiver<bool>,
     stages: &mut Stages,
-) -> Result<(Route, String), Refused> {
-    let released = |writer: String, route_revision: u64| {
-        let claims = transport::admitted_wake(ticket, &writer, route_revision);
-        (claims, writer)
-    };
+) -> Result<(Route, Writer), Refused> {
     // Released at its generation already: routed at once, as a running database is.
     match transport::wake_state(gateway, ticket).await {
         WakeState::Released {
             writer,
             route_revision,
-        } => return Ok(released(writer, route_revision)),
+        } => {
+            return gateway
+                .admit_wake(ticket, &writer, route_revision)
+                .await
+                .map_err(not_accepting);
+        }
         WakeState::Stale => return Err(not_accepting("route_stale")),
         WakeState::Waiting => {}
     }
@@ -640,8 +675,8 @@ async fn wake(
         let changed = table.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        if gateway.draining.load(Ordering::Acquire) || *stop.borrow() {
-            return Err(refused("gateway_draining", "08006", "gateway restarting"));
+        if gateway.draining() || *stop.borrow() {
+            return Err(not_accepting("gateway_draining"));
         }
         if let Some(result) = held
             .verdict()
@@ -666,7 +701,10 @@ async fn wake(
                 route_revision,
             } => {
                 let _ = held.release();
-                return Ok(released(writer, route_revision));
+                return gateway
+                    .admit_wake(ticket, &writer, route_revision)
+                    .await
+                    .map_err(not_accepting);
             }
             WakeState::Stale => return Err(not_accepting("route_stale")),
             WakeState::Waiting => {}
@@ -678,21 +716,11 @@ async fn wake(
                 return Err(refused("wake_timeout", "57P03", "database did not wake in time"));
             }
             changed = stop.changed() => if changed.is_err() {
-                return Err(refused("gateway_draining", "08006", "gateway restarting"));
+                return Err(not_accepting("gateway_draining"));
             },
         }
     }
 }
-/// The unit the route was admitted on, if the agent's table still shows it, and the table epoch
-/// it is admitted at.
-async fn current(
-    gateway: &Gateway,
-    claims: &Route,
-    released: Option<&str>,
-) -> Result<(Writer, Epoch), Refused> {
-    gateway.admit(claims, released).await.map_err(not_accepting)
-}
-
 /// What the pool had for a request.
 enum Checkout {
     Taken(Box<Backend>),
@@ -700,14 +728,15 @@ enum Checkout {
     /// login uses when PostgreSQL asks for the same salt and iterations.
     Missed(Option<Salted>),
 }
-/// An idle session of the route's database and role on the same writer and table epoch whose
-/// verifier the password matches. Only the newest session's verifier is derived, once: the
-/// sessions of one role share it unless its password was rotated.
+/// An idle session of the route's database and role on the same writer and at the route's
+/// generation whose verifier the password matches. A session of another generation proved its
+/// password before a role change and is ended; the route's revision does not matter, since the
+/// page that carries the claim of a wake moves only that. Only the newest session's verifier is
+/// derived, once: the sessions of one role share it unless its password was rotated.
 async fn checkout(
     gateway: &Gateway,
     claims: &Route,
     target: &Writer,
-    epoch: Epoch,
     password: &Password,
 ) -> Checkout {
     let key = (claims.db.clone(), claims.user.clone());
@@ -747,7 +776,7 @@ async fn checkout(
         let Ok(backend) = taken.await else {
             continue;
         };
-        if backend.epoch == epoch
+        if backend.generation == claims.generation
             && backend.lease.target == *target
             && backend.authenticated.elapsed() < LIFETIME
             && gateway.permits(&claims.db, &backend.lease.target).await
@@ -763,7 +792,6 @@ async fn open(
     gateway: &Arc<Gateway>,
     claims: &Route,
     target: &Writer,
-    epoch: Epoch,
     password: &Password,
     known: Option<Salted>,
     stages: &mut Stages,
@@ -777,7 +805,7 @@ async fn open(
         .map_err(|_| capacity())?;
     // The route was checked against this writer; a replacement is never dialled.
     gateway
-        .dialable(database, Some(epoch), target)
+        .dialable(database, target, true)
         .await
         .map_err(not_accepting)?;
     gateway
@@ -804,7 +832,7 @@ async fn open(
         postgres,
         database: database.clone(),
         user: claims.user.clone(),
-        epoch,
+        generation: claims.generation,
         verifier: None,
         authenticated: Instant::now(),
         _memory: memory,
@@ -863,9 +891,14 @@ async fn authenticate(
     startup.push(0);
     let mut bytes = ((startup.len() + 4) as u32).to_be_bytes().to_vec();
     bytes.extend_from_slice(&startup);
+    // A database that stopped admitting before the guarded write got nothing: it is refused as
+    // any request that finds the database not accepting, which an integrator retries by its code.
     write_guarded(gateway, backend, &bytes)
         .await
-        .map_err(|_| failed())?;
+        .map_err(|guard| match guard {
+            Guard::Fenced => not_accepting("fenced"),
+            Guard::Lost => failed(),
+        })?;
     let login = auth::login(&mut backend.postgres, password, known)
         .await
         .map_err(|_| failed())?;
@@ -897,8 +930,8 @@ async fn authenticate(
     }
     Err(protocol())
 }
-/// Writes to PostgreSQL only while the agent's table still admits the session's database at the
-/// epoch it was admitted at on its writer, holding the table for the bounded write.
+/// Writes to PostgreSQL only while the agent's table still admits new work for the session's
+/// database on its writer, holding the table for the bounded write.
 async fn write_guarded(
     gateway: &Gateway,
     backend: &mut Backend,
@@ -908,11 +941,10 @@ async fn write_guarded(
         lease,
         postgres,
         database,
-        epoch,
         ..
     } = backend;
     gateway
-        .write_admitted(database, *epoch, &lease.target, postgres, bytes)
+        .write_admitted(database, &lease.target, postgres, bytes)
         .await
         .map_err(|blocked| match blocked {
             Blocked::Fenced | Blocked::TargetChanged => Guard::Fenced,
@@ -1180,14 +1212,7 @@ async fn execute(
     }
 }
 async fn retired(actions: &mut watch::Receiver<Action>) {
-    loop {
-        if *actions.borrow_and_update() == Action::Retire {
-            return;
-        }
-        if actions.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
+    sessions::until(actions, |action| action == Action::Retire).await;
 }
 async fn results(
     postgres: &mut UnixStream,

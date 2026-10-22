@@ -11,7 +11,7 @@
 //! `/run/pgcf/dev/<id>` (`MountImages=`). A host without udev (a container) has no `/dev/dm-<n>`
 //! nodes, which systemd's image dissection needs: the lab makes them as udev does.
 use super::{
-    ActiveState, DB_ROOT, Error, Units,
+    ActiveState, CALLS_IN_FLIGHT, DB_ROOT, Error, Units,
     limits::{Io, Limits},
     unit_name,
     users::Users,
@@ -23,6 +23,7 @@ use std::{
     process::Command,
     time::Duration,
 };
+use zbus::proxy::CacheProperties;
 
 const BIN: &str = "/usr/lib/postgresql/18/bin";
 
@@ -305,14 +306,19 @@ async fn a_database_unit_starts_serves_changes_its_limits_and_stops() {
     let database = Database::new(1);
     let id = database.id.as_str();
     let units = Units::connect(DB_ROOT).await.unwrap();
-    // A unit that never started is loaded on demand and inactive, at the template's ceiling.
+    // A unit that never started is not loaded, and is inactive: the read does not load it.
     let idle = units.state(id).await.unwrap();
     assert_eq!(idle.active, ActiveState::Inactive);
     assert_eq!(
-        (idle.main_pid, idle.invocation_id, idle.uid),
-        (None, None, None)
+        (
+            idle.main_pid,
+            idle.invocation_id,
+            idle.uid,
+            idle.memory_max_bytes
+        ),
+        (None, None, None, None)
     );
-    assert_eq!(idle.memory_max_bytes, Some(256 << 20));
+    assert!(loaded(&database.unit()).is_empty());
 
     // Limits before the first start, persistent and without a reload.
     units.set_limits(id, &limits(256, 500)).await.unwrap();
@@ -583,6 +589,165 @@ async fn a_start_that_fails_names_the_jobs_result() {
     link_to(&database.id, &database.volume.device());
     within(units.start(&database.id)).await.unwrap();
     within(units.stop(&database.id)).await.unwrap();
+}
+
+/// Whether a database's unit has a cgroup that holds a process.
+fn cgroup_populated(database: &str) -> bool {
+    fs::read_to_string(super::cgroup_events_path(database).unwrap())
+        .is_ok_and(|events| super::populated(&events))
+}
+
+/// Thaws a filesystem when it goes out of scope, so that a failing assertion leaves no process in
+/// uninterruptible sleep behind.
+struct Frozen(PathBuf);
+impl Frozen {
+    /// Freezes the filesystem mounted at `mount`: a process that writes to it sleeps in the kernel
+    /// (`D`) until it is thawed, and no signal ends it, `SIGKILL` included.
+    fn new(mount: &Path) -> Self {
+        run("fsfreeze", &["-f", mount.to_str().unwrap()]);
+        Self(mount.to_path_buf())
+    }
+    fn thaw(&self) {
+        quiet("fsfreeze", &["-u", self.0.to_str().unwrap()]);
+    }
+}
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        self.thaw();
+    }
+}
+
+/// The processes in a database's unit cgroup.
+fn cgroup_processes(database: &str) -> Vec<u32> {
+    let events = super::cgroup_events_path(database).unwrap();
+    fs::read_to_string(events.with_file_name("cgroup.procs"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .collect()
+}
+
+/// Whether a process is in uninterruptible sleep (`D` in `/proc/<pid>/stat`, after the command).
+fn in_uninterruptible_sleep(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('D'))
+        })
+        .unwrap_or(false)
+}
+
+/// The postmaster dies and a backend in uninterruptible sleep outlives every signal: the unit is
+/// `deactivating` (`stop-sigkill`, then `final-sigkill`) with no main process and no job for up to
+/// two stop timeouts, and then `failed` ("Processes still around after final SIGKILL"). Job mode
+/// `fail` refuses a start only against a pending job, so systemd accepts one in that window and
+/// runs it when the unit ends, over the process it left ("Found left-over process ... Ignoring").
+/// The agent refuses the start in both states.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
+async fn a_start_is_refused_while_the_unit_stops_over_a_process_no_signal_ends() {
+    if !lab() {
+        return;
+    }
+    let database = Database::new(13);
+    let id = database.id.as_str();
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    // The stops are short, as the template's two would take 60 s.
+    let dropin = format!("/run/systemd/system/{}.d", database.unit());
+    fs::create_dir_all(&dropin).unwrap();
+    fs::write(
+        format!("{dropin}/stop.conf"),
+        "[Service]\nTimeoutStopSec=3\n",
+    )
+    .unwrap();
+    run("systemctl", &["daemon-reload"]);
+    let first = within(units.start(id)).await.unwrap();
+
+    // A frozen filesystem, and a checkpoint that makes a process of the postmaster write to it.
+    let frozen = Frozen::new(&database.root);
+    let account = super::users::account_name(id);
+    let mut client = Command::new("runuser")
+        .args(["-u", &account, "--", &format!("{BIN}/psql"), "-h"])
+        .arg(format!("/run/pgcf/{id}"))
+        .args(["-d", "postgres", "-c", "checkpoint"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut asleep = false;
+    for _ in 0..100 {
+        asleep = cgroup_processes(id)
+            .into_iter()
+            .any(|pid| pid != first.main_pid && in_uninterruptible_sleep(pid));
+        if asleep {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(asleep, "no process of the unit is in uninterruptible sleep");
+    run("kill", &["-KILL", &first.main_pid.to_string()]);
+
+    // The unit is stopping with nothing to wait for but the process, and no job.
+    let mut state = units.state(id).await.unwrap();
+    for _ in 0..100 {
+        if state.active != ActiveState::Active {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        state = units.state(id).await.unwrap();
+    }
+    assert_eq!(state.active, ActiveState::Deactivating);
+    assert_eq!(state.main_pid, None);
+    assert!(cgroup_populated(id));
+    // Without the refusal the start waits for the stop to end and runs over the process, so it
+    // does not answer within these seconds.
+    let refused = tokio::time::timeout(Duration::from_secs(2), units.start(id)).await;
+    assert!(
+        matches!(refused, Ok(Err(Error::StrayProcesses))),
+        "{refused:?}"
+    );
+
+    // The stop ends in failed, with the process still in the cgroup, and the start is refused.
+    for _ in 0..400 {
+        if units.state(id).await.unwrap().active == ActiveState::Failed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let failed = units.state(id).await.unwrap();
+    assert_eq!(failed.active, ActiveState::Failed);
+    assert!(cgroup_populated(id), "the process is still in the cgroup");
+    let refused = within(units.start(id)).await.unwrap_err();
+    assert!(matches!(refused, Error::StrayProcesses), "{refused:?}");
+    let after = units.state(id).await.unwrap();
+    assert_eq!(after.active, ActiveState::Failed);
+    assert_eq!(after.main_pid, None);
+    assert_eq!(
+        after.invocation_id.as_deref(),
+        Some(first.invocation_id.as_str()),
+        "nothing was started"
+    );
+
+    // The filesystem thaws, the process ends, and the start goes through.
+    frozen.thaw();
+    for _ in 0..200 {
+        if !cgroup_populated(id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!cgroup_populated(id));
+    let second = within(units.start(id)).await.unwrap();
+    assert_ne!(second.invocation_id, first.invocation_id);
+    // A start of a unit that runs finds its cgroup populated and joins it: no refusal.
+    assert_eq!(
+        same_unit(within(units.start(id)).await.unwrap()),
+        same_unit(second)
+    );
+    within(units.stop(id)).await.unwrap();
+    let _ = client.kill();
+    let _ = client.wait();
 }
 
 #[tokio::test]
@@ -1023,4 +1188,297 @@ async fn the_awake_budget_is_the_memory_ceiling_of_the_database_slice() {
         Some(started.main_pid)
     );
     within(units.stop(&database.id)).await.unwrap();
+}
+
+/// What `systemctl show` says of one property of a unit.
+fn show(unit: &str, property: &str) -> String {
+    let output = Command::new("systemctl")
+        .args(["show", "-p", property, "--value", unit])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// The command line of a process, which says which `ExecStart=` it was started with. A start job
+/// of `Type=simple` ends when the process is forked, and until it has executed its command its
+/// name is `(name)`: this waits for the command.
+async fn command_line(pid: &str) -> String {
+    let mut line = String::new();
+    for _ in 0..100 {
+        line = fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        if !line.starts_with('(') && !line.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    line
+}
+
+const LAB_TEMPLATE: &str = "/run/systemd/system/pgcf-labhf@.service";
+const LAB_STOP_MARKER: &str = "/run/pgcf-labhf-stopped";
+
+fn lab_template(version: u32) -> String {
+    match version {
+        1 => "[Service]\nExecStart=/bin/sleep 1000\nMemoryMax=64M\nTimeoutStopSec=30\nKillSignal=SIGTERM\n".to_string(),
+        _ => format!(
+            "[Service]\nExecStart=/bin/sleep 2000\nMemoryMax=96M\nTimeoutStopSec=45\nKillSignal=SIGINT\nExecStop=/bin/sh -c 'echo stopped > {LAB_STOP_MARKER}'\n"
+        ),
+    }
+}
+
+/// The memory ceiling the kernel enforces on the unit's cgroup, which is what the unit started with
+/// and not what `systemctl show` says once the file changed.
+fn cgroup_memory_max(unit: &str) -> String {
+    let file = format!("/sys/fs/cgroup{}/memory.max", show(unit, "ControlGroup"));
+    fs::read_to_string(file).unwrap().trim().to_string()
+}
+
+/// What a release's host file does to a template instance that runs (plan 9.3, `next_start`): the
+/// D-Bus `Reload` the agent makes after it wrote the file, and what a start takes after it. Measured
+/// on Debian 13's systemd 257: the reload gives the loaded unit the new file (its properties and,
+/// at its next stop, its `ExecStop=`, `KillSignal=` and `TimeoutStopSec=`), and the running process
+/// and its cgroup limits are left as they were until the unit starts again.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1 and root (lab)"]
+async fn a_reload_changes_what_the_next_stop_does_and_a_start_what_a_running_instance_is_made_of() {
+    if !lab() {
+        return;
+    }
+    let unit = "pgcf-labhf@a.service";
+    let _clean = scopeguard(|| {
+        quiet("systemctl", &["stop", unit]);
+        let _ = fs::remove_file(LAB_TEMPLATE);
+        let _ = fs::remove_file(LAB_STOP_MARKER);
+        quiet("systemctl", &["daemon-reload"]);
+    });
+    let _ = fs::remove_file(LAB_STOP_MARKER);
+    fs::write(LAB_TEMPLATE, lab_template(1)).unwrap();
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    within(units.reload()).await.unwrap();
+    within(units.start_service(unit, false)).await.unwrap();
+    let pid = show(unit, "MainPID");
+    assert_ne!(pid, "0");
+    assert_eq!(command_line(&pid).await, "/bin/sleep 1000");
+    let bytes = |mib: u64| (mib << 20).to_string();
+    assert_eq!(show(unit, "MemoryMax"), bytes(64));
+    assert_eq!(cgroup_memory_max(unit), bytes(64));
+
+    // The file changes on disk.
+    fs::write(LAB_TEMPLATE, lab_template(2)).unwrap();
+
+    // After the reload the instance is the same process and keeps the cgroup limit it started
+    // with, though the unit now reports the new one; its stop settings are the file's.
+    within(units.reload()).await.unwrap();
+    assert_eq!(show(unit, "MainPID"), pid);
+    assert_eq!(command_line(&pid).await, "/bin/sleep 1000");
+    assert_eq!(show(unit, "MemoryMax"), bytes(96));
+    assert_eq!(cgroup_memory_max(unit), bytes(64));
+    assert_eq!(show(unit, "TimeoutStopUSec"), "45s");
+    assert_eq!(show(unit, "KillSignal"), "2");
+
+    // The next stop of that very instance runs the `ExecStop=` the file added.
+    assert!(!Path::new(LAB_STOP_MARKER).exists());
+    run("systemctl", &["stop", unit]);
+    assert!(Path::new(LAB_STOP_MARKER).exists());
+
+    // The next start takes the exec settings and the cgroup limits of the file.
+    within(units.start_service(unit, false)).await.unwrap();
+    let started = show(unit, "MainPID");
+    assert_ne!(started, pid);
+    assert_eq!(command_line(&started).await, "/bin/sleep 2000");
+    assert_eq!(cgroup_memory_max(unit), bytes(96));
+}
+
+/// The agent's own new unit stands in `/run/systemd/system` until the agent that runs it moves it
+/// to its place (`hostfiles::promote`): systemd reads it before the image's file, and a boot, which
+/// empties `/run`, leaves the image's file as the unit that runs.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1 and root (lab)"]
+async fn a_unit_in_the_runtime_directory_wins_over_the_images_and_leaves_with_its_file() {
+    if !lab() {
+        return;
+    }
+    let unit = "pgcf-labhf-stage.service";
+    let image = format!("/usr/lib/systemd/system/{unit}");
+    let runtime = format!("/run/systemd/system/{unit}");
+    let _clean = scopeguard(|| {
+        let _ = fs::remove_file(&image);
+        let _ = fs::remove_file(&runtime);
+        quiet("systemctl", &["daemon-reload"]);
+    });
+    let body = |description: &str| {
+        format!("[Unit]\nDescription={description}\n[Service]\nType=oneshot\nExecStart=/bin/true\n")
+    };
+    fs::write(&image, body("last good")).unwrap();
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    within(units.reload()).await.unwrap();
+    assert_eq!(show(unit, "FragmentPath"), image);
+    assert_eq!(show(unit, "Description"), "last good");
+
+    // The agent stages the new unit and reads the units again: the copy in /run is the unit.
+    fs::write(&runtime, body("new")).unwrap();
+    within(units.reload()).await.unwrap();
+    assert_eq!(show(unit, "FragmentPath"), runtime);
+    assert_eq!(show(unit, "Description"), "new");
+
+    // A boot empties /run: the image's file is what systemd reads, the last good unit.
+    fs::remove_file(&runtime).unwrap();
+    within(units.reload()).await.unwrap();
+    assert_eq!(show(unit, "FragmentPath"), image);
+    assert_eq!(show(unit, "Description"), "last good");
+
+    // The promotion: the file of the image is written, the copy goes, one reload reads the file.
+    fs::write(&runtime, body("new")).unwrap();
+    within(units.reload()).await.unwrap();
+    fs::write(&image, body("new")).unwrap();
+    fs::remove_file(&runtime).unwrap();
+    within(units.reload()).await.unwrap();
+    assert_eq!(show(unit, "FragmentPath"), image);
+    assert_eq!(show(unit, "Description"), "new");
+}
+
+/// The units that systemd has loaded and that match `pattern`, as `systemctl list-units` lists
+/// them: it does not load a unit, as `systemctl show` of one does.
+fn loaded(pattern: &str) -> Vec<String> {
+    let output = Command::new("systemctl")
+        .args(["list-units", "--all", "--no-legend", "--plain", pattern])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// The agent reads the state of every database's unit when it starts, all at once: the bus
+/// connection has one pending reply per call, and the bus daemon (dbus-daemon's
+/// `max_replies_per_connection`) refuses the calls past its limit. A node has hundreds of
+/// databases and almost all of them are asleep, not loaded, and a read of one of their properties
+/// loads the unit.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1 and the node image's units (lab)"]
+async fn the_state_of_hundreds_of_units_is_read_at_once_and_every_read_is_answered() {
+    if !lab() {
+        return;
+    }
+    const UNITS: usize = 300;
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    let ids: Vec<String> = (0..UNITS).map(|n| format!("labrd{n:015}")).collect();
+    let started = std::time::Instant::now();
+    let reads = futures_util::future::join_all(ids.iter().map(|id| units.state(id))).await;
+    eprintln!(
+        "lab: {UNITS} unit reads at once took {} ms",
+        started.elapsed().as_millis()
+    );
+    let failed: Vec<String> = reads
+        .iter()
+        .filter_map(|read| read.as_ref().err().map(ToString::to_string))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "{} of {UNITS} reads failed: {:?}",
+        failed.len(),
+        failed.first()
+    );
+    assert!(
+        reads
+            .iter()
+            .all(|read| matches!(read, Ok(state) if state.active == ActiveState::Inactive))
+    );
+    // The reads loaded none of them.
+    assert!(loaded("pgcf-pg@labrd*").is_empty());
+}
+
+/// The agent applies the CPU quota of every database that runs when it starts, at once
+/// (`Core::adopt_running`): one property change each, decided on 16 at a time among the first and
+/// by a retry for any other, and a node has dozens of them. The changes take a place among
+/// `CALLS_IN_FLIGHT` like the reads do, so that 300 asked at once, which are past the bus's limit
+/// of 128 calls that are not answered yet, are all answered. A unit that is not loaded is loaded
+/// by the change, which is the slow part (the reads of such units are 3.7 ms each).
+#[tokio::test]
+#[ignore = "needs systemd as PID 1 and the node image's units (lab)"]
+async fn hundreds_of_property_changes_are_asked_at_once_and_every_one_is_answered() {
+    if !lab() {
+        return;
+    }
+    const UNITS: usize = 300;
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    let ids: Vec<String> = (0..UNITS).map(|n| format!("labpc{n:015}")).collect();
+    let changes = futures_util::future::join_all(
+        ids.iter()
+            .map(|id| units.set_cpu_quota(id, NonZeroU32::new(250))),
+    )
+    .await;
+    for id in &ids {
+        let _ = fs::remove_dir_all(format!("/run/systemd/system.control/{}.d", unit_name(id)));
+    }
+    let failed: Vec<String> = changes
+        .iter()
+        .filter_map(|change| change.as_ref().err().map(ToString::to_string))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "{} of {UNITS} changes failed: {:?}",
+        failed.len(),
+        failed.first()
+    );
+    within(units.reload()).await.unwrap();
+}
+
+/// The limit the bound stands on: the bus daemon answers one connection with no more than 128
+/// calls that are not answered yet, and a read of a unit that systemd has not loaded is five
+/// calls that it answers one after the other, each after it has loaded the unit. The reads that
+/// `CALLS_IN_FLIGHT` allows are far below the limit, and a few times as many are not.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1 (lab)"]
+async fn the_bus_answers_the_reads_in_flight_and_refuses_those_past_its_limit() {
+    if !lab() {
+        return;
+    }
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    // The five properties of `state`, asked of a unit that is not loaded, so that systemd loads it
+    // before it answers.
+    let read = |unit: String| {
+        let units = units.clone();
+        async move {
+            let (unit_proxy, service) = (
+                units.unit_proxy(&unit, CacheProperties::No).await.unwrap(),
+                units.service_proxy(&unit).await.unwrap(),
+            );
+            let (a, b, c, d, e) = tokio::join!(
+                unit_proxy.active_state(),
+                unit_proxy.invocation_id(),
+                service.main_pid(),
+                service.uid(),
+                service.memory_max(),
+            );
+            a.is_ok() && b.is_ok() && c.is_ok() && d.is_ok() && e.is_ok()
+        }
+    };
+    let mut report = Vec::new();
+    for reads in [CALLS_IN_FLIGHT, 24, 25, 26, 32, 64] {
+        let answered = futures_util::future::join_all(
+            (0..reads).map(|n| read(unit_name(&format!("labbs{reads:05}{n:010}")))),
+        )
+        .await
+        .into_iter()
+        .filter(|ok| *ok)
+        .count();
+        report.push((reads, answered));
+    }
+    eprintln!("lab: reads at once and reads answered: {report:?}");
+    assert_eq!(report[0], (CALLS_IN_FLIGHT, CALLS_IN_FLIGHT));
+    assert!(
+        report
+            .last()
+            .is_some_and(|(reads, answered)| answered < reads)
+    );
 }

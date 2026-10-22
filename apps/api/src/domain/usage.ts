@@ -12,7 +12,12 @@ import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import { assertProjectAccess, getAuth } from "../middleware/auth.ts";
 import { databaseForRequest } from "./rows.ts";
-import { aggregateUsageDay, emptyUsageMetrics } from "./usage-rollup.ts";
+import {
+  aggregateUsageDay,
+  emptyUsageMetrics,
+  storedUsageGaps,
+  storedUsageMetrics,
+} from "./usage-rollup.ts";
 
 /** Include this statement in the same atomic batch as the lifecycle state change. */
 export function usageLifecycleStatement(
@@ -407,11 +412,11 @@ export async function queryUsage(
         metrics:
           hour.metrics === null
             ? emptyUsageMetrics()
-            : JSON.parse(hour.metrics),
+            : storedUsageMetrics(hour.metrics),
         gaps:
           hour.gaps === null
             ? ["rollup_pending", ...Object.keys(emptyUsageMetrics())]
-            : JSON.parse(hour.gaps),
+            : storedUsageGaps(hour.gaps),
       });
     });
     return query.granularity === "day" ? aggregateUsageDay(rows) : rows[0]!;

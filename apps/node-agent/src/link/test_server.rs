@@ -73,6 +73,30 @@ pub fn database_id(index: usize) -> String {
     format!("a{index:019}")
 }
 
+/// The property a later release adds (`with_unknown_properties`).
+pub const UNKNOWN_PROPERTY: &str = "a_property_of_a_later_release";
+/// `value` with a property this build does not know on every object of it, as a later release of
+/// the API adds one. The `keys` of a route keyring are a map of key identifiers and take none.
+pub fn with_unknown_properties(value: &Value) -> Value {
+    fn add(value: &mut Value, map: bool) {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object.iter_mut() {
+                    add(child, key == "keys");
+                }
+                if !map {
+                    object.insert(UNKNOWN_PROPERTY.into(), 1.into());
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|item| add(item, false)),
+            _ => {}
+        }
+    }
+    let mut value = value.clone();
+    add(&mut value, false);
+    value
+}
+
 /// What the double does with the next POSTs (the enrollment included), after it recorded them.
 #[derive(Clone, Copy, Debug)]
 pub enum Failure {
@@ -125,6 +149,9 @@ pub struct Inner {
     /// The next this many observation reports that name databases are answered 503: the ones that
     /// carry events alone are not counted, as the node posts those on its own account.
     pub observation_failures: usize,
+    /// The verdict the double gives a database of an observation report, where it is not `accept`
+    /// (`ObservationVerdict`).
+    pub verdicts: std::collections::HashMap<String, &'static str>,
     /// The node uid the desired pages name; the enrolled node's own unless a test changes it.
     pub page_uid: String,
     /// The pages never advance their cursor.
@@ -136,6 +163,12 @@ pub struct Inner {
     pub samples: Vec<Value>,
     /// The archive path a credential identifier is for, where it is not the example's.
     pub credential_paths: std::collections::HashMap<String, String>,
+    /// How long the double takes to answer a read of an archive credential, as the Worker takes
+    /// (a lookup in D1 and a round trip): zero unless a test gives it one.
+    pub credential_delay: Duration,
+    /// The same for a read of the node's credentials (the Tunnel and the route keyring), which the
+    /// Worker answers after several calls to Cloudflare's API.
+    pub node_credentials_delay: Duration,
     /// Files served to anyone at `/files/...`, as a release's binaries are by their URLs.
     pub files: std::collections::HashMap<String, Vec<u8>>,
     /// The release the pages name, where it is not the example's.
@@ -143,6 +176,11 @@ pub struct Inner {
     /// The credentials a read returns, where they are not the example's; the pages name their
     /// revision.
     pub credentials: Option<Value>,
+    /// The policy the pages carry, where it is not the example's.
+    pub policy: Option<Value>,
+    /// The API of a later release: every object it sends (pages, credentials, the enrollment, the
+    /// welcome and the fence) carries a property this build does not know.
+    pub unknown_properties: bool,
 }
 pub struct Cloud {
     pub origin: String,
@@ -202,6 +240,7 @@ impl Cloud {
             probe_failures: 0,
             boot_failures: 0,
             observation_failures: 0,
+            verdicts: std::collections::HashMap::new(),
             page_uid: NODE_UID.into(),
             stuck: false,
             silent_welcome: false,
@@ -209,9 +248,13 @@ impl Cloud {
             hellos: vec![],
             samples: vec![],
             credential_paths: Default::default(),
+            credential_delay: Duration::ZERO,
+            node_credentials_delay: Duration::ZERO,
             files: Default::default(),
             release: None,
             credentials: None,
+            policy: None,
+            unknown_properties: false,
         }));
         let (commands, _) = broadcast::channel(16);
         let task = tokio::spawn({
@@ -492,7 +535,8 @@ fn desired(inner: &Inner, query: &[(String, String)]) -> Value {
         .credentials
         .as_ref()
         .map_or(json!(3), |credentials| credentials["revision"].clone());
-    let mut page = json!({"node":node,"release":release,"policy":example["policy"],"credentials_revision":credentials_revision,"orders":inner.orders,"databases":rows,"next":next});
+    let policy = inner.policy.clone().unwrap_or(example["policy"].clone());
+    let mut page = json!({"node":node,"release":release,"policy":policy,"credentials_revision":credentials_revision,"orders":inner.orders,"databases":rows,"next":next});
     if !inner.diagnostics.is_empty() && !inner.fenced {
         page["diagnostics"] = inner.diagnostics.clone().into();
     }
@@ -535,7 +579,25 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
         }
         answer(200, credential)
     } else if is("observations") {
-        post("NodeObservationReport")
+        if method != "POST" || !contract_valid("NodeObservationReport", body) {
+            return answer(400, error("invalid_request"));
+        }
+        // As the API answers (`nodeObservations`): a verdict on each database of the report, in its
+        // order, and how many results of orders it took; a fenced node's databases are not read.
+        let databases: Vec<Value> = body["databases"]
+            .as_array()
+            .filter(|_| !inner.fenced)
+            .into_iter()
+            .flatten()
+            .map(|db| {
+                let id = db["id"].as_str().unwrap();
+                json!({"id": id, "verdict": inner.verdicts.get(id).copied().unwrap_or("accept")})
+            })
+            .collect();
+        answer(
+            200,
+            json!({"databases": databases, "orders": body["orders"].as_array().map_or(0, Vec::len)}),
+        )
     } else if is("volumes") {
         post("NodeVolumeReport")
     } else if is("events") {
@@ -585,7 +647,7 @@ async fn serve(
     let upgrade = request
         .header("upgrade")
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    let (answer, failure) = {
+    let (answer, failure, delay) = {
         let mut inner = inner.lock().unwrap();
         let signed = if enrolling || public {
             None
@@ -642,6 +704,14 @@ async fn serve(
         } else {
             route(&mut inner, &request.method, &request.target, &body)
         };
+        let answer = if inner.unknown_properties {
+            Answer {
+                body: with_unknown_properties(&answer.body),
+                ..answer
+            }
+        } else {
+            answer
+        };
         let status = match failure {
             Some(Failure::Status(status)) => status,
             _ => answer.status,
@@ -653,8 +723,22 @@ async fn serve(
             signed,
             status,
         });
-        (answer, failure)
+        let paths = constant("NODE_API_PATHS");
+        let delay = if request
+            .target
+            .starts_with(paths["archiveCredentials"].as_str().unwrap())
+        {
+            inner.credential_delay
+        } else if request.target == paths["credentials"].as_str().unwrap() {
+            inner.node_credentials_delay
+        } else {
+            Duration::ZERO
+        };
+        (answer, failure, delay)
     };
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     match failure {
         Some(Failure::Drop) => return Ok(()),
         Some(Failure::Status(status)) => {
@@ -711,18 +795,22 @@ async fn session<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     if !contract_valid("AgentLinkMessage", &hello) || hello["type"] != "hello" {
         return;
     }
-    let silent = {
+    let (silent, welcome) = {
         let mut inner = inner.lock().unwrap();
         inner.hellos.push(hello);
-        inner.silent_welcome
+        let welcome = json!({"type":"welcome","protocol":1});
+        let welcome = if inner.unknown_properties {
+            with_unknown_properties(&welcome)
+        } else {
+            welcome
+        };
+        (inner.silent_welcome, welcome)
     };
     if silent {
         return std::future::pending().await;
     }
     if socket
-        .send(Message::text(
-            json!({"type":"welcome","protocol":1}).to_string(),
-        ))
+        .send(Message::text(welcome.to_string()))
         .await
         .is_err()
     {

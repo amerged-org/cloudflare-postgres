@@ -13,7 +13,6 @@ import {
 const resources = {
   memory_mib: 256,
   cpu_millicores: 250,
-  cpu_request_millicores: 25,
   storage_gib: 5,
   max_connections: 20,
   sleep_after_seconds: 60,

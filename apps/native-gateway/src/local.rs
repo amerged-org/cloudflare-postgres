@@ -93,10 +93,7 @@ pub struct LocalTable {
     /// The channel is up and its table arrived. Without it nothing new is admitted; established
     /// sessions keep their writer, which only the agent can stop.
     synchronized: bool,
-    epoch: u64,
     records: HashMap<String, Database>,
-    database_epochs: HashMap<String, u64>,
-    next_database_epoch: u64,
     /// Signalled after every change of the table and every loss of the channel: a held wake
     /// connection waits on it for its release.
     pub changed: Arc<Notify>,
@@ -104,14 +101,6 @@ pub struct LocalTable {
 impl LocalTable {
     pub fn synchronized(&self) -> bool {
         self.synchronized
-    }
-    /// The table epoch and the database's own epoch: a session admitted at another epoch writes
-    /// nothing before it is admitted again.
-    pub fn bound_epoch(&self, database: &str) -> (u64, u64) {
-        (
-            self.epoch,
-            self.database_epochs.get(database).copied().unwrap_or(0),
-        )
     }
     pub fn record(&self, database: &str) -> Option<&Database> {
         self.records.get(database)
@@ -148,16 +137,8 @@ impl LocalTable {
             .collect();
         for (database, record) in &records {
             if self.records.get(database) != Some(record) {
-                self.next_database_epoch += 1;
-                self.database_epochs
-                    .insert(database.clone(), self.next_database_epoch);
                 actions.push((database.clone(), action(record.mode)));
             }
-        }
-        self.database_epochs
-            .retain(|database, _| records.contains_key(database));
-        if !self.synchronized {
-            self.epoch += 1;
         }
         std::mem::swap(&mut self.records, &mut records);
         self.synchronized = true;
@@ -169,9 +150,6 @@ impl LocalTable {
         if self.records.get(&record.database) == Some(&record) {
             return None;
         }
-        self.next_database_epoch += 1;
-        self.database_epochs
-            .insert(record.database.clone(), self.next_database_epoch);
         let changed = (record.database.clone(), action(record.mode));
         self.records.insert(record.database.clone(), record);
         self.changed.notify_waiters();
@@ -179,7 +157,6 @@ impl LocalTable {
     }
     pub fn remove(&mut self, database: &str) -> Option<(String, Action)> {
         self.records.remove(database)?;
-        self.database_epochs.remove(database);
         self.changed.notify_waiters();
         Some((database.into(), Action::Retire))
     }
@@ -187,7 +164,6 @@ impl LocalTable {
     pub fn disconnect(&mut self) {
         if self.synchronized {
             self.synchronized = false;
-            self.epoch += 1;
             self.changed.notify_waiters();
         }
     }
@@ -560,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn the_table_admits_running_units_and_moves_the_epochs_of_what_changed() {
+    fn the_table_admits_running_units_and_tells_the_sessions_what_changed() {
         let (a, b) = ("a".repeat(20), "b".repeat(20));
         let mut table = LocalTable::default();
         assert!(!table.admits(&a));
@@ -571,7 +547,6 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert!(table.admits(&a) && !table.admits(&b));
         assert!(table.permits(&a, &writer(100)) && !table.permits(&a, &writer(101)));
-        let (epoch_a, epoch_b) = (table.bound_epoch(&a), table.bound_epoch(&b));
         // The same table again changes nothing.
         assert!(
             table
@@ -581,20 +556,24 @@ mod tests {
                 ])
                 .is_empty()
         );
-        assert_eq!(table.bound_epoch(&a), epoch_a);
+        // A later route revision, as the page that carries Cloudflare's claim of a wake brings
+        // it, says only that the database runs: it admits new work on the same unit as before.
+        let claimed = Database {
+            route_revision: 8,
+            ..record(&a, Mode::Running, 3, 100)
+        };
+        assert_eq!(table.update(claimed), Some((a.clone(), Action::Running)));
+        assert!(table.admits(&a) && table.permits(&a, &writer(100)));
         // A quiescing database admits nothing new; its sessions keep the writer.
         assert_eq!(
             table.update(record(&a, Mode::Quiesce, 3, 100)),
             Some((a.clone(), Action::Quiesce))
         );
         assert!(!table.admits(&a) && table.permits(&a, &writer(100)));
-        assert_ne!(table.bound_epoch(&a), epoch_a);
-        assert_eq!(table.bound_epoch(&b), epoch_b);
-        // Losing the channel admits nothing new, keeps the writers and moves every epoch.
+        // Losing the channel admits nothing new and keeps the writers.
         table.update(record(&a, Mode::Running, 3, 100));
         table.disconnect();
         assert!(!table.admits(&a) && table.permits(&a, &writer(100)));
-        assert_ne!(table.bound_epoch(&b), epoch_b);
         // A database the next table leaves out is retired.
         let actions = table.replace(vec![record(&a, Mode::Running, 3, 100)]);
         assert!(actions.contains(&(b.clone(), Action::Retire)));

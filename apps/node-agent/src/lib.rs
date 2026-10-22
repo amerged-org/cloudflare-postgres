@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub(crate) mod events;
 pub mod fence;
 pub mod gateway;
+pub mod hostfiles;
 pub mod layout;
 pub mod link;
 pub mod machine;
@@ -18,6 +19,7 @@ pub mod node_link;
 pub mod notify;
 pub mod pg_control;
 pub mod postgres;
+pub mod prefetch;
 pub mod proof;
 pub mod release;
 pub mod roles;
@@ -28,6 +30,8 @@ pub mod settings;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod shell_ca;
 pub mod sleep;
+#[cfg(all(test, target_os = "linux"))]
+mod start_lab;
 pub mod state;
 pub mod storage;
 #[cfg(test)]

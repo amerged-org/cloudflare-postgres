@@ -299,6 +299,23 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(file.responses["206"]!.content).not.toHaveProperty("text/plain");
   });
 
+  it("documents that the API verifies a release's signature, with the image in what is signed, and refuses one that does not verify", async () => {
+    const management = await document("/v1/openapi.json");
+    const register = operation(management, "/v1/fleet/releases/{id}", "put");
+    expect(register.description).toContain("verifies it");
+    expect(register.description).toContain("image");
+    expect(register.description).not.toContain("cannot check");
+    expect(register.description).not.toContain("holds no key");
+    expect(register.responses["400"]).toBeDefined();
+    // Why an audited server waits for its installer: the firewall, or a release nobody signed.
+    const blockers = JSON.stringify(management).match(
+      /"install_blocker":\{[^}]*\}/g,
+    );
+    expect(blockers).not.toBeNull();
+    for (const blocker of blockers!)
+      expect(blocker).toContain('"release_unverified"');
+  });
+
   it("documents the scopes of the keys, their expiry and the audit log", async () => {
     const doc = await document("/v1/openapi.json");
     const schemas = doc.components!.schemas as Record<
@@ -616,6 +633,30 @@ describe("actual generated API references in the Workers runtime", () => {
     });
   });
 
+  it("documents none of the removed capacity fields, alert kind or usage metrics", async () => {
+    const text = JSON.stringify(await document("/v1/openapi.json"));
+    for (const gone of [
+      "ram_expansion_threshold_ppm",
+      "ram_warning_threshold_ppm",
+      "placement_mode",
+      "postgres_memory_request_mib",
+      "cpu_request_millicores",
+      "memory_window_observed_at",
+      "memory_window_valid",
+      "memory_utilization_ppm",
+      "memory_expansion_triggered_at",
+      "regional_ram_warning",
+      "reserved_memory_mib_seconds",
+      "reserved_cpu_millicore_seconds",
+      "reserved_storage_byte_seconds",
+    ])
+      expect(text, gone).not.toMatch(
+        new RegExp(`(?<![a-z_])${gone}(?![a-z_])`),
+      );
+    // The alert event keeps the field a receiver may read; it is always null.
+    expect(text).toMatch(/regional_ram_utilization_ppm/);
+  });
+
   it("documents the rules the validators apply beyond the field types", async () => {
     const doc = await document("/v1/openapi.json");
     const schemas = doc.components!.schemas as Record<
@@ -626,10 +667,8 @@ describe("actual generated API references in the Workers runtime", () => {
       /integrator.*project_id/s,
     );
     expect(schemas.RoleName!.description).toMatch(/pgcf_maintenance/);
-    expect(schemas.SizeClass!.description).toMatch(/cpu_request_millicores/);
-    expect(schemas.SizeClassUpsert!.description).toMatch(
-      /cpu_request_millicores/,
-    );
+    expect(schemas.SizeClass!.description).toMatch(/multiple of 256/);
+    expect(schemas.SizeClassUpsert!.description).toMatch(/multiple of 256/);
     const usage = operation(doc, "/v1/usage", "get");
     expect(usage.description).toMatch(/exactly one/);
     expect(usage.description).toMatch(/31 days/);

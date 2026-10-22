@@ -10,10 +10,6 @@ import {
 } from "@pgcf/contracts/nodes";
 import { z } from "zod";
 import { ApiError } from "../api-error.ts";
-import {
-  withAdmissionMutation,
-  type AdmissionMutation,
-} from "../domain/admission-mutations.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { requireAdminRead, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
@@ -42,7 +38,7 @@ export const NodeCapacityPolicy = NodeRegionPolicy.safeExtend({
     .boolean()
     .default(false)
     .describe(
-      "Lets the minute capacity cron add a node when capacity is needed: it adopts the first unused adopt_instance_ids entry, otherwise reserves an addition of `order` once regional RAM reaches ram_expansion_threshold_ppm. Dispatching an order still needs purchases_enabled and a cost approval. GET /v1/regions/{id}/capacity-decision previews the next step.",
+      "Lets the minute capacity cron add a node when no node can take a database: it adopts the first unused adopt_instance_ids entry, otherwise, while purchases_enabled is true, reserves an addition of `order` (with purchases_enabled false it reserves none: action purchases_disabled). Dispatching an order still needs purchases_enabled and a cost approval. GET /v1/regions/{id}/capacity-decision previews the next step.",
     ),
   adopt_instance_ids: z
     .array(ProviderInstanceId)
@@ -279,8 +275,6 @@ export async function getCapacityPolicy(
     .first<{
       region_id: string;
       max_nodes: number | null;
-      ram_expansion_threshold_ppm: number | null;
-      ram_warning_threshold_ppm: number | null;
       node_ram_warning_threshold_ppm: number | null;
       node_cpu_warning_threshold_ppm: number | null;
       node_storage_warning_threshold_ppm: number | null;
@@ -289,9 +283,7 @@ export async function getCapacityPolicy(
       order_config: string | null;
       autoscale_enabled: number;
       adopt_instance_ids: string;
-      placement_mode: "reserved" | "actual_ram";
       maximum_database_memory_mib: number | null;
-      postgres_memory_request_mib: number | null;
       standing_cost_profile: string | null;
     }>();
   if (!row)
@@ -300,8 +292,6 @@ export async function getCapacityPolicy(
     NodeCapacityPolicy.parse({
       region_id: row.region_id,
       max_nodes: row.max_nodes,
-      ram_expansion_threshold_ppm: row.ram_expansion_threshold_ppm,
-      ram_warning_threshold_ppm: row.ram_warning_threshold_ppm,
       node_ram_warning_threshold_ppm: row.node_ram_warning_threshold_ppm,
       node_cpu_warning_threshold_ppm: row.node_cpu_warning_threshold_ppm,
       node_storage_warning_threshold_ppm:
@@ -311,9 +301,7 @@ export async function getCapacityPolicy(
       autoscale_enabled: Boolean(row.autoscale_enabled),
       order: row.order_config === null ? null : JSON.parse(row.order_config),
       adopt_instance_ids: JSON.parse(row.adopt_instance_ids),
-      placement_mode: row.placement_mode,
       maximum_database_memory_mib: row.maximum_database_memory_mib,
-      postgres_memory_request_mib: row.postgres_memory_request_mib,
       standing_cost_profile:
         row.standing_cost_profile === null
           ? null
@@ -333,47 +321,21 @@ export async function setCapacityPolicy(
       "invalid_request",
       "Policy region differs from the route",
     );
-  const previous = await c.env.DB.prepare(
-    "SELECT placement_mode,postgres_memory_request_mib FROM node_region_policies WHERE region_id=?",
-  )
-    .bind(id)
-    .first<{
-      placement_mode: string;
-      postgres_memory_request_mib: number | null;
-    }>();
-  const changesRuntime =
-    policy.placement_mode !== (previous?.placement_mode ?? "reserved") ||
-    (policy.placement_mode === "actual_ram" &&
-      policy.postgres_memory_request_mib !==
-        (previous?.postgres_memory_request_mib ?? null));
-  const execute = async (mutation?: AdmissionMutation) =>
-    configureNodeRegionPolicy(
-      c.env.DB,
-      {
-        region_id: id,
-        max_nodes: policy.max_nodes,
-        ram_expansion_threshold_ppm: policy.ram_expansion_threshold_ppm,
-        ram_warning_threshold_ppm: policy.ram_warning_threshold_ppm,
-        node_ram_warning_threshold_ppm: policy.node_ram_warning_threshold_ppm,
-        node_cpu_warning_threshold_ppm: policy.node_cpu_warning_threshold_ppm,
-        node_storage_warning_threshold_ppm:
-          policy.node_storage_warning_threshold_ppm,
-        cap_warning_enabled: policy.cap_warning_enabled,
-        purchases_enabled: policy.purchases_enabled,
-        order: policy.order,
-        placement_mode: policy.placement_mode,
-        maximum_database_memory_mib: policy.maximum_database_memory_mib,
-        postgres_memory_request_mib: policy.postgres_memory_request_mib,
-        standing_cost_profile: policy.standing_cost_profile,
-        autoscale_enabled: policy.autoscale_enabled,
-        adopt_instance_ids: policy.adopt_instance_ids,
-      },
-      mutation,
-      previous ?? { placement_mode: null, postgres_memory_request_mib: null },
-    );
-  if (changesRuntime)
-    await withAdmissionMutation(c.env, [], execute, { kind: "region", id });
-  else await execute();
+  await configureNodeRegionPolicy(c.env.DB, {
+    region_id: id,
+    max_nodes: policy.max_nodes,
+    node_ram_warning_threshold_ppm: policy.node_ram_warning_threshold_ppm,
+    node_cpu_warning_threshold_ppm: policy.node_cpu_warning_threshold_ppm,
+    node_storage_warning_threshold_ppm:
+      policy.node_storage_warning_threshold_ppm,
+    cap_warning_enabled: policy.cap_warning_enabled,
+    purchases_enabled: policy.purchases_enabled,
+    order: policy.order,
+    maximum_database_memory_mib: policy.maximum_database_memory_mib,
+    standing_cost_profile: policy.standing_cost_profile,
+    autoscale_enabled: policy.autoscale_enabled,
+    adopt_instance_ids: policy.adopt_instance_ids,
+  });
   return getCapacityPolicy(c, id);
 }
 export async function capacityDecision(

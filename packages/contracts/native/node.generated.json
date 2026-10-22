@@ -18,7 +18,6 @@
         }
       },
       "required": ["node_id", "region", "api_url", "enrollment_token"],
-      "additionalProperties": false,
       "$defs": {
         "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
         "RegionId": {
@@ -70,7 +69,6 @@
         "region_id": { "$ref": "#/$defs/RegionId" }
       },
       "required": ["id", "uid", "hostname", "region_id"],
-      "additionalProperties": false,
       "$defs": {
         "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
         "RegionId": {
@@ -139,16 +137,14 @@
               }
             }
           },
-          "required": ["active", "keys"],
-          "additionalProperties": false
+          "required": ["active", "keys"]
         },
         "shell_ca_public_key": {
           "type": "string",
           "pattern": "^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-P][A-Za-z0-9+/]{42}$"
         }
       },
-      "required": ["revision", "tunnel_token", "route_keyring"],
-      "additionalProperties": false
+      "required": ["revision", "tunnel_token", "route_keyring"]
     },
     "ArchiveCredential": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -189,7 +185,6 @@
         "session_token",
         "expires_at"
       ],
-      "additionalProperties": false,
       "$defs": {
         "Timestamp": {
           "type": "string",
@@ -217,8 +212,7 @@
             },
             "region_id": { "$ref": "#/$defs/RegionId" }
           },
-          "required": ["id", "uid", "hostname", "region_id"],
-          "additionalProperties": false
+          "required": ["id", "uid", "hostname", "region_id"]
         },
         "release": {
           "anyOf": [
@@ -228,6 +222,32 @@
                 "id": {
                   "type": "string",
                   "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+                },
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                    "size_bytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    "raw_sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "raw_bytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "sha256",
+                    "size_bytes",
+                    "raw_sha256",
+                    "raw_bytes"
+                  ]
                 },
                 "binaries": {
                   "type": "object",
@@ -250,8 +270,7 @@
                           "maximum": 9007199254740991
                         }
                       },
-                      "required": ["url", "sha256", "size_bytes"],
-                      "additionalProperties": false
+                      "required": ["url", "sha256", "size_bytes"]
                     },
                     "pgcf-native-gateway": {
                       "type": "object",
@@ -271,8 +290,7 @@
                           "maximum": 9007199254740991
                         }
                       },
-                      "required": ["url", "sha256", "size_bytes"],
-                      "additionalProperties": false
+                      "required": ["url", "sha256", "size_bytes"]
                     },
                     "pgcf-archive": {
                       "type": "object",
@@ -292,8 +310,7 @@
                           "maximum": 9007199254740991
                         }
                       },
-                      "required": ["url", "sha256", "size_bytes"],
-                      "additionalProperties": false
+                      "required": ["url", "sha256", "size_bytes"]
                     },
                     "pgcf-wal-fetch": {
                       "type": "object",
@@ -313,8 +330,7 @@
                           "maximum": 9007199254740991
                         }
                       },
-                      "required": ["url", "sha256", "size_bytes"],
-                      "additionalProperties": false
+                      "required": ["url", "sha256", "size_bytes"]
                     }
                   },
                   "required": [
@@ -322,8 +338,7 @@
                     "pgcf-native-gateway",
                     "pgcf-archive",
                     "pgcf-wal-fetch"
-                  ],
-                  "additionalProperties": false
+                  ]
                 },
                 "os": {
                   "type": "object",
@@ -354,20 +369,85 @@
                           "maximum": 9007199254740991
                         }
                       },
-                      "required": ["url", "sha256", "size_bytes"],
-                      "additionalProperties": false
+                      "required": ["url", "sha256", "size_bytes"]
+                    },
+                    "host_files": {
+                      "maxItems": 1024,
+                      "type": "array",
+                      "items": {
+                        "oneOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 256
+                              },
+                              "kind": { "type": "string", "const": "file" },
+                              "mode": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 8
+                              },
+                              "sha256": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128
+                              },
+                              "size_bytes": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "apply": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128
+                              }
+                            },
+                            "required": [
+                              "path",
+                              "kind",
+                              "mode",
+                              "sha256",
+                              "size_bytes",
+                              "apply"
+                            ]
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 256
+                              },
+                              "kind": {
+                                "type": "string",
+                                "const": "symlink-to-dev-null"
+                              },
+                              "apply": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128
+                              }
+                            },
+                            "required": ["path", "kind", "apply"]
+                          }
+                        ]
+                      }
                     }
                   },
                   "required": [
                     "image_version",
                     "debian_snapshot",
-                    "package_lock"
-                  ],
-                  "additionalProperties": false
+                    "package_lock",
+                    "host_files"
+                  ]
                 }
               },
-              "required": ["id", "binaries", "os"],
-              "additionalProperties": false
+              "required": ["id", "image", "binaries", "os"]
             },
             { "type": "null" }
           ]
@@ -411,6 +491,12 @@
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 300
+                },
+                "cpu_boost_ms": {
+                  "default": 0,
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
                 }
               },
               "required": [
@@ -421,8 +507,7 @@
                 "start_concurrency",
                 "queue_wait_ms",
                 "retry_after_seconds"
-              ],
-              "additionalProperties": false
+              ]
             },
             "early_sleep": {
               "type": "object",
@@ -434,8 +519,7 @@
                   "maximum": 3600
                 }
               },
-              "required": ["enabled", "min_idle_seconds"],
-              "additionalProperties": false
+              "required": ["enabled", "min_idle_seconds"]
             },
             "storage": {
               "type": "object",
@@ -460,8 +544,7 @@
                 "reserve_bytes",
                 "metadata_no_room_percent",
                 "sample_max_age_seconds"
-              ],
-              "additionalProperties": false
+              ]
             },
             "backup": {
               "type": "object",
@@ -495,12 +578,10 @@
                       "maximum": 4096
                     }
                   },
-                  "required": ["wal_upload", "wal_fetch", "base_backup"],
-                  "additionalProperties": false
+                  "required": ["wal_upload", "wal_fetch", "base_backup"]
                 }
               },
-              "required": ["wal_uploads", "base_backups", "memory_mib"],
-              "additionalProperties": false
+              "required": ["wal_uploads", "base_backups", "memory_mib"]
             },
             "io": {
               "type": "object",
@@ -516,12 +597,10 @@
                   "maximum": 10000000
                 }
               },
-              "required": ["write_bytes_per_second", "write_iops"],
-              "additionalProperties": false
+              "required": ["write_bytes_per_second", "write_iops"]
             }
           },
-          "required": ["admission", "early_sleep", "storage", "backup", "io"],
-          "additionalProperties": false
+          "required": ["admission", "early_sleep", "storage", "backup", "io"]
         },
         "credentials_revision": {
           "type": "integer",
@@ -545,8 +624,7 @@
                     "maximum": 9007199254740991
                   }
                 },
-                "required": ["type", "operation", "database", "generation"],
-                "additionalProperties": false
+                "required": ["type", "operation", "database", "generation"]
               },
               {
                 "type": "object",
@@ -565,8 +643,7 @@
                   "operation",
                   "database",
                   "storage_generation"
-                ],
-                "additionalProperties": false
+                ]
               },
               {
                 "type": "object",
@@ -587,8 +664,7 @@
                   "database",
                   "storage_generation",
                   "remove_volume"
-                ],
-                "additionalProperties": false
+                ]
               },
               {
                 "type": "object",
@@ -596,8 +672,7 @@
                   "type": { "type": "string", "const": "fence" },
                   "operation": { "$ref": "#/$defs/OperationId" }
                 },
-                "required": ["type", "operation"],
-                "additionalProperties": false
+                "required": ["type", "operation"]
               },
               {
                 "type": "object",
@@ -605,8 +680,7 @@
                   "type": { "type": "string", "const": "maintenance" },
                   "operation": { "$ref": "#/$defs/OperationId" }
                 },
-                "required": ["type", "operation"],
-                "additionalProperties": false
+                "required": ["type", "operation"]
               }
             ]
           }
@@ -648,8 +722,7 @@
               },
               "lines": { "type": "integer", "minimum": 1, "maximum": 2000 }
             },
-            "required": ["id", "probe", "boot", "since_seconds", "lines"],
-            "additionalProperties": false
+            "required": ["id", "probe", "boot", "since_seconds", "lines"]
           }
         },
         "databases": {
@@ -700,8 +773,7 @@
                     "maximum": 65536
                   }
                 },
-                "required": ["memory_mib", "cpu_millicores", "storage_gib"],
-                "additionalProperties": false
+                "required": ["memory_mib", "cpu_millicores", "storage_gib"]
               },
               "settings": {
                 "type": "object",
@@ -717,8 +789,7 @@
                     "maximum": 3600
                   }
                 },
-                "required": ["max_connections", "archive_timeout_seconds"],
-                "additionalProperties": false
+                "required": ["max_connections", "archive_timeout_seconds"]
               },
               "sleep_after_seconds": {
                 "anyOf": [
@@ -767,8 +838,7 @@
                           "description": "BYPASSRLS. Absent means NOBYPASSRLS."
                         }
                       },
-                      "required": ["name", "owner", "password", "revision"],
-                      "additionalProperties": false
+                      "required": ["name", "owner", "password", "revision"]
                     },
                     {
                       "type": "object",
@@ -777,7 +847,6 @@
                         "state": { "type": "string", "const": "absent" }
                       },
                       "required": ["name", "state"],
-                      "additionalProperties": false,
                       "description": "A deleted role the node must remove; it carries no credential."
                     }
                   ]
@@ -799,12 +868,10 @@
                       },
                       "expires_at": { "$ref": "#/$defs/Timestamp" }
                     },
-                    "required": ["id", "expires_at"],
-                    "additionalProperties": false
+                    "required": ["id", "expires_at"]
                   }
                 },
-                "required": ["path", "credential"],
-                "additionalProperties": false
+                "required": ["path", "credential"]
               },
               "origin": {
                 "oneOf": [
@@ -813,8 +880,7 @@
                     "properties": {
                       "kind": { "type": "string", "const": "create" }
                     },
-                    "required": ["kind"],
-                    "additionalProperties": false
+                    "required": ["kind"]
                   },
                   {
                     "type": "object",
@@ -842,8 +908,7 @@
                               },
                               "expires_at": { "$ref": "#/$defs/Timestamp" }
                             },
-                            "required": ["id", "expires_at"],
-                            "additionalProperties": false
+                            "required": ["id", "expires_at"]
                           }
                         },
                         "required": [
@@ -851,12 +916,10 @@
                           "path",
                           "backup_id",
                           "credential"
-                        ],
-                        "additionalProperties": false
+                        ]
                       }
                     },
-                    "required": ["kind", "source"],
-                    "additionalProperties": false
+                    "required": ["kind", "source"]
                   },
                   {
                     "type": "object",
@@ -883,8 +946,7 @@
                               },
                               "expires_at": { "$ref": "#/$defs/Timestamp" }
                             },
-                            "required": ["id", "expires_at"],
-                            "additionalProperties": false
+                            "required": ["id", "expires_at"]
                           },
                           "end": {
                             "type": "object",
@@ -914,8 +976,7 @@
                               "checkpoint_lsn",
                               "last_archived_segment",
                               "proven_at"
-                            ],
-                            "additionalProperties": false
+                            ]
                           }
                         },
                         "required": [
@@ -924,12 +985,10 @@
                           "backup_id",
                           "credential",
                           "end"
-                        ],
-                        "additionalProperties": false
+                        ]
                       }
                     },
-                    "required": ["kind", "source"],
-                    "additionalProperties": false
+                    "required": ["kind", "source"]
                   }
                 ]
               }
@@ -947,8 +1006,7 @@
               "sleep_after_seconds",
               "roles",
               "archive"
-            ],
-            "additionalProperties": false
+            ]
           }
         },
         "next": {
@@ -964,7 +1022,6 @@
         "databases",
         "next"
       ],
-      "additionalProperties": false,
       "$defs": {
         "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
         "RegionId": {
@@ -1209,6 +1266,36 @@
         "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
         "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
         "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
+      }
+    },
+    "NodeObservationAnswer": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "databases": {
+          "maxItems": 200,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "$ref": "#/$defs/DatabaseId" },
+              "verdict": {
+                "type": "string",
+                "enum": ["accept", "stale", "conflict"]
+              }
+            },
+            "required": ["id", "verdict"]
+          }
+        },
+        "orders": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": ["databases", "orders"],
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
       }
     },
     "NodeSample": {
@@ -1684,6 +1771,16 @@
                         "minimum": 0,
                         "maximum": 600000
                       },
+                      "slot": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
+                      "bind": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
                       "start": {
                         "type": "integer",
                         "minimum": 0,
@@ -1967,8 +2064,7 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
       "properties": { "error": { "type": "string", "const": "node_fenced" } },
-      "required": ["error"],
-      "additionalProperties": false
+      "required": ["error"]
     },
     "AgentLinkMessage": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2005,13 +2101,18 @@
                 "packages_sha256": {
                   "type": "string",
                   "pattern": "^[0-9a-f]{64}$"
+                },
+                "host_files_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
                 }
               },
               "required": [
                 "boot_id",
                 "booted_at",
                 "kernel_release",
-                "packages_sha256"
+                "packages_sha256",
+                "host_files_sha256"
               ],
               "additionalProperties": false
             }
@@ -2221,8 +2322,7 @@
             "type": { "type": "string", "const": "welcome" },
             "protocol": { "type": "number", "const": 1 }
           },
-          "required": ["type", "protocol"],
-          "additionalProperties": false
+          "required": ["type", "protocol"]
         },
         {
           "type": "object",
@@ -2235,8 +2335,7 @@
               "items": { "$ref": "#/$defs/DatabaseId" }
             }
           },
-          "required": ["type"],
-          "additionalProperties": false
+          "required": ["type"]
         }
       ],
       "$defs": {
@@ -2284,19 +2383,21 @@
       "usage": "/node/v1/usage",
       "diagnostics": "/node/v1/diagnostics"
     },
+    "NODE_ORDER_TYPES": ["wake", "move", "superseded", "fence", "maintenance"],
     "INSTALLER_PROGRESS_PATH": "/node/v1/installer/progress",
     "NODE_ENROLLMENT_SEED_PATH": "/var/lib/pgcf/enrollment/seed.json",
     "ENROLLMENT_TOKEN_LIFETIME_SECONDS": 1800,
     "NODE_SAMPLE_INTERVAL_MS": 15000,
     "NODE_VOLUME_REPORT_INTERVAL_MS": 60000,
     "NODE_STALE_MS": 180000,
+    "NODE_OBSERVATION_RESEND_MS": 900000,
     "NODE_EVENT_RETRY_SECONDS": 600,
     "NODE_FENCED_PATHS": ["/node/v1/desired", "/node/v1/observations"],
     "NODE_FENCED_ERROR": "node_fenced",
     "NODE_LINK_MESSAGE_MAX_BYTES": 65536,
     "NODE_DESIRED_PAGE_LIMIT_MAX": 200,
     "NODE_REPORT_EVENTS_MAX": 64,
-    "NODE_REPORT_EVENT_FIELDS_MAX": 16,
+    "NODE_REPORT_EVENT_FIELDS_MAX": 24,
     "NODE_BOOT_REPORT_ENTRIES_MAX": 1000,
     "NODE_BOOT_REPORT_MESSAGE_MAX_BYTES": 2048,
     "NODE_BOOT_REPORT_MAX_BYTES": 1048576,
@@ -2326,6 +2427,15 @@
     "MAINTENANCE_ROLE": "pgcf_maintenance",
     "RESERVED_ROLE_NAMES": ["postgres", "streaming_replica"],
     "RESERVED_ROLE_PREFIXES": ["pg_", "cnpg_"],
+    "PRESENT_ROLE_PROPERTIES": [
+      "owner",
+      "password",
+      "revision",
+      "valid_until",
+      "connection_limit",
+      "member_of",
+      "bypass_rls"
+    ],
     "ADMISSION_STARTS": [
       "wake",
       "create",
@@ -2364,8 +2474,51 @@
     ],
     "RELEASE_REFUSALS": [
       "release_signature_missing",
-      "release_signature_invalid"
+      "release_signature_invalid",
+      "host_file_path_refused",
+      "host_file_mode_refused",
+      "host_file_apply_refused",
+      "host_files_invalid"
     ],
-    "RELEASE_SIGNATURE_FILE": "release.sig"
+    "RELEASE_SIGNATURE_FILE": "release.sig",
+    "RELEASE_HOST_FILES_DIRECTORY": "host-files",
+    "HOST_FILE_DIRECTORIES": [
+      "/etc/modprobe.d",
+      "/etc/ssh/sshd_config.d",
+      "/etc/sysctl.d",
+      "/etc/sysusers.d",
+      "/etc/systemd/journald.conf.d",
+      "/etc/systemd/system",
+      "/etc/tmpfiles.d",
+      "/usr/lib/sysctl.d",
+      "/usr/lib/sysusers.d",
+      "/usr/lib/systemd/journald.conf.d",
+      "/usr/lib/systemd/system",
+      "/usr/lib/tmpfiles.d"
+    ],
+    "HOST_FILE_KINDS": ["file", "symlink-to-dev-null"],
+    "HOST_FILE_MODES": ["0644", "0755"],
+    "HOST_FILE_UNITS": [
+      "pgcf-agent.service",
+      "pgcf-cloudflared.service",
+      "pgcf-gateway.service",
+      "ssh.service",
+      "systemd-journald.service",
+      "systemd-sysctl.service"
+    ],
+    "HOST_FILE_APPLIES": [
+      "daemon_reload",
+      "next_start",
+      "sysusers",
+      "tmpfiles",
+      "restart_unit:pgcf-agent.service",
+      "restart_unit:pgcf-cloudflared.service",
+      "restart_unit:pgcf-gateway.service",
+      "restart_unit:ssh.service",
+      "restart_unit:systemd-journald.service",
+      "restart_unit:systemd-sysctl.service"
+    ],
+    "HOST_FILES_MAX": 64,
+    "HOST_FILE_MAX_BYTES": 1048576
   }
 }

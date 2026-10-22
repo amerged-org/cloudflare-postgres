@@ -14,12 +14,13 @@ import {
   RELEASE_IMAGE_FILE,
   RELEASE_LOCK_FILE,
   fleetReleaseSpec,
+  hostFileObjectKey,
+  hostFilesSha256,
   releaseObjectKey,
   type FleetPinnedFile,
   type FleetRegionReleaseUpdate,
   type FleetReleaseRegistration,
   type FleetReleaseSpec,
-  type ReleaseFile,
 } from "@pgcf/contracts/releases";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
@@ -27,6 +28,7 @@ import { requireAdminRead, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
 import { hintNode } from "./node-hints.ts";
+import { releaseIsSigned } from "./release-signature.ts";
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -115,29 +117,31 @@ function registeredSpec(
 }
 const hex = (bytes: ArrayBuffer) => bytesToHex(new Uint8Array(bytes));
 /**
- * A release is registered only when the archive bucket holds each of its six files at the
- * registered size and R2 itself verified the registered sha256 when the file was uploaded
- * (`x-amz-checksum-sha256`), so a mistyped version or a half-finished upload is refused here
- * and not at the install of a node.
+ * A release is registered only when the archive bucket holds each of its six files, and each of
+ * its host files by its digest, at the registered size and R2 itself verified the registered
+ * sha256 when the file was uploaded (`x-amz-checksum-sha256`), so a mistyped version or a
+ * half-finished upload is refused here and not at the install of a node.
  */
 async function assertFilesStored(
   bucket: R2Bucket,
   id: string,
   spec: FleetReleaseSpec,
 ): Promise<void> {
-  const pins: [ReleaseFile, { sha256: string; size_bytes: number }][] = [
-    [RELEASE_IMAGE_FILE, spec.image],
-    [RELEASE_LOCK_FILE, spec.os.package_lock],
-    ...RELEASE_BINARY_FILES.map(
-      (file) => [file, spec.binaries[file]] as [ReleaseFile, FleetPinnedFile],
-    ),
+  const pins: [string, { sha256: string; size_bytes: number }][] = [
+    [releaseObjectKey(id, RELEASE_IMAGE_FILE), spec.image],
+    [releaseObjectKey(id, RELEASE_LOCK_FILE), spec.os.package_lock],
+    ...RELEASE_BINARY_FILES.map((file): [string, FleetPinnedFile] => [
+      releaseObjectKey(id, file),
+      spec.binaries[file],
+    ]),
   ];
-  const stored = await Promise.all(
-    pins.map(([file]) => bucket.head(releaseObjectKey(id, file))),
-  );
-  pins.forEach(([file, pin], index) => {
-    const object = stored[index],
-      key = releaseObjectKey(id, file);
+  // A host file is an object named by its digest; two files of the same bytes are one object.
+  for (const file of spec.os.host_files)
+    if (file.kind === "file")
+      pins.push([hostFileObjectKey(id, file.sha256), file]);
+  const stored = await Promise.all(pins.map(([key]) => bucket.head(key)));
+  pins.forEach(([key, pin], index) => {
+    const object = stored[index];
     if (!object) conflict(`${key} is not in the archive bucket`);
     else if (object.size !== pin.size_bytes)
       conflict(
@@ -158,8 +162,26 @@ export async function approveFleetRelease(
   registration: FleetReleaseRegistration,
 ): Promise<Response> {
   await requireScope(c, "admin");
-  const spec = registeredSpec(c, id, registration),
-    specJson = canonical(spec),
+  // A node reports this digest of the files it holds, and the API compares it: a registration
+  // that names another digest than its own list's would never be converged on.
+  if (
+    (await hostFilesSha256(registration.os.host_files)) !==
+    registration.os.host_files_sha256
+  )
+    throw new ApiError(
+      "invalid_request",
+      "os.host_files_sha256 is not the digest of os.host_files",
+    );
+  const spec = registeredSpec(c, id, registration);
+  // The release key signed this release or nobody did: a node is installed from the image of a
+  // registered release, and an agent is updated to its binaries, so a spec whose signature is not
+  // the key's signature of its own facts is refused before the bucket or the database is read.
+  if (!(await releaseIsSigned(id, spec)))
+    throw new ApiError(
+      "invalid_request",
+      "signature is not the release key's signature of this release's manifest (its id, image, binaries, package lock, snapshot and host files)",
+    );
+  const specJson = canonical(spec),
     hash = await sha256(specJson);
   const read = async () => {
     const current = await release(c.env.DB, id);
@@ -281,16 +303,19 @@ interface NodeReleaseRow {
   os_booted_at: string | null;
   os_kernel_release: string | null;
   os_packages_sha256: string | null;
+  os_host_files_sha256: string | null;
   desired_release_id: string | null;
   desired_spec_sha256: string | null;
   desired_kernel_release: string | null;
   desired_packages_sha256: string | null;
+  desired_host_files_sha256: string | null;
 }
 const nodeReleaseSelect = `SELECT n.id node_id,n.region_id,n.node_uid,n.lost_at,n.last_observed_at,n.reported_release_id,n.agent_version,
-    n.os_boot_id,n.os_booted_at,n.os_kernel_release,n.os_packages_sha256,
+    n.os_boot_id,n.os_booted_at,n.os_kernel_release,n.os_packages_sha256,n.os_host_files_sha256,
     f.release_id desired_release_id,r.spec_sha256 desired_spec_sha256,
     json_extract(r.spec_json,'$.os.kernel_release') desired_kernel_release,
-    json_extract(r.spec_json,'$.os.packages_sha256') desired_packages_sha256
+    json_extract(r.spec_json,'$.os.packages_sha256') desired_packages_sha256,
+    json_extract(r.spec_json,'$.os.host_files_sha256') desired_host_files_sha256
     FROM nodes n LEFT JOIN fleet_region_releases f ON f.region_id=n.region_id LEFT JOIN fleet_releases r ON r.id=f.release_id`;
 /** What the fleet knows of a node beyond its row: its release status and what its link reported. */
 export type NodeFleet = {
@@ -299,7 +324,10 @@ export type NodeFleet = {
 /**
  * Where a node stands against its region's release. A node follows the release of its region:
  * its page names it, and the agent's hello names the release it runs and the operating system
- * it boots. The OS is the release's when the kernel and the installed packages are.
+ * it boots. The OS is the release's when the kernel, the installed packages and the host files
+ * are: while systemd has still to be told of a host file (a reload, a run of its tool or a
+ * restart that failed or is still to come), the node does not report the release's digest, so
+ * the release is not converged until it has.
  */
 function nodeReleaseStatus(row: NodeReleaseRow, now = Date.now()): NodeFleet {
   const seen =
@@ -315,14 +343,17 @@ function nodeReleaseStatus(row: NodeReleaseRow, now = Date.now()): NodeFleet {
           : stale
             ? "stale"
             : "converged";
+  // A node that last said hello before the host files existed has not reported them: its
+  // operating system is not known as it is now, as for a node that has not reported at all.
   const os =
-    row.os_boot_id === null
+    row.os_boot_id === null || row.os_host_files_sha256 === null
       ? null
       : NodeOs.parse({
           boot_id: row.os_boot_id,
           booted_at: row.os_booted_at,
           kernel_release: row.os_kernel_release,
           packages_sha256: row.os_packages_sha256,
+          host_files_sha256: row.os_host_files_sha256,
         });
   return {
     status: FleetNodeReleaseStatus.parse({
@@ -345,7 +376,8 @@ function nodeReleaseStatus(row: NodeReleaseRow, now = Date.now()): NodeFleet {
       os === null || row.desired_release_id === null
         ? null
         : os.kernel_release === row.desired_kernel_release &&
-          os.packages_sha256 === row.desired_packages_sha256,
+          os.packages_sha256 === row.desired_packages_sha256 &&
+          os.host_files_sha256 === row.desired_host_files_sha256,
   };
 }
 export async function readFleetNodeRelease(

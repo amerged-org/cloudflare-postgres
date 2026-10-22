@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# The gateway's listening socket. systemd owns it, so it outlives the gateway: while a release
+# replaces the gateway (the old process drains and exits, then the new one starts), a connection
+# from cloudflared waits in this socket's queue and the new gateway accepts it once it has the
+# agent's table. The port is the one the Tunnel's ingress names
+# (apps/api/src/domain/node-tunnel.ts); loopback only, which the gateway checks again.
+#
+# pgcf-gateway.service requires this unit, so starting the gateway starts the socket and a node
+# that receives these files as a release needs no preset. There is no [Install] section for that
+# reason, and the unit is never restarted by itself: stopping it stops the gateway. A release
+# applies a change of this file with the reload only, which leaves a running socket as it is; it
+# takes effect at the next restart of this unit (a reboot, or `systemctl restart
+# pgcf-gateway.socket`, which restarts the gateway too).
+[Unit]
+Description=PGCF gateway socket
+Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
+ConditionPathExists=/var/lib/pgcf/credentials/gateway.env
+
+[Socket]
+ListenStream=127.0.0.1:8080
+# The address policy of the service does not apply to a socket that systemd passes to it, so the
+# service's policy is repeated here (systemd.resource-control).
+IPAddressDeny=any
+IPAddressAllow=localhost

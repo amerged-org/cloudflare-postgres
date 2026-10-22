@@ -88,6 +88,7 @@ while [ $# -gt 0 ]; do
 done
 dest=$1; server=$2
 if [ -f "$STORE/backup-fail" ]; then echo 'simulated backup failure' >&2; exit 4; fi
+if [ -f "$STORE/backup-delay" ]; then sleep "$(cat "$STORE/backup-delay")"; fi
 base="$STORE/objects/${{dest#s3://}}/$server/base"
 id=$(date -u +%Y%m%dT%H%M%S)
 while [ -d "$base/$id" ]; do sleep 1; id=$(date -u +%Y%m%dT%H%M%S); done
@@ -118,6 +119,9 @@ pub(crate) fn policy() -> Policy {
     let mut page = vector("NodeDesiredPage", "full-page");
     // Tests wait for what they wait for; nothing in them should be refused for want of time.
     page["policy"]["admission"]["queue_wait_ms"] = json!(300);
+    // The quota comes with the wake, as the tests that read it expect; the tests of the burst set
+    // theirs (`boost`).
+    page["policy"]["admission"]["cpu_boost_ms"] = json!(0);
     Policy::parse(&page["policy"]).unwrap()
 }
 
@@ -132,6 +136,8 @@ pub(crate) fn timing() -> Timing {
         adopt_wait: Duration::from_secs(5),
         report_retry: Duration::from_millis(10),
         report_retry_maximum: Duration::from_millis(40),
+        host_files_retry: Duration::from_millis(500),
+        host_files_retry_maximum: Duration::from_millis(2000),
         settle: Duration::from_secs(10),
         detail: Duration::from_millis(100),
     }
@@ -238,7 +244,7 @@ impl Rig {
         let listener = crate::gateway::bind(&root.join("g.sock"), 0o600, None).unwrap();
         let feed = tokio::spawn(async move { feed.serve(listener, wake_sender, None).await });
         let fences = Fences::load(machine.layout().fences()).unwrap();
-        let (core, early, _resumed) = Core::new(
+        let (core, early) = Core::new(
             Parts {
                 machine: machine.clone(),
                 jobs,
@@ -267,14 +273,24 @@ impl Rig {
     /// The agent restarts: a new process on the same node. What it keeps in memory is gone; the
     /// units run on, and it finds them as it finds them at boot.
     pub(crate) async fn restart(self) -> Self {
-        for task in &self.tasks {
-            task.abort();
-        }
         let units = self.machine.units().await.unwrap();
         let running = units
             .iter()
             .filter_map(|unit| Running::from_unit(unit, false))
             .collect();
+        self.restart_with(running).await
+    }
+
+    /// The agent restarts and has read `running` of its units: they can change before it decides
+    /// on their databases, a start in flight ending among them.
+    pub(crate) async fn restart_with(self, running: Vec<Running>) -> Self {
+        for task in &self.tasks {
+            task.abort();
+        }
+        // The timers that apply the quotas after a burst die with the process.
+        for db in self.core.all() {
+            db.end_boost();
+        }
         let (machine, fixture, root) = (
             self.machine.clone(),
             self.fixture.clone(),

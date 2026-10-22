@@ -698,10 +698,10 @@ describe("API platform on real Workers D1", () => {
     });
   });
 
-  it("stores and replays separate CPU requests without losing hard limits", async () => {
+  it("stores and replays a CPU limit and refuses a separate CPU request", async () => {
     const admin = await bootstrap();
     const worker = app();
-    const body = { ...size, cpu_millicores: 250, cpu_request_millicores: 25 };
+    const body = { ...size, cpu_millicores: 250 };
     const key = crypto.randomUUID();
     const write = () =>
       worker.fetch(
@@ -711,27 +711,23 @@ describe("API platform on real Workers D1", () => {
     const first = await write();
     expect(first.status).toBe(200);
     const expected = await first.json();
-    expect(expected).toMatchObject({
-      cpu_millicores: 250,
-      cpu_request_millicores: 25,
-    });
+    expect(expected).toMatchObject({ cpu_millicores: 250 });
+    expect(expected).not.toHaveProperty("cpu_request_millicores");
     expect(await (await write()).json()).toEqual(expected);
     expect(
       await env.DB.prepare(
-        "SELECT cpu_millicores, cpu_request_millicores FROM size_classes WHERE id='small'",
+        "SELECT cpu_millicores FROM size_classes WHERE id='small'",
       ).first(),
-    ).toEqual({ cpu_millicores: 250, cpu_request_millicores: 25 });
+    ).toEqual({ cpu_millicores: 250 });
     expect(
       await (
         await worker.fetch(request("/v1/size-classes", admin.key), env)
       ).json(),
-    ).toMatchObject({
-      data: [{ cpu_millicores: 250, cpu_request_millicores: 25 }],
-    });
+    ).toMatchObject({ data: [{ cpu_millicores: 250 }] });
     const invalid = await worker.fetch(
       request("/v1/size-classes/small", admin.key, "PUT", {
         ...body,
-        cpu_request_millicores: 251,
+        cpu_request_millicores: 25,
       }),
       env,
     );
@@ -798,23 +794,11 @@ describe("API platform on real Workers D1", () => {
     const cpuMutation = await worker.fetch(
       request("/v1/size-classes/small", admin.key, "PUT", {
         ...size,
-        cpu_request_millicores: 25,
+        cpu_millicores: size.cpu_millicores + 100,
       }),
       env,
     );
     expect(cpuMutation.status).toBe(409);
-    // Explicitly encoding a legacy request equal to its unchanged limit changes no resources.
-    expect(
-      (
-        await worker.fetch(
-          request("/v1/size-classes/small", admin.key, "PUT", {
-            ...size,
-            cpu_request_millicores: size.cpu_millicores,
-          }),
-          env,
-        )
-      ).status,
-    ).toBe(200);
     const policyMutation = await worker.fetch(
       request(
         "/v1/size-classes/small",

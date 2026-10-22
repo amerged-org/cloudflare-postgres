@@ -61,8 +61,10 @@ pub fn refuse_init_mount_namespace(own: &Path, init: &Path) -> io::Result<()> {
 }
 
 /// What the hello reports of the node's operating system (`NodeOs`, SEC-03): this boot, the running
-/// kernel, and the digest of the installed packages (`update::packages_digest`). The agent reads it
-/// when it starts and again after a maintenance cycle that did not reboot, not with every sample.
+/// kernel, the digest of the installed packages (`update::packages_digest`) and the digest of the
+/// host files it holds, read from its disk (`hostfiles::observed_digest`). The agent reads it when
+/// it starts and again after a maintenance cycle that did not reboot and after it wrote host
+/// files, not with every sample.
 pub async fn os_report<M: Machine>(machine: &M) -> Result<Value, crate::Error> {
     let boot = machine
         .boot()
@@ -70,11 +72,14 @@ pub async fn os_report<M: Machine>(machine: &M) -> Result<Value, crate::Error> {
     let installed =
         update::without_idle_kernels(machine.installed_packages().await?, &boot.kernel_release);
     let booted_at_ms = i64::try_from(boot.booted_at)?.saturating_mul(1000);
+    let layout = machine.layout();
+    let held = crate::hostfiles::State::load(&layout.host_files());
     Ok(json!({
         "boot_id": boot.id,
         "booted_at": crate::archive::facts::timestamp(booted_at_ms),
         "kernel_release": boot.kernel_release,
         "packages_sha256": update::packages_digest(&installed),
+        "host_files_sha256": crate::hostfiles::observed_digest(&layout.host_root, &held, &boot.id),
     }))
 }
 
@@ -153,7 +158,7 @@ pub(crate) fn gateway_environment(
     node: &NodeIdentity,
     credentials: &serde_json::Value,
 ) -> io::Result<String> {
-    let keyring = serde_json::to_string(&credentials["route_keyring"])?;
+    let keyring = serde_json::to_string(&crate::node_link::route_keyring(credentials))?;
     if keyring.contains(['\'', '\n'])
         || !crate::valid_region(&node.region_id)
         || !pgcf_native_protocol::valid_pattern("node", &node.id)
@@ -354,6 +359,16 @@ pub trait Machine: Send + Sync + 'static {
     // ---- updates (plan 9.3)
     /// Restarts one of the image's own services and waits for the job.
     fn restart_service(&self, unit: &str) -> impl Future<Output = Result<(), units::Error>> + Send;
+    /// Has systemd read its unit files again (`systemctl daemon-reload`), once a release has
+    /// written host files (`hostfiles`). No unit restarts for it.
+    fn daemon_reload(&self) -> impl Future<Output = Result<(), units::Error>> + Send;
+    /// Runs `systemd-sysusers <file>`: makes the users and groups the file lists, as the postinst
+    /// of a package does. It changes nothing for a user that exists. A boot does not do this for a
+    /// file that changed (systemd-sysusers.service runs at a boot only when /usr is newer than
+    /// /etc/.updated, which a file in /usr/lib/sysusers.d does not make it).
+    fn run_sysusers(&self, file: &str) -> impl Future<Output = io::Result<()>> + Send;
+    /// Runs `systemd-tmpfiles --create <file>`: makes the directories and files the file lists.
+    fn run_tmpfiles(&self, file: &str) -> impl Future<Output = io::Result<()>> + Send;
     /// The installed Debian packages and their versions.
     fn installed_packages(
         &self,
@@ -394,10 +409,6 @@ pub trait Machine: Send + Sync + 'static {
     fn cpu(&self) -> Option<CpuTimes>;
     /// The throttling of the database's unit since it started; `None` where it has no cgroup.
     fn throttle(&self, database: &str) -> Option<Throttle>;
-    /// How much of the database's files the page cache holds (`cache`); `None` where the kernel
-    /// cannot say. It reads the directory and the files, so it blocks: callers run it in a task
-    /// of its own.
-    fn cache_residency(&self, database: &str) -> Option<crate::cache::Residency>;
 }
 
 /// This boot of the node and the kernel it runs (SEC-03).
@@ -752,6 +763,21 @@ mod tests {
         refuse_init_mount_namespace(&agent, &init).unwrap();
         // A namespace that cannot be read is no answer.
         assert!(refuse_init_mount_namespace(&directory.join("missing"), &init).is_err());
+    }
+
+    /// The credentials may carry a property this build does not name, in the keyring too. The
+    /// gateway parses its keyring strictly, so only what the contract names reaches its environment:
+    /// a property of a later release must not keep the gateway from starting.
+    #[test]
+    fn a_property_the_keyring_has_that_this_build_does_not_name_is_not_written_to_the_gateway() {
+        let keyring =
+            json!({"active": "k1", "keys": {"k1": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}});
+        let mut later = keyring.clone();
+        later["a_property_of_a_later_release"] = 1.into();
+        assert_eq!(
+            gateway_environment(&node(), &json!({"route_keyring": later})).unwrap(),
+            gateway_environment(&node(), &json!({"route_keyring": keyring})).unwrap()
+        );
     }
 
     #[test]

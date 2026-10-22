@@ -70,25 +70,20 @@ export const sameResources = (a: Resources, b: Resources) =>
 
 /**
  * The resource snapshot a lifecycle event keeps for usage (plan 3.4: effective limits times awake
- * seconds). Its `reserved_*` figures are the limits too: nothing is added to them any more.
+ * seconds).
  */
 export function usageSnapshot(resources: Resources) {
   return {
     memory_mib: resources.memory_mib,
     cpu_millicores: resources.cpu_millicores,
-    reserved_memory_mib: resources.memory_mib,
-    reserved_cpu_millicores: resources.cpu_millicores,
-    storage_allocated_bytes: resources.storage_gib * 2 ** 30,
   };
 }
 
 /**
- * `usageSnapshot` in SQL, for the database `d` and its row `r` of the view `database_resources`:
- * the events that follow `created` keep the very figures it does.
+ * `usageSnapshot` in SQL, for the row `r` of the view `database_resources`: the events that follow
+ * `created` keep the very figures it does.
  */
-export const USAGE_SNAPSHOT_SQL = `json_object('memory_mib',r.memory_mib,'cpu_millicores',r.cpu_millicores,
-  'reserved_memory_mib',r.memory_mib,'reserved_cpu_millicores',r.cpu_millicores,
-  'storage_allocated_bytes',CASE WHEN d.storage_profile_json IS NULL THEN r.storage_gib*1073741824 ELSE NULL END)`;
+export const USAGE_SNAPSHOT_SQL = `json_object('memory_mib',r.memory_mib,'cpu_millicores',r.cpu_millicores)`;
 
 /** The effective values of a database, as the SQL columns `effective_*` that rows.ts selects. */
 export function effectiveOf(

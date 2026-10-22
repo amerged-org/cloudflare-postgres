@@ -8,7 +8,10 @@ import {
   bytesToHex,
   hashApiKey,
 } from "@pgcf/contracts";
-import { releaseFileUrl } from "@pgcf/contracts/releases";
+import {
+  releaseFileUrl,
+  type FleetReleaseSpec,
+} from "@pgcf/contracts/releases";
 import { INSTALLER_SCRIPT } from "@pgcf/contracts/node-installer";
 import {
   driveNodeInstall,
@@ -26,6 +29,7 @@ import {
   cleanupFixtures,
   rawRequest,
 } from "./fixtures.ts";
+import { signRelease } from "../release-key.ts";
 import {
   auditedAddition,
   enroll,
@@ -57,8 +61,9 @@ const settings = {
   CONTABO_NODE_FIREWALL_ID: FIREWALL_ID,
 };
 const hex = (letter: string) => letter.repeat(64);
-const spec = (id: string) => ({
-  version: 2,
+/** The spec of a registered release before the release key signs it: `release` signs it. */
+const spec = (id: string): Omit<FleetReleaseSpec, "signature"> => ({
+  version: 3,
   image: {
     url: "https://images.example.org/node-images/r1/pgcf-node.raw.zst",
     sha256: hex("1"),
@@ -78,7 +83,7 @@ const spec = (id: string) => ({
         },
       ],
     ),
-  ),
+  ) as FleetReleaseSpec["binaries"],
   os: {
     image_version: "1.2.0",
     debian_snapshot: "20261016T000000Z",
@@ -89,16 +94,39 @@ const spec = (id: string) => ({
     },
     packages_sha256: hex("6"),
     kernel_release: "6.12.113+deb13-amd64",
+    host_files: [
+      {
+        path: "/usr/lib/systemd/system/pgcf-agent.service",
+        kind: "file",
+        mode: "0644",
+        sha256: hex("7"),
+        size_bytes: 900,
+        apply: "restart_unit:pgcf-agent.service",
+      },
+    ],
+    host_files_sha256: hex("8"),
   },
-  signature: "e".repeat(128),
 });
-async function release(region: string) {
+/**
+ * A release of the region's, signed by the release key as the signer signs one. `change` edits the
+ * row after it was signed, as a registration by an older path or an edit in D1 would leave it.
+ */
+async function release(
+  region: string,
+  change: (row: ReturnType<typeof spec> & { signature: string }) => void = () =>
+    undefined,
+) {
   const id = `installer-test-${crypto.randomUUID().slice(0, 8)}`;
   const now = new Date().toISOString();
+  const row = {
+    ...spec(id),
+    signature: await signRelease({ id, ...spec(id) }),
+  };
+  change(row);
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
-    ).bind(id, JSON.stringify(spec(id)), hex("5"), now),
+    ).bind(id, JSON.stringify(row), hex("5"), now),
     env.DB.prepare(
       "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES(?,?,1,?)",
     ).bind(region, id, now),
@@ -546,6 +574,91 @@ describe("the node firewall before the rescue", () => {
     expect(await s.addition()).toMatchObject({
       status: "audited",
       install_blocker: "node_firewall_unconfirmed",
+    });
+  });
+});
+
+describe("the release is verified where the installer's userData is rendered", () => {
+  const started = async (change?: Parameters<typeof release>[1]) => {
+    const a = await auditedAddition();
+    await release(a.f.region, change);
+    const p = provider(a.instance);
+    const operation = a.addition.intent.operation_id;
+    return {
+      a,
+      p,
+      operation,
+      drive: () => driveNodeInstall(settings, operation, p.provider),
+      addition: () => readNodeAddition(env.DB, operation),
+    };
+  };
+  const tokens = (nodeId: string) =>
+    env.DB.prepare("SELECT 1 AS issued FROM node_installs WHERE node_id=?")
+      .bind(nodeId)
+      .first();
+
+  it("renders the userData of a release the release key signed", async () => {
+    const s = await started();
+    await s.drive();
+    expect(s.p.rescue).toHaveBeenCalledTimes(1);
+    expect(await s.addition()).toMatchObject({
+      status: "bootstrapping",
+      install_blocker: null,
+    });
+  });
+
+  it("sends no rescue and issues no tokens for a row the release key did not sign, in every way it can differ", async () => {
+    const edits: [string, NonNullable<Parameters<typeof release>[1]>][] = [
+      // A registration by a path that never checked it, or any other string of 128 hex digits.
+      ["a signature no key made", (row) => (row.signature = "e".repeat(128))],
+      // The image of an attacker's choice under the signature of the real one: each of the four
+      // facts the installer checks.
+      ["the image's sha256", (row) => (row.image.sha256 = hex("9"))],
+      ["the image's size", (row) => (row.image.size_bytes += 1)],
+      ["the raw image's sha256", (row) => (row.image.raw_sha256 = hex("9"))],
+      ["the raw image's size", (row) => (row.image.raw_bytes += 512)],
+      // Anything else the signature covers.
+      ["a binary", (row) => (row.binaries["pgcf-agent"].sha256 = hex("9"))],
+      ["the package lock", (row) => (row.os.package_lock.size_bytes += 1)],
+      ["a host file", (row) => (row.os.host_files[0]!.apply = "next_start")],
+    ];
+    for (const [name, change] of edits) {
+      const s = await started(change);
+      await s.drive();
+      await s.drive();
+      expect(s.p.rescue, name).not.toHaveBeenCalled();
+      expect(await tokens(s.a.id), name).toBeNull();
+      expect(await s.addition(), name).toMatchObject({
+        status: "audited",
+        install_blocker: "release_unverified",
+      });
+    }
+  });
+
+  it("refuses a row carrying the signature of another release, and goes on when a signed release is assigned", async () => {
+    // The same facts under the id of another release: the signature names the id it was made for.
+    const foreign = await signRelease({
+      id: "installer-test-another",
+      ...spec("installer-test-another"),
+    });
+    const s = await started((row) => (row.signature = foreign));
+    await s.drive();
+    expect(s.p.rescue).not.toHaveBeenCalled();
+    expect(await s.addition()).toMatchObject({
+      status: "audited",
+      install_blocker: "release_unverified",
+    });
+    expect(await tokens(s.a.id)).toBeNull();
+    // The operator assigns a release that was signed: the next pass installs from it.
+    await env.DB.prepare("DELETE FROM fleet_region_releases WHERE region_id=?")
+      .bind(s.a.f.region)
+      .run();
+    await release(s.a.f.region);
+    await s.drive();
+    expect(s.p.rescue).toHaveBeenCalledTimes(1);
+    expect(await s.addition()).toMatchObject({
+      status: "bootstrapping",
+      install_blocker: null,
     });
   });
 });

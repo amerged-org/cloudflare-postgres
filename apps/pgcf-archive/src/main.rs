@@ -2,14 +2,34 @@
 //! `archive_command = '/usr/libexec/pgcf/pgcf-archive %p'`. Exits 0 only when the node agent
 //! answered that the segment is durable in R2; every other outcome exits 1, and PostgreSQL keeps
 //! the segment and retries.
+//!
+//! `pgcf-archive slot <n>` is the supervisor of PostgreSQL slot n (`slot.rs`), the one other call.
 use pgcf_archive::{CLIENT_BOUND, Reply, Request, exchange, socket, valid_name};
 use std::process::ExitCode;
+
+#[cfg(target_os = "linux")]
+mod slot;
+
+#[cfg(target_os = "linux")]
+fn run_slot(slot: &str) -> ExitCode {
+    slot::run(slot)
+}
+#[cfg(not(target_os = "linux"))]
+fn run_slot(_slot: &str) -> ExitCode {
+    eprintln!("pgcf-archive: the slot supervisor runs on Linux only");
+    ExitCode::FAILURE
+}
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args_os()
         .skip(1)
         .map(|argument| argument.into_string().unwrap_or_default())
         .collect();
+    if let [mode, slot] = &arguments[..]
+        && mode == "slot"
+    {
+        return run_slot(slot);
+    }
     // PostgreSQL's %p is the segment's path relative to the data directory.
     let name = match &arguments[..] {
         [path] => path.strip_prefix("pg_wal/").filter(|name| valid_name(name)),

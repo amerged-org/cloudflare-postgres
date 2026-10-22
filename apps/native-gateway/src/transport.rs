@@ -5,7 +5,7 @@ use crate::{
     hold::{Held, Verdict, WakeQueue},
     http::{self, HttpHead},
     local::{self, LocalTable},
-    sessions::{Action, Sessions, SharedSessions},
+    sessions::{self, Action, Sessions, SharedSessions},
     telemetry::GatewayMeasurements,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -19,16 +19,15 @@ use pgcf_native_protocol::{
 };
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    future::Future,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UnixStream},
-    sync::{Notify, OwnedSemaphorePermit, RwLock, mpsc, watch},
+    net::{TcpListener, TcpStream, UnixStream},
+    sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch},
+    task::JoinSet,
     time::timeout,
 };
 use tokio_tungstenite::{
@@ -70,10 +69,10 @@ impl Default for Admission {
         }
     }
 }
-pub(crate) type Epoch = (u64, u64);
 /// Why bytes were not written to a session's writer.
 pub(crate) enum Blocked {
-    /// The table moved past the session's admission: nothing was written.
+    /// The database admits no new work (it quiesces, sleeps or is retired, or the table is not
+    /// current): nothing was written.
     Fenced,
     /// The session's writer is not the database's any more: nothing was written.
     TargetChanged,
@@ -86,7 +85,9 @@ pub struct Gateway {
     pub table: Arc<RwLock<LocalTable>>,
     pub sessions: SharedSessions,
     pub measurements: Arc<Mutex<GatewayMeasurements>>,
-    pub draining: AtomicBool,
+    /// When the drain ends, once it has begun ([`Gateway::drain`]): a session that is still
+    /// busy then is cut.
+    drain_until: OnceLock<Instant>,
     /// The held connections of sleeping databases and their wake tickets.
     pub wakes: Arc<WakeQueue>,
     /// The stage marks of those connections, on their way to the agent.
@@ -104,7 +105,7 @@ impl Gateway {
             table: Arc::default(),
             sessions: Arc::new(Mutex::new(Sessions::default())),
             measurements: Arc::new(Mutex::new(GatewayMeasurements::new())),
-            draining: AtomicBool::new(false),
+            drain_until: OnceLock::new(),
             wakes: WakeQueue::new(),
             stage_marks: local::StageQueue::default(),
             sql: crate::sql::Pool::default(),
@@ -160,20 +161,71 @@ impl Gateway {
             actions,
         ))
     }
+    /// Begins the drain: from now on the gateway admits no new work, and a session that is still
+    /// busy after `bound` is cut. Only the first call counts.
+    pub fn drain(&self, bound: Duration) {
+        let _ = self.drain_until.set(Instant::now() + bound);
+    }
+    pub fn draining(&self) -> bool {
+        self.drain_until.get().is_some()
+    }
+    /// The end of the drain, once it has begun.
+    pub(crate) fn drain_until(&self) -> Option<Instant> {
+        self.drain_until.get().copied()
+    }
+    /// Waits until the agent's table has arrived, at most `bound`; whether it has.
+    async fn table_arrived(&self, bound: Duration) -> bool {
+        timeout(bound, async {
+            loop {
+                // The wait is registered before the table is read, so that a table that arrives
+                // in between wakes it.
+                let changed = self.changed().await;
+                let notified = changed.notified();
+                if self.table.read().await.synchronized() {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
     /// Whether the gateway admits new work: the agent's table is current and it is not draining.
     pub(crate) async fn ready(&self) -> bool {
-        self.table.read().await.synchronized() && !self.draining.load(Ordering::Acquire)
+        self.table.read().await.synchronized() && !self.draining()
     }
-    /// The writer a route is admitted on and the epoch it is admitted at, or the `conn_stages`
-    /// outcome it is refused with. `released` is the unit a held wake was released to.
-    pub(crate) async fn admit(
+    /// The writer a route the Edge signed is admitted on, or the `conn_stages` outcome it is
+    /// refused with. The route names the revision it was signed under, and no other is admitted.
+    pub(crate) async fn admit(&self, claims: &Route) -> Result<Writer, &'static str> {
+        self.admit_route(claims, false).await
+    }
+    /// The route and the writer a wake ticket is admitted under once the table has released its
+    /// wake on `writer` under `route_revision` (`wake_state`), or the outcome it is refused with.
+    /// The HTTP request, the connection routed at once and the held connection admit their
+    /// ticket here: the table is read again, and the page that carries Cloudflare's claim of the
+    /// wake moves the route revision on, also between the release and this read, so a released
+    /// wake is admitted under the revision of its release or a later one. The generation, the
+    /// unit and the database's mode are checked as for any route. This is a convention and not a
+    /// type: `admit` takes any `Route`, whose fields are public, so the tests of each path pin it
+    /// (`tests/transport.rs`, `tests/sql.rs`: the claim lands between the two reads).
+    pub(crate) async fn admit_wake(
         &self,
-        claims: &Route,
-        released: Option<&str>,
-    ) -> Result<(Writer, Epoch), &'static str> {
+        ticket: &WakeClaims,
+        writer: &str,
+        route_revision: u64,
+    ) -> Result<(Route, Writer), &'static str> {
+        let claims = Route::released(ticket, writer, route_revision);
+        let target = self.admit_route(&claims, true).await?;
+        Ok((claims, target))
+    }
+    /// `released` is true only for a released wake's route (`admit_wake`), which names the
+    /// revision of its release and is admitted under that revision or a later one.
+    async fn admit_route(&self, claims: &Route, released: bool) -> Result<Writer, &'static str> {
         let table = self.table.read().await;
-        let epoch = table.bound_epoch(&claims.db);
-        if self.draining.load(Ordering::Acquire) || !table.synchronized() {
+        if self.draining() {
+            return Err("gateway_draining");
+        }
+        if !table.synchronized() {
             return Err("fenced");
         }
         let Some(record) = table.record(&claims.db) else {
@@ -182,15 +234,15 @@ impl Gateway {
         let (Mode::Running, Some(unit)) = (record.mode, &record.writer) else {
             return Err("fenced");
         };
-        // The route names the generation, the route revision and the unit it was admitted for.
-        if claims.generation != record.generation
-            || claims.route_revision != record.route_revision
-            || claims.instance != unit.instance
-            || released.is_some_and(|instance| instance != unit.instance)
-        {
+        let revision = if released {
+            claims.route_revision <= record.route_revision
+        } else {
+            claims.route_revision == record.route_revision
+        };
+        if claims.generation != record.generation || !revision || claims.instance != unit.instance {
             return Err("route_stale");
         }
-        Ok((unit.clone(), epoch))
+        Ok(unit.clone())
     }
     /// What signals a change of the table, which a held wake waits on.
     pub(crate) async fn changed(&self) -> Arc<Notify> {
@@ -200,24 +252,19 @@ impl Gateway {
     pub(crate) async fn permits(&self, database: &str, writer: &Writer) -> bool {
         self.table.read().await.permits(database, writer)
     }
-    /// Whether the database is still admitted at `epoch`.
-    async fn admitted_at(&self, database: &str, epoch: Epoch) -> bool {
-        let table = self.table.read().await;
-        table.bound_epoch(database) == epoch && table.admits(database)
-    }
-    /// Writes `bytes` to a session's writer while the database is admitted at `epoch` and
-    /// `writer` is its writer, holding the table for the bounded write: a change that would stop
-    /// the write waits for it.
+    /// Writes `bytes` to a session's writer while the database admits new work and `writer` is its
+    /// writer, holding the table for the bounded write: a change that would stop the write waits
+    /// for it. Any other change of the database's entry, such as a later route revision, leaves
+    /// the session's admission as it was.
     pub(crate) async fn write_admitted(
         &self,
         database: &str,
-        epoch: Epoch,
         writer: &Writer,
         postgres: &mut UnixStream,
         bytes: &[u8],
     ) -> Result<(), Blocked> {
         let table = self.table.read().await;
-        if table.bound_epoch(database) != epoch || !table.admits(database) {
+        if !table.admits(database) {
             return Err(Blocked::Fenced);
         }
         if !table.permits(database, writer) {
@@ -268,17 +315,15 @@ impl Gateway {
         }
     }
     /// Whether a dial of `writer` for the database may begin: it is the database's writer and,
-    /// with `epoch`, the database is still admitted at that epoch; or the outcome that stops it.
+    /// with `admitted`, the database admits new work; or the outcome that stops it.
     pub(crate) async fn dialable(
         &self,
         database: &str,
-        epoch: Option<Epoch>,
         writer: &Writer,
+        admitted: bool,
     ) -> Result<(), &'static str> {
         let table = self.table.read().await;
-        if epoch
-            .is_some_and(|epoch| table.bound_epoch(database) != epoch || !table.admits(database))
-        {
+        if admitted && !table.admits(database) {
             return Err("fenced");
         }
         if !table.permits(database, writer) {
@@ -427,6 +472,78 @@ fn upgrade(head: &HttpHead) -> bool {
             .is_some_and(valid_websocket_key)
         && head.count("x-pgcf-route") <= 1
 }
+/// How long a session that is still busy when the gateway drains is given: what a transaction in
+/// flight may take to end, and so the longest a new connection waits for the gateway that
+/// replaces this one. It stays well under the integrators' retry rule (1, 2, 4 and 8 s).
+pub const DRAIN_BOUND: Duration = Duration::from_secs(10);
+/// How long a new gateway waits for the agent's table before it accepts. The agent sends it as
+/// soon as the gateway connects, so the wait is as long as the connect takes; the bound is for a
+/// gateway that starts while the agent does not serve its channel (a boot), which then answers
+/// `fenced` as it does whenever it has no table, instead of leaving connections without an answer.
+pub const FIRST_TABLE_BOUND: Duration = Duration::from_secs(5);
+/// The time the sessions have to close after the drain's bound.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// The connections whose request is being read at one time.
+pub const HANDSHAKES: usize = 128;
+/// Serves the connections of `listener` until `shutdown` completes, then drains: the gateway
+/// stops accepting and admitting new work (`Gateway::drain`), the sessions are told, and the
+/// function returns when the last of them has ended or `bound` and the grace after it are over.
+/// The listening socket stays open until the function returns, so that a connection that arrives
+/// meanwhile waits in its queue instead of being refused. It is also not accepted before the
+/// agent's table has arrived (for `first_table` at most): without the table every route is
+/// refused as `fenced`, and the connections that waited through a swap are the ones the new
+/// gateway must serve.
+pub async fn serve(
+    listener: TcpListener,
+    gateway: Arc<Gateway>,
+    stop: watch::Sender<bool>,
+    shutdown: impl Future<Output = ()>,
+    bound: Duration,
+    first_table: Duration,
+) -> std::io::Result<()> {
+    let pending = Arc::new(Semaphore::new(HANDSHAKES));
+    let mut sessions = JoinSet::new();
+    tokio::pin!(shutdown);
+    let stopped = tokio::select! {
+        _ = &mut shutdown => true,
+        _ = gateway.table_arrived(first_table) => false,
+    };
+    let accepting = if stopped {
+        Ok(())
+    } else {
+        loop {
+            // A slot first, then the connection: when every slot is taken, a connection waits in the
+            // socket's queue and is served in its turn, instead of being accepted and reset. The
+            // burst that meets a new gateway after a swap is the connections that waited for it.
+            let permit = tokio::select! {
+                _ = &mut shutdown => break Ok(()),
+                Some(_) = sessions.join_next() => continue,
+                permit = pending.clone().acquire_owned() => permit.expect("the semaphore is never closed"),
+            };
+            tokio::select! {
+                _ = &mut shutdown => break Ok(()),
+                Some(_) = sessions.join_next() => {},
+                accepted = listener.accept() => match accepted {
+                    Ok((socket, _)) => {
+                        let (gateway, receiver) = (gateway.clone(), stop.subscribe());
+                        sessions.spawn(async move {
+                            let _ = serve_socket(socket, gateway, receiver, permit).await;
+                        });
+                    }
+                    Err(error) => break Err(error),
+                },
+            }
+        }
+    };
+    gateway.drain(bound);
+    let _ = stop.send(true);
+    let _ = timeout(bound + DRAIN_GRACE, async {
+        while sessions.join_next().await.is_some() {}
+    })
+    .await;
+    sessions.abort_all();
+    accepting
+}
 pub async fn serve_socket(
     mut socket: TcpStream,
     gateway: Arc<Gateway>,
@@ -452,10 +569,10 @@ pub async fn serve_socket(
             } else {
                 200
             },
-            if path == "/healthz" || ready {
-                "ok\n"
-            } else if gateway.draining.load(Ordering::Acquire) {
+            if gateway.draining() {
                 "draining\n"
+            } else if path == "/healthz" || ready {
+                "ok\n"
             } else {
                 "unsynchronized\n"
             },
@@ -475,7 +592,7 @@ pub async fn serve_socket(
     }
     let route = head.one("x-pgcf-route");
     // Declared before the lease and both streams, so it is dropped and logged after them.
-    let (claims, mut stages) = if route
+    let (admitted, mut stages) = if route
         .is_some_and(|route| route.starts_with(&format!("{}.", wake::ROUTE_PREFIX)))
     {
         let ticket = match wake::verify_wake(
@@ -493,7 +610,10 @@ pub async fn serve_socket(
             WakeState::Released {
                 writer,
                 route_revision,
-            } => (admitted_wake(&ticket, &writer, route_revision), stages),
+            } => (
+                gateway.admit_wake(&ticket, &writer, route_revision).await,
+                stages,
+            ),
             WakeState::Stale => {
                 stages.outcome = "route_stale";
                 return http::reply(&mut socket, 503, serde_json::json!({"error":"route_stale"}))
@@ -524,9 +644,12 @@ pub async fn serve_socket(
             Err(reason) => return route_denied(&mut socket, reason).await,
         };
         let stages = Stages::new(&claims.db, received);
-        (claims, stages)
+        (
+            gateway.admit(&claims).await.map(|target| (claims, target)),
+            stages,
+        )
     };
-    let (target, epoch) = match gateway.admit(&claims, None).await {
+    let (claims, target) = match admitted {
         Ok(admitted) => admitted,
         Err(refused) => {
             stages.outcome = refused;
@@ -569,9 +692,9 @@ pub async fn serve_socket(
     stages.accepted = Some(Instant::now());
     drop(handshake_permit);
     let result = tokio::select! {
-        result=timeout(STARTUP_BOUND,startup(&mut websocket,&claims,&session,epoch,&mut stages,&mut early))=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
+        result=timeout(STARTUP_BOUND,startup(&mut websocket,&claims,&session,&mut stages,&mut early))=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
         _=stop.changed()=>{stages.outcome="gateway_draining";Err("gateway draining".into())},
-        _=actions.changed()=>{stages.outcome="fenced";Err("startup fenced".into())},
+        _=interrupted(&mut actions)=>{stages.outcome="fenced";Err("startup fenced".into())},
     };
     let (postgres, started) = match result {
         Ok(value) => value,
@@ -583,7 +706,6 @@ pub async fn serve_socket(
     let admitted = Admitted {
         claims: &claims,
         session: &session,
-        epoch,
     };
     run_session(
         &mut websocket,
@@ -673,11 +795,6 @@ pub(crate) async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeSt
         _ => WakeState::Waiting,
     }
 }
-/// The route a released wake is admitted under: the ticket's connection at its generation, the
-/// released unit's invocation ID, and the route revision that released it.
-pub(crate) fn admitted_wake(ticket: &WakeClaims, writer: &str, route_revision: u64) -> Route {
-    Route::released(ticket, writer, route_revision)
-}
 /// Where a held wake connection stands: released to a writer, ended, or (none) still waiting.
 async fn held_state(
     gateway: &Gateway,
@@ -685,7 +802,7 @@ async fn held_state(
     held: &Held,
     stop: &watch::Receiver<bool>,
 ) -> Option<Result<(String, u64), HeldEnd>> {
-    if gateway.draining.load(Ordering::Acquire) || *stop.borrow() {
+    if gateway.draining() || *stop.borrow() {
         return Some(Err(HeldEnd::Draining));
     }
     if let Some(result) = held
@@ -775,9 +892,14 @@ async fn serve_held(
     mut stages: Stages,
 ) -> Result<(), Failure> {
     let database = ticket.db.clone();
-    if gateway.draining.load(Ordering::Acquire) {
-        stages.outcome = "fenced";
-        return http::reply(&mut socket, 503, serde_json::json!({"error":"fenced"})).await;
+    if gateway.draining() {
+        stages.outcome = "gateway_draining";
+        return http::reply(
+            &mut socket,
+            503,
+            serde_json::json!({"error":"gateway_draining"}),
+        )
+        .await;
     }
     let Some(base) = session_memory(&gateway, &database) else {
         stages.outcome = "memory_capacity";
@@ -914,8 +1036,7 @@ async fn serve_held(
     stages.held_outcome = Some("released");
     stages.wake_wait = Some(upgraded.elapsed());
     // From here the connection is the admitted route of the woken unit.
-    let claims = admitted_wake(&ticket, &writer, route_revision);
-    let (target, epoch) = match gateway.admit(&claims, Some(&writer)).await {
+    let (claims, target) = match gateway.admit_wake(&ticket, &writer, route_revision).await {
         Ok(admitted) => admitted,
         Err(refused) => {
             stages.outcome = refused;
@@ -939,9 +1060,9 @@ async fn serve_held(
     }
     let mut early = None;
     let dialed = tokio::select! {
-        result=timeout(STARTUP_BOUND,async{take_password(&mut websocket,&mut started,&session,&mut stages).await?;dial_started(&claims,&session,epoch,&mut stages,&mut early).await})=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
+        result=timeout(STARTUP_BOUND,async{take_password(&mut websocket,&mut started,&session,&mut stages).await?;dial_started(&claims,&session,&mut stages,&mut early).await})=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
         _=stop.changed()=>{stages.outcome="gateway_draining";Err("gateway draining".into())},
-        _=actions.changed()=>{stages.outcome="fenced";Err("startup fenced".into())},
+        _=interrupted(&mut actions)=>{stages.outcome="fenced";Err("startup fenced".into())},
     };
     let Ok(postgres) = dialed else {
         // A refused password was answered and its socket closed: this send then fails unseen.
@@ -951,7 +1072,6 @@ async fn serve_held(
     let admitted = Admitted {
         claims: &claims,
         session: &session,
-        epoch,
     };
     run_session(
         &mut websocket,
@@ -964,11 +1084,10 @@ async fn serve_held(
     )
     .await
 }
-/// A route admitted on a writer, with its reserved session and the table epoch it was admitted at.
+/// A route admitted on a writer, with its reserved session.
 struct Admitted<'a> {
     claims: &'a Route,
     session: &'a SessionLease,
-    epoch: Epoch,
 }
 /// The client's StartupMessage, with what it sent behind it, checked against the route.
 struct Started {
@@ -994,11 +1113,7 @@ async fn run_session(
     stop: &mut watch::Receiver<bool>,
     stages: &mut Stages,
 ) -> Result<(), Failure> {
-    let Admitted {
-        claims,
-        session,
-        epoch,
-    } = admitted;
+    let Admitted { claims, session } = admitted;
     let gateway = &session.gateway;
     let id = &session.id;
     let wire = &session.wire;
@@ -1021,7 +1136,7 @@ async fn run_session(
         }
         update(gateway, id, &activity, true, false);
         match gateway
-            .write_admitted(&claims.db, epoch, target, &mut postgres, &initial)
+            .write_admitted(&claims.db, target, &mut postgres, &initial)
             .await
         {
             Ok(()) => {}
@@ -1044,7 +1159,7 @@ async fn run_session(
             let login = tokio::select! {
                 login=timeout(STARTUP_BOUND,auth::login(&mut postgres,&password,None))=>login.map_err(|_|"startup_timeout").and_then(|login|login.map_err(|_|"postgres_error")),
                 _=stop.changed()=>Err("gateway_draining"),
-                _=actions.changed()=>Err("fenced"),
+                _=interrupted(actions)=>Err("fenced"),
             };
             drop(password);
             let answer = match login {
@@ -1256,6 +1371,11 @@ async fn send_client(
     }
     Ok(sent??)
 }
+/// Resolves when a session still starting up is told to do anything but run: its database
+/// quiesces, sleeps or is retired.
+async fn interrupted(actions: &mut watch::Receiver<Action>) {
+    sessions::until(actions, |action| action != Action::Running).await;
+}
 /// Ends a failed PostgreSQL session with the end of its stream within 500 ms, so PostgreSQL sees
 /// a clean end instead of a broken connection.
 pub(crate) async fn close_upstream(postgres: &mut UnixStream) {
@@ -1374,14 +1494,13 @@ async fn read_startup(
 async fn dial_started(
     claims: &Route,
     session: &SessionLease,
-    epoch: Epoch,
     stages: &mut Stages,
     early: &mut Option<EarlyDial>,
 ) -> Result<UnixStream, Failure> {
     let gateway = &*session.gateway;
     let database = &claims.db;
     gateway
-        .dialable(database, Some(epoch), &session.target)
+        .dialable(database, &session.target, true)
         .await
         .map_err(|outcome| {
             stages.outcome = outcome;
@@ -1408,8 +1527,8 @@ async fn dial_started(
         stages.outcome = error.outcome();
         "PostgreSQL dial failed"
     })?;
-    if !gateway.admitted_at(database, epoch).await {
-        stages.outcome = "fenced";
+    if let Err(outcome) = gateway.dialable(database, &session.target, true).await {
+        stages.outcome = outcome;
         close_upstream(&mut postgres).await;
         return Err("table changed during the dial".into());
     }
@@ -1420,7 +1539,6 @@ async fn startup(
     socket: &mut WebSocket,
     claims: &Route,
     session: &SessionLease,
-    epoch: Epoch,
     stages: &mut Stages,
     early: &mut Option<EarlyDial>,
 ) -> Result<(UnixStream, Started), Failure> {
@@ -1434,7 +1552,7 @@ async fn startup(
     )
     .await?;
     take_password(socket, &mut started, session, stages).await?;
-    let postgres = dial_started(claims, session, epoch, stages, early).await?;
+    let postgres = dial_started(claims, session, stages, early).await?;
     Ok((postgres, started))
 }
 /// A dial of PostgreSQL that began when the route was admitted: its peer is the unit, and it has
@@ -1463,7 +1581,7 @@ impl Drop for EarlyDial {
 }
 /// Starts the dial of the writer a route was admitted for, if it is still the writer.
 async fn early_dial(gateway: &Gateway, claims: &Route, bound: &Writer) -> Option<EarlyDial> {
-    gateway.dialable(&claims.db, None, bound).await.ok()?;
+    gateway.dialable(&claims.db, bound, false).await.ok()?;
     let writer = bound.clone();
     let wanted = writer.clone();
     Some(EarlyDial {
@@ -1474,6 +1592,26 @@ async fn early_dial(gateway: &Gateway, claims: &Route, bound: &Writer) -> Option
             (dialed, began.elapsed())
         }),
     })
+}
+/// What a session that is still busy when the drain ends is told before it is closed. Ending the
+/// gateway's connection to PostgreSQL rolls back a session that is idle in a transaction, as
+/// PostgreSQL tells a client when it shuts down (57P01). It does not stop a statement in flight:
+/// PostgreSQL finishes it, and the COMMIT the client sent behind it, and notices that the client
+/// is gone only when it writes its answer, so the statement may commit after this message. Its
+/// outcome is unknown (08007, as for a COMMIT whose answer was lost).
+fn drain_cut(activity: &PostgresActivity) -> Vec<u8> {
+    if activity.in_flight() {
+        error_response_with(
+            "08007",
+            "gateway restarting during a statement; its outcome is unknown",
+            Some("PostgreSQL goes on with the statement and may commit it after this error."),
+            Some(
+                "Repeat only a write that is idempotent, or check its effect after the statement's run time.",
+            ),
+        )
+    } else {
+        error_response_with("57P01", "gateway restarting", None, None)
+    }
 }
 /// `held` is what the client sent that waits for the session to run: the bytes it pipelined
 /// behind a password the gateway logged in with.
@@ -1496,7 +1634,6 @@ async fn relay(
     let mut alive = true;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.tick().await;
-    let mut drain_at = None;
     let mut physical_timer = tokio::time::interval(Duration::from_millis(100));
     let database = id.split_once('/').expect("bound session identity").0;
     update(gateway, id, activity, false, false);
@@ -1535,11 +1672,29 @@ async fn relay(
             }
             mode = Action::Quiesce;
         }
-        let deadline =
-            drain_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
+        // A draining gateway keeps a session only while it is busy, and for no longer than the
+        // drain lasts.
+        if gateway.draining() && !activity.busy() && !wire.busy() && held.is_none() {
+            stages.outcome = "gateway_draining";
+            close(websocket, CloseCode::Restart, "gateway restarting").await;
+            break;
+        }
+        let deadline = gateway
+            .drain_until()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
         tokio::select! {
-            _=stop.changed()=>{if *stop.borrow(){drain_at=Some(Instant::now()+Duration::from_secs(29));}},
-            _=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))=>{stages.outcome="gateway_draining";close(websocket,CloseCode::Restart,"gateway restarting").await;break;},
+            _=stop.changed()=>{},
+            _=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))=>{
+                stages.outcome="gateway_draining";
+                // Cut with a transaction or a statement open: the client is told what became of it,
+                // unless a message of PostgreSQL's is half delivered, which nothing may be inserted into.
+                if !activity.backend_partial(){
+                    let error=drain_cut(activity);
+                    let _=timeout(Duration::from_millis(500),websocket.send(Message::Binary(error.into()))).await;
+                }
+                close(websocket,CloseCode::Restart,"gateway restarting").await;
+                break;
+            },
             _=actions.changed()=>{},
             _=physical_timer.tick()=>{},
             _=heartbeat.tick(),if mode==Action::Running=>{if !alive{stages.outcome="heartbeat_timeout";break;}alive=false;send_client(websocket,Message::Ping(Vec::new().into()),stages).await?;},
@@ -1608,6 +1763,117 @@ mod tests {
     use super::*;
 
     const DATABASE: &str = "aaaaaaaaaaaaaaaaaaaa";
+    const INSTANCE: &str = "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c";
+
+    fn gateway() -> Arc<Gateway> {
+        Gateway::new(Arc::new(Config {
+            region: "eu-test".into(),
+            node: "nod_aaaaaaaaaaaaaaaaaaaa".into(),
+            keyring: Keyring {
+                active: "test".into(),
+                keys: HashMap::new(),
+            },
+            maximum_memory: 192 << 20,
+            database_memory: 96 << 20,
+        }))
+    }
+    fn route(route_revision: u64) -> Route {
+        Route {
+            db: DATABASE.into(),
+            user: "app".into(),
+            cid: "01234567-89ab-4def-8123-000000000001".into(),
+            exp: u64::MAX,
+            generation: 2,
+            route_revision,
+            instance: INSTANCE.into(),
+        }
+    }
+
+    fn ticket(route_revision: u64) -> WakeClaims {
+        WakeClaims {
+            v: 5,
+            db: DATABASE.into(),
+            user: "app".into(),
+            cid: "01234567-89ab-4def-8123-000000000001".into(),
+            rg: "eu-test".into(),
+            kid: "test".into(),
+            iat: 0,
+            exp: u64::MAX,
+            op: format!("op_{}", "w".repeat(20)),
+            generation: 2,
+            route_revision,
+            rh: "0".repeat(64),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_released_wake_is_admitted_under_its_route_revision_or_a_later_one() {
+        // The agent released the wake under revision 7. The page that carries Cloudflare's claim
+        // of it moves the revision to 8, also between the release and the admission, which
+        // reads the table again: the HTTP request, the connection routed at once and the held
+        // connection all admit their ticket here (their own tests place the claim between the
+        // two reads).
+        let gateway = gateway();
+        let writer = Writer {
+            socket: "/run/pgcf/aaaaaaaaaaaaaaaaaaaa/.s.PGSQL.5432".into(),
+            uid: 61_001,
+            pid: 100,
+            instance: INSTANCE.into(),
+        };
+        let running = |route_revision| pgcf_native_protocol::agent::Database {
+            database: DATABASE.into(),
+            generation: 2,
+            operation: format!("op_{}", "w".repeat(20)),
+            mode: Mode::Running,
+            route_revision,
+            writer: Some(writer.clone()),
+        };
+        gateway.table.write().await.replace(vec![running(8)]);
+        let (claims, target) = gateway
+            .admit_wake(&ticket(7), INSTANCE, 7)
+            .await
+            .expect("a release under 7 is admitted at 8");
+        assert_eq!(
+            (&target, claims.instance.as_str(), claims.generation),
+            (&writer, INSTANCE, 2)
+        );
+        // A route the Edge signed is admitted under the revision it names and no other.
+        assert_eq!(gateway.admit(&route(7)).await, Err("route_stale"));
+        assert_eq!(gateway.admit(&route(8)).await.as_ref(), Ok(&writer));
+        // A release under a revision the table has not reached is stale, and so is a release on
+        // a unit that is not the database's, or at another generation.
+        gateway.table.write().await.update(running(6));
+        assert_eq!(
+            gateway.admit_wake(&ticket(7), INSTANCE, 7).await,
+            Err("route_stale")
+        );
+        gateway.table.write().await.update(running(8));
+        assert_eq!(
+            gateway
+                .admit_wake(&ticket(7), "another-invocation", 7)
+                .await,
+            Err("route_stale")
+        );
+        let mut elsewhere = ticket(7);
+        elsewhere.generation = 1;
+        assert_eq!(
+            gateway.admit_wake(&elsewhere, INSTANCE, 7).await,
+            Err("route_stale")
+        );
+        // A database that no longer runs admits nothing, whatever was released.
+        gateway
+            .table
+            .write()
+            .await
+            .update(pgcf_native_protocol::agent::Database {
+                mode: Mode::Quiesce,
+                ..running(8)
+            });
+        assert_eq!(
+            gateway.admit_wake(&ticket(7), INSTANCE, 7).await,
+            Err("fenced")
+        );
+    }
 
     #[test]
     fn a_connection_held_for_a_wake_sends_its_marks_when_it_ends_and_no_other_does() {

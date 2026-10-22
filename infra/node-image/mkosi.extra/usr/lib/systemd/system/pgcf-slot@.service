@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+# A slot is the sandbox of a database unit (pgcf-pg@.service), built before a wake for no database
+# (plan 3.1, 5.5). The agent is the only starter: it keeps idle slots, one unit per number n, and a
+# wake takes one instead of making the executor build the sandbox while the request waits. An idle
+# slot runs the supervisor, `pgcf-archive slot <n>`, which binds control in its RuntimeDirectory,
+# sends READY=1 and waits for root. A wake sets the database's limits on the slot (SetUnitProperties),
+# moves two mounts into its mount namespace (the database's volume and its socket directory
+# /run/pgcf/<id>, each a clone that maps the slot's user to the database's uid on disk) and sends one
+# order, `exec <id> <major>`. The supervisor locks the data directory and executes the postgres
+# command line of pgcf-pg@.service in its own process, so the postmaster is the unit's main process
+# and sends READY=1 itself, as under pgcf-pg@.service. A slot serves one database for one awake
+# period and ends with its stop: only its number and its user come back, for a new, empty unit.
+#
+# The sandbox is the database unit's, directive by directive (D13). units.test.ts holds the three
+# lists of what differs, each with its reason, and fails when a directive of pgcf-pg@.service is
+# missing here or changes on one side only:
+# - There is no MountImages=, AssertPathExists= or ReadWritePaths= for a database. The volume and the
+#   socket directory arrive after the start as mounts the agent moves in, so the unit's device policy
+#   is the clock alone (char-rtc, from ProtectClock): narrower than the block devices that
+#   MountImages= adds to pgcf-pg@.service.
+# - The user is pooled: pgcf-slot-<n>, uid and gid 300000 + n, below systemd's container range and
+#   outside the agent's database range. The files of a database keep its own uid on disk. A uid that
+#   a second database uses must leave nothing of the first behind that the second can read or write:
+#   every directive below that closes a place that is shared by uid (the IPC namespace, /run/lock,
+#   /dev/mqueue, the journal) is what makes a pooled user acceptable, and the boot test enumerates all
+#   of it.
+# - The control socket lives in the RuntimeDirectory, mode 0700, which systemd removes at the stop.
+#   Only the leaf goes: the directories above it are shared by the other slots.
+# - PostgreSQL's own interlock against a second postmaster fails between two uids: a postmaster.pid
+#   whose process another uid owns answers EPERM to kill(pid, 0), which miscinit.c takes for a stale
+#   file, and a segment in another IPC namespace is not found, so the supervisor's lock on the data
+#   directory is what refuses it. It does not rely on the PID namespace, which stays shared.
+# - The limits are the idle ones. The agent sets the database's own at the bind and these again when
+#   it builds the slot for its next incarnation (a runtime property outlives a stop).
+# - StartLimitIntervalSec=0: slot numbers restart all the time, and systemd's limit of 5 starts in
+#   10 s would refuse them.
+[Unit]
+Description=PGCF slot %i
+Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=pgcf-slot-%i
+Group=pgcf-slot-%i
+Slice=pgcf.slice
+# The supervisor, never postgres itself: it executes postgres after the agent's order.
+ExecStart=/usr/libexec/pgcf/pgcf-archive slot %i
+RuntimeDirectory=pgcf/slot/%i
+RuntimeDirectoryMode=0700
+# READY=1 comes only after crash recovery or a restore's replay, which can outlast any fixed
+# timeout (Stage 1 replayed for 97 s); the agent owns the start deadline.
+TimeoutStartSec=infinity
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=no
+OOMPolicy=continue
+OOMScoreAdjust=-900
+Environment=PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj
+Environment=PG_OOM_ADJUST_VALUE=0
+UMask=0077
+
+# The idle limits of a supervisor with no database.
+MemoryMax=32M
+MemoryHigh=28M
+MemorySwapMax=0
+TasksMax=64
+CPUWeight=10
+
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+# PostgreSQL maps its segments in /dev/shm read-write only; nothing in it may run, carry setuid or be
+# a device. /tmp and /var/tmp are small tmpfs of the unit's own, and not PrivateTmp=yes, which puts
+# both on the host's root filesystem (8 GiB, no quota, and disk blocks are no memory that MemoryMax
+# counts): one awake tenant filled it and stopped the journal and the agent's state writes for the
+# whole node. PostgreSQL uses neither directory, and what is written in them is the unit's memory.
+TemporaryFileSystem=/dev/shm:size=64M,mode=1777,noexec,nosuid,nodev
+TemporaryFileSystem=/tmp:size=16M,nr_inodes=1024,mode=1777,noexec,nosuid,nodev
+TemporaryFileSystem=/var/tmp:size=16M,nr_inodes=1024,mode=1777,noexec,nosuid,nodev
+# Nothing writable or readable by uid is shared with another unit, and a slot's uid is used by one
+# database after another, so every place that keeps something by uid is out of reach. The unit has
+# its own IPC namespace (its own SysV segments and its own POSIX queue mount). /run/lock is a tmpfs
+# for the whole node and /dev/mqueue is mode 1777: a place where one user leaves what another
+# reads, and files that outlive the unit. /dev/pts is the host's devpts, which PrivateDevices=
+# binds into the private /dev. The journal directories hold a file user-<uid>.journal for every uid
+# that journald splits (journald.conf.d/pgcf-split.conf turns the split off, and the files of
+# earlier uids stay until journald vacuums them), readable by that uid through a POSIX ACL. The unit
+# logs through /run/systemd/journal/stdout, which stays.
+PrivateIPC=yes
+InaccessiblePaths=-/run/lock -/dev/mqueue -/dev/pts -/var/log/journal -/run/log/journal
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# @system-service allows what kernel exploits use as their second stage: io_uring, userfaultfd, the
+# kernel keyring, the message queues and the SysV semaphores. PostgreSQL needs none of them
+# (io_method=worker, SysV shared memory, unnamed POSIX semaphores); shmget, shmat, shmdt and shmctl
+# stay allowed. The line follows the allow line above, because systemd merges the lines in order.
+# The filter applies to the supervisor and stays on postgres after the exec.
+SystemCallFilter=~@keyring io_uring_setup io_uring_enter io_uring_register userfaultfd msgget msgsnd msgrcv msgctl semget semop semtimedop semctl mq_open mq_unlink mq_timedsend mq_timedreceive mq_notify mq_getsetattr
+MemoryDenyWriteExecute=yes

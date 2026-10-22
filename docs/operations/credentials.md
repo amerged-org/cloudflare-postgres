@@ -99,8 +99,9 @@ gateway holds**, so no check tells you beforehand that every gateway has the new
 restarts of a running gateway are a release that changes the gateway's binary and a reboot that is
 due anyway (a maintenance cycle in its announced window; never a reboot made for this purpose, which
 needs the owner's go and, from the canary on, an announced window, plan 9.3). A gateway restart
-ends every open client session: the release restarts the gateway without draining it first, the
-gateway refuses new work, drops what is left after at most 30 seconds, and clients reconnect. A
+ends every open client session: the gateway stops accepting (its socket is systemd's, so a
+connection that arrives meanwhile waits for the next gateway), closes the idle sessions at once,
+gives a busy one 10 seconds, and clients reconnect. A
 release that changes both the agent and the gateway restarts the gateway before the agent has
 written the new file, so the gateway needs a later release or reboot of its own. To rotate: add the
 new key beside the old one with the old one still active, deploy the API and the Edge, let every
@@ -122,6 +123,12 @@ connection and HTTP query then fails. The token expires after the duration chose
 created (8760h in the operator installation), after which Access refuses the Edge in the same way.
 Refresh it in Zero Trust (or with the Refresh endpoint, one more year) before then, and turn on the
 Zero Trust "Expiring Access Service Token" notification, which warns a week ahead.
+
+Choose short `CREDENTIAL_KEYS` IDs (the live one has 4 characters): the ID is written into every
+role of a database, and a deleted database's retained archive holds all of them in one row, which D1
+cannot import into a restore if it passes 100,000 bytes. The largest set of roles the contracts
+allow stays below that with an ID of 18 characters or fewer, whatever the revision of the passwords,
+and from 34 characters even a first password can pass it.
 
 For `CREDENTIAL_KEYS`, adding a new active key ID does not make old ciphertext disposable. Retain
 all key IDs referenced by database roles, deleted-source archives and older D1 exports. Back up
@@ -154,8 +161,11 @@ A node holds no secret of the image. Its credentials come from the install and f
   parent key or a bucket-wide key. To replace the parent key, create the new R2 API token (object
   read and write on the archive bucket), set both Worker secrets and deploy; credentials delivered
   afterwards are signed with the new key. Delete the old token only after the credentials it signed
-  have expired, 7 days after the deploy: deleting it earlier ends the credentials the nodes hold,
-  and archiving fails until they read new ones (`database_archive_failing`).
+  have expired, 7 days after the deploy, or after a forced refresh that every node has read and a
+  base backup, a WAL archive and a restore read on the new key
+  ([the bucket move](operator-installation.md#moving-to-another-archive-bucket), step 11): deleting it
+  earlier ends the credentials the nodes hold, and archiving fails until they read new ones
+  (`database_archive_failing`).
 
 ## Provider and account credentials
 

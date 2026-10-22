@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-export { ADMISSION_DEADLINE_MS } from "@pgcf/contracts/database-admission";
+export { ADMISSION_DEADLINE_MS } from "@pgcf/contracts/edge-policy";
 
 /**
  * IPv4 admission is per address; IPv6 admission is per canonical /64. A caller without

@@ -6,6 +6,14 @@
  * release, policy and orders), reads its credentials, keeps the link to its NodeActor with a
  * sample every 15 s, and posts observations, volume reports and events. The Rust node agent reads
  * the JSON Schemas and vectors in `native/node.generated.json` and `node-vectors.generated.json`.
+ *
+ * Changing it: the objects here are strict, and so is the API, which never sends or accepts a
+ * property by accident. The node reads what Cloudflare sends it with every object open
+ * (`native/node-schema.ts`). The rule for a change, and the order of its releases by the kind of
+ * change and the direction (what the node receives or sends), is written once in the plan, 9.3
+ * "Changing the page" (its table); `test/node-required.ts` and `test/node-closed-sets.ts` fail
+ * until a required property or a value of a closed set is a deliberate line. What this file does
+ * for it: a new property is `.optional()` or `.default(...)` with the default in its comment.
  */
 import { z } from "zod";
 import {
@@ -36,8 +44,10 @@ import {
   FleetReleaseBinaries,
   FleetReleaseId,
   FleetReleaseOs,
+  ImageIdentity,
   ImageVersion,
   KernelRelease,
+  NodeHostFiles,
 } from "./releases.ts";
 import { USAGE_HOUR_MS } from "./usage.ts";
 import {
@@ -101,6 +111,41 @@ export const NODE_SAMPLE_INTERVAL_MS = 15_000;
 export const NODE_VOLUME_REPORT_INTERVAL_MS = 60_000;
 /** A node whose link stays silent this long is stale; staleness never declares it lost. */
 export const NODE_STALE_MS = 180_000;
+/**
+ * The anti-entropy of observations (plan 5.3). A node posts what it observed of a database when
+ * that changes, and the API keeps it; a report that does not name a database says nothing of it,
+ * in particular never that it is gone. To repair what a lost change, a restored D1 or an API
+ * that lost its state would leave behind, the node says again what it said of each database, once
+ * in this period, at a point of the period that its identifier fixes, so that the databases never
+ * come in one minute. The period is never shortened: at 15 minutes 300 databases
+ * are 20 observations a minute, where a full pass each minute was 300 and filled the API's minute
+ * at about 1,200 databases. The node's own sample and volume report (every 15 s and 60 s) are its
+ * liveness, and they stay. A database that Cloudflare waits for, a build, a restore or a move
+ * (an entry with an origin, or an open move order), is not on this clock: the node keeps posting
+ * it with every full pull, because the API's create, restore and move steps wait for the next
+ * report that names it.
+ *
+ * Who reads the time of a database's own observation, and what each needs:
+ * - `databases.backup_observed_at` (`health.backup` of a database and of the operator listing, and
+ *   the alert `database_base_backup_stale`) is the one reader that needs it: a database that is
+ *   unchanged and alive was last named at most one period ago, so these judge a report fresh for
+ *   `NODE_DATABASE_STALE_MS`. The API touches the column when an unchanged observation arrives.
+ * - `regional_node_stale`, placement, `thin_storage_blocked` (`thin_pool_unobserved`), the node
+ *   alerts and the fleet release state read the node's own sample (`nodes.last_observed_at`), not
+ *   a database's observation: unchanged at 180 s.
+ * - Storage samples, `health.disk` and the volume alerts come from the volume report of the node,
+ *   one per minute, and from nothing a database observation carries: unchanged.
+ * - The proven-sleep record and the recovery points are facts, written when they change; their
+ *   time is when they were observed, never a proof of life, and nothing judges their age.
+ * - The Actor's admission snapshot is published by every report that names the database, changed
+ *   or not, and a publish that fails within a second fails the report, which the node sends
+ *   again: the period is how often a snapshot that a lost publish left behind is repaired. The
+ *   cron step `database_actors` republishes a page of 200 databases a minute and is the other
+ *   repair; it reads D1's rows and no observation time.
+ */
+export const NODE_OBSERVATION_RESEND_MS = 15 * 60_000;
+/** A database's own observation is stale when it is older than three periods of the resend. */
+export const NODE_DATABASE_STALE_MS = 3 * NODE_OBSERVATION_RESEND_MS;
 export const NODE_LINK_MESSAGE_MAX_BYTES = 64 * 1024;
 export const NODE_DESIRED_PAGE_LIMIT_MAX = 200;
 export const NODE_ORDER_LIMIT = 1000;
@@ -665,9 +710,19 @@ export type NodeDesiredQuery = z.infer<typeof NodeDesiredQuery>;
  */
 export const NodeRelease = z.strictObject({
   id: FleetReleaseId,
+  /**
+   * The image's identity, which a node never fetches: the release key signs it with the rest of
+   * the release (`signedReleaseManifest`), and the agent builds that text from its page alone.
+   */
+  image: ImageIdentity,
   binaries: FleetReleaseBinaries,
   /** What the node installs. What it is expected to report back stays with the API. */
-  os: FleetReleaseOs.omit({ packages_sha256: true, kernel_release: true }),
+  os: FleetReleaseOs.omit({
+    packages_sha256: true,
+    kernel_release: true,
+    host_files_sha256: true,
+    host_files: true,
+  }).extend({ host_files: NodeHostFiles }),
 });
 export type NodeRelease = z.infer<typeof NodeRelease>;
 
@@ -685,6 +740,16 @@ export const NodePolicy = z.strictObject({
     /** A wake waits this long for room, below the gateway's 25 s wake bound, then gets 57P03. */
     queue_wait_ms: z.number().int().min(0).max(20_000),
     retry_after_seconds: z.number().int().min(1).max(300),
+    /**
+     * After a wake the database runs without the CPU quota of its class for this long, counted
+     * from the release of the writer, so that its first requests, its start-up and the reading of
+     * its buffer list are not throttled (plan 4.4). Its weight and its memory, IO and task limits
+     * stay. 0 applies the quota at once. A restarted agent applies it at once to what it finds.
+     * Optional for its first release (plan 9.3, "Changing the page"): a policy and a page without
+     * it mean 0, the quota with the wake as before, so that an agent that does not know it reads
+     * the page and an agent that does reads a page without it.
+     */
+    cpu_boost_ms: z.number().int().min(0).max(60_000).default(0),
   }),
   /** D2: put idle-but-awake databases to sleep early, only while a wake waits. */
   early_sleep: z.strictObject({
@@ -890,6 +955,10 @@ export const NodeOrder = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("maintenance"), operation: OperationId }),
 ]);
 export type NodeOrder = z.infer<typeof NodeOrder>;
+/** The types of order a node reads: a page with another is refused whole (plan 9.3). */
+export const NODE_ORDER_TYPES = NodeOrder.options.map(
+  (order) => order.shape.type.value,
+);
 
 // ---------- Probes on request (POST /v1/nodes/{id}/diagnostics) ----------
 
@@ -1175,7 +1244,8 @@ export interface GenerationRef {
   generation: number;
   operation: string;
 }
-export type ObservationVerdict = "accept" | "stale" | "conflict";
+export const OBSERVATION_VERDICTS = ["accept", "stale", "conflict"] as const;
+export type ObservationVerdict = (typeof OBSERVATION_VERDICTS)[number];
 /**
  * Whether the API takes an observation of a database. `desired` is D1's current generation,
  * `claim` the wake ticket the DatabaseActor issued whose claim D1 has not committed yet (null
@@ -1225,9 +1295,17 @@ export const NodeOrderResult = z
   );
 export type NodeOrderResult = z.infer<typeof NodeOrderResult>;
 
-/** The events a report carries, and the fields of one. */
+/**
+ * The events a report carries, and the fields of one. The agent keeps the first
+ * `NODE_REPORT_EVENT_FIELDS_MAX` fields of a log line by key order and drops the others without a
+ * word, so the bound has to hold the widest line it sends: the `wake_detail` of a wake on the
+ * slot path has 13 fields (the 9 of the detail and `slot_from`, `slot_wait_us`, `bind_us` and
+ * `order_us`), and the readahead's counts are to join them. The bound is raised from 16 and goes
+ * API first like every bound on what the node sends (plan 9.3): an API that still holds 16
+ * refuses the whole report that carries a wider event.
+ */
 export const NODE_REPORT_EVENTS_MAX = 64;
-export const NODE_REPORT_EVENT_FIELDS_MAX = 16;
+export const NODE_REPORT_EVENT_FIELDS_MAX = 24;
 /**
  * One line of the agent's own log (plan 9.9): an event's name, and fields that are numbers or
  * short tokens. The shape rules out whitespace, path separators, non-ASCII, nested values and
@@ -1271,6 +1349,26 @@ export const NodeObservationReport = z
     { message: "A report names each database and order once" },
   );
 export type NodeObservationReport = z.infer<typeof NodeObservationReport>;
+
+/**
+ * The answer to a report: the verdict on each database of it (`observationVerdict`), where the
+ * report named it. The node holds a database's observation as taken by the API only on `accept`;
+ * on `stale` and `conflict` the page wins and the node reports again from the page it pulls next.
+ * A fenced node's report is read for its orders alone, and its answer names no database.
+ */
+export const NodeObservationAnswer = z.strictObject({
+  databases: z
+    .array(
+      z.strictObject({
+        id: DatabaseId,
+        verdict: z.enum(OBSERVATION_VERDICTS),
+      }),
+    )
+    .max(NODE_DESIRED_PAGE_LIMIT_MAX),
+  /** How many results of the report's orders the API took. */
+  orders: z.number().int().nonnegative(),
+});
+export type NodeObservationAnswer = z.infer<typeof NodeObservationAnswer>;
 
 // ---------- Samples (link) and volumes (POST /node/v1/volumes) ----------
 
@@ -1568,6 +1666,29 @@ export const NODE_BOOT_REPORT_MESSAGE_MAX_BYTES = 2048;
 /** The JSON body of a report: the agent drops the oldest entries until it fits. */
 export const NODE_BOOT_REPORT_MAX_BYTES = 1024 * 1024;
 const utf8Bytes = (text: string) => new TextEncoder().encode(text).byteLength;
+/**
+ * The most a stored boot report or probe result may take as the `INSERT` statement that a dump of
+ * the control database writes for its row (single quotes doubled, as a dump writes them). D1
+ * refuses a statement above 100,000 bytes (`SQLITE_TOOBIG`), so a row above that can be exported
+ * but never imported again, and no backup of the database could be restored. A node may send
+ * `NODE_BOOT_REPORT_MAX_BYTES` or `NODE_PROBE_RESULT_MAX_BYTES`; the API stores the newest part
+ * that fits this bound and marks the cut (`CutMark`). The node is not told: its send succeeded.
+ */
+export const NODE_DIAGNOSTIC_ROW_MAX_BYTES = 64 * 1024;
+/**
+ * What the API adds to a report or result it cut to `NODE_DIAGNOSTIC_ROW_MAX_BYTES`, and a node
+ * never sends: `truncated` is true and `dropped_entries` is how many of the oldest entries went (0
+ * when only the end of a text was cut). Both are there or neither.
+ */
+const CutMark = {
+  truncated: z.literal(true).optional(),
+  dropped_entries: Count.optional(),
+};
+const hasWholeMark = (body: { truncated?: true; dropped_entries?: number }) =>
+  (body.truncated === undefined) === (body.dropped_entries === undefined);
+const WHOLE_MARK = {
+  message: "truncated and dropped_entries are both there or neither",
+};
 
 /**
  * One line of the previous boot's journal, reduced to what explains a stop: when, which unit and
@@ -1594,6 +1715,12 @@ export const NodeJournalEntry = z.strictObject({
     ),
 });
 export type NodeJournalEntry = z.infer<typeof NodeJournalEntry>;
+const bootReport = {
+  boot_id: z.uuid(),
+  previous_boot_id: z.uuid().nullable(),
+  kernel_release: KernelRelease,
+  entries: z.array(NodeJournalEntry).max(NODE_BOOT_REPORT_ENTRIES_MAX),
+};
 /**
  * POST /node/v1/diagnostics: sent once after a boot, when the boot ID differs from the one the
  * agent stored when it last reported; the API keeps one report per boot ID of a node, and answers
@@ -1603,15 +1730,11 @@ export type NodeJournalEntry = z.infer<typeof NodeJournalEntry>;
  * null when the agent had stored none (it was just installed or updated). `entries` are the tail of
  * the previous boot's journal from the agent, the gateway, cloudflared,
  * networkd, the operator shell's sshd, PID 1 and the kernel, oldest first; they are empty when the node has no journal of the
- * previous boot.
+ * previous boot. The API stores at most `NODE_DIAGNOSTIC_ROW_MAX_BYTES` of a report: its newest
+ * entries, marked in the copy that `NodeDiagnostic.report` returns.
  */
 export const NodeBootReport = z
-  .strictObject({
-    boot_id: z.uuid(),
-    previous_boot_id: z.uuid().nullable(),
-    kernel_release: KernelRelease,
-    entries: z.array(NodeJournalEntry).max(NODE_BOOT_REPORT_ENTRIES_MAX),
-  })
+  .strictObject(bootReport)
   .refine(
     (report) => utf8Bytes(JSON.stringify(report)) <= NODE_BOOT_REPORT_MAX_BYTES,
     { message: "A boot report is at most 1 MiB" },
@@ -1635,10 +1758,21 @@ export const NodeDiagnosticSummary = z.strictObject({
 });
 export type NodeDiagnosticSummary = z.infer<typeof NodeDiagnosticSummary>;
 export const NodeDiagnostic = NodeDiagnosticSummary.extend({
-  report: NodeBootReport,
+  /** The report as stored: whole, or cut to `NODE_DIAGNOSTIC_ROW_MAX_BYTES` and marked. */
+  report: z
+    .strictObject({ ...bootReport, ...CutMark })
+    .refine(hasWholeMark, WHOLE_MARK),
 });
 export type NodeDiagnostic = z.infer<typeof NodeDiagnostic>;
 
+const probeResult = {
+  kind: z.literal("probe"),
+  diagnostic_id: z.uuid(),
+  probe: NodeProbe,
+  status: z.enum(["ok", "failed"]),
+  entries: z.array(NodeJournalEntry).max(NODE_PROBE_LINES_MAX),
+  text: z.string(),
+};
 /**
  * POST /node/v1/diagnostics with `kind` "probe": the answer to one request on the desired page.
  * `status` is "failed" when the command ended with a status other than 0 or could not be run, and
@@ -1647,17 +1781,11 @@ export type NodeDiagnostic = z.infer<typeof NodeDiagnostic>;
  * database's unit or of a backup job); every other probe answers with `text`, with the lines that
  * name a database's unit or a backup job left out. The side a probe does not answer with is
  * empty. The body is at most 1 MiB: the agent drops the oldest entries, or the end of the text,
- * until it fits.
+ * until it fits. The API stores at most `NODE_DIAGNOSTIC_ROW_MAX_BYTES` of it, cut the same way and
+ * marked in the copy that `NodeProbeDiagnostic.body` returns.
  */
 export const NodeProbeResult = z
-  .strictObject({
-    kind: z.literal("probe"),
-    diagnostic_id: z.uuid(),
-    probe: NodeProbe,
-    status: z.enum(["ok", "failed"]),
-    entries: z.array(NodeJournalEntry).max(NODE_PROBE_LINES_MAX),
-    text: z.string(),
-  })
+  .strictObject(probeResult)
   .refine(
     (result) =>
       utf8Bytes(JSON.stringify(result)) <= NODE_PROBE_RESULT_MAX_BYTES,
@@ -1687,7 +1815,11 @@ export const NodeProbeDiagnostic = z.strictObject({
   requested_at: Timestamp,
   status: z.enum(NODE_PROBE_STATUSES),
   received_at: Timestamp.nullable(),
-  body: NodeProbeResult.nullable(),
+  /** The result as stored: whole, or cut to `NODE_DIAGNOSTIC_ROW_MAX_BYTES` and marked. */
+  body: z
+    .strictObject({ ...probeResult, ...CutMark })
+    .refine(hasWholeMark, WHOLE_MARK)
+    .nullable(),
 });
 export type NodeProbeDiagnostic = z.infer<typeof NodeProbeDiagnostic>;
 
@@ -1695,14 +1827,17 @@ export type NodeProbeDiagnostic = z.infer<typeof NodeProbeDiagnostic>;
 
 /**
  * The boot and the operating system a node reports in its hello: the kernel's boot ID and the
- * time of the boot (a reboot is a new ID), `uname -r`, and `packagesSha256` of the packages dpkg
- * reports as installed. The API compares the last two with the release of the node's region.
+ * time of the boot (a reboot is a new ID), `uname -r`, `packagesSha256` of the packages dpkg
+ * reports as installed, and `hostFilesSha256` of the host files the node holds, read from its
+ * disk, which is the release's only once systemd has been told of every file. The API compares the last
+ * three with the release of the node's region.
  */
 export const NodeOs = z.strictObject({
   boot_id: z.uuid(),
   booted_at: Timestamp,
   kernel_release: KernelRelease,
   packages_sha256: Sha256,
+  host_files_sha256: Sha256,
 });
 export type NodeOs = z.infer<typeof NodeOs>;
 

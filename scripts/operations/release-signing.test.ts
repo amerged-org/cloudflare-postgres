@@ -135,6 +135,12 @@ const options = (apiBase: string, publicPath: string, extra = {}) => ({
 });
 const MANIFEST = signedReleaseManifest({
   id: "sha-0123456789ab",
+  image: {
+    sha256: "7".repeat(64),
+    size_bytes: 1000,
+    raw_sha256: "8".repeat(64),
+    raw_bytes: 2048,
+  },
   binaries: Object.fromEntries(
     ["pgcf-agent", "pgcf-native-gateway", "pgcf-archive", "pgcf-wal-fetch"].map(
       (name, index) => [
@@ -146,6 +152,16 @@ const MANIFEST = signedReleaseManifest({
   os: {
     debian_snapshot: "20261016T000000Z",
     package_lock: { sha256: "5".repeat(64), size_bytes: 1000 },
+    host_files: [
+      {
+        path: "/usr/lib/systemd/system/pgcf-gateway.service",
+        kind: "file",
+        mode: "0644",
+        sha256: "6".repeat(64),
+        size_bytes: 1000,
+        apply: "restart_unit:pgcf-gateway.service",
+      },
+    ],
   },
 });
 

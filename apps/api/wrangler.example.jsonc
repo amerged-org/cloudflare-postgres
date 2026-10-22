@@ -50,6 +50,18 @@
     // Durable Object location hint for new DatabaseActor objects, near the database regions and D1.
     // Set the same value on the Edge Worker. An existing object never moves.
     "DATABASE_ACTOR_LOCATION_HINT": "weur",
+    // Location hint for new ActorWarmer objects, used only when DATABASE_ACTOR_LOCATION_HINT is not
+    // set: put it where the DatabaseActors live, or each visit crosses an ocean and a cycle outlasts
+    // its interval. The warmers are named "v2:<shard>", so a hint set later places new warmers; the
+    // ones of the earlier name stop within the lease (docs/operations/operator-installation.md).
+    // "ACTOR_WARMER_LOCATION_HINT": "weur",
+    // Milliseconds between two visits of each DatabaseActor by the ActorWarmer objects, which keep its
+    // isolate loaded so that the first admission after a quiet period is not a cold start: any value
+    // from 1000 to 300000, 0 turns the keep-warm off, unset means 8000. A visit every 10 s or faster
+    // keeps an actor warm; the cost grows with the visit rate (docs/operations/operator-installation.md).
+    // With Workers Logs on, each visit may also be one billed invocation log event: the same page
+    // says how to check it and how to turn it off ("observability.logs.invocation_logs": false).
+    "DATABASE_ACTOR_WARM_INTERVAL_MS": "8000",
     // The id of the Contabo firewall every node sits behind: active, created once with no inbound
     // rule, as docs/operations/operator-installation.md describes. AddNode sends the installer's
     // rescue only once the firewall lists the instance.
@@ -67,6 +79,9 @@
       // Checks the minute cron's heartbeat from its own alarm; keep the binding and the v4 migration
       // in every deployed configuration so a stopped or failing cron is still reported.
       { "name": "CRON_WATCHDOG", "class_name": "CronWatchdog" },
+      // Visits every DatabaseActor every DATABASE_ACTOR_WARM_INTERVAL_MS from its alarm; the minute
+      // cron arms it. Keep the binding and the v7 migration while the interval is not 0.
+      { "name": "ACTOR_WARMER", "class_name": "ActorWarmer" },
     ],
   },
   "migrations": [
@@ -81,6 +96,7 @@
       "new_sqlite_classes": ["NodeActor"],
       "deleted_classes": ["RegionLink"],
     },
+    { "tag": "v7", "new_sqlite_classes": ["ActorWarmer"] },
   ],
   "workflows": [
     {

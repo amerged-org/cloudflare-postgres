@@ -5,6 +5,16 @@ import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  resolve: {
+    alias: [
+      {
+        // The key CI's signer holds has no private half to sign test releases with: the tests
+        // verify with a key of their own (test/release-key.ts), at the same import.
+        find: /^@pgcf\/contracts\/release-key$/,
+        replacement: join(import.meta.dirname, "test/release-key.ts"),
+      },
+    ],
+  },
   plugins: [
     cloudflareTest(async () => ({
       remoteBindings: false,

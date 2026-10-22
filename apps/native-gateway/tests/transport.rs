@@ -33,7 +33,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UnixListener, UnixStream},
-    sync::{Semaphore, mpsc, watch},
+    sync::{RwLock, RwLockWriteGuard, Semaphore, mpsc, watch},
     task::JoinHandle,
     time::timeout,
 };
@@ -255,10 +255,13 @@ impl Double {
 }
 /// One session of the double: the StartupMessage, the login, then a ReadyForQuery for every
 /// message until Terminate or the end of the stream. `slow` reads each message only after 200 ms.
+/// While `gate` is closed the login waits after the StartupMessage: the test opens it when it
+/// wants the login to go on.
 async fn postgres_session(
     mut stream: UnixStream,
     double: Double,
     slow: bool,
+    mut gate: watch::Receiver<bool>,
     send: mpsc::Sender<Vec<u8>>,
     ended: mpsc::Sender<()>,
 ) {
@@ -271,6 +274,9 @@ async fn postgres_session(
     let mut startup_bytes = length.to_be_bytes().to_vec();
     startup_bytes.extend(raw);
     send.send(startup_bytes).await.unwrap();
+    if gate.wait_for(|open| *open).await.is_err() {
+        return;
+    }
     if !double.authenticate(&mut stream).await {
         return;
     }
@@ -320,6 +326,8 @@ struct Fixture {
     upstream: mpsc::Receiver<Vec<u8>>,
     /// One per upstream session whose stream the gateway ended.
     ends: mpsc::Receiver<()>,
+    /// While it is closed, the double does not log a session in after its StartupMessage.
+    gate: watch::Sender<bool>,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     _directory: Directory,
@@ -398,6 +406,7 @@ impl Fixture {
         let (stop, receiver) = watch::channel(false);
         let (send, received) = mpsc::channel(16);
         let (ended, ends) = mpsc::channel(16);
+        let (gate, open) = watch::channel(true);
         let mut shutdown = receiver.clone();
         let counted = calls.clone();
         let upstream_task = tokio::spawn(async move {
@@ -408,7 +417,7 @@ impl Fixture {
                     accepted = upstream.accept() => {
                         let (stream, _) = accepted.unwrap();
                         counted.fetch_add(1, Ordering::SeqCst);
-                        tasks.spawn(postgres_session(stream, double.clone(), slow, send.clone(), ended.clone()));
+                        tasks.spawn(postgres_session(stream, double.clone(), slow, open.clone(), send.clone(), ended.clone()));
                     }
                 }
             }
@@ -451,6 +460,7 @@ impl Fixture {
             observe,
             upstream: received,
             ends,
+            gate,
             stop,
             tasks: vec![upstream_task, gateway_task],
             _directory: directory,
@@ -591,6 +601,21 @@ impl Fixture {
     }
     async fn release(&self, generation: u64) {
         self.release_at(generation, ROUTE_REVISION).await;
+    }
+    /// The page that carries Cloudflare's claim of a wake reaches the agent after it released the
+    /// unit: the entry of the same unit, generation and operation under a later route revision,
+    /// published as the channel publishes it (`local::apply`: the entry, then the sessions are told
+    /// what the database does).
+    async fn claimed(&self, generation: u64, operation: &str) {
+        self.gateway.table.write().await.update(Database {
+            route_revision: ROUTE_REVISION + 1,
+            ..entry(Mode::Running, generation, operation, Some(&self.unit))
+        });
+        self.gateway
+            .sessions
+            .lock()
+            .unwrap()
+            .signal(DATABASE, Action::Running);
     }
     async fn stop(self) {
         let _ = self.stop.send(true);
@@ -958,6 +983,88 @@ async fn a_unit_replaced_after_admission_is_never_written_to() {
             .await
             .is_err()
     );
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_connection_that_is_starting_up_follows_an_entry_that_leaves_its_unit_running() {
+    let mut fixture = Fixture::new().await;
+    // Admitted on the running unit; its StartupMessage is yet to come.
+    let mut client = fixture.connect(920).await;
+    fixture.claimed(1, &operation()).await;
+    fixture.login(&mut client).await;
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_held_wake_released_before_the_claim_reaches_the_agent_goes_on_to_its_login() {
+    let fixture = Fixture::scram(false, Double::Scram(PASSWORD)).await;
+    let mut client = fixture.upgrade(&wake_token(1508, 2)).await.unwrap();
+    // The connection waits for the end of a password it began to pipeline: it is released and
+    // reserved by then.
+    let password = password_message(PASSWORD.as_bytes());
+    client
+        .send(Message::Binary(
+            [startup("app"), password[..3].to_vec()].concat().into(),
+        ))
+        .await
+        .unwrap();
+    fixture.release(2).await;
+    timeout(Duration::from_secs(5), async {
+        while fixture
+            .gateway
+            .sessions
+            .lock()
+            .unwrap()
+            .counts(DATABASE)
+            .connections
+            != 1
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the wake is released to a session");
+    fixture.claimed(2, &wake_operation()).await;
+    client
+        .send(Message::Binary(password[3..].to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+    assert_eq!(next_message(&mut client).await, authenticated());
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn the_gateway_s_login_to_postgres_goes_on_when_the_claim_of_the_wake_reaches_the_table() {
+    // The Neon driver's default: the password behind the StartupMessage, so the gateway logs in
+    // to PostgreSQL itself, which takes as long as PostgreSQL needs (68-467 ms live). The claim
+    // of the wake reaches the agent in that time: its entry changes in the route revision, and
+    // the sessions are told `Running`, which interrupts nothing.
+    let mut fixture = Fixture::scram(false, Double::Scram(PASSWORD)).await;
+    fixture.gate.send(false).unwrap();
+    let mut client = fixture.upgrade(&wake_token(1509, 2)).await.unwrap();
+    client
+        .send(Message::Binary(
+            [startup("app"), password_message(PASSWORD.as_bytes())]
+                .concat()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    fixture.release(2).await;
+    // PostgreSQL has the StartupMessage and holds the login at its gate.
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        startup("app")
+    );
+    fixture.claimed(2, &wake_operation()).await;
+    fixture.gate.send(true).unwrap();
+    assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+    assert_eq!(next_message(&mut client).await, authenticated());
+    client.close(None).await.unwrap();
     fixture.stop().await;
 }
 #[tokio::test]
@@ -1479,6 +1586,84 @@ async fn a_v5_ticket_already_released_at_its_generation_is_routed_at_once_as_war
     assert_eq!(fixture.gateway.wakes.held(DATABASE), 0);
     assert!(fixture.gateway.wakes.ticket(DATABASE).is_none());
     fixture.login(&mut client).await;
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+/// Lets the reader that waits behind `held` through, and returns the write lock that queues
+/// behind that read: tokio's lock is fair, so the writer goes ahead of the reader's next read.
+/// A reader that has not arrived yet leaves `try_write` the lock, which is held again until one
+/// has.
+async fn after_next_read<'a, T>(
+    table: &'a RwLock<T>,
+    mut held: RwLockWriteGuard<'a, T>,
+) -> RwLockWriteGuard<'a, T> {
+    loop {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        drop(held);
+        match table.try_write() {
+            Ok(guard) => held = guard,
+            Err(_) => return table.write().await,
+        }
+    }
+}
+#[tokio::test]
+async fn a_v5_ticket_the_table_released_at_once_is_routed_when_the_claim_lands_between_its_two_reads()
+ {
+    // The connection reads the table to see that its wake is released (`wake_state`, under route
+    // revision 19) and reads it again to admit the route. The page with Cloudflare's claim of the
+    // wake lands in between and moves the revision to 20: a released wake is admitted under its
+    // revision or a later one, not refused as route_stale.
+    let mut fixture = Fixture::sleeping().await;
+    fixture.release(2).await;
+    let table = fixture.gateway.table.clone();
+    let held = table.write().await;
+    let driver = async {
+        // The connection's first read of the table is granted, and this writer is behind it.
+        let mut between = after_next_read(&table, held).await;
+        between.update(Database {
+            route_revision: ROUTE_REVISION + 1,
+            ..entry(Mode::Running, 2, &wake_operation(), Some(&fixture.unit))
+        });
+    };
+    let ticket = wake_token(1090, 2);
+    let (client, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(fixture.upgrade(&ticket), driver)
+    })
+    .await
+    .unwrap();
+    let mut client = client.expect("the released wake is routed under the later revision");
+    fixture.login(&mut client).await;
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_held_wake_is_routed_when_the_claim_lands_between_its_release_and_its_admission() {
+    // The held connection reads the table for its release (`changed`, then `wake_state`) and
+    // reads it again to admit the route; the claim's entry lands behind the second of the first
+    // two reads, before the admission.
+    let mut fixture = Fixture::sleeping().await;
+    let mut client = fixture.upgrade(&wake_token(1091, 2)).await.unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    untouched(&mut fixture).await;
+    let table = fixture.gateway.table.clone();
+    let mut released = table.write().await;
+    released.update(entry(
+        Mode::Running,
+        2,
+        &wake_operation(),
+        Some(&fixture.unit),
+    ));
+    let waiting = after_next_read(&table, released).await;
+    let mut between = after_next_read(&table, waiting).await;
+    between.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 2, &wake_operation(), Some(&fixture.unit))
+    });
+    drop(between);
+    fixture.login_sent(&mut client).await;
     client.close(None).await.unwrap();
     fixture.stop().await;
 }

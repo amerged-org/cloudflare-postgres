@@ -438,7 +438,42 @@ mod tests {
             many[format!("f{n}")] = n.into();
         }
         let event = sanitize(&many, AT).unwrap();
-        assert_eq!(event["fields"].as_object().unwrap().len(), 16);
+        let bound = constant("NODE_REPORT_EVENT_FIELDS_MAX").as_u64().unwrap();
+        assert_eq!(event["fields"].as_object().unwrap().len() as u64, bound);
+        assert!(contract_valid(
+            "NodeObservationReport",
+            &report_of(vec![event])
+        ));
+    }
+
+    /// `sanitize` keeps the first fields by key order and drops the rest without a word, so a
+    /// bound below the widest line the agent logs would lose the last keys, `throttled_usec`
+    /// and the steal numbers among them.
+    #[test]
+    fn the_wake_detail_of_the_slot_path_loses_no_field_to_the_bound() {
+        let mut line =
+            json!({"event": "wake_detail", "database_id": DATABASE, "slot_from": "pool"});
+        let numbers = [
+            "slot_wait_us",
+            "bind_us",
+            "order_us",
+            "job_to_fork_us",
+            "fork_to_handoff_us",
+            "handoff_to_starting_us",
+            "starting_to_shut_down_us",
+            "shut_down_to_ready_us",
+            "nr_throttled",
+            "throttled_usec",
+            "steal_ms",
+            "steal_window_ms",
+        ];
+        for (n, name) in numbers.iter().enumerate() {
+            line[*name] = (n as u64 + 1).into();
+        }
+        let event = sanitize(&line, AT).unwrap();
+        let fields = event["fields"].as_object().unwrap();
+        assert_eq!(fields.len(), numbers.len() + 1);
+        assert!(numbers.iter().all(|name| fields.contains_key(*name)));
         assert!(contract_valid(
             "NodeObservationReport",
             &report_of(vec![event])

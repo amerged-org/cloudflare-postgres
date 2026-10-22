@@ -33,7 +33,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UnixListener, UnixStream},
-    sync::{Semaphore, watch},
+    sync::{RwLock, RwLockWriteGuard, Semaphore, watch},
     task::JoinHandle,
     time::timeout,
 };
@@ -46,6 +46,8 @@ const NODE: &str = "nod_aaaaaaaaaaaaaaaaaaaa";
 const INSTANCE: &str = "01234567-89ab-4def-8123-0123456789ab";
 const ROUTE_REVISION: u64 = 19;
 const PASSWORD: &str = "correct horse battery";
+/// The role's password after a reset.
+const ROTATED: &str = "staple correct horse";
 const SALT: &[u8] = b"pgcf-test-salt";
 fn cid(id: usize) -> String {
     format!("01234567-89ab-4def-8123-{id:012x}")
@@ -62,11 +64,15 @@ fn token(prefix: &str, purpose: &str, claims: Value) -> String {
 }
 /// The admission route Cloudflare signs for the fixture's running generation and unit.
 fn route(id: usize) -> String {
+    route_at(id, 1, ROUTE_REVISION)
+}
+/// The admission route for the database at `generation` and `route_revision`.
+fn route_at(id: usize, generation: u64, route_revision: u64) -> String {
     let now = http::now() / 1000;
     token(
         wire("nodeRouteTokenPrefix"),
         wire("nodeRouteSignatureDomain"),
-        json!({"v":6,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":1,"route_revision":ROUTE_REVISION,"node":NODE,"inst":INSTANCE}),
+        json!({"v":6,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"route_revision":route_revision,"node":NODE,"inst":INSTANCE}),
     )
 }
 fn wake_operation() -> String {
@@ -192,8 +198,8 @@ fn strings(body: &[u8]) -> Vec<String> {
         .map(|part| String::from_utf8(part.to_vec()).unwrap())
         .collect()
 }
-/// The server side of SCRAM-SHA-256 for `PASSWORD`; true when the client proved it.
-async fn scram(stream: &mut UnixStream) -> Result<bool, Failure> {
+/// The server side of SCRAM-SHA-256 for `password`; true when the client proved it.
+async fn scram(stream: &mut UnixStream, password: &str) -> Result<bool, Failure> {
     let mut mechanisms = 10u32.to_be_bytes().to_vec();
     mechanisms.extend_from_slice(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0");
     send(stream, b'R', &mechanisms).await?;
@@ -216,7 +222,7 @@ async fn scram(stream: &mut UnixStream) -> Result<bool, Failure> {
     let last = String::from_utf8(last)?;
     let (without_proof, proof) = last.rsplit_once(",p=").unwrap();
     assert_eq!(without_proof, format!("c=biws,r={nonce}"));
-    let salted = pbkdf2(PASSWORD.as_bytes(), SALT, 4096);
+    let salted = pbkdf2(password.as_bytes(), SALT, 4096);
     let stored = Sha256::digest(mac(&salted, b"Client Key")).to_vec();
     let message = format!("{bare},{server_first},{without_proof}");
     let signature = mac(&stored, message.as_bytes());
@@ -243,7 +249,10 @@ async fn scram(stream: &mut UnixStream) -> Result<bool, Failure> {
 /// How the double authenticates a session.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Authentication {
+    /// SCRAM-SHA-256 for `PASSWORD`.
     Scram,
+    /// SCRAM-SHA-256 for `ROTATED`: the role's password was reset.
+    Rotated,
     /// AuthenticationCleartextPassword; what the gateway answers is journaled.
     Cleartext,
     /// No password: AuthenticationOk at once.
@@ -258,6 +267,7 @@ async fn postgres_session(
     mut stream: UnixStream,
     journal: Journal,
     authentication: Authentication,
+    mut gate: watch::Receiver<bool>,
 ) -> Result<(), Failure> {
     let length = stream.read_u32().await? as usize;
     let mut startup = vec![0; length - 4];
@@ -270,8 +280,12 @@ async fn postgres_session(
         .map(|pair| format!("{}={}", pair[0], pair[1]))
         .collect();
     journal.push(format!("startup:{}", pairs.join(" ")));
+    // A PostgreSQL that is slow to log in: the test closes the gate and opens it when it wants
+    // the login to go on.
+    gate.wait_for(|open| *open).await?;
     let accepted = match authentication {
-        Authentication::Scram => scram(&mut stream).await?,
+        Authentication::Scram => scram(&mut stream, PASSWORD).await?,
+        Authentication::Rotated => scram(&mut stream, ROTATED).await?,
         Authentication::Cleartext => {
             send(&mut stream, b'R', &3u32.to_be_bytes()).await?;
             let answer = receive(&mut stream).await.map(|(tag, _)| tag as char);
@@ -465,6 +479,8 @@ struct Fixture {
     journal: Journal,
     /// How the double authenticates the sessions it accepts next.
     authentication: Arc<Mutex<Authentication>>,
+    /// While it is closed, the double does not answer a StartupMessage.
+    gate: watch::Sender<bool>,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     _directory: Directory,
@@ -506,6 +522,7 @@ impl Fixture {
         let counted = calls.clone();
         let authentication = Arc::new(Mutex::new(Authentication::Scram));
         let asks = authentication.clone();
+        let (gate, open) = watch::channel(true);
         let mut shutdown = receiver.clone();
         let upstream_task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
@@ -515,8 +532,8 @@ impl Fixture {
                     accepted = upstream.accept() => {
                         let (stream, _) = accepted.unwrap();
                         counted.fetch_add(1, Ordering::SeqCst);
-                        let (journal, authentication) = (recorder.clone(), *asks.lock().unwrap());
-                        tasks.spawn(async move { let _ = postgres_session(stream, journal, authentication).await; });
+                        let (journal, authentication, open) = (recorder.clone(), *asks.lock().unwrap(), open.clone());
+                        tasks.spawn(async move { let _ = postgres_session(stream, journal, authentication, open).await; });
                     }
                 }
             }
@@ -548,6 +565,7 @@ impl Fixture {
             calls,
             journal,
             authentication,
+            gate,
             stop,
             tasks: vec![upstream_task, gateway_task],
             _directory: directory,
@@ -756,6 +774,69 @@ async fn a_pooled_session_is_reused_only_for_its_password_and_closes_when_the_da
     fixture.stop().await;
 }
 #[tokio::test]
+async fn a_pooled_session_is_reused_across_a_route_revision_but_not_across_a_generation() {
+    // The page that carries Cloudflare's claim of a wake moves the route revision of the entry
+    // and nothing else: the pooled session goes on. A role change (resetPassword) moves the
+    // generation on the unit that runs, and the agent publishes it on the same writer without
+    // ending the sessions of the role: PostgreSQL has a new verifier, the pooled session proved
+    // the old one and is never asked again. A request at the new generation logs in itself, and
+    // PostgreSQL refuses the password that was reset.
+    let fixture = Fixture::new().await;
+    let request = body(PASSWORD, &[("select", json!([]))], None);
+    assert_eq!(fixture.sql(&route(30), &request).await.0, 200);
+    fixture.idle(1).await;
+    fixture.gateway.table.write().await.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 1, &operation(), &fixture.unit)
+    });
+    assert_eq!(
+        fixture
+            .sql(&route_at(31, 1, ROUTE_REVISION + 1), &request)
+            .await
+            .0,
+        200
+    );
+    fixture.idle(1).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.journal.count("auth:ok"), 1);
+    // The role's password is reset: the generation moves, and the unit is the same.
+    *fixture.authentication.lock().unwrap() = Authentication::Rotated;
+    fixture.gateway.table.write().await.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 2, &operation(), &fixture.unit)
+    });
+    let (status, answer) = fixture
+        .sql(&route_at(32, 2, ROUTE_REVISION + 1), &request)
+        .await;
+    assert_eq!(
+        (status, &answer["code"]),
+        (400, &json!("28P01")),
+        "{answer}"
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    fixture.idle(0).await;
+    // The new password logs in once and is pooled at the new generation.
+    let rotated = body(ROTATED, &[("select", json!([]))], None);
+    assert_eq!(
+        fixture
+            .sql(&route_at(33, 2, ROUTE_REVISION + 1), &rotated)
+            .await
+            .0,
+        200
+    );
+    fixture.idle(1).await;
+    assert_eq!(
+        fixture
+            .sql(&route_at(34, 2, ROUTE_REVISION + 1), &rotated)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.journal.count("auth:ok"), 2);
+    fixture.stop().await;
+}
+#[tokio::test]
 async fn a_postgres_error_answers_with_its_fields_and_a_failed_batch_rolls_back() {
     let fixture = Fixture::new().await;
     let (status, answer) = fixture
@@ -936,6 +1017,204 @@ async fn a_wake_ticket_is_held_without_a_dial_until_the_table_releases_the_unit(
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["rows"], json!([["woken"]]));
     assert_eq!(fixture.gateway.wakes.held(DATABASE), 0);
+    fixture.stop().await;
+}
+/// Waits until the gateway has admitted a request on the unit and written its StartupMessage to
+/// PostgreSQL, which holds the login at its closed gate.
+async fn logging_in(fixture: &Fixture) {
+    timeout(Duration::from_secs(5), async {
+        while fixture
+            .journal
+            .count("startup:user=app database=aaaaaaaaaaaaaaaaaaaa client_encoding=UTF8")
+            != 1
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the request reached PostgreSQL");
+}
+#[tokio::test]
+async fn a_cold_request_goes_on_when_the_claim_of_its_wake_reaches_the_table_during_its_login() {
+    // The agent releases the wake under the route revision it knows. Cloudflare's claim of the
+    // wake runs beside the request and commits a later revision, and the page that carries it
+    // reaches the agent while PostgreSQL is still logging the request in. The unit, its
+    // generation and its operation are the same: the entry the agent publishes names nothing
+    // the request was admitted on differently.
+    let fixture = Fixture::with(Mode::Sleeping).await;
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["woken"]))], None);
+    let answer = tokio::spawn(async move {
+        post(port, &wake_token(26, 2), request.to_string().as_bytes()).await
+    });
+    timeout(Duration::from_secs(5), async {
+        while fixture.gateway.wakes.held(DATABASE) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.gate.send(false).unwrap();
+    release(&fixture, 2).await;
+    logging_in(&fixture).await;
+    fixture.gateway.table.write().await.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 2, &wake_operation(), &fixture.unit)
+    });
+    fixture.gate.send(true).unwrap();
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["rows"], json!([["woken"]]));
+    fixture.stop().await;
+}
+/// Lets the reader that waits behind `held` through, and returns the write lock that queues
+/// behind that read: tokio's lock is fair, so the writer goes ahead of the reader's next read.
+/// A reader that has not arrived yet leaves `try_write` the lock, which is held again until one
+/// has.
+async fn after_next_read<'a, T>(
+    table: &'a RwLock<T>,
+    mut held: RwLockWriteGuard<'a, T>,
+) -> RwLockWriteGuard<'a, T> {
+    loop {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        drop(held);
+        match table.try_write() {
+            Ok(guard) => held = guard,
+            Err(_) => return table.write().await,
+        }
+    }
+}
+#[tokio::test]
+async fn a_cold_request_the_table_released_at_once_goes_on_when_the_claim_lands_between_its_two_reads()
+ {
+    // The request reads the table to see that its wake is released (`wake_state`, under route
+    // revision 19) and reads it again to admit the route. The page with Cloudflare's claim of the
+    // wake lands in between and moves the revision to 20: a released wake is admitted under its
+    // revision or a later one, not refused as route_stale.
+    let fixture = Fixture::with(Mode::Sleeping).await;
+    release(&fixture, 2).await;
+    let table = fixture.gateway.table.clone();
+    let held = table.write().await;
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["woken"]))], None);
+    let answer = tokio::spawn(async move {
+        post(port, &wake_token(28, 2), request.to_string().as_bytes()).await
+    });
+    // The request's first read of the table is granted, and this writer is behind it.
+    let mut between = after_next_read(&table, held).await;
+    between.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 2, &wake_operation(), &fixture.unit)
+    });
+    drop(between);
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["rows"], json!([["woken"]]));
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_held_cold_request_goes_on_when_the_claim_lands_between_its_release_and_its_admission() {
+    // The held request reads the table for its release (`changed`, then `wake_state`) and reads
+    // it again to admit the route; the claim's entry lands behind the second of the first two
+    // reads, before the admission.
+    let fixture = Fixture::with(Mode::Sleeping).await;
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["woken"]))], None);
+    let answer = tokio::spawn(async move {
+        post(port, &wake_token(30, 2), request.to_string().as_bytes()).await
+    });
+    timeout(Duration::from_secs(5), async {
+        while fixture.gateway.wakes.held(DATABASE) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let table = fixture.gateway.table.clone();
+    let mut released = table.write().await;
+    released.update(entry(Mode::Running, 2, &wake_operation(), &fixture.unit));
+    let waiting = after_next_read(&table, released).await;
+    let mut between = after_next_read(&table, waiting).await;
+    between.update(Database {
+        route_revision: ROUTE_REVISION + 1,
+        ..entry(Mode::Running, 2, &wake_operation(), &fixture.unit)
+    });
+    drop(between);
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["rows"], json!([["woken"]]));
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_request_whose_database_quiesces_before_its_startup_message_is_refused_as_57p03() {
+    // The route is admitted (first read of the table) and the writer is still the database's
+    // (second read, before the dial); the sleep proof begins before the guarded write of the
+    // StartupMessage (third read). Nothing was written to PostgreSQL, so the request is the
+    // refusal an integrator retries by its code, not a failed connection.
+    let fixture = Fixture::new().await;
+    let table = fixture.gateway.table.clone();
+    let held = table.write().await;
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["late"]))], None);
+    let answer =
+        tokio::spawn(async move { post(port, &route(29), request.to_string().as_bytes()).await });
+    let admitted = after_next_read(&table, held).await;
+    let mut dialable = after_next_read(&table, admitted).await;
+    dialable.update(entry(Mode::Quiesce, 1, &operation(), &fixture.unit));
+    drop(dialable);
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(
+        (status, &answer["code"]),
+        (400, &json!("57P03")),
+        "{answer}"
+    );
+    fixture.idle(0).await;
+    assert!(
+        fixture
+            .journal
+            .entries()
+            .iter()
+            .all(|entry| !entry.starts_with("startup:")),
+        "{:?}",
+        fixture.journal.entries()
+    );
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_request_whose_database_stops_admitting_during_its_login_writes_no_statement() {
+    // The sleep proof begins between the request's admission and its first statement: the
+    // statement waits for nothing and never reaches PostgreSQL.
+    let fixture = Fixture::new().await;
+    fixture.gate.send(false).unwrap();
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["late"]))], None);
+    let answer =
+        tokio::spawn(async move { post(port, &route(27), request.to_string().as_bytes()).await });
+    logging_in(&fixture).await;
+    fixture.gateway.table.write().await.update(entry(
+        Mode::Quiesce,
+        1,
+        &operation(),
+        &fixture.unit,
+    ));
+    fixture.gate.send(true).unwrap();
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(
+        (status, &answer["code"]),
+        (400, &json!("57P03")),
+        "{answer}"
+    );
+    fixture.idle(0).await;
+    assert!(
+        fixture
+            .journal
+            .entries()
+            .iter()
+            .all(|entry| !entry.starts_with("parse:") && !entry.starts_with("bind:")),
+        "{:?}",
+        fixture.journal.entries()
+    );
     fixture.stop().await;
 }
 #[tokio::test]

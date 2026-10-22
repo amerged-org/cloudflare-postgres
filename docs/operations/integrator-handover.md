@@ -84,7 +84,7 @@ creation or resize. Disabled classes (`enabled: false`) are listed but refused.
 | Field                                      | Bounds in the contract                                 | Meaning                                                                                                                                   |
 | ------------------------------------------ | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `memory_mib`                               | 256 to 1,048,576 in steps of 256                       | The database's hard memory ceiling while it is awake; PostgreSQL's settings follow it (`shared_buffers` an eighth, `effective_cache_size` three quarters of it) |
-| `cpu_millicores`, `cpu_request_millicores` | 100 to 256,000; request optional and at most the limit | CPU size: the database's CPU weight is proportional to it and a quota of it applies once PostgreSQL has started. The request is accepted and stored, and no node reads it |
+| `cpu_millicores`                           | 100 to 256,000                                         | CPU size: the database's CPU weight is proportional to it and a quota of it applies once PostgreSQL has started; after a wake the quota comes only after the region's CPU burst (the node policy's `cpu_boost_ms`, 5 s at first), during which the database is not held to its size: it takes its weight's share of contested CPU and what is idle. Each wake has such a burst, so frequent suspend and resume cycles repeat it |
 | `storage_gib`                              | 1 to 65,536                                            | The thin volume's size; the pool hands out real space only as the database writes. It grows online and never shrinks |
 | `max_connections`                          | 10 to 10,000                                           | PostgreSQL `max_connections`                                                                                                              |
 | `sleep_after_seconds`                      | 60 to 2,592,000, or `null`                             | Idle time before hibernation of a database that sets none of its own; `null` is always warm                                               |
@@ -248,9 +248,9 @@ What happens: the database record (generation 1) and the owner role `app` with a
 password are written (`pgcf_maintenance` is only a reserved name); the
 placement step picks the node that is the fullest of those that stay under 80 % active RAM and 80 %
 CPU load, each as the highest 30-minute average of the last seven days, and whose thin pool is
-open (data below 80 %, metadata below 50 %, sold storage within four times its data). A database
-placed after the node's newest sample counts at its full memory until that sample exists, and the
-newest sample's active RAM counts when it is above the average. The node then creates the volume
+open (data below 80 %, metadata below 50 %, sold storage within four times its data) and that holds
+fewer than 1,000 volumes. A database placed after the node's newest sample counts at its full
+memory until that sample exists, and the newest sample's active RAM counts when it is above the average. The node then creates the volume
 and the cluster, applies the roles, starts PostgreSQL through its own admission and takes the first
 base backup; WAL archiving starts with the first start. The database is ready only when that backup
 is DONE, so it is never writable before it is restorable. The idle time
@@ -297,7 +297,7 @@ unplaced), `health` and `storage`:
 | Field              | Meaning                                                                                                                                                                                                                                                                                                                                         |
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `health.archiving` | `ok`, `failing`, `unknown`, with `since`                                                                                                                                                                                                                                                                                                        |
-| `health.backup`    | `status` is `ok` while the last completed base backup is at most 36 h old, `stale` when older, `failing` when the node reports failing or its last failure is newer than its last completion, `unknown` without a report within 180 s or without a completed backup; `last_base_backup_at` is when that backup finished, `null` while unknown |
+| `health.backup`    | `status` is `ok` while the last completed base backup is at most 36 h old, `stale` when older, `failing` when the node reports failing or its last failure is newer than its last completion, `unknown` without a report of the database within 45 min (a node names an unchanged database once in 15 min) or without a completed backup; `last_base_backup_at` is when that backup finished, `null` while unknown |
 | `health.disk`      | `status` is `warning` from 90 % used and `unknown` without a usage sample within 180 s; `used_ratio` is used divided by allocated bytes of the newest sample, `null` when it measured nothing. An awake database is sampled every minute; a hibernated one cannot grow and is sampled once in each quarter hour, so it reads `unknown` between samples                                                                                                                                                   |
 | `storage`          | `{used_bytes, allocated_bytes, observed_at}` of the newest sample the node's agent reported (at most a minute old for an awake database, at most 15 minutes for a hibernated one), with `null` figures where it measured nothing; the whole object is `null` before the first sample. It is not cut off by age: judge `observed_at` yourself                                                                                        |
 
@@ -803,7 +803,7 @@ Where a new database goes is described in [2.1](#21-create). The per-database me
 (11,967 MiB visible to the system). What a node admits is decided by the region's node policy (an
 admin reads it at `GET /v1/regions/{id}/node-policy`; ask the operator for its values): the memory
 rule, the memory floor and the awake-database budget, how many starts may run at once, how long a
-wake may wait for room, early sleep, the pool reserve, the backup concurrency and the write limits.
+wake may wait for room, how long after a wake the CPU quota stays off (the CPU burst), early sleep, the pool reserve, the backup concurrency and the write limits.
 The plan's starting values for EU1 are an awake budget of 9,937 MiB, a floor of 600 MiB, at most 4
 starts at once and a wait of up to 10 s before `57P03` with a retry hint of 5 s; Stage 5 replaces
 them with measured values.
@@ -846,9 +846,17 @@ times the pool's data. Chunks are zeroed before reuse, so space freed by one dat
 readable by another.
 
 - **The pool.** Placement closes a node's pool at 80 % of its data, 50 % of its metadata or the
-  cap: nothing new is created or restored there, and running databases keep running. A node whose
-  pool has no room refuses every create, restore and wake with `57P03` and the DETAIL "storage". A
-  pool that does fill fails writes at once, with no commit acknowledged without durable WAL; the
+  cap, and the node itself at 1,000 volumes (the technical bound: the largest count measured on a
+  node, raised only after a measurement at a higher count, not a sales limit): nothing new is
+  created, restored or moved there, and running databases keep running. A resize creates no
+  volume and takes no real space, so a node closed by the pool's data, its metadata or the volume
+  count still grows a database's storage while its pool has room. Only the cap, or a pool with no
+  room (below), refuses it: on a node at the cap, whatever else has closed it, raising storage gets
+  `503 capacity_exhausted` (section 2.5). A region whose nodes are all closed
+  holds a new database as "Waiting for verified regional capacity" until a node is added. A node
+  whose pool has no room (free data below the reserve, or metadata at 75 %) refuses every create,
+  restore and wake with `57P03` and the DETAIL "storage", and a storage resize with the same
+  `503 capacity_exhausted`. A pool that does fill fails writes at once, with no commit acknowledged without durable WAL; the
   affected databases stop, and the node recovers them by itself once space is back.
 - **One volume.** Raising a database's storage is an admin call (`PUT /v1/databases/{id}/resources`,
   growth only, online); nothing grows a volume for you. `health.disk.status` becomes `warning` at
@@ -899,18 +907,14 @@ pgcf -G "$PGCF_API/v1/usage" \
 | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `provisioned_seconds`, `awake_seconds`                               | seconds between creation and deletion, and seconds between a ready or wake event and the next hibernation or suspension                                                       |
 | `memory_mib_seconds`, `cpu_millicore_seconds`                        | the class's memory and CPU **limits** times awake seconds; not measured consumption                                                                                           |
-| `reserved_cpu_millicore_seconds` | **scheduled for removal (plan 3.4); do not build on it.** Today: the class's CPU limit times **provisioned** seconds, sleeping time included |
-| `reserved_memory_mib_seconds` | **scheduled for removal (plan 3.4); do not build on it.** Today: the memory limit times **provisioned** seconds, sleeping time included |
-| `reserved_storage_byte_seconds` | **scheduled for removal (plan 11.4); do not build on it.** Today: the allocated storage (the effective `storage_gib`) times provisioned seconds |
 | `storage_used_bytes_max`, `storage_allocated_bytes` | maximum of the node's filesystem samples in the period (bytes used on the volume); the effective storage size |
 | `backup_bytes_max`                                                   | maximum archive size in R2 measured in the period                                                                                                                             |
 | `ingress_bytes`, `egress_bytes`, `connections`, `connection_seconds` | gateway counters of the hour, summed over its measurement intervals (none spans two hours); `null` with `traffic_coverage` when an interval of the hour is missing or unknown |
 
 For compute time price `awake_seconds` and `memory_mib_seconds`; for storage use
 `storage_allocated_bytes` and `storage_used_bytes_max`; for traffic read `ingress_bytes` and
-`egress_bytes` of final rows. The three `reserved_*` metrics are still in the contract and in every
-row, but they described the retired Kubernetes runtime's requests and are scheduled for removal
-(plan 3.4 and 11.4, no backwards compatibility): bill from the metrics above, not from them.
+`egress_bytes` of final rows. The retired Kubernetes runtime's three `reserved_*` metrics are gone
+from the contract and from every stored row (no backwards compatibility).
 
 **Traffic across an hour boundary.** The gateway counts cumulative totals and the node agent reads
 them once a minute. When two readings enclose a UTC hour boundary, the
@@ -966,7 +970,6 @@ measurement is fresh and below the threshold. A recurrence has the same `event_i
 | `regional_node_ram_warning`                                   | any node's 30-minute average of active RAM reaches the threshold                                                                             | `node_ram_warning_threshold_ppm`, 850,000 (85 %) |
 | `regional_node_cpu_warning`                                   | any node's 30-minute average CPU load reaches it                                                                                             | `node_cpu_warning_threshold_ppm`, 900,000 (90 %)  |
 | `regional_node_storage_warning`                               | the node's thin-pool data or metadata fill reaches it (placement closes a pool at 80 % data or 50 % metadata)                                | `node_storage_warning_threshold_ppm`; the plan names no value (placement closes the pool at 800,000 for data and 500,000 for metadata) |
-| `regional_ram_warning`                                        | regional RAM utilisation reaches it                                                                                                          | `ram_warning_threshold_ppm`; it needs a regional RAM window that no node reports yet, so it never fires |
 | `regional_node_cap_reached`                                   | allocated nodes reach `max_nodes`                                                                                                            | `cap_warning_enabled`, off by default            |
 | `regional_node_stale`                                         | a node's observation is older than 180 s, or the node is marked lost and a database is still placed on it                                                                         | fixed                                             |
 | `infrastructure_backup_failed`, `infrastructure_backup_stale` | the daily D1 backup fails, or none completed for 36 h                                                                                        | fixed                                             |
@@ -974,7 +977,7 @@ measurement is fresh and below the threshold. A recurrence has the same `event_i
 | `database_base_backup_stale`                                  | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count         | fixed                              |
 | `thin_storage_blocked`                                        | a node's newest sample says its thin pool has no room, or a node that holds databases has no sample of its pool within 180 s (`thin_pool_*`) | fixed                                             |
 | `regional_node_capacity_refusals`                             | a node refused 5 or more wakes for awake capacity (`57P03`) in 10 minutes                                                                    | fixed                                             |
-| `regional_node_pool_closed`                                   | a node's newest sample closes its thin pool for placement: data at 80 %, metadata at 50 % or the sold storage at 4 times its data           | fixed                                             |
+| `regional_node_pool_closed`                                   | a node's newest sample closes it for placement: pool data at 80 %, pool metadata at 50 %, sold storage at 4 times its data, or 1,000 volumes | fixed                                             |
 | `database_volume_warning`, `database_volume_critical`         | a database volume's space or inodes are at least 80 % (below 90 %), or at least 90 %, used                                                   | fixed                                             |
 | `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed |
 | `node_unexpected_reboot` | a node rebooted and no maintenance order of it asked for it, within the last 24 h | fixed |
@@ -1011,6 +1014,7 @@ disk verdicts for every project at once.
 | Idle sleep | PostgreSQL stops after the sleep proof (every committed transaction is in R2 first); the volume stays mounted; the next connection starts PostgreSQL from it | in R2 and on the volume | reconnect |
 | Manual suspend | refused with `57P03` until resume | as above | `POST /resume` |
 | Node maintenance cycle (new packages, a kernel update) | placement on the node is closed, so creates wait; the node holds new wakes with `57P03`, puts every awake database to sleep with the proof and reboots only if a kernel or core library changed; the first live cycle took 67 s end to end. Kernel security updates follow the owner's standing approval: within 7 days of a Debian advisory, in an announced window, one node at a time; other reboots need the owner's go and an announced window from the canary on. The announcement channel is not defined in the repository | kept | plan around the window; ask the operator for it |
+| Gateway release (a new gateway binary, or a change of the node's route keys) | the gateway on the node is replaced. It closes your idle connections at once with WebSocket close code 1012; a connection in a transaction or running a statement keeps up to 10 s. At that bound a session idle in a transaction is ended with `57P01` and its transaction is rolled back. A session with a statement running is ended with `08007` and **its statement is not stopped**: PostgreSQL finishes it, and the `COMMIT` sent behind it, and notices that the client is gone only when it writes its answer, so the work can commit after the error, up to the statement's run time later (a check made at the error finds nothing yet). An HTTP `/sql` request still running at the bound is answered `08007` in the same way (outcome unknown, not retried). Connections that arrive meanwhile wait for the new gateway, at most those 10 s and its start (and its first table from the node's agent, normally milliseconds, 5 s at most); the one connection the old gateway had accepted at the moment of the signal and not yet read gets `08006`. Designed and tested for that bound; the first live swap is recorded in the plan. **One time, for the release that brings this behaviour:** the node's agent restarts the gateway before it writes the new unit files, so the first stop is of the previous gateway, which holds every WebSocket for up to 29 s (idle ones too) and keeps its port without accepting for up to 30 s, then resets the connections that waited; a new connection can fail for up to 30 s then, longer than the retry rule, and an HTTP `/sql` request still running at 30 s gets no answer from the gateway (the Edge reports its own `08007`). The restart after the unit files has the new drain but no socket handover (a connection that arrives meanwhile waits in the old process and is reset when it exits, at most 12 s later); the release after that is the first with the handover | a transaction that committed is kept; one idle in a transaction at the bound is rolled back; a statement running at the bound has an unknown outcome and can commit after the error | reconnect on 1012; retry `08006` and `57P01`; after `08007` repeat only an idempotent write, and check a write's effect only after the statement's run time has passed |
 | Node reboot or crash | every awake database stops with the node; when it is back, its agent finds each database that stopped without a proof, starts it through admission, lets it archive and proves its sleep, and a connection wakes it as usual. A hard power cut under writes on EU1 lost no acknowledged commit; the node reported again 26.8 s after the start request. No outage duration is promised | kept (local volume) | retry with backoff; check `observed_state` |
 | Archiving failing (`health.archiving: failing`, for example an R2 problem) | connections keep working; WAL accumulates on the volume until archiving works again, and a full volume stops writes (standard PostgreSQL behaviour, not tested here) | recoverable window goes stale | escalate at once |
 | Volume full | PostgreSQL cannot write; the node frees the filesystem's last reserve once so that it can recover | kept | free space, or have the size raised (admin `PUT /v1/databases/{id}/resources`) or move to a larger class ([2.5](#25-resize)) |
@@ -1233,7 +1237,7 @@ description of the schema or the operation; the code is authoritative.
 | Rule                                                                                                                                                                                                  | Where the document says it         | Refusal |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- | ------- |
 | An `integrator` key requires `project_id` and an `admin` key must omit it                                                                                                                             | `ApiKeyCreate`                     | `400`   |
-| `memory_mib` of a size class is a multiple of 256 and `cpu_request_millicores` does not exceed `cpu_millicores`                                                                                       | `SizeClass`, `SizeClassUpsert`     | `400`   |
+| `memory_mib` of a size class is a multiple of 256                                                                                                                                                      | `SizeClass`, `SizeClassUpsert`     | `400`   |
 | `postgres`, `streaming_replica`, `pg_*` and `cnpg_*` are not role names, and `pgcf_maintenance` cannot be created                                                                                     | `RoleName`, `RoleCreate`           | `400`   |
 | `valid_until` must lie in the future when the request executes (not on a replay); every `member_of` entry is a live role of this database that is neither `app`, `pgcf_maintenance` nor being deleted | `RoleCreate`                       | `400`   |
 | A usage request names exactly one scope; both boundaries are aligned to the granularity and at most 31 days apart                                                                                     | `getUsage`                         | `400`   |

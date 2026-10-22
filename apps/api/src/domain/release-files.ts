@@ -4,6 +4,7 @@ import {
   RELEASE_IMAGE_FILE,
   RELEASE_SIGNATURE_FILE,
   ReleaseFileName,
+  hostFileObjectKey,
   releaseObjectKey,
   type ReleaseFile,
 } from "@pgcf/contracts/releases";
@@ -59,12 +60,7 @@ const notFound = () => new ApiError("not_found", "Release file not found");
  * and the agent pull from a URL. The bucket's key never leaves the Worker: no presigned URL and
  * no credential reaches a node.
  */
-async function deliver(
-  c: ApiContext,
-  version: string,
-  file: ReleaseFile,
-): Promise<Response> {
-  const key = releaseObjectKey(version, file);
+async function deliver(c: ApiContext, key: string): Promise<Response> {
   const stored = await c.env.ARCHIVE.head(key);
   if (stored === null) throw notFound();
   const range = parseByteRange(c.req.header("Range") ?? null, stored.size);
@@ -141,7 +137,30 @@ export async function serveReleaseFile(
   if (name === RELEASE_SIGNATURE_FILE) return releaseSignature(c, version);
   const file = await registeredFile(c, version, name);
   if (file === RELEASE_IMAGE_FILE) throw notFound();
-  return deliver(c, version, file);
+  return deliver(c, releaseObjectKey(version, file));
+}
+
+/**
+ * A host file of a registered release (plan 9.3), named by its sha256 and served only when the
+ * release's own list holds that digest: an object under another digest, or another release's, is
+ * not found. An agent reads these without a credential, as it reads the binaries: the signed page
+ * pins each by digest and size.
+ */
+export async function serveHostFile(
+  c: ApiContext,
+  version: string,
+  sha256: string,
+): Promise<Response> {
+  const id = FleetReleaseVersion.safeParse(version);
+  if (!id.success || !/^[0-9a-f]{64}$/.test(sha256)) throw notFound();
+  const listed = await c.env.DB.prepare(
+    `SELECT 1 FROM fleet_releases r, json_each(r.spec_json,'$.os.host_files') h
+     WHERE r.id=? AND json_extract(h.value,'$.sha256')=?`,
+  )
+    .bind(id.data, sha256)
+    .first();
+  if (listed === null) throw notFound();
+  return deliver(c, hostFileObjectKey(id.data, sha256));
 }
 
 /**
@@ -156,5 +175,5 @@ export async function serveInstallerImage(
   await registeredFile(c, version, RELEASE_IMAGE_FILE);
   if (install.image_version !== version)
     throw new ApiError("unauthorized", "Invalid installer credentials");
-  return deliver(c, version, RELEASE_IMAGE_FILE);
+  return deliver(c, releaseObjectKey(version, RELEASE_IMAGE_FILE));
 }

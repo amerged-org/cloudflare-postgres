@@ -229,12 +229,19 @@ impl Api {
     }
     /// POST `body` to `path`; any success is the acknowledgement.
     pub async fn post(&self, path: &str, body: &Value) -> Result<(), Error> {
+        self.post_bytes(path, body).await?;
+        Ok(())
+    }
+    /// POST `body` to `path`, answered with JSON that says more than that it was taken.
+    pub async fn post_answer(&self, path: &str, body: &Value) -> Result<Value, Error> {
+        Ok(serde_json::from_slice(&self.post_bytes(path, body).await?)?)
+    }
+    async fn post_bytes(&self, path: &str, body: &Value) -> Result<Vec<u8>, Error> {
         let encoded = serde_json::to_vec(body)?;
         if encoded.len() > MAX_REQUEST_BYTES {
             return Err("node request exceeds bound".into());
         }
-        self.send(Method::POST, path, Some(encoded)).await?;
-        Ok(())
+        self.send(Method::POST, path, Some(encoded)).await
     }
     /// The URL of `target` (a path with its query) and the bearer token of a request for it. The
     /// token binds the path and the query exactly as the URL spells them.

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Conformance inputs of the node contracts, never live acceptance or product defaults. Each
-// vector states whether the Zod contract accepts it; `refinement` marks a value only the
-// contract's own checks refuse, which a JSON Schema alone accepts.
+// vector states whether the Zod contract accepts it (`valid`) and whether the node does
+// (`node_valid`: the node ignores a property that a document it receives does not name);
+// `refinement` marks a value only a rule of the contract and of the node refuses, which the
+// JSON Schema alone accepts.
 import type { z } from "zod";
 import * as link from "../src/node-link.ts";
 import * as local from "../src/node-local.ts";
 import { bytesToBase64url } from "../src/encoding.ts";
 import {
   FleetReleaseId,
+  hostFilesSha256,
   packagesSha256,
   signedReleaseManifest,
+  type HostFile,
 } from "../src/releases.ts";
 
 const id = `d${"b".repeat(19)}`,
@@ -111,6 +115,12 @@ const page = {
   node,
   release: {
     id: "release-25",
+    image: {
+      sha256: "d".repeat(64),
+      size_bytes: 500_000_000,
+      raw_sha256: "e".repeat(64),
+      raw_bytes: 2_147_483_648,
+    },
     binaries: {
       "pgcf-agent": binary,
       "pgcf-native-gateway": binary,
@@ -125,6 +135,16 @@ const page = {
         sha256: "b".repeat(64),
         size_bytes: 2000,
       },
+      host_files: [
+        {
+          path: "/usr/lib/systemd/system/pgcf-agent.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "c".repeat(64),
+          size_bytes: 900,
+          apply: "restart_unit:pgcf-agent.service",
+        },
+      ],
     },
   },
   policy: {
@@ -136,6 +156,7 @@ const page = {
       start_concurrency: 4,
       queue_wait_ms: 10_000,
       retry_after_seconds: 5,
+      cpu_boost_ms: 5000,
     },
     early_sleep: { enabled: true, min_idle_seconds: 30 },
     storage: {
@@ -205,6 +226,8 @@ const fenced = {
 };
 // A page with nothing on it but what its own rules are about.
 const bare = { ...page, orders: [], databases: [], next: null };
+// A property that only a later release of the API names.
+const later = { a_property_of_a_later_release: 1 };
 const withDatabase = (change: object) => ({
   ...page,
   orders: [],
@@ -350,6 +373,7 @@ const hello = {
     booted_at: now,
     kernel_release: "6.12.111+deb13-amd64",
     packages_sha256: "a".repeat(64),
+    host_files_sha256: "b".repeat(64),
   },
 };
 
@@ -418,6 +442,7 @@ export const nodeSchemas = {
   ArchiveCredential: link.ArchiveCredential,
   NodeDesiredPage: link.NodeDesiredPage,
   NodeObservationReport: link.NodeObservationReport,
+  NodeObservationAnswer: link.NodeObservationAnswer,
   NodeSample: link.NodeSample,
   NodeVolumeReport: link.NodeVolumeReport,
   NodeEventReport: link.NodeEventReport,
@@ -430,6 +455,26 @@ export const nodeSchemas = {
   InstallerProgress: link.InstallerProgress,
   FleetReleaseId,
 } as const satisfies Record<string, z.ZodType>;
+
+/**
+ * The documents Cloudflare sends and the node reads. The node reads them with every object open:
+ * a property it does not name is ignored, so that an additive change reaches the API first and
+ * the nodes by the release that follows, with no hand step (plan 9.3, "Changing the page"). What
+ * the node sends stays closed, and so does the API's own contract, which never sends a property
+ * by accident. A value out of the closed sets (a type of order, a kind of origin or host file, a
+ * rule of memory) is still refused, as is a missing property, a wrong type and an out-of-bound
+ * number.
+ */
+export const nodeReceives = [
+  "NodeEnrollmentSeed",
+  "NodeEnrollmentResponse",
+  "NodeCredentials",
+  "ArchiveCredential",
+  "NodeDesiredPage",
+  "NodeObservationAnswer",
+  "NodeFencedResponse",
+  "ServerLinkMessage",
+] as const satisfies readonly (keyof typeof nodeSchemas)[];
 
 const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   NodeEnrollmentSeed: [
@@ -530,6 +575,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
   NodeEnrollmentResponse: [
     ["identity", node, true],
+    ["extra-property", { ...node, ...later }, false],
     ["bad-uid", { ...node, uid: "not-a-uuid" }, false],
   ],
   NodeRequestClaims: [
@@ -564,6 +610,15 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
   NodeCredentials: [
     ["credentials", credentials, true],
+    [
+      "extra-property-on-the-credentials-and-the-keyring",
+      {
+        ...credentials,
+        ...later,
+        route_keyring: { ...credentials.route_keyring, ...later },
+      },
+      false,
+    ],
     [
       "no-revision",
       {
@@ -609,6 +664,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
   ArchiveCredential: [
     ["read-write", archiveCredential, true],
+    ["extra-property", { ...archiveCredential, ...later }, false],
     [
       "read-only-source",
       {
@@ -708,6 +764,187 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     ["unknown-field", { ...page, region: region }, false],
+    // A property of a later release is optional for the release that adds it: the page without
+    // it is a page, and the node reads the burst of 0 (plan 9.3, "Changing the page").
+    [
+      "policy-without-cpu-boost",
+      {
+        ...page,
+        policy: {
+          ...page.policy,
+          admission: { ...page.policy.admission, cpu_boost_ms: undefined },
+        },
+      },
+      true,
+    ],
+    // The contract refuses a property it does not name (the API never sends one by accident); the
+    // node ignores it wherever it stands, so that the API can send a property before the nodes know it.
+    ["extra-property-on-the-page", { ...page, ...later }, false],
+    [
+      "extra-property-on-the-policy",
+      { ...page, policy: { ...page.policy, ...later } },
+      false,
+    ],
+    [
+      "extra-property-on-a-policy-group",
+      {
+        ...page,
+        policy: {
+          ...page.policy,
+          admission: { ...page.policy.admission, ...later },
+          early_sleep: { ...page.policy.early_sleep, ...later },
+        },
+      },
+      false,
+    ],
+    [
+      "extra-property-on-the-release",
+      { ...page, release: { ...page.release, ...later } },
+      false,
+    ],
+    [
+      "extra-property-on-the-image",
+      {
+        ...page,
+        release: {
+          ...page.release,
+          image: { ...page.release.image, ...later },
+        },
+      },
+      false,
+    ],
+    [
+      "extra-property-on-a-binary",
+      {
+        ...page,
+        release: {
+          ...page.release,
+          binaries: {
+            ...page.release.binaries,
+            "pgcf-agent": { ...binary, ...later },
+          },
+        },
+      },
+      false,
+    ],
+    [
+      "extra-property-on-a-host-file",
+      {
+        ...page,
+        release: {
+          ...page.release,
+          os: {
+            ...page.release.os,
+            host_files: [{ ...page.release.os.host_files[0], ...later }],
+          },
+        },
+      },
+      false,
+    ],
+    ["extra-property-on-an-entry", withDatabase(later), false],
+    [
+      "extra-property-on-a-role",
+      withDatabase({ roles: [{ ...owner, ...later }, reader] }),
+      false,
+    ],
+    [
+      "extra-property-on-an-origin",
+      withDatabase({
+        origin: {
+          kind: "restore",
+          source: { ...restored.origin.source, ...later },
+        },
+      }),
+      false,
+    ],
+    [
+      "extra-property-on-an-order",
+      { ...page, orders: [{ ...page.orders[3], ...later }] },
+      false,
+    ],
+    [
+      "extra-property-everywhere",
+      {
+        ...page,
+        ...later,
+        policy: {
+          ...page.policy,
+          ...later,
+          admission: { ...page.policy.admission, ...later },
+        },
+        orders: page.orders.map((order) => ({ ...order, ...later })),
+        databases: page.databases.map((db) => ({
+          ...db,
+          ...later,
+          resources: { ...db.resources, ...later },
+          roles: db.roles.map((role) => ({ ...role, ...later })),
+        })),
+      },
+      false,
+    ],
+    // What the node still refuses: a type, a kind, a rule or a state it does not know, a missing
+    // property, a wrong type and a number out of bound.
+    [
+      "order-of-an-unknown-type",
+      { ...page, orders: [{ type: "reboot", operation: op("r") }] },
+      false,
+    ],
+    [
+      "order-without-an-operation",
+      {
+        ...page,
+        orders: [{ type: "wake", database: other, generation: 6 }],
+      },
+      false,
+    ],
+    [
+      "order-generation-as-text",
+      {
+        ...page,
+        orders: [
+          {
+            type: "wake",
+            operation: op("w"),
+            database: other,
+            generation: "6",
+          },
+        ],
+      },
+      false,
+    ],
+    [
+      "origin-of-an-unknown-kind",
+      withDatabase({ origin: { kind: "clone" } }),
+      false,
+    ],
+    [
+      "host-file-of-an-unknown-kind",
+      {
+        ...page,
+        release: {
+          ...page.release,
+          os: {
+            ...page.release.os,
+            host_files: [
+              { ...page.release.os.host_files[0], kind: "directory" },
+            ],
+          },
+        },
+      },
+      false,
+    ],
+    [
+      "unknown-memory-rule",
+      {
+        ...page,
+        policy: {
+          ...page.policy,
+          admission: { ...page.policy.admission, memory_rule: "elastic" },
+        },
+      },
+      false,
+    ],
+    ["unknown-desired-state", withDatabase({ desired_state: "paused" }), false],
     [
       "memory-step",
       withDatabase({ resources: { ...database.resources, memory_mib: 300 } }),
@@ -848,6 +1085,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
         ],
       },
       false,
+      true,
     ],
     [
       "move-without-end",
@@ -895,6 +1133,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
         },
       }),
       false,
+      true,
     ],
     ["no-owner", withDatabase({ roles: [reader] }), false, true],
     [
@@ -907,6 +1146,29 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     [
       "owner-removed",
       withDatabase({ roles: [owner, { name: "app", state: "absent" }] }),
+      false,
+      true,
+    ],
+    // A role is present or removed, never both: the schema the node holds is open, so that a
+    // present role that also says `state: "absent"` matches either variant, and the removal drops
+    // the role (`roles_valid`).
+    [
+      "role-both-present-and-removed",
+      withDatabase({ roles: [owner, { ...reader, state: "absent" }] }),
+      false,
+      true,
+    ],
+    [
+      "removal-with-a-property-of-a-present-role",
+      withDatabase({
+        roles: [owner, { name: "report", state: "absent", bypass_rls: false }],
+      }),
+      false,
+      true,
+    ],
+    [
+      "role-with-a-state-that-is-not-absent",
+      withDatabase({ roles: [owner, { ...reader, state: "present" }] }),
       false,
       true,
     ],
@@ -1081,6 +1343,37 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
     ["with-events", { ...observations(), events: [reportEvent] }, true],
     [
+      // The `wake_detail` of a wake on the slot path has 13 fields: the 9 of the detail and
+      // `slot_from`, `slot_wait_us`, `bind_us` and `order_us`. The bound has to hold them.
+      "event-with-the-fields-of-a-wake-on-the-slot-path",
+      {
+        ...observations(),
+        events: [
+          {
+            at: now,
+            event: "wake_detail",
+            database_id: id,
+            fields: {
+              slot_from: "pool",
+              slot_wait_us: 38_000,
+              bind_us: 9_000,
+              order_us: 1_200,
+              job_to_fork_us: 2_300,
+              fork_to_handoff_us: 33_886,
+              handoff_to_starting_us: 12_840,
+              starting_to_shut_down_us: 1_605,
+              shut_down_to_ready_us: 1_522,
+              nr_throttled: 2,
+              throttled_usec: 7_500,
+              steal_ms: 30,
+              steal_window_ms: 2_000,
+            },
+          },
+        ],
+      },
+      true,
+    ],
+    [
       "event-with-a-space",
       {
         ...observations(),
@@ -1109,7 +1402,10 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
           {
             ...reportEvent,
             fields: Object.fromEntries(
-              Array.from({ length: 17 }, (_, i) => [`f${i}`, i]),
+              Array.from(
+                { length: link.NODE_REPORT_EVENT_FIELDS_MAX + 1 },
+                (_, i) => [`f${i}`, i],
+              ),
             ),
           },
         ],
@@ -1174,6 +1470,37 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       false,
       true,
     ],
+  ],
+  NodeObservationAnswer: [
+    [
+      "one-of-each",
+      {
+        databases: [
+          { id, verdict: "accept" },
+          { id: other, verdict: "stale" },
+          { id: source, verdict: "conflict" },
+        ],
+        orders: 2,
+      },
+      true,
+    ],
+    ["a-fenced-node", { databases: [], orders: 1 }, true],
+    [
+      "unknown-verdict",
+      { databases: [{ id, verdict: "rejected" }], orders: 0 },
+      false,
+    ],
+    [
+      "no-identifier",
+      { databases: [{ id: "not-a-database", verdict: "accept" }], orders: 0 },
+      false,
+    ],
+    [
+      "negative-orders",
+      { databases: [{ id, verdict: "accept" }], orders: -1 },
+      false,
+    ],
+    ["an-unknown-key", { databases: [], orders: 0, hint: true }, false],
   ],
   NodeSample: [
     ["sample", sample, true],
@@ -1322,6 +1649,15 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
             reason: "no_room",
             retry_after_seconds: undefined,
           },
+        ],
+      },
+      true,
+    ],
+    [
+      "wake-on-the-slot-path",
+      {
+        events: [
+          { ...wake, phases_ms: { ...wake.phases_ms, slot: 38, bind: 9 } },
         ],
       },
       true,
@@ -1564,7 +1900,14 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
   ServerLinkMessage: [
     ["welcome", { type: "welcome", protocol: 1 }, true],
+    [
+      "welcome-with-another-property",
+      { type: "welcome", protocol: 1, ...later },
+      false,
+    ],
     ["desired", { type: "desired" }, true],
+    ["desired-with-another-property", { type: "desired", ...later }, false],
+    ["message-of-an-unknown-type", { type: "reboot" }, false],
     ["desired-ids", { type: "desired", ids: [id] }, true],
     ["desired-no-ids", { type: "desired", ids: [] }, false],
     ["apply", { type: "apply" }, false],
@@ -1581,19 +1924,76 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
 };
 
-/** Every schema vector; generation fails when the contract disagrees with a stated result. */
+type Issue = z.core.$ZodIssue;
+/** The `unrecognized_keys` issues of `issues`, with the absolute path of the object they name. */
+function unknownKeys(
+  issues: readonly Issue[],
+  prefix: PropertyKey[] = [],
+): { path: PropertyKey[]; keys: string[] }[] {
+  return issues.flatMap((issue) => {
+    const path = [...prefix, ...issue.path];
+    if (issue.code === "unrecognized_keys") return [{ path, keys: issue.keys }];
+    if (issue.code !== "invalid_union") return [];
+    // Of the variants of a union only one that fails for unknown properties alone is the value's.
+    return issue.errors
+      .filter((errors) => errors.every((e) => e.code === "unrecognized_keys"))
+      .flatMap((errors) => unknownKeys(errors as Issue[], path));
+  });
+}
+/**
+ * Whether `value` is valid once the properties its schema does not name are taken away, which is
+ * how the node reads a document it receives. Everything else (a missing property, a wrong type, a
+ * value out of its set or its bound, and the contract's own rules) must still hold.
+ */
+function validWithoutUnknownProperties(schema: z.ZodType, value: unknown) {
+  const current = structuredClone(value);
+  for (let round = 0; round < 8; round++) {
+    const result = schema.safeParse(current);
+    if (result.success) return true;
+    const unknown = unknownKeys(result.error.issues);
+    if (unknown.length === 0) return false;
+    for (const { path, keys } of unknown) {
+      let at = current as Record<PropertyKey, unknown>;
+      for (const key of path) at = at[key] as Record<PropertyKey, unknown>;
+      for (const key of keys) delete at[key];
+    }
+  }
+  return false;
+}
+
+/**
+ * Every schema vector; generation fails when the contract disagrees with a stated result.
+ * `valid` is the contract's verdict, which refuses a property it does not name; `node_valid` is
+ * the node's: the same for what the node sends, and for what it receives (`nodeReceives`) the
+ * verdict on the value without its unknown properties.
+ */
 export function nodeSchemaVectors() {
+  const received = new Set<string>(nodeReceives);
   return Object.entries(cases).flatMap(([schema, list]) =>
     list.map(([name, input, valid, refinement]) => {
       // JSON drops undefined fields, exactly as the wire does.
       const value: unknown = JSON.parse(JSON.stringify(input));
-      const result =
-        nodeSchemas[schema as keyof typeof nodeSchemas].safeParse(value);
+      const zodSchema = nodeSchemas[schema as keyof typeof nodeSchemas];
+      const result = zodSchema.safeParse(value);
       if (result.success !== valid)
         throw new Error(
           `${schema}/${name}: the contract says ${result.success}`,
         );
-      return { schema, name, valid, refinement: refinement ?? false, value };
+      // A refinement is a rule the value breaks whatever properties it has, and the node holds it
+      // too (the node's page rules), so it stays invalid for the node.
+      const node_valid =
+        !refinement &&
+        (valid ||
+          (received.has(schema) &&
+            validWithoutUnknownProperties(zodSchema, value)));
+      return {
+        schema,
+        name,
+        valid,
+        node_valid,
+        refinement: refinement ?? false,
+        value,
+      };
     }),
   );
 }
@@ -1647,7 +2047,7 @@ export async function packageVectors() {
  * a manifest with two of them swapped is another one. It carries no signature and no key: the
  * agent's tests make a throwaway key and sign the text.
  */
-export function releaseVectors() {
+export async function releaseVectors() {
   const pin = (name: string, digit: string, size: number) => ({
     url: `https://releases.example/${name}`,
     sha256: digit.repeat(64),
@@ -1655,6 +2055,13 @@ export function releaseVectors() {
   });
   const release = {
     id: "sha-0123456789ab",
+    // The image's four facts, each different from the others and from every digest below.
+    image: {
+      sha256: "c".repeat(64),
+      size_bytes: 520_000_000,
+      raw_sha256: "d".repeat(64),
+      raw_bytes: 2_147_483_648,
+    },
     binaries: {
       "pgcf-agent": pin("pgcf-agent", "1", 11_000_000),
       "pgcf-native-gateway": pin("pgcf-native-gateway", "2", 12_000_000),
@@ -1665,6 +2072,62 @@ export function releaseVectors() {
       image_version: "sha-0123456789ab",
       debian_snapshot: "20261016T000000Z",
       package_lock: pin("packages.lock.json", "5", 90_000),
+      // Every kind, mode and way to take effect, ascending by path, each digest different.
+      host_files: [
+        {
+          path: "/etc/ssh/sshd_config.d/10-pgcf.conf",
+          kind: "file",
+          mode: "0644",
+          sha256: "6".repeat(64),
+          size_bytes: 1500,
+          apply: "restart_unit:ssh.service",
+        },
+        {
+          path: "/etc/systemd/system/modprobe@loop.service",
+          kind: "symlink-to-dev-null",
+          apply: "daemon_reload",
+        },
+        {
+          path: "/usr/lib/sysctl.d/90-pgcf.conf",
+          kind: "file",
+          mode: "0644",
+          sha256: "7".repeat(64),
+          size_bytes: 800,
+          apply: "restart_unit:systemd-sysctl.service",
+        },
+        {
+          path: "/usr/lib/systemd/system/pgcf-agent.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "8".repeat(64),
+          size_bytes: 1100,
+          apply: "restart_unit:pgcf-agent.service",
+        },
+        {
+          path: "/usr/lib/systemd/system/pgcf-pg@.service",
+          kind: "file",
+          mode: "0644",
+          sha256: "9".repeat(64),
+          size_bytes: 4300,
+          apply: "next_start",
+        },
+        {
+          path: "/usr/lib/sysusers.d/pgcf.conf",
+          kind: "file",
+          mode: "0755",
+          sha256: "a".repeat(64),
+          size_bytes: 300,
+          apply: "sysusers",
+        },
+        {
+          path: "/usr/lib/tmpfiles.d/pgcf.conf",
+          kind: "file",
+          mode: "0644",
+          sha256: "b".repeat(64),
+          size_bytes: 400,
+          apply: "tmpfiles",
+        },
+      ] as HostFile[],
     },
   };
   link.NodeRelease.parse(release);
@@ -1673,6 +2136,8 @@ export function releaseVectors() {
       name: "distinct-digests",
       release,
       manifest: signedReleaseManifest(release),
+      // What a node that holds the release's host files reports in its hello.
+      host_files_sha256: await hostFilesSha256(release.os.host_files),
     },
   ];
 }

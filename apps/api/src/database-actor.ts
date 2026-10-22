@@ -1540,6 +1540,12 @@ export class DatabaseActor extends DurableObject<Env> {
       }),
     ]).finally(() => clearTimeout(timer));
   }
+  /**
+   * The keep-warm visit of an ActorWarmer (`actor-warmer.ts`). The call alone keeps this object's
+   * isolate loaded, which is what makes the next admission fast; so it reads and writes nothing:
+   * no row, no D1 statement, no counter, no clock and no ticket, and it creates no table.
+   */
+  warm(): void {}
   override async fetch(): Promise<Response> {
     return new Response(null, { status: 404 });
   }

@@ -174,6 +174,24 @@ it("also waits for the fence to be complete, whatever the databases proved", asy
   await expect(assertReinstallAllowed(env.DB, f.node)).resolves.toBeUndefined();
 });
 
+it("lets the owner's acknowledgement lift the missing proofs but never an incomplete fence", async () => {
+  const f = await node();
+  await f.declare();
+  await acknowledgeReinstallOverride(
+    env.DB,
+    f.node,
+    keyId,
+    "accepted",
+    Date.now(),
+  );
+  await expect(assertReinstallAllowed(env.DB, f.node)).rejects.toMatchObject({
+    code: "conflict",
+    message: expect.stringContaining("not fenced"),
+  });
+  await f.fenced();
+  await expect(assertReinstallAllowed(env.DB, f.node)).resolves.toBeUndefined();
+});
+
 it("guards AddNode in recover mode when it is requested and again when it is carried out", async () => {
   const f = await node();
   await configureNodeRegionPolicy(env.DB, {

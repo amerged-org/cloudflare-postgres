@@ -4,6 +4,7 @@ import {
   BACKUP_HEALTH_STATUSES,
   DISK_HEALTH_STATUSES,
   DatabaseId,
+  NODE_DATABASE_STALE_MS,
   NodeId,
   RegionId,
   Timestamp,
@@ -36,7 +37,7 @@ export const BackupHealth = HealthClock.safeExtend({
   status: z
     .enum(BACKUP_HEALTH_STATUSES)
     .describe(
-      "ok: last completed base backup at most 36 h old; stale: older; failing: the agent reports failing or the last failure is newer than the last completion; unknown: no agent report within 180 s, an unknown report, or no completed backup.",
+      "ok: last completed base backup at most 36 h old; stale: older; failing: the agent reports failing or the last failure is newer than the last completion; unknown: no agent report of the database within 45 min (a node names an unchanged database once in 15 min), an unknown report, or no completed backup.",
     ),
   last_completed_at: Timestamp.nullable(),
   last_failed_at: Timestamp.nullable(),
@@ -103,10 +104,11 @@ export function backupHealth(
     last_completed_at: completedAge === null ? null : sample!.last_completed_at,
     last_failed_at: failedAge === null ? null : sample!.last_failed_at,
   };
+  // A database's own report is repeated once in each anti-entropy period when nothing changed.
   if (
     !sample ||
     seconds === null ||
-    seconds * 1000 > NODE_OBSERVATION_MAX_AGE_MS ||
+    seconds * 1000 > NODE_DATABASE_STALE_MS ||
     sample.health === "unknown"
   )
     return result;

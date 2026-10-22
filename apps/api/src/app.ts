@@ -110,6 +110,7 @@ export const DIAGNOSTIC_ROUTES = new Set([
   "/node/v1/enroll",
   "/node/v1/installer/progress",
   "/node/v1/releases/:version/pgcf-node.raw.zst",
+  "/node/v1/releases/:version/host-files/:sha256",
   "/node/v1/releases/:version/:file",
   "/node/v1/link",
   "/node/v1/desired",

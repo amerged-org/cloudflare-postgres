@@ -20,8 +20,15 @@
 //! - The memory ceiling of `pgcf.slice`, which holds every database, is the operator's awake-database
 //!   budget (`set_slice_memory`): the kernel's backstop under either memory rule. The image's slice
 //!   has 80 % of RAM until the agent sets it.
+//! - A database's mounts for a sandbox that was built before the database was chosen: the volume
+//!   and the socket directory, handed over as idmapped clones into the sandbox's mount namespace
+//!   (`idmap`).
 //!
 //! The agent runs as root on the node; systemd answers these calls without further authorization.
+// `pgcf_idmap_lab` is set by RUSTFLAGS, not declared in the manifest.
+#![allow(unexpected_cfgs)]
+#[cfg(target_os = "linux")]
+pub mod idmap;
 pub mod journal;
 pub mod limits;
 pub mod ready;
@@ -32,8 +39,37 @@ mod dbus;
 use futures_util::StreamExt;
 use limits::{Limits, Property, cpu_quota, slice_memory};
 use pgcf_native_protocol::valid_pattern;
-use std::{num::NonZeroU32, path::PathBuf};
+use std::{future::Future, num::NonZeroU32, path::PathBuf, sync::Arc};
+use tokio::sync::Semaphore;
 use zbus::{proxy::CacheProperties, zvariant::OwnedObjectPath};
+
+/// How many calls about units are in flight at once: the reads of a unit's state and the changes
+/// of a unit's properties (a CPU quota, a limit). A read is a call and then five at once on the
+/// one connection to the bus, and the bus daemon allows a connection 128 calls that are not
+/// answered yet (dbus-daemon's `max_replies_per_connection`): past that every call fails with
+/// `LimitsExceeded`. A node decides on every database when its agent starts, and 300 reads at
+/// once failed 260 of them in the lab (Debian 13); 16 are at most 80 calls, which leaves the rest
+/// of the limit to the starts and stops that run beside them. The jobs of a start or a stop wait
+/// for systemd's signal for as long as they take and hold no place.
+const CALLS_IN_FLIGHT: usize = 16;
+
+/// systemd's answer to a call about a unit that is not loaded.
+const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
+
+/// The calls that may be in flight at once.
+#[derive(Clone)]
+struct Calls(Arc<Semaphore>);
+impl Calls {
+    fn new(limit: usize) -> Self {
+        Self(Arc::new(Semaphore::new(limit)))
+    }
+    /// Runs `call` when fewer than the limit are running. The waiting is in order.
+    async fn within<T>(&self, call: impl Future<Output = T>) -> T {
+        // The semaphore is never closed; a call that finds it so runs without a place.
+        let _place = self.0.acquire().await.ok();
+        call.await
+    }
+}
 
 /// Where the database volumes are mounted: `<DB_ROOT>/<id>` holds the data directory `data`.
 pub const DB_ROOT: &str = "/var/lib/pgcf/db";
@@ -152,6 +188,17 @@ pub struct UnitState {
     pub memory_max_bytes: Option<u64>,
 }
 impl UnitState {
+    /// A unit that systemd has not loaded: it has no process.
+    fn not_loaded(database: &str) -> Self {
+        Self {
+            database: database.to_string(),
+            active: ActiveState::Inactive,
+            main_pid: None,
+            invocation_id: None,
+            uid: None,
+            memory_max_bytes: None,
+        }
+    }
     /// From the raw values of the unit's D-Bus properties, which spell "none" as zero, `u32::MAX`
     /// and `u64::MAX`.
     pub fn from_properties(
@@ -186,6 +233,17 @@ pub enum Error {
     /// The unit finished starting but PostgreSQL is not the ready main process. The reason is one
     /// of `ready::ready_socket` or `unit_not_active`, `no_main_pid`, `no_uid`, `no_invocation_id`.
     NotReady(&'static str),
+    /// The unit does not run, and its cgroup still holds a process of an earlier start: a backend
+    /// that outlived its postmaster, or one that no signal could end ("Processes still around
+    /// after final SIGKILL"). The unit is `inactive`, `failed`, or `deactivating` with no job:
+    /// when the postmaster dies on its own, systemd stops what is left (`stop-sigkill`, then
+    /// `final-sigkill`) and accepts a start meanwhile, as job mode `fail` refuses only against a
+    /// pending job. systemd starts a unit over such a process ("Found left-over process ...
+    /// Ignoring"), and the new postmaster could not find it: the unit has an IPC namespace of its
+    /// own at every start, so PostgreSQL's check of the shared memory segment named in
+    /// `postmaster.pid` sees nothing, and the old backend would run beside the new postmaster on
+    /// one data directory.
+    StrayProcesses,
     /// systemd did something the agent does not understand.
     Unexpected(&'static str),
 }
@@ -196,6 +254,7 @@ impl std::fmt::Display for Error {
             Self::Bus(error) => write!(f, "systemd: {error}"),
             Self::Job { unit, result } => write!(f, "the job of {unit} ended with {result}"),
             Self::NotReady(reason) => write!(f, "PostgreSQL is not ready: {reason}"),
+            Self::StrayProcesses => f.write_str("the unit's cgroup still holds a process"),
             Self::Unexpected(what) => write!(f, "unexpected from systemd: {what}"),
         }
     }
@@ -263,15 +322,49 @@ fn monotonic_micros() -> Option<u64> {
     None
 }
 
-/// The `cpu.stat` of a database's unit in the cgroup tree, where its throttling is counted;
-/// `None` for an argument that is no database ID.
-pub fn cpu_stat_path(database: &str) -> Option<PathBuf> {
+/// A file of a database's unit in the cgroup tree; `None` for an argument that is no database ID.
+fn cgroup_file(database: &str, file: &str) -> Option<PathBuf> {
     valid_pattern("database", database).then(|| {
         PathBuf::from(format!(
-            "/sys/fs/cgroup/{SLICE}/{}/cpu.stat",
+            "/sys/fs/cgroup/{SLICE}/{}/{file}",
             unit_name(database)
         ))
     })
+}
+
+/// The `cpu.stat` of a database's unit in the cgroup tree, where its throttling is counted;
+/// `None` for an argument that is no database ID.
+pub fn cpu_stat_path(database: &str) -> Option<PathBuf> {
+    cgroup_file(database, "cpu.stat")
+}
+
+/// The `cgroup.events` of a database's unit: its `populated` line says whether any process is in
+/// the cgroup. The directory exists while the unit runs, and while a process of it remains.
+fn cgroup_events_path(database: &str) -> Option<PathBuf> {
+    cgroup_file(database, "cgroup.events")
+}
+
+/// Whether the text of a `cgroup.events` says that the cgroup, or one below it, holds a process.
+fn populated(events: &str) -> bool {
+    events.lines().any(|line| line.trim() == "populated 1")
+}
+
+/// A process of the cgroup that no start of the unit accounts for: the cgroup is populated and the
+/// unit is not running or starting its main process (`active`, `reloading`, `activating`,
+/// `refreshing`). `deactivating` is a stray too: it is a stop that has not ended, and a main
+/// process that died on its own leaves the unit there with no job for up to the stop timeouts
+/// while a process that no signal ends stays, so a start asked for then is accepted and runs over
+/// that process when the unit fails. A start asked for while a stop job is pending fails in job
+/// mode `fail` anyway, so the refusal changes nothing a legitimate caller does.
+fn stray_processes(active: ActiveState, events: &str) -> bool {
+    populated(events)
+        && !matches!(
+            active,
+            ActiveState::Active
+                | ActiveState::Reloading
+                | ActiveState::Activating
+                | ActiveState::Refreshing
+        )
 }
 
 #[derive(Clone, Copy)]
@@ -288,6 +381,7 @@ pub struct Units {
     connection: zbus::Connection,
     manager: dbus::ManagerProxy<'static>,
     db_root: PathBuf,
+    calls: Calls,
 }
 impl Units {
     /// Connects to the system bus and subscribes to systemd's job signals. `db_root` is where the
@@ -300,6 +394,7 @@ impl Units {
             connection,
             manager,
             db_root: db_root.into(),
+            calls: Calls::new(CALLS_IN_FLIGHT),
         })
     }
 
@@ -367,12 +462,33 @@ impl Units {
             .await?)
     }
 
-    /// The state of a database's unit. systemd loads a unit when it is asked for it, so a database
-    /// that never started is `inactive`, with the memory ceiling of the unit template.
+    /// The state of a database's unit. A unit that is not loaded has no process and is `inactive`,
+    /// and systemd is not asked to load it: reading a property of an unloaded unit loads it, which
+    /// reads the unit's files, and a node has hundreds of databases that are asleep (lab: 3.7 ms
+    /// for each of 300 against 0.2 ms to be told it is not loaded). The reads wait for a place
+    /// among `CALLS_IN_FLIGHT`.
     pub async fn state(&self, database: &str) -> Result<UnitState, Error> {
         let unit_name = Self::unit_of(database)?;
-        let unit = self.unit_proxy(&unit_name, CacheProperties::No).await?;
-        let service = self.service_proxy(&unit_name).await?;
+        self.calls
+            .within(async {
+                let began = std::time::Instant::now();
+                let state = self.read_state(database, &unit_name).await;
+                crate::timing::UNIT_READ.add(began.elapsed());
+                state
+            })
+            .await
+    }
+
+    async fn read_state(&self, database: &str, unit_name: &str) -> Result<UnitState, Error> {
+        match self.manager.get_unit(unit_name).await {
+            Ok(_) => {}
+            Err(zbus::Error::MethodError(name, ..)) if name.as_str() == NO_SUCH_UNIT => {
+                return Ok(UnitState::not_loaded(database));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let unit = self.unit_proxy(unit_name, CacheProperties::No).await?;
+        let service = self.service_proxy(unit_name).await?;
         let (active, invocation, pid, uid, memory) = tokio::join!(
             unit.active_state(),
             unit.invocation_id(),
@@ -451,10 +567,34 @@ impl Units {
     }
 
     /// Starts the unit and returns when PostgreSQL accepts connections. Dropping the future does
-    /// not stop the start.
+    /// not stop the start. A unit that does not run (`inactive`, `failed`, `deactivating`) but
+    /// whose cgroup holds a process is not started (`Error::StrayProcesses`).
     pub async fn start(&self, database: &str) -> Result<Started, Error> {
-        let requested = self.job(&Self::unit_of(database)?, JobKind::Start).await?;
+        let unit = Self::unit_of(database)?;
+        self.refuse_stray_processes(database).await?;
+        let requested = self.job(&unit, JobKind::Start).await?;
         self.started(database, requested).await
+    }
+
+    /// Refuses a start over a process that outlived the last one. The cgroup of a unit that is
+    /// stopped does not exist, so the common case is one failed `open`; the state is read only
+    /// where the cgroup is populated, because a unit that runs, or is starting, holds processes
+    /// of its own (`stray_processes`).
+    async fn refuse_stray_processes(&self, database: &str) -> Result<(), Error> {
+        let path = cgroup_events_path(database).ok_or(Error::InvalidDatabase)?;
+        let events = match std::fs::read_to_string(path) {
+            Ok(events) => events,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(Error::Unexpected("the unit's cgroup cannot be read")),
+        };
+        if !populated(&events) {
+            return Ok(());
+        }
+        let active = self.state(database).await?.active;
+        if stray_processes(active, &events) {
+            return Err(Error::StrayProcesses);
+        }
+        Ok(())
     }
 
     /// Waits for a unit that is starting, one the agent found `activating` when it started, and
@@ -493,8 +633,8 @@ impl Units {
         properties: &[Property],
     ) -> Result<(), Error> {
         let encoded: Vec<_> = properties.iter().map(dbus::encode).collect();
-        self.manager
-            .set_unit_properties(unit, runtime, &encoded)
+        self.calls
+            .within(self.manager.set_unit_properties(unit, runtime, &encoded))
             .await?;
         Ok(())
     }
@@ -523,6 +663,14 @@ impl Units {
         self.job(name, kind).await.map(drop)
     }
 
+    /// Has systemd read its unit files again (`systemctl daemon-reload`): what a release wrote
+    /// becomes the definition a unit starts with, and its stop settings are those of its next
+    /// stop. A unit that runs keeps its process, its exec and namespace settings and the limits of
+    /// its cgroup until it restarts (measured by the lab test of the host files).
+    pub async fn reload(&self) -> Result<(), Error> {
+        Ok(self.manager.reload().await?)
+    }
+
     /// Sets the CPU quota of a database's unit until the next boot, or lifts it with `None`.
     pub async fn set_cpu_quota(
         &self,
@@ -536,6 +684,11 @@ impl Units {
 
 #[cfg(test)]
 pub(crate) mod lab;
+
+// The privileged lab of `idmap` exists only in a build made for it: the unprivileged kernel step
+// of CI runs every ignored test and must not meet it.
+#[cfg(all(test, target_os = "linux", pgcf_idmap_lab))]
+mod idmap_lab;
 
 /// A fresh, private directory path below the temporary directory for a test, kept short because a
 /// Unix socket path must fit in `sun_path`. The test creates and removes it.
@@ -553,6 +706,80 @@ pub(crate) fn test_dir(label: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Hundreds of calls ask at once, and no more than the limit run: the rest wait for a place and
+    /// every one of them is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn calls_that_ask_at_once_run_no_more_than_the_limit_at_a_time() {
+        let calls = Calls::new(CALLS_IN_FLIGHT);
+        let (running, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let tasks: Vec<_> = (0..300)
+            .map(|n| {
+                let (calls, running, most) = (calls.clone(), running.clone(), most.clone());
+                tokio::spawn(async move {
+                    calls
+                        .within(async {
+                            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                            most.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            running.fetch_sub(1, Ordering::SeqCst);
+                            n
+                        })
+                        .await
+                })
+            })
+            .collect();
+        let mut answered = 0;
+        for (n, task) in tasks.into_iter().enumerate() {
+            assert_eq!(task.await.unwrap(), n);
+            answered += 1;
+        }
+        assert_eq!(answered, 300);
+        assert_eq!(most.load(Ordering::SeqCst), CALLS_IN_FLIGHT);
+    }
+
+    #[test]
+    fn a_cgroup_that_holds_a_process_is_populated() {
+        assert!(populated("populated 1\nfrozen 0\n"));
+        assert!(!populated("populated 0\nfrozen 0\n"));
+        assert!(!populated(""));
+        assert!(!populated("populated 10\n"), "the value is exactly 1");
+    }
+
+    #[test]
+    fn a_process_is_a_stray_unless_the_unit_runs_or_starts_it() {
+        let (held, empty) = ("populated 1\nfrozen 0\n", "populated 0\nfrozen 0\n");
+        // `Deactivating` is a stray: a unit whose main process died on its own is stopping its
+        // other processes with no job pending, and systemd accepts a start in that window (job
+        // mode `fail` refuses only against a pending job) and runs it over what survives the
+        // final SIGKILL.
+        for (active, own) in [
+            (ActiveState::Active, true),
+            (ActiveState::Reloading, true),
+            (ActiveState::Inactive, false),
+            (ActiveState::Failed, false),
+            (ActiveState::Activating, true),
+            (ActiveState::Deactivating, false),
+            (ActiveState::Maintenance, false),
+            (ActiveState::Refreshing, true),
+        ] {
+            assert_eq!(stray_processes(active, held), !own, "{active:?}");
+            assert!(!stray_processes(active, empty), "{active:?}");
+        }
+    }
+
+    #[test]
+    fn the_cgroup_files_of_a_unit_are_below_the_databases_slice() {
+        assert_eq!(
+            cgroup_events_path("abcdefghij0123456789"),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/pgcf.slice/pgcf-pg@abcdefghij0123456789.service/cgroup.events"
+            ))
+        );
+        assert_eq!(cgroup_events_path("../x"), None);
+        assert_eq!(cpu_stat_path("not a database"), None);
+    }
 
     #[test]
     fn a_unit_name_and_its_database_round_trip() {

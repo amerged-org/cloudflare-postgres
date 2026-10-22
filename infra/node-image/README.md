@@ -172,20 +172,30 @@ What the script does, and what the API checks:
 
 - It refuses a build whose compressed image, package lock or any of the four binaries is not the
   one `pgcf-node.json` describes (so binaries rebuilt since the image was built are refused: build
-  the image again), and a release name that is no version.
+  the image again), and a release name that is no version. It also derives the release's host
+  files from the checkout's `mkosi.extra` ([host-files.ts](host-files.ts)) and refuses a tree whose
+  list is not the one the summary states (`host_files_sha256`): check out the commit that was
+  built (`--tree DIR` names another tree).
 - It reads the signature and checks it against the release key before it uploads a byte: a release
-  without a signature, or with one that does not verify, is refused, because every node would refuse it.
+  without a signature, or with one that does not verify (the signature covers the image's compressed
+  and raw sha256 and size too), is refused, because the API and every node would refuse it.
 - It uploads `pgcf-node.raw.zst`, `packages.lock.json` and the four binaries to
-  `node-images/<version>/` with `x-amz-checksum-sha256`, so R2 itself verifies each digest. A file
+  `node-images/<version>/`, and every host file that has content to
+  `node-images/<version>/host-files/<sha256>` (two files of the same bytes are one object), with
+  `x-amz-checksum-sha256`, so R2 itself verifies each digest. A file
   that is already there with the same content (size, md5 and the sha256 R2 reports for it) is
   skipped, so a run that stopped half way is repeated. A file with the same size and md5 that R2
   holds no sha256 for, because another tool stored it, is sent again with the checksum: the API
   refuses a file without it. One with another content stops the run, because a registered release
   is never overwritten.
-- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file and the signature.
-  The API refuses a registration without a well-formed signature (64 bytes in hex; it holds no key,
-  so it stores and shows the signature and cannot check it). It refuses the registration
-  unless the bucket holds every file at that size with that sha256, and it names
+- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file, the host
+  files (path, mode, sha256, size and how each takes effect) with the digest a node that holds them
+  reports, and the signature. The API refuses a registration without a well-formed signature (64
+  bytes in hex), one whose signature is not the release key's signature of the registration's own
+  manifest (400: it verifies with the public key built into its code, so a signature of another
+  key, of another release or of other digests, an image's included, is refused and nothing is
+  stored), one whose host files digest is not the list's own, and one unless the bucket holds every
+  file and every host file at that size with that sha256, and it names
   every URL of the stored, immutable spec itself, as `/node/v1/releases/<version>/<file>` on its
   own origin (`NODE_API_ORIGIN`). Nothing in the registration is a URL or a credential. The script
   prints the release id and spec sha256 of the answer, and fails if the stored spec is another
@@ -238,11 +248,94 @@ offers the previous kernel through the `.old` links. A one-shot boot of the prev
 `grub-editenv /efi/grub/grubenv set next_entry=previous`, then reboot. The kernel console is on
 `tty0` (Contabo VNC) and `ttyS0`. Both entries carry `systemd.ssh_auto=no`.
 
+## What ships with the image, what with a release
+
+A node gets files two ways. The image is written once, at an install or a reinstall. A release
+reaches every running node, signed by CI (plan 9.3), and carries more than binaries.
+
+| Reaches a running node with a release, no reinstall | Needs a new image |
+| --- | --- |
+| The four binaries (`pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive`, `pgcf-wal-fetch`) | The bootloader and the kernel command line (`efi/grub/grub.cfg`) |
+| The Debian packages of the lock, in a maintenance cycle | The partition layout and first-boot partitioning (`mkosi.repart`, `usr/lib/repart.d`), `fstab` |
+| **The host files**: the systemd units and masks (`/usr/lib/systemd/system`, `/etc/systemd/system`) and the sshd, journald, sysctl, tmpfiles, sysusers and modprobe configuration (the allow-listed directories of [host-files.ts](host-files.ts)) | The firewall (`nftables.conf`), sshd's data files (`pgcf_revoked.krl`, `principals/`), the generator mask `systemd-ssh-generator`, the presets (which units are enabled), the links `/usr/libexec/pgcf/*`, `mkosi.skeleton` (package configuration at install) |
+| | The initial boot and cloud-init, the installer and the installer's userData |
+| | The first agent that can write host files (an agent of an earlier build refuses a page whose release lists them), and a change of the mount topology (see the rules below: nothing refuses it, and it must not reach a running node) |
+
+Everything in `mkosi.extra` is one or the other, and the build stops at a file that is neither:
+`HOST_FILE_APPLY` in [host-files.ts](host-files.ts) says how each host file takes effect, and
+`IMAGE_ONLY` lists the rest with the reason. [host-files.test.ts](host-files.test.ts) and
+[units.test.ts](units.test.ts) hold the tables to the tree.
+
+### Changing a unit or a configuration file without a new image
+
+1. Edit the file in `infra/node-image/mkosi.extra` (a new file in an allow-listed directory also
+   needs its row in `HOST_FILE_APPLY`; the registration says so if it is missing). Nothing else.
+2. Merge. CI builds the image, whose summary pins the digest of the host files of that tree, runs
+   the registration's dry run, and the `sign-release` job has the signer sign the release: the
+   signed text carries every host file with its digest and how it takes effect.
+3. Register the signed build (`register-node-image.ts`, from a checkout of the commit that was
+   built) and assign it to the region (`PUT /v1/regions/<region>/release`).
+4. Each node's agent installs the binaries first, and then writes the files that differ: if the
+   agent's own binary changed, the agent that runs after its restart writes them. It holds the
+   signed list to its own rules just before it writes (a list its rules do not allow is refused for
+   its files only, the binaries are installed all the same), runs `systemd-sysusers` and
+   `systemd-tmpfiles --create` on the files that say so (`sysusers`, `tmpfiles`), reads systemd's
+   units again once, and then restarts what changed (the gateway, cloudflared, ssh, journald,
+   systemd-sysctl; the agent's own last). The agent's own unit is first written to
+   `/run/systemd/system`, which systemd reads before `/usr/lib/systemd/system` and which a boot
+   empties; the agent that runs it moves it to its place once it has read its first page, and a
+   node whose new unit cannot start is restarted from the API (Contabo) and runs the unit it had
+   ([recovery](../../docs/operations/recovery.md#the-agent-does-not-come-back-after-a-release)).
+   What a running per-database unit (`pgcf-pg@.service`, `next_start`) takes from the new template
+   is measured on Debian 13's systemd 257 (the lab test `a_reload_changes_what_the_next_stop_does_and_a_start_what_a_running_instance_is_made_of`):
+   the reload loads the file, so `KillSignal=`, `TimeoutStopSec=` and `ExecStop=` (the stop
+   settings the lab measured) are those of the instance's next stop and `systemctl show` already reports the new
+   resource settings, but the running process, its exec and namespace settings (`ExecStart=`,
+   `MountImages=`, `PrivateMounts=`, `User=`) and the limits its cgroup enforces (`MemoryMax=`,
+   `TasksMax=`, `CPUWeight=`) stay as they were until the database's next start. The slot template
+   (`pgcf-slot@.service`, below) is `next_start` the same way, and the agent stops its idle slots after the reload and
+   builds them again from the new file (plan 11.2, package P; the agent code is not written yet). A failed reload,
+   run or restart stays in the record and is tried again with a growing wait (5 s up to 5 min),
+   not with every page; one unit that fails to restart does not keep the others from theirs, and
+   the node does not report the release's files as held until all of it is done.
+5. Check `GET /v1/nodes/{id}`: `os.host_files_sha256` is the release's `spec.os.host_files_sha256`
+   and `os_converged` is true. A refused or failed apply is a node event with a class and no
+   contents: `release_refused` with `host_file_path_refused`, `host_file_mode_refused`,
+   `host_file_apply_refused` or `host_files_invalid` when the signed list breaks the agent's own
+   rules (once per release), `host_files_not_applied` for a file that could not be read, written
+   or told to systemd, and `agent_unit_promoted` when the agent's new unit has moved to its place.
+
+Three rules keep a release safe on a node that already runs. They hold because the order of an
+update is fixed (the binaries first, the host files after them, the packages of the lock only in
+the maintenance cycle), and nothing but the author of the change checks them:
+
+- **A new agent starts under the previous agent unit.** The binary is switched before the unit is
+  written, so the new `pgcf-agent` first runs under the unit of the release before. A binary that
+  needs its new unit (a path, a user, a directory, a socket activation, a changed `Type=`) would
+  crash-loop and never write that unit. Ship such a change in two releases: the first is an agent
+  that runs under both units, the second changes the unit.
+- **A host file works with the packages of the release before.** The files land before the
+  packages of the lock, which wait for the maintenance cycle. A flag of cloudflared or an option of
+  sshd that only the new lock's version understands fails at its restart, and the tunnel or sshd is
+  down until the cycle. Ship such a change in two releases: the lock first (a cycle), the file
+  after.
+- **A change of the mount topology must not reach a running node.** A release that changes
+  `MountImages=` or `PrivateMounts=` in these files is written to every running node, and nothing
+  refuses it: the running databases keep the topology they started with, the next start of each
+  takes the new one, and a node holds both until every database has slept. Do not assign such a
+  release to a region that has running nodes; V4h's change reached EU1 with a reinstall.
+
+The agent runs the `sysusers` and `tmpfiles` files of a release before it reads systemd's units
+again and before any restart in the same release, so a unit may need the users and directories
+that the release makes, and a unit with `Restart=always` that crashes after the reload comes back
+under its new definition with them in place.
+
 ## Units
 
 | Unit | Runs as | Notes |
 | --- | --- | --- |
 | `pgcf-pg@<id>.service` | `pgcf-<id>` | One PostgreSQL per database, in `pgcf.slice`; started only by the agent |
+| `pgcf-slot@<n>.service` | `pgcf-slot-<n>` | The sandbox of a database unit built before a wake, for no database; a supervisor waits in it for the agent's order ([The slot unit](#the-slot-unit)); started only by the agent |
 | `pgcf.slice` | | All databases; the agent sets the awake-database memory budget, 80 % of RAM until then |
 | `pgcfbackup.slice` | | barman-cloud jobs (transient units the agent starts); 512 MiB, CPU and IO weight 20; no dash in the name, because systemd nests `pgcf-backup.slice` inside `pgcf.slice` and the jobs would run under the databases' memory ceiling |
 | `pgcf-agent.service` | root | `pgcf-agent run`, `Type=notify`; a mount namespace of its own, `PrivateMounts=yes` (see [The agent unit](#the-agent-unit)); creates `/run/pgcf/agent` |
@@ -311,7 +404,8 @@ package from creating a default cluster.
 - **Limits:** `MemorySwapMax=0`, `TasksMax=64` and, until the agent applies the database's size, the
   smallest class (`MemoryMax=256M`, `MemoryHigh=230M`). The agent sets `MemoryMax`, `MemoryHigh` (90 %),
   `CPUWeight`, `IOWriteBandwidthMax`, `IOWriteIOPSMax` and `TasksMax` as persistent unit properties
-  (`SetUnitProperties`), never by `daemon-reload`. `CPUQuota` is set only after ready and cleared
+  (`SetUnitProperties`), never by `daemon-reload`. `CPUQuota` is set only after ready (for a wake, after the policy's `cpu_boost_ms`, so that the
+  start-up and the first requests are not throttled) and cleared
   at stop with the empty assignment `CPUQuota=` (`CPUQuotaPerSecUSec` = `UINT64_MAX` over D-Bus
   `SetUnitProperties`): a unit property outlives the stop and would throttle the next start.
   `CPUQuota=infinity` is no value: systemd rejects it ("Invalid CPU quota") and ignores a drop-in
@@ -320,17 +414,102 @@ package from creating a default cluster.
   `PG_OOM_ADJUST_VALUE=0`: the postmaster is protected, backends are not.
 - **Sandbox:** `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
   `ProtectSystem=strict` with only the unit's own volume (a mount of its own) and the socket
-  directory writable; `ProtectHome`, `PrivateTmp`, `PrivateDevices`, a private `/dev/shm` of 64 MiB
-  mounted `noexec,nosuid,nodev`
-  (`TemporaryFileSystem`; a database's own size goes in a drop-in that applies at its next start);
+  directory writable; `ProtectHome`, `PrivateDevices`, and a private `/dev/shm` of 64 MiB, `/tmp`
+  and `/var/tmp` of 16 MiB and 1,024 files each, mounted `noexec,nosuid,nodev` (`TemporaryFileSystem`,
+  not `PrivateTmp`, which is a directory on the host's disk; a database's own `/dev/shm` size goes
+  in a drop-in that applies at its next start);
   `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`,
   `ProtectProc=invisible`, `ProcSubset=pid`; `RestrictNamespaces`, `RestrictRealtime`,
   `RestrictSUIDSGID`, `LockPersonality`, `NoNewPrivileges`, an empty `CapabilityBoundingSet`,
-  `RemoveIPC`; `SystemCallFilter=@system-service` minus `@privileged @resources` and minus what
+  `RemoveIPC`, `PrivateIPC` and `InaccessiblePaths=-/run/lock -/dev/mqueue -/dev/pts
+  -/var/log/journal -/run/log/journal` (below);
+  `SystemCallFilter=@system-service` minus `@privileged @resources` and minus what
   kernel exploits use as a second stage and PostgreSQL does not need (`@keyring`,
   `io_uring_setup/enter/register`, `userfaultfd`, the SysV message queues and semaphores `msg*` and
   `sem*`, the POSIX message queues `mq_*`; `shmget`, `shmat`, `shmdt` and `shmctl` stay; a forbidden
   call kills the process), `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`.
+- **Nothing writable is shared with another unit** (`PrivateIPC=yes`, `InaccessiblePaths=-/run/lock
+  -/dev/mqueue -/dev/pts -/var/log/journal -/run/log/journal`, and `/tmp` and `/var/tmp` as tmpfs of
+  the unit). Found on EU1 by the node lab, 2026-10-20: inside the full directive set a database's
+  user could create files in `/run/lock` (a 5 MiB tmpfs of the whole node, mode 1777) and in
+  `/dev/mqueue` (the host's queues, mode 1777). The enumeration of what the user can write, made in
+  the lab for this change, found a third: `/dev/pts` is the host's devpts, bound into the private
+  `/dev`, and one user allocated 3072 of the kernel's 4096 ptys from it (the listing shows every
+  unit's). Every unit shared them: a place where one tenant leaves what another reads, files that
+  outlive the unit in a tmpfs that LVM keeps its lock directory in, and a pty table one tenant can
+  fill. PostgreSQL uses none of them. Measured on systemd 257.13 (Debian 13, privileged container
+  with systemd as PID 1, the repository's unit with the volume bound from a directory):
+  `PrivateIPC=yes` gives the unit a new IPC namespace and a mqueue instance of its own (a different
+  `st_dev`, a file made in one is not in the other) but leaves the directory writable, so
+  `/dev/mqueue` is inaccessible as well: the filter denies `mq_open`, and creating a file in the
+  directory makes the same queue. The inaccessible directories answer `EACCES`, and `/var/lock`, a
+  link to `/run/lock`, with them. PostgreSQL 18.6 starts and serves in the unit (DDL, DML, a
+  parallel query through dynamic shared memory in the private `/dev/shm`, a clean stop and a start
+  after it): its SysV segment (56 bytes) is in the unit's namespace and in no other, and semaphores
+  are the unnamed POSIX ones in shared memory. `RemoveIPC=yes` stays: it removes the objects of the
+  user in the host's namespace, where a job of the same user could leave some. What
+  `PrivateIPC=yes` costs the interlock is under Not set below.
+  **The journal.** journald's `SplitMode=uid` (the default) keeps
+  `/var/log/journal/<machine>/user-<uid>.journal` (and `/run/log/journal/...` before the flush) for
+  every database uid, with a POSIX ACL that grants that uid read access, in a directory every user
+  may traverse (EU1: 371 files, read-only check of 2026-10-20). The unit's user reads its own file
+  (the lab shows it): its PostgreSQL log, DETAIL lines with data values included. That is a leak
+  between tenants as soon as a uid is used twice, and the agent does that: `Users::release` frees a
+  database's uid when the database leaves the node, `remove_account` deletes no journal file, and
+  `allocate` gives the uid to a later database whose SHA-256 preference or linear probe lands on
+  it, which then reads the former owner's `user-<uid>.journal` and its archived files by the
+  numeric ACL (in the lab the deleted databases left eight such files behind, and a process with
+  the uid of one read it while another uid could not). Both journal directories
+  are inaccessible in the unit now; PostgreSQL logs through `/run/systemd/journal/stdout`, which
+  stays (the lab shows its lines in the journal by invocation, the way the agent reads them).
+  [pgcf-split.conf](mkosi.extra/usr/lib/systemd/journald.conf.d/pgcf-split.conf) sets
+  `SplitMode=none` and removes the files at the source: journald makes no new per-uid file (lab,
+  systemd 257.13: without the file `user-301000.journal` appears with the first line a slot logs,
+  readable by uid 301000 and not by an unrelated uid; with it the line is in the system journal). The files
+  made before stay until journald vacuums them by age, and the unit does not see them.
+  **Scratch space.** `PrivateTmp=yes` made `/tmp` and `/var/tmp` directories on the host's root
+  filesystem (8 GiB, no quota), and disk blocks are no memory that `MemoryMax` counts: an awake
+  tenant could fill the root filesystem, which stops the journal and the agent's state writes for the
+  whole node. They are tmpfs of the unit now, 16 MiB and 1,024 files each (`TemporaryFileSystem`,
+  `noexec,nosuid,nodev`, as the 64 MiB of `/dev/shm`), their pages count in the unit's memory, and
+  a write past the limit fails (the boot test writes 17 MiB). PostgreSQL uses neither directory.
+  **Not bounded: the socket directory.** `/run/pgcf/<id>` is a directory on the node's `/run`
+  tmpfs, and the unit's user writes there (the socket and its lock file). Lab, 2026-10-20 (a unit
+  with `MemoryMax` 256 MiB, `MemoryHigh` 230 MiB and no swap): a file a tenant writes there is the
+  unit's memory while the unit runs (the writer is throttled at `MemoryHigh` and stops near
+  245 MiB), and it stays when the unit stops, charged to `pgcf.slice` and counted in `/run` (215
+  MiB used after the stop). A tenant can leave up to its `MemoryMax` in `/run` for good, and enough
+  databases fill `/run`: the device links under `/run/pgcf/dev`, systemd's runtime files and LVM's
+  locks stop working, and no database on the node can wake. This is open (plan 11.2): the files
+  have to leave with the unit, either by the agent emptying the directory at every stop or by a
+  tmpfs of its own with a size and an inode limit; a tmpfs per database in PID 1's namespace would
+  cost every start about 1 ms per database (Stage 1), so the pool's design (package P)
+  decides.
+  **What a database's user can still write**, enumerated inside the running unit as that user
+  (`find / -writable`, symbolic links resolved): its own volume, its socket directory and the socket
+  and lock file in it, the private `/tmp`, `/var/tmp` and `/dev/shm`, and the pressure file of its
+  own cgroup (systemd hands it to the unit's user); the character devices of the private `/dev`
+  (`null`, `zero`, `full`, `random`, `urandom`, `tty`), which hold nothing; and sockets, each on the
+  boot test's explicit list and each answered by a service that checks its caller:
+  - journald's `/run/systemd/journal/socket`, `dev-log` and `stdout` (the unit's log goes there);
+  - systemd's notify socket `/run/systemd/notify` (only the main process of a unit with
+    `NotifyAccess=main` counts) and its varlink sockets, `io.systemd.*` in `/run/systemd` and in its
+    `userdb`, `netif` and `resolve` directories (PID 1, networkd and hostnamed make them; each
+    answers by the caller's rights);
+  - D-Bus's system bus socket `/run/dbus/system_bus_socket`, where the bus policy and polkit refuse
+    a change;
+  - **the agent's archive socket `/run/pgcf/agent/archive.sock`** (mode 0666 in the agent's
+    `RuntimeDirectory=pgcf/agent`, mode 0755; `archive/server.rs`). It is the endpoint every
+    database's archive command calls (`pgcf-archive`, `pgcf-wal-fetch`), and it authorizes a call by
+    the kernel's report of the caller's uid (`SO_PEERCRED`) alone, which names one database while a
+    uid belongs to one. A uid used by a second database (the pool, plan 11.2) needs more than the
+    uid: the slot's cgroup and invocation.
+  The gateway's socket `/run/pgcf/agent/gateway.sock` is mode 0600 and not on the list. The boot
+  test enumerates the directories, regular files, sockets and FIFOs a database's user can write and
+  fails on any other than the unit's own or those on the list (a FIFO is never expected), so the
+  image's sockets and the next one anyone adds are seen. The backup jobs (`archive/job.rs`) run as
+  the database's user with a smaller set and still see the host's `/run/lock` and `/dev/mqueue`;
+  they run the node's barman, not a tenant's code, so they are not closed here.
 - **Device policy:** with `PrivateDevices=yes` the policy is closed, and systemd adds to the policy of
   every unit with `MountImages=` the devices that image dissection touches: `block-device-mapper`,
   `block-blkext` and `block-loop` (`rwm`), `/dev/mapper/control` and `/dev/loop-control` (`rw`), next
@@ -356,9 +535,143 @@ package from creating a default cluster.
   cannot make a volume made with the gap unmountable (every such filesystem ends 4 MiB before its
   volume, see below); a volume made before the gap existed has no such protection until it grows
   (see the rollout below).
-- **Not set:** `PrivatePIDs` and `PrivateIPC`, because PostgreSQL's `postmaster.pid` interlock needs
-  them off (the lab showed a second unit on the same directory being refused); `unix_socket_group`,
-  because PostgreSQL would call `chown`, which the filter kills.
+- **Not set:** `PrivatePIDs`, because PostgreSQL's `postmaster.pid` interlock needs the units to
+  share the PID namespace: a second postmaster on a running database's directory finds the first
+  with `kill(pid, 0)`. `unix_socket_group`, because PostgreSQL would call `chown`, which the filter
+  kills.
+- **What `PrivateIPC=yes` takes from the interlock, and what replaces it.** PostgreSQL refuses a
+  second postmaster on a data directory in two ways: the pid in `postmaster.pid` is alive
+  (`kill(pid, 0)`), and the SysV segment named there is still attached. The second way is what
+  protects a database from a backend that outlives its postmaster, and a new IPC namespace at every
+  start blinds it. Lab (systemd 257.13, PostgreSQL 18.6): a backend was stopped (`SIGSTOP`), its
+  postmaster killed (`SIGKILL`), and the segment stayed attached (`nattch` 1). A second postmaster in
+  the same IPC namespace was refused ("pre-existing shared memory block ... is still in use"); one
+  in a new IPC namespace, which `PrivateIPC=yes` gives every start, ran "database system was not
+  properly shut down; automatic recovery in progress" while the old backend was alive. The real path
+  to it is a backend in uninterruptible sleep through both stop timeouts ("Processes still around
+  after final SIGKILL"): the unit is `failed` with a process in its cgroup, the sleep proof fails,
+  the agent starts the unit to recover the database, and systemd starts a unit over a process of its
+  cgroup ("Found left-over process ... while starting unit. Ignoring."; reproduced in the lab, where
+  the new postmaster recovered the data directory beside the stopped backend). The same start is
+  accepted earlier, while the unit is still `deactivating`: when the postmaster dies on its own,
+  systemd stops what is left (`stop-sigkill`, then `final-sigkill`, each of them
+  `TimeoutStopSec`, up to 60 s with the template's 30 s) with no main process and no job, and job
+  mode `fail` refuses a start only against a pending job. The start is accepted as a job that
+  waits, and it runs over the process when the unit has failed (lab, systemd 257.13: a backend in
+  uninterruptible sleep on a frozen filesystem, `fsfreeze`). **The agent refuses that start:**
+  `Units::start` reads the unit's `cgroup.events`, and a unit whose cgroup says `populated 1` is
+  not started unless it is `active`, `reloading`, `activating` or `refreshing`: `failed`,
+  `inactive` and `deactivating` are refused (`Error::StrayProcesses`, the diagnostic class
+  `units_stray_processes`); the wake or the recovery fails like any failed start, is tried again,
+  and goes through when the process is gone. A start asked for while a stop job is pending failed
+  at systemd before (job mode `fail`), so no legitimate start changes; a unit that runs, starts or
+  reloads is passed on to systemd as before. A stopped unit has no cgroup, so the common case is
+  one failed `open`. The lab test
+  `a_start_is_refused_while_the_unit_stops_over_a_process_no_signal_ends` (`units/lab.rs`) freezes
+  a database's filesystem so that a process of the unit sleeps in the kernel, kills the
+  postmaster, and asks for a start in each of the two states (`deactivating`, then `failed`); it
+  fails without the refusal (the start is accepted and waits behind the stop) and passes with it,
+  and the start goes through after the filesystem thaws. The pid half
+  still refuses a second postmaster of the same user
+  while a postmaster lives (the boot test asserts it). Neither half refuses one of another user:
+  `kill` answers `EPERM`, which PostgreSQL reads as a stale file (`miscinit.c`), and an unreadable
+  segment as foreign (`sysv_shmem.c`, `EACCES`): a database has one user, so the agent's one writer
+  per database is what stops a second start today, and a pooled slot user needs the supervisor's
+  lock (plan 11.2, package P).
+
+### The slot unit
+
+[pgcf-slot@.service](mkosi.extra/usr/lib/systemd/system/pgcf-slot@.service) is the sandbox of a
+database unit built before a wake, for no database (plan 3.1, 5.5; package P). The agent keeps idle
+slots, one unit per number `n`; a wake takes one instead of making systemd's executor build the
+sandbox while the request waits (what that costs is in plan 11.1). An idle slot runs the supervisor, `pgcf-archive
+slot <n>`, which binds `control` in its `RuntimeDirectory=`, sends `READY=1` and waits for root.
+The agent then binds the database (its limits as unit properties, its volume and socket directory
+as mounts moved into the slot's mount namespace, each a clone that maps the slot's user to the
+database's uid on disk), and sends one order, `exec <id> <major>`; the supervisor locks the data
+directory and executes the postgres command line of `pgcf-pg@.service` in place. A slot serves one
+database for one awake period and ends with its stop. The unit file, its tests and the host files
+are done; the supervisor (`apps/pgcf-archive`) and the agent's pool are other packages, so nothing
+starts a slot yet.
+
+- **The sandbox is the database unit's, directive by directive (D13).** `units.test.ts` holds three
+  tables, each row with its reason, and fails when a directive of `pgcf-pg@.service` is missing
+  from the slot unit, differs, or when the slot unit has one that the tables do not name. Not
+  carried: `AssertPathExists=`, `MountImages=` and `ReadWritePaths=` for a database, because the
+  volume and the socket directory arrive after the start. Changed: the description, the user and
+  group, `ExecStart=` (the supervisor) and the idle limits (`MemoryMax=32M`, `MemoryHigh=28M`,
+  `CPUWeight=10`; `MemorySwapMax=0` and `TasksMax=64` as before): the agent sets the database's own
+  at the bind and these again when it builds the slot for its next incarnation, because a runtime
+  property outlives a stop, and the 32M is the placeholder that the lab of idle slots (memory and
+  slab of eight of them) replaces. Added: `StartLimitIntervalSec=0` (slot numbers restart all the
+  time, and systemd's limit of five starts in ten seconds would refuse them) and
+  `RuntimeDirectory=pgcf/slot/%i` with mode 0700. Everything else is carried, and the tests that
+  state the isolation of a database unit (no start process, the system-call filter, `/dev/shm`,
+  `PrivateIPC` with the five inaccessible paths, the tmpfs `/tmp` and `/var/tmp`) run against both
+  units.
+- **A pooled user per slot.** `pgcf-slot-<n>`, uid and gid `300000 + n` (`n` from 0 to 1023): below
+  systemd's container range at 524288, above the agent's database range 200000 to 299999, and
+  outside the dynamic range. Files on disk keep the database's own uid (the mounts map it), so
+  the plan's "a fixed user per database" holds for everything that is stored; the one exception
+  is the process, which runs under a uid that a second database uses after the first. That is
+  acceptable only while nothing keeps something by uid for the next tenant to find, and that is
+  what the rest of this section closes and the boot test enumerates. It asserts the same of a
+  second incarnation as of the first: the closed places below, journald's split, and the kernel
+  keyrings read as the uid.
+- **What keeps things by uid, and how each is closed.** The IPC namespace (`PrivateIPC=yes`, and
+  `RemoveIPC=yes` for the host's); `/run/lock` and `/dev/mqueue` (inaccessible); `/dev/pts`
+  (inaccessible); the journal (`SplitMode=none` as a host file, and the two directories
+  inaccessible in the unit); the kernel keyrings (`@keyring` is denied by the filter, so no process
+  of the unit adds a key; the one keyring the uid holds while a slot runs is the anonymous session
+  keyring `_ses` that systemd gives every service (`KeyringMode=private`) and the kernel frees
+  after the stop. The user keyring `_uid.<uid>` and every key in it would stay in the kernel after
+  the last process of the uid has exited, and `/proc/keys` lists only the keys that its reader may
+  view, root none of another uid's: the boot test reads it **as the uid** and requires none after
+  each stop); the writable
+  mounts and files (`/tmp`, `/var/tmp` and `/dev/shm` are tmpfs of the unit, the control directory
+  is its `RuntimeDirectory=`, which systemd removes at the stop; only the leaf goes, the
+  directories above it belong to the other slots); files in the cgroup tree (the unit's own
+  pressure files, which go with the cgroup).
+- **Second postmaster.** PostgreSQL's own guard fails between two uids (see Not set above), so the
+  supervisor's `flock` on the data directory is what refuses a second postmaster, in a slot or
+  beside a legacy database unit; the PID namespace stays shared as in the database unit.
+- **Device policy.** With no `MountImages=` the policy is `closed` with `char-rtc r` alone (from
+  `ProtectClock`), where the database unit's holds six entries.
+- **Boot test.** `slot_unit_sandbox` (rated SAFE and no worse than the database unit),
+  `slot_unit_device_allow`, the start and system-call-filter checks of the database unit run against
+  the slot as well (`database_unit_waits_for_recovery`, `database_unit_has_no_start_pre`,
+  `database_unit_syscall_filter`), `journal_not_split`, and three that
+  enumerate what a uid keeps. Two start the real template with a runtime drop-in that replaces
+  `ExecStart=` with a process that logs a line and waits (the supervisor is not under test); the
+  third needs no unit:
+  - `slot_isolation` starts slot 1000 twice, as two databases in turn. In each incarnation, as the
+    slot's user in the namespaces of its unit with no capability: `/run/lock`, `/dev/mqueue` and
+    `/dev/pts` refuse a file and a listing, both journal directories refuse a listing, the unit is
+    not in PID 1's IPC namespace, the host's SysV segment is not in it and it starts with no SysV
+    object, **every mount** of the unit's mount namespace that the user can write is one of the
+    private `/tmp`, `/var/tmp` and `/dev/shm`, the control directory and the unit's own cgroup
+    files, every directory and regular file it can write is the unit's own, every socket it can
+    write is on the list of endpoints that check their caller (the control directory aside), **every
+    file it can read and an unrelated uid (390000) cannot** is under its control directory, and the
+    control directory is `pgcf-slot-<n>` with mode 0700. The first incarnation writes a marker in
+    each writable place and makes a SysV segment; the second finds none. After each stop, from the
+    host: the control directory is gone and its neighbour is not, no file the uid can read and the
+    unrelated uid cannot, no file owned by the uid or its gid on any mounted filesystem (`/dev/mqueue`
+    included), no journal file of the uid in `/var/log/journal` or `/run/log/journal`, no SysV
+    object of the uid in the host's namespace and no key of the uid in `/proc/keys`, read as the uid.
+  - `slot_enumeration_sees_an_open_unit` runs the enumeration against the same template with
+    `InaccessiblePaths=` reset and `PrivateIPC=no`, and requires that it reports a file created in
+    `/run/lock` and in `/dev/mqueue`, `/dev/pts` and the journal directory not refused, PID 1's IPC
+    namespace and the host's SysV segment, so that the enumeration is not vacuous.
+  - `slot_keyring_probe_sees_a_key` is the same control for the keyring probe: a process of an
+    unrelated uid (390001) adds a key to its user keyring, and the probe that `slot_isolation` uses
+    after each stop must report it. Read as root the probe reports nothing of it, which is why it
+    reads as the uid.
+  The checks ran in a Debian 13 container with systemd 257.13 as PID 1 (the image's units and
+  journald files, the boot test's functions); the KVM boot test has not run them yet (plan 11.2).
+  A journal file as journald made them before the split was turned off, and which stay on a node,
+  is the control of `database_user_reads_no_journal`: the image has no `setfacl`, so the test writes
+  the ACL as the extended attribute that journald's files carry.
 
 ### The agent unit
 
@@ -371,18 +684,33 @@ before inside the namespace; the database units and the backup jobs mount their 
 (`MountImages=`).
 
 - The namespace ends with the agent. An agent restart (a release, a crash) ends every mount it made
-  and drops every device link; it mounts every current volume again when it gets its first desired
-  page, one after the other under the storage lock, and serves no wake before it has. The
-  databases that run are not touched: a unit has its own mount, which does not depend on the
-  agent's. A restart also ends the page cache of the volumes of sleeping databases (their last
-  mount is gone), so the first wake after it reads from disk: the plan measured about 300 ms more
-  on a cold first request. What the restart costs on EU1 is not measured. In the lab (loop-backed
-  thin pool, 300 volumes of 32 MiB, one agent's namespace) the mounts of 50, 100 and 300 volumes
-  took 0.20, 0.26 and 0.86 s (about 3 ms each, with each attach reading the whole mount table
-  again), and unmounting 300 took 1.1 s; the agent waits for all of them before it serves a wake.
-  Until it is measured on EU1 (Open in the plan), the remedy, if it is needed, is to keep the
-  agent's namespace across restarts (bind it under `/run` and enter it before the runtime starts)
-  or to serve wakes while the mounts are made; neither is built.
+  and drops every device link. The agent mounts a database's volume when it decides on the
+  database (`Core::reconcile`), after it has read the database's unit and its volume: the
+  databases that run first, then the others, 16 at a time, each mount waiting for the disk beside
+  the others. It serves the gateway as soon as it has decided on the databases that run (they
+  must be in its first table as running, or the gateway ends their sessions), not when it has
+  mounted every volume, and a wake for a database it has not decided on yet has the decision made
+  at once, its mount included. A start that was in flight when the agent began (a unit still
+  `activating`) stays counted by admission, with its memory, until the decision on its database ends
+  it: the unit's answer is read from its `postmaster.pid` through the agent's mount, so it is not
+  read, and not taken for a failure, before the mount is made. The databases that run are not touched: a unit has its own mount,
+  which does not depend on the agent's. A restart also ends the page cache of the volumes of
+  sleeping databases (their last mount is gone), so the first wake after it reads from disk: the
+  plan measured about 300 ms more on a cold first request.
+- The agent's exit unmounts its volumes 16 at a time (`Storage::unmount_all`) before the process
+  ends. A process that exits leaves its mount namespace, and the kernel unmounts what the
+  namespace holds one after the other, each as slow as the disk's flushes; the process is not gone
+  until it has, and systemd starts the next agent after it (EU1: 14 s to stop with 301 volumes).
+  A mount that is busy stays for the kernel.
+- What a restart costs is in the plan (11.1, "Agent start"), measured in a lab with a disk slowed
+  to EU1's mount time: 300 volumes, stop and start to the first served wake 76 s before the change
+  and 6 s after it. On EU1 (167 volumes) it is measured in the plan (11.1, the rollout of
+  `2f9901b3`); the events `agent_start_phase` of one restart (`process_start`, `storage_open`,
+  `device_links`, `restore_runtime`, `link_started`, `first_page`, `units_read`, `credentials`
+  (the archive credentials of the databases and the node's own, read at the same time), `apply`,
+  `settled`, `gateway_table`, `service_started`, with `link_hello` and `first_wake_served` beside
+  them, and `reconcile_first_pass` with the number and the summed time of the runs of `lvs`, the
+  mounts and the unit reads) say where its time went.
 - What the agent decides never rests on its own mount table alone, because a unit or a job mounts
   the volume in a namespace of its own, and the agent's own mounts end with its restart: whether a
   unit may start is the link (`attached`); which generation a running unit serves is its own
@@ -478,6 +806,11 @@ token or the route keyring changed.
   starts, because `/run` is empty after a boot. It clears the database's `CPUQuota` (`CPUQuota=`)
   whenever the database stops and, when the agent itself starts, for every stopped `pgcf-pg@` unit:
   a quota that outlived a stop or an agent crash would throttle the next start.
+- It does not start a database's unit while its cgroup still holds a process (`cgroup.events` says
+  `populated 1`) and the unit is not `active`, `reloading`, `activating` or `refreshing`, a
+  `deactivating` unit included: the unit has a new IPC namespace at every start, so PostgreSQL
+  could not find a backend that outlived its postmaster by its shared memory segment (see Not set,
+  above).
 - Its sockets are `/run/pgcf/agent/gateway.sock` (gateway only) and `/run/pgcf/agent/archive.sock`
   (databases, identified by uid); the archive clients are reached as
   `/usr/libexec/pgcf/pgcf-archive` and `/usr/libexec/pgcf/pgcf-wal-fetch`.
@@ -490,18 +823,41 @@ token or the route keyring changed.
   `current`. It restarts `pgcf-gateway` if the gateway's binary changed (the gateway is not drained
   first yet) and exits if its own changed, so that `Restart=always` starts the new one; the
   databases keep running. The previous release's directory stays, older ones go.
-- **The image's units and the agent's binary go together, in one order.** The units and the masks
-  (`pgcf-pg@.service`, `pgcf-agent.service`, the `modprobe@` masks) ship only with the image; a
-  release changes the binaries only. The new units mount the volume themselves from the link
-  `/run/pgcf/dev/<id>` and assert it; the agent makes the link. So: first a release whose agent
-  makes the link, which works on the old image (its agent unit has no private mount namespace, so
-  the volumes are in PID 1's, and the old database units assert the mount point, with none of
-  the gain in start time), then the new image on each node, which is a reinstall. The reverse is an outage: an agent from before the link on an image
-  with the new units makes no link, so every start of `pgcf-pg@` fails its assertion and no
-  database wakes. A node on the new image therefore never gets an older release: **never assign a
-  release older than the first one that makes the link to a region that has such a node.** Nothing
-  refuses it; the release assignment does not check the image (the maintenance cycle's `pgcf-agent
-  check` follows a package install, not a release move).
+- **The units and the agent's binary go together, in one order.** The units and the masks
+  (`pgcf-pg@.service`, `pgcf-agent.service`, the `modprobe@` masks) reach a node as host files of a
+  release (see above), after the binaries and by the agent that runs the release's own binary, so
+  a unit that asserts something the agent makes (the new `pgcf-pg@.service` mounts the volume from
+  the link `/run/pgcf/dev/<id>` and asserts it) is never written before the agent that makes it.
+  The change that introduced those units, `MountImages=` with `PrivateMounts=yes`, moves volumes
+  out of PID 1's mount namespace and no file delivers that, so it reaches a node with the image
+  (a reinstall), after a release whose agent makes the link (which works on the old image: its
+  agent unit has no private mount namespace, so the volumes are in PID 1's, and the old database
+  units assert the mount point, with none of the gain in start time). The reverse is an outage: an
+  agent from before the link on an image with the new units makes no link, so every start of
+  `pgcf-pg@` fails its assertion and no database wakes. A node on the new image therefore never
+  gets an older release: **never assign a release older than the first one that makes the link to
+  a region that has such a node.** Nothing refuses it; the release assignment does not check the
+  image (the maintenance cycle's `pgcf-agent check` follows a package install, not a release move).
+- **Host files** (`hostfiles.rs`, plan 9.3). After the binaries of a release are in place and the
+  signature held, the agent holds the signed list to its own rules (a list its rules do not allow
+  is refused for its files, once, with the class of the rule: the binaries are installed all the
+  same, because the rules are the agent's and the release may carry the agent that knows them), then
+  compares each file of the list with the disk (digest, size, mode, kind, owner) and writes what
+  differs: a hidden file beside the target is written, synced and renamed over it, and the directory
+  is synced, so a crash leaves the old unit or the new one and never a torn one. It never follows a
+  link (a directory on the way is opened with `O_NOFOLLOW` component by component, and a link at
+  the target is replaced), makes no directory but the last allow-listed one, leaves a directory at
+  a target alone and removes a path that an earlier list named and this one drops, whether the
+  agent wrote it or the image brought it (it keeps `agent/host-files.json` with the paths it owns
+  and what is left to tell systemd, saved before the first write, and restarts the unit that a
+  dropped file applied to). Then the runs of `systemd-sysusers` and `systemd-tmpfiles --create` on
+  the files that say so, then one `daemon-reload`, then the restarts in name order, the
+  agent's own last, each taken out of the record when done; a restart that fails does not keep the
+  others from theirs, and what failed is tried again after a growing wait. A reload and restarts
+  that a boot has made moot are dropped with the boot id. The agent's own unit is written to
+  `/run/systemd/system` and moved to its place by the agent that runs it, after its first page. It
+  reports the digest of the facts it reads from the disk in its hello, which is the release's
+  only when systemd has been told everything.
 - In the maintenance cycle (plan 9.3) it reads the release's package lock (the `packages.lock.json`
   of the image the release is built from), installs what differs from `dpkg` with
   `apt-get install --no-install-recommends --allow-downgrades -o Dpkg::Options::=--force-confold
@@ -572,7 +928,8 @@ token or the route keyring changed.
 - **Journal.** [journald](mkosi.extra/usr/lib/systemd/journald.conf.d/pgcf.conf) keeps at most
   1 GiB, at least 2 GiB free and 14 days on the 8 GiB root, and syncs to disk every 15 s instead of
   every five minutes, so that the minutes before a freeze are in the journal after the reboot.
-  After every reboot the agent posts the last 1,000 lines of the previous boot from `pgcf-agent`,
+  [pgcf-split.conf](mkosi.extra/usr/lib/systemd/journald.conf.d/pgcf-split.conf) keeps one journal
+  for every user (`SplitMode=none`; see The slot unit). After every reboot the agent posts the last 1,000 lines of the previous boot from `pgcf-agent`,
   `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, `ssh`, PID 1 and the kernel (`journalctl
   --boot=-1`, never the units of the databases or of the backup jobs, and an event line of the agent
   only as far as the observation report carries it), which the API keeps for 30 days, one report
@@ -645,5 +1002,5 @@ The guest reports one line per check on the second serial port:
 
 | Boot | Checks |
 | --- | --- |
-| First | no failed unit; nothing listens outside loopback; the journal syncs every 15 s (`systemd-analyze cat-config`); no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; `sshd -t` passes and `sshd -T` reports the operator shell's values; a certificate from a throwaway CA is refused on 127.0.0.1 and ::1, accepted once that CA is installed and refused again when it is removed; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`, and the slice carries the image's 512 MiB `MemoryMax`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check`, run in the agent's mount namespace, creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750; no volume is in PID 1's mount namespace and the agent's has the scratch volume; its filesystem ends at least 4 MiB before its volume; the database unit's `DeviceAllow` is `char-rtc r` and the five entries of `MountImages=` with a closed policy, a private `/dev` and no capability; the scratch database's user, inside its unit, finds no block node in `/dev`, cannot make one and cannot open a device-mapper node or its volume's device; a start of a unit without a link fails its assertion; the scratch database, started from its link, runs on across a restart of the agent, whose start has dropped every link, and stays awake into the reboot |
-| Second | no failed unit; loopback only; the journal syncs every 15 s; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database, with no volume in PID 1's mount namespace; the database that was awake at the reboot was stopped cleanly before the node went down, and neither PostgreSQL nor ext4 recovered anything at this start |
+| First | no failed unit; nothing listens outside loopback; the journal syncs every 15 s and is not split by uid (`systemd-analyze cat-config`); no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; `sshd -t` passes and `sshd -T` reports the operator shell's values; a certificate from a throwaway CA is refused on 127.0.0.1 and ::1, accepted once that CA is installed and refused again when it is removed; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls, and the slot unit does the same and rates no worse than the database unit; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`, and the slice carries the image's 512 MiB `MemoryMax`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check`, run in the agent's mount namespace, creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750; no volume is in PID 1's mount namespace and the agent's has the scratch volume; its filesystem ends at least 4 MiB before its volume; the database unit's `DeviceAllow` is `char-rtc r` and the five entries of `MountImages=` with a closed policy, a private `/dev` and no capability, and the slot unit's is `char-rtc r` alone with the same policy; the scratch database's user, inside its unit, finds no block node in `/dev`, cannot make one and cannot open a device-mapper node or its volume's device; as that user, inside the unit, `/run/lock`, `/dev/mqueue` and `/dev/pts` refuse a file and a listing, no pty can be allocated, the host's markers in `/tmp`, `/var/tmp` and `/dev/shm` and the host's SysV segment are not there, the unit is not in PID 1's IPC namespace, PostgreSQL's own segment is in the unit's namespace and not in the host's, every directory and regular file the user can write is the unit's own, and a second postmaster of the same user in an IPC namespace of its own on the directory is refused with "lock file postmaster.pid already exists"; a journal file made as journald made them before the split was turned off is read by the scratch user on the host and by nothing inside the unit; a slot started twice with the template and a stand-in process shares and keeps nothing by uid (the list under [The slot unit](#the-slot-unit)), and the same enumeration finds every shared place in the template without `PrivateIPC` and the inaccessible paths; a start of a unit without a link fails its assertion; the scratch database, started from its link, runs on across a restart of the agent, whose start has dropped every link, and stays awake into the reboot |
+| Second | no failed unit; loopback only; the journal syncs every 15 s and is not split by uid; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database, with no volume in PID 1's mount namespace; the database that was awake at the reboot was stopped cleanly before the node went down, and neither PostgreSQL nor ext4 recovered anything at this start |

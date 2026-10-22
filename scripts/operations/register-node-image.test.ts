@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   FleetReleaseRegistration,
   fleetReleaseSpec,
+  hostFilesSha256,
   signedReleaseManifest,
 } from "../../packages/contracts/src/releases.ts";
+import { imageTree, readHostFiles } from "../../infra/node-image/host-files.ts";
 import {
   apiCredentials,
   checkSignature,
@@ -29,6 +31,10 @@ import { readReleaseKey } from "./release-signing.ts";
 
 const sha = (text: string, algorithm = "sha256") =>
   createHash(algorithm).update(text).digest("hex");
+
+// The host files of the image's tree, as the build summarized them and the registration lists them.
+const TREE = await readHostFiles();
+const HOST_FILES_SHA256 = await hostFilesSha256(TREE.files);
 
 const BINARIES = [
   "pgcf-agent",
@@ -87,6 +93,7 @@ function summary(release: string, files: { zst: string; lock: string }) {
         },
       ]),
     ),
+    host_files_sha256: HOST_FILES_SHA256,
   };
 }
 
@@ -142,6 +149,9 @@ test("the build's summary is read as the builder writes it and nothing else", ()
     { ...good, raw: { ...good.raw, size: 0 } },
     { ...good, lock_sha256: "x" },
     { ...good, binaries: undefined },
+    { ...good, host_files_sha256: undefined },
+    { ...good, host_files_sha256: "A".repeat(64) },
+    { ...good, host_files_sha256: "a".repeat(63) },
     { ...good, binaries: { ...good.binaries, "pgcf-agent": undefined } },
     {
       ...good,
@@ -184,19 +194,39 @@ test("the manifest registers the digests of the files the build produced, under 
       // What a node that runs the lock reports in its hello, from the lock the image was built from.
       packages_sha256: LOCK_PACKAGES_SHA256,
       kernel_release: "6.12.113+deb13-amd64",
+      // The files of the image's tree, and the digest of what a node that holds them reports.
+      host_files: TREE.files,
+      host_files_sha256: HOST_FILES_SHA256,
     });
-    // Six files go to the prefix the API reads them from.
+    // Six files go to the prefix the API reads them from, and each host file with content to its
+    // directory there under its digest, once however many files have the same bytes.
+    const hostObjects = [
+      ...new Set(
+        TREE.files.flatMap((file) =>
+          file.kind === "file" ? [file.sha256] : [],
+        ),
+      ),
+    ].map((digest) => `node-images/sha-0123456789ab/host-files/${digest}`);
+    assert.ok(hostObjects.length > 0);
     assert.deepEqual(
       manifest.uploads.map((upload) => upload.key).sort(),
       [
-        "packages.lock.json",
-        "pgcf-agent",
-        "pgcf-archive",
-        "pgcf-native-gateway",
-        "pgcf-node.raw.zst",
-        "pgcf-wal-fetch",
-      ].map((file) => `node-images/sha-0123456789ab/${file}`),
+        ...[
+          "packages.lock.json",
+          "pgcf-agent",
+          "pgcf-archive",
+          "pgcf-native-gateway",
+          "pgcf-node.raw.zst",
+          "pgcf-wal-fetch",
+        ].map((file) => `node-images/sha-0123456789ab/${file}`),
+        ...hostObjects,
+      ].sort(),
     );
+    for (const upload of manifest.uploads.filter((u) => u.file === "host-file"))
+      assert.equal(
+        upload.digest.sha256,
+        upload.key.slice(upload.key.lastIndexOf("/") + 1),
+      );
     assert.equal(
       manifest.uploads.find((upload) => upload.key.endsWith("pgcf-agent"))
         ?.digest.md5,
@@ -276,6 +306,40 @@ test("a release is refused when the files are not the ones the build summarized"
     await assert.rejects(releaseManifest(b.options), /pgcf-archive/);
     await writeFile(join(b.options.binariesDir, "pgcf-archive"), "");
     await assert.rejects(releaseManifest(b.options), /pgcf-archive/);
+  } finally {
+    await rm(b.root, { recursive: true, force: true });
+  }
+});
+
+test("the host files are the tree the image was built from: a tree that changed since the build is refused before a byte is sent", async () => {
+  const b = await build();
+  try {
+    // The same tree, as a copy: the registration lists exactly what the build summarized.
+    const copy = join(b.root, "tree");
+    await cp(imageTree, copy, { recursive: true, verbatimSymlinks: true });
+    assert.equal(
+      (await releaseManifest({ ...b.options, tree: copy })).registration.os
+        .host_files_sha256,
+      HOST_FILES_SHA256,
+    );
+    // One byte of one unit differs: a node that took this release would hold files the image does not.
+    const unit = join(copy, "usr/lib/systemd/system/pgcf-gateway.service");
+    await writeFile(unit, `${await readFile(unit, "utf8")}# changed\n`);
+    await assert.rejects(
+      releaseManifest({ ...b.options, tree: copy }),
+      /host files.*not the ones the image was built with/s,
+    );
+    // The summary of a build that did not state them is no summary of this builder.
+    const { host_files_sha256: _omitted, ...old } = summary(
+      "sha-0123456789ab",
+      b.files,
+    );
+    void _omitted;
+    await writeFile(
+      join(b.options.imageDir, "pgcf-node.json"),
+      JSON.stringify(old),
+    );
+    await assert.rejects(releaseManifest(b.options), /summary/);
   } finally {
     await rm(b.root, { recursive: true, force: true });
   }
@@ -690,6 +754,31 @@ test("the signature CI wrote beside the files is read and checked against the ke
     );
     await writeFile(signaturePath, elsewhere);
     assert.equal((await checkSignature(manifest, options))?.verified, false);
+    // The image is in what is signed: the signature of this build for an image of one's own does
+    // not verify for this build, so nothing is uploaded under it.
+    for (const change of [
+      { sha256: "f".repeat(64) },
+      { size_bytes: manifest.registration.image.size_bytes + 1 },
+      { raw_sha256: "f".repeat(64) },
+      { raw_bytes: manifest.registration.image.raw_bytes + 512 },
+    ]) {
+      await writeFile(
+        signaturePath,
+        signText(
+          key.privateKey,
+          signedReleaseManifest({
+            id: manifest.version,
+            ...manifest.registration,
+            image: { ...manifest.registration.image, ...change },
+          }),
+        ),
+      );
+      assert.equal(
+        (await checkSignature(manifest, options))?.verified,
+        false,
+        JSON.stringify(Object.keys(change)),
+      );
+    }
     await writeFile(signaturePath, signature);
     await writeFile(keyPath, `${generateKeyPair().publicKey}\n`);
     assert.equal((await checkSignature(manifest, options))?.verified, false);

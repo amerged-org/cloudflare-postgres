@@ -19,3 +19,35 @@ library holds the protocol for the agent's side.
 The tests run both clients under a real PostgreSQL 18 (`PGCF_TEST_POSTGRES_BINDIR`): archiving
 only after the agent's `ok`, recovery of a base backup through the agent, and an aborted recovery
 that completes once the agent can fetch again.
+
+## Slot supervisor
+
+`pgcf-archive slot <n>` is the same binary in a second role (a separate binary would change the
+signed release's set of files): the supervisor that waits in the idle PostgreSQL sandbox
+`pgcf-slot@<n>.service` as the slot's own user, with no capability, until the node agent orders
+the start of one database (the slot pool of ULTRA plan 3.1; the slot unit and the agent's side are
+separate changes, so nothing starts this mode yet). It listens on `$RUNTIME_DIRECTORY/control`,
+reports `READY=1` to systemd, and answers only a peer whose uid is 0, one line per connection:
+
+| Line | Answer |
+| --- | --- |
+| `ping` | `pgcf-slot/1 idle` |
+| `exec <database> <major>` | `exec <CLOCK_MONOTONIC microseconds>`, then it replaces itself with the command line of `ExecStart=` in `pgcf-pg@.service` |
+| anything else, or a failed check | `refused order`, `id`, `major`, `unbound`, `held` or `lock`, then exit status 1 |
+
+The agent sends `exec` after it set the database's limits on the slot and mounted the volume and
+the socket directory into it. The supervisor opens `/var/lib/pgcf/db/<database>/data` without
+following a link and checks that this directory and `/run/pgcf/<database>` belong to its own uid
+(the proof that the mounts are in place), takes `flock(LOCK_EX | LOCK_NB)` on the data directory
+and keeps that descriptor across the exec. PostgreSQL's own guard against a second postmaster does
+not hold between two uids (`kill(pid, 0)` fails with `EPERM`, which `miscinit.c` reads as a stale
+`postmaster.pid`, and `shmget` fails with `EACCES`, which `sysv_shmem.c` reads as a foreign
+segment), so this lock is the guard: PostgreSQL and its backends inherit it, and it lasts until
+the last process of the slot has ended. A second supervisor on the same directory gets
+`refused held`. The supervisor never forks, mounts or accepts a second order; after a refusal or
+a failure the slot is not used again.
+
+The tests run the supervisor as a real process (the test program starts itself again, because a
+process that execs cannot run inside a test). They exec a script in place of PostgreSQL to show
+the lock surviving the process that took it, and, with `PGCF_TEST_POSTGRES_BINDIR`, a real
+PostgreSQL 18 as the target.

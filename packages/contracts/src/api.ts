@@ -168,8 +168,6 @@ export type ProjectCreate = z.infer<typeof ProjectCreate>;
 const SizeClassFields = {
   memory_mib: z.number().int().min(256).max(1_048_576),
   cpu_millicores: z.number().int().min(100).max(256_000),
-  /** Scheduling share; omission preserves the legacy request equal to the limit. */
-  cpu_request_millicores: z.number().int().positive().max(256_000).optional(),
   storage_gib: z.number().int().min(1).max(65_536),
   max_connections: z.number().int().min(10).max(10_000),
   sleep_after_seconds: z
@@ -193,19 +191,10 @@ export const SizeClass = z
     created_at: Timestamp,
     updated_at: Timestamp,
   })
-  .refine(
-    (size) =>
-      size.cpu_request_millicores === undefined ||
-      size.cpu_request_millicores <= size.cpu_millicores,
-    {
-      path: ["cpu_request_millicores"],
-      message: "PostgreSQL CPU request cannot exceed its class limit",
-    },
-  )
   .meta({
     id: "SizeClass",
     description:
-      "cpu_request_millicores, when present, is at most cpu_millicores. memory_mib is a multiple of 256 in a class an operator defines.",
+      "memory_mib is a multiple of 256 in a class an operator defines.",
   });
 export type SizeClass = z.infer<typeof SizeClass>;
 
@@ -217,19 +206,9 @@ export const SizeClassUpsert = z
       .multipleOf(256)
       .meta({ multipleOf: 256 }),
   })
-  .refine(
-    (size) =>
-      size.cpu_request_millicores === undefined ||
-      size.cpu_request_millicores <= size.cpu_millicores,
-    {
-      path: ["cpu_request_millicores"],
-      message: "PostgreSQL CPU request cannot exceed its class limit",
-    },
-  )
   .meta({
     id: "SizeClassUpsert",
-    description:
-      "memory_mib is a multiple of 256, and cpu_request_millicores, when present, is at most cpu_millicores; a violation is a 400.",
+    description: "memory_mib is a multiple of 256; a violation is a 400.",
   });
 export type SizeClassUpsert = z.infer<typeof SizeClassUpsert>;
 
@@ -306,16 +285,6 @@ export const Node = z
     schedulable: z.boolean(),
     database_placement_enabled: z.boolean().optional(),
     database_placement_closed_at: Timestamp.nullable().optional(),
-    memory_expansion_triggered_at: Timestamp.nullable().optional(),
-    memory_window_observed_at: Timestamp.nullable().optional(),
-    memory_window_valid: z.boolean().optional(),
-    memory_utilization_ppm: z
-      .number()
-      .int()
-      .min(0)
-      .max(1000000)
-      .nullable()
-      .optional(),
     allocatable_memory_mib: z.number().int().nonnegative(),
     allocatable_cpu_millicores: z.number().int().nonnegative(),
     storage_gib_total: z.number().int().nonnegative().nullable(),
@@ -377,7 +346,7 @@ export const DatabaseHealth = z
       status: z
         .enum(BACKUP_HEALTH_STATUSES)
         .describe(
-          "ok: the last completed base backup is at most 36 h old; stale: older; failing: the region reports failing, or the last failure is newer than the last completion; unknown: no report within 180 s, an unknown report, or no completed backup.",
+          "ok: the last completed base backup is at most 36 h old; stale: older; failing: the region reports failing, or the last failure is newer than the last completion; unknown: no report of the database within 45 min (a node names an unchanged database once in 15 min), an unknown report, or no completed backup.",
         ),
       last_base_backup_at: describedTimestamp(
         "When the last completed base backup finished; null while none is known.",

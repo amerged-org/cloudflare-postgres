@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ApiKey } from "@pgcf/contracts";
 import type { Context } from "hono";
+import type { ActorWarmer } from "./actor-warmer.ts";
 import type { CronWatchdog } from "./cron-watchdog.ts";
 import type { NodeCaller, NodeClaim } from "./domain/node-auth.ts";
 
@@ -8,6 +9,8 @@ export type Env = Cloudflare.Env & {
   CF_VERSION_METADATA: WorkerVersionMetadata;
   INFRASTRUCTURE_BACKUP?: Workflow<{ run_id: string }>;
   CRON_WATCHDOG?: DurableObjectNamespace<CronWatchdog>;
+  /** Keeps the DatabaseActors warm (`actor-warmer.ts`); needed while the interval below is not 0. */
+  ACTOR_WARMER?: DurableObjectNamespace<ActorWarmer>;
   INFRASTRUCTURE_BACKUP_CF_TOKEN?: string;
   RESEND_API_KEY?: string;
   /** The parent R2 key that signs the temporary credentials of the nodes (ULTRA plan 7.3). */
@@ -37,6 +40,17 @@ export type Env = Cloudflare.Env & {
   NODE_SSH_USER_CA_PUBLIC_KEY?: string;
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
   DATABASE_ACTOR_LOCATION_HINT?: string;
+  /**
+   * Durable Object location hint for new ActorWarmer objects when DATABASE_ACTOR_LOCATION_HINT is
+   * not set: where the DatabaseActors live (`weur` for Dev), so that a visit does not cross an
+   * ocean. It places only a new object; `ACTOR_WARMER_NAME_VERSION` makes new ones.
+   */
+  ACTOR_WARMER_LOCATION_HINT?: string;
+  /**
+   * Milliseconds between two visits of each DatabaseActor, which keep its isolate loaded: unset is
+   * 8000, 0 turns the keep-warm off, any other value is 1000 to 300000 (`domain/actor-warm.ts`).
+   */
+  DATABASE_ACTOR_WARM_INTERVAL_MS?: string;
   INFRASTRUCTURE_ALERT_WEBHOOK?: Fetcher;
   INFRASTRUCTURE_ALERT_WEBHOOK_URL?: string;
   INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN?: string;

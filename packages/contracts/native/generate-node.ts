@@ -2,7 +2,6 @@
 // The node agent, the gateway and the archive clients consume these exact schemas, constants and
 // vectors of the node contracts (src/node-link.ts, src/node-local.ts). Check them in CI.
 import { readFile, writeFile } from "node:fs/promises";
-import { z } from "zod";
 import { format } from "prettier";
 import * as link from "../src/node-link.ts";
 import * as local from "../src/node-local.ts";
@@ -12,36 +11,44 @@ import {
   RESERVED_ROLE_PREFIXES,
 } from "../src/ids.ts";
 import { MAINTENANCE_ROLE } from "../src/maintenance.ts";
-import { RELEASE_REFUSALS, RELEASE_SIGNATURE_FILE } from "../src/releases.ts";
+import {
+  HOST_FILE_APPLIES,
+  HOST_FILE_DIRECTORIES,
+  HOST_FILE_KINDS,
+  HOST_FILE_MAX_BYTES,
+  HOST_FILE_MODES,
+  HOST_FILE_UNITS,
+  HOST_FILES_MAX,
+  RELEASE_HOST_FILES_DIRECTORY,
+  RELEASE_REFUSALS,
+  RELEASE_SIGNATURE_FILE,
+} from "../src/releases.ts";
 import {
   archiveVectors,
   gatewayChannelVectors,
   nodeRequestVectors,
-  nodeSchemas,
   nodeSchemaVectors,
   packageVectors,
   refusalVectors,
   releaseVectors,
 } from "./node-vectors.ts";
+import { nodeJsonSchemas } from "./node-schema.ts";
 
 const files = {
   "node.generated.json": {
     version: 1,
-    schemas: Object.fromEntries(
-      Object.entries(nodeSchemas).map(([name, schema]) => [
-        name,
-        z.toJSONSchema(schema),
-      ]),
-    ),
+    schemas: nodeJsonSchemas(),
     constants: {
       NODE_PROTOCOL_VERSION: link.NODE_PROTOCOL_VERSION,
       NODE_API_PATHS: link.NODE_API_PATHS,
+      NODE_ORDER_TYPES: link.NODE_ORDER_TYPES,
       INSTALLER_PROGRESS_PATH: link.INSTALLER_PROGRESS_PATH,
       NODE_ENROLLMENT_SEED_PATH: link.NODE_ENROLLMENT_SEED_PATH,
       ENROLLMENT_TOKEN_LIFETIME_SECONDS: link.ENROLLMENT_TOKEN_LIFETIME_SECONDS,
       NODE_SAMPLE_INTERVAL_MS: link.NODE_SAMPLE_INTERVAL_MS,
       NODE_VOLUME_REPORT_INTERVAL_MS: link.NODE_VOLUME_REPORT_INTERVAL_MS,
       NODE_STALE_MS: link.NODE_STALE_MS,
+      NODE_OBSERVATION_RESEND_MS: link.NODE_OBSERVATION_RESEND_MS,
       NODE_EVENT_RETRY_SECONDS: link.NODE_EVENT_RETRY_SECONDS,
       NODE_FENCED_PATHS: link.NODE_FENCED_PATHS,
       NODE_FENCED_ERROR: link.NODE_FENCED_ERROR,
@@ -70,19 +77,31 @@ const files = {
       MAINTENANCE_ROLE,
       RESERVED_ROLE_NAMES: [...RESERVED_ROLE_NAMES],
       RESERVED_ROLE_PREFIXES,
+      // What a present role names and a removal never does: the node refuses a role that is both.
+      PRESENT_ROLE_PROPERTIES: Object.keys(link.DesiredRole.shape).filter(
+        (property) => property !== "name",
+      ),
       ADMISSION_STARTS: link.ADMISSION_STARTS,
       NODE_DATABASE_STATES: link.NODE_DATABASE_STATES,
       NODE_DATABASE_ERRORS: link.NODE_DATABASE_ERRORS,
       INSTALLER_CHECKPOINTS: link.INSTALLER_CHECKPOINTS,
       RELEASE_REFUSALS,
       RELEASE_SIGNATURE_FILE,
+      RELEASE_HOST_FILES_DIRECTORY,
+      HOST_FILE_DIRECTORIES,
+      HOST_FILE_KINDS,
+      HOST_FILE_MODES,
+      HOST_FILE_UNITS,
+      HOST_FILE_APPLIES,
+      HOST_FILES_MAX,
+      HOST_FILE_MAX_BYTES,
     },
   },
   "node-vectors.generated.json": {
     schemas: nodeSchemaVectors(),
     requests: await nodeRequestVectors(),
     packages: await packageVectors(),
-    releases: releaseVectors(),
+    releases: await releaseVectors(),
   },
   "node-local.generated.json": {
     version: 1,

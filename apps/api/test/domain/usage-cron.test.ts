@@ -29,13 +29,7 @@ import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 const start = Date.parse("2026-01-01T00:00:00.000Z"),
   iso = (value: number) => new Date(value).toISOString();
-const resources = {
-  memory_mib: 512,
-  cpu_millicores: 500,
-  reserved_memory_mib: 640,
-  reserved_cpu_millicores: 600,
-  storage_allocated_bytes: 5 * 1024 ** 3,
-};
+const resources = { memory_mib: 512, cpu_millicores: 500 };
 afterEach(async () => {
   vi.restoreAllMocks();
   await env.DB.batch([
@@ -514,9 +508,11 @@ describe("bounded usage cron", () => {
     const result = await runCron(env, start + 30 * 60_000);
     expect(result.usage.databases).toBe(1);
     expect(result.failed).toBe(0);
+    const metrics = JSON.parse((await rows(id))[0]!.metrics);
+    expect(metrics.memory_mib_seconds).toBe(512 * 1800);
     expect(
-      JSON.parse((await rows(id))[0]!.metrics).reserved_memory_mib_seconds,
-    ).toBe(640 * 1800);
+      Object.keys(metrics).filter((name) => name.startsWith("reserved_")),
+    ).toEqual([]);
     expect(
       (
         await env.DB.prepare(

@@ -7,6 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./ids": "./src/ids.ts",
+    "./ids-core": "./src/ids-core.ts",
     "./timestamp": "./src/timestamp.ts",
     "./database-admission": "./src/database-admission.ts",
     "./edge-policy": "./src/edge-policy.ts",
@@ -14,6 +15,7 @@
     "./usage": "./src/usage.ts",
     "./maintenance": "./src/maintenance.ts",
     "./route-token": "./src/route-token.ts",
+    "./route-token-core": "./src/route-token-core.ts",
     "./pg-wire": "./src/pg-wire.ts",
     "./gateway-limits": "./src/gateway-limits.ts",
     "./sleep": "./src/sleep.ts",
@@ -22,12 +24,13 @@
     "./nodes": "./src/nodes.ts",
     "./node-installer": "./src/node-installer.ts",
     "./releases": "./src/releases.ts",
+    "./release-key": "./src/release-key.generated.ts",
     "./client": "./src/client.ts",
     "./infrastructure-backups": "./src/infrastructure-backups.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node native/generate.ts --check && node native/generate-node.ts --check && node native/generate-power.ts --check && node native/generate-measurements.ts --check && node native/generate-installer.ts --check && vitest run --passWithNoTests"
+    "test": "node native/generate.ts --check && node native/generate-node.ts --check && node native/generate-power.ts --check && node native/generate-measurements.ts --check && node native/generate-installer.ts --check && node native/generate-release-key.ts --check && vitest run --passWithNoTests"
   },
   "dependencies": {
     "zod": "^4.6.5"

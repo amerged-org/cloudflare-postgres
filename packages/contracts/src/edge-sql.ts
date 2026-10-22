@@ -2,7 +2,7 @@
 // Portable HTTP SQL request reading (`POST /sql`, the Neon serverless driver's HTTP query mode);
 // no Workers host types. The TypeScript Edge (`apps/edge/src/sql.ts`) serves it and the Rust Edge
 // (`apps/edge-rust/src/sql.rs`) is held to it by the vectors of `native/generate-edge.ts`.
-import { isDatabaseId, isRoleName } from "./ids.ts";
+import { isDatabaseId, isRoleName } from "./ids-core.ts";
 
 /** The largest body the gateway accepts (`MAX_REQUEST_BYTES` in the gateway's sql.rs). */
 export const MAX_SQL_REQUEST_BYTES = 4 * 1024 * 1024;

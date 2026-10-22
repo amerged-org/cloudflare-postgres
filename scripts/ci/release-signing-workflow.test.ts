@@ -131,3 +131,28 @@ test("what the signer requires of a caller is what this workflow is: the one fil
     /account_id|RELEASE_SIGNING_KEY|secret|zone|route|d1_|r2_|kv_|\bservices\b|durable|queues|"ai"/i,
   );
 });
+
+test("the image that is signed is the image the build kept: its bytes and its summary travel in the artifact the signing job downloads", () => {
+  // The manifest names the image's compressed and raw sha256 and size. `sign-release.ts` takes the
+  // compressed ones from the file it hashes and the raw ones from the build summary, and refuses a
+  // summary that does not describe that file, so both have to be in the artifact that
+  // `node-image` keeps and `sign-release` downloads by id, and the build that wrote them is the
+  // one whose name the signer ties to the commit.
+  const collect = code(jobs["node-image"]!).slice(
+    code(jobs["node-image"]!).indexOf("- name: Collect the files"),
+  );
+  assert.match(
+    collect,
+    /cp "\$PGCF_NODE_IMAGE_WORK\/out\/pgcf-node\.raw\.zst" "\$PGCF_NODE_IMAGE_WORK\/out\/pgcf-node\.json" \\/,
+  );
+  assert.match(
+    collect,
+    /path: \$\{\{ runner\.temp \}\}\/pgcf-node-image\/release\//,
+  );
+  const signing = code(jobs["sign-release"]!);
+  assert.match(
+    signing,
+    /sign-release\.ts sign --image-dir "\$release" --binaries "\$release" \\\n\s+--lock "\$release\/packages\.lock\.json"/,
+  );
+  assert.match(signing, /path: \$\{\{ runner\.temp \}\}\/release\n/);
+});

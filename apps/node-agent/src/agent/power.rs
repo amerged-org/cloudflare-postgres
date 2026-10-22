@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Starting and stopping PostgreSQL (plan 4.6, 4.7, 5.9, 7.9, 7.10): a wake, the sleep with its
 //! proof, the recovery of a database that stopped without one, and the watches that start them.
-use super::{Claim, Core, Db, Desired, Entry, Phase, View, now_ms, report::uuid};
+use super::{
+    Claim, Core, Db, Desired, Entry, Phase, View,
+    build::{Backup, put_off_for_the_longest},
+    now_ms,
+    report::uuid,
+};
 use crate::{
     Error,
     admission::{AdmitError, EarlySleep, Request},
     archive::server::{Registration, Table},
-    cache::Residency,
     layout::Layout,
     machine::{CpuTimes, Machine, Throttle},
     proof::{self, Outcome, Proof, Steps, WakeRefusal},
@@ -27,11 +31,6 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
-
-/// How long the `wake_detail` waits for the reading of the page cache, which began with the wake,
-/// seconds before: one that is not done by then is stuck on a slow disk, and the event goes
-/// without its numbers.
-const CACHE_WAIT: Duration = Duration::from_millis(50);
 
 /// What a start is for, in the admission event and the wake's phases.
 #[derive(Clone, Copy, Debug)]
@@ -63,13 +62,23 @@ impl StartFailure {
     }
 }
 
+/// A start that failed, with one event that names the class of the error. No caller kept the
+/// error, and a start that failed after its unit was up left nothing to say why (EU1, 2026-10-20).
+fn failed(db: &Db, start: StartAs<'_>, class: &str) -> StartFailure {
+    crate::timing::emit_event(json!({
+        "event": "unit_start_failed", "database_id": db.id, "kind": start.kind, "class": class,
+    }));
+    StartFailure::Failed
+}
+
 /// How a wake ticket does not match the entry of the page the node holds: the reason behind a
 /// `desired_stale` refusal, named in the wake event's `stale` (`WAKE_STALE` of the contract).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stale {
     /// The node holds no entry for the database.
     NoEntry,
-    /// The ticket's generation is neither the next one, nor the entry's, nor a claim's.
+    /// The ticket's generation is neither the next one, nor the entry's, nor a claim's; or it is
+    /// above the entry of a suspended database, which is a page that has not caught up.
     Generation,
     /// The ticket's generation is the entry's, with another operation.
     Operation,
@@ -181,14 +190,12 @@ fn steal_since(from: CpuMark, now: Option<CpuTimes>) -> Option<(u64, u64)> {
 
 /// The log line of a started wake's detail (plan 11.1): numbers only, and none for what could not
 /// be read. `throttle` is the throttling since the release, `steal` the stolen CPU time and the
-/// window it was counted over, `cache` what the page cache held of the database's files before
-/// its unit started.
+/// window it was counted over.
 fn detail_line(
     database: &str,
     timeline: &Timeline,
     throttle: Option<Throttle>,
     steal: Option<(u64, u64)>,
-    cache: Option<Residency>,
 ) -> serde_json::Value {
     let mut line = json!({"event": "wake_detail", "database_id": database});
     let startup = timeline.startup.as_ref();
@@ -211,15 +218,6 @@ fn detail_line(
         ("throttled_usec", throttle.map(|t| t.throttled_usec)),
         ("steal_ms", steal.map(|(steal_ms, _)| steal_ms)),
         ("steal_window_ms", steal.map(|(_, window_ms)| window_ms)),
-        ("cache_files", cache.map(|c| c.files)),
-        ("cache_pages", cache.map(|c| c.pages)),
-        ("cache_resident", cache.map(|c| c.cached.resident)),
-        ("cache_dirty", cache.map(|c| c.cached.dirty)),
-        ("cache_evicted", cache.map(|c| c.cached.evicted)),
-        (
-            "cache_recently_evicted",
-            cache.map(|c| c.cached.recently_evicted),
-        ),
     ] {
         if let Some(value) = value {
             line[name] = value.into();
@@ -295,14 +293,12 @@ impl<M: Machine> Core<M> {
             // The database is awake, starting or already waiting: it is admitted.
             Err(AdmitError::Duplicate) => {
                 let mark = (Instant::now(), self.machine.cpu());
-                let started = self
-                    .machine
-                    .start(&db.id)
-                    .await
-                    .map_err(|_| StartFailure::Failed)?;
+                let started = self.machine.start(&db.id).await.map_err(|error| {
+                    failed(db, start, &crate::diagnostics::error_code(&error.into()))
+                })?;
                 return Ok((started, Duration::ZERO, mark));
             }
-            Err(AdmitError::Stopped) => return Err(StartFailure::Failed),
+            Err(AdmitError::Stopped) => return Err(failed(db, start, "admission_stopped")),
         };
         let waited = permit.waited;
         self.event(event("admitted", waited, None));
@@ -317,14 +313,18 @@ impl<M: Machine> Core<M> {
                 permit.ready();
                 Ok((started, waited, mark))
             }
-            Ok(Err(_)) => {
+            Ok(Err(error)) => {
                 // A unit that is awake still holds its memory: the permit stays counted until its
                 // unit is reported stopped. One that is not awake never started.
                 let awake = self.unit_awake(&db.id, true).await;
                 if !awake {
                     permit.failed();
                 }
-                Err(StartFailure::Failed)
+                Err(failed(
+                    db,
+                    start,
+                    &crate::diagnostics::error_code(&error.into()),
+                ))
             }
             Err(_) => {
                 // The start goes on: the agent waits for it, and a database that comes up late is
@@ -388,20 +388,15 @@ impl<M: Machine> Core<M> {
             view.writer = Some(writer);
             view.awake_since_ms = Some(now_ms());
         });
-        self.after_ready(db).await;
+        self.after_wake(db).await;
     }
 
-    /// A start that outlasted its wake and gave no database that accepts connections: a unit that
-    /// is down leaves the database as the wake found it, one that runs anyway is stopped.
+    /// A start that outlasted its wake and gave no database that accepts connections: see
+    /// `after_failed_start`.
     async fn late_failure(self: &Arc<Self>, db: &Arc<Db>) {
         let _flow = db.lock.lock().await;
-        if db.phase() != Phase::Starting {
-            return;
-        }
-        if self.unit_awake(&db.id, true).await {
-            self.stop_unproven(db).await;
-        } else {
-            self.set(db, |view| view.phase = Phase::Asleep);
+        if db.phase() == Phase::Starting {
+            self.after_failed_start(db).await;
         }
     }
 
@@ -412,7 +407,9 @@ impl<M: Machine> Core<M> {
         self.go_unproven(db);
     }
 
-    /// Off the path of a wake, once PostgreSQL is released: the CPU quota of the database's size.
+    /// The CPU quota of the database's size, applied now (plan 4.4): a build's, a restart's, and a
+    /// wake's once its burst is over. The entry counts as it is at this time, so a resize in
+    /// between is the quota that follows.
     pub(crate) async fn after_ready(&self, db: &Db) {
         let millicores = db
             .view()
@@ -420,6 +417,45 @@ impl<M: Machine> Core<M> {
             .as_ref()
             .and_then(|entry| NonZeroU32::new(entry.cpu_millicores));
         let _ = self.machine.set_cpu_quota(&db.id, millicores).await;
+    }
+
+    /// Once a wake has released PostgreSQL: its CPU quota follows after the policy's
+    /// `cpu_boost_ms`, and at once if that is 0. The start-up, the first request and the reading
+    /// of the buffer list of the last stop (`autoprewarm`) share the quota's 0.5 or 0.25 CPU when
+    /// it comes with the release, and that was throttled in 19 of about 25 periods (EU1,
+    /// 2026-10-20). The unit keeps its weight and its memory, IO and task limits meanwhile: the
+    /// burst lifts the cap of the quota and nothing else, so the weights still divide contested
+    /// CPU (plan 4.4 states the bound).
+    ///
+    /// One task per wake waits out the burst and ends with it; `Db::end_boost` ends it earlier,
+    /// when the database leaves service (`Core::set`) or a base backup begins (`end_burst`). It
+    /// applies the quota under the database's flow, so that it cannot meet the stop of a sleep,
+    /// which lifts the quota, half way.
+    pub(crate) async fn after_wake(self: &Arc<Self>, db: &Arc<Db>) {
+        let boost = Duration::from_millis(self.policy().admission.admission.cpu_boost_ms);
+        if boost.is_zero() {
+            self.after_ready(db).await;
+            return;
+        }
+        let (core, database) = (self.clone(), db.clone());
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(boost).await;
+            let _flow = database.lock.lock().await;
+            if database.claim_boost() {
+                core.after_ready(&database).await;
+            }
+        });
+        db.begin_boost(task.abort_handle());
+    }
+
+    /// A flow that holds the database's flow for as long as its data is large while the database
+    /// stays served (a base backup) cannot let the burst wait behind it: the timer would apply the
+    /// quota only when the flow ends. The burst ends now, with the quota applied under the flow
+    /// the caller holds. Without a burst that is still to end, nothing happens.
+    pub(crate) async fn end_burst(&self, db: &Db) {
+        if db.end_boost() {
+            self.after_ready(db).await;
+        }
     }
 
     // ---- wake
@@ -491,6 +527,15 @@ impl<M: Machine> Core<M> {
             }
             match entry.desired {
                 Desired::Deleted => return Err(("deleted", None)),
+                // The entry is a manual suspension. A connection of its generation, or an older
+                // one, is a connection to a suspended database. A request of a later generation
+                // is not: D1 moved on (a resume, for one) and the page the node holds has not
+                // caught up, so the entry says nothing of what D1 wants now. That is stale, which
+                // `obey_wake` waits out, and never final; nothing starts from an entry that is
+                // behind.
+                Desired::Suspended if request.generation > entry.generation => {
+                    return Err(("desired_stale", Some(Stale::Generation)));
+                }
                 Desired::Suspended => return Err(("suspended", None)),
                 Desired::Running => {}
             }
@@ -571,9 +616,6 @@ impl<M: Machine> Core<M> {
             Phase::Unproven => return refuse("unproven"),
             _ => return refuse("wake_in_progress"),
         }
-        // What the page cache holds of the database's files is read before the unit starts, in a
-        // task the wake does not wait for; its numbers join the detail event (`detail_later`).
-        let cache = self.read_cache(&db.id);
         let volume = Self::volume_id(&entry).ok_or(("volume_missing", None))?;
         let began = Instant::now();
         let exists = self.machine.has_volume(&volume).await;
@@ -656,12 +698,15 @@ impl<M: Machine> Core<M> {
         let (started, waited, steal) = match started {
             Ok(started) => started,
             Err(failure) => {
-                if !matches!(failure, StartFailure::Timeout) {
-                    self.after_failed_start(&db).await;
-                }
-                if let StartFailure::Refused(refused) = &failure {
-                    steps.insert("queue_wait".into(), millis(refused.waited));
-                    self.set(&db, |view| view.phase = Phase::Asleep);
+                match &failure {
+                    // The unit was never asked to start.
+                    StartFailure::Refused(refused) => {
+                        steps.insert("queue_wait".into(), millis(refused.waited));
+                        self.set(&db, |view| view.phase = Phase::Asleep);
+                    }
+                    StartFailure::Failed => self.after_failed_start(&db).await,
+                    // The start goes on, and its task ends the phase (`late_start`, `late_failure`).
+                    StartFailure::Timeout => {}
                 }
                 return Err(failure.wake_reason());
             }
@@ -691,58 +736,35 @@ impl<M: Machine> Core<M> {
             view.refusal = None;
         });
         steps.insert("release".into(), millis(releasing.elapsed()));
-        self.detail_later(&db, started, steal, cache);
-        self.after_ready(&db).await;
+        self.detail_later(&db, started, steal);
+        self.after_wake(&db).await;
         Ok(())
     }
 
-    /// Reads what the page cache holds of the database's files in a task of its own, which holds
-    /// no lock of the wake and which the wake never waits for.
-    fn read_cache(&self, database: &str) -> tokio::task::JoinHandle<Option<Residency>> {
-        let (machine, database) = (self.machine.clone(), database.to_string());
-        tokio::task::spawn_blocking(move || machine.cache_residency(&database))
-    }
-
     /// Off the path of a wake, once its writer is released: one `wake_detail` event, read
-    /// `Timing::detail` later, when the login and the first statements are over. The CPU quota is
-    /// applied right after the release, so its throttling in between is in the event. `cache` is
-    /// the reading of the page cache that began before the start; it is joined here, for at most
-    /// `CACHE_WAIT`.
-    fn detail_later(
-        self: &Arc<Self>,
-        db: &Db,
-        started: Started,
-        steal: CpuMark,
-        cache: tokio::task::JoinHandle<Option<Residency>>,
-    ) {
+    /// `Timing::detail` later, when the login and the first statements are over. The throttling
+    /// since the release is in the event: that of the quota where it came with the release
+    /// (`cpu_boost_ms` 0) or before the event is read, and none inside a burst.
+    fn detail_later(self: &Arc<Self>, db: &Db, started: Started, steal: CpuMark) {
         let (core, database) = (self.clone(), db.id.clone());
         tokio::spawn(async move {
             let throttle = core.machine.throttle(&database);
             tokio::time::sleep(core.timing.detail).await;
-            let cache = tokio::time::timeout(CACHE_WAIT, cache)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .flatten();
-            let line = core
-                .wake_detail(&database, &started, steal, throttle, cache)
-                .await;
+            let line = core.wake_detail(&database, &started, steal, throttle).await;
             crate::timing::emit_event(line);
         });
     }
 
     /// What the unit, the journal and the kernel say of a start that was released: the time to
     /// the fork, to the handoff and to the three messages of PostgreSQL's start, the CPU quota's
-    /// throttling since the release, the steal time since the unit was asked to start, and the
-    /// page cache's share of the database's files before the start. `steal`, `throttle` and
-    /// `cache` are the readings from then.
+    /// throttling since the release, and the steal time since the unit was asked to start.
+    /// `steal` and `throttle` are the readings from then.
     async fn wake_detail(
         &self,
         database: &str,
         started: &Started,
         steal: CpuMark,
         throttle: Option<Throttle>,
-        cache: Option<Residency>,
     ) -> serde_json::Value {
         let timeline = self
             .machine
@@ -754,7 +776,6 @@ impl<M: Machine> Core<M> {
             &timeline,
             throttle_since(throttle, self.machine.throttle(database)),
             steal_since(steal, self.machine.cpu()),
-            cache,
         )
     }
 
@@ -776,14 +797,17 @@ impl<M: Machine> Core<M> {
         });
     }
 
-    /// A start that failed: the database is not awake. What it was before is what it is now.
-    async fn after_failed_start(&self, db: &Db) {
-        if self.unit_awake(&db.id, false).await {
-            return;
+    /// A start that failed. A unit that is awake, or that cannot be read, may run a PostgreSQL
+    /// that nobody released (the start failed after the unit was up): it is stopped without a
+    /// proof, so that recovery proves the sleep. One that is stopped leaves the database as it was
+    /// before the start; a start that fails for a unit that crashed in recovery leaves the data
+    /// directory as it was, and the next wake finds it unproven by `pg_control`.
+    async fn after_failed_start(self: &Arc<Self>, db: &Arc<Db>) {
+        if self.unit_awake(&db.id, true).await {
+            self.stop_unproven(db).await;
+        } else {
+            self.set(db, |view| view.phase = Phase::Asleep);
         }
-        // A start that fails for a unit that crashed in recovery leaves the data directory as it
-        // was: the next wake finds it unproven by `pg_control`.
-        self.set(db, |view| view.phase = Phase::Asleep);
     }
 
     // ---- sleep
@@ -810,13 +834,17 @@ impl<M: Machine> Core<M> {
             (entry, generation)
         };
         // The idle time is when a due base backup is taken, while the database still runs: it
-        // is never woken for one.
-        if matches!(why, Why::Idle)
-            && let Err(error) = self.backup_if_due(db, &entry).await
-        {
-            crate::timing::emit_event(json!({
-                "event": "backup_failed", "database_id": db.id, "error": error,
-            }));
+        // is never woken for one. One that is put off for a wake keeps the database up, since
+        // nothing would ask for the backup before its next idle sleep; the next idle pass asks
+        // again, and an early sleep, which takes none, can still reclaim the database.
+        if matches!(why, Why::Idle) {
+            match self.backup_if_due(db, &entry).await {
+                Ok(Backup::PutOff) => return Slept::BackupPutOff,
+                Ok(Backup::Taken | Backup::NotTaken) => {}
+                Err(error) => crate::timing::emit_event(json!({
+                    "event": "backup_failed", "database_id": db.id, "error": error,
+                })),
+            }
         }
         let proof = self.proof(&entry);
         let steps = Quiet {
@@ -890,6 +918,7 @@ impl<M: Machine> Core<M> {
             view.phase = Phase::Asleep;
             view.writer = None;
             view.awake_since_ms = None;
+            view.backup_put_off_ms = None;
             view.refusal = None;
         });
         if let Some(volume) = Self::volume_id(entry) {
@@ -1113,7 +1142,7 @@ impl<M: Machine> Core<M> {
     /// tells admission when each was last used, which early sleep picks from.
     pub async fn idle_pass(self: &Arc<Self>) {
         for db in self.all() {
-            let (entry, since, backup) = {
+            let (entry, since, backup, put_off) = {
                 let view = db.view();
                 if view.phase != Phase::Ready {
                     continue;
@@ -1122,13 +1151,17 @@ impl<M: Machine> Core<M> {
                     view.entry.clone(),
                     view.awake_since_ms,
                     view.state.as_ref().and_then(|state| state.backup.clone()),
+                    view.backup_put_off_ms,
                 )
             };
             let Some(entry) = entry else { continue };
-            if entry.sleep_after_seconds.is_none()
+            // An always-warm database takes its backup while it serves. So does one that was put
+            // off for the longest: the idle sleep that would take it does not come while the
+            // database is used.
+            if (entry.sleep_after_seconds.is_none() || put_off_for_the_longest(put_off, now_ms()))
                 && super::build::backup_due(backup.as_ref(), None, now_ms())
             {
-                self.spawn_daily_backup(&db);
+                self.spawn_served_backup(&db);
             }
             // Without the gateway there is no way to know that nobody uses the database.
             let Some(activity) = self.gateway.activity(&db.id).await else {
@@ -1153,9 +1186,11 @@ impl<M: Machine> Core<M> {
         }
     }
 
-    /// The daily base backup of an always-warm database (plan 7.6), off the idle pass. A flow
-    /// that runs on the database now, a backup among them, puts it off to the next pass.
-    fn spawn_daily_backup(self: &Arc<Self>, db: &Arc<Db>) {
+    /// The base backup of a database that stays up and serves (plan 7.6): the daily one of an
+    /// always-warm database, and the one of a database that was put off the longest, off the
+    /// idle pass. A flow that runs on the database now, a backup among them, puts it off to the
+    /// next pass.
+    fn spawn_served_backup(self: &Arc<Self>, db: &Arc<Db>) {
         let (core, db) = (self.clone(), db.clone());
         tokio::spawn(async move {
             let Ok(_flow) = db.lock.try_lock() else {
@@ -1207,6 +1242,9 @@ pub(crate) enum Slept {
     /// Refused: the database runs and is wakeable.
     Refused(Refusal),
     Unproven(&'static str),
+    /// An idle sleep that was not taken: the base backup that is due waits for a wake
+    /// (`Core::backup_if_due`), and the database runs until the next idle pass asks again.
+    BackupPutOff,
     /// There was nothing to put to sleep.
     NotRunning,
 }
@@ -1322,7 +1360,7 @@ impl<M: Machine> Steps for Alone<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::Pages;
+    use crate::agent::build::{BACKUP_AFTER_WAKE_MS, BACKUP_PUT_OFF_MAX_MS};
     use crate::{
         agent::testing::{Rig, eventually},
         node_link::contract_valid,
@@ -1606,18 +1644,7 @@ mod tests {
         assert_eq!(throttled, throttle(2, 7_500));
         let (steal_ms, _window) = stolen.unwrap();
         assert_eq!(steal_ms, 30);
-        // Before the start 10,240 of the 16,384 pages of 41 files were in the page cache.
-        let cached = Some(Residency {
-            files: 41,
-            pages: 16_384,
-            cached: Pages {
-                resident: 10_240,
-                dirty: 7,
-                evicted: 5_900,
-                recently_evicted: 310,
-            },
-        });
-        let line = detail_line("abcdefghijklmnopqrst", &timeline, throttled, stolen, cached);
+        let line = detail_line("abcdefghijklmnopqrst", &timeline, throttled, stolen);
         assert_eq!(
             line,
             json!({
@@ -1627,29 +1654,20 @@ mod tests {
                 "shut_down_to_ready_us": 1_522,
                 "nr_throttled": 2, "throttled_usec": 7_500, "steal_ms": 30,
                 "steal_window_ms": line["steal_window_ms"],
-                "cache_files": 41, "cache_pages": 16_384, "cache_resident": 10_240,
-                "cache_dirty": 7, "cache_evicted": 5_900, "cache_recently_evicted": 310,
             })
         );
-        // What the node sends of it is what Cloudflare accepts: 15 of the 16 fields.
+        // What the node sends of it is what Cloudflare accepts: all 9 of its fields, within the bound.
         let at = "2026-10-18T10:11:12.345Z";
         let event = crate::events::sanitize(&line, at).unwrap();
-        assert_eq!(event["fields"].as_object().unwrap().len(), 15);
+        assert_eq!(event["fields"].as_object().unwrap().len(), 9);
         assert!(contract_valid(
             "NodeObservationReport",
             &json!({"observed_at": at, "databases": [], "orders": [], "events": [event]})
         ));
 
-        // A journal that could not be read, a unit that is gone, a machine without a clock and a
-        // page cache that was not read leave their numbers out; the counters that went back are
-        // no reading.
-        let bare = detail_line(
-            "abcdefghijklmnopqrst",
-            &Timeline::default(),
-            None,
-            None,
-            None,
-        );
+        // A journal that could not be read, a unit that is gone and a machine without a clock
+        // leave their numbers out; the counters that went back are no reading.
+        let bare = detail_line("abcdefghijklmnopqrst", &Timeline::default(), None, None);
         assert_eq!(
             bare,
             json!({"event": "wake_detail", "database_id": "abcdefghijklmnopqrst"})
@@ -1685,73 +1703,17 @@ mod tests {
         assert_eq!(db.phase(), Phase::Ready);
         assert!(details().is_empty());
 
-        // This machine has no journal and no cgroup: the steal time of the window and the six
-        // numbers of the page cache are all it reads. The cache numbers are those of the files of
-        // the cluster the test made, counted before its start: the database was proven asleep
-        // just before, so its files are in memory, written back and none evicted.
+        // This machine has no journal and no cgroup: the steal time of the window is all it reads.
         eventually(10, "the detail", || !details().is_empty()).await;
         let detail = details().remove(0);
         let fields = detail["fields"].as_object().unwrap();
         assert!(fields["steal_ms"].is_u64() && fields["steal_window_ms"].as_u64() >= Some(1));
-        let (files, pages) = (
-            fields["cache_files"].as_u64(),
-            fields["cache_pages"].as_u64(),
-        );
-        let resident = fields["cache_resident"].as_u64();
-        assert!(
-            files >= Some(3) && pages >= resident && resident >= Some(1),
-            "{detail}"
-        );
-        for field in ["cache_dirty", "cache_evicted", "cache_recently_evicted"] {
-            assert_eq!(fields[field], 0, "{field}");
-        }
-        assert_eq!(fields.len(), 8, "{detail}");
+        assert_eq!(fields.len(), 2, "{detail}");
 
         // The same wake again finds the database released: no start, no detail.
         assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
         tokio::time::sleep(Duration::from_millis(1000)).await;
         assert_eq!(details().len(), 1);
-    }
-
-    /// The reading of the page cache is not on the path of a wake and is not waited for: a disk
-    /// that is slow to list its files delays neither the release nor the event, which then goes
-    /// without the numbers of the cache.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_slow_reading_of_the_page_cache_holds_neither_the_wake_nor_its_detail() {
-        let timing = crate::agent::Timing {
-            detail: Duration::from_millis(600),
-            ..crate::agent::testing::timing()
-        };
-        let Some(rig) = Rig::with_timing("wake-detail-slow-cache", timing).await else {
-            return;
-        };
-        let (entry, db) = rig.create().await;
-        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
-        rig.machine.slow_cache(Duration::from_secs(6));
-
-        let began = Instant::now();
-        let result = rig.core.wake(&Rig::ticket(&entry)).await;
-        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
-        assert!(
-            began.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            began.elapsed()
-        );
-        let details = || -> Vec<Value> {
-            crate::events::seen()
-                .into_iter()
-                .filter(|e| e["event"] == "wake_detail" && e["database_id"] == entry.id.as_str())
-                .collect()
-        };
-        eventually(10, "the detail", || !details().is_empty()).await;
-        let detail = details().remove(0);
-        let fields = detail["fields"].as_object().unwrap();
-        assert!(fields["steal_ms"].is_u64());
-        assert!(
-            fields.keys().all(|name| !name.starts_with("cache_")),
-            "{detail}"
-        );
-        assert_eq!(fields.len(), 2, "{detail}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1976,13 +1938,23 @@ mod tests {
         rig.core.maintenance.store(true, Ordering::Relaxed);
         assert_eq!(refused(rig.core.wake(&ticket).await), reason("maintenance"));
         rig.core.maintenance.store(false, Ordering::Relaxed);
-        for (desired, wanted) in [
-            (Desired::Suspended, "suspended"),
-            (Desired::Deleted, "deleted"),
-        ] {
-            with(&|view| view.entry.as_mut().unwrap().desired = desired);
-            assert_eq!(refused(rig.core.wake(&ticket).await), reason(wanted));
-        }
+        // A connection of the generation of a manual suspension, or of an older one, is a
+        // connection to a suspended database. A request of a later generation is not: D1 moved on
+        // (a resume, say) and the page the node holds has not caught up, so it says nothing of
+        // what D1 wants now and is stale, never `suspended`.
+        with(&|view| view.entry.as_mut().unwrap().desired = Desired::Suspended);
+        let mut current = ticket.clone();
+        current.generation = entry.generation;
+        assert_eq!(refused(rig.core.wake(&current).await), reason("suspended"));
+        let mut older = ticket.clone();
+        older.generation = entry.generation - 1;
+        assert_eq!(refused(rig.core.wake(&older).await), reason("suspended"));
+        assert_eq!(
+            refused(rig.core.wake(&ticket).await),
+            reason("desired_stale")
+        );
+        with(&|view| view.entry.as_mut().unwrap().desired = Desired::Deleted);
+        assert_eq!(refused(rig.core.wake(&ticket).await), reason("deleted"));
         with(&|view| view.entry.as_mut().unwrap().desired = Desired::Running);
         rig.core
             .fences
@@ -2072,6 +2044,18 @@ mod tests {
             assert_eq!(wake["reason"], "desired_stale");
             assert_eq!(wake["stale"], stale);
         }
+        // A ticket that is ahead of the entry of a suspended database is stale by its generation.
+        rig.core.set(&db, |view| {
+            view.entry.as_mut().unwrap().desired = Desired::Suspended
+        });
+        let result = rig.core.wake(&ticket()).await;
+        assert_eq!(result.reason.as_deref(), Some("desired_stale"));
+        let events = rig.core.take_events();
+        let wake = events.iter().find(|e| e["type"] == "wake").unwrap();
+        assert_eq!(wake["stale"], "generation");
+        rig.core.set(&db, |view| {
+            view.entry.as_mut().unwrap().desired = Desired::Running
+        });
         // A refusal for another reason names no way of being stale.
         rig.core.maintenance.store(true, Ordering::Relaxed);
         assert_eq!(
@@ -2212,6 +2196,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_page_with_the_claim_of_a_released_wake_moves_only_the_route_revision_of_its_entry()
+    {
+        let Some(rig) = Rig::new("wake-claim-entry").await else {
+            return;
+        };
+        let mut json = rig.entry_json();
+        let (entry, db) = rig.create_from(&json).await;
+        json.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let ticket = Rig::ticket(&entry);
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        // The node released the wake before the page named it: the claimed generation and
+        // operation on the entry's route revision.
+        let released = rig.gateway.get(&entry.id).unwrap();
+        assert_eq!(
+            (
+                released.mode,
+                released.generation,
+                released.operation.as_str(),
+                released.route_revision
+            ),
+            (
+                Mode::Running,
+                ticket.generation,
+                ticket.operation.as_str(),
+                entry.route_revision
+            )
+        );
+        // D1 commits the claim beside the request and hints the node, which pulls the page: the
+        // same generation and operation under the revision the claim committed. The gateway's
+        // entry changes in the route revision and nowhere else, so that a request admitted on the
+        // released unit is still on the unit the table names.
+        json["generation"] = ticket.generation.into();
+        json["operation"] = ticket.operation.clone().into();
+        json["route_revision"] = (entry.route_revision + 1).into();
+        rig.core.apply(&Rig::page(vec![json], vec![])).await;
+        assert_eq!(
+            rig.gateway.get(&entry.id).unwrap(),
+            pgcf_native_protocol::agent::Database {
+                route_revision: entry.route_revision + 1,
+                ..released
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_start_that_outlasts_its_wake_and_then_fails_leaves_the_database_wakeable() {
         let timing = crate::agent::Timing {
             wake_start: Duration::from_millis(300),
@@ -2249,6 +2279,96 @@ mod tests {
         let result = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
         assert_eq!(db.phase(), Phase::Ready);
+    }
+
+    /// A wake whose start returns an error after its unit is up, so the node never sees PostgreSQL
+    /// released (EU1, 2026-10-20: a resume answered `release_failed` while its PostgreSQL ran for
+    /// 83 s). The node may neither take the database for asleep nor leave it starting for ever:
+    /// the unit is stopped without a proof, and recovery proves the sleep before the next wake.
+    /// `units_readable` says whether the node can read the unit's state after the failure.
+    async fn a_start_fails_after_its_unit_is_up(label: &str, units_readable: bool) {
+        let Some(rig) = Rig::new(label).await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let data = tenant(&rig, &entry.id).await;
+        data.batch("CREATE TABLE t AS SELECT generate_series(1, 3000) AS a")
+            .await
+            .unwrap();
+        drop(data);
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        rig.core.take_events();
+
+        rig.machine.fail_next_start_after_up();
+        rig.machine.set_units_unreadable(!units_readable);
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (WakeOutcome::Refused, Some("release_failed")),
+            "{result:?}"
+        );
+        // Starting for ever is the phase of a unit that is awake and read; asleep with PostgreSQL
+        // running, that of a unit that could not be read.
+        assert_ne!(db.phase(), Phase::Starting);
+        eventually(10, "the unit to be stopped and its sleep proven", || {
+            db.phase() == Phase::Asleep && !rig.machine.running(&entry.id)
+        })
+        .await;
+        assert!(
+            rig.core
+                .take_events()
+                .iter()
+                .any(|e| e["type"] == "admission" && e["start"] == "recovery"),
+            "recovery proved the sleep"
+        );
+        // The memory of the unit that ran was given back.
+        let waited = std::time::Instant::now();
+        while !rig
+            .core
+            .admission
+            .snapshot()
+            .await
+            .unwrap()
+            .awake
+            .is_empty()
+        {
+            assert!(
+                waited.elapsed() < Duration::from_secs(5),
+                "timed out: the memory to be given back"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The failure left a line with the class of the error, which no caller keeps.
+        let failures: Vec<Value> = crate::events::seen()
+            .into_iter()
+            .filter(|e| e["event"] == "unit_start_failed" && e["database_id"] == entry.id.as_str())
+            .collect();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            (
+                failures[0]["fields"]["kind"].as_str(),
+                failures[0]["fields"]["class"].as_str()
+            ),
+            (Some("wake"), Some("bus_limits_exceeded"))
+        );
+
+        // Nothing acknowledged was lost: the next wake finds the proven database and its rows.
+        let woke = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(woke.outcome, WakeOutcome::Started, "{woke:?}");
+        let data = tenant(&rig, &entry.id).await;
+        let rows = data.query("SELECT count(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 3000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_that_fails_after_its_unit_is_up_and_is_read_awake_is_proven_asleep() {
+        a_start_fails_after_its_unit_is_up("start-fails-awake", true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_that_fails_after_its_unit_is_up_and_cannot_be_read_is_proven_asleep() {
+        a_start_fails_after_its_unit_is_up("start-fails-unread", false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2546,10 +2666,12 @@ mod tests {
         assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
         assert_eq!(db.state().unwrap().backup, Some(first.clone()));
 
-        // A day later the database is woken and written to; its idle sleep takes a backup first.
+        // A day later the database is woken and written to; its idle sleep, after its first
+        // minute, takes a backup first.
         let result = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
         age_backup(&rig, &db);
+        db.view().awake_since_ms = Some(now_ms() - 2 * BACKUP_AFTER_WAKE_MS);
         let data = tenant(&rig, &entry.id).await;
         data.batch("CREATE TABLE t AS SELECT generate_series(1, 100) AS a")
             .await
@@ -2580,6 +2702,7 @@ mod tests {
             rig.core.build(&db, &entry).await.unwrap();
         }
         let first = db.state().unwrap().backup.unwrap();
+        db.view().awake_since_ms = Some(now_ms() - 2 * BACKUP_AFTER_WAKE_MS);
         // Of today: nothing to do.
         rig.core.idle_pass().await;
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2612,6 +2735,343 @@ mod tests {
         .await;
         assert_eq!(db.phase(), Phase::Ready);
         assert!(rig.machine.running(&entry.id));
+    }
+
+    /// A start in flight on the node for another database, which the test ends when it likes: what
+    /// a wake looks like to the scheduler of the base backups.
+    async fn wake_on_the_node(rig: &Rig) -> crate::admission::Permit {
+        rig.machine.set_available_bytes(8 << 30);
+        rig.core
+            .admission
+            .admit(crate::admission::Request {
+                database: "another-database".into(),
+                memory_mib: 64,
+                always_warm: false,
+            })
+            .await
+            .expect("the start of another database is admitted")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_daily_backup_waits_for_a_wake_on_the_node_and_for_the_first_minute_after_one() {
+        let Some(rig) = Rig::new("backup-quiet").await else {
+            return;
+        };
+        let mut json = rig.entry_json();
+        json["sleep_after_seconds"] = Value::Null;
+        let entry = rig.entry_for(&json);
+        let db = rig.core.db(&entry.id);
+        assert!(rig.core.accept(&db, entry.clone()));
+        {
+            let _flow = db.lock.lock().await;
+            rig.core.build(&db, &entry).await.unwrap();
+        }
+        let newest = || db.state().unwrap().backup.unwrap().backup_id;
+        let first = newest();
+        age_backup(&rig, &db);
+        db.view().awake_since_ms = Some(now_ms() - 3_600_000);
+
+        // A wake is in flight on the node: the backup that is due is put off, and the database
+        // runs on.
+        let wake = wake_on_the_node(&rig).await;
+        rig.core.idle_pass().await;
+        eventually(30, "the backup put off", || {
+            db.view().backup_put_off_ms.is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(newest(), first);
+        assert_eq!(db.phase(), Phase::Ready);
+
+        // The wake is over: the next pass takes it, and the wait is forgotten.
+        wake.failed();
+        rig.core.idle_pass().await;
+        eventually(30, "the daily backup", || newest() != first).await;
+        eventually(5, "the wait forgotten", || {
+            db.view().backup_put_off_ms.is_none()
+        })
+        .await;
+
+        // The database itself woke ten seconds ago: the minute after a wake is not over.
+        let second = newest();
+        age_backup(&rig, &db);
+        db.view().awake_since_ms = Some(now_ms() - 10_000);
+        rig.core.idle_pass().await;
+        eventually(30, "the backup put off", || {
+            db.view().backup_put_off_ms.is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(newest(), second);
+        db.view().awake_since_ms = Some(now_ms() - BACKUP_AFTER_WAKE_MS - 1_000);
+        rig.core.idle_pass().await;
+        eventually(30, "the daily backup", || newest() != second).await;
+    }
+
+    /// A start that waits for room on the node, because there is none: what a queued wake looks
+    /// like to the scheduler of the base backups. It leaves the queue when its task ends.
+    async fn queued_wake_on_the_node(rig: &Rig) -> tokio::task::JoinHandle<()> {
+        let mut policy = rig.core.policy();
+        policy.admission.admission.queue_wait_ms = 60_000;
+        rig.core.set_policy(policy);
+        rig.machine.set_available_bytes(0);
+        let admission = rig.core.admission.clone();
+        let waiting = {
+            let admission = admission.clone();
+            tokio::spawn(async move {
+                let _ = admission
+                    .admit(crate::admission::Request {
+                        database: "another-database".into(),
+                        memory_mib: 64,
+                        always_warm: false,
+                    })
+                    .await;
+            })
+        };
+        let started = std::time::Instant::now();
+        loop {
+            let node = admission.snapshot().await.expect("the admission loop runs");
+            if node.queued == 1 {
+                assert_eq!(node.starting, 0, "the wake is queued, none is in flight");
+                return waiting;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "timed out: the start that waits for room"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A database that nobody uses for longer than its idle time, with a base backup due.
+    async fn idle_with_a_backup_due(
+        rig: &Rig,
+    ) -> (Entry, Arc<Db>, crate::agent::testing::FakeGateway) {
+        let gateway = rig.connect_gateway().await;
+        let (entry, db) = rig.create().await;
+        age_backup(rig, &db);
+        db.view().awake_since_ms = Some(now_ms() - 2 * BACKUP_AFTER_WAKE_MS);
+        gateway.sessions.lock().unwrap().last_activity_ms = Some(now_ms() - 61_000);
+        (entry, db, gateway)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_idle_database_stays_awake_while_a_wake_runs_and_its_backup_is_taken_at_the_next_pass_after_it()
+     {
+        let Some(rig) = Rig::new("backup-idle-wake").await else {
+            return;
+        };
+        let (entry, db, _gateway) = idle_with_a_backup_due(&rig).await;
+        let first = db.state().unwrap().backup.unwrap();
+
+        // Another database is waking: the backup that is due waits and the database is not put to
+        // sleep without it (it would not be woken for it later), but stays up for the next pass.
+        let wake = wake_on_the_node(&rig).await;
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Ready);
+        assert!(rig.machine.running(&entry.id));
+        assert_eq!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+        let put_off = db.view().backup_put_off_ms.expect("the backup is put off");
+
+        // It is asked again, and the longest wait stays counted from the first time.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Ready);
+        assert_eq!(db.view().backup_put_off_ms, Some(put_off));
+
+        // The wake is over: the next pass takes the backup, then puts the database to sleep.
+        wake.failed();
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Asleep);
+        assert_ne!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+        assert_eq!(db.view().backup_put_off_ms, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_that_waits_for_room_puts_off_the_backup_of_an_idle_database_too() {
+        let Some(rig) = Rig::new("backup-idle-queued").await else {
+            return;
+        };
+        let (entry, db, _gateway) = idle_with_a_backup_due(&rig).await;
+        let first = db.state().unwrap().backup.unwrap();
+
+        let waiting = queued_wake_on_the_node(&rig).await;
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Ready);
+        assert!(rig.machine.running(&entry.id));
+        assert!(db.view().backup_put_off_ms.is_some());
+        assert_eq!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+
+        // The wake leaves the queue: the next pass takes the backup.
+        waiting.abort();
+        let _ = waiting.await;
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Asleep);
+        assert_ne!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_idle_sleep_takes_the_backup_whatever_the_node_does_once_it_was_put_off_the_longest()
+    {
+        let Some(rig) = Rig::new("backup-idle-longest").await else {
+            return;
+        };
+        let (_entry, db, _gateway) = idle_with_a_backup_due(&rig).await;
+        let first = db.state().unwrap().backup.unwrap();
+
+        let wake = wake_on_the_node(&rig).await;
+        // A moment short of the longest wait: still put off.
+        db.view().backup_put_off_ms = Some(now_ms() - BACKUP_PUT_OFF_MAX_MS + 30_000);
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Ready);
+        // The longest wait has passed, and a wake is in flight still: the backup is taken.
+        db.view().backup_put_off_ms = Some(now_ms() - BACKUP_PUT_OFF_MAX_MS);
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Asleep);
+        assert_ne!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+        assert_eq!(db.view().backup_put_off_ms, None);
+        wake.failed();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_backup_of_an_idle_database_waits_for_the_first_minute_after_a_wake_of_another() {
+        let Some(rig) = Rig::new("backup-after-another-wake").await else {
+            return;
+        };
+        // A: asleep, then woken just now, with an idle time that this test does not outlast. Its
+        // start is over, so no start is queued or in flight on the node, and its first statements
+        // are what the backup of B must not share the disk with.
+        let mut json = rig.entry_json();
+        json["sleep_after_seconds"] = json!(3600);
+        let (a_entry, a) = rig.create_from(&json).await;
+        assert_eq!(rig.core.sleep(&a, Why::Idle).await, Slept::Proven);
+        let woken = rig.core.wake(&Rig::ticket(&a_entry)).await;
+        assert_eq!(woken.outcome, WakeOutcome::Started, "{woken:?}");
+        // B: idle for its idle time, a base backup due, its own wake long ago. It comes up after A
+        // because both run as the test's user and the agent's archive table, which names a
+        // database by its user, then names the one that came up last: B's WAL is archived as B's.
+        let (_, b, _gateway) = idle_with_a_backup_due(&rig).await;
+        let first = b.state().unwrap().backup.unwrap();
+        let node = rig.core.admission.snapshot().await.unwrap();
+        assert_eq!((node.starting, node.queued), (0, 0));
+
+        rig.core.idle_pass().await;
+        assert_eq!(b.phase(), Phase::Ready);
+        assert!(rig.machine.running(&b.id));
+        assert!(b.view().backup_put_off_ms.is_some());
+        assert_eq!(
+            b.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+        assert_eq!(a.phase(), Phase::Ready);
+
+        // A's minute is over: the next pass takes the backup of B, then puts it to sleep.
+        a.view().awake_since_ms = Some(now_ms() - BACKUP_AFTER_WAKE_MS);
+        rig.core.idle_pass().await;
+        assert_eq!(b.phase(), Phase::Asleep);
+        assert_ne!(
+            b.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+        assert_eq!(b.view().backup_put_off_ms, None);
+        assert_eq!(a.phase(), Phase::Ready);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_that_is_used_takes_the_backup_it_was_put_off_for_while_it_serves_once_the_wait_is_over()
+     {
+        let Some(rig) = Rig::new("backup-put-off-used").await else {
+            return;
+        };
+        let (entry, db, gateway) = idle_with_a_backup_due(&rig).await;
+        let first = db.state().unwrap().backup.unwrap();
+        let newest = || db.state().unwrap().backup.unwrap().backup_id;
+
+        // Put off for a wake on the node, and then a client comes back: busy, the database is
+        // never idle, so no idle sleep comes to take the backup.
+        let wake = wake_on_the_node(&rig).await;
+        rig.core.idle_pass().await;
+        assert!(db.view().backup_put_off_ms.is_some());
+        {
+            let mut sessions = gateway.sessions.lock().unwrap();
+            sessions.connections = 1;
+            sessions.busy_connections = 1;
+        }
+
+        // A moment short of the longest wait: still put off, and the database keeps serving.
+        db.view().backup_put_off_ms = Some(now_ms() - BACKUP_PUT_OFF_MAX_MS + 30_000);
+        rig.core.idle_pass().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(newest(), first.backup_id);
+
+        // The longest wait has passed and a wake is in flight still: the backup is taken while
+        // the database stays up and in use.
+        db.view().backup_put_off_ms = Some(now_ms() - BACKUP_PUT_OFF_MAX_MS);
+        rig.core.idle_pass().await;
+        eventually(30, "the backup of a database that is used", || {
+            newest() != first.backup_id
+        })
+        .await;
+        eventually(5, "the wait forgotten", || {
+            db.view().backup_put_off_ms.is_none()
+        })
+        .await;
+        assert_eq!(db.phase(), Phase::Ready);
+        assert!(rig.machine.running(&entry.id));
+        wake.failed();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_that_sleeps_without_its_backup_waits_anew_at_its_next_wake() {
+        let Some(rig) = Rig::new("backup-put-off-forgotten").await else {
+            return;
+        };
+        let (entry, db, _gateway) = idle_with_a_backup_due(&rig).await;
+        let first = db.state().unwrap().backup.unwrap();
+
+        // Put off, and reclaimed for a wake that waits for room after the longest wait: asleep
+        // without its backup.
+        let wake = wake_on_the_node(&rig).await;
+        rig.core.idle_pass().await;
+        assert!(db.view().backup_put_off_ms.is_some());
+        db.view().backup_put_off_ms = Some(now_ms() - 2 * BACKUP_PUT_OFF_MAX_MS);
+        let early = Why::Early {
+            for_database: "another-database".into(),
+        };
+        assert_eq!(rig.core.sleep(&db, early).await, Slept::Proven);
+        assert_eq!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id
+        );
+
+        // What it waited in that session is not counted in the next: put off again, though a
+        // wake is in flight and the old wait is over.
+        let woken = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(woken.outcome, WakeOutcome::Started, "{woken:?}");
+        db.view().awake_since_ms = Some(now_ms() - 2 * BACKUP_AFTER_WAKE_MS);
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Ready);
+        assert!(
+            db.view()
+                .backup_put_off_ms
+                .is_some_and(|since| { now_ms() - since < BACKUP_PUT_OFF_MAX_MS })
+        );
+        wake.failed();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2675,5 +3135,237 @@ mod tests {
             "NodeEventReport",
             &json!({"events": events})
         ));
+    }
+
+    // ---- the CPU burst after a wake (policy.admission.cpu_boost_ms)
+
+    /// The rig's agent applies the CPU quota `window` after a wake.
+    fn boost(rig: &Rig, window: Duration) {
+        let mut policy = rig.core.policy();
+        policy.admission.admission.cpu_boost_ms = u64::try_from(window.as_millis()).unwrap();
+        rig.core.set_policy(policy);
+    }
+
+    /// Found live on EU1 (2026-10-20, 59 sm-class databases woken after an hour): the quota applied
+    /// at the release throttled the first request, the start-up and the reading of the buffer list
+    /// in 19 of about 25 periods, and the whole request took 2.0 s at p50 against 0.3 s awake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_woken_database_gets_its_quota_once_after_the_boost_and_with_the_wake_at_zero() {
+        let Some(rig) = Rig::new("cpu-boost").await else {
+            return;
+        };
+        let window = Duration::from_millis(1500);
+        boost(&rig, window);
+        let (entry, db) = rig.create().await;
+        let quota = NonZeroU32::new(250);
+        // A build is no wake: its quota comes with ready, whatever the policy says.
+        assert_eq!(rig.machine.quota(&entry.id), Some(quota));
+        assert!(!db.boosting());
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        assert_eq!(rig.machine.quota(&entry.id), Some(None), "a stop lifts it");
+
+        let began = Instant::now();
+        let ticket = Rig::ticket(&entry);
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        assert!(rig.machine.running(&entry.id));
+        assert_eq!(
+            rig.machine.quota(&entry.id),
+            Some(None),
+            "released, no quota"
+        );
+        assert!(db.boosting());
+        tokio::time::sleep(window / 2).await;
+        assert_eq!(
+            rig.machine.quota(&entry.id),
+            Some(None),
+            "inside the window"
+        );
+        eventually(10, "the quota after the boost", || {
+            rig.machine.quota(&entry.id) == Some(quota)
+        })
+        .await;
+        assert!(began.elapsed() >= window, "{:?}", began.elapsed());
+        // Not twice: nothing else sets it while the database runs on.
+        tokio::time::sleep(window).await;
+        assert_eq!(rig.machine.quota_calls(&entry.id), [quota, quota]);
+
+        // At zero the quota comes with the wake, as before the burst existed.
+        boost(&rig, Duration::ZERO);
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        assert_eq!(rig.machine.quota(&entry.id), Some(quota));
+        assert!(!db.boosting());
+        assert_eq!(rig.machine.quota_calls(&entry.id), [quota, quota, quota]);
+    }
+
+    /// The timer is one bounded task of the wake, and a stop ends it: a quota set on a stopped
+    /// unit would outlive the stop and throttle the next start. A later wake has a window of its
+    /// own, which the earlier wake's timer does not cut short.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sleep_ends_the_boost_and_the_next_wake_has_a_boost_of_its_own() {
+        let Some(rig) = Rig::new("cpu-boost-sleep").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let quota = NonZeroU32::new(250);
+        let window = Duration::from_millis(4000);
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        boost(&rig, window);
+        let ticket = Rig::ticket(&entry);
+
+        let first = Instant::now();
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        assert!(db.boosting());
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let second = Instant::now();
+        assert!(
+            second.duration_since(first) < window / 2,
+            "the sleep was slow"
+        );
+        assert!(!db.boosting(), "the sleep ended the timer");
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        assert!(db.boosting());
+        assert!(second.duration_since(first) > Duration::from_millis(100));
+
+        // Past the end of the first wake's window the unit still has no quota.
+        tokio::time::sleep_until((first + window + Duration::from_millis(100)).into()).await;
+        assert_eq!(rig.machine.quota(&entry.id), Some(None));
+        assert_eq!(
+            rig.machine.quota_calls(&entry.id),
+            [quota],
+            "the build's only"
+        );
+        eventually(10, "the quota after the second window", || {
+            rig.machine.quota(&entry.id) == Some(quota)
+        })
+        .await;
+        assert!(second.elapsed() >= window, "{:?}", second.elapsed());
+        assert_eq!(rig.machine.quota_calls(&entry.id), [quota, quota]);
+    }
+
+    /// A resize inside the window changes the quota that follows it: the entry at the time counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_quota_after_the_boost_is_the_class_the_database_has_by_then() {
+        let Some(rig) = Rig::new("cpu-boost-resize").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        boost(&rig, Duration::from_millis(1500));
+        let ticket = Rig::ticket(&entry);
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        assert_eq!(rig.machine.quota(&entry.id), Some(None));
+        // The page catches up with the wake and names a bigger class.
+        let bigger = Entry {
+            generation: ticket.generation,
+            operation: ticket.operation.clone(),
+            cpu_millicores: 500,
+            ..entry.clone()
+        };
+        assert!(rig.core.accept(&db, bigger));
+        eventually(10, "the quota of the new class", || {
+            rig.machine.quota(&entry.id) == Some(NonZeroU32::new(500))
+        })
+        .await;
+    }
+
+    /// An agent that restarts inside a window has lost its timer: it applies the quota at once to
+    /// what it finds running, whatever the policy says.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_applies_the_quota_to_a_unit_it_finds_inside_a_boost() {
+        let Some(rig) = Rig::new("cpu-boost-restart").await else {
+            return;
+        };
+        rig.machine.direct_archive();
+        let mut json = rig.entry_json();
+        let id = json["id"].as_str().unwrap().to_string();
+        let page = |json: &Value| {
+            let mut page = Rig::page(vec![json.clone()], vec![]);
+            page.policy["admission"]["cpu_boost_ms"] = json!(60_000);
+            page
+        };
+        rig.core.apply(&page(&json)).await;
+        let db = rig.core.db(&id);
+        eventually(90, "ready", || db.phase() == Phase::Ready).await;
+        json.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let ticket = Rig::ticket(&rig.entry_for(&json));
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        assert_eq!(
+            rig.machine.quota(&id),
+            Some(None),
+            "inside a window of a minute"
+        );
+
+        let rig = rig.restart().await;
+        rig.deliver(json["archive"]["path"].as_str().unwrap(), "read_write");
+        rig.core.apply(&page(&json)).await;
+        let found = rig.core.db(&id);
+        eventually(20, "the unit and its quota", || {
+            found.phase() == Phase::Ready && rig.machine.quota(&id) == Some(NonZeroU32::new(250))
+        })
+        .await;
+        assert!(!found.boosting());
+    }
+
+    /// Found by review: the timer waits for the database's flow lock, and the daily base backup of
+    /// an always-warm database holds it for as long as it takes (minutes for 10 GiB), so the burst
+    /// outlasted its window by that time. Such a database is woken after a long suspend or a node
+    /// reboot, which is when its backup is due. The backup ends the burst before it begins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_base_backup_that_begins_inside_a_boost_ends_it_before_it_takes_the_flow() {
+        let Some(rig) = Rig::new("cpu-boost-backup").await else {
+            return;
+        };
+        let mut json = rig.entry_json();
+        json["sleep_after_seconds"] = Value::Null;
+        let entry = rig.entry_for(&json);
+        let db = rig.core.db(&entry.id);
+        assert!(rig.core.accept(&db, entry.clone()));
+        {
+            let _flow = db.lock.lock().await;
+            rig.core.build(&db, &entry).await.unwrap();
+        }
+        let first = db.state().unwrap().backup.unwrap();
+        let quota = NonZeroU32::new(250);
+        assert_eq!(rig.core.sleep(&db, Why::Order).await, Slept::Proven);
+        // A day later it is woken, and its backup is due. The base backup takes 6 s.
+        age_backup(&rig, &db);
+        rig.fixture.set("backup-delay", "6");
+        boost(&rig, Duration::from_secs(1));
+        let ticket = Rig::ticket(&entry);
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        assert_eq!(rig.machine.quota(&entry.id), Some(None));
+        assert!(db.boosting());
+
+        // The contract's longest burst is as long as the first minute that a backup waits for, so
+        // a backup begins inside a burst only at that edge: this burst is made to outlast it.
+        db.view().awake_since_ms = Some(now_ms() - 2 * BACKUP_AFTER_WAKE_MS);
+        // The idle pass starts the backup, which holds the flow of the database.
+        rig.core.idle_pass().await;
+        eventually(4, "the quota before the base backup is over", || {
+            rig.machine.quota(&entry.id) == Some(quota)
+        })
+        .await;
+        assert!(db.lock.try_lock().is_err(), "the backup holds the flow");
+        assert_eq!(
+            db.state().unwrap().backup.unwrap().backup_id,
+            first.backup_id,
+            "the base backup is not over"
+        );
+        assert!(!db.boosting());
+
+        // The backup ends, and nothing applies the quota again.
+        eventually(30, "the daily backup", || {
+            db.state()
+                .and_then(|state| state.backup)
+                .is_some_and(|backup| backup.backup_id != first.backup_id)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(rig.machine.quota_calls(&entry.id), [quota, quota]);
+        assert_eq!(db.phase(), Phase::Ready);
     }
 }

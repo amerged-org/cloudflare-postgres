@@ -4,8 +4,10 @@
 // which Cloudflare does not let anyone read back, and whose public half the node agent has
 // compiled in, read from apps/node-agent/release-signing.pub. The signer signs the manifest of a
 // release for CI's job `sign-release` (sign-release.ts); a node checks the signature before it
-// installs anything of the release, and registration checks it too, so that no release that
-// every node would refuse is registered. This module holds what the checks share and the
+// installs anything of the release, and the API Worker checks it with the same public key (a
+// constant generated from the file, packages/contracts/native/generate-release-key.ts) when the
+// release is registered and again before a node is installed from its image. The registration
+// script checks it too, so that no release that the API and every node would refuse is uploaded. This module holds what the checks share and the
 // operator's one command that makes the key. Nothing here prints a key.
 //
 //   node scripts/operations/release-signing.ts provision --token-env NAME --account-env NAME
@@ -350,13 +352,19 @@ export async function main(
   print(`public key fingerprint (sha256 of its 32 bytes): ${fingerprint}`);
   print("next:");
   print(
-    "  1. commit the public key on the branch that carries the sign-release job, and merge only with it:",
+    "  1. run `node packages/contracts/native/generate-release-key.ts`: it copies the public key into the",
   );
   print(
-    "     a main without it is red at the signing job (docs/operations/release-signing.md)",
+    "     constant the API Worker verifies releases with (CI fails while the two differ)",
   );
   print(
-    "  2. set the repository variable RELEASE_SIGNER_URL to the Worker's https origin",
+    "  2. commit both files on the branch that carries the sign-release job, and merge only with them:",
+  );
+  print(
+    "     a main without the key is red at the signing job (docs/operations/release-signing.md)",
+  );
+  print(
+    "  3. set the repository variable RELEASE_SIGNER_URL to the Worker's https origin",
   );
 }
 

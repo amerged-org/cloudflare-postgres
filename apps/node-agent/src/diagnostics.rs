@@ -73,21 +73,27 @@ fn storage_code(error: &crate::storage::Error) -> String {
     }
 }
 
-/// A call on a unit that failed: the bus's error name where it answered with one, the result of a
-/// job, why PostgreSQL was not ready, or the kind of failure.
+/// A call on a unit that failed: the bus's error name where the bus or systemd answered with one
+/// (`bus_limits_exceeded`, `bus_no_reply`; a method call's reply is a `MethodError` and a property
+/// read's is an `FDO` error, and both are named the same), the result of a job, why PostgreSQL was
+/// not ready, or the kind of failure. `units_bus` is a bus error with no name of its own: a
+/// connection that broke, an I/O failure, a reply the agent could not read.
 fn units_code(error: &crate::units::Error) -> String {
     use crate::units::Error;
     match error {
-        Error::Bus(zbus::Error::MethodError(name, ..)) => {
-            format!(
-                "bus_{}",
-                snake(name.as_str().rsplit('.').next().unwrap_or_default())
-            )
+        Error::Bus(zbus::Error::MethodError(name, ..)) => bus_code(name.as_str()),
+        Error::Bus(zbus::Error::FDO(error)) => {
+            bus_code(zbus::DBusError::name(error.as_ref()).as_str())
         }
         Error::Job { result, .. } => format!("job_{}", slug(result)),
         Error::NotReady(reason) => format!("not_ready_{}", slug(reason)),
         other => format!("units_{}", variant(other)),
     }
+}
+
+/// A bus error name by its last part: `org.freedesktop.DBus.Error.NoReply` is `bus_no_reply`.
+fn bus_code(name: &str) -> String {
+    format!("bus_{}", snake(name.rsplit('.').next().unwrap_or_default()))
 }
 
 /// The variant of a derived `Debug`, as snake case: `NeedsRepair` is `needs_repair`.
@@ -281,6 +287,36 @@ mod tests {
                     "org.freedesktop.DBus.Error.LimitsExceeded",
                 ))),
                 "bus_limits_exceeded",
+            ),
+            // A property read (`Properties.Get`) comes back as `zbus::Error::FDO`: the bus's error
+            // name is the class there too, the reply's words are not.
+            (
+                code(units::Error::Bus(zbus::Error::FDO(Box::new(
+                    zbus::fdo::Error::LimitsExceeded(
+                        "10.0.0.7 has too many replies pending".into(),
+                    ),
+                )))),
+                "bus_limits_exceeded",
+            ),
+            (
+                code(units::Error::Bus(zbus::Error::FDO(Box::new(
+                    zbus::fdo::Error::NoReply("systemd did not answer 10.0.0.7".into()),
+                )))),
+                "bus_no_reply",
+            ),
+            // A bus error with no name of its own, a broken connection or a reply that cannot be
+            // read, is the only `units_bus`.
+            (
+                code(units::Error::Bus(zbus::Error::InputOutput(
+                    std::io::Error::from_raw_os_error(libc::EPIPE).into(),
+                ))),
+                "units_bus",
+            ),
+            (
+                code(units::Error::Bus(zbus::Error::Failure(
+                    "10.0.0.7 hung up".into(),
+                ))),
+                "units_bus",
             ),
             (
                 code(units::Error::Job {

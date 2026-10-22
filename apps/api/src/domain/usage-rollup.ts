@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { z } from "zod";
 import {
   USAGE_FINAL_DELAY_MS,
   USAGE_HOUR_MS,
@@ -24,6 +25,38 @@ export interface MeteredEvent {
 export interface StoredSample {
   payload: string;
 }
+/**
+ * What an API Worker from before migration 0082 may still write into stored usage: it keeps
+ * running between the migration and the deploy of the Worker that follows it. The new Worker reads
+ * those rows and events as they are and meters from the two limits; the names below are dropped
+ * before a stored row meets the contract, and a snapshot keeps its two limits.
+ */
+const LEGACY_USAGE_NAMES: ReadonlySet<unknown> = new Set([
+  "reserved_memory_mib_seconds",
+  "reserved_cpu_millicore_seconds",
+  "reserved_storage_byte_seconds",
+]);
+const StoredResourceSnapshot = z.object(UsageResourceSnapshot.shape);
+/** The `metrics` JSON of a stored hourly row, without the metrics that no longer exist. */
+export function storedUsageMetrics(text: string): unknown {
+  const metrics: unknown = JSON.parse(text);
+  return typeof metrics === "object" &&
+    metrics !== null &&
+    !Array.isArray(metrics)
+    ? Object.fromEntries(
+        Object.entries(metrics).filter(
+          ([name]) => !LEGACY_USAGE_NAMES.has(name),
+        ),
+      )
+    : metrics;
+}
+/** The `gaps` JSON of a stored hourly row, without the gaps of metrics that no longer exist. */
+export function storedUsageGaps(text: string): unknown {
+  const gaps: unknown = JSON.parse(text);
+  return Array.isArray(gaps)
+    ? gaps.filter((name) => !LEGACY_USAGE_NAMES.has(name))
+    : gaps;
+}
 export function emptyUsageMetrics(): UsageMetrics {
   return Object.fromEntries(
     USAGE_METRICS.map((metric) => [metric, null]),
@@ -32,9 +65,6 @@ export function emptyUsageMetrics(): UsageMetrics {
 const resourceMetrics = [
   "memory_mib_seconds",
   "cpu_millicore_seconds",
-  "reserved_memory_mib_seconds",
-  "reserved_cpu_millicore_seconds",
-  "reserved_storage_byte_seconds",
 ] as const;
 const trafficMetrics = [
   "ingress_bytes",
@@ -89,22 +119,14 @@ export function computeUsageHour(
         gaps.add("resource_snapshot");
         for (const key of resourceMetrics) metrics[key] = null;
       } else {
-        const values = [
-          awake ? resources.memory_mib * seconds : 0,
-          awake ? resources.cpu_millicores * seconds : 0,
-          resources.reserved_memory_mib * seconds,
-          resources.reserved_cpu_millicores * seconds,
-          resources.storage_allocated_bytes === null
-            ? null
-            : resources.storage_allocated_bytes * seconds,
-        ];
-        for (const [index, key] of resourceMetrics.entries()) {
-          const value = values[index];
-          if (value == null) {
-            metrics[key] = null;
-            gaps.add(key);
-          } else if (metrics[key] !== null) metrics[key] += value;
-        }
+        if (metrics.memory_mib_seconds !== null)
+          metrics.memory_mib_seconds += awake
+            ? resources.memory_mib * seconds
+            : 0;
+        if (metrics.cpu_millicore_seconds !== null)
+          metrics.cpu_millicore_seconds += awake
+            ? resources.cpu_millicores * seconds
+            : 0;
       }
     }
     cursor = until;
@@ -127,7 +149,7 @@ export function computeUsageHour(
         ? null
         : (() => {
             try {
-              return UsageResourceSnapshot.safeParse(
+              return StoredResourceSnapshot.safeParse(
                 JSON.parse(event.resource_snapshot),
               );
             } catch {
@@ -378,8 +400,8 @@ async function rollupAttempt(
   }
   return UsageRow.parse({
     ...row,
-    metrics: JSON.parse(persisted!.metrics),
-    gaps: JSON.parse(persisted!.gaps),
+    metrics: storedUsageMetrics(persisted!.metrics),
+    gaps: storedUsageGaps(persisted!.gaps),
     final: persisted!.final === 1,
   });
 }
