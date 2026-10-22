@@ -110,9 +110,10 @@
   "triggers": { "crons": ["* * * * *"] },
   // Optional private secrets: INFRASTRUCTURE_BACKUP_CF_TOKEN (D1 export), RESEND_API_KEY (email),
   // R2_PARENT_ACCESS_KEY_ID and R2_PARENT_SECRET_ACCESS_KEY (the parent key that signs the nodes' temporary
-  // R2 credentials) and CLOUDFLARE_API_TOKEN (edits the Tunnels and the DNS records of the nodes' gateways and
-  // deletes the Tunnel of a node declared lost). Their hostnames are made under NODE_GATEWAY_DOMAIN, a domain
-  // of the DNS zone NODE_GATEWAY_ZONE_ID; set both as variables.
+  // R2 credentials) and CLOUDFLARE_API_TOKEN (Account: Cloudflare Tunnel: Edit and Zone: DNS: Edit on the gateway
+  // zone; edits the Tunnels and the DNS records of the nodes' gateways and deletes both of a node declared lost).
+  // Their hostnames are made under NODE_GATEWAY_DOMAIN, a domain of the DNS zone NODE_GATEWAY_ZONE_ID; set both
+  // as variables.
   // Enable backups and select actual D1 identity/R2 region through the management API.
   "secrets": {
     "required": [

@@ -6,6 +6,15 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { HarnessError, command, record, string } from "./core.ts";
 
+/**
+ * The names of the sanitized report. The CI job `external_probe` attests, uploads and removes the file
+ * under these names, and the runbook downloads the artifact into the evidence directory that
+ * `consumeExternalProbe` reads.
+ */
+export const PROBE_ARTIFACT = "pgcf-node-external-probe";
+export const PROBE_REPORT_FILE = `${PROBE_ARTIFACT}.json`;
+export const PROBE_EVIDENCE_DIRECTORY = ".local/evidence/node-external-probe";
+
 type TcpState = "connected" | "refused" | "timed_out" | "inconclusive";
 interface Sample {
   state: TcpState;
@@ -388,7 +397,7 @@ export async function sourcePool(
       redirect: "error",
       signal: AbortSignal.timeout(10_000),
       headers: {
-        "User-Agent": "pgcf-e6-native-probe",
+        "User-Agent": PROBE_ARTIFACT,
         ...(env.GH_TOKEN ? { Authorization: `Bearer ${env.GH_TOKEN}` } : {}),
       },
     });
@@ -579,7 +588,7 @@ export async function consumeExternalProbe(
   const allowlist = json(env.PGCF_E2E_OPERATOR_ALLOWLIST);
   if (!Array.isArray(allowlist) || allowlist.some((v) => typeof v !== "string"))
     throw new HarnessError("external_probe_allowlist_required");
-  const path = resolve(root, ".local/evidence/phase1/pgcf-e6-native.json");
+  const path = resolve(root, PROBE_EVIDENCE_DIRECTORY, PROBE_REPORT_FILE);
   const body = await readFile(path, "utf8");
   const verified = await io.command(
     "gh",
@@ -653,7 +662,7 @@ export async function consumeExternalProbe(
     !Array.isArray(artifacts.artifacts) ||
     !artifacts.artifacts.some((entry: unknown) => {
       const a = record(entry);
-      return a.name === "pgcf-e6-native" && a.expired === false;
+      return a.name === PROBE_ARTIFACT && a.expired === false;
     })
   )
     throw new HarnessError("external_probe_artifact_missing");
@@ -711,7 +720,7 @@ async function main(): Promise<void> {
   }
   report.finished_at = new Date().toISOString();
   await writeFile(
-    resolve(process.env.RUNNER_TEMP!, "pgcf-e6-native.json"),
+    resolve(process.env.RUNNER_TEMP!, PROBE_REPORT_FILE),
     `${JSON.stringify(report)}\n`,
     { mode: 0o600, flag: "wx" },
   );

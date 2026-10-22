@@ -26,7 +26,7 @@ applying additive migrations and rehearse them against the export.
 | `BOOTSTRAP_TOKEN` | Creates the first admin key, once |
 | `CONTABO_CLIENT_ID`, `CONTABO_CLIENT_SECRET`, `CONTABO_USERNAME`, `CONTABO_PASSWORD` | The Contabo API credentials |
 | `R2_PARENT_ACCESS_KEY_ID`, `R2_PARENT_SECRET_ACCESS_KEY` | An R2 API token with object read and write on the archive buckets, from which the Worker signs the nodes' temporary R2 credentials (plan 7.3) |
-| `CLOUDFLARE_API_TOKEN` | Makes and deletes the nodes' Tunnels and DNS records |
+| `CLOUDFLARE_API_TOKEN` | Makes and deletes the nodes' Tunnels and their DNS records (permissions below) |
 | `INFRASTRUCTURE_BACKUP_CF_TOKEN`, `RESEND_API_KEY`, `INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN` | Optional: the D1 export, direct email and the alert webhook (see below and the [infrastructure backup runbook](infrastructure-backups.md)) |
 
 The EU archive uses the EU-jurisdiction binding and EU S3 endpoint. Every other region has a
@@ -48,11 +48,31 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
   [release-signing.md](release-signing.md) says.
 - `NODE_API_ORIGIN` is this Worker's `https` origin, which the installed node enrolls at, and
   `NODE_DNS_SERVERS` a JSON array of one to three resolvers the node is installed with.
-- `CLOUDFLARE_API_TOKEN` (a private secret with edit access to Tunnels and to the zone's DNS
-  records) makes the node's Tunnel when the node first reads its credentials. Its gateway gets the
-  hostname `pgcf-node-<id>.<domain>` under `NODE_GATEWAY_DOMAIN`, a domain of the zone
-  `NODE_GATEWAY_ZONE_ID`; the Cloudflare account is the one of the region's R2 endpoint. Without
-  the token, the domain or the zone a node gets no credentials and stays closed to placement.
+- `CLOUDFLARE_API_TOKEN` (a private secret) makes the node's Tunnel when the node first reads its
+  credentials. Its gateway gets the hostname `pgcf-node-<id>.<domain>` under `NODE_GATEWAY_DOMAIN`,
+  a domain of the zone `NODE_GATEWAY_ZONE_ID`; the Cloudflare account is the one of the region's R2
+  endpoint. Without the token, the domain or the zone a node gets no credentials and stays closed
+  to placement. The API Worker uses this one secret for everything it does at Cloudflare for a
+  node: it makes the Tunnel and its records (`domain/node-credentials.ts`) and deletes both when
+  the node is declared lost (`domain/fence-actions.ts`). Create it as an API token with exactly two
+  permissions:
+
+  | Permission | Scope | What for |
+  | --- | --- | --- |
+  | Account: Cloudflare Tunnel: Edit | the account of the region's R2 endpoint | Lists, makes and configures the node's Tunnel; deletes it and its connections when the node is lost |
+  | Zone: DNS: Edit | the zone `NODE_GATEWAY_ZONE_ID`, and no other zone | Makes, corrects and removes the node's CNAME records; deletes them when the node is lost |
+
+  Declaring a node lost deletes, after its Tunnel, the node's records under `NODE_GATEWAY_DOMAIN`:
+  the gateway's `pgcf-node-<id>`, the shell's `pgcf-shell-<id>` and the shell's former
+  `pgcf-node-<id>-ssh`, each only if it points at one of the node's own Tunnels; a record with that
+  name that points elsewhere, and every other record of the zone, is left. The Tunnel is deleted
+  first and whatever the zone is: it is what fences the node. Without the DNS permission, or
+  without `NODE_GATEWAY_ZONE_ID` and `NODE_GATEWAY_DOMAIN` (or with values that are not a zone and
+  its domain), the records of the same step fail after the Tunnel is gone (`tunnel_delete_failed`,
+  or `fence_unconfigured` when the zone is missing); the step is retried whole each minute, and the
+  node is not ordered off until it holds. The Access setup script
+  below takes its own token (`PGCF_CLOUDFLARE_API_TOKEN`), and `INFRASTRUCTURE_BACKUP_CF_TOKEN` is
+  a third one; neither is this one.
 - `NODE_SHELL_HOSTNAME` is off unless it is the string `true`. The node's shell hostname
   `pgcf-shell-<id>.<domain>`, its DNS record and its Tunnel ingress rule exist only while it is
   `true`, and a node that has them loses them on its next credentials read when it is not. The

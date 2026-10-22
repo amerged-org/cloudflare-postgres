@@ -146,6 +146,6 @@ erDiagram
 - [apps/api/migrations/0080_signed_node_image.sql:1](../../../apps/api/migrations/0080_signed_node_image.sql#L1)
 - [apps/api/migrations/0081_node_policy_cpu_boost.sql:1](../../../apps/api/migrations/0081_node_policy_cpu_boost.sql#L1)
 - [apps/api/migrations/0082_drop_dead_capacity_fields.sql:1](../../../apps/api/migrations/0082_drop_dead_capacity_fields.sql#L1)
-- [apps/api/migrations/0085_unreserved_role_names.sql:1](../../../apps/api/migrations/0085_unreserved_role_names.sql#L1)
+- [apps/api/migrations/0083_credentials_state.sql:1](../../../apps/api/migrations/0083_credentials_state.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.
