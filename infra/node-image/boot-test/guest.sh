@@ -707,11 +707,11 @@ line_in_system_journal() {
 }
 
 # The agent finds PostgreSQL's lines in the system journal (by unit and invocation) and builds the
-# boot report from it. journald's SplitMode=uid (the default) keeps the lines of every user above
-# systemd's system, dynamic and container ranges in a user-<uid>.journal of their own: EU1 held 371 of
-# them, one per database ever created, and journald vacuums them by age only (plan 11.1). The scratch
-# database's user logs a line the way its PostgreSQL does (the journal's stream): the line is in the
-# system journal, and no user-*.journal file exists anywhere.
+# boot report from it. journald's SplitMode=uid (the default) keeps the lines of every user outside
+# systemd's system, dynamic and container ranges and nobody in a user-<uid>.journal of their own:
+# EU1 held 371 of them, one per database ever created, and journald vacuums them by age only (plan
+# 11.1). The scratch database's user logs a line the way its PostgreSQL does (the journal's stream):
+# the line is in the system journal, and no user-*.journal file exists anywhere.
 database_log_stays_in_the_system_journal() {
 	local id=pgcfcheckscratch0000 tag=pgcf-boot-test-journal pid uid gid marker files
 	pid=$(systemctl show --property=MainPID --value "pgcf-pg@$id.service")
@@ -721,10 +721,12 @@ database_log_stays_in_the_system_journal() {
 	}
 	uid=$(stat -c %u "/proc/$pid")
 	gid=$(stat -c %g "/proc/$pid")
-	# journald never splits the 16-bit uids (system accounts, systemd's dynamic users, nobody) or the
-	# container uids from 524288: with such a user the file check below would pass whatever the config.
+	# journald keeps the system uids (to 999), systemd's dynamic range (61184 to 65519), nobody (65534),
+	# 65535 and the container range (from 524288) in the system journal whatever SplitMode is: with
+	# such a user the file check below would pass whatever the config. The check takes only a uid from
+	# 65536 to 524287, which journald splits and which holds the agent's database uids (from 200000).
 	{ [ "$uid" -gt 65535 ] && [ "$uid" -lt 524288 ]; } || {
-		echo "uid $uid is one that journald does not split: the probe proves nothing"
+		echo "uid $uid is outside 65536-524287, the range that journald splits: the probe proves nothing"
 		return 1
 	}
 	marker=$tag-$$-$RANDOM
