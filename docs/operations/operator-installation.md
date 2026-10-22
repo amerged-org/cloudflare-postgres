@@ -39,6 +39,32 @@ which is the same for every region. The keys keep regions apart:
 infrastructure backups. A binding that is missing, or a name that is not the bucket the archive
 paths in D1 name, fails closed with an internal error.
 
+The endpoint must be the bucket's on every region row, and nothing checks it. The Worker signs a
+node's temporary credential with the endpoint of the node's region, and no API changes the field:
+`PUT /v1/regions/{id}/configuration` takes only the gateway fields (a body with
+`backup_endpoint_url` is a 400), so a region is made with the right endpoint in its `POST
+/v1/regions` body or is corrected in D1. A region that names the account's general endpoint
+(`https://<account>.r2.cloudflarestorage.com`, which the earlier runbook gave every region outside
+the EU while it had a bucket of its own), another account's endpoint or another jurisdiction's gets
+credentials for a host that does not hold the bucket: every upload of its nodes fails and its
+databases never become ready. Read the table before the first node of a region installs, after
+every region is made and in step 1 of the move below (read-only; no row may answer; `<endpoint>`
+is the bucket's, which the first region holds):
+```sql
+SELECT id,backup_endpoint_url FROM regions WHERE backup_endpoint_url<>'<endpoint>' ORDER BY id;
+```
+Correct a row that answers (`<region>` is its id) from a 0600 file in a 0700 directory, run like
+the rewrite of step 6 below (`wrangler d1 execute <database> --remote --file <file>`) and
+rehearsed on a D1 export first. The same file deletes the credential rows of the region's nodes: a
+node holds the endpoint of the credential it read and reads another only when its page names a new
+id, so it needs the maintenance cycle and the check of step 7 below afterwards, with `<T>` the
+time the file ended (a region without a node needs neither):
+```sql
+UPDATE regions SET backup_endpoint_url='<endpoint>',updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE id='<region>' AND backup_endpoint_url<>'<endpoint>';
+DELETE FROM archive_credentials WHERE node_id IN (SELECT id FROM nodes WHERE region_id='<region>');
+```
+
 The nodes' temporary R2 credentials are signed for `ARCHIVE_BUCKET_NAME` and one database
 generation's prefix, so the parent key (`R2_PARENT_ACCESS_KEY_ID` and
 `R2_PARENT_SECRET_ACCESS_KEY`, an R2 API token) must have object read and write on that bucket.
@@ -159,31 +185,48 @@ bucket, made after the last write into it, closes any gap.
 
 1. Deploy the Worker with the single `ARCHIVE` binding still naming the old bucket, then apply
    migration `0083` (the old Worker cannot run on the new schema, the new one runs on the old).
+   Then run the endpoint check of the deployment inputs above: no region row may name another
+   endpoint than the bucket's. A region made while it had a bucket of its own (`us-dev`) is the
+   likely one: the earlier runbook gave it the account's general endpoint, and the new bucket is in
+   the EU jurisdiction, so its first node (US1) would get credentials for a host without the
+   bucket. Correct a row that answers with the file of that section before the region's first node
+   reads a credential; for a node that already holds one, the same file makes it read a new one.
 2. With the owner's costed go, create the new bucket (same jurisdiction). Replace the parent key
    (`R2_PARENT_ACCESS_KEY_ID`, `R2_PARENT_SECRET_ACCESS_KEY`) by a token whose policy names both
    buckets, and keep the old bucket in it until step 11 revokes it: a rollback signs for the old
    bucket with it.
-3. Copy what a database that is not deleted needs while everything runs, and repeat until a pass
-   copies only what changed. Make the list of prefixes first, read-only, into a 0600 file in a 0700
-   directory that is deleted afterwards:
+3. Copy what a database that is not deleted needs while everything runs, in rounds, and repeat
+   until a round copies only what changed. A round starts with the list of prefixes, made
+   read-only into a 0600 file in a 0700 directory that is deleted afterwards, and copies each line:
    ```sql
    SELECT substr(archive_path,length('s3://<old>/')+1) FROM databases
      WHERE deleted_at IS NULL AND substr(archive_path,1,length('s3://<old>/'))='s3://<old>/';
    ```
    The copy and the compare take one `--prefix` a call, so run each once for every line of the list
    (`<region>/<database>/g<generation>-<operation>/`) and once each for `node-images/` and
-   `infrastructure/v1/`. The passes with `--since` of steps 8 and 10 take no prefix: they copy whatever
-   was written since, and a deleted database writes nothing, so they bring none of the left-behind
-   archives along, and they catch a database created after the list was made. A key counts as copied when its
-   size and ETag, or its size and a LastModified not older than the source's, match, because R2 may
-   recompute a multipart ETag on a copy. Compare sizes and ETags of every key of the list, the bodies of the ones
-   whose ETag differs, and the stored sha256 and custom metadata of the node images and infrastructure
-   exports (a HEAD returns a checksum only when it asks with `x-amz-checksum-mode`). An object whose
-   checksum the copy lost is uploaded again with `register-node-image.ts` run with `PGCF_R2_BUCKET` set
-   to the new bucket: until step 5 the variable names the old one, where the script finds the object
-   complete and sends nothing.
-4. Rehearse the rewrite below on a D1 export. Check that no create, restore, move or base backup is in
-   flight and that every node runs its region's release.
+   `infrastructure/v1/`. The last round, the one that ends before step 5, makes its own list at its
+   start and starts its first copy within an hour of making the list. That is what covers a
+   database created after the list: it is not on it, so no per-prefix copy brings its first base
+   backup or its WAL, and only the passes by time of steps 8 and 10 can. They reach the keys
+   modified since their `--since`, which step 8 takes an hour before the earliest pass of the last
+   round began, so with the first copy within the hour of the list it lies before the list was made,
+   and every key of a database created after the list is newer than it. A list from an earlier
+   round, or a last round that begins more than an hour after its list, leaves a gap: a database
+   created in between has its first base backup and its WAL in no per-prefix copy and older than
+   every later `--since`, and it has no restorable base backup in the new bucket until its next
+   one. The passes by time take no prefix: they copy whatever was written since, and a deleted
+   database writes nothing, so they bring none of the left-behind archives along, and they catch
+   a database created after the last round's list was made.
+A key counts as copied when its size and ETag, or its size and a LastModified not older
+   than the source's, match, because R2 may recompute a multipart ETag on a copy. Compare sizes and
+   ETags of every key of the list, the bodies of the ones whose ETag differs, and the stored sha256
+   and custom metadata of the node images and infrastructure exports (a HEAD returns a checksum
+   only when it asks with `x-amz-checksum-mode`). An object whose checksum the copy lost is uploaded
+   again with `register-node-image.ts` run with `PGCF_R2_BUCKET` set to the new bucket: until step
+   5 the variable names the old one, where the script finds the object complete and sends nothing.
+4. Rehearse the rewrite below on a D1 export, and with it the correction of a region endpoint if
+   step 1's check answered a row. Check that no create, restore, move or base backup is in flight
+   and that every node runs its region's release.
 5. Deploy the Worker with `ARCHIVE` bound to the new bucket and `ARCHIVE_BUCKET_NAME` set to it. Note
    the time (T_B) immediately before the deploy starts and after the last warm copy has ended: every
    copy predates it, and everything a database or the Worker writes into the new bucket postdates it
@@ -228,7 +271,8 @@ bucket, made after the last write into it, closes any gap.
    Databases that were asleep stay asleep. If a cycle fails or
    a node is offline, do not go on: that node's awake databases may still write into the old bucket.
 8. Copy again what the old bucket received since the warm copy (only keys modified since a time a
-   little before the last warm pass, the `next_since` of the earliest pass of the last warm round, so that
+   little before the last warm round, the `next_since` of the earliest pass of the last warm round: an
+   hour before it began, so before that round's list was made (step 3), and no earlier, so that
    a key the new bucket's retention has deleted before is not brought back), and compare. Then delete from the new bucket the copies of what the old bucket's
    retention deleted before step 5 (written there at or before T_B, absent in the old bucket), or
    a deleted database's data outlives its recovery window. T_B was noted before the deploy of step 5,

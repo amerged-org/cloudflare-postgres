@@ -73,9 +73,18 @@ const MOVE = RUNBOOK.slice(
   RUNBOOK.indexOf("### Moving to another archive bucket"),
   RUNBOOK.indexOf("### Keeping the DatabaseActors warm"),
 );
-/** The one fenced SQL block of the bucket-move runbook that holds `needle`, with its placeholders filled. */
-function runbookSql(needle: string, values: Record<string, string>) {
-  const blocks = [...MOVE.matchAll(/^ *```sql\n([\s\S]*?)^ *```/gm)]
+/** The runbook's installation inputs: where the region endpoint check lives. */
+const INPUTS = RUNBOOK.slice(
+  RUNBOOK.indexOf("## Reviewed deployment inputs"),
+  RUNBOOK.indexOf("### The node firewall"),
+);
+/** The one fenced SQL block of a runbook section that holds `needle`, with its placeholders filled. */
+function runbookSql(
+  needle: string,
+  values: Record<string, string>,
+  section = MOVE,
+) {
+  const blocks = [...section.matchAll(/^ *```sql\n([\s\S]*?)^ *```/gm)]
     .map((match) => match[1]!)
     .filter((block) => block.includes(needle));
   expect(blocks).toHaveLength(1);
@@ -226,4 +235,142 @@ it("runs the SQL of the bucket-move runbook on the migrated schema and selects w
       .all()
       .map((row) => row.id),
   ).toEqual([`crd_${"a".repeat(20)}`, `crd_${"f".repeat(20)}`]);
+});
+
+it("checks and corrects the endpoint of every region, which no API can change", () => {
+  db.close();
+  db = new DatabaseSync(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  for (const name of migrations) apply(name);
+  const bucket = `https://${"a".repeat(32)}.eu.r2.example.com`;
+  // A region made the way the old runbook said for a region outside the EU: the general endpoint.
+  const general = `https://${"a".repeat(32)}.r2.example.com`;
+  const project = `prj_${"a".repeat(20)}`;
+  const run = (sql: string, ...params: (string | number | null)[]) =>
+    db.prepare(sql).run(...params);
+  const row = (sql: string, ...params: (string | number | null)[]) =>
+    db.prepare(sql).all(...params);
+  run(
+    "INSERT INTO projects(id,name,created_at,updated_at) VALUES(?,?,?,?)",
+    project,
+    "p",
+    NOW,
+    NOW,
+  );
+  run(
+    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,archive_timeout_seconds,backup_retention_days,created_at,updated_at)
+     VALUES('small',512,500,10,100,60,7,?,?)`,
+    NOW,
+    NOW,
+  );
+  for (const [region, endpoint, letter] of [
+    ["eu-test", bucket, "a"],
+    ["us-test", general, "b"],
+    ["us-spare", general, "c"],
+  ] as const) {
+    const node = `nod_${letter.repeat(20)}`;
+    const database = `${letter}${"1".repeat(19)}`;
+    const path = `s3://pgcf-test/${region}/${database}/g1-op_${letter.repeat(20)}`;
+    run(
+      `INSERT INTO regions(id,provider,provider_region,gateway_url,backup_endpoint_url,created_at,updated_at)
+       VALUES(?,'contabo','EU',?,?,?,?)`,
+      region,
+      `https://${region}.example.com/pg`,
+      endpoint,
+      NOW,
+      NOW,
+    );
+    // A region without a node yet (us-spare) is the one US1 is installed into.
+    if (region === "us-spare") continue;
+    run(
+      `INSERT INTO nodes(id,region_id,hostname,allocatable_memory_mib,allocatable_cpu_millicores,created_at,updated_at)
+       VALUES(?,?,?,0,0,?,?)`,
+      node,
+      region,
+      `${letter}1`,
+      NOW,
+      NOW,
+    );
+    run(
+      `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,archive_path,created_at,updated_at)
+       VALUES(?,?,?,?,?,'small','running',?,?,?)`,
+      database,
+      project,
+      region,
+      node,
+      `db-${letter}`,
+      path,
+      NOW,
+      NOW,
+    );
+    run(
+      `INSERT INTO archive_credentials(id,node_id,database_id,archive_path,access,issued_at,expires_at)
+       VALUES(?,?,?,?,'read_write',?,?)`,
+      `crd_${letter.repeat(20)}`,
+      node,
+      database,
+      path,
+      NOW,
+      "2026-10-26T10:00:00.000Z",
+    );
+  }
+  const values = { "<endpoint>": bucket, "<region>": "us-test" };
+
+  // The check answers exactly the regions that name another endpoint than the bucket's.
+  const check = runbookSql(
+    "SELECT id,backup_endpoint_url FROM regions",
+    values,
+    INPUTS,
+  );
+  expect(row(check)).toEqual([
+    { id: "us-spare", backup_endpoint_url: general },
+    { id: "us-test", backup_endpoint_url: general },
+  ]);
+
+  // The correction fixes one named region, forces its nodes to read a new credential, and touches no other.
+  const correction = runbookSql(
+    "UPDATE regions SET backup_endpoint_url",
+    values,
+    INPUTS,
+  );
+  const before = row("SELECT * FROM regions WHERE id<>'us-test' ORDER BY id");
+  db.exec(correction);
+  db.exec(correction);
+  expect(row(check)).toEqual([
+    { id: "us-spare", backup_endpoint_url: general },
+  ]);
+  expect(row("SELECT * FROM regions WHERE id<>'us-test' ORDER BY id")).toEqual(
+    before,
+  );
+  expect(
+    row(
+      "SELECT backup_endpoint_url,gateway_url,provider_region,created_at,updated_at>? changed FROM regions WHERE id='us-test'",
+      NOW,
+    ),
+  ).toEqual([
+    {
+      backup_endpoint_url: bucket,
+      gateway_url: "https://us-test.example.com/pg",
+      provider_region: "EU",
+      created_at: NOW,
+      changed: 1,
+    },
+  ]);
+  expect(
+    row("SELECT id FROM archive_credentials ORDER BY id").map(
+      (value) => value.id,
+    ),
+  ).toEqual([`crd_${"a".repeat(20)}`]);
+});
+
+it("makes the prefix list again for the last warm round, so a database created after it is inside the window of the passes by time", () => {
+  const steps = MOVE.slice(MOVE.indexOf("\n3. Copy"), MOVE.indexOf("\n4. "));
+  const text = steps.replace(/\s+/g, " ");
+  // The last round makes its own list at its start and starts copying within an hour of it.
+  expect(text).toMatch(/last round.{0,100}makes its own list at its start/);
+  expect(text).toMatch(/within an hour of making the list/);
+  // The claim that the passes by time catch a later database is tied to that list, not to any list.
+  expect(text).not.toMatch(
+    /they catch a database created after the list was made/,
+  );
 });
