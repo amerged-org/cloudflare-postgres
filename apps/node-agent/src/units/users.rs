@@ -5,8 +5,12 @@
 //! The uid a database prefers is a function of its ID alone. The agent persists what it handed
 //! out, so a preferred uid that another database holds moves a later database to the next free
 //! one, and a database keeps its uid for as long as it exists. The agent releases the uid only
-//! when the database is gone from the node, volume included (plan 5.10), so no file of a former
-//! owner outlives the uid's reuse.
+//! when the database is gone from the node, volume included (plan 5.10), and a later database can
+//! be given it. Every file of the former owner on its volume goes with the volume. What
+//! `release` does not remove is kept by other services under the numeric uid: journald's
+//! `user-<uid>.journal`, which grants that uid read access. The database unit cannot see the
+//! journal directories (`InaccessiblePaths=` in `pgcf-pg@.service`), and a new place where a uid's
+//! files are kept must be closed the same way (plan 8).
 use pgcf_native_protocol::valid_pattern;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

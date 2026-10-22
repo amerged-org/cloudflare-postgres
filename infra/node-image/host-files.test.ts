@@ -41,6 +41,8 @@ test("the image tree is read as one list: every file of it is a host file or sta
   const paths = files.map((file) => file.path);
   for (const path of [
     "/usr/lib/systemd/system/pgcf-pg@.service",
+    "/usr/lib/systemd/system/pgcf-slot@.service",
+    "/usr/lib/systemd/journald.conf.d/pgcf-split.conf",
     "/usr/lib/systemd/system/pgcf-agent.service",
     "/etc/systemd/system/modprobe@loop.service",
     "/etc/systemd/system/modprobe@dm_mod.service",
