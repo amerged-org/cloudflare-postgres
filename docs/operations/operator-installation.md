@@ -202,9 +202,21 @@ bucket, made after the last write into it, closes any gap.
    <database> --remote` shows only `0084` pending (`0083`, the credentials revision, is additive and goes before the
    Worker that reads its column, so it is applied before the deploy below); if `0082` or `0083` is
    pending, finish that first and run no `migrations apply` and no deploy with `--migrate` from this
-   commit meanwhile. Then deploy the Worker with `ARCHIVE_ENDPOINT_URL` set to
-   the endpoint of the bucket (the old bucket's, which is the new bucket's too) and the single
-   `ARCHIVE` binding still naming the old bucket, and only then apply `0084`. The Worker of this
+   commit meanwhile. Check, read-only, that the bucket the Worker will use is the one the databases
+   name. `<old>` is the value of `ARCHIVE_BUCKET_NAME` now (the earlier Worker read it only for a
+   region that `ARCHIVE_BINDINGS` did not map, so it can be stale); no live database may name another
+   bucket:
+   ```sql
+   SELECT count(*) FROM databases WHERE deleted_at IS NULL
+     AND substr(archive_path,1,length('s3://<old>/'))<>'s3://<old>/';
+   ```
+   It must answer 0: step 3's list takes only the databases that name `<old>`, so a database that
+   names a third bucket would be left out of the copy, and every archive operation of the Worker
+   refuses its path. Then deploy the Worker with `ARCHIVE_ENDPOINT_URL` set to
+   the endpoint of the bucket (the old bucket's, which is the new bucket's too), the single
+   `ARCHIVE` binding and `ARCHIVE_BUCKET_NAME` still naming the old bucket, and the `ARCHIVE_US`
+   binding and the `ARCHIVE_BINDINGS` variable gone from the private configuration (the Worker reads
+   neither), and only then apply `0084`. The Worker of this
    commit reads neither region column, so it runs on the schema before `0084` (except that `POST
    /v1/regions` fails until `0084` is applied, because its insert names no endpoint), while the Worker
    before it reads both columns and cannot run on the schema after `0084`. From the deploy on, every
@@ -318,9 +330,12 @@ bucket, made after the last write into it, closes any gap.
    `copy --since <next_since> --allow-extra-destination-keys`. The flag is not
    optional here: step 7's cycle archived the final WAL of every awake database into the new bucket
    only, and a database created after the deploy exists only there, so without it the copy refuses
-   and copies nothing. Then compare. Then delete from the new bucket the copies of what the old bucket's
-   retention deleted before step 5 (written there at or before T_B, absent in the old bucket), or
-   a deleted database's data outlives its recovery window. T_B was noted before the deploy of step 5,
+   and copies nothing. Then compare: `verify --from <old> --to <new> --since <next_since>` (the same
+   time; without `--since` it would report every left-behind archive as missing). Then delete from the
+   new bucket the copies of what the old bucket's retention deleted before step 5 (written there at or
+   before T_B, absent in the old bucket), or a deleted database's data outlives its recovery window:
+   `prune --from <old> --to <new> --before <T_B>` is the dry run (it prints the count and the first
+   keys), the same with `--execute` deletes. T_B was noted before the deploy of step 5,
    so a database created after it is never touched. After a rollback (a second attempt) this delete
    is allowed only when the rollback's reverse checks are done (the last chained pass, after X_NEW,
    found nothing missing, and the missing keys of every earlier pass were mirrored or found unnamed)
@@ -353,8 +368,9 @@ bucket, made after the last write into it, closes any gap.
     base backup that ended at least `backup_retention_days` (a day at least) before, and a purge or an
     expiry waits as long for a deleted database or a finished move, so the overlap copies back only a
     key that retention deletes again, or a purged prefix that the check below finds unnamed. Run
-    after each pass also `verify --from <old> --to <new> --since <T_REWRITE> --sample-heads 0
-    --missing-file <file>`: every key the old bucket received since step 6's file ended, compared with
+    after each pass also the tripwire, `inventory --from <old> --since <T_REWRITE>` (how many keys the
+    old bucket received since step 6's file ended, with the first ten), and `verify --from <old>
+    --to <new> --since <T_REWRITE> --sample-heads 0 --missing-file <file>`: every key the old bucket received since step 6's file ended, compared with
     the new bucket whatever the chain skipped. In the passes of an hour and a day it finds nothing
     missing (the new bucket's retention cannot have acted on keys that young). After the last
     credential has expired a missing key is no gap only if no row names its prefix (below) or if it is

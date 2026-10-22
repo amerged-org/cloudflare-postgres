@@ -230,6 +230,20 @@ it("runs the SQL of the bucket-move runbook on the migrated schema and selects w
     ),
   );
 
+  // Step 1: the live databases that name another bucket than the one the Worker will use. g is the only
+  // one: step 3's list above leaves it out, so the check is what tells the operator before the deploy.
+  // The deleted database e names the old bucket and a deleted row is never counted.
+  expect(
+    db
+      .prepare(
+        runbookSql("SELECT count(*) FROM databases WHERE deleted_at IS NULL", {
+          "<old>": OLD,
+        }),
+      )
+      .all()
+      .map((row) => Object.values(row)[0]),
+  ).toEqual([1]);
+
   // Step 7: the databases that cannot have switched yet are awake or possibly awake and hold no
   // read-write credential issued after the time: b (an older one), c (none) and f (read-only);
   // a (newer), d (suspended by hand) and e (deleted) are not counted.
