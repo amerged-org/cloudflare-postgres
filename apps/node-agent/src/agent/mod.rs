@@ -175,8 +175,8 @@ pub(crate) struct View {
     pub roles_blocked: Vec<String>,
     /// A recovery runs or waits for its retry.
     pub recovering: bool,
-    /// Since when the unit runs: the usage meter's, and the first minute that a due base backup
-    /// waits for (`backup_if_due`).
+    /// Since when the unit runs: the usage meter's, and the first minute after which a due base
+    /// backup on the node may start (`Core::newest_ready_ms`).
     pub awake_since_ms: Option<i64>,
     /// When the last base backup that was due failed (`backup_if_due`).
     pub backup_failed_ms: Option<i64>,
@@ -523,6 +523,15 @@ impl<M: Machine> Core<M> {
             .collect();
         dbs.sort_by(|a, b| a.id.cmp(&b.id));
         dbs
+    }
+
+    /// When the newest awake database on the node became ready (`View::awake_since_ms`): a wake, a
+    /// build, or the adoption of a unit that runs. A database that sleeps has none.
+    pub(crate) fn newest_ready_ms(&self) -> Option<i64> {
+        self.all()
+            .iter()
+            .filter_map(|db| db.view().awake_since_ms)
+            .max()
     }
 
     /// The agent's files of a database.

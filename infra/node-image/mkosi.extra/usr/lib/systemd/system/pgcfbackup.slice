@@ -28,9 +28,14 @@ MemorySwapMax=0
 # Deleting the two lines below does not lift the cap: systemd writes io.max only for the devices
 # that a unit lists, so a node that runs keeps 32 MB/s until it reboots (lab, systemd 257.13: a
 # reload and the next job left io.max as it was). A release that lifts the cap keeps both lines and
-# writes infinity as the size on the same device; the next job in the slice applies it. At once, on
-# one node: systemctl set-property --runtime pgcfbackup.slice
+# writes infinity as the size on the same device; the next job in the slice applies it.
+# A runtime change, on one node (for example systemctl set-property --runtime pgcfbackup.slice
 # "IOReadBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm infinity"
-# "IOWriteBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm infinity".
+# "IOWriteBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm infinity", or the same with another size
+# for a measurement), applies at once but leaves a drop-in in /run/systemd/system.control that
+# overrides every later release of this file until the node reboots (lab, systemd 257.13: after
+# infinity and 32M at runtime, a file with 48M and a reload left io.max at 32 MB/s; only
+# systemctl revert pgcfbackup.slice and then the next job applied 48 MB/s). So end every runtime
+# change with: systemctl revert pgcfbackup.slice
 IOReadBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm 32M
 IOWriteBandwidthMax=/dev/disk/by-partlabel/pgcf-lvm 32M
