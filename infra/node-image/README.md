@@ -995,9 +995,12 @@ restarts the instance through the API. EU1's live install enrolled the node 28.0
 
 [boot-test.ts](boot-test.ts) boots a copy of the image, grown by 40 GiB, in QEMU with SeaBIOS and an
 isolated network (QEMU user mode with `restrict=on`) configured the way the installer configures a
-node. It injects [guest.sh](boot-test/guest.sh), a unit that runs it and that network configuration
-through SMBIOS system credentials (`systemd.extra-unit.*`, `systemd.unit-dropin.*`,
-`network.network.*`), so the image carries no test hook.
+node. It injects [guest.sh](boot-test/guest.sh) (gzipped, which the unit decompresses into `/run`), a unit
+that runs it and that network configuration through SMBIOS system credentials
+(`systemd.extra-unit.*`, `systemd.unit-dropin.*`, `network.network.*`), so the image carries no test hook.
+QEMU gives all SMBIOS tables of the machine 64 KiB: with QEMU 8.2.2, strings of 62 KB arrive and strings of
+66 KB corrupt the table, so the guest gets no credential at all and the boot test waits for a result that is
+never written. `boot-test.ts` refuses to start when the credentials take more than 48 KiB.
 The guest reports one line per check on the second serial port:
 
 | Boot | Checks |

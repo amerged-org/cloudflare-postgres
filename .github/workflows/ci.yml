@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       external_probe:
-        description: Run only the supplemental Dev TCP probe
+        description: Run only the TCP/25 probe of the node public addresses
         type: boolean
         default: false
       advisories:
@@ -232,7 +232,7 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
-      - name: Probe the approved Dev targets without publishing their addresses
+      - name: Probe the node public addresses on TCP/25 without publishing them
         env:
           GH_TOKEN: ${{ github.token }}
           PGCF_E2E_EXTERNAL_PROBE_CONFIG: ${{ secrets.PGCF_E2E_EXTERNAL_PROBE_CONFIG }}
@@ -242,19 +242,19 @@ jobs:
       - name: Attest the sanitized report
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
-          subject-path: ${{ runner.temp }}/pgcf-e6-native.json
+          subject-path: ${{ runner.temp }}/pgcf-node-external-probe.json
           show-summary: false
       - name: Upload only the sanitized report
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: pgcf-e6-native
-          path: ${{ runner.temp }}/pgcf-e6-native.json
+          name: pgcf-node-external-probe
+          path: ${{ runner.temp }}/pgcf-node-external-probe.json
           if-no-files-found: error
           retention-days: 1
           overwrite: false
       - name: Remove private acceptance files
         if: always()
-        run: rm -f "$RUNNER_TEMP/pgcf-e6-native.json"
+        run: rm -f "$RUNNER_TEMP/pgcf-node-external-probe.json"
 
   node-image:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || !(inputs.external_probe || inputs.advisories))

@@ -46,6 +46,8 @@ it("creates the Tunnel of a node, sends its gateway to loopback and points one h
     gateway_url: `https://${GATEWAY}/pg`,
   });
   expect(api.tunnels).toEqual([{ id: TUNNEL, name: NAME }]);
+  // A Tunnel that was deleted is not the node's Tunnel: only live ones are listed.
+  expect(api.calls[0]!.url).toContain("is_deleted=false");
   expect(
     api.calls.find((c) => c.method === "POST" && c.url.endsWith("/cfd_tunnel"))
       ?.body,

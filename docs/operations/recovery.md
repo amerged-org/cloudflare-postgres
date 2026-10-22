@@ -70,26 +70,34 @@ database moves (plan 7.11, 9.4).
    Loss is terminal, repeated calls preserve the original record, and metadata, archives and
    historical provider receipts remain available. Heartbeats cannot make the node healthy again.
 3. The minute cron finishes the fence one step per run and retries each step until it holds: it
-   deletes the node's Tunnel (its token dies with it), orders the instance powered off through the
+   deletes the node's Tunnel (its token dies with it) and then the node's DNS records that point at
+   that Tunnel (`pgcf-node-<id>`, `pgcf-shell-<id>` and the former `pgcf-node-<id>-ssh`; no other
+   record of the zone), orders the instance powered off through the
    Contabo API, and reads the instance until the provider says stopped. `GET /v1/nodes/{id}/loss`
    shows `fencing` or `fenced`, the time of each step, the class of the step that failed last (a
    fence stuck for days raises `control_cron_step_failing`) and, for each database of the node, the
    proven-sleep record and the newest base backup the node last reported: the recovery point.
    Measured on EU1 (2026-10-19): `mark-lost` at 18:40:33 UTC, Tunnel deleted and instance off
    (`fenced`) by 18:41:03, within 30 s.
-   **DNS records.** The fence deletes the Tunnel and nothing else in Cloudflare: the node's proxied
-   CNAME `pgcf-node-<id>.<NODE_GATEWAY_DOMAIN>`, and `pgcf-shell-<id>.<NODE_GATEWAY_DOMAIN>` if the
-   shell was on, stay and point at the deleted Tunnel. After `fenced`, delete them by hand, with the
-   `CLOUDFLARE_API_TOKEN` of the Worker from private custody: list the zone's CNAME records of that
-   exact name (`GET /zones/{zone}/dns_records?type=CNAME&name=<hostname>`), check that each one's
-   target is `<tunnel-id>.cfargotunnel.com` of that node's Tunnel, which Cloudflare lists as deleted
+   **DNS records.** The step deletes the node's proxied CNAME records after its Tunnel:
+   `pgcf-node-<id>`, `pgcf-shell-<id>` and the former `pgcf-node-<id>-ssh` under
+   `NODE_GATEWAY_DOMAIN` (`<id>` is the node's ID without its `nod_` prefix), each only if it points
+   at a Tunnel of that node (a deleted one included).
+   A record of that name that points elsewhere, and every other record of the zone, stays. The
+   Worker's `CLOUDFLARE_API_TOKEN` needs Zone: DNS: Edit on that zone for it
+   ([permissions](operator-installation.md#reviewed-deployment-inputs)). Without it, or without a
+   usable `NODE_GATEWAY_ZONE_ID` and `NODE_GATEWAY_DOMAIN`, the Tunnel is gone and the step fails
+   (`tunnel_delete_failed`, or `fence_unconfigured` for the zone); the cron repeats it whole each
+   minute and orders the instance off only when it holds. A node fenced by an API Worker without this
+   step, and every node until the Worker that has it is deployed, leaves its records pointing at the
+   deleted Tunnel. Delete them by hand, with the `CLOUDFLARE_API_TOKEN` of the Worker from private
+   custody: list the zone's CNAME records of that exact name
+   (`GET /zones/{zone}/dns_records?type=CNAME&name=<hostname>`), check that each one's target is
+   `<tunnel-id>.cfargotunnel.com` of that node's Tunnel, which Cloudflare lists as deleted
    (`GET /accounts/{account}/cfd_tunnel?name=pgcf-node-<id>&is_deleted=true`), and delete only those
    records (`DELETE /zones/{zone}/dns_records/{record}`). Never delete a `pgcf-` record whose Tunnel
    is alive, and never a record by name pattern alone: the cleanup of 2026-10-22 deleted only a
-   record whose target was one of the account's own deleted Tunnels. The planned change
-   (`loss-dns-cleanup`, not built) makes the fence delete both records next to the Tunnel, so that
-   no DNS record of a lost node remains once it is `fenced`; this paragraph is shortened when that
-   change is merged and deployed.
+   record whose target was one of the account's own deleted Tunnels.
 4. Only when the status is `fenced`, restore the affected databases onto healthy capacity with the
    separate-target restore procedure above. Each restore is a new database with a new ID; the
    integrator rebinds. The last archived commit is what comes back, not the last acknowledged one

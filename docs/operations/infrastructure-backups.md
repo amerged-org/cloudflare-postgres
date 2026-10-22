@@ -283,9 +283,17 @@ sampling of that runtime (usage posts of the regional agent, one per 15 s) showe
 in four of six nightly runs, a stall of at least 37 s in three of them and none in two, and so
 contradicts it. On the node runtime the export of the window test below ran 6.1 s from start to
 completion; that is the length of the job and not a measurement of the stall inside it, which no
-test has timed. A wake admits from the DatabaseActor's own state and commits its claim to D1 after
-the answer, so by design it does not wait for the export. The window test below found no failed
-wake; whether a wake that fell inside the export was slower than the others was not measured.
+test has timed. A wake through a wake ticket admits from the DatabaseActor's own state and commits
+its claim to D1 after the answer, so by design it does not wait for the export. A wake on the
+`ensure_awake` path does: the actor has no snapshot that says whether the database is wakeable, or
+its snapshot shows it neither ready to serve nor an idle sleeper (resuming, being created,
+restarting at a generation the controller has not reported), and then the actor reads D1 before it
+answers, unless its snapshot already admits the connection, and its claim reads D1 under the
+actor's gate. Such a wake can wait for the export. The `path` of the `actor_admit` log line names
+which path answered a connection (`snapshot`, `ticket`, `ensure_awake` or `refused`). The
+window test below found no failed wake; its record has 37 wakes but 32 ticket claims and does not
+say how the other five were admitted, and whether a wake that fell inside the export was slower than
+the others was not measured.
 
 **Window test (go-live gate G6), passed 2026-10-22.** The test does not wait for the nightly run: a
 private operator tool starts the same raw D1 export of the control database that the nightly backup
@@ -299,7 +307,7 @@ URL is never read), and the traffic around it runs from 60 s before to 120 s aft
   every 5 s with one HTTP `/sql` request each under the integrators' retry rule: 37 answered, 0 failed,
   0 retries, WAKE plus request p50 750 ms and p95 1,486 ms. The record has no maximum and no time of
   each wake against the 6.1 s of the export. At one wake every 5 s, one or two of the 37 fell inside
-  the export, and those are exactly the samples that can sit above p95;
+  the export, and those may be among the samples above p95;
 - the API Worker's logs in the window: 32 ticket claims, the longest actor gate held 3.3 s (the limit
   is 30 s), no `admission_refused`. A gate of 3.3 s fits a D1 commit that the export stalled; the
   logs do not say whether it was one.
