@@ -36,8 +36,9 @@ Worker back below this release first needs
 `DELETE FROM infrastructure_alerts WHERE kind IN ('database_archive_failing','database_base_backup_stale','thin_storage_blocked','control_cron_stalled','control_cron_step_failing')`,
 because the earlier release's health route does not parse those kinds. Migration
 `0082_drop_dead_capacity_fields.sql` is not undone by rolling the Worker back either: an older
-Worker reads columns it dropped (the node RAM window and fields of the capacity policy and the size
-classes), so a rollback below it starts from the D1 export taken before the migration.
+Worker reads columns and a table it dropped. A rollback below it needs the forward migration of
+[Rolling back below migration 0082](#rolling-back-below-migration-0082); the export taken before
+the migration is not a substitute for it.
 
 Use the administrator API, replacing every placeholder with this installation's
 actual values:
@@ -67,6 +68,137 @@ capability. Changing only the alert sender or recipient never does: the update c
 every valid pending or running run to the new revision in the same transaction, and a
 run the cron creates while the update is in flight takes the revision in the statement
 that inserts it.
+
+## Rolling back below migration 0082
+
+Migration `0082_drop_dead_capacity_fields.sql` removes the node RAM window, fields of the capacity
+policy and of the size classes, and the three `reserved_*` usage keys. A Worker of an earlier release
+that runs over the migrated database fails: its SQL names the dropped columns and the dropped
+`node_memory_samples` table, and its strict usage contract requires the three keys that the migration
+removed from every hourly usage row and every lifecycle resource snapshot. `GET /v1/usage` answers 500
+for a range that covers a stored hour, and the rollup reads a snapshot without them as a gap.
+
+**A rollback below `0082` is a forward migration, and without it is unsupported.** Restoring the D1
+export taken before `0082` is not a rollback of the migration: it replaces the control database with
+its state at the time of the export and loses every control-plane write since. That includes the
+databases created since (D1 forgets them and the Edge stops routing them, while their volumes stay on
+the node), deletions (the databases come back), resizes, storage generations (they move backwards
+under the fencing invariants), API keys, approvals, enrollments and usage. It needs the owner's
+explicit go, and switching the Worker bindings to a restored database is the separate,
+explicitly authorized step of [recovery](recovery.md#control-plane).
+
+The forward migration adds back what `0082` dropped, with the definitions of migrations `0018`,
+`0024`, `0038` and `0041`. The columns held only dead data with no producer, so the restored values
+are the old defaults (none, `reserved`, `0`) and the older Worker reads them as it did before. Save
+the three blocks below as one migration file in `apps/api/migrations`, numbered after the highest
+migration the installation has applied, and apply it with `wrangler d1 migrations apply`, which runs
+it as one transaction. Apply it first and deploy the older Worker straight after: the older Worker
+fails without the migration, and the newer Worker that runs in between writes statements that name
+none of the restored columns and reads the restored usage shape. That newer Worker fails one route
+family while `size_classes.cpu_request_millicores` exists: it parses a whole size class row with a
+strict schema that does not know the column, so `GET /v1/size-classes` and `PUT /v1/size-classes/{id}`
+(after it stored the class) answer 500 until the older Worker runs.
+
+```sql
+-- The dropped columns and the empty RAM sample table, as 0018, 0024, 0038 and 0041 created them.
+ALTER TABLE node_region_policies ADD COLUMN ram_expansion_threshold_ppm INTEGER
+  CHECK(ram_expansion_threshold_ppm IS NULL OR
+    (typeof(ram_expansion_threshold_ppm)='integer' AND ram_expansion_threshold_ppm BETWEEN 1 AND 1000000));
+ALTER TABLE node_region_policies ADD COLUMN ram_warning_threshold_ppm INTEGER
+  CHECK(ram_warning_threshold_ppm IS NULL OR
+    (typeof(ram_warning_threshold_ppm)='integer' AND ram_warning_threshold_ppm BETWEEN 1 AND 1000000));
+ALTER TABLE node_region_policies ADD COLUMN placement_mode TEXT NOT NULL DEFAULT 'reserved'
+  CHECK(placement_mode IN('reserved','actual_ram'));
+ALTER TABLE node_region_policies ADD COLUMN postgres_memory_request_mib INTEGER
+  CHECK(postgres_memory_request_mib>0);
+ALTER TABLE nodes ADD COLUMN memory_window_observed_at TEXT;
+ALTER TABLE nodes ADD COLUMN memory_window_valid INTEGER NOT NULL DEFAULT 0
+  CHECK(memory_window_valid IN(0,1));
+ALTER TABLE nodes ADD COLUMN memory_utilization_ppm INTEGER
+  CHECK(memory_utilization_ppm BETWEEN 0 AND 1000000);
+ALTER TABLE nodes ADD COLUMN memory_expansion_triggered_at TEXT;
+ALTER TABLE size_classes ADD COLUMN cpu_request_millicores INTEGER
+  CHECK(cpu_request_millicores IS NULL OR
+    (typeof(cpu_request_millicores)='integer' AND cpu_request_millicores>0
+      AND cpu_request_millicores<=cpu_millicores));
+CREATE TABLE node_memory_samples(
+  node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  node_uid TEXT NOT NULL,
+  minute INTEGER NOT NULL,
+  observed_at TEXT NOT NULL,
+  working_set_bytes INTEGER CHECK(working_set_bytes>=0),
+  capacity_memory_bytes INTEGER CHECK(capacity_memory_bytes>0),
+  available_bytes INTEGER CHECK(available_bytes>=0),
+  memory_pressure INTEGER CHECK(memory_pressure IN(0,1)),
+  capacity_cpu_millicores INTEGER
+    CHECK(capacity_cpu_millicores IS NULL OR
+      (typeof(capacity_cpu_millicores)='integer' AND capacity_cpu_millicores>0)),
+  cpu_usage_nano_cores INTEGER
+    CHECK(cpu_usage_nano_cores IS NULL OR
+      (typeof(cpu_usage_nano_cores)='integer' AND cpu_usage_nano_cores>=0 AND capacity_cpu_millicores IS NOT NULL)),
+  PRIMARY KEY(node_id,node_uid,minute),
+  CHECK(working_set_bytes IS NULL OR working_set_bytes<=capacity_memory_bytes),
+  CHECK(available_bytes IS NULL OR available_bytes<=capacity_memory_bytes)
+);
+```
+
+```sql
+-- Every hourly usage row has the three reserved_* metrics again, unknown (null) and listed in gaps as
+-- the rollup lists a metric it could not measure. A row that has them is not touched.
+UPDATE usage_hourly
+SET metrics=json_set(metrics,'$.reserved_memory_mib_seconds',json('null'),
+    '$.reserved_cpu_millicore_seconds',json('null'),'$.reserved_storage_byte_seconds',json('null')),
+  gaps=(SELECT json_group_array(value) FROM (SELECT value FROM json_each(usage_hourly.gaps)
+    UNION SELECT 'reserved_cpu_millicore_seconds' UNION SELECT 'reserved_memory_mib_seconds'
+    UNION SELECT 'reserved_storage_byte_seconds' ORDER BY value))
+WHERE json_type(metrics,'$.reserved_memory_mib_seconds') IS NULL;
+```
+
+```sql
+-- Every lifecycle resource snapshot has its three fields again. The limits stand in for the reserved
+-- figures, which the older release wrote equal to them; the allocated storage is unknown (null).
+-- The immutability trigger is dropped for the update and created again, unchanged.
+DROP TRIGGER lifecycle_events_immutable;
+UPDATE lifecycle_events
+SET resource_snapshot=json_set(resource_snapshot,
+  '$.reserved_memory_mib',json_extract(resource_snapshot,'$.memory_mib'),
+  '$.reserved_cpu_millicores',json_extract(resource_snapshot,'$.cpu_millicores'),
+  '$.storage_allocated_bytes',json('null'))
+WHERE json_type(resource_snapshot,'$.reserved_memory_mib') IS NULL
+  AND json_type(resource_snapshot,'$.memory_mib')='integer'
+  AND json_type(resource_snapshot,'$.cpu_millicores')='integer';
+CREATE TRIGGER lifecycle_events_immutable BEFORE UPDATE ON lifecycle_events
+BEGIN SELECT RAISE(ABORT, 'lifecycle events are immutable'); END;
+```
+
+On an installation with many hourly rows or lifecycle events, run each of the two `UPDATE`
+statements once for each first letter of the database ID, as `0082` does: add
+`AND database_id>='a' AND database_id<'b'` to its `WHERE`, then the same for `'b'` and `'c'` up to
+`'y'` and `'z'`, and `AND database_id>='z'` alone for the last, all inside the same migration.
+
+What the migration does not restore, and why the older Worker still works:
+
+- **Approval hashes.** The hashes that `0082` cleared stay cleared, and the older Worker reads the
+  restored threshold as none, so a standing profile with a trigger no longer matches its stored hash.
+  Both only fail safe: an order waits for `POST /v1/nodes/additions/{id}/approve` until
+  `PUT /v1/regions/{id}/capacity-policy` stores the profile again through the older Worker (which
+  demands `ram_expansion_threshold_ppm` there when autoscaling, purchases and an `order` are all set).
+- **The alert kind `regional_ram_warning`.** Its CHECK stays narrowed and its rows stay deleted. The
+  older Worker raises it only for a non-null `ram_warning_threshold_ppm` and a measured window, and
+  the restored threshold is none and the restored table empty.
+- **Reserved usage figures.** They stay unknown for every hour and snapshot written before the
+  rollback; the older Worker meters new hours from the limits as before.
+
+To roll forward again, deploy the newer Worker and then run the statement below; the size-class
+routes answer 500 as above until it has run. It drops the one restored column that the newer Worker's
+strict parse refuses. The other restored columns and the table stay unread, and the newer Worker reads
+the restored usage shape as it reads the shape the older Worker wrote after `0082`. The statement
+discards the CPU request the older Worker may have stored, a value no placement or admission code
+reads.
+
+```sql
+ALTER TABLE size_classes DROP COLUMN cpu_request_millicores;
+```
 
 ## Capture and acceptance
 

@@ -218,6 +218,12 @@ bindings stays a separate step that needs the operator's explicit authorization.
 passed on the nightly artifact of 2026-10-21 (24 chunks, no foreign key violation, the counts of the
 live database).
 
+A restored export is the control database as it was when the export was taken: every write since is
+gone, including databases created, deletions, resizes, storage generations, API keys, approvals,
+enrollments and usage. It is for control loss, not for undoing a migration; the rollback of a
+migration is a forward migration
+([migration `0082`](infrastructure-backups.md#rolling-back-below-migration-0082)).
+
 ## Integrator migration
 
 Operator acceptance and customer migration are separate; moving existing databases from another

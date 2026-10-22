@@ -808,7 +808,11 @@ migration keeps the stored hash of a policy whose threshold was 760000, or that 
 profile has no trigger, and clears every other: an order then waits for
 `POST /v1/nodes/additions/{id}/approve` until `PUT /v1/regions/{id}/capacity-policy` stores the
 profile again. After the deploy read each region's
-policy, send it back unchanged, and read `GET /v1/regions/{id}/capacity-decision`.
+policy, send it back unchanged, and read `GET /v1/regions/{id}/capacity-decision`. Rolling the API
+Worker back below `0082` is not undone by the Worker and is not a restore of the export taken before
+the migration, which loses every control-plane write since: it is a forward migration that adds the
+dropped columns and the usage keys back
+([Rolling back below migration 0082](infrastructure-backups.md#rolling-back-below-migration-0082)).
 
 Operators configure an exact `order` and their own standing authority. A standing profile binds the
 exact order, an owner reference, an approval time and optional monetary, order-count and expiry
@@ -979,6 +983,10 @@ read. A rule of the table was broken, or the API sent a page that does not match
      first (`SELECT type, count(*) FROM lifecycle_orders WHERE closed_at IS NULL GROUP BY type`) and do
      not roll back while orders of the new type are open: closing them is a write to D1 that needs the
      owner's go, and the order is lost.
+   - *A control database after migration `0082`.* The older API reads columns and a table that
+     migration dropped and requires usage keys it removed. Apply the forward migration of
+     [Rolling back below migration 0082](infrastructure-backups.md#rolling-back-below-migration-0082)
+     before the older API is deployed; do not restore the earlier export instead.
 3. **Then the release path works again:** assign the release whose agent reads the page, wait until
    the node is `converged`, and deploy the API again, with the `PUT` of step 2 where it applies.
    Replacing the agent by hand is the last resort.
