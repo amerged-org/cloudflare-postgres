@@ -177,7 +177,9 @@ plan 9.3, "Changing the page"; it is written there once.
   inside the burst applies it first) and reports the phases of the wake as events; about 2 s later
   a `wake_detail` event adds the split of the start, the CPU quota's throttling and the steal time.
   A wake it already serves is answered
-  `wake_in_progress`, which is no result.
+  `wake_in_progress`, which is no result. A start that fails writes a `unit_start_failed` event with
+  the class of the error and answers `release_failed`; a unit that is awake or cannot be read at that
+  point is stopped without a proof and recovered, so no database stays `starting`.
 - **Sleep.** After the database's idle time the agent runs the sleep proof (plan 7.9): the gateway
   quiesces and closes idle sessions, the guard refuses while a session is busy or a transaction is
   prepared (`power_busy`), a checkpoint and a WAL switch close the last segment, the upload log must
@@ -185,9 +187,10 @@ plan 9.3, "Changing the page"; it is written there once.
   `pg_control` must then say shut down, with the recorded identity and a checkpoint after the
   switched segment, and the record is written and fsynced before the sleep is reported. A refused
   proof leaves the database running and wakeable. After a clean sleep the agent trims the volume.
-- **Recovery.** At boot, after a failed proof and after an unexpected stop, a database without a
-  matching record is unproven: the agent starts it through admission, lets it archive and proves its
-  sleep, retrying until it holds. Nothing is replayed to a client.
+- **Recovery.** At boot, after a failed proof, after an unexpected stop and after a failed start
+  whose unit is awake or cannot be read, a database without a matching record is unproven: the
+  agent starts it through admission, lets it archive and proves its sleep, retrying until it
+  holds. Nothing is replayed to a client.
 - **Create.** User, volume, filesystem, `initdb`, configuration, a check that the database's R2
   prefix is empty, the roles and the first base backup. The database is ready only when that backup
   is DONE. A create that a restart interrupted resumes when every backup in the archive belongs to the

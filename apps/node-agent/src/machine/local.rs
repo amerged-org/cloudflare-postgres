@@ -71,6 +71,9 @@ struct State {
     volume_error: Option<storage::Error>,
     /// `start` fails once.
     start_fails: bool,
+    /// `start` fails once after its unit is up, as the real one can (EU1, 2026-10-20): the unit
+    /// runs on.
+    start_fails_after_up: bool,
     /// `reboot` fails once, and the node keeps running.
     reboot_fails: bool,
     /// `purge_packages` fails once, as dpkg does for a package that others depend on.
@@ -149,12 +152,22 @@ fn tool_failed(program: &str, file: &str) -> io::Error {
 }
 
 /// What a read of a unit fails with when the bus refuses the call, as dbus-daemon does past its
-/// limit of calls that are not answered yet.
+/// limit of calls that are not answered yet: an error reply named `LimitsExceeded`, which is what
+/// `Units::state` gets from `GetUnit` (a method call's refusal is a `MethodError`).
 fn bus_refused() -> units::Error {
-    units::Error::Bus(zbus::Error::Failure(
-        "org.freedesktop.DBus.Error.LimitsExceeded: the maximum number of pending replies per \
-         connection has been reached"
-            .into(),
+    let name = "org.freedesktop.DBus.Error.LimitsExceeded";
+    let call = zbus::message::Message::method_call("/org/freedesktop/systemd1", "GetUnit")
+        .unwrap()
+        .build(&())
+        .unwrap();
+    let reply = zbus::message::Message::error(&call.header(), name.to_string())
+        .unwrap()
+        .build(&())
+        .unwrap();
+    units::Error::Bus(zbus::Error::MethodError(
+        name.try_into().unwrap(),
+        Some("the maximum number of pending replies per connection has been reached".into()),
+        reply,
     ))
 }
 
@@ -421,6 +434,10 @@ impl Local {
     }
     pub fn fail_next_start(&self) {
         self.state().start_fails = true;
+    }
+    /// The next start fails after the unit is up and keeps running.
+    pub fn fail_next_start_after_up(&self) {
+        self.state().start_fails_after_up = true;
     }
     pub fn fail_next_reboot(&self) {
         self.state().reboot_fails = true;
@@ -1008,7 +1025,12 @@ impl Machine for Local {
         let started = Instant::now();
         loop {
             match self.active_state(database) {
-                ActiveState::Active => return self.started(database),
+                ActiveState::Active => {
+                    if std::mem::take(&mut self.state().start_fails_after_up) {
+                        return Err(bus_refused());
+                    }
+                    return self.started(database);
+                }
                 ActiveState::Activating => {}
                 _ => {
                     return Err(units::Error::Job {
