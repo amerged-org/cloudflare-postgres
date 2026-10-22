@@ -15156,6 +15156,46 @@
     },
     {
       "schema": "NodeObservationReport",
+      "name": "event-with-the-fields-of-a-wake-on-the-slot-path",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "databases": [],
+        "orders": [],
+        "events": [
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "event": "wake_detail",
+            "database_id": "dbbbbbbbbbbbbbbbbbbb",
+            "fields": {
+              "slot_from": "pool",
+              "slot_wait_us": 38000,
+              "bind_us": 9000,
+              "order_us": 1200,
+              "job_to_fork_us": 2300,
+              "fork_to_handoff_us": 33886,
+              "handoff_to_starting_us": 12840,
+              "starting_to_shut_down_us": 1605,
+              "shut_down_to_ready_us": 1522,
+              "nr_throttled": 2,
+              "throttled_usec": 7500,
+              "steal_ms": 30,
+              "steal_window_ms": 2000,
+              "cache_files": 41,
+              "cache_pages": 16384,
+              "cache_resident": 10240,
+              "cache_dirty": 7,
+              "cache_evicted": 5900,
+              "cache_recently_evicted": 310
+            }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeObservationReport",
       "name": "event-with-a-space",
       "valid": false,
       "node_valid": false,
@@ -15251,7 +15291,15 @@
               "f13": 13,
               "f14": 14,
               "f15": 15,
-              "f16": 16
+              "f16": 16,
+              "f17": 17,
+              "f18": 18,
+              "f19": 19,
+              "f20": 20,
+              "f21": 21,
+              "f22": 22,
+              "f23": 23,
+              "f24": 24
             }
           }
         ]
@@ -16253,6 +16301,41 @@
             "reason": "no_room",
             "waited_ms": 10000,
             "memory_mib": 256
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeEventReport",
+      "name": "wake-on-the-slot-path",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "events": [
+          {
+            "type": "wake",
+            "id": "bbbbbbbb-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "outcome": "started",
+            "phases_ms": {
+              "admission": 9,
+              "volume_check": 1,
+              "repair_check": 1,
+              "mount": 1,
+              "pg_control": 2,
+              "config": 1,
+              "archive": 1,
+              "queue_wait": 1,
+              "start": 61,
+              "roles": 2,
+              "release": 3,
+              "slot": 38,
+              "bind": 9
+            }
           }
         ]
       }

@@ -7,7 +7,12 @@ import { z } from "zod";
 import node from "../native/node.generated.json" with { type: "json" };
 import vectors from "../native/node-vectors.generated.json" with { type: "json" };
 import { nodeReceives, nodeSchemas } from "../native/node-vectors.ts";
-import { NodeDesiredPage, NodePolicy } from "../src/node-link.ts";
+import {
+  NodeDesiredPage,
+  NodeEventReport,
+  NodeObservationReport,
+  NodePolicy,
+} from "../src/node-link.ts";
 import { NODE_CLOSED_SETS } from "./node-closed-sets.ts";
 import { NODE_REQUIRED } from "./node-required.ts";
 import { closedSets, requiredProperties } from "./node-schema-walk.ts";
@@ -234,5 +239,63 @@ describe("a property of the page starts optional", () => {
       values(NODE_CLOSED_SETS, found),
       "values gone from a closed set: remove them from test/node-closed-sets.ts",
     ).toEqual([]);
+  });
+});
+
+describe("a phase of a wake event starts optional", () => {
+  // The agent times the slot it took from the pool or built, and the bind of its properties,
+  // mounts and order, on the slot path only; an agent before that path reports its wake without
+  // them. The strict API reads the event, so it deploys first (plan 9.3, "Changing the page").
+  type WakeEvent = { type: string; phases_ms: Record<string, number> };
+  const wakes = (name: string) =>
+    (vector("NodeEventReport", name).value as { events: WakeEvent[] }).events
+      .filter((event) => event.type === "wake")
+      .map((event) => event.phases_ms);
+
+  it("lets the API read the wake of an agent that reports the slot and the bind and of one that does not", () => {
+    for (const name of ["events", "wake-on-the-slot-path"]) {
+      const v = vector("NodeEventReport", name);
+      expect([v.valid, v.node_valid], name).toEqual([true, true]);
+      expect(NodeEventReport.safeParse(v.value).success, name).toBe(true);
+    }
+    expect(wakes("events")[0]).not.toHaveProperty("slot");
+    expect(wakes("events")[0]).not.toHaveProperty("bind");
+    expect(wakes("wake-on-the-slot-path")[0]).toMatchObject({
+      slot: 38,
+      bind: 9,
+    });
+  });
+
+  it("names both in the schema the agent holds its events to, and requires neither", () => {
+    const events = schemas.NodeEventReport!.properties!.events!.items!;
+    const wake = (events.oneOf ?? events.anyOf ?? []).find(
+      (variant) => variant.properties?.type?.const === "wake",
+    )!;
+    const phases = wake.properties!.phases_ms!;
+    expect(Object.keys(phases.properties!)).toEqual(
+      expect.arrayContaining(["slot", "bind"]),
+    );
+    expect(phases.required).toBeUndefined();
+    expect(wake.required).toContain("phases_ms");
+  });
+});
+
+describe("the fields of an event reach the API within a bound it reads first", () => {
+  // `events::sanitize` of the agent keeps the first NODE_REPORT_EVENT_FIELDS_MAX fields by key
+  // order and drops the rest without a word, so the bound has to hold what the agent emits: a
+  // wake that came up on the slot path emits 19. A bound that is raised is an API first change
+  // (plan 9.3): an API with the old bound refuses the whole report that carries such an event.
+  it("holds the 19 fields of the wake_detail of a wake on the slot path", () => {
+    const v = vector(
+      "NodeObservationReport",
+      "event-with-the-fields-of-a-wake-on-the-slot-path",
+    );
+    const { fields } = (v.value as { events: { fields: object }[] }).events[0]!;
+    expect(Object.keys(fields)).toHaveLength(19);
+    expect(Object.keys(fields)).toEqual(
+      expect.arrayContaining(["steal_ms", "steal_window_ms", "throttled_usec"]),
+    );
+    expect([v.valid, v.node_valid]).toEqual([true, true]);
+    expect(NodeObservationReport.safeParse(v.value).success).toBe(true);
   });
 });

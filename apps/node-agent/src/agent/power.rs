@@ -1683,7 +1683,7 @@ mod tests {
                 "cache_dirty": 7, "cache_evicted": 5_900, "cache_recently_evicted": 310,
             })
         );
-        // What the node sends of it is what Cloudflare accepts: 15 of the 16 fields.
+        // What the node sends of it is what Cloudflare accepts: all 15 fields, within the bound.
         let at = "2026-10-18T10:11:12.345Z";
         let event = crate::events::sanitize(&line, at).unwrap();
         assert_eq!(event["fields"].as_object().unwrap().len(), 15);
