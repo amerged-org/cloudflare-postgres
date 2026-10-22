@@ -34,7 +34,10 @@ minute and `cron.watchdog_checked_at` must follow. The watchdog is armed by the 
 run after the deploy, so a cron that never runs again after it is not reported. Rolling the
 Worker back below this release first needs
 `DELETE FROM infrastructure_alerts WHERE kind IN ('database_archive_failing','database_base_backup_stale','thin_storage_blocked','control_cron_stalled','control_cron_step_failing')`,
-because the earlier release's health route does not parse those kinds.
+because the earlier release's health route does not parse those kinds. Migration
+`0082_drop_dead_capacity_fields.sql` is not undone by rolling the Worker back either: an older
+Worker reads columns it dropped (the node RAM window and fields of the capacity policy and the size
+classes), so a rollback below it starts from the D1 export taken before the migration.
 
 Use the administrator API, replacing every placeholder with this installation's
 actual values:
@@ -113,16 +116,35 @@ proof in the ULTRA plan; targeted tests alone are not live backup acceptance.
 
 While the provider's export job runs, the control database stops answering requests. Cloudflare
 documents the unavailability and states no duration. The exporter sends no D1 request of its own
-meanwhile, and no running database needs D1 to keep writing. **How long D1 stops is not
+meanwhile, and no running database needs D1 to keep writing. **How long D1 itself stops is not
 established.** ULTRA plan 9.10 states about 4 s, tagged as measured on EU1, which the plan's legend
 defines as the retired Kubernetes runtime; the plan does not say how it was taken. The earlier
 sampling of that runtime (usage posts of the regional agent, one per 15 s) showed gaps of 37 to 72 s
 in four of six nightly runs, a stall of at least 37 s in three of them and none in two, and so
-contradicts it. Nothing on the node runtime has measured the length yet, and gate G6 does not ask
-for it: record the stall of a nightly run in the plan when one is measured. A wake admits from the
-DatabaseActor's own state and commits its claim to D1 after the answer, so it is not expected to
-wait for the export. That is not yet observed: go-live gate G6 needs a night with an awake database
-under writes and one wake during the export that shows no failed wake.
+contradicts it. On the node runtime the export of the window test below ran 6.1 s from start to
+completion; that is the length of the job and not a measurement of the stall inside it, which no
+test has timed. A wake admits from the DatabaseActor's own state and commits its claim to D1 after
+the answer, so it is not expected to wait for the export; the window test below found no wake that
+did.
+
+**Window test (go-live gate G6), passed 2026-10-22.** The test does not wait for the nightly run: a
+private operator tool starts the same raw D1 export of the control database that the nightly backup
+makes (`output_format: polling`, the nightly dump options; no Workflow, no backup row, and the signed
+URL is never read), and the traffic around it runs from 60 s before to 120 s after its start. On
+2026-10-22 (12:30:25.9 UTC, export completed in 6.1 s):
+
+- one new `xs` test database took one committed `INSERT` a second: 181 acknowledged, 181 found
+  afterwards, 0 lost, 0 refused, the slowest write 1,767 ms;
+- 37 sleeping small test databases, never the databases of the cold-path measurement, were woken one
+  every 5 s with one HTTP `/sql` request each under the integrators' retry rule: 37 answered, 0 failed,
+  0 retries, WAKE plus request p50 750 ms and p95 1,486 ms;
+- the API Worker's logs in the window: 32 ticket claims, the longest actor gate held 3.3 s (the limit
+  is 30 s), no `admission_refused`.
+
+The test database and its temporary key were removed afterwards. The pass rule is no failed wake
+after the integrators' 1/2/4/8 s retry rule and no actor gate held above 30 s. Together with the
+[restore drill](#restore-drill) of 2026-10-21 this meets gate G6; the full record is in the ULTRA
+plan (11.1).
 
 ## Optional email or webhook delivery
 
@@ -147,7 +169,10 @@ policy region each minute:
 - Storage is the fuller of the thin pool's data and metadata in the node's newest sample.
 
 The email subject is `PGCF infrastructure: <kind> (<region>)` and its body is the
-event JSON, including `node_ids`, `threshold_ppm` and the highest `utilization_ppm`.
+event JSON, including `node_ids`, `threshold_ppm` and the highest `utilization_ppm`. The JSON also
+carries `regional_ram_utilization_ppm`, always `null` since the regional RAM window was removed
+(migration `0082`); it stays so that a receiver that reads it keeps working, and a receiver may
+ignore it.
 A node crossing during an active episode adds no message only while a listed node
 still exceeds; otherwise it replaces the episode with a new event. The episode clears
 only when every listed node is fresh and below the threshold, or lost.
@@ -358,6 +383,16 @@ complete artifact (go-live gate G6 of the
 [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md)), after any change of
 the keyring or of the envelope code, and before relying on the backup in a recovery.
 
+**Last drill: passed on the artifact of day 2026-10-21** (the nightly run completed at 00:00:25 UTC;
+43,708,855 plaintext bytes, key version `dev1`; drilled at 00:03 and again at 00:05 UTC with the same
+result). The object was downloaded from R2, decrypted and authenticated against its receipt, and
+imported into a new scratch D1 in 24 chunks (the largest 5,000 statements or 2,097,085 bytes; the
+largest single statement 49,223 bytes): 55 tables, 82,761 queries and 310,008 rows written, every
+chunk accepted the first time. `PRAGMA foreign_key_check` returned no row; `d1_migrations` (81) and
+`databases` (846) equal the live control database, `regions` 2 and `nodes` 5. The scratch database
+was deleted by its ID. The window half of gate G6 is the
+[window test](#the-d1-export-window) of 2026-10-22; the full record is in the ULTRA plan (11.1).
+
 The tool is `scripts/operations/restore-infrastructure-backup.ts` (Node, no packages beyond the
 repository's). It does not share code with the Worker: it reads the layout documented under
 [offline recovery custody](#offline-recovery-custody), so a restore needs nothing of the Worker.
@@ -520,11 +555,11 @@ wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
    power cut, cannot clean up: delete `$TMPDIR/pgcf-restore-*` (for `import`) or `<output>.partial`
    (for `decrypt`) by hand.
 
-   **Unverified until the first drill:** that D1 accepts a file that opens with the dump's `PRAGMA
-   defer_foreign_keys=TRUE;` and takes chunks of the default size (2 MiB, 5,000 statements). The
-   first chunk is the schema, so a refusal of the pragma shows at chunk 1; a reset shows at the
-   first chunk of rows. The chunks do not depend on how D1 groups a file into transactions: every
-   table's rows come after the rows of the tables it references.
+   **Verified by the drill of 2026-10-21:** D1 accepts a file that opens with the dump's `PRAGMA
+   defer_foreign_keys=TRUE;` and takes chunks of the default size (2 MiB, 5,000 statements): all 24
+   chunks of the artifact of that day were accepted the first time, so neither the pragma at chunk 1
+   nor the first chunk of rows was refused or reset. The chunks do not depend on how D1 groups a file
+   into transactions: every table's rows come after the rows of the tables it references.
 
 6. **Check the scratch database** against the live one. The tool has run `PRAGMA foreign_key_check`
    (it printed `foreign_key_check: no violations`). `d1_migrations` and `regions` must match the

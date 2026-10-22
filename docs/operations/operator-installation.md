@@ -29,6 +29,11 @@ applying additive migrations and rehearse them against the export.
 | `CLOUDFLARE_API_TOKEN` | Makes and deletes the nodes' Tunnels and DNS records |
 | `INFRASTRUCTURE_BACKUP_CF_TOKEN`, `RESEND_API_KEY`, `INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN` | Optional: the D1 export, direct email and the alert webhook (see below and the [infrastructure backup runbook](infrastructure-backups.md)) |
 
+No other secret is read by the API Worker. Two that the retired Kubernetes runtime left on it,
+`BOOTSTRAP_RELAY_SIGNING_KEYS` and `CONTABO_RESCUE_CONFIGURATION`, were read by no code and were
+deleted on 2026-10-22 (the [rotation record](credentials.md#provider-and-account-credentials));
+an installation that still holds either deletes it.
+
 The EU archive uses the EU-jurisdiction binding and EU S3 endpoint. Every other region has a
 separate bucket on the account's general S3 endpoint. Choose that region's location hint when
 creating its bucket; the hint does not guarantee jurisdiction. `ARCHIVE_BINDINGS` must map each
@@ -53,6 +58,10 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
   hostname `pgcf-node-<id>.<domain>` under `NODE_GATEWAY_DOMAIN`, a domain of the zone
   `NODE_GATEWAY_ZONE_ID`; the Cloudflare account is the one of the region's R2 endpoint. Without
   the token, the domain or the zone a node gets no credentials and stays closed to placement.
+  Declaring a node lost deletes its Tunnel and nothing else in Cloudflare today: its proxied DNS
+  records (the gateway's, and the shell's while the shell is on) stay and point at the deleted
+  Tunnel until someone removes them ([recovery](recovery.md#lost-node) says how). The change that
+  makes node loss delete them as well is planned and not built.
 - `NODE_SHELL_HOSTNAME` is off unless it is the string `true`. The node's shell hostname
   `pgcf-shell-<id>.<domain>`, its DNS record and its Tunnel ingress rule exist only while it is
   `true`, and a node that has them loses them on its next credentials read when it is not. The
@@ -741,7 +750,18 @@ or a reboot), so the two disagree until then.
 
 Placement follows plan 4.8 and needs no policy: a node takes new databases until its active RAM or
 its CPU load reaches 80 %, each measured as the highest 30-minute average of the last seven days,
-and the fullest qualifying node wins. The capacity policy (`GET` and `PUT /v1/regions/{id}/capacity-policy`) holds
+and the fullest qualifying node wins. Two more things close a node to new databases, and neither is
+a policy field: its thin pool (data at 80 %, metadata at 50 %, or the sold storage at four times its
+data) and **1,000 thin volumes**, the largest count Stage 1 measured on EU1 and the constant
+`MAX_VOLUMES_PER_NODE` in `apps/api/src/domain/placement.ts`. The bound counts every volume the node
+reports, sleeping databases included, because each holds its volume; at 1,000 the node takes no
+create, restore or move, a resize of a database it already holds still works, and the alert
+`regional_node_pool_closed` fires. A node closed this way cannot take the database that waits, so
+the capacity cron finds a shortage; with `autoscale_enabled` it then adopts the next unused
+`adopt_instance_ids` entry or, with `purchases_enabled` and an `order`, reserves an order addition
+(below). Volumes created between two samples can take a node a little past 1,000, and the bound
+rises only after a measurement at a higher count (the LVM metadata area the agent creates would
+hold far more). The capacity policy (`GET` and `PUT /v1/regions/{id}/capacity-policy`) holds
 the purchase switches and the alert thresholds. The live node ceiling is removed (`max_nodes:null`),
 and the alert webhook is the delivery destination; no direct email is configured. Purchases and
 autoscale stay off; enabling them, or any new paid resource, needs the owner's explicit, costed go.
@@ -749,32 +769,46 @@ autoscale stay off; enabling them, or any new paid resource, needs the owner's e
 Management is API-only and requires an administrator key of scope `admin` (`admin_read` only
 reads); an integrator's project key does not control infrastructure purchases. Read the policy,
 then PUT the intended complete policy to the same route. Existing fields retain their documented
-full-replacement semantics; omitting `max_nodes`, `ram_expansion_threshold_ppm`, the warning
-thresholds or `cap_warning_enabled` preserves the stored values, and an explicit `null` removes an
-optional value. No large sentinel count represents an absent limit.
+full-replacement semantics; omitting `max_nodes`, the warning thresholds or `cap_warning_enabled`
+preserves the stored values, and an explicit `null` removes an optional value. No large sentinel
+count represents an absent limit.
 
 | Setting                                                              | Meaning                                                                                                                                                                                                                              |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `autoscale_enabled`                                                  | Lets the minute capacity cron add a node when no node fits the database that waits (the smallest enabled size class when none waits): it adopts the first unused `adopt_instance_ids` entry, else reserves an addition of `order`, at most one purchase attempt per hour of continued shortage. False by default. |
-| `purchases_enabled`                                                  | Permits a paid provider order: an order addition is dispatched only while this is true and its order equals `order`. Requires `order`. False by default.                                                                               |
+| `purchases_enabled`                                                  | Permits a paid provider order: the capacity cron reserves an order addition, and it is dispatched, only while this is true and its order equals `order`. Requires `order`. False by default.                                           |
 | `order`                                                              | The exact provider order (`product_id`, `provider_region`, `image_id`, `term_months`, `location`, optional add-ons) of every order addition; manual order requests must equal it. `null` means no orders.                            |
 | `adopt_instance_ids`                                                 | Provider instances that autoscale may adopt, in list order.                                                                                                                                                                           |
-| `standing_cost_profile`                                              | The owner's standing approval for orders of exactly `order`. With `trigger: "regional_actual_ram"` it approves only the capacity cron's automatic orders; without a trigger it also approves manual order additions and needs an expiry and finite limits. `null`: every order waits for `POST /v1/nodes/additions/{id}/approve`. |
+| `standing_cost_profile`                                              | The owner's standing approval for orders of exactly `order`. With a `trigger` (`regional_actual_ram` or `ram_76_percent`, names kept as stored: no RAM threshold is read any more) it approves only the orders the capacity cron reserves on its own while `autoscale_enabled` is true, at no stated price or ceiling; without a trigger it also approves manual order additions and needs an expiry and finite limits. `null`: every order waits for `POST /v1/nodes/additions/{id}/approve`. |
 | `max_nodes` | Optional regional node ceiling; `null` removes it. It counts the region's nodes (lost ones included) and held node additions, once per provider instance; recovering a lost node on its own allocation is exempt. |
 | `cap_warning_enabled`                                                | Opt-in notice for a finite `max_nodes`; false by default.                                                                                                                                                                             |
 | `node_ram_warning_threshold_ppm`                                     | Optional warning when any node's 30-minute average of active RAM, (MemTotal - MemAvailable) / MemTotal, reaches it; judged from samples spanning at least ten minutes, the newest at most 180 s old. `null` disables it.               |
 | `node_cpu_warning_threshold_ppm`                                     | Optional warning when any node's 30-minute average CPU load, busy time over all its cores, reaches it; judged the same way. `null` disables it.                                                                                       |
 | `node_storage_warning_threshold_ppm`                                 | Optional warning when the fuller of any node's thin-pool data and metadata, in its newest sample (at most 180 s old), reaches it; placement closes a pool at 800,000 (data) and 500,000 (metadata). `null` disables it.                |
-| `ram_warning_threshold_ppm`, `ram_expansion_threshold_ppm`           | The regional RAM window these two read needs ten fresh one-minute samples of every node, which no node reports yet, so the warning stays unknown and never fires. The contract still requires an expansion threshold when autoscale, purchases and an order are all set (409 otherwise); the capacity cron does not read it. |
 | `maximum_database_memory_mib`                                        | The most memory one database of the region may have, for a size class and for its own memory; `null` means 4096.                                                                                                                      |
-| `placement_mode`, `postgres_memory_request_mib`                      | Stored, and read by no placement or admission code: the 80 % rule and the node's own admission decide. Leave `reserved` and `null`.                                                                                                   |
 
 `GET /v1/regions/{id}/capacity-decision` is a dry run of the capacity cron for the region. Its
 `action` says what the next step is, for example `idle`, `placement_pending` (a waiting database fits a node),
 `maintenance` (an open maintenance cycle holds placement closed, which is no reason to buy),
 `observations_stale` (a node that should report is quiet, which is no reason to buy), `disabled`,
 `cap_reached`, `selection_unconfigured` (neither an adoptable instance nor an `order`),
-`waiting_for_approval`, `addition_in_progress`, `adopt` or `order`.
+`purchases_disabled` (no unused `adopt_instance_ids` entry, and an `order` is set while
+`purchases_enabled` is false, so nothing is reserved), `size_policy_unavailable` (the waiting
+database's size class is disabled or its memory is above the region's per-database maximum),
+`unconfigured` (the region has no policy), `waiting_for_approval`, `addition_in_progress`, `adopt` or
+`order`.
+
+**Deploying migration `0082`.** It removes the regional RAM window and the capacity-policy and
+size-class fields that nothing read (the header of `apps/api/migrations/0082_drop_dead_capacity_fields.sql`
+lists them); a request body that still carries one, such as `ram_expansion_threshold_ppm` or
+`cpu_request_millicores`, is refused with 400 (unknown field). Take a fresh D1 export first, apply
+the migration and deploy the API Worker straight after (the Worker that runs in between reads
+columns that are gone). The approval hash of a standing profile no longer folds in a threshold. The
+migration keeps the stored hash of a policy whose threshold was 760000, or that had none and whose
+profile has no trigger, and clears every other: an order then waits for
+`POST /v1/nodes/additions/{id}/approve` until `PUT /v1/regions/{id}/capacity-policy` stores the
+profile again. After the deploy read each region's
+policy, send it back unchanged, and read `GET /v1/regions/{id}/capacity-decision`.
 
 Operators configure an exact `order` and their own standing authority. A standing profile binds the
 exact order, an owner reference, an approval time and optional monetary, order-count and expiry
@@ -823,6 +857,13 @@ and actual delivery are separate evidence. The alert kinds and their runbook act
    only in the [maintenance cycle](recovery.md#node-maintenance-cycle), one node at a time. A node
    whose agent predates host files (EU1 did, until 2026-10-20) first has its agent
    [replaced by hand](#replacing-the-agent-by-hand-a-node-whose-agent-predates-host-files), once.
+
+**Measured on EU1.** The pull install took 196.5 s from the rescue request to the node's enrollment
+(Stage 4, 2026-10-18: the installer started 116.3 s after the request, took 52.3 s from its start
+to the reboot, 36.8 s of it verifying the image and 13.6 s writing the disk, and the node enrolled
+28.0 s after the reboot). AddNode in recover mode reached `ready` after 231 s on 2026-10-19.
+Recover restores nothing: the node comes back empty, and each database is restored from R2 as a new
+database ([recovery](recovery.md#lost-node)).
 
 Verify an install as described under [the node firewall](#the-node-firewall) and
 [Cloudflare Access](#cloudflare-access-for-node-gateways-and-shells).
@@ -967,8 +1008,8 @@ state intact for retry; they are not successful application.
 A profile revision is a size class (`resources`): memory, CPU, storage, `max_connections`,
 `sleep_after_seconds`, `archive_timeout_seconds` and `backup_retention_days`. The node reads the
 memory, the CPU limit and the storage: the memory is the database's hard ceiling, and its CPU is a
-weight proportional to the CPU size plus a quota of that size once started (plan 4.4). The class's
-optional `cpu_request_millicores` is accepted and stored, and no node reads it.
+weight proportional to the CPU size plus a quota of that size once started (plan 4.4). The former
+`cpu_request_millicores` is gone (migration `0082`); a request that names it is refused with 400.
 
 A confirmed sleeping database accepts a new revision while it sleeps: its `application_state` is
 `deferred_until_wake`, and the next wake is admitted against the new size and must report the

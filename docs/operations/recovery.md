@@ -75,6 +75,21 @@ database moves (plan 7.11, 9.4).
    shows `fencing` or `fenced`, the time of each step, the class of the step that failed last (a
    fence stuck for days raises `control_cron_step_failing`) and, for each database of the node, the
    proven-sleep record and the newest base backup the node last reported: the recovery point.
+   Measured on EU1 (2026-10-19): `mark-lost` at 18:40:33 UTC, Tunnel deleted and instance off
+   (`fenced`) by 18:41:03, within 30 s.
+   **DNS records.** The fence deletes the Tunnel and nothing else in Cloudflare: the node's proxied
+   CNAME `pgcf-node-<id>.<NODE_GATEWAY_DOMAIN>`, and `pgcf-shell-<id>.<NODE_GATEWAY_DOMAIN>` if the
+   shell was on, stay and point at the deleted Tunnel. After `fenced`, delete them by hand, with the
+   `CLOUDFLARE_API_TOKEN` of the Worker from private custody: list the zone's CNAME records of that
+   exact name (`GET /zones/{zone}/dns_records?type=CNAME&name=<hostname>`), check that each one's
+   target is `<tunnel-id>.cfargotunnel.com` of that node's Tunnel, which Cloudflare lists as deleted
+   (`GET /accounts/{account}/cfd_tunnel?name=pgcf-node-<id>&is_deleted=true`), and delete only those
+   records (`DELETE /zones/{zone}/dns_records/{record}`). Never delete a `pgcf-` record whose Tunnel
+   is alive, and never a record by name pattern alone: the cleanup of 2026-10-22 deleted only a
+   record whose target was one of the account's own deleted Tunnels. The planned change
+   (`loss-dns-cleanup`, not built) makes the fence delete both records next to the Tunnel, so that
+   no DNS record of a lost node remains once it is `fenced`; this paragraph is shortened when that
+   change is merged and deployed.
 4. Only when the status is `fenced`, restore the affected databases onto healthy capacity with the
    separate-target restore procedure above. Each restore is a new database with a new ID; the
    integrator rebinds. The last archived commit is what comes back, not the last acknowledged one
@@ -90,6 +105,20 @@ database moves (plan 7.11, 9.4).
    while the fence is incomplete and while any database of the node lacks a proven-sleep record for
    its current generation, because a reinstall overwrites any WAL that never reached R2; the owner
    acknowledges that loss with `POST /v1/nodes/{id}/reinstall-override` and a reason.
+7. The reinstall brings the node back empty: recover mode restores nothing, and each database
+   is restored from R2 as a new database with the restore procedure above (a new ID; the
+   integrator rebinds).
+
+**Measured (EU1).** Fence: within 30 s of `mark-lost` (2026-10-19). Reinstall: AddNode in recover
+mode reached `ready` after 231 s on 2026-10-19; the pull install alone took 196.5 s from the rescue
+request to the enrolled node in Stage 4 (2026-10-18; the steps are under
+[adding a node](operator-installation.md#adding-reinstalling-and-updating-a-node)). **Restore: not
+measured yet.** The test databases had been deleted before that reinstall, so no node's population
+has been restored and timed. It is measured without wiping EU1 again: restore a sample of each size
+class into new databases on the release that runs the canary, record the time per database, the
+time per GiB and the node's restore concurrency, and extrapolate to the node's population. The
+total for the loss of a node (fence, reinstall and restores) is written here next to the two
+measured times; until then this runbook states no total.
 
 ## Looking at a node
 
@@ -185,7 +214,9 @@ Open a daily D1 artifact with the
 [restore drill](infrastructure-backups.md#restore-drill): `scripts/operations/restore-infrastructure-backup.ts`
 verifies and decrypts it with the offline keyring and imports it into a new, empty D1 database.
 Use the same command for the separate D1 database this section calls for; switching the Worker
-bindings stays a separate step that needs the operator's explicit authorization.
+bindings stays a separate step that needs the operator's explicit authorization. The drill has
+passed on the nightly artifact of 2026-10-21 (24 chunks, no foreign key violation, the counts of the
+live database).
 
 ## Integrator migration
 
@@ -208,8 +239,9 @@ created at full size at first boot and does not grow.
   `reserve_bytes` and metadata below `metadata_no_room_percent`. The refusal is `57P03` with the
   DETAIL "storage"; running databases keep running. Cloudflare places no new database or restore on
   a node whose pool is at 80 % of its data or 50 % of its metadata, whose sold storage reached
-  four times its data, or that holds 1,000 volumes (`regional_node_pool_closed`). Sold sizes do not
-  reserve space. `thin_storage_blocked` fires when the pool has no room. Free space by deleting
+  four times its data, or that holds 1,000 volumes, the largest count Stage 1 measured
+  (`regional_node_pool_closed`; the bound counts sleeping databases too and is no policy field: only
+  a measurement at a higher count raises it). Sold sizes do not reserve space. `thin_storage_blocked` fires when the pool has no room. Free space by deleting
   databases on the node.
 - **A full pool.** Writes fail at once (`--errorwhenfull y`) and no commit is acknowledged without
   durable WAL. ext4 on the affected volumes then aborts its journal and remounts read-only, so

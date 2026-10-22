@@ -113,6 +113,28 @@ Retire the old key from the keyring only after every node passed. Until `credent
 be raised by an API route, treat rotating this key as a planned operation with the owner's go, not
 as routine.
 
+**Planned, not built: the keyring change reaches the nodes by itself.** The change
+`credentials-revision` makes a node's effective `credentials_revision`, which its desired page
+carries, rise whenever the keyring derived for that node (its key IDs) or its Tunnel token changes,
+and not only when the shell's state does. The agent already reads its credentials again when the
+page names a higher revision, writes `gateway.env` and the Tunnel's credential and restarts the
+gateway and cloudflared for a change of their own secrets, and no database stop is ordered. The
+rotation then needs no release and no reboot:
+
+1. Add the new key beside the old one, the old one still active, and deploy the API and the Edge.
+   Within one pull (at most a minute) every node reads its credentials and restarts its gateway.
+2. Make the new key active and deploy both again. Open a fresh connection to a database on every
+   node: a node whose gateway lacks the key refuses it, and making the old key active again, which
+   is still in the keyring, restores it.
+3. Retire the old key only after every node passed.
+
+Each deploy that changes a keyring ends every client session of every node within a minute: the
+gateway stops accepting (its socket is systemd's, so a connection that arrives meanwhile waits for
+the next gateway), closes the idle sessions at once, gives a busy one 10 seconds, and clients
+reconnect. So the owner's go and, from the canary on, an announced window still apply. This text is
+replaced by that procedure, and the sentences above that no API route raises the revision go, when
+the change is merged and deployed.
+
 For the Edge's Access service token (`ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET`), rotate the
 token's secret in Zero Trust with a grace period; the Client ID stays the same
 ([operator installation](operator-installation.md#cloudflare-access-for-node-gateways-and-shells)).
@@ -154,7 +176,8 @@ A node holds no secret of the image. Its credentials come from the install and f
 - **Tunnel token and route keyring.** The API makes the node's Tunnel with `CLOUDFLARE_API_TOKEN`
   when the node first reads its credentials and hands it the token and its derived route keyring;
   the node stores the token as an encrypted systemd credential. Declaring a node lost deletes its
-  Tunnel, which ends the token.
+  Tunnel, which ends the token; its DNS records stay until they are deleted by hand
+  ([recovery](recovery.md#lost-node)).
 - **R2 credentials.** The Worker signs each node's temporary credentials locally from the parent key
   (`R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`): one archive prefix of one
   database generation, no delete right, 7 days, renewed after a third of that. Nodes never hold the
@@ -176,6 +199,16 @@ Credentials of the retired Kubernetes runtime (the Talos and Kubernetes authorit
 credentials, region agent keys, bucket-wide R2 keys and old Tunnel tokens) are revoked under
 Stage 0 step 4 of the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md).
 Keep every `CREDENTIAL_KEYS` ID that older D1 exports reference.
+
+**Stage 0 rotation record, 2026-10-22.** Deleted that day:
+
+- the two Tunnels of the Kubernetes era, `pgcf-eu-dev` and `pgcf-bootstrap-relay-eu-dev`, which had
+  been down since early October with no connection (their tokens ended with them);
+- the two API Worker secrets that no code reads, `BOOTSTRAP_RELAY_SIGNING_KEYS` and
+  `CONTABO_RESCUE_CONFIGURATION`;
+- the Worker `pgcf-node-source-control-dev`;
+- the proxied DNS record of the retired node, whose Tunnel was gone. Only `pgcf-` records whose
+  Tunnel target was one of the account's own deleted Tunnels were eligible.
 
 Record changed key IDs, dates and successful checks in private custody. Refresh the encrypted
 operator backup and its independent offline copy. Do not record secret values in `PLAN.md`, Git,
