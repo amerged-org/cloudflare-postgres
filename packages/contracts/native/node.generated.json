@@ -2424,7 +2424,7 @@
     "NODE_REQUEST_MAX_LENGTH": 2048,
     "ARCHIVE_SERVER_NAME": "database",
     "OWNER_ROLE_NAME": "app",
-    "RESERVED_ROLE_NAMES": ["postgres"],
+    "RESERVED_ROLE_NAMES": ["postgres", "pgcf_backup"],
     "RESERVED_ROLE_PREFIXES": ["pg_"],
     "PRESENT_ROLE_PROPERTIES": [
       "owner",

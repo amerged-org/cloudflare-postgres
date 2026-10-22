@@ -187,7 +187,8 @@ describe("role removal", () => {
     // unknown, however it is called.
     for (const name of ["nobody", "pgcf_maintenance", "cnpg_app"])
       expect((await removeRole(f, name)).status, name).toBe(404);
-    expect((await removeRole(f, "postgres")).status).toBe(400);
+    for (const name of ["postgres", "pgcf_backup"])
+      expect((await removeRole(f, name)).status, name).toBe(400);
     expect((await removeRole(f, "report_job", null)).status).toBe(400);
     expect((await removeRole(f, "report_job", key(), f.otherKey)).status).toBe(
       404,

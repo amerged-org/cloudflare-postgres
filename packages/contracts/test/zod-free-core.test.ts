@@ -89,6 +89,7 @@ describe("the zod-free IDs", () => {
     "app",
     "reader",
     "postgres",
+    "pgcf_backup",
     "streaming_replica",
     "pg_monitor",
     "pg_",

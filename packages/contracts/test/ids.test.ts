@@ -79,8 +79,8 @@ describe("ids", () => {
     expect(RegionId.safeParse("a".repeat(33)).success).toBe(false);
   });
 
-  it("rejects the names PostgreSQL itself reserves: postgres and pg_*", () => {
-    for (const name of ["postgres", "pg_monitor", "pg_"]) {
+  it("rejects the names the node needs for itself: postgres, pg_* and the backup role", () => {
+    for (const name of ["postgres", "pg_monitor", "pg_", "pgcf_backup"]) {
       expect(isReservedRoleName(name)).toBe(true);
       expect(isRoleName(name)).toBe(false);
       expect(RoleName.safeParse(name).success).toBe(false);
@@ -96,6 +96,7 @@ describe("ids", () => {
       "cnpg_app",
       "cnpg_pooler_pgbouncer",
       "pgcf_maintenance",
+      "pgcf_backup2",
       "a" + "b".repeat(62),
     ]) {
       expect(isReservedRoleName(name)).toBe(false);

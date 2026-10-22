@@ -1185,6 +1185,12 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     [
+      "backup-role",
+      withDatabase({ roles: [owner, { ...reader, name: "pgcf_backup" }] }),
+      false,
+      true,
+    ],
+    [
       "roles-named-as-the-kubernetes-runtime-named-its-own",
       withDatabase({
         roles: [

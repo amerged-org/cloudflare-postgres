@@ -668,6 +668,7 @@ describe("actual generated API references in the Workers runtime", () => {
     );
     expect(schemas.RoleName!.description).toMatch(/postgres/);
     expect(schemas.RoleName!.description).toMatch(/pg_/);
+    expect(schemas.RoleName!.description).toMatch(/pgcf_backup/);
     expect(schemas.RoleName!.description).not.toMatch(
       /cnpg_|streaming_replica|pgcf_maintenance/,
     );

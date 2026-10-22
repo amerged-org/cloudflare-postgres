@@ -77,7 +77,7 @@ it("has no PostgreSQL scheduling share beside the hard CPU limit", () => {
 });
 
 it("refuses only the names PostgreSQL reserves in customer creation", () => {
-  for (const name of ["postgres", "pg_monitor"])
+  for (const name of ["postgres", "pg_monitor", "pgcf_backup"])
     expect(RoleCreate.safeParse({ name }).success, name).toBe(false);
   // The names of the Kubernetes runtime are ordinary customer roles now.
   for (const name of [
@@ -132,6 +132,7 @@ describe("role lifecycle attributes", () => {
       { member_of: ["pg_read_all_data"] },
       { member_of: ["pg_execute_server_program"] },
       { member_of: ["postgres"] },
+      { member_of: ["pgcf_backup"] },
       { member_of: ["report_job"] },
       { member_of: "reader" },
       { bypass_rls: "yes" },

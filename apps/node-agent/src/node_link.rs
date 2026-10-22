@@ -547,6 +547,24 @@ mod tests {
             }
         }
     }
+    /// The roles the node creates for itself are names a customer role must never take: a page that
+    /// named one would be applied with `ALTER ROLE` to the role barman logs in as.
+    #[test]
+    fn the_roles_the_node_creates_for_itself_are_reserved() {
+        use crate::settings::{AGENT_ROLE, BACKUP_ROLE};
+        for name in [AGENT_ROLE, BACKUP_ROLE] {
+            assert!(reserved_role(name), "{name}");
+        }
+        // The names of the Kubernetes runtime are ordinary roles, and a near miss is not reserved.
+        for name in [
+            "cnpg_app",
+            "streaming_replica",
+            "pgcf_maintenance",
+            "pgcf_backups",
+        ] {
+            assert!(!reserved_role(name), "{name}");
+        }
+    }
     #[test]
     fn requests_are_signed_byte_for_byte_as_the_contract_signs_them() {
         for vector in VECTORS["requests"].as_array().unwrap() {

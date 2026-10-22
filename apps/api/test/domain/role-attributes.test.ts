@@ -153,7 +153,7 @@ describe("role attributes", () => {
     ]);
   });
 
-  it("refuses an expiry that is not in the future, unknown memberships, the owner as a target and the names PostgreSQL reserves", async () => {
+  it("refuses an expiry that is not in the future, unknown memberships, the owner as a target and the names a customer role cannot take", async () => {
     const f = await fixture(),
       id = await database(f);
     for (const body of [
@@ -169,8 +169,10 @@ describe("role attributes", () => {
       { name: "boss", member_of: ["app"] },
       { name: "boss", member_of: ["pg_read_all_data"] },
       { name: "limit", connection_limit: 0 },
+      { name: "boss", member_of: ["pgcf_backup"] },
       { name: "postgres" },
       { name: "pg_monitor" },
+      { name: "pgcf_backup" },
     ]) {
       const response = await createRole(f, id, body);
       expect(response.status, JSON.stringify(body)).toBe(400);

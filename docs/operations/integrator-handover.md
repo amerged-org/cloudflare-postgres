@@ -318,7 +318,8 @@ pgcf "$PGCF_API/v1/databases/<database-id>/roles/web/connection-uri"
   `rolsuper = false`). Roles you add are login roles without superuser, `createdb`,
   `createrole` or replication; `bypassrls` only when you ask for it (below). Grant them
   privileges with SQL as `app`. Role names match `^[a-z][a-z0-9_]{0,62}$` and may not be
-  `postgres` or start with `pg_`. There is no API to choose a password.
+  `postgres` or `pgcf_backup` (the role of the node's base backups) or start with `pg_`. There is no
+  API to choose a password.
 - Passwords are 43 characters of base64url, server-generated. Only an integrator key can read one,
   and only through the connection URI. `reset-password` replaces it (`password_revision` + 1).
 - Creating, resetting and deleting a role require an `Idempotency-Key` (`400` without one).
@@ -1237,7 +1238,7 @@ description of the schema or the operation; the code is authoritative.
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- | ------- |
 | An `integrator` key requires `project_id` and an `admin` key must omit it                                                                                                                             | `ApiKeyCreate`                     | `400`   |
 | `memory_mib` of a size class is a multiple of 256                                                                                                                                                      | `SizeClass`, `SizeClassUpsert`     | `400`   |
-| `postgres` and `pg_*` are not role names                                                                                                                                                              | `RoleName`, `RoleCreate`           | `400`   |
+| `postgres`, `pgcf_backup` and `pg_*` are not role names                                                                                                                                                              | `RoleName`, `RoleCreate`           | `400`   |
 | `valid_until` must lie in the future when the request executes (not on a replay); every `member_of` entry is a live role of this database that is neither `app` nor being deleted | `RoleCreate`                       | `400`   |
 | A usage request names exactly one scope; both boundaries are aligned to the granularity and at most 31 days apart                                                                                     | `getUsage`                         | `400`   |
 | A request body is JSON of at most 64 KiB with `Content-Type: application/json` whenever there is a body                                                                                               | `info.description`                 | `400`   |

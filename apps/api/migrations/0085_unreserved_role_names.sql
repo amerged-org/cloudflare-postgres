@@ -1,22 +1,35 @@
 -- SPDX-License-Identifier: Apache-2.0
--- Contract: the role names of the Kubernetes runtime are ordinary customer roles (plan W2-C).
+-- Contract: the role names of the Kubernetes runtime are ordinary customer roles, and the node's own
+-- backup role is not (plan W2-C).
 --
 -- `roles.name` refused `streaming_replica` and `cnpg_*` in a column CHECK, next to what PostgreSQL
 -- reserves itself. SQLite cannot change a CHECK in place, so the table is built again without those
--- two terms and every row is copied unchanged: the credential, the attributes, the tombstones. What
--- the name still refuses is `postgres`, the `pg_` prefix and anything that is not a lower-case
--- identifier of 1 to 63 characters. Nothing references `roles`, so no foreign key is in play.
+-- two terms and with one new one, `pgcf_backup`: the role barman's base backups log in as, which the
+-- node agent creates and never restores. A customer role of that name would be altered, lose the
+-- privileges of the backup role and, because PostgreSQL cannot drop it, leave that database without
+-- base backups for good. Every row is copied unchanged: the credential, the attributes, the
+-- tombstones. What the name still refuses is `postgres`, `pgcf_backup`, the `pg_` prefix and
+-- anything that is not a lower-case identifier of 1 to 63 characters. Nothing references `roles`,
+-- so no foreign key is in play.
 --
--- Deploy order: this migration and the API Worker come after the release that lets the node agent
--- accept these names has reached every node. A node refuses a whole desired page that names a role
--- it still holds reserved, so a role the API accepts first would stop the page of its database.
+-- Deploy order. This migration, the API Worker and the Edge Worker come after the node release that
+-- accepts these names (R-2) is observed on every node, and every image a node can be installed or
+-- recovered from holds R-2 or newer. A node below R-2 refuses a whole desired page that names a role
+-- it still holds reserved, and that page also carries the node's release: the node can then never
+-- receive a newer release, and rolling forward cannot fix it. Until the Edge Worker is redeployed, a
+-- role of such a name is created but every connection as it answers 28P01. From the merge of this
+-- change until R-2 is observed on every node, deploy no API Worker from main and apply no
+-- `wrangler d1 migrations apply`, which applies every pending migration, this one included.
+-- Check before R-2 and again before this migration that no row of `roles`, tombstones included, is
+-- named `pgcf_backup`: the CHECK below refuses the copy of such a row and the migration stops, and
+-- a node on R-2 refuses the page of its database.
 
 CREATE TABLE roles_next (
   database_id TEXT NOT NULL REFERENCES databases(id),
   name TEXT NOT NULL
     CHECK (length(name) BETWEEN 1 AND 63 AND substr(name, 1, 1) BETWEEN 'a' AND 'z'
       AND NOT name GLOB '*[^a-z0-9_]*'
-      AND name <> 'postgres' AND name NOT GLOB 'pg_*'),
+      AND name NOT IN ('postgres', 'pgcf_backup') AND name NOT GLOB 'pg_*'),
   owner INTEGER NOT NULL DEFAULT 0 CHECK (owner IN (0, 1)),
   -- AES-GCM ciphertext and IV (base64url), key ID; AAD is "<database_id>|<name>|<kid>".
   password_ciphertext TEXT NOT NULL CHECK (length(password_ciphertext) BETWEEN 1 AND 512),
