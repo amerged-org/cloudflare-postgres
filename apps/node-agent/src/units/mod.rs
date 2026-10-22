@@ -20,8 +20,15 @@
 //! - The memory ceiling of `pgcf.slice`, which holds every database, is the operator's awake-database
 //!   budget (`set_slice_memory`): the kernel's backstop under either memory rule. The image's slice
 //!   has 80 % of RAM until the agent sets it.
+//! - A database's mounts for a sandbox that was built before the database was chosen: the volume
+//!   and the socket directory, handed over as idmapped clones into the sandbox's mount namespace
+//!   (`idmap`).
 //!
 //! The agent runs as root on the node; systemd answers these calls without further authorization.
+// `pgcf_idmap_lab` is set by RUSTFLAGS, not declared in the manifest.
+#![allow(unexpected_cfgs)]
+#[cfg(target_os = "linux")]
+pub mod idmap;
 pub mod journal;
 pub mod limits;
 pub mod ready;
@@ -677,6 +684,11 @@ impl Units {
 
 #[cfg(test)]
 pub(crate) mod lab;
+
+// The privileged lab of `idmap` exists only in a build made for it: the unprivileged kernel step
+// of CI runs every ignored test and must not meet it.
+#[cfg(all(test, target_os = "linux", pgcf_idmap_lab))]
+mod idmap_lab;
 
 /// A fresh, private directory path below the temporary directory for a test, kept short because a
 /// Unix socket path must fit in `sun_path`. The test creates and removes it.
