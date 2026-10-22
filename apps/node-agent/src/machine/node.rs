@@ -1000,6 +1000,9 @@ mod lab {
         };
         assert!(node.attached(&volume));
         assert_eq!(node.unit_volume(ID).await.unwrap(), None);
+        // A wake makes no user: the quiet passes of a node's refill have made them. The lab makes
+        // the one user of the slot it binds (the lowest number), as such a pass does.
+        node.make_slot_user().await.unwrap();
         let bound = node.bind(ID, &bind).await.unwrap();
         assert_eq!(bound.slot, 0, "the lowest number, built on demand");
         assert_eq!(show(&unit, "MemoryMax"), (512u64 << 20).to_string());

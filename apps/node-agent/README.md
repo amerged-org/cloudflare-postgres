@@ -526,7 +526,9 @@ by `inotify` against the postmaster's `READY=1`, the reset of a slot's limits, t
 slots, adoption after the agent dies and after a boot, and the bind's time against the agent's
 size. It is built only with `RUSTFLAGS='--cfg pgcf_slot_lab'` and runs as root on a systemd host
 with the image's `pgcf-slot@.service`, `pgcf.slice`, the supervisor at
-`/usr/libexec/pgcf/pgcf-archive` and PostgreSQL 18, inside `systemd-run --wait --pipe -p
+`/usr/libexec/pgcf/pgcf-archive` (a link through `/var/lib/pgcf/bin/current` to the release's
+directory, as in the image: the kernel names the process's file by its real path, and the agent
+knows the supervisor by the file the link leads to now) and PostgreSQL 18, inside `systemd-run --wait --pipe -p
 PrivateMounts=yes <test binary> --ignored --test-threads=1 units::slot_lab` (its header says how).
 `start_lab.rs` is the agent's start on a node with 300 databases, on the same real parts and with a
 disk that is slow to flush (its header says how to run it); the numbers it gave are in the plan

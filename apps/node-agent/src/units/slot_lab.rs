@@ -5,7 +5,9 @@
 //! only in a build made for them (`--cfg pgcf_slot_lab`): the kernel step of CI runs every ignored
 //! test in an unprivileged container and must not meet them. The host has the image's
 //! `pgcf-slot@.service` and `pgcf.slice`, the supervisor at `/usr/libexec/pgcf/pgcf-archive`
-//! (`pgcf-archive slot <n>`), PostgreSQL 18 under `/usr/lib/postgresql/18`, util-linux,
+//! (`pgcf-archive slot <n>`; a link, as in the image: to `/var/lib/pgcf/bin/current/pgcf-archive`,
+//! and `current` links to the release's directory, so the kernel names the process's file by that
+//! directory and the lab must have the links too), PostgreSQL 18 under `/usr/lib/postgresql/18`, util-linux,
 //! e2fsprogs, perl and `nsenter`. The test binary runs as the agent runs, in a mount namespace of
 //! its own with the propagation that `PrivateMounts=yes` of `pgcf-agent.service` gives it (the
 //! idmapped handoff needs it, see `idmap_lab`):

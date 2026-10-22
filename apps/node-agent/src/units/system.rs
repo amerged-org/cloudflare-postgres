@@ -140,7 +140,7 @@ impl<R: CommandRunner + Send + Sync + 'static> System<R> {
     /// The program of a process, from its `/proc/<pid>/exe`.
     fn program(&self, pid: u32) -> Option<Exe> {
         let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-        Some(program_of(
+        Some(program_at(
             &link,
             Path::new(&self.layout.archive_command),
             &self.layout.postgres_bin.join("postgres"),
@@ -186,6 +186,17 @@ fn slot_users(passwd: &str) -> BTreeSet<u32> {
             (number < slots::SLOT_COUNT && slot_account(number) == name).then_some(number)
         })
         .collect()
+}
+
+/// Which program a process runs, from its `exe` link: [`program_of`] with the paths of the
+/// supervisor and of PostgreSQL as the image names them. The kernel names the file a process runs
+/// by its real path, with every link followed, and the image names the supervisor by a link
+/// (`/usr/libexec/pgcf/pgcf-archive`, which leads through `bin/current` to the running release),
+/// so both are resolved first. The supervisor of an earlier release is not the file the link leads
+/// to now: it is another program, and an idle slot that runs it is built again.
+fn program_at(exe: &Path, supervisor: &Path, postgres: &Path) -> Exe {
+    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    program_of(exe, &resolved(supervisor), &resolved(postgres))
 }
 
 /// Which program a process runs, from its `exe` link. The link of a binary that a release
@@ -713,6 +724,37 @@ mod tests {
         assert_eq!(program("/usr/lib/postgresql/17/bin/postgres"), Exe::Other);
         assert_eq!(program("/bin/sh"), Exe::Other);
         assert_eq!(program("/tmp/usr/libexec/pgcf/pgcf-archive"), Exe::Other);
+    }
+
+    #[test]
+    fn a_supervisor_started_through_the_images_links_is_known_by_the_file_they_lead_to() {
+        // The image's layout: `/usr/libexec/pgcf/pgcf-archive` links to
+        // `/var/lib/pgcf/bin/current/pgcf-archive`, and `current` links to the release's directory.
+        // The kernel names the file a process runs by its real path, with every link followed.
+        let root = crate::link::test_server::tempdir();
+        let root = std::fs::canonicalize(&*root).unwrap();
+        let bin = root.join("var/lib/pgcf/bin");
+        for release in ["release-a", "release-b"] {
+            std::fs::create_dir_all(bin.join(release)).unwrap();
+            std::fs::write(bin.join(release).join("pgcf-archive"), b"").unwrap();
+        }
+        std::os::unix::fs::symlink("release-b", bin.join("current")).unwrap();
+        let libexec = root.join("usr/libexec/pgcf");
+        std::fs::create_dir_all(&libexec).unwrap();
+        let command = libexec.join("pgcf-archive");
+        std::os::unix::fs::symlink(bin.join("current/pgcf-archive"), &command).unwrap();
+        let postgres = root.join("usr/lib/postgresql/18/bin/postgres");
+        let program = |exe: &Path| program_at(exe, &command, &postgres);
+
+        let running = bin.join("release-b/pgcf-archive");
+        assert_eq!(program(&running), Exe::Supervisor);
+        let replaced = format!("{} (deleted)", running.display());
+        assert_eq!(program(Path::new(&replaced)), Exe::Supervisor);
+        // The supervisor of the release before is another program: an agent of this release does
+        // not trust its protocol.
+        assert_eq!(program(&bin.join("release-a/pgcf-archive")), Exe::Other);
+        // A file of another name in the running release's directory is not the supervisor.
+        assert_eq!(program(&bin.join("release-b/pgcf-agent")), Exe::Other);
     }
 
     #[test]
