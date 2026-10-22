@@ -168,21 +168,61 @@ slots again adopts them. Two things do the two halves of it.
   (`POST /v1/databases/{id}/suspend`). The order's hold ends when its cycle is answered, within
   seconds when the node holds the release's packages already, and no order holds the wakes across
   the swap of the agent. A manual suspension is a desired state, and a connection never wakes a
-  database in it, whatever agent is running. It reaches every database: one that is `ready` goes
-  through the sleep proof, and one that hibernates (a verified idle sleeper) is claimed by the API
-  with no action of the node (`verifiedIdle` in `apps/api/src/domain/lifecycle.ts`; the test
+  database in it, whatever agent is running. It reaches every database that is not in a wake or a
+  sleep: one that is `ready` goes through the sleep proof, and one that hibernates (a verified idle sleeper) is claimed by the API
+  with no sleep to run (`verifiedIdle` in `apps/api/src/domain/lifecycle.ts`; the node reports the
+  new generation asleep on its next pull; the test
   "manual suspension can claim an already verified idle sleeper and keeps connect auto-wake
   disabled" proves it). Its costs: an integrator's `resume` of one of these databases wakes it
   (the integrator has to be told), the operator resumes every database afterwards, one by one, and
   a resume answers `409` with `node_capacity` where the node cannot hold what is resumed at once.
 
-The order of the operator: suspend every database of the node, run the `maintenance` order and wait
-for `done`, **then read that no slot holds a database**: every database of the node reports
-`observed_power` `hibernated`, and one that does not (a wake that began before the suspension
-reached it, or one the order missed because it was not `ready` yet) is suspended again or waited
-for before anything goes on. This check is mandatory and no formality, since the drain never looks
-at a database that is not `ready`. Then assign the older release. The agent that installs the older
-release is this one: it does not look at its slots before it switches its link.
+**The order of the operator.**
+
+1. Suspend every database of the node (`POST /v1/databases/{id}/suspend`). A database whose wake is
+   under way, or whose idle sleep has not ended, answers `409` `not_ready` and stays as it was (the
+   claim of a wake has set its `desired_state` to `running`): suspend it again when the node has
+   reported the wake `ready` or the sleep `asleep`.
+2. Run the `maintenance` order and wait for `done`. The drain sleeps only the databases that are
+   `ready`: what it leaves is what the next two steps read.
+3. **Read the node's own count.** In D1, the two newest complete minutes of the node in
+   `node_minutes` (folded from its 15 s samples) have `samples` of at least 3 and `awake_max` 0: no
+   sample counted a database whose PostgreSQL is active or starting. The node's admission counts
+   every wake and every start of a recovery (`Admitter::snapshot`).
+4. **Read the check, last.** List the node's databases (`GET /v1/databases?node_id=<node>`, every
+   page, admin key). Every one reads `observed_state` `hibernated` and `suspension_reason`
+   `manual`. In D1 that is
+   `desired_state='suspended' AND suspension_reason='manual' AND observed_generation=generation AND observed_power='hibernated'`.
+   A database that fails is suspended again or waited for, and steps 3 and 4 are read again.
+5. Assign the older release. Until the older agent runs, no integrator resumes a database of the
+   node and nothing restarts the agent but the swap. The agent that installs the older release is
+   this one: it does not look at its slots before it switches its link.
+
+**Why `observed_power` is not the check.** It is the power of the node's last report, and no report
+comes while a wake runs. The claim of a wake (an integrator's `resume`, or a connection's wake
+ticket) sets `desired_state` `running` and raises the generation and leaves `observed_power` as it
+was; the agent sends no observation while it starts PostgreSQL (`Phase::Starting`; `observe` in
+`agent/report.rs`: "a wake under way has nothing to report"), and its first report is `ready`. A
+database whose wake began before its suspension reads `observed_power` `hibernated` with its
+PostgreSQL coming up in a slot, and an agent of the earlier release would then start a second
+postmaster over it. The reports `unproven`, `building` and `error` keep the earlier power too
+(`applyObservation` in `apps/api/src/domain/node-observations.ts`). The public `hibernated`
+(`databaseView` in `apps/api/src/domain/rows.ts`) needs `desired_state` `suspended`,
+`observed_generation` equal to `generation` and `observed_power` `hibernated` together: the
+suspension of a database in its wake is refused, one accepted after the wake's `ready` raises the
+generation, and the generation is observed only when the node says the database asleep at it.
+`manual` is needed because a database suspended for idleness reads `hibernated` too, and a
+connection wakes it into a slot at any time. Both halves are tested:
+`apps/api/test/domain/rollback-check.test.ts` and `a_wake_under_way_has_nothing_to_report_and_an_unproven_database_says_so`
+(`agent/report.rs`).
+
+**What the check cannot see, and the count does.** When the agent starts and cannot prove the sleep
+of a database (`adopt_asleep`), it reports `unproven`, the API keeps the power, the generation and
+the state as they were, and the recovery starts PostgreSQL in a slot while D1 still reads
+`hibernated` (the third test of `rollback-check.test.ts` shows it). Only the node's count sees that
+recovery; a database whose delete was requested is no longer listed either, and the count keeps its
+unit until the agent has stopped it. This is a rule for the operator and no guard, and it follows from reading
+the agent of `origin/main`; it was not run on a node.
 
 **The health check** runs the scratch database in the slot of its own (number 1023), so it takes no
 idle slot of the agent's pool and leaves none; it builds that slot (and makes its user) with its own

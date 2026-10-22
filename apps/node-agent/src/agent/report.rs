@@ -514,6 +514,28 @@ mod tests {
         assert!(!contract_valid("NodeObservationReport", &without));
     }
 
+    /// The rollback rule of the slot pool reads Cloudflare's view of a database, and Cloudflare
+    /// hears nothing of a database whose PostgreSQL is coming up in a slot: it keeps the power of
+    /// the last report (`apps/node-agent/README.md`, "Rolling back to an earlier release").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_under_way_has_nothing_to_report_and_an_unproven_database_says_so() {
+        let Some(rig) = Rig::new("observe-silent-wake").await else {
+            return;
+        };
+        let (_, db) = rig.create().await;
+        let observed = |phase: Phase| {
+            rig.core.set(&db, |view| view.phase = phase);
+            rig.core.observe(&db, &db.view())
+        };
+        for phase in [Phase::Starting, Phase::Retired] {
+            assert_eq!(observed(phase), None, "{phase:?}");
+        }
+        for (phase, state) in [(Phase::Building, "building"), (Phase::Unproven, "unproven")] {
+            let observation = observed(phase).expect("an observation");
+            assert_eq!(observation["state"], state, "{phase:?}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn events_alone_are_a_report_once_per_window_and_otherwise_ride_with_what_goes() {
         let Some(rig) = Rig::new("report-events").await else {
