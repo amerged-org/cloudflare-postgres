@@ -3060,10 +3060,10 @@ mod tests {
                 "restart pgcf-gateway.service"
             ]
         );
-        // The agent takes the restart out of its record after systemd has done it, so the record
-        // is finished a moment after the unit runs the new definition, not at the same time.
+        // The unit's definition changes when the restart is done; the record that the host files are
+        // done is written just after it, so the test waits for it as well.
         let boot = machine.boot().unwrap().id;
-        eventually(30, "the record to be finished", || {
+        eventually(30, "the host files to be recorded as done", || {
             !crate::hostfiles::State::load(&machine.layout().host_files()).unfinished(&boot)
         })
         .await;
@@ -3289,7 +3289,7 @@ mod tests {
         .await;
         // The record is finished a moment after the unit runs, as in the test above.
         let boot = machine.boot().unwrap().id;
-        eventually(30, "the record to be finished", || {
+        eventually(30, "the host files to be recorded as done", || {
             !crate::hostfiles::State::load(&machine.layout().host_files()).unfinished(&boot)
         })
         .await;

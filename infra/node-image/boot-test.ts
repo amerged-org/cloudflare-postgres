@@ -15,7 +15,7 @@ export interface BootTestResult {
 }
 
 // One SMBIOS type 11 string carrying a systemd system credential.
-export function smbiosCredential(name: string, content: string | Uint8Array): string {
+export function smbiosCredential(name: string, content: string | Buffer): string {
   if (!/^[A-Za-z0-9_.~@-]+$/.test(name)) throw new Error(`invalid credential name ${name}`);
   return `io.systemd.credential.binary:${name}=${Buffer.from(content).toString("base64")}`;
 }
@@ -48,7 +48,12 @@ export function passed(result: BootTestResult): boolean {
   return result.phases.get(1) === "ok" && result.phases.get(2) === "ok" && result.failedChecks.length === 0;
 }
 
-const testUnit = `[Unit]
+// The guest script travels gzip-compressed: the SMBIOS table QEMU hands to the guest holds 65,535
+// bytes in all, and the base64 of the script, at 50 KB, was cut inside it, so systemd could not
+// decode the credential and the test never ran.
+export const guestCredential = (script: string): string => smbiosCredential("pgcf.boot-test", gzipSync(script));
+
+export const testUnit = `[Unit]
 Description=PGCF boot test
 After=multi-user.target
 
@@ -56,8 +61,7 @@ After=multi-user.target
 # Not oneshot: the boot must finish while the test waits for it (systemctl is-system-running --wait).
 Type=exec
 ImportCredential=pgcf.boot-test
-# The test travels gzipped (it does not fit the SMBIOS space otherwise); %d is its credentials directory.
-ExecStart=/bin/bash -c 'gzip --decompress --stdout %d/pgcf.boot-test >/run/pgcf-boot-test.sh && exec /bin/bash /run/pgcf-boot-test.sh'
+ExecStart=/bin/bash -c 'gzip -dc "%d/pgcf.boot-test" > /run/pgcf-boot-test.sh && exec /bin/bash /run/pgcf-boot-test.sh'
 `;
 
 // What the installer writes for a node (install.sh), for QEMU's isolated user network.
@@ -80,7 +84,7 @@ export function bootCredentials(guest: string): string[] {
   return [
     smbiosCredential("systemd.extra-unit.pgcf-boot-test.service", testUnit),
     smbiosCredential("systemd.unit-dropin.multi-user.target~pgcf-boot-test", "[Unit]\nWants=pgcf-boot-test.service\n"),
-    smbiosCredential("pgcf.boot-test", gzipSync(guest, { level: 9 })),
+    guestCredential(guest),
     smbiosCredential("network.network.10-pgcf", network),
   ];
 }
