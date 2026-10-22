@@ -25,7 +25,7 @@ import {
   unknownOutcome,
   type Connection,
 } from "@pgcf/contracts/edge-sql";
-import { ROUTE_TOKEN_HEADER } from "@pgcf/contracts/route-token";
+import { ROUTE_TOKEN_HEADER } from "@pgcf/contracts/route-token-core";
 import {
   AdmissionFailure,
   admitRoute,

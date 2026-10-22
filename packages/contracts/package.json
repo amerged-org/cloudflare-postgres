@@ -7,6 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./ids": "./src/ids.ts",
+    "./ids-core": "./src/ids-core.ts",
     "./timestamp": "./src/timestamp.ts",
     "./database-admission": "./src/database-admission.ts",
     "./edge-policy": "./src/edge-policy.ts",
@@ -14,6 +15,7 @@
     "./usage": "./src/usage.ts",
     "./maintenance": "./src/maintenance.ts",
     "./route-token": "./src/route-token.ts",
+    "./route-token-core": "./src/route-token-core.ts",
     "./pg-wire": "./src/pg-wire.ts",
     "./gateway-limits": "./src/gateway-limits.ts",
     "./sleep": "./src/sleep.ts",

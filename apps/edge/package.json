@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "wrangler types --config wrangler.example.jsonc && tsc --noEmit",
-    "test": "node --test test/entry-runtime.node-test.ts && vitest run",
+    "test": "node --test test/*.node-test.ts && vitest run",
     "bench": "node bench/relay.ts"
   },
   "dependencies": {

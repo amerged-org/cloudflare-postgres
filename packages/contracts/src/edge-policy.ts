@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-// Portable Edge limits and refusal key derivation; no Workers host types.
-import { parseRouteKeyring } from "./route-token.ts";
+// Portable Edge limits and refusal key derivation; no Workers host types. The Edge loads this
+// module, so it imports no zod: `route-token-core.ts`, not `route-token.ts`.
+import { parseRouteKeyring } from "./route-token-core.ts";
+
+/**
+ * How long a connect to a sleeping database may wait to be admitted, at the Edge and in the Actor.
+ * A cold Thin wake takes 22 s when the identity turn is free and about 40 s when one is in flight,
+ * which the 30 s of the first deadline cut off (measured 2026-10-16).
+ */
+export const ADMISSION_DEADLINE_MS = 60_000;
 
 export const DECOY_DEADLINE_MS = 10_000;
 export const DECOY_MAX_BYTES = 64 * 1024;
