@@ -154,12 +154,22 @@ fn tool_failed(program: &str, file: &str) -> io::Error {
 }
 
 /// What a read of a unit fails with when the bus refuses the call, as dbus-daemon does past its
-/// limit of calls that are not answered yet.
+/// limit of calls that are not answered yet: an error reply named `LimitsExceeded`, which is what
+/// `Units::state` gets from `GetUnit` (a method call's refusal is a `MethodError`).
 fn bus_refused() -> units::Error {
-    units::Error::Bus(zbus::Error::Failure(
-        "org.freedesktop.DBus.Error.LimitsExceeded: the maximum number of pending replies per \
-         connection has been reached"
-            .into(),
+    let name = "org.freedesktop.DBus.Error.LimitsExceeded";
+    let call = zbus::message::Message::method_call("/org/freedesktop/systemd1", "GetUnit")
+        .unwrap()
+        .build(&())
+        .unwrap();
+    let reply = zbus::message::Message::error(&call.header(), name.to_string())
+        .unwrap()
+        .build(&())
+        .unwrap();
+    units::Error::Bus(zbus::Error::MethodError(
+        name.try_into().unwrap(),
+        Some("the maximum number of pending replies per connection has been reached".into()),
+        reply,
     ))
 }
 

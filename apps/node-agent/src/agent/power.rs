@@ -2452,7 +2452,7 @@ mod tests {
                 failures[0]["fields"]["kind"].as_str(),
                 failures[0]["fields"]["class"].as_str()
             ),
-            (Some("wake"), Some("units_bus"))
+            (Some("wake"), Some("bus_limits_exceeded"))
         );
 
         // Nothing acknowledged was lost: the next wake finds the proven database and its rows.
