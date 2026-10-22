@@ -154,7 +154,7 @@ A node holds no secret of the image. Its credentials come from the install and f
 - **Tunnel token and route keyring.** The API makes the node's Tunnel with `CLOUDFLARE_API_TOKEN`
   when the node first reads its credentials and hands it the token and its derived route keyring;
   the node stores the token as an encrypted systemd credential. Declaring a node lost deletes its
-  Tunnel, which ends the token.
+  Tunnel, which ends the token, and then the DNS records that point at it.
 - **R2 credentials.** The Worker signs each node's temporary credentials locally from the parent key
   (`R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`): one archive prefix of one
   database generation, no delete right, 7 days, renewed after a third of that. Nodes never hold the
@@ -168,7 +168,9 @@ A node holds no secret of the image. Its credentials come from the install and f
 
 Create a replacement with the same scoped authority, update the private Worker secret, then check
 its real use before revoking the old value. R2 requires an actual base backup, WAL archive and
-restore read. `CLOUDFLARE_API_TOKEN` requires a node's credentials read that finds its Tunnel.
+restore read. `CLOUDFLARE_API_TOKEN` (Account: Cloudflare Tunnel: Edit and Zone: DNS: Edit on the
+gateway zone, see [operator installation](operator-installation.md)) requires a node's credentials
+read that finds its Tunnel.
 `INFRASTRUCTURE_BACKUP_CF_TOKEN` requires the next daily D1 export to complete. Contabo requires an
 authenticated inventory read; changing credentials must never issue a test order.
 

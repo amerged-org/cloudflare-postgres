@@ -20,15 +20,15 @@ import { ensureArchiveCredentials } from "./archive-credentials.ts";
 import { moveTargets } from "./database-moves.ts";
 import { openNodeOrders } from "./lifecycle-orders.ts";
 import { openDiagnosticRequests } from "./node-diagnostics.ts";
-import { shellCredentialsRevision } from "./node-shell.ts";
+import {
+  credentialsRevision,
+  nodeRouteKeyring,
+  type CredentialsRow,
+} from "./node-credentials.ts";
 
-interface NodeRow {
-  id: string;
-  uid: string;
+interface NodeRow extends CredentialsRow {
   hostname: string;
   region_id: string;
-  credentials_revision: number;
-  shell_state: string;
 }
 interface DatabaseRow {
   id: string;
@@ -166,6 +166,27 @@ async function databaseRoles(
 }
 
 /**
+ * The keyring the page's credentials revision holds. A keyring the Worker cannot read (a variable
+ * that is not one) is no reason to refuse the page, which carries the fence and the wakes: the
+ * revision stays as it is, the credentials read fails until the variable is fixed, and the
+ * failure is logged for every page.
+ */
+async function pageKeyring(env: Env, nodeId: string) {
+  try {
+    return await nodeRouteKeyring(env, nodeId);
+  } catch (error) {
+    console.log(
+      JSON.stringify({
+        event: "node_keyring_unreadable",
+        node_id: nodeId,
+        error: error instanceof Error ? error.message : "unknown",
+      }),
+    );
+    return null;
+  }
+}
+
+/**
  * One page of the databases a node serves, with its release, policy and open orders (plan 5.3).
  * A database is on the page once its archive credential is issued. A fenced node's page holds the
  * fence and the retired storage generations and nothing else. The probes an administrator asked
@@ -177,7 +198,8 @@ export async function nodeDesiredPage(
   query: NodeDesiredQuery,
 ): Promise<NodeDesiredPage> {
   const node = await env.DB.prepare(
-    "SELECT id,node_uid uid,hostname,region_id,credentials_revision,shell_state FROM nodes WHERE id=? AND node_uid=?",
+    `SELECT id,node_uid uid,hostname,region_id,credentials_revision,shell_state,route_keyring_state
+     FROM nodes WHERE id=? AND node_uid=?`,
   )
     .bind(caller.id, caller.uid)
     .first<NodeRow>();
@@ -340,7 +362,11 @@ export async function nodeDesiredPage(
     node: identity,
     release: await pageRelease(env, node.region_id),
     policy,
-    credentials_revision: await shellCredentialsRevision(env, node),
+    credentials_revision: await credentialsRevision(
+      env,
+      node,
+      await pageKeyring(env, node.id),
+    ),
     orders,
     ...(diagnostics.length > 0 ? { diagnostics } : {}),
     databases,

@@ -701,6 +701,64 @@ database_user_reads_no_journal() {
 	[ "$result" = 0 ]
 }
 
+# The line $3 that uid $1 logged under the identifier $2 is in a system.journal file: --file reads
+# that file alone, so a line that journald kept in a user-<uid>.journal is not found.
+line_in_system_journal() {
+	local file lines
+	while IFS= read -r file; do
+		lines=$(journalctl --file="$file" --no-pager --output=cat "_UID=$1" "SYSLOG_IDENTIFIER=$2" 2>/dev/null)
+		grep -qxF "$3" <<<"$lines" && return 0
+	done < <(find /var/log/journal /run/log/journal -name system.journal 2>/dev/null)
+	return 1
+}
+
+# The agent finds PostgreSQL's lines in the system journal (by unit and invocation) and builds the
+# boot report from it. journald's SplitMode=uid (the default) keeps the lines of every user outside
+# systemd's system, dynamic and container ranges and nobody in a user-<uid>.journal of their own:
+# EU1 held 371 of them, one per database ever created, and journald vacuums them by age only (plan
+# 11.1). The scratch database's user logs a line the way its PostgreSQL does (the journal's stream):
+# the line is in the system journal, and no user-*.journal file exists anywhere.
+database_log_stays_in_the_system_journal() {
+	local id=pgcfcheckscratch0000 tag=pgcf-boot-test-journal pid uid gid marker files
+	pid=$(systemctl show --property=MainPID --value "pgcf-pg@$id.service")
+	[ "${pid:-0}" -gt 0 ] || {
+		echo "the scratch database does not run"
+		return 1
+	}
+	uid=$(stat -c %u "/proc/$pid")
+	gid=$(stat -c %g "/proc/$pid")
+	# journald keeps the system uids (to 999), systemd's dynamic range (61184 to 65519), nobody (65534),
+	# 65535 and the container range (from 524288) in the system journal whatever SplitMode is: with
+	# such a user the file check below would pass whatever the config. The check takes only a uid from
+	# 65536 to 524287, which journald splits and which holds the agent's database uids (from 200000).
+	{ [ "$uid" -gt 65535 ] && [ "$uid" -lt 524288 ]; } || {
+		echo "uid $uid is outside 65536-524287, the range that journald splits: the probe proves nothing"
+		return 1
+	}
+	marker=$tag-$$-$RANDOM
+	setpriv --reuid="$uid" --regid="$gid" --clear-groups -- systemd-cat --identifier="$tag" echo "$marker" || return 1
+	wait_for 10 line_in_system_journal "$uid" "$tag" "$marker" || {
+		echo "the line of uid $uid is not in the system journal"
+		return 1
+	}
+	files=$(find /var/log/journal /run/log/journal -name 'user-*.journal*' 2>/dev/null)
+	[ -z "$files" ] || {
+		echo "journald keeps user journal files: ${files//$'\n'/ }"
+		return 1
+	}
+}
+
+# The journal of this boot shows the agent's own lines (the unit's, not PID 1's lines about it): the
+# agent logs `agent_start_phase` from its first moment, and the checks begin when the system runs.
+journal_has_agent_lines() {
+	local lines
+	lines=$(journalctl --boot=0 --quiet --no-pager --output=cat --lines=1 _SYSTEMD_UNIT=pgcf-agent.service) || return 1
+	[ -n "$lines" ] || {
+		echo "journalctl --boot=0 shows no line of pgcf-agent.service"
+		return 1
+	}
+}
+
 # A database's scratch space is bounded. The private /tmp and /var/tmp used to be directories on the
 # host's root filesystem (8 GiB, no quota, and disk blocks are not memory the unit's MemoryMax
 # counts): one awake tenant could fill it, which stops the journal and the agent's state writes
@@ -1066,6 +1124,7 @@ check loopback_only loopback_only
 check no_ssh_socket no_ssh_socket
 check journal_sync_interval journal_sync_interval
 check journal_not_split journal_not_split
+check journal_has_agent_lines journal_has_agent_lines
 check inbound_dropped inbound_dropped
 check binaries binaries
 check io_uring_disabled sysctl_is kernel.io_uring_disabled 2
@@ -1101,6 +1160,7 @@ if [ "$phase" = 1 ]; then
 	check database_user_reaches_no_block_device database_user_reaches_no_block_device
 	check database_user_shares_nothing_writable database_user_shares_nothing_writable
 	check database_user_reads_no_journal database_user_reads_no_journal
+	check database_log_stays_in_the_system_journal database_log_stays_in_the_system_journal
 	check database_scratch_space_is_bounded database_scratch_space_is_bounded
 	check database_second_postmaster_is_refused database_second_postmaster_is_refused
 	check slot_isolation slot_isolation

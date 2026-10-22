@@ -58,13 +58,23 @@ export function cloudflare(
     expect(init?.redirect).toBe("manual");
     const ok = (result: unknown) => Response.json({ success: true, result });
     const path = url.pathname.replace("/client/v4", "");
-    if (path === `/accounts/${ACCOUNT}/cfd_tunnel` && method === "GET") {
-      expect(url.searchParams.get("is_deleted")).toBe("false");
+    if (path === `/accounts/${ACCOUNT}/cfd_tunnel` && method === "GET")
+      // Deleted Tunnels are listed unless the call says `is_deleted=false`.
       return ok(
         tunnels.filter(
-          (t) => t.name === url.searchParams.get("name") && !t.deleted_at,
+          (t) =>
+            t.name === url.searchParams.get("name") &&
+            !(url.searchParams.get("is_deleted") === "false" && t.deleted_at),
         ),
       );
+    const removal = /\/cfd_tunnel\/([0-9a-f-]{36})(\/connections)?$/.exec(path);
+    if (removal && method === "DELETE") {
+      // A Tunnel is deleted for good; its connections are only closed.
+      const tunnel = tunnels.find((t) => t.id === removal[1]);
+      if (tunnel === undefined)
+        return Response.json({ success: false, result: null }, { status: 404 });
+      if (removal[2] === undefined) tunnel.deleted_at = "2026-10-22T10:00:00Z";
+      return ok({ id: tunnel.id });
     }
     if (path === `/accounts/${ACCOUNT}/cfd_tunnel` && method === "POST") {
       const tunnel = { id: TUNNEL, name: body.name as string };

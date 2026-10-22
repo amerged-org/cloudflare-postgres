@@ -10,7 +10,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
 import type { Env } from "../../src/env.ts";
 import { fenceOperation } from "../../src/domain/node-desired.ts";
-import { shellCredentialsRevision } from "../../src/domain/node-shell.ts";
+import {
+  credentialsRevision,
+  nodeRouteKeyring,
+} from "../../src/domain/node-credentials.ts";
 import {
   HOST_FILES,
   assignRelease,
@@ -112,6 +115,95 @@ describe("the desired page of a node", () => {
     ).toBe(5);
   });
 
+  it("raises the credentials revision once for every change of the route keyring derived for the node, and orders no database to stop", async () => {
+    const f = await fixture();
+    const db = await served(f);
+    const key = () =>
+      btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
+        .replaceAll("+", "-")
+        .replaceAll("/", "_")
+        .replace(/=+$/, "");
+    const first = JSON.parse(env.ROUTE_MASTER_KEYS) as {
+      active: string;
+      keys: Record<string, string>;
+    };
+    const ring = (active: string, keys: Record<string, string>) => ({
+      ROUTE_MASTER_KEYS: JSON.stringify({ active, keys }),
+    });
+    const page = async (bindings: Partial<Env>) => {
+      const response = await nodeRequest(f, "/node/v1/desired", { bindings });
+      expect(response.status).toBe(200);
+      return NodeDesiredPage.parse(await response.json());
+    };
+    const revision = async (bindings: Partial<Env>) =>
+      (await page(bindings)).credentials_revision;
+    const second = key();
+    // The keyring a node starts with is no change.
+    expect(await revision({})).toBe(1);
+    expect(await revision(ring(first.active, first.keys))).toBe(1);
+    // A rotation, as credentials.md has it: the new key beside the old one, the old one still
+    // active; the same keys in another order are the same keyring.
+    const both = { ...first.keys, v2: second };
+    expect(await revision(ring(first.active, both))).toBe(2);
+    expect(await revision(ring(first.active, both))).toBe(2);
+    expect(
+      await revision(ring(first.active, { v2: second, ...first.keys })),
+    ).toBe(2);
+    // The new key active, the old one retired, and a key that changes under its own id.
+    expect(await revision(ring("v2", both))).toBe(3);
+    const retired = await page(ring("v2", { v2: second }));
+    expect(retired.credentials_revision).toBe(4);
+    const replaced = key();
+    expect(await revision(ring("v2", { v2: replaced }))).toBe(5);
+    expect(await revision(ring("v2", { v2: replaced }))).toBe(5);
+    // No order stops a database: the page orders nothing and the database is still running.
+    expect(retired.orders).toEqual([]);
+    expect(
+      retired.databases.map((database) => [
+        database.id,
+        database.desired_state,
+      ]),
+    ).toEqual([[db.id, "running"]]);
+    // D1 holds a digest of the keyring and none of its keys.
+    const held = (await env.DB.prepare(
+      "SELECT route_keyring_state s FROM nodes WHERE id=?",
+    )
+      .bind(f.node)
+      .first<string>("s"))!;
+    expect(held).toMatch(/^[0-9a-f]{64}$/);
+    expect(held).not.toContain(second);
+  });
+
+  it("answers the page of a node when the route keyring cannot be read, and the shell's state still raises the revision", async () => {
+    const f = await fixture();
+    await setNodePolicy(f);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const revision = async (bindings: Partial<Env>) => {
+        const response = await nodeRequest(f, "/node/v1/desired", {
+          bindings,
+        });
+        expect(response.status).toBe(200);
+        return NodeDesiredPage.parse(await response.json())
+          .credentials_revision;
+      };
+      expect(await revision({ ROUTE_MASTER_KEYS: "{" })).toBe(1);
+      expect(
+        await revision({ ROUTE_MASTER_KEYS: "{", NODE_SHELL_HOSTNAME: "true" }),
+      ).toBe(2);
+      const lines = log.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("node_keyring_unreadable"));
+      expect(lines.length).toBeGreaterThan(0);
+      expect(JSON.parse(lines[0]!)).toMatchObject({
+        event: "node_keyring_unreadable",
+        node_id: f.node,
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("names the revision at which D1 holds its own state even when the row moved since the node was read", async () => {
     const f = await fixture();
     await setNodePolicy(f);
@@ -120,6 +212,7 @@ describe("the desired page of a node", () => {
       uid: "",
       credentials_revision: 1,
       shell_state: "off",
+      route_keyring_state: null,
     };
     row.uid = (await env.DB.prepare("SELECT node_uid u FROM nodes WHERE id=?")
       .bind(f.node)
@@ -137,7 +230,7 @@ describe("the desired page of a node", () => {
       NODE_SSH_USER_CA_PUBLIC_KEY: SHELL_CA,
     };
     // The revision 2 names the other key: this version's key needs a revision of its own.
-    expect(await shellCredentialsRevision(mine, row)).toBe(3);
+    expect(await credentialsRevision(mine, row, null)).toBe(3);
     const held = () =>
       env.DB.prepare(
         "SELECT credentials_revision r,shell_state s FROM nodes WHERE id=?",
@@ -146,8 +239,26 @@ describe("the desired page of a node", () => {
         .first<{ r: number; s: string }>();
     expect(await held()).toEqual({ r: 3, s: `on ${SHELL_CA}` });
     // A read that finds D1 already holding its state takes that revision and raises nothing.
-    expect(await shellCredentialsRevision(mine, row)).toBe(3);
+    expect(await credentialsRevision(mine, row, null)).toBe(3);
     expect(await held()).toEqual({ r: 3, s: `on ${SHELL_CA}` });
+    // The same for the keyring: another version recorded its own, and a version with another
+    // raises the revision once, whatever the row it read said.
+    const digests = () =>
+      env.DB.prepare(
+        "SELECT credentials_revision r,route_keyring_state k FROM nodes WHERE id=?",
+      )
+        .bind(f.node)
+        .first<{ r: number; k: string | null }>();
+    await env.DB.prepare("UPDATE nodes SET route_keyring_state=? WHERE id=?")
+      .bind("a".repeat(64), f.node)
+      .run();
+    const keyring = await nodeRouteKeyring(env, f.node);
+    expect(await credentialsRevision(mine, row, keyring)).toBe(4);
+    const recorded = await digests();
+    expect(recorded?.r).toBe(4);
+    expect(recorded?.k).toMatch(/^[0-9a-f]{64}$/);
+    expect(recorded?.k).not.toBe("a".repeat(64));
+    expect(await credentialsRevision(mine, row, keyring)).toBe(4);
   });
 
   it("leaves the credentials revision of a fenced node alone", async () => {
