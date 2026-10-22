@@ -38,7 +38,7 @@ export const NodeCapacityPolicy = NodeRegionPolicy.safeExtend({
     .boolean()
     .default(false)
     .describe(
-      "Lets the minute capacity cron add a node when no node can take a database: it adopts the first unused adopt_instance_ids entry, otherwise reserves an addition of `order`. Dispatching an order still needs purchases_enabled and a cost approval. GET /v1/regions/{id}/capacity-decision previews the next step.",
+      "Lets the minute capacity cron add a node when no node can take a database: it adopts the first unused adopt_instance_ids entry, otherwise, while purchases_enabled is true, reserves an addition of `order` (with purchases_enabled false it reserves none: action purchases_disabled). Dispatching an order still needs purchases_enabled and a cost approval. GET /v1/regions/{id}/capacity-decision previews the next step.",
     ),
   adopt_instance_ids: z
     .array(ProviderInstanceId)

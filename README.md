@@ -43,11 +43,11 @@ Placement follows the
 [ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#48-placement-in-cloudflare):
 a node takes new databases until its active RAM or its CPU load reaches 80 %, each measured as the
 highest 30-minute average of the last seven days, and among the nodes that qualify the fullest
-wins. A node whose thin pool placement has closed (data at 80 %, metadata at 50 % or the sold
-storage at four times its data) takes none. Each start is admitted by the node itself, from its own
-free RAM and pool. No lease expiry, stale sample or missing observation stops a running database:
-besides its own idle sleep and the node's early sleep, only explicit orders (suspend, delete, move,
-maintenance) do. A database that no node can host is accepted and waits as "Waiting for verified regional
+wins. A node that placement has closed (pool data at 80 %, pool metadata at 50 %, the sold storage
+at four times the pool's data, or 1,000 volumes) takes none. Each start is admitted by the node
+itself, from its own free RAM and pool. No lease expiry, stale sample or missing observation stops
+a running database: besides its own idle sleep and the node's early sleep, only explicit orders
+(suspend, delete, move, maintenance) do. A database that no node can host is accepted and waits as "Waiting for verified regional
 capacity". Missing observations remain unknown. A node is added only when no node fits and the
 operator has enabled it: purchases and autoscale are operator settings of the authenticated
 management API, fresh installations do not purchase automatically or send notifications, and this
@@ -225,10 +225,10 @@ infrastructure backup, a running database whose WAL archive is failing
 (`database_archive_failing`), an awake database with no completed base backup within 36 hours of
 awake time (`database_base_backup_stale`; sleeping databases are excluded), a thin pool without
 room or without a sample (`thin_storage_blocked`), a node that keeps refusing wakes for awake
-capacity (`regional_node_capacity_refusals`), a thin pool that placement has closed
-(`regional_node_pool_closed`: data at 80 %, metadata at 50 % or the sold storage at four times its
-data), a database volume at 80 % or 90 % of its space or inodes (`database_volume_warning`,
-`database_volume_critical`), an enrollment token that was presented again or too late
+capacity (`regional_node_capacity_refusals`), a node that placement has closed
+(`regional_node_pool_closed`: pool data at 80 %, pool metadata at 50 %, the sold storage at four
+times the pool's data, or 1,000 volumes), a database volume at 80 % or 90 % of its space or
+inodes (`database_volume_warning`, `database_volume_critical`), an enrollment token that was presented again or too late
 (`node_enrollment_refused`) and a node that rebooted without a maintenance order
 (`node_unexpected_reboot`). Each minute-cron step runs in its own failure boundary, and the
 `CronWatchdog` Durable Object (binding `CRON_WATCHDOG`) judges the cron's heartbeat from its own

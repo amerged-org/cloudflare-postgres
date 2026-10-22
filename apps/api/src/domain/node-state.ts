@@ -291,12 +291,19 @@ function automaticCapacityOrderKey(key: string): boolean {
 const manualKeySql = (key: string) =>
   `${key} NOT LIKE '${AUTOMATIC_ORDER_KEY_PREFIX}%'`;
 /**
+ * SQL: the region's purchase and autoscale switches, which an automatic purchase needs for the
+ * policy row `policy`. They are read in the same statement that reserves, approves or dispatches,
+ * so a switch turned off after the capacity cron read the policy still stops the order.
+ */
+const automaticSwitchesSql = (policy: string) =>
+  `${policy}.purchases_enabled=1 AND ${policy}.autoscale_enabled=1`;
+/**
  * SQL: the authority of an automatic purchase, for the policy row `policy` and the request key
- * `key`: the region's autoscale switch. The capacity cron decided from placement that no node fits
- * (ULTRA plan 9.7), so nothing more is read.
+ * `key`: the switches. The capacity cron decided from placement that no node fits (ULTRA plan
+ * 9.7), so nothing more is read.
  */
 const automaticAuthoritySql = (policy: string, key: string) =>
-  `(${policy}.autoscale_enabled=1 AND ${key} LIKE '${AUTOMATIC_ORDER_KEY_PREFIX}%')`;
+  `(${automaticSwitchesSql(policy)} AND ${key} LIKE '${AUTOMATIC_ORDER_KEY_PREFIX}%')`;
 export async function reserveNodeAddition(
   db: D1Database,
   input: {
@@ -383,7 +390,7 @@ export async function reserveNodeAddition(
       SELECT ?,?,p.region_id,?,?,?,?,'reserved',?,?,? FROM node_region_policies p JOIN regions r ON r.id=p.region_id AND r.provider='contabo'
       WHERE p.region_id=? AND (p.max_nodes IS NULL OR ${slotCount}<p.max_nodes
         OR (?='recover' AND ${slotCount}<=p.max_nodes)) AND (?<>'order' OR p.order_config=?)
-      AND (?<>'order' OR ?=0 OR p.autoscale_enabled=1)
+      AND (?<>'order' OR ?=0 OR (${automaticSwitchesSql("p")}))
       AND ${authority}
       AND (? IS NULL OR NOT EXISTS(SELECT 1 FROM node_additions WHERE slot_held=1 AND status<>'ready' AND (requested_instance_id=? OR provider_instance_id=?)))
       AND ((?=0 AND (?<>'order' OR COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'') NOT IN('ram_76_percent','regional_actual_ram')))
