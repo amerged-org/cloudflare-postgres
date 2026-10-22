@@ -15,19 +15,26 @@
 -- is not a lower-case identifier of 1 to 63 characters. Nothing references `roles`, so no foreign
 -- key is in play.
 --
--- Deploy order. This migration, the API Worker and the Edge Worker come after the node release that
--- accepts these names (R-2) is observed on every node, and every image a node can be installed or
--- recovered from holds R-2 or newer. A node below R-2 refuses a whole desired page that names a role
--- it still holds reserved, and that page also carries the node's release: the node can then never
--- receive a newer release, and rolling forward cannot fix it. Until the Edge Worker is redeployed, a
--- role of such a name is created but every connection as it answers 28P01. From the merge of this
--- change until R-2 is observed on every node, deploy no API Worker from main and apply no
--- `wrangler d1 migrations apply`, which applies every pending migration, this one included.
--- Check before R-2 and again before this migration that no row of `roles`, tombstones included, is
--- named `pgcf_backup`, `public` or `none`: R-2 refuses the page of a database that holds one (the
--- node cannot create it, or it would take the backup role), and the CHECK below refuses the copy of
--- such a row and the migration stops. These three names are the whole narrowing of this change; the
--- names it frees were refused before.
+-- Deploy order: this migration first, then the node release that accepts these names (R-2), then
+-- the API Worker, then the Edge Worker. Check first, as the last act before the apply, that no row of
+-- `roles`, tombstones included, is named `pgcf_backup`, `public` or `none`; the CHECK below refuses
+-- the copy of such a row, the migration stops and the table stays as it was, so a row that appears
+-- after the check delays the apply and is deleted in D1 first. The migration opens nothing: the
+-- Workers of today still refuse `cnpg_*`, `streaming_replica` and `pgcf_maintenance`, and a restore
+-- copies only names that D1 already holds. What it closes are the three names above, which the old
+-- API accepted until now. The old API's insert of one of them fails on the CHECK, an error
+-- `isConstraintError` does not map (it matches only UNIQUE), so it answers 500 and creates nothing.
+-- The API Worker of this change waits until R-2 is observed on every node and every image a node can
+-- be installed or recovered from holds R-2 or newer. A node below R-2 refuses a whole desired page
+-- that names a role it still holds reserved, and applies nothing of it. The agent's start asks for
+-- the first full page and retries it without end, and the gateway is served after that page, so
+-- once such a role exists, a node below R-2 accepts no new connection for any of its databases from
+-- its next start on (a release install, a reboot, a crash, or a rollback to a release below R-2).
+-- Pulls after the start only log the refusal, and a targeted pull for another database of the node
+-- is applied and carries the release.
+-- Until the Edge Worker is redeployed, a role of a released name is created but every connection
+-- as it answers 28P01. The names it frees were refused before; the three above are the whole
+-- narrowing of this change.
 
 CREATE TABLE roles_next (
   database_id TEXT NOT NULL REFERENCES databases(id),

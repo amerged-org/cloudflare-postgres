@@ -7,7 +7,7 @@ const directory = new URL("../../../apps/api/migrations/", import.meta.url);
 const migrations = readdirSync(directory)
   .filter((name) => name.endsWith(".sql"))
   .sort();
-const MIGRATION = "0085_unreserved_role_names.sql";
+const MIGRATION = "0084_unreserved_role_names.sql";
 const NOW = "2026-10-22T10:00:00.000Z";
 const project = `prj_${"a".repeat(20)}`;
 const database = `a${"1".repeat(19)}`;
