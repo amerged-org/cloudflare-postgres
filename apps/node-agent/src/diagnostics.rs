@@ -75,7 +75,7 @@ fn storage_code(error: &crate::storage::Error) -> String {
 
 /// A call on a unit that failed: the bus's error name where it answered with one, the result of a
 /// job, why PostgreSQL was not ready, or the kind of failure.
-fn units_code(error: &crate::units::Error) -> String {
+pub(crate) fn units_code(error: &crate::units::Error) -> String {
     use crate::units::Error;
     match error {
         Error::Bus(zbus::Error::MethodError(name, ..)) => {

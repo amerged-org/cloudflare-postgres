@@ -625,8 +625,8 @@ impl<R: CommandRunner + Send + Sync + 'static> Host for System<R> {
         }))
     }
 
-    async fn legacy_awake(&self, database: &str) -> Result<bool, Error> {
-        Ok(self.units.state(database).await?.active.awake())
+    async fn legacy_holds(&self, database: &str) -> Result<bool, Error> {
+        self.units.holds_database(database).await
     }
 
     async fn timestamps(&self, slot: u32) -> Result<Option<(u64, u64)>, Error> {

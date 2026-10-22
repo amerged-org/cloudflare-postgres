@@ -110,6 +110,9 @@ struct State {
     /// `hold_volume` and `release_volume`.
     jobs: BTreeSet<VolumeId>,
     accounts: Vec<String>,
+    /// The slot numbers whose user exists. A node that has run for a while has them all; the
+    /// process of the health check starts with none, and its refill makes the one it needs.
+    slot_users: BTreeSet<u32>,
     quotas: HashMap<String, Option<NonZeroU32>>,
     /// Every `set_cpu_quota` the agent made, in order: (database, quota). A stop lifts a quota
     /// without a call, as systemd's does.
@@ -311,6 +314,7 @@ impl Local {
             state: Mutex::new(State {
                 available_bytes: 8 << 30,
                 kernel_release: "6.12.111+deb13-amd64".into(),
+                slot_users: (0..slots::SLOT_COUNT).collect(),
                 ..State::default()
             }),
             unit_gate: tokio::sync::watch::channel(true).0,
@@ -338,6 +342,8 @@ impl Local {
         let Self { shared, pool } = Self::new(label)?;
         drop(pool);
         let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| panic!("not shared yet"));
+        // A process that never made a slot: no slot user exists yet.
+        shared.state().slot_users.clear();
         Some(Self::wrap_in(
             shared,
             slots::CHECK_SLOT..slots::CHECK_SLOT + 1,
@@ -1831,11 +1837,14 @@ impl Host for LocalHost {
         Ok(units)
     }
 
+    /// The processes of the machine all run as the user of the test, so no slot has an account of
+    /// its own: a number "has a user" when the test machine says so.
     fn users(&self) -> BTreeSet<u32> {
-        BTreeSet::new()
+        self.0.state().slot_users.clone()
     }
 
-    async fn ensure_user(&self, _slot: u32) -> Result<(), units::Error> {
+    async fn ensure_user(&self, slot: u32) -> Result<(), units::Error> {
+        self.0.state().slot_users.insert(slot);
         Ok(())
     }
 
@@ -2073,7 +2082,11 @@ impl Host for LocalHost {
             return Ok(None);
         }
         let pid = unit.child.as_ref().map_or(0, Child::id);
-        let databases: Vec<_> = unit.mounted.iter().cloned().collect();
+        let databases: Vec<_> = unit
+            .mounted
+            .iter()
+            .map(|(database, volume)| (database.clone(), Some(volume.clone())))
+            .collect();
         let postmaster = unit
             .postgres
             .then(|| databases.first())
@@ -2097,7 +2110,7 @@ impl Host for LocalHost {
         }))
     }
 
-    async fn legacy_awake(&self, database: &str) -> Result<bool, units::Error> {
+    async fn legacy_holds(&self, database: &str) -> Result<bool, units::Error> {
         Ok(self
             .0
             .state()

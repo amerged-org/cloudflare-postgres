@@ -81,8 +81,15 @@ maintenance order stops the idle ones). An idle slot runs the supervisor (`pgcf-
 which takes one order, from root. Every start takes one path: the admission permit, then
 
 1. **Take or build** (`slots::Pool::bind`): an idle slot, or a new one built inside the permit, so
-   that `start_concurrency` bounds the builds as it bounds the starts. The slot's user is made at
-   the refill, not on the wake's path, unless a miss needs a number that has none.
+   that `start_concurrency` bounds the builds as it bounds the starts. The claim is one step under
+   the table's lock: no slot holds the database in any state, and then an idle slot becomes the
+   database's, or a free number is entered as being built for it (a slot being built already holds
+   its database). A wake makes no slot user (`groupadd` and `useradd` cost about 75 ms each and
+   lock the node's account files): a miss takes only a free number that has a user, and fails with
+   `no slot` where none has. The refill makes the users, lowest number first, up to twice
+   `start_concurrency` above the highest slot in use. A build that fails (the unit refuses its
+   start over a process left in its cgroup, a user that cannot be made) keeps its number out of the
+   next builds while another is free and is reported as `slot_build_failed`.
 2. **Bind**, in parallel: the database's limits as runtime properties of the slot, its volume and
    its socket directory moved into the slot's mount namespace as idmapped clones (`units/idmap.rs`),
    and a check that no unit of its own (`pgcf-pg@`) holds the database.
@@ -99,9 +106,12 @@ because a runtime property outlives the stop of its unit.
 
 **One writer.** A slot's name says nothing of the database, so the pool enforces what one unit name
 per database used to: it binds no database while any slot holds it in any state, in any generation
-of its volume, until the slot has reached `inactive`; and the supervisor takes `flock` on the data
-directory before it executes PostgreSQL (the agent try-locks it before every bind and holds it while
-it writes a sleeping database's configuration). PostgreSQL's own guard cannot do it across two
+of its volume, until the slot has reached `inactive` (checked again in the step that claims the
+slot, so two starts of one database cannot both claim); it binds none while the database's unit of
+its own (`pgcf-pg@`) is awake or has ended with a process left in its cgroup (that unit never took
+the lock below); and the supervisor takes `flock` on the data directory before it executes
+PostgreSQL (the agent try-locks it before every bind and holds it while it writes a sleeping
+database's configuration). PostgreSQL's own guard cannot do it across two
 users: `kill(pid, 0)` of another user's process is `EPERM`, which `miscinit.c` takes for a stale
 `postmaster.pid`, and a segment in another IPC namespace is not found (the slot lab shows the second
 postmaster coming up without the lock).
@@ -114,14 +124,17 @@ uid with no database now gets `peer_unknown`.
 **Adoption.** The table is never written to disk. When the agent starts it reads the units, each
 main process, `/proc/<pid>/exe`, its mount table and `/proc/locks` (`Pool::adopt`): an idle slot
 stays; one that holds a database it was never ordered to run, or whose postmaster does not hold the
-lock, is stopped and its database stays asleep; one whose PostgreSQL runs is kept, ready or still
+lock, is stopped and its database stays asleep (every mount at a database's directory counts as
+holding it, also one the agent cannot name as a volume of that database: unknown means tainted, and
+such a slot is never kept idle); one whose PostgreSQL runs is kept, ready or still
 starting; one that is stopping is waited for, and its database is then decided by its control file.
 The units of their own that an earlier agent started are served and put to sleep as before, and the
 archive socket knows their callers by uid until they sleep; the release after the one that finds
 none left deletes that path.
 
 **The health check** runs the scratch database in the slot of its own (number 1023), so it takes no
-idle slot of the agent's pool and leaves none.
+idle slot of the agent's pool and leaves none; it builds that slot (and makes its user) with its own
+refill before the bind.
 
 ## What the agent keeps
 

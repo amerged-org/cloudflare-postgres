@@ -3256,7 +3256,8 @@ mod tests {
     }
 
     /// The agent holds the data directory's lock while it writes the configuration of a database
-    /// that sleeps, and a process that holds it keeps the write, and the wake, from happening.
+    /// that sleeps, and a process that holds it keeps the write, and the wake, from happening:
+    /// the configuration file is not rewritten, and the bind takes no slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_database_whose_data_directory_is_locked_is_neither_configured_nor_woken() {
         let Some(rig) = Rig::new("locked-data").await else {
@@ -3264,10 +3265,30 @@ mod tests {
         };
         let (entry, db) = rig.create().await;
         assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
-        // A change of the size changes what the configuration says, so the next wake writes it,
-        // while a process of the earlier postmaster still holds the data directory.
+        // An idle slot, which a wake that is not refused takes.
+        rig.core.refill_pass().await;
+        let idle = rig.machine.slots().idle;
+        assert!(idle > 0);
+        let conf = rig.machine.layout().data(&entry.id).join("postgresql.conf");
+        let before = std::fs::read(&conf).unwrap();
+        // A process of the earlier postmaster still holds the data directory.
         let held = std::fs::File::open(rig.machine.layout().data(&entry.id)).unwrap();
         held.lock().unwrap();
+
+        // The data directory is locked and the size does not change: the bind is refused by its
+        // own try-lock, before it takes a slot.
+        let ticket = Rig::ticket(&entry);
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (WakeOutcome::Refused, Some("release_failed")),
+            "{result:?}"
+        );
+        assert_eq!(rig.machine.slots().idle, idle, "no slot was taken");
+        assert_eq!(rig.machine.slots().held, 0);
+
+        // A change of the size changes what the configuration says, so the next wake writes it:
+        // the write is refused by the lock, and the file is the one it was.
         let mut changed = entry.clone();
         changed.max_connections += 1;
         assert!(rig.core.accept(&db, changed));
@@ -3278,9 +3299,22 @@ mod tests {
             (WakeOutcome::Refused, Some("release_failed")),
             "{result:?}"
         );
+        assert_eq!(
+            std::fs::read(&conf).unwrap(),
+            before,
+            "postgresql.conf was not rewritten under a lock"
+        );
+        assert_eq!(rig.machine.slots().idle, idle, "no slot was taken");
         assert!(!rig.machine.running(&entry.id));
+
+        // Without the lock the same wake writes the new configuration and starts.
         drop(held);
         let result = rig.core.wake(&ticket).await;
         assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        assert_ne!(
+            std::fs::read(&conf).unwrap(),
+            before,
+            "the new size is written"
+        );
     }
 }

@@ -418,6 +418,15 @@ fn unit_cgroup_events(unit: &str) -> PathBuf {
     unit_cgroup_file(unit, "cgroup.events")
 }
 
+/// The `cgroup.events` of a unit, `None` when the unit has no cgroup (it is stopped).
+fn read_cgroup_events(unit: &str) -> Result<Option<String>, Error> {
+    match std::fs::read_to_string(unit_cgroup_events(unit)) {
+        Ok(events) => Ok(Some(events)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(Error::Unexpected("the unit's cgroup cannot be read")),
+    }
+}
+
 /// Whether the text of a `cgroup.events` says that the cgroup, or one below it, holds a process.
 fn populated(events: &str) -> bool {
     events.lines().any(|line| line.trim() == "populated 1")
@@ -439,6 +448,12 @@ fn stray_processes(active: ActiveState, events: &str) -> bool {
                 | ActiveState::Activating
                 | ActiveState::Refreshing
         )
+}
+
+/// Whether a unit of its own holds its database: it is awake, or a process of an earlier start
+/// remains in its cgroup (`stray_processes`; `events` is `None` for a unit with no cgroup).
+fn holds(active: ActiveState, events: Option<&str>) -> bool {
+    active.awake() || events.is_some_and(|events| stray_processes(active, events))
 }
 
 #[derive(Clone, Copy)]
@@ -677,10 +692,8 @@ impl Units {
     /// where the cgroup is populated, because a unit that runs, or is starting, holds processes
     /// of its own (`stray_processes`).
     async fn refuse_stray_processes(&self, unit: &str) -> Result<(), Error> {
-        let events = match std::fs::read_to_string(unit_cgroup_events(unit)) {
-            Ok(events) => events,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(_) => return Err(Error::Unexpected("the unit's cgroup cannot be read")),
+        let Some(events) = read_cgroup_events(unit)? else {
+            return Ok(());
         };
         if !populated(&events) {
             return Ok(());
@@ -690,6 +703,19 @@ impl Units {
             return Err(Error::StrayProcesses);
         }
         Ok(())
+    }
+
+    /// Whether a database's unit of its own (`pgcf-pg@`, which an earlier agent started) holds the
+    /// database: it is awake, or it is not and its cgroup still holds a process (`inactive` or
+    /// `failed` after "Processes still around after final SIGKILL"). The unit never took the
+    /// supervisor's `flock`, so its leftover backend is seen by no lock, and PostgreSQL's own
+    /// guard is blind across users and IPC namespaces (plan 7.11): a slot's postmaster started
+    /// beside it would run on the same data directory.
+    pub async fn holds_database(&self, database: &str) -> Result<bool, Error> {
+        let unit = Self::unit_of(database)?;
+        let active = self.raw(&unit).await?.active;
+        let events = read_cgroup_events(&unit)?;
+        Ok(holds(active, events.as_deref()))
     }
 
     /// Waits for a unit of its own that is starting, one the agent found `activating` when it
@@ -868,6 +894,32 @@ mod tests {
         ] {
             assert_eq!(stray_processes(active, held), !own, "{active:?}");
             assert!(!stray_processes(active, empty), "{active:?}");
+        }
+    }
+
+    /// A database's unit of its own holds the database while it is awake, and after it ended
+    /// (`inactive`, `failed`, `maintenance`) while a process of its cgroup remains: that unit never
+    /// took the supervisor's lock, so a slot's postmaster would run beside the leftover backend.
+    #[test]
+    fn a_unit_of_its_own_holds_its_database_while_it_is_awake_or_a_process_of_it_remains() {
+        let (held, empty) = ("populated 1\nfrozen 0\n", "populated 0\nfrozen 0\n");
+        for (active, awake) in [
+            (ActiveState::Active, true),
+            (ActiveState::Reloading, true),
+            (ActiveState::Activating, true),
+            (ActiveState::Deactivating, true),
+            (ActiveState::Refreshing, true),
+            (ActiveState::Inactive, false),
+            (ActiveState::Failed, false),
+            (ActiveState::Maintenance, false),
+        ] {
+            assert_eq!(holds(active, None), awake, "{active:?}, no cgroup");
+            assert_eq!(
+                holds(active, Some(empty)),
+                awake,
+                "{active:?}, empty cgroup"
+            );
+            assert!(holds(active, Some(held)), "{active:?}, a process remains");
         }
     }
 

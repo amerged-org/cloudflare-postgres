@@ -17,9 +17,13 @@
 //! ```
 //!
 //! Everything the lab makes lives under `/var/tmp/pgcf-lab-slots`, in the mounts
-//! `/var/lib/pgcf/db/labslot*`, in the slots 900 to 915 (their units and users `pgcf-slot-900` ...)
-//! and the users `pgcf-lab-*`, and is removed again. A database, a slot or a user of the node is
-//! never touched: the lab's pool has its own numbers.
+//! `/var/lib/pgcf/db/labslot*`, in the links `/dev/mapper/*labslot*`, in the slots 900 to 915
+//! (the real template `pgcf-slot@900` ... and the users `pgcf-slot-900` ...) and in the users
+//! `pgcf-lab-db` and `pgcf-lab-gw`, and is removed again. **The slots 900 to 915 lie in the range
+//! of the agent's own pool** (0 to 1022; only 1023, the health check's, lies outside it), so the
+//! lab must not run beside an agent that can restart: an agent that starts adopts or stops those
+//! units, and a lab slot that holds a lab volume is a slot that holds a database. Run it with
+//! `pgcf-agent.service` stopped, or in a quiet window in which nothing restarts the agent.
 use super::{
     ActiveState, DB_ROOT, Error, Units, limits, ready,
     slots::{self, Bind, Host, Pool, SlotFrom, slot_uid, slot_unit},
@@ -375,6 +379,16 @@ impl Lab {
     async fn another_pool(&self, database: &Database) -> Pool<System<LabLvm>> {
         Self::pool_of(database).await
     }
+
+    /// The same, for an agent whose `lvs` lists no volume: the mount of the database in a slot is
+    /// there and cannot be named as one of its volumes.
+    async fn blind_pool(&self) -> Pool<System<LabLvm>> {
+        let layout = Layout::default();
+        let units = Units::connect(layout.volumes()).await.unwrap();
+        let listing = r#"{"report":[{"lv":[]}]}"#.to_string();
+        let storage = Arc::new(Storage::new(LabLvm(listing), Config::default()));
+        Pool::new(System::new(units, layout, storage), POOL)
+    }
 }
 impl Drop for Lab {
     fn drop(&mut self) {
@@ -600,14 +614,11 @@ async fn the_kernel_lets_one_slot_run_a_postmaster_on_a_data_directory_and_postg
         }
     };
     assert_ne!(restarted.invocation_id, started.invocation_id);
-    assert_eq!(
-        show(&slot_unit(first.slot), "ActiveState"),
-        if first.slot == restarted.slot.unwrap().slot {
-            "active"
-        } else {
-            "inactive"
-        },
-    );
+    // The unit whose postmaster was killed ended `failed`, and its number is kept out of the next
+    // builds (a unit that failed may hold a process that refuses every start): the database went
+    // to another slot, and the old unit stays over.
+    assert_ne!(restarted.slot.unwrap().slot, first.slot);
+    assert_eq!(show(&slot_unit(first.slot), "ActiveState"), "failed");
     let session = database.agent().await;
     session.query("SELECT 1::int4", &[]).await.unwrap();
     drop(session);
@@ -931,10 +942,19 @@ async fn slots_are_adopted_after_the_agent_dies_and_a_boot_leaves_nothing_to_ado
     let adopted = latest.adopt().await.unwrap();
     assert_eq!(adopted.tainted, [(half.slot, database.id.clone())]);
     assert_eq!(show(&slot_unit(half.slot), "ActiveState"), "inactive");
-    latest
+    let held = latest
         .bind(&database.id, &database.bind(512))
         .await
         .unwrap();
+
+    // The same again, with an agent that cannot name the volume (its `lvs` lists none): the mount
+    // at the database's directory is held all the same, so the slot is stopped and not kept idle
+    // beside a tenant's volume (D13: unknown means tainted).
+    let blind = lab.blind_pool().await;
+    let adopted = blind.adopt().await.unwrap();
+    assert_eq!(adopted.tainted, [(held.slot, database.id.clone())]);
+    assert!(!adopted.idle.contains(&held.slot), "{adopted:?}");
+    assert_eq!(show(&slot_unit(held.slot), "ActiveState"), "inactive");
     assert!(latest.stop(&database.id).await.unwrap());
 
     // A boot: what lived in `/run` and in memory is gone, and the users of the slots stay.

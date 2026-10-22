@@ -11,7 +11,8 @@
 //!
 //! 1. [`Pool::bind`] takes an idle slot or builds one on the spot (a pool miss, inside the
 //!    caller's permit, so `start_concurrency` bounds the builds too), and binds the database to
-//!    it: its limits as runtime properties and its two mounts, in parallel;
+//!    it: its limits as runtime properties and its two mounts, in parallel. A wake makes no slot
+//!    user: a miss takes only a number that has one, and the refill makes the users ahead of it;
 //! 2. the caller binds the archive socket's caller to the slot (the pool's table answers it:
 //!    [`Pool::holder`]);
 //! 3. [`Pool::exec`] sends the one order and waits for PostgreSQL to be ready, by an inotify watch
@@ -24,17 +25,21 @@
 //!
 //! **One writer.** systemd gave a unit name per database; a slot's name says nothing of the
 //! database, so the pool enforces it, in layers: the agent's per-database flow lock; the pool's
-//! table, which refuses a bind while any slot holds the database in any state, whichever
-//! generation of its volume it has, until the slot has reached `inactive`; and, in the kernel, the
-//! supervisor's `flock` of the data directory (a lock belongs to one inode, so two generations
-//! need the table). The agent also tries the lock before every bind ([`data_lock_free`]).
+//! table, which refuses a bind while any slot holds the database in any state (a slot being built
+//! for a start holds it from the first moment), whichever generation of its volume it has, until
+//! the slot has reached `inactive`, and which looks again in the very step that claims a slot; and,
+//! in the kernel, the supervisor's `flock` of the data directory (a lock belongs to one inode, so
+//! two generations need the table). The agent also tries the lock before every bind
+//! ([`data_lock_free`]). A database's unit of its own (`pgcf-pg@`) never took that lock: it holds
+//! the database while it is awake and after it ended with a process left in its cgroup.
 //! PostgreSQL's own guard cannot be the only one once two slots with two users see the directory
 //! as their own: `miscinit.c` takes `EPERM` of `kill(pid, 0)` on the `postmaster.pid` for a stale
 //! file, and `sysv_shmem.c` takes `EACCES` on the old segment for a foreign one.
 //!
 //! **A restart of the agent loses nothing.** The table is never written to disk. [`Pool::adopt`]
 //! reads it back from kernel facts only: the unit list, each unit's main process, its
-//! `/proc/<pid>/exe`, its mount table and `/proc/locks`.
+//! `/proc/<pid>/exe`, its mount table and `/proc/locks`. A mount at a database's directory that
+//! cannot be named as a volume of that database counts as held: unknown means tainted.
 use super::{ActiveState, Error, Started, UnitState, limits::Property, ready};
 use crate::{machine::Account, storage::VolumeId};
 use serde_json::json;
@@ -187,8 +192,10 @@ pub fn is_holder(holder: &Holder, cgroup: Option<&str>, invocation: Option<&str>
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub idle: usize,
+    /// Idle slots being built by the refill.
     pub spawning: usize,
-    /// Slots that hold a database, from the bind to the end of its stop.
+    /// Slots that hold a database, from the moment a start takes or builds one to the end of its
+    /// stop.
     pub held: usize,
 }
 
@@ -224,8 +231,10 @@ pub enum Exe {
 pub struct Facts {
     pub pid: u32,
     pub exe: Exe,
-    /// The databases whose volume is mounted in the process's mount namespace, with the volume.
-    pub databases: Vec<(String, VolumeId)>,
+    /// The databases with a mount at their directory in the process's mount namespace, with the
+    /// volume it is. `None` is a mount the agent cannot name as a volume of that database: it is
+    /// held all the same, and a slot that holds one is never idle (D13: unknown means tainted).
+    pub databases: Vec<(String, Option<VolumeId>)>,
     /// `/proc/locks` shows a lock of the process on the data directory of the one database.
     pub locked: bool,
     /// The status in `postmaster.pid` as the process sees it, if it is PostgreSQL's.
@@ -297,8 +306,10 @@ pub trait Host: Send + Sync + 'static {
     /// What the kernel says of the slot's process (the unit's first process when `pid` is `None`);
     /// `None` when the unit has none.
     fn facts(&self, slot: u32, pid: Option<u32>) -> Result<Option<Facts>, Error>;
-    /// Whether the database's unit of its own (`pgcf-pg@`) is awake.
-    fn legacy_awake(&self, database: &str) -> impl Future<Output = Result<bool, Error>> + Send;
+    /// Whether the database's unit of its own (`pgcf-pg@`) holds the database: it is awake, or it
+    /// ended with a process of it left in its cgroup. That unit never took the supervisor's lock,
+    /// and PostgreSQL's own guard is blind across users and IPC namespaces.
+    fn legacy_holds(&self, database: &str) -> impl Future<Output = Result<bool, Error>> + Send;
     /// The fork of the unit's main process and the handoff to the supervisor, in microseconds of
     /// `CLOCK_MONOTONIC`: what systemd-executor spent on the sandbox. `None` where it has none.
     fn timestamps(
@@ -343,8 +354,9 @@ fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum State {
-    /// Being built.
-    Spawning,
+    /// Being built: for no database (the refill), or for the one a start is waiting for (a pool
+    /// miss), which holds it from the first moment.
+    Spawning(Option<String>),
     /// Running the supervisor, with no database.
     Idle,
     /// Chosen for a database: its limits and mounts are going in.
@@ -362,8 +374,8 @@ impl State {
             Self::Taken(database) | Self::Starting(database) | Self::Serving(database) => {
                 Some(database)
             }
-            Self::Stopping(database) => database.as_deref(),
-            Self::Spawning | Self::Idle => None,
+            Self::Spawning(database) | Self::Stopping(database) => database.as_deref(),
+            Self::Idle => None,
         }
     }
 }
@@ -381,8 +393,12 @@ struct Slot {
 #[derive(Default)]
 struct Table {
     slots: BTreeMap<u32, Slot>,
-    /// The numbers whose user exists.
+    /// The numbers whose user exists. Only the refill makes users.
     users: BTreeSet<u32>,
+    /// The numbers whose last build failed. A build takes another number while one is free: a unit
+    /// that failed with a process left in its cgroup refuses every start until the process ends,
+    /// and a number whose user cannot be made fails the same way every time.
+    failed: BTreeSet<u32>,
 }
 impl Table {
     fn holding(&self, database: &str) -> Vec<u32> {
@@ -391,6 +407,31 @@ impl Table {
             .filter(|(_, slot)| slot.state.database() == Some(database))
             .map(|(number, _)| *number)
             .collect()
+    }
+    /// The number a build takes: the lowest of `range` that is free and has a user, one that
+    /// failed last. A number without a user is never taken, since a user is made by the refill
+    /// and not by a wake.
+    fn free_number(&self, range: &Range<u32>) -> Option<u32> {
+        let mut free = range
+            .clone()
+            .filter(|slot| self.users.contains(slot) && !self.slots.contains_key(slot));
+        let first = free.clone().find(|slot| !self.failed.contains(slot));
+        first.or_else(|| free.next())
+    }
+    /// Enters a slot that is being built, for the database a start waits for or for none.
+    fn reserve(&mut self, range: &Range<u32>, database: Option<&str>) -> Result<u32, Error> {
+        let slot = self.free_number(range).ok_or(Error::NoSlot)?;
+        self.slots.insert(
+            slot,
+            Slot {
+                state: State::Spawning(database.map(str::to_string)),
+                main_pid: None,
+                invocation_id: None,
+                requested_us: None,
+                volume: None,
+            },
+        );
+        Ok(slot)
     }
 }
 
@@ -404,10 +445,14 @@ pub struct Pool<H: Host> {
 impl<H: Host> Pool<H> {
     /// A pool of the slot numbers in `range`.
     pub fn new(host: H, range: Range<u32>) -> Self {
+        let table = Table {
+            users: host.users(),
+            ..Table::default()
+        };
         Self {
             host,
             range,
-            table: Mutex::new(Table::default()),
+            table: Mutex::new(table),
         }
     }
     pub fn host(&self) -> &H {
@@ -435,7 +480,7 @@ impl<H: Host> Pool<H> {
         };
         Snapshot {
             idle: count(|state| *state == State::Idle),
-            spawning: count(|state| *state == State::Spawning),
+            spawning: count(|state| *state == State::Spawning(None)),
             held: count(|state| state.database().is_some()),
         }
     }
@@ -501,7 +546,7 @@ impl<H: Host> Pool<H> {
         let (set, mounted, legacy) = tokio::join!(
             self.host.set(slot, &bind.properties),
             self.host.mount(slot, bind),
-            self.host.legacy_awake(database),
+            self.host.legacy_holds(database),
         );
         let failed = set.err().or(mounted.err()).or(match legacy {
             Ok(false) => None,
@@ -641,7 +686,8 @@ impl<H: Host> Pool<H> {
         };
         self.set_state(slot, State::Stopping(Some(database.to_string())));
         self.host.stop(slot).await?;
-        if self.host.unit(slot).await?.ended() {
+        let unit = self.host.unit(slot).await?;
+        if self.over(slot, &unit) {
             self.forget(slot, database, "stopped");
             Ok(true)
         } else {
@@ -737,15 +783,17 @@ impl<H: Host> Pool<H> {
 
     /// Builds one idle slot if fewer than `target` are idle or being built; the number of the
     /// slot it built. The caller decides when: the build costs the node about 80 ms of CPU, and it
-    /// must not take it from a wake.
+    /// must not take it from a wake. The refill also makes the slot users a wake may need ahead of
+    /// it ([`Pool::make_users`]), because a wake never makes one.
     pub async fn refill(&self, target: usize) -> Result<Option<u32>, Error> {
         self.sweep().await;
+        self.make_users(target).await?;
         let counted = self.snapshot();
         if counted.idle + counted.spawning >= target {
             return Ok(None);
         }
-        let slot = self.reserve()?;
-        let spawned = self.build(slot).await?;
+        let slot = self.table().reserve(&self.range, None)?;
+        let spawned = self.build(slot, None).await?;
         self.set_state(slot, State::Idle);
         let mut event = json!({
             "event": "slot_spawned", "slot": slot, "invocation": spawned.invocation_id,
@@ -759,6 +807,45 @@ impl<H: Host> Pool<H> {
         }
         crate::timing::emit_event(event);
         Ok(Some(slot))
+    }
+
+    /// Makes the users a start may need, ahead of it: every number below the highest in use plus
+    /// twice `target`, lowest first, so that the numbers a wake takes first have theirs first.
+    /// `groupadd` and `useradd` take node-wide locks on `/etc/passwd` and `/etc/group` and cost
+    /// about 75 ms each (lab, Debian 13), so a wake never makes a user: one that finds no free
+    /// number with a user fails with `NoSlot`, and the refill that its failure asks for makes the
+    /// users. A user that cannot be made keeps its number out of every later build, and ends this
+    /// pass with the error.
+    async fn make_users(&self, target: usize) -> Result<(), Error> {
+        let end = {
+            let table = self.table();
+            let highest = table
+                .slots
+                .keys()
+                .next_back()
+                .map_or(self.range.start, |slot| slot + 1);
+            let ahead = u32::try_from(target.saturating_mul(2)).unwrap_or(u32::MAX);
+            highest.saturating_add(ahead).min(self.range.end)
+        };
+        for slot in self.range.start..end {
+            {
+                let table = self.table();
+                if table.users.contains(&slot) || table.failed.contains(&slot) {
+                    continue;
+                }
+            }
+            match self.host.ensure_user(slot).await {
+                Ok(()) => {
+                    self.table().users.insert(slot);
+                }
+                Err(error) => {
+                    self.table().failed.insert(slot);
+                    build_failed(slot, "user", None, &error);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Stops every idle slot, and the ones that were left behind by a stop that failed.
@@ -797,15 +884,19 @@ impl<H: Host> Pool<H> {
         {
             let mut table = self.table();
             table.slots.clear();
+            table.failed.clear();
             table.users = self.host.users();
         }
-        let units = self.host.units().await?;
+        let units: Vec<SlotUnit> = self
+            .host
+            .units()
+            .await?
+            .into_iter()
+            .filter(|unit| self.range.contains(&unit.slot))
+            .collect();
         let mut adopted = Adopted::default();
         let mut stopping = Vec::new();
-        for unit in units
-            .into_iter()
-            .filter(|unit| self.range.contains(&unit.slot) && !unit.ended())
-        {
+        for unit in units.into_iter().filter(|unit| !self.over(unit.slot, unit)) {
             let class = self.classify(&unit).await?;
             let slot = unit.slot;
             let kept = |state: State, volume: Option<VolumeId>| Slot {
@@ -882,6 +973,20 @@ impl<H: Host> Pool<H> {
         }
     }
 
+    /// Whether the slot's unit is over. A unit that ended `failed` (its postmaster crashed, its
+    /// supervisor refused an order, or a process outlived the final SIGKILL) keeps its number out
+    /// of the next builds: the start of a unit with a process left in its cgroup is refused, and a
+    /// wake must not be the one that finds out.
+    fn over(&self, slot: u32, unit: &SlotUnit) -> bool {
+        if !unit.ended() {
+            return false;
+        }
+        if unit.active == ActiveState::Failed {
+            self.table().failed.insert(slot);
+        }
+        true
+    }
+
     /// Removes a slot's entry for good, as its unit is over.
     fn forget(&self, slot: u32, database: &str, reason: &str) {
         let removed = {
@@ -904,7 +1009,18 @@ impl<H: Host> Pool<H> {
     async fn release_ended(&self, database: &str) -> Result<(), Error> {
         let held = self.table().holding(database);
         for slot in held {
-            if !self.host.unit(slot).await?.ended() {
+            // A slot that is being built for another start of the database has no unit to be over
+            // yet: it is that start's, and it holds the database.
+            let building = self
+                .table()
+                .slots
+                .get(&slot)
+                .is_some_and(|held| matches!(held.state, State::Spawning(_)));
+            if building {
+                return Err(Error::Held);
+            }
+            let unit = self.host.unit(slot).await?;
+            if !self.over(slot, &unit) {
                 return Err(Error::Held);
             }
             self.forget(slot, database, "ended");
@@ -912,35 +1028,12 @@ impl<H: Host> Pool<H> {
         Ok(())
     }
 
-    /// The lowest free number of the pool's range, entered as being built.
-    fn reserve(&self) -> Result<u32, Error> {
-        let mut table = self.table();
-        let slot = self
-            .range
-            .clone()
-            .find(|slot| !table.slots.contains_key(slot))
-            .ok_or(Error::NoSlot)?;
-        table.slots.insert(
-            slot,
-            Slot {
-                state: State::Spawning,
-                main_pid: None,
-                invocation_id: None,
-                requested_us: None,
-                volume: None,
-            },
-        );
-        Ok(slot)
-    }
-
-    /// Makes the slot's user if it has none, sets the idle limits, starts the unit and asks the
-    /// supervisor whether it is idle. A failure stops the unit and drops the entry.
-    async fn build(&self, slot: u32) -> Result<Spawned, Error> {
+    /// Sets the idle limits, starts the unit and asks the supervisor whether it is idle; the slot
+    /// is entered as being built (`database`: the start that waits for it, if any). A failure
+    /// stops the unit, keeps the number out of the next builds and says so; the entry goes once
+    /// its unit is over, and stays, swept again, while a process of it remains.
+    async fn build(&self, slot: u32, database: Option<&str>) -> Result<Spawned, Error> {
         let built = async {
-            if !self.table().users.contains(&slot) {
-                self.host.ensure_user(slot).await?;
-                self.table().users.insert(slot);
-            }
             self.host.set(slot, &super::limits::idle()).await?;
             let spawned = self.host.start(slot).await?;
             self.host.ping(slot).await?;
@@ -949,7 +1042,9 @@ impl<H: Host> Pool<H> {
         .await;
         match built {
             Ok(spawned) => {
-                if let Some(held) = self.table().slots.get_mut(&slot) {
+                let mut table = self.table();
+                table.failed.remove(&slot);
+                if let Some(held) = table.slots.get_mut(&slot) {
                     held.main_pid = Some(spawned.main_pid);
                     held.invocation_id = Some(spawned.invocation_id.clone());
                     held.requested_us = spawned.requested_us;
@@ -957,51 +1052,75 @@ impl<H: Host> Pool<H> {
                 Ok(spawned)
             }
             Err(error) => {
-                let _ = self.host.stop(slot).await;
-                self.table().slots.remove(&slot);
+                self.table().failed.insert(slot);
+                build_failed(
+                    slot,
+                    if database.is_some() {
+                        "demand"
+                    } else {
+                        "refill"
+                    },
+                    database,
+                    &error,
+                );
+                self.set_state(slot, State::Stopping(None));
+                self.finish_stop(slot).await;
                 Err(error)
             }
         }
     }
 
     /// An idle slot for the database, or a new one built inside the bind.
+    ///
+    /// The claim is one step under the table's lock: no slot holds the database in any state (a
+    /// start that passed `release_ended` at the same time as this one is the other's, and loses),
+    /// and then an idle slot becomes the database's, or a free number with a user is entered as
+    /// being built for it.
     async fn take(&self, database: &str, volume: &VolumeId) -> Result<(u32, SlotFrom), Error> {
         loop {
-            let idle = {
+            let claim = {
                 let mut table = self.table();
+                if !table.holding(database).is_empty() {
+                    return Err(Error::Held);
+                }
                 let idle = table
                     .slots
                     .iter()
                     .find(|(_, held)| held.state == State::Idle)
                     .map(|(slot, _)| *slot);
-                if let Some(held) = idle.and_then(|slot| table.slots.get_mut(&slot)) {
-                    held.state = State::Taken(database.to_string());
-                    held.volume = Some(volume.clone());
+                match idle {
+                    Some(slot) => {
+                        if let Some(held) = table.slots.get_mut(&slot) {
+                            held.state = State::Taken(database.to_string());
+                            held.volume = Some(volume.clone());
+                        }
+                        Claim::Idle(slot)
+                    }
+                    None => Claim::Build(table.reserve(&self.range, Some(database))?),
                 }
-                idle
             };
-            match idle {
-                Some(slot) if self.host.alive(slot) => return Ok((slot, SlotFrom::Pool)),
+            match claim {
+                Claim::Idle(slot) if self.host.alive(slot) => return Ok((slot, SlotFrom::Pool)),
                 // The supervisor ended while it waited: the slot is no use.
-                Some(slot) => {
+                Claim::Idle(slot) => {
                     self.set_state(slot, State::Stopping(None));
                     self.finish_stop(slot).await;
                 }
-                None => break,
+                Claim::Build(slot) => {
+                    let spawned = self.build(slot, Some(database)).await?;
+                    // The wake's own detail has what this one cost; the line is for the node's log.
+                    crate::timing::log_line(json!({
+                        "event": "slot_spawned", "slot": slot, "invocation": spawned.invocation_id,
+                        "cause": "demand",
+                    }));
+                    if let Some(held) = self.table().slots.get_mut(&slot) {
+                        held.state = State::Taken(database.to_string());
+                        held.volume = Some(volume.clone());
+                    }
+                    return Ok((slot, SlotFrom::Demand));
+                }
             }
         }
-        let slot = self.reserve()?;
-        let spawned = self.build(slot).await?;
-        // The wake's own detail has what this one cost; the line is for the node's log.
-        crate::timing::log_line(json!({
-            "event": "slot_spawned", "slot": slot, "invocation": spawned.invocation_id,
-            "cause": "demand",
-        }));
-        if let Some(held) = self.table().slots.get_mut(&slot) {
-            held.state = State::Taken(database.to_string());
-            held.volume = Some(volume.clone());
-        }
-        Ok((slot, SlotFrom::Demand))
     }
 
     /// A slot that failed before the order: stopped, and the database holds nothing.
@@ -1028,7 +1147,11 @@ impl<H: Host> Pool<H> {
     async fn finish_stop(&self, slot: u32) -> bool {
         let stopped = self.host.stop(slot).await;
         let over = match stopped {
-            Ok(()) => self.host.unit(slot).await.is_ok_and(|unit| unit.ended()),
+            Ok(()) => self
+                .host
+                .unit(slot)
+                .await
+                .is_ok_and(|unit| self.over(slot, &unit)),
             Err(_) => false,
         };
         if over {
@@ -1070,10 +1193,18 @@ impl<H: Host> Pool<H> {
                 tainted: false,
             });
         };
-        let held = facts.databases.first().cloned();
-        let database = held.as_ref().map(|(database, _)| database.clone());
-        Ok(match (unit.active, facts.exe) {
-            (ActiveState::Active, Exe::Supervisor) if facts.databases.is_empty() => {
+        let database = facts
+            .databases
+            .first()
+            .map(|(database, _)| database.clone());
+        // The one database a PostgreSQL serves: its volume is named and it holds the lock. A mount
+        // that cannot be named, a second mount and a missing lock are none.
+        let served = match facts.databases.as_slice() {
+            [(database, Some(volume))] if facts.locked => Some((database.clone(), volume.clone())),
+            _ => None,
+        };
+        Ok(match (unit.active, facts.exe, served) {
+            (ActiveState::Active, Exe::Supervisor, _) if facts.databases.is_empty() => {
                 match self.host.ping(unit.slot).await {
                     Ok(()) => Class::Idle,
                     // Another protocol, or a supervisor that does not answer: built again.
@@ -1083,19 +1214,21 @@ impl<H: Host> Pool<H> {
                     },
                 }
             }
-            // The mounts are in and the order was not sent: the database never ran.
-            (_, Exe::Supervisor) => Class::Stop {
+            // A mount at a database's directory, named or not, and the order was not sent: the
+            // database never ran.
+            (_, Exe::Supervisor, _) => Class::Stop {
                 tainted: database.is_some(),
                 database,
             },
-            (ActiveState::Deactivating, _) => Class::Stop {
+            (ActiveState::Deactivating, _, _) => Class::Stop {
                 database,
                 tainted: false,
             },
-            (ActiveState::Active | ActiveState::Activating, Exe::Postgres)
-                if facts.databases.len() == 1 && facts.locked =>
-            {
-                let (database, volume) = facts.databases[0].clone();
+            (
+                ActiveState::Active | ActiveState::Activating,
+                Exe::Postgres,
+                Some((database, volume)),
+            ) => {
                 match facts.postmaster {
                     Some(ready::Status::Ready) => Class::Serving(database, volume),
                     // It holds the lock and has not written a status yet, or says it starts: the
@@ -1113,6 +1246,27 @@ impl<H: Host> Pool<H> {
             },
         })
     }
+}
+
+/// What a start's claim on the pool got.
+enum Claim {
+    /// An idle slot, now the database's.
+    Idle(u32),
+    /// A number entered as being built for the database.
+    Build(u32),
+}
+
+/// A slot that could not be built: its number is kept out of the next builds, and the node says
+/// which and why (`cause`: the `refill`, a `demand` build inside a wake, or the `user` of a number).
+fn build_failed(slot: u32, cause: &str, database: Option<&str>, error: &Error) {
+    let mut event = json!({
+        "event": "slot_build_failed", "slot": slot, "cause": cause,
+        "class": crate::diagnostics::units_code(error),
+    });
+    if let Some(database) = database {
+        event["database_id"] = database.into();
+    }
+    crate::timing::emit_event(event);
 }
 
 /// The class of a unit the agent finds when it starts.
@@ -1188,6 +1342,12 @@ mod tests {
         legacy: BTreeSet<String>,
         /// Databases whose data directory a postmaster holds the lock on, by slot.
         locks: BTreeMap<String, u32>,
+        /// Slots whose unit failed with a process left in its cgroup: a start is refused.
+        stuck: BTreeSet<u32>,
+        /// Numbers whose user cannot be made.
+        no_user: BTreeSet<u32>,
+        /// A start waits here for a permit, as a unit's job takes its time.
+        start_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
     #[derive(Clone)]
     struct SimUnit {
@@ -1195,13 +1355,21 @@ mod tests {
         pid: Option<u32>,
         invocation: String,
         exe: Exe,
-        mounted: Option<(String, VolumeId)>,
+        /// The database directory mounted in the slot, and the volume if the agent can name it.
+        mounted: Option<(String, Option<VolumeId>)>,
         status: Option<ready::Status>,
         memory_max: Option<u64>,
         properties: Vec<Property>,
     }
     impl Sim {
+        /// A node that has run for a while: the users of the first slot numbers exist.
         fn new() -> Self {
+            let sim = Self::fresh();
+            sim.state().users = (0..32).collect();
+            sim
+        }
+        /// A node that never made a slot: no slot user exists.
+        fn fresh() -> Self {
             Self(Arc::new(Mutex::new(SimState {
                 next_pid: 1000,
                 ..SimState::default()
@@ -1228,6 +1396,15 @@ mod tests {
         fn active(&self, slot: u32) -> ActiveState {
             self.unit_of(slot)
                 .map_or(ActiveState::Inactive, |unit| unit.active)
+        }
+        /// The process of the slot ends by itself, cleanly: the unit is `inactive`.
+        fn exit(&self, slot: u32) {
+            let mut state = self.state();
+            if let Some(unit) = state.units.get_mut(&slot) {
+                unit.active = ActiveState::Inactive;
+                unit.pid = None;
+            }
+            state.locks.retain(|_, held| *held != slot);
         }
         /// The process of the slot dies by itself, as a crashed postmaster does.
         fn die(&self, slot: u32) {
@@ -1280,6 +1457,9 @@ mod tests {
         }
         async fn ensure_user(&self, slot: u32) -> Result<(), Error> {
             let mut state = self.state();
+            if state.no_user.contains(&slot) {
+                return Err(refused("useradd"));
+            }
             if state.users.insert(slot) {
                 state.calls.push(format!("user {slot}"));
             }
@@ -1310,8 +1490,15 @@ mod tests {
             Ok(())
         }
         async fn start(&self, slot: u32) -> Result<Spawned, Error> {
+            let gate = self.state().start_gate.clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
             if self.failing("start") {
                 return Err(refused("start"));
+            }
+            if self.state().stuck.contains(&slot) {
+                return Err(Error::StrayProcesses);
             }
             let mut state = self.state();
             state.calls.push(format!("start {slot}"));
@@ -1350,7 +1537,10 @@ mod tests {
             let mut state = self.state();
             state.calls.push(format!("stop {slot}"));
             if let Some(unit) = state.units.get_mut(&slot) {
-                unit.active = ActiveState::Inactive;
+                // A stop job leaves a failed unit failed, as systemd does until it is reset.
+                if unit.active != ActiveState::Failed {
+                    unit.active = ActiveState::Inactive;
+                }
                 unit.pid = None;
                 unit.mounted = None;
                 unit.status = None;
@@ -1381,7 +1571,7 @@ mod tests {
             state.calls.push(format!("mount {slot}"));
             let database = bind.volume.database().to_string();
             if let Some(unit) = state.units.get_mut(&slot) {
-                unit.mounted = Some((database, bind.volume.clone()));
+                unit.mounted = Some((database, Some(bind.volume.clone())));
             }
             Ok(())
         }
@@ -1444,7 +1634,7 @@ mod tests {
                 postmaster: unit.status,
             }))
         }
-        async fn legacy_awake(&self, database: &str) -> Result<bool, Error> {
+        async fn legacy_holds(&self, database: &str) -> Result<bool, Error> {
             Ok(self.state().legacy.contains(database))
         }
         async fn timestamps(&self, _slot: u32) -> Result<Option<(u64, u64)>, Error> {
@@ -1596,27 +1786,27 @@ mod tests {
 
     // 6. A miss builds inside the bind.
 
-    /// A bind with no idle slot builds one and says so; with an idle slot it builds none, and the
-    /// user of a slot is made at the refill, not in the bind.
+    /// A bind with no idle slot builds one and says so; with an idle slot it builds none. A miss
+    /// makes no user: the node's users exist already.
     #[tokio::test]
     async fn a_pool_miss_builds_the_slot_inside_the_bind_and_a_hit_builds_none() {
         let (sim, data) = (Sim::new(), data_directory("miss"));
         let pool = pool(&sim);
-        // A miss on a pool that never built a slot: the user and the unit, then the bind.
+        // A miss on a pool that never built a slot: the unit, then the bind.
         let miss = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
         assert_eq!(miss.from, SlotFrom::Demand);
         assert_eq!(
             sim.calls(),
-            ["user 0", "set 0", "start 0", "ping 0", "set 0", "mount 0"]
+            ["set 0", "start 0", "ping 0", "set 0", "mount 0"]
         );
-        // The refill built one beforehand, users included; a hit only binds.
+        // The refill built one beforehand; a hit only binds.
         assert_eq!(pool.refill(1).await.unwrap(), Some(1));
         sim.clear();
         let hit = pool.bind(D2, &bind_of(D2, 1, &data)).await.unwrap();
         assert_eq!(hit.from, SlotFrom::Pool);
         assert_eq!(hit.slot, 1);
         assert_eq!(sim.calls(), ["set 1", "mount 1"]);
-        // A miss on a slot whose user is there does not make it again.
+        // A miss takes the lowest free number.
         sim.clear();
         let again = pool
             .bind(
@@ -1629,8 +1819,258 @@ mod tests {
         assert_eq!(again.slot, 2, "the lowest free number");
         assert_eq!(
             sim.calls(),
-            ["user 2", "set 2", "start 2", "ping 2", "set 2", "mount 2"]
+            ["set 2", "start 2", "ping 2", "set 2", "mount 2"]
         );
+    }
+
+    /// A wake makes no slot user (`groupadd` and `useradd` lock the node's account files, and a
+    /// storm of builds on a new node would contend for them): a miss takes only a number that has
+    /// one, and fails where none has. The refill makes the users, lowest number first, ahead of
+    /// the highest slot in use by twice the target.
+    #[tokio::test]
+    async fn a_miss_never_makes_a_user_and_the_refill_makes_them_ahead() {
+        let (sim, data) = (Sim::fresh(), data_directory("users"));
+        let pool = pool(&sim);
+        let databases = [
+            D1,
+            D2,
+            "cdefghijkl2345678901",
+            "defghijklm3456789012",
+            "efghijklmn4567890123",
+            "fghijklmno5678901234",
+        ];
+        let bind = |database: &'static str| {
+            let (pool, data) = (&pool, data.clone());
+            async move { pool.bind(database, &bind_of(database, 1, &data)).await }
+        };
+        // A node that never made a slot: a miss has no number with a user, and runs no useradd.
+        assert!(matches!(bind(databases[0]).await, Err(Error::NoSlot)));
+        assert!(sim.calls().is_empty(), "{:?}", sim.calls());
+        assert_eq!(pool.snapshot(), Snapshot::default());
+        assert_eq!(
+            pool.slot_of(databases[0]),
+            None,
+            "a failed claim holds nothing"
+        );
+
+        // The refill: users 0 to 3 (twice the target of 2, from slot 0), then the first idle slot;
+        // the second refill is ahead of slot 0, so one more.
+        assert_eq!(pool.refill(2).await.unwrap(), Some(0));
+        assert_eq!(
+            sim.calls()[..4],
+            ["user 0", "user 1", "user 2", "user 3"],
+            "{:?}",
+            sim.calls()
+        );
+        assert_eq!(pool.refill(2).await.unwrap(), Some(1));
+        assert_eq!(sim.state().users, BTreeSet::from([0, 1, 2, 3, 4]));
+        sim.clear();
+        // Two hits, then three misses on the numbers whose users the refill made: no user on a wake.
+        let mut taken = Vec::new();
+        for (at, database) in databases[..5].iter().enumerate() {
+            let bound = bind(database).await.unwrap();
+            let from = if at < 2 {
+                SlotFrom::Pool
+            } else {
+                SlotFrom::Demand
+            };
+            assert_eq!(bound.from, from, "{database}");
+            taken.push(bound.slot);
+        }
+        assert_eq!(taken, [0, 1, 2, 3, 4]);
+        assert!(
+            !sim.calls().iter().any(|call| call.starts_with("user")),
+            "{:?}",
+            sim.calls()
+        );
+        // Past the numbers that have a user, a miss fails; the next refill makes more users, ahead
+        // of the highest number in use (4 + 1 + 4 = 9, so up to 8).
+        assert!(matches!(bind(databases[5]).await, Err(Error::NoSlot)));
+        assert_eq!(pool.refill(2).await.unwrap(), Some(5));
+        assert_eq!(sim.state().users, (0..9).collect::<BTreeSet<u32>>());
+    }
+
+    /// A user that cannot be made keeps its number out of the builds, and the refill goes on with
+    /// the numbers above it on its next pass.
+    #[tokio::test]
+    async fn a_number_whose_user_cannot_be_made_is_skipped() {
+        let (sim, data) = (Sim::fresh(), data_directory("no-user"));
+        sim.state().no_user.insert(1);
+        let pool = pool(&sim);
+        assert!(pool.refill(1).await.is_err(), "user 1 fails");
+        assert!(sim.state().users.contains(&0));
+        assert!(!sim.state().users.contains(&1));
+        assert_eq!(pool.refill(1).await.unwrap(), Some(0));
+        let hit = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
+        assert_eq!(hit.slot, 0);
+        // Number 0 is in use and number 1 has no user: a wake finds nothing to take, and makes none.
+        assert!(matches!(
+            pool.bind(D2, &bind_of(D2, 1, &data)).await,
+            Err(Error::NoSlot)
+        ));
+        // The refill goes past number 1 and makes the user of number 2, and no attempt is made at 1.
+        sim.clear();
+        assert_eq!(pool.refill(1).await.unwrap(), Some(2));
+        assert!(
+            sim.calls().iter().any(|call| call == "user 2"),
+            "{:?}",
+            sim.calls()
+        );
+        assert!(
+            !sim.calls().iter().any(|call| call == "user 1"),
+            "{:?}",
+            sim.calls()
+        );
+    }
+
+    // 6. The binding rule is one step.
+
+    /// Two binds of one database that both passed the check of the table before either claimed a
+    /// slot claim one slot between them: the table is looked at again in the step that takes it.
+    #[tokio::test]
+    async fn two_binds_of_one_database_claim_one_slot_between_them() {
+        let (sim, data) = (Sim::new(), data_directory("claim-twice"));
+        let pool = pool(&sim);
+        pool.refill(2).await.unwrap();
+        pool.refill(2).await.unwrap();
+        let (one, two) = (bind_of(D1, 1, &data), bind_of(D1, 2, &data));
+        let (first, second) = tokio::join!(pool.bind(D1, &one), pool.bind(D1, &two));
+        let outcomes = [first.is_ok(), second.is_ok()];
+        assert_eq!(
+            outcomes.iter().filter(|ok| **ok).count(),
+            1,
+            "exactly one bind wins: {first:?} {second:?}"
+        );
+        let refused = first.err().or(second.err());
+        assert!(matches!(refused, Some(Error::Held)), "{refused:?}");
+        assert_eq!(pool.snapshot().held, 1, "one slot holds D1");
+        assert_eq!(
+            pool.snapshot().idle,
+            1,
+            "the other idle slot was not touched"
+        );
+    }
+
+    /// A start that builds its slot already holds the database: a second bind of it, begun while
+    /// the unit is still starting, is refused, and the slot being built is neither taken nor
+    /// forgotten by it.
+    #[tokio::test]
+    async fn a_slot_being_built_for_a_start_already_holds_its_database() {
+        let (sim, data) = (Sim::new(), data_directory("building"));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        sim.state().start_gate = Some(gate.clone());
+        let pool = Arc::new(pool(&sim));
+        let first = {
+            let (pool, data) = (pool.clone(), data.clone());
+            tokio::spawn(async move { pool.bind(D1, &bind_of(D1, 1, &data)).await })
+        };
+        // The first bind is building: its unit has not started (the gate holds it).
+        for _ in 0..200 {
+            if pool.slot_of(D1).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            pool.slot_of(D1).is_some(),
+            "the slot being built holds the database"
+        );
+        assert_eq!(
+            pool.snapshot().spawning,
+            0,
+            "it is no idle slot in the making"
+        );
+        let second = pool.bind(D1, &bind_of(D1, 1, &data)).await;
+        assert!(matches!(second, Err(Error::Held)), "{second:?}");
+        // The first bind finishes undisturbed.
+        gate.add_permits(1);
+        let bound = first.await.unwrap().unwrap();
+        assert_eq!(bound.from, SlotFrom::Demand);
+        assert_eq!(pool.slot_of(D1), Some(bound.slot));
+        assert_eq!(pool.snapshot().held, 1);
+    }
+
+    // 4. A number whose build fails is kept out.
+
+    /// A build that fails leaves its number out of the next builds, so that a slot whose unit
+    /// failed with a process left in its cgroup (which refuses every start) cannot take every
+    /// wake of the node with it, and it says so.
+    #[tokio::test]
+    async fn a_slot_number_whose_build_fails_is_not_the_next_one_built() {
+        let (sim, data) = (Sim::new(), data_directory("failed-number"));
+        let pool = pool(&sim);
+        // A wake whose build of slot 0 fails: the unit refuses its start over a stray process.
+        sim.state().stuck.insert(0);
+        let database = "ghijklmnop6789012345";
+        assert!(matches!(
+            pool.bind(database, &bind_of(database, 1, &data)).await,
+            Err(Error::StrayProcesses)
+        ));
+        assert_eq!(pool.snapshot(), Snapshot::default());
+        let event = crate::events::seen().into_iter().find(|event| {
+            event["event"] == "slot_build_failed" && event["database_id"] == database
+        });
+        let event = event.expect("a failed build is an event");
+        let fields = &event["fields"];
+        assert_eq!(
+            (fields["slot"].as_u64(), fields["cause"].as_str()),
+            (Some(0), Some("demand"))
+        );
+        assert_eq!(fields["class"], "units_stray_processes");
+        // The next wake, and the refill, build the next number and not that one again.
+        sim.clear();
+        let next = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
+        assert_eq!(next.slot, 1, "{:?}", sim.calls());
+        assert!(
+            !sim.calls().iter().any(|call| call == "start 0"),
+            "{:?}",
+            sim.calls()
+        );
+        assert_eq!(pool.refill(1).await.unwrap(), Some(2));
+    }
+
+    /// The number a build takes is free, has a user, and failed last: where every other number is
+    /// in use the failed one is tried again, as it may work by then.
+    #[test]
+    fn a_failed_number_is_the_last_one_a_build_takes() {
+        let serving = |database: &str| Slot {
+            state: State::Serving(database.to_string()),
+            main_pid: None,
+            invocation_id: None,
+            requested_us: None,
+            volume: None,
+        };
+        let mut table = Table {
+            users: BTreeSet::from([0, 1, 2, 3]),
+            failed: BTreeSet::from([0]),
+            ..Table::default()
+        };
+        assert_eq!(table.free_number(&(0..4)), Some(1), "not the failed 0");
+        table.slots.insert(1, serving("a"));
+        table.slots.insert(2, serving("b"));
+        assert_eq!(table.free_number(&(0..4)), Some(3));
+        table.slots.insert(3, serving("c"));
+        assert_eq!(
+            table.free_number(&(0..4)),
+            Some(0),
+            "the failed one is the last"
+        );
+        table.slots.insert(0, serving("d"));
+        assert_eq!(table.free_number(&(0..4)), None, "every number is in use");
+        // A number without a user is never taken, free as it is.
+        table.users.remove(&2);
+        table.slots.remove(&2);
+        assert_eq!(table.free_number(&(0..4)), None);
+    }
+
+    /// A refill whose build fails keeps the number out too.
+    #[tokio::test]
+    async fn a_refill_whose_build_fails_goes_on_with_the_next_number() {
+        let sim = Sim::new();
+        let pool = pool(&sim);
+        sim.fail_next("start");
+        assert!(pool.refill(1).await.is_err());
+        assert_eq!(pool.refill(1).await.unwrap(), Some(1), "not slot 0 again");
     }
 
     // 7. The refill.
@@ -1654,11 +2094,16 @@ mod tests {
             }
         );
         // An idle slot whose supervisor ended is dropped, and a new one built in its place.
-        sim.die(0);
+        sim.exit(0);
         assert_eq!(pool.refill(2).await.unwrap(), Some(0));
         assert_eq!(pool.snapshot().idle, 2);
         // The idle limits go on at every build: they take back what the last incarnation set.
         assert_eq!(sim.properties(0), crate::units::limits::idle());
+        // One that failed is dropped too, and its number is the last one built again: a unit that
+        // failed may hold a process that refuses every start.
+        sim.die(1);
+        assert_eq!(pool.refill(2).await.unwrap(), Some(2));
+        assert_eq!(pool.snapshot().idle, 2);
     }
 
     // 8. Fence and maintenance.
@@ -1813,6 +2258,42 @@ mod tests {
         let _ = data;
     }
 
+    /// A mount at a database's directory that the agent cannot name as a volume of that database
+    /// (the `lvs` listing failed, or the device is none of the database's) is held all the same:
+    /// the slot that has one is stopped, whether its supervisor still answers a ping or its
+    /// postmaster holds the lock, and never kept idle. Kept idle, it would take the next database
+    /// beside a tenant's volume mapped to the same slot uid (D13: unknown means tainted).
+    #[tokio::test]
+    async fn a_slot_with_a_mount_the_agent_cannot_name_is_stopped_not_kept() {
+        for serving in [false, true] {
+            let (sim, data) = (Sim::new(), data_directory("adopt-unnamed"));
+            let first = pool(&sim);
+            if serving {
+                let bound = first.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
+                first.exec(&bound).await.unwrap();
+            } else {
+                // The agent was killed between the mount and the order: the supervisor still
+                // answers its ping, because it never got an order.
+                first.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
+            }
+            sim.state().units.get_mut(&0).unwrap().mounted = Some((D1.to_string(), None));
+            let second = pool(&sim);
+            let adopted = second.adopt().await.unwrap();
+            assert!(
+                adopted.idle.is_empty()
+                    && adopted.serving.is_empty()
+                    && adopted.starting.is_empty(),
+                "serving {serving}: {adopted:?}"
+            );
+            assert_eq!(adopted.tainted, [(0, D1.to_string())], "serving {serving}");
+            assert_eq!(sim.active(0), ActiveState::Inactive, "serving {serving}");
+            assert_eq!(second.snapshot(), Snapshot::default());
+            // The database stays asleep with its proof, and the next bind never meets the mount.
+            let next = second.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
+            assert!(sim.unit_of(next.slot).unwrap().mounted.is_some());
+        }
+    }
+
     /// A postmaster that dies on its own leaves its slot to be reaped: the database is held until
     /// systemd reports the unit over, and then it binds again.
     #[tokio::test]
@@ -1824,9 +2305,11 @@ mod tests {
         sim.die(bound.slot);
         let unit = pool.state(D1).await.unwrap().unwrap();
         assert!(!unit.active.awake(), "{unit:?}");
-        // The unit is failed: it is over, so the next bind reaps it and takes a slot.
+        // The unit is failed: it is over, so the next bind reaps it and takes a slot, and not the
+        // number of the unit that failed: it may hold a process that refuses every start.
         let again = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
         assert_eq!(again.database, D1);
+        assert_ne!(again.slot, bound.slot);
     }
 
     /// `wait_started` is a wait for the PostgreSQL that is coming up, and an error for one that

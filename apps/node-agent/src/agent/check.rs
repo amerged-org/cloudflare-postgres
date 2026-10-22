@@ -116,6 +116,9 @@ async fn answer<M: Machine>(
         volume,
         account: account.clone(),
     };
+    // The check's slot is built like the pool's, here and not in the bind: its user is made by the
+    // refill, never by a start.
+    machine.refill_slot(1).await?;
     let bound = machine.bind(SCRATCH, &bind).await?;
     let started = machine.exec(&bound).await?;
     if started.slot.is_none() {
