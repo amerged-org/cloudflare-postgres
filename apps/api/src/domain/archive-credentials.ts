@@ -9,6 +9,7 @@ import {
 import { ApiError } from "../api-error.ts";
 import { R2_ACTIONS, signR2Credential } from "../crypto/r2-credentials.ts";
 import type { ApiContext } from "../env.ts";
+import { archiveEndpoint } from "./archive-bucket.ts";
 
 /**
  * The temporary R2 credentials of the nodes (ULTRA plan 7.3). A row of `archive_credentials` says
@@ -34,6 +35,8 @@ export interface ArchiveCredentialEnvironment {
   DB: D1Database;
   /** The one archive bucket of the installation; a credential names no other. */
   ARCHIVE_BUCKET_NAME: string;
+  /** The S3 endpoint of that bucket, the same for every region. */
+  ARCHIVE_ENDPOINT_URL: string;
   R2_PARENT_ACCESS_KEY_ID?: string;
   R2_PARENT_SECRET_ACCESS_KEY?: string;
 }
@@ -220,7 +223,6 @@ interface DeliveryRow {
   archive_path: string;
   access: ArchiveAccess;
   expires_at: string;
-  backup_endpoint_url: string;
   database_node_id: string | null;
   database_archive_path: string;
   lost: number;
@@ -232,8 +234,9 @@ interface DeliveryRow {
  * The credential for a node that asks for one it was issued, signed now with the Worker's parent
  * key; null for anything else (unknown, another node's, expired, a lost or fenced node's, a
  * write right for a storage generation the node does not serve and does not restore). Throws
- * `archive_credentials_unavailable` when the Worker has no parent key or the path names another
- * bucket than the installation's one. The caller never logs the result.
+ * `archive_credentials_unavailable` when the Worker has no parent key or no valid
+ * `ARCHIVE_ENDPOINT_URL`, or the path names another bucket than the installation's one. The
+ * endpoint is the installation's, whatever region the node is in. The caller never logs the result.
  */
 export async function deliverArchiveCredential(
   env: ArchiveCredentialEnvironment,
@@ -242,12 +245,12 @@ export async function deliverArchiveCredential(
   now: number,
 ): Promise<ArchiveCredential | null> {
   const row = await env.DB.prepare(
-    `SELECT c.id,c.node_id,c.archive_path,c.access,c.expires_at,r.backup_endpoint_url,
+    `SELECT c.id,c.node_id,c.archive_path,c.access,c.expires_at,
       d.node_id database_node_id,d.archive_path database_archive_path,
       CASE WHEN n.lost_at IS NOT NULL OR EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=n.id) THEN 1 ELSE 0 END lost,
       CASE WHEN EXISTS(SELECT 1 FROM database_moves m WHERE m.database_id=c.database_id AND m.status='restoring'
         AND m.target_node_id=c.node_id AND m.target_archive_path=c.archive_path) THEN 1 ELSE 0 END staged
-      FROM archive_credentials c JOIN nodes n ON n.id=c.node_id JOIN regions r ON r.id=n.region_id
+      FROM archive_credentials c JOIN nodes n ON n.id=c.node_id
       JOIN databases d ON d.id=c.database_id WHERE c.id=? AND c.node_id=?`,
   )
     .bind(id, nodeId)
@@ -267,26 +270,19 @@ export async function deliverArchiveCredential(
     secretAccessKey: env.R2_PARENT_SECRET_ACCESS_KEY ?? "",
   };
   const path = parseArchivePath(row.archive_path);
-  let account: string | undefined;
-  try {
-    account = /^([0-9a-f]{32})\./.exec(
-      new URL(row.backup_endpoint_url).host,
-    )?.[1];
-  } catch {
-    account = undefined;
-  }
+  const endpoint = archiveEndpoint(env);
   if (
     parent.accessKeyId === "" ||
     parent.secretAccessKey === "" ||
     !path ||
     path.bucket !== env.ARCHIVE_BUCKET_NAME ||
-    account === undefined
+    endpoint === null
   )
     throw unavailable();
   const issuedAt = Math.floor(now / 1000);
   const signed = await signR2Credential(parent, {
-    accountId: account,
-    endpoint: row.backup_endpoint_url,
+    accountId: endpoint.accountId,
+    endpoint: endpoint.url,
     bucket: path.bucket,
     prefix: `${path.region}/${path.database}/g${path.generation}-${path.operation}/`,
     actions: R2_ACTIONS[row.access],
@@ -299,7 +295,7 @@ export async function deliverArchiveCredential(
     id: row.id,
     path: row.archive_path,
     access: row.access,
-    endpoint_url: row.backup_endpoint_url,
+    endpoint_url: endpoint.url,
     access_key_id: signed.accessKeyId,
     secret_access_key: signed.secretAccessKey,
     session_token: signed.sessionToken,

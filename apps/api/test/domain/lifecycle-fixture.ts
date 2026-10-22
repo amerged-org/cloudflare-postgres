@@ -27,6 +27,7 @@ export const PARENT_KEY = {
   R2_PARENT_SECRET_ACCESS_KEY: "parent-secret-" + "q".repeat(40),
 };
 export const ACCOUNT_ID = "0123456789abcdef0123456789abcdef";
+/** The S3 endpoint of the installation's one archive bucket: the Worker's `ARCHIVE_ENDPOINT_URL`. */
 export const ENDPOINT = `https://${ACCOUNT_ID}.eu.r2.cloudflarestorage.com`;
 /** The Worker environment as a deployment with the parent key has it. */
 export const keyedEnv = () => ({ ...env, ...PARENT_KEY });
@@ -89,9 +90,6 @@ export async function lifecycle() {
   expect((await nodeReport(f, id, 1, "ready", { backup: BACKUP })).status).toBe(
     200,
   );
-  await env.DB.prepare("UPDATE regions SET backup_endpoint_url=? WHERE id=?")
-    .bind(ENDPOINT, f.region)
-    .run();
   await env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?")
     .bind(String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!), f.node)
     .run();

@@ -371,7 +371,6 @@ describe("request bodies", () => {
       provider_region: "EU",
       gateway_url: `https://${["gateway", "example", "com"].join(".")}`,
       gateway_binding: null,
-      backup_endpoint_url: `https://${["r2", "example", "com"].join(".")}`,
       agent_last_seen_at: null,
       created_at: "2026-10-02T10:46:00.000Z",
       updated_at: "2026-10-02T10:46:00.000Z",
@@ -381,11 +380,12 @@ describe("request bodies", () => {
       keys: { k1: newSecret(), k0: newSecret() },
     };
     expect(Region.safeParse(region).success).toBe(true);
-    // The archive bucket is the installation's, not a region's: a region names none.
+    // The archive bucket and its endpoint are the installation's, not a region's: a region names neither.
     for (const extra of [
       { route_keyring: keyring },
       { agent_key: `pgcf_ak_eu-1_${newSecret()}` },
       { backup_bucket: "pgcf-backups" },
+      { backup_endpoint_url: `https://${["r2", "example", "com"].join(".")}` },
     ])
       expect(Region.safeParse({ ...region, ...extra }).success).toBe(false);
     expect(
@@ -394,19 +394,21 @@ describe("request bodies", () => {
         provider: region.provider,
         provider_region: region.provider_region,
         gateway_url: region.gateway_url,
-        backup_endpoint_url: region.backup_endpoint_url,
       }).success,
     ).toBe(true);
-    expect(
-      RegionCreate.safeParse({
-        id: region.id,
-        provider: region.provider,
-        provider_region: region.provider_region,
-        gateway_url: region.gateway_url,
-        backup_bucket: "pgcf-backups",
-        backup_endpoint_url: region.backup_endpoint_url,
-      }).success,
-    ).toBe(false);
+    for (const extra of [
+      { backup_bucket: "pgcf-backups" },
+      { backup_endpoint_url: `https://${["r2", "example", "com"].join(".")}` },
+    ])
+      expect(
+        RegionCreate.safeParse({
+          id: region.id,
+          provider: region.provider,
+          provider_region: region.provider_region,
+          gateway_url: region.gateway_url,
+          ...extra,
+        }).success,
+      ).toBe(false);
     expect(RegionRouteKeyring.safeParse(keyring).success).toBe(true);
     const nonCanonical = keyring.keys.k1.slice(0, -1) + "B";
     for (const broken of [

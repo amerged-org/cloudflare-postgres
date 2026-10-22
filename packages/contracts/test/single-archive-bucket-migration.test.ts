@@ -7,7 +7,7 @@ const directory = new URL("../../../apps/api/migrations/", import.meta.url);
 const migrations = readdirSync(directory)
   .filter((name) => name.endsWith(".sql"))
   .sort();
-const MIGRATION = "0083_single_archive_bucket.sql";
+const MIGRATION = "0084_single_archive_bucket.sql";
 const NOW = "2026-10-19T10:00:00.000Z";
 let db: DatabaseSync;
 
@@ -35,34 +35,53 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
-it("takes the archive bucket off the regions and keeps every region with its children and endpoint", () => {
-  const endpoint = `https://${["r2", "example", "com"].join(".")}`;
-  for (const [id, bucket] of [
-    ["eu-test", "pgcf-test-eu"],
-    ["us-test", "pgcf-test-other"],
+it("takes the archive bucket and its endpoint off the regions and keeps every region with its children", () => {
+  // Three regions as the live installation has them: the bucket of the EU jurisdiction with its .eu.
+  // endpoint, and us-dev with the account's general endpoint for the same bucket, which no API could correct.
+  const eu = `https://${"a".repeat(32)}.eu.r2.example.com`;
+  const general = `https://${"a".repeat(32)}.r2.example.com`;
+  for (const [id, endpoint] of [
+    ["eu-test", eu],
+    ["us-test", general],
   ] as const) {
     db.prepare(
       `INSERT INTO regions(id,provider,provider_region,gateway_url,gateway_binding,backup_bucket,backup_endpoint_url,created_at,updated_at)
-       VALUES(?,'contabo','EU',?,NULL,?,?,?,?)`,
-    ).run(id, `https://${id}.example.com/pg`, bucket, endpoint, NOW, NOW);
+       VALUES(?,'contabo','EU',?,NULL,'pgcf-test-eu',?,?,?)`,
+    ).run(id, `https://${id}.example.com/pg`, endpoint, NOW, NOW);
     db.prepare(
       "INSERT INTO node_region_policies(region_id,max_nodes) VALUES(?,3)",
     ).run(id);
   }
   expect(columns()).toContain("backup_bucket");
+  expect(columns()).toContain("backup_endpoint_url");
   apply(MIGRATION);
   expect(columns()).not.toContain("backup_bucket");
-  expect(columns()).toContain("backup_endpoint_url");
+  expect(columns()).not.toContain("backup_endpoint_url");
   expect(
-    db.prepare("SELECT id,backup_endpoint_url FROM regions ORDER BY id").all(),
-  ).toEqual([
-    { id: "eu-test", backup_endpoint_url: endpoint },
-    { id: "us-test", backup_endpoint_url: endpoint },
-  ]);
+    db
+      .prepare(
+        "SELECT id,provider,provider_region,gateway_url,created_at,updated_at FROM regions ORDER BY id",
+      )
+      .all(),
+  ).toEqual(
+    ["eu-test", "us-test"].map((id) => ({
+      id,
+      provider: "contabo",
+      provider_region: "EU",
+      gateway_url: `https://${id}.example.com/pg`,
+      created_at: NOW,
+      updated_at: NOW,
+    })),
+  );
   expect(
     db.prepare("SELECT count(*) n FROM node_region_policies").get(),
   ).toEqual({ n: 2 });
   expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+  // A region is made without either column.
+  db.prepare(
+    `INSERT INTO regions(id,provider,provider_region,gateway_url,created_at,updated_at)
+     VALUES('us-new','contabo','US',?,?,?)`,
+  ).run("https://us-new.example.com/pg", NOW, NOW);
 });
 
 const RUNBOOK = readFileSync(
@@ -104,7 +123,6 @@ it("runs the SQL of the bucket-move runbook on the migrated schema and selects w
   const operation = (letter: string) => `op_${letter.repeat(20)}`;
   const project = `prj_${"a".repeat(20)}`;
   const node = `nod_${"a".repeat(20)}`;
-  const endpoint = `https://${["r2", "example", "com"].join(".")}`;
   const run = (sql: string, ...params: (string | number | null)[]) =>
     db.prepare(sql).run(...params);
   run(
@@ -115,10 +133,9 @@ it("runs the SQL of the bucket-move runbook on the migrated schema and selects w
     NOW,
   );
   run(
-    `INSERT INTO regions(id,provider,provider_region,gateway_url,backup_endpoint_url,created_at,updated_at)
-     VALUES('eu-test','contabo','EU',?,?,?,?)`,
+    `INSERT INTO regions(id,provider,provider_region,gateway_url,created_at,updated_at)
+     VALUES('eu-test','contabo','EU',?,?,?)`,
     `https://${["gateway", "example", "com"].join(".")}`,
-    endpoint,
     NOW,
     NOW,
   );
@@ -237,130 +254,40 @@ it("runs the SQL of the bucket-move runbook on the migrated schema and selects w
   ).toEqual([`crd_${"a".repeat(20)}`, `crd_${"f".repeat(20)}`]);
 });
 
-it("checks and corrects the endpoint of every region, which no API can change", () => {
-  db.close();
-  db = new DatabaseSync(":memory:");
-  db.exec("PRAGMA foreign_keys = ON");
-  for (const name of migrations) apply(name);
-  const bucket = `https://${"a".repeat(32)}.eu.r2.example.com`;
-  // A region made the way the old runbook said for a region outside the EU: the general endpoint.
-  const general = `https://${"a".repeat(32)}.r2.example.com`;
-  const project = `prj_${"a".repeat(20)}`;
-  const run = (sql: string, ...params: (string | number | null)[]) =>
-    db.prepare(sql).run(...params);
-  const row = (sql: string, ...params: (string | number | null)[]) =>
-    db.prepare(sql).all(...params);
-  run(
-    "INSERT INTO projects(id,name,created_at,updated_at) VALUES(?,?,?,?)",
-    project,
-    "p",
-    NOW,
-    NOW,
+it("takes the archive endpoint from the Worker's variable, with no SQL that edits a region's", () => {
+  // A region row holds no endpoint, so the runbook has no check or correction of one in D1: it names the
+  // variable, the example configuration that sets it and the refusal of the old body.
+  expect(INPUTS).toMatch(/`ARCHIVE_ENDPOINT_URL`/);
+  expect(INPUTS).toMatch(/apps\/api\/wrangler\.example\.jsonc/);
+  expect(INPUTS).toMatch(/whatever the node's region/);
+  expect(INPUTS).toMatch(
+    /answer 400 for\s+a body that names `backup_bucket` or `backup_endpoint_url`/,
   );
-  run(
-    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,archive_timeout_seconds,backup_retention_days,created_at,updated_at)
-     VALUES('small',512,500,10,100,60,7,?,?)`,
-    NOW,
-    NOW,
+  const sql = [...RUNBOOK.matchAll(/^ *```sql\n([\s\S]*?)^ *```/gm)].map(
+    (match) => match[1]!,
   );
-  for (const [region, endpoint, letter] of [
-    ["eu-test", bucket, "a"],
-    ["us-test", general, "b"],
-    ["us-spare", general, "c"],
-  ] as const) {
-    const node = `nod_${letter.repeat(20)}`;
-    const database = `${letter}${"1".repeat(19)}`;
-    const path = `s3://pgcf-test/${region}/${database}/g1-op_${letter.repeat(20)}`;
-    run(
-      `INSERT INTO regions(id,provider,provider_region,gateway_url,backup_endpoint_url,created_at,updated_at)
-       VALUES(?,'contabo','EU',?,?,?,?)`,
-      region,
-      `https://${region}.example.com/pg`,
-      endpoint,
-      NOW,
-      NOW,
-    );
-    // A region without a node yet (us-spare) is the one US1 is installed into.
-    if (region === "us-spare") continue;
-    run(
-      `INSERT INTO nodes(id,region_id,hostname,allocatable_memory_mib,allocatable_cpu_millicores,created_at,updated_at)
-       VALUES(?,?,?,0,0,?,?)`,
-      node,
-      region,
-      `${letter}1`,
-      NOW,
-      NOW,
-    );
-    run(
-      `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,archive_path,created_at,updated_at)
-       VALUES(?,?,?,?,?,'small','running',?,?,?)`,
-      database,
-      project,
-      region,
-      node,
-      `db-${letter}`,
-      path,
-      NOW,
-      NOW,
-    );
-    run(
-      `INSERT INTO archive_credentials(id,node_id,database_id,archive_path,access,issued_at,expires_at)
-       VALUES(?,?,?,?,'read_write',?,?)`,
-      `crd_${letter.repeat(20)}`,
-      node,
-      database,
-      path,
-      NOW,
-      "2026-10-26T10:00:00.000Z",
-    );
-  }
-  const values = { "<endpoint>": bucket, "<region>": "us-test" };
-
-  // The check answers exactly the regions that name another endpoint than the bucket's.
-  const check = runbookSql(
-    "SELECT id,backup_endpoint_url FROM regions",
-    values,
-    INPUTS,
+  expect(sql.length).toBeGreaterThan(0);
+  for (const block of sql)
+    expect(block).not.toMatch(/backup_endpoint_url|backup_bucket/);
+  // The variable is in place with the Worker of step 1, before 0084 drops the columns the old Worker reads.
+  const step = FORWARD.get(1)!;
+  expect(step).toMatch(
+    /Then deploy the Worker with `ARCHIVE_ENDPOINT_URL` set/,
   );
-  expect(row(check)).toEqual([
-    { id: "us-spare", backup_endpoint_url: general },
-    { id: "us-test", backup_endpoint_url: general },
-  ]);
-
-  // The correction fixes one named region, forces its nodes to read a new credential, and touches no other.
-  const correction = runbookSql(
-    "UPDATE regions SET backup_endpoint_url",
-    values,
-    INPUTS,
-  );
-  const before = row("SELECT * FROM regions WHERE id<>'us-test' ORDER BY id");
-  db.exec(correction);
-  db.exec(correction);
-  expect(row(check)).toEqual([
-    { id: "us-spare", backup_endpoint_url: general },
-  ]);
-  expect(row("SELECT * FROM regions WHERE id<>'us-test' ORDER BY id")).toEqual(
-    before,
-  );
+  const at = (text: RegExp) => step.search(text);
+  expect(at(/ARCHIVE_ENDPOINT_URL/)).toBeGreaterThan(-1);
+  expect(at(/ARCHIVE_ENDPOINT_URL/)).toBeLessThan(at(/only then apply `0084`/));
+  // The example configuration sets it, and the move leaves it alone (same account and jurisdiction).
   expect(
-    row(
-      "SELECT backup_endpoint_url,gateway_url,provider_region,created_at,updated_at>? changed FROM regions WHERE id='us-test'",
-      NOW,
+    readFileSync(
+      new URL("../../../apps/api/wrangler.example.jsonc", import.meta.url),
+      "utf8",
     ),
-  ).toEqual([
-    {
-      backup_endpoint_url: bucket,
-      gateway_url: "https://us-test.example.com/pg",
-      provider_region: "EU",
-      created_at: NOW,
-      changed: 1,
-    },
-  ]);
-  expect(
-    row("SELECT id FROM archive_credentials ORDER BY id").map(
-      (value) => value.id,
-    ),
-  ).toEqual([`crd_${"a".repeat(20)}`]);
+  ).toMatch(
+    /"ARCHIVE_ENDPOINT_URL": "https:\/\/<CLOUDFLARE_ACCOUNT_ID>\.eu\.r2\.cloudflarestorage\.com"/,
+  );
+  expect(FORWARD.get(2)!).toMatch(/`ARCHIVE_ENDPOINT_URL` stays as it is/);
+  expect(FORWARD.get(4)!).not.toMatch(/endpoint/);
 });
 
 it("makes the prefix list again for the last warm round, so a database created after it is inside the window of the passes by time", () => {
@@ -420,22 +347,24 @@ it("names the flag that lets a copy go on where the destination holds keys the s
   expect(FORWARD.get(3)).toMatch(/second attempt/);
 });
 
-it("applies 0082 with its Worker before this move's Worker, so that 0083 is the only pending migration", () => {
+it("applies 0082 with its Worker before this move's Worker, so that 0084 is the only pending migration", () => {
   // `wrangler d1 migrations apply` takes every pending file. 0082 needs its own Worker straight after it
-  // (and a fresh D1 export before it); 0083 needs its Worker before it. One command cannot do both.
+  // (and a fresh D1 export before it); 0084 needs its Worker before it. One command cannot do both.
   const step = FORWARD.get(1)!;
   expect(step).toMatch(/`0082`/);
   expect(step).toMatch(/wrangler d1 migrations list/);
-  expect(step).toMatch(/only `0083`/);
+  expect(step).toMatch(/only `0084`/);
   expect(step).toMatch(/every pending (migration|file)/);
   expect(step).toMatch(/fresh (daily )?D1 export/);
-  // The check comes before the Worker is deployed, and 0083 after it.
+  // 0083 is additive and goes before the Worker that reads its column.
+  expect(step).toMatch(/`0083`[^.]*additive[^.]*before\s+the\s+Worker/);
+  // The check comes before the Worker is deployed, and 0084 after it.
   const at = (text: RegExp) => step.search(text);
   expect(at(/migrations list/)).toBeGreaterThan(-1);
   expect(at(/migrations list/)).toBeLessThan(at(/Then deploy the Worker/));
   expect(at(/Then deploy the Worker/)).toBeGreaterThan(-1);
   expect(at(/Then deploy the Worker/)).toBeLessThan(
-    at(/only then apply `0083`/),
+    at(/only then apply `0084`/),
   );
 });
 
@@ -455,5 +384,121 @@ it("keeps the previous parent token alive until step 11 and retires every earlie
   expect(FORWARD.get(10)!).not.toMatch(/revoking the old parent key/);
   expect(MOVE.replace(/\s+/g, " ")).not.toMatch(
     /until step 11 revokes the old parent key,/,
+  );
+});
+
+/** The bullets of the runbook's list of what can be rolled back, keyed by their bold label. */
+const WINDOWS = (() => {
+  const start = MOVE.indexOf("What can be rolled back, step by step.");
+  const end = MOVE.indexOf("If a step fails.");
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  const windows = new Map<string, string>();
+  for (const chunk of MOVE.slice(start, end)
+    .split(/\n(?=- \*\*)/)
+    .slice(1)) {
+    const label = /^- \*\*([^*]+)\*\*/.exec(chunk)![1]!;
+    windows.set(label, chunk.replace(/\s+/g, " ").trim());
+  }
+  return windows;
+})();
+
+it("says what can and what cannot be rolled back at each step of the cutover", () => {
+  expect([...WINDOWS.keys()]).toEqual([
+    "Step 1.",
+    "Steps 2 to 4.",
+    "Steps 5 to 10.",
+    "Steps 11.1 to 11.3.",
+    "Step 11.4 and after (the revocation).",
+    "Step 12.",
+  ]);
+  // The migration has no way back, and the Worker only until it is applied.
+  expect(WINDOWS.get("Step 1.")).toMatch(/until `0084` is applied/);
+  expect(WINDOWS.get("Step 1.")).toMatch(/`0084` cannot be rolled back/);
+  expect(WINDOWS.get("Step 1.")).toMatch(/Time Travel/);
+  // Before anything reads the new bucket, giving up needs no rollback; the previous token must live on.
+  expect(WINDOWS.get("Steps 2 to 4.")).toMatch(
+    /previous parent token stays alive/,
+  );
+  // From the deploy of step 5 the whole procedure applies; the old configuration alone undoes nothing.
+  expect(WINDOWS.get("Steps 5 to 10.")).toMatch(/whole rollback applies/);
+  expect(WINDOWS.get("Steps 5 to 10.")).toMatch(/undoes nothing/);
+  // 11.1 sets a parent key without the old bucket: the rollback must put the old one back until 11.4.
+  const keyed = WINDOWS.get("Steps 11.1 to 11.3.")!;
+  expect(keyed).toMatch(
+    /whole rollback still applies, with one addition to its step 1/,
+  );
+  expect(keyed).toMatch(
+    /parent key goes back to the token that names the old bucket/,
+  );
+  expect(keyed).toMatch(
+    /`R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`/,
+  );
+  expect(keyed).toMatch(/until 11\.4/);
+  // The revocation ends it, and so does deleting the old bucket.
+  expect(WINDOWS.get("Step 11.4 and after (the revocation).")).toMatch(
+    /There is no rollback/,
+  );
+  expect(WINDOWS.get("Step 11.4 and after (the revocation).")).toMatch(
+    /fixed forward/,
+  );
+  expect(WINDOWS.get("Step 12.")).toMatch(/cannot be undone/);
+});
+
+it("puts the parent key back in the rollback's first step whenever step 11.1 has run, and keeps the new key until the new credentials expire", () => {
+  const one = ROLLBACK.get(1)!;
+  expect(one).toMatch(
+    /When step 11\.1 has run, set `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`/,
+  );
+  expect(one).toMatch(/in the same deploy/);
+  // The token that named the old bucket before 11.1: step 2's, or the previous one, both alive until 11.4.
+  expect(one).toMatch(/the token of step 2, or the previous token/);
+  expect(one).toMatch(/alive until 11\.4/);
+  // What a rollback that leaves the 11.1 token in place does.
+  expect(one).toMatch(/R2 refuses every upload/);
+  expect(one).toMatch(/database_archive_failing/);
+  expect(one).toMatch(/Keep the 11\.1 token until X_NEW/);
+  // X_NEW is read in the same step, before step 2 deletes the rows that record it.
+  expect(one).toMatch(/X_NEW/);
+  // And the forward step says so where the key is set.
+  expect(numberedSteps(MOVE).get(11)!).toMatch(
+    /a rollback also puts the parent key\s+back/,
+  );
+});
+
+it("retires the old keys in the order new parent key, credential refresh, WAL archive, base backup and restore read, then revoke", () => {
+  const eleven = FORWARD.get(11)!;
+  const order = [
+    "Create the new parent token",
+    "Replace the credentials the nodes hold",
+    "With the old keys still alive, check on the new key",
+    "a WAL archive",
+    "a base backup",
+    "a restore read",
+    "Only when all three pass, revoke the old keys",
+    "After the revocation, repeat the WAL archive check",
+  ].map((text) => eleven.indexOf(text));
+  for (const at of order) expect(at).toBeGreaterThan(-1);
+  expect([...order].sort((a, b) => a - b)).toEqual(order);
+  expect(eleven).toMatch(/From here there is no rollback to the old bucket/);
+});
+
+it("keeps the token of the copy through the last pass after the revocation, and deletes it only then", () => {
+  // 11.5 runs step 10's last pass after the revocation, and that pass reads the old bucket and writes the new one
+  // with the copy token: revoking it in 11.4 would leave the last copy without a key.
+  const eleven = FORWARD.get(11)!;
+  const revoke = eleven.slice(
+    eleven.indexOf("Only when all three pass"),
+    eleven.indexOf("Keep the token of the copy"),
+  );
+  expect(revoke.length).toBeGreaterThan(0);
+  expect(revoke).not.toMatch(/token of the copy/);
+  expect(eleven).toMatch(/Keep the token of the copy for 11\.5/);
+  const lastPass = eleven.indexOf(
+    "After the revocation, repeat the WAL archive check",
+  );
+  expect(lastPass).toBeGreaterThan(-1);
+  expect(eleven.indexOf("Then delete the token of the copy")).toBeGreaterThan(
+    lastPass,
   );
 });

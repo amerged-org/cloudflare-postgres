@@ -57,7 +57,8 @@ function actions(
   } = {},
 ) {
   const calls: string[] = [],
-    tunnelMade: boolean[] = [];
+    tunnelMade: boolean[] = [],
+    accounts: (string | null)[] = [];
   let tunnels = 0,
     powers = 0,
     polls = 0;
@@ -65,6 +66,7 @@ function actions(
     async deleteTunnel(target) {
       calls.push(`tunnel:${target.nodeId}`);
       tunnelMade.push(target.tunnelMade);
+      accounts.push(target.accountId);
       script.tunnel?.(++tunnels);
     },
     async powerOff(target) {
@@ -77,7 +79,7 @@ function actions(
       return states[Math.min(polls++, states.length - 1)]!;
     },
   };
-  return { impl, calls, tunnelMade };
+  return { impl, calls, tunnelMade, accounts };
 }
 
 it("declares a node lost: the fence and a superseded order for each database, nothing else changed", async () => {
@@ -275,6 +277,26 @@ it("fences in the order the plan sets: Tunnel, power off, then a stopped instanc
   });
   await runNodeFencing(env, later + 60_000, run.impl);
   expect(run.calls).toHaveLength(4);
+});
+
+it("tells the fence the account that holds the archive bucket, whatever the node's region, and none while the endpoint names none", async () => {
+  const f = await lost();
+  await f.declare();
+  const run = actions();
+  await runNodeFencing(env, Date.now(), run.impl);
+  expect(run.accounts).toEqual(["0123456789abcdef0123456789abcdef"]);
+  const g = await lost();
+  await g.declare();
+  const unnamed = actions();
+  await runNodeFencing(
+    {
+      ...env,
+      ARCHIVE_ENDPOINT_URL: `https://${["archive", "invalid"].join(".")}`,
+    },
+    Date.now(),
+    unnamed.impl,
+  );
+  expect(unnamed.accounts).toEqual([null]);
 });
 
 it("tells the fence that a node that never read its credentials made no Tunnel", async () => {

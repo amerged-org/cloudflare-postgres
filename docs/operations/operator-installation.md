@@ -30,40 +30,30 @@ applying additive migrations and rehearse them against the export.
 | `INFRASTRUCTURE_BACKUP_CF_TOKEN`, `RESEND_API_KEY`, `INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN` | Optional: the D1 export, direct email and the alert webhook (see below and the [infrastructure backup runbook](infrastructure-backups.md)) |
 
 Every region archives into one R2 bucket, named without a region. The `ARCHIVE` binding is that
-bucket (with `"jurisdiction": "eu"` on an EU installation) and the variable `ARCHIVE_BUCKET_NAME`
-names the same bucket. A region row holds no bucket, only the S3 endpoint of it
-(`backup_endpoint_url`, `https://<account>.eu.r2.cloudflarestorage.com` for the EU jurisdiction),
-which is the same for every region. The keys keep regions apart:
+bucket (with `"jurisdiction": "eu"` on an EU installation), the variable `ARCHIVE_BUCKET_NAME`
+names the same bucket and the variable `ARCHIVE_ENDPOINT_URL` is its S3 endpoint:
+`https://<account>.eu.r2.cloudflarestorage.com` for a bucket of the EU jurisdiction and
+`https://<account>.r2.cloudflarestorage.com` for one without a jurisdiction, where `<account>` is
+the 32-character ID of the Cloudflare account that holds the bucket. A region row holds neither the
+bucket nor the endpoint, so a region made in any way gets the installation's: the Worker signs the
+temporary credential of every node with `ARCHIVE_ENDPOINT_URL`, whatever the node's region, and
+makes the nodes' Tunnels in the account the endpoint names. No API sets either, because they are
+not a region's setting (`POST /v1/regions` and `PUT /v1/regions/{id}/configuration` answer 400 for
+a body that names `backup_bucket` or `backup_endpoint_url`). The keys keep regions apart:
 `<region>/<database>/g<generation>-<operation>/database/` for a database generation,
 `node-images/<release>/` for the node image releases and `infrastructure/v1/` for the daily
 infrastructure backups. A binding that is missing, or a name that is not the bucket the archive
-paths in D1 name, fails closed with an internal error.
-
-The endpoint must be the bucket's on every region row, and nothing checks it. The Worker signs a
-node's temporary credential with the endpoint of the node's region, and no API changes the field:
-`PUT /v1/regions/{id}/configuration` takes only the gateway fields (a body with
-`backup_endpoint_url` is a 400), so a region is made with the right endpoint in its `POST
-/v1/regions` body or is corrected in D1. A region that names the account's general endpoint
-(`https://<account>.r2.cloudflarestorage.com`, which the earlier runbook gave every region outside
-the EU while it had a bucket of its own), another account's endpoint or another jurisdiction's gets
-credentials for a host that does not hold the bucket: every upload of its nodes fails and its
-databases never become ready. Read the table before the first node of a region installs, after
-every region is made and in step 1 of the move below (read-only; no row may answer; `<endpoint>`
-is the bucket's, which the first region holds):
-```sql
-SELECT id,backup_endpoint_url FROM regions WHERE backup_endpoint_url<>'<endpoint>' ORDER BY id;
-```
-Correct a row that answers (`<region>` is its id) from a 0600 file in a 0700 directory, run like
-the rewrite of step 6 below (`wrangler d1 execute <database> --remote --file <file>`) and
-rehearsed on a D1 export first. The same file deletes the credential rows of the region's nodes: a
-node holds the endpoint of the credential it read and reads another only when its page names a new
-id, so it needs the maintenance cycle and the check of step 7 below afterwards, with `<T>` the
-time the file ended (a region without a node needs neither):
-```sql
-UPDATE regions SET backup_endpoint_url='<endpoint>',updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-  WHERE id='<region>' AND backup_endpoint_url<>'<endpoint>';
-DELETE FROM archive_credentials WHERE node_id IN (SELECT id FROM nodes WHERE region_id='<region>');
-```
+paths in D1 name, fails closed with an internal error. A Worker whose `ARCHIVE_ENDPOINT_URL` is
+missing, is not an `https` URL or does not begin with an account ID hands out no archive credential
+(`archive_credentials_unavailable`), makes no Tunnel (`node_tunnel_unconfigured`) and cannot fence a
+lost node (`fence_unconfigured`), so set it in the private API configuration before the first
+deploy of this change, from `apps/api/wrangler.example.jsonc`. Nothing checks that the endpoint is
+the bucket's: R2 serves a bucket of the EU jurisdiction only at the `.eu.` host, so the general
+host (or another account's) makes every upload of every node fail and no database becomes ready.
+The jurisdiction and the account are those of the bucket in the Cloudflare dashboard, and the proof
+is the first base backup of a database in each region: it is done under
+`s3://<bucket>/<region>/<database>/g...` before the database is ready
+(`GET /v1/databases/{id}/backups`).
 
 The nodes' temporary R2 credentials are signed for `ARCHIVE_BUCKET_NAME` and one database
 generation's prefix, so the parent key (`R2_PARENT_ACCESS_KEY_ID` and
@@ -84,8 +74,8 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
   `NODE_DNS_SERVERS` a JSON array of one to three resolvers the node is installed with.
 - `CLOUDFLARE_API_TOKEN` (a private secret) makes the node's Tunnel when the node first reads its
   credentials. Its gateway gets the hostname `pgcf-node-<id>.<domain>` under `NODE_GATEWAY_DOMAIN`,
-  a domain of the zone `NODE_GATEWAY_ZONE_ID`; the Cloudflare account is the one of the region's R2
-  endpoint. Without the token, the domain or the zone a node gets no credentials and stays closed
+  a domain of the zone `NODE_GATEWAY_ZONE_ID`; the Cloudflare account is the one `ARCHIVE_ENDPOINT_URL`
+  names. Without the token, the domain or the zone a node gets no credentials and stays closed
   to placement. The API Worker uses this one secret for everything it does at Cloudflare for a
   node: it makes the Tunnel and its records (`domain/node-credentials.ts`) and deletes both when
   the node is declared lost (`domain/fence-actions.ts`). Create it as an API token with exactly two
@@ -93,7 +83,7 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
 
   | Permission | Scope | What for |
   | --- | --- | --- |
-  | Account: Cloudflare Tunnel: Edit | the account of the region's R2 endpoint | Lists, makes and configures the node's Tunnel; deletes it and its connections when the node is lost |
+  | Account: Cloudflare Tunnel: Edit | the account of `ARCHIVE_ENDPOINT_URL` | Lists, makes and configures the node's Tunnel; deletes it and its connections when the node is lost |
   | Zone: DNS: Edit | the zone `NODE_GATEWAY_ZONE_ID`, and no other zone | Makes, corrects and removes the node's CNAME records; deletes them when the node is lost |
 
   Declaring a node lost deletes, after its Tunnel, the node's records under `NODE_GATEWAY_DOMAIN`:
@@ -175,7 +165,8 @@ because a new paid resource needs the owner's explicit, costed go. Put the firew
 
 The archive paths stored in D1 (`s3://<bucket>/<region>/<database>/g<generation>-<operation>`), the
 credentials the nodes hold and the Worker's binding name the bucket, so a move changes more than the
-binding. The keys below the bucket stay valid: a key never contains the bucket, and it is unique per
+binding. The endpoint (`ARCHIVE_ENDPOINT_URL`) does not change: the new bucket is in the same account
+and jurisdiction, because a server-side copy stays inside one endpoint. The keys below the bucket stay valid: a key never contains the bucket, and it is unique per
 database generation and operation, so the objects are copied unchanged and server side (CopyObject,
 which stays inside one jurisdiction's endpoint). The old bucket is only read, except by the rollback's
 mirror and cleanup below, until the owner says it may go. The move needs the owner's costed go for the new bucket;
@@ -203,25 +194,33 @@ every awake database to sleep with the proof. WAL segment keys are written once 
 so the union of both buckets holds every segment, and a last copy of what exists only in the old
 bucket, made after the last write into it, closes any gap.
 
-1. Make `0083` the only pending migration before anything is deployed. `wrangler d1 migrations
+1. Make `0084` the only pending migration before anything is deployed. `wrangler d1 migrations
    apply` (and a deploy script's `--migrate`, which runs it before the deploy) takes every pending
-   file, and `0082` and `0083` need opposite orders: `0082` (the dead capacity fields, D-1 of the plan)
-   goes first, with a fresh daily D1 export in place and its Worker straight after it, while `0083`
+   file, and `0082` and `0084` need opposite orders: `0082` (the dead capacity fields, D-1 of the plan)
+   goes first, with a fresh daily D1 export in place and its Worker straight after it, while `0084`
    needs its Worker first. So D-1 is live before this move starts, and `wrangler d1 migrations list
-   <database> --remote` shows only `0083` pending; if `0082` is pending, finish D-1 first and run no
-   `migrations apply` and no deploy with `--migrate` from this commit meanwhile. Then deploy the
-   Worker with the single `ARCHIVE` binding still naming the old bucket, and only then apply `0083`
-   (the old Worker cannot run on the new schema, the new one runs on the old). Then run the endpoint
-   check of the deployment inputs above: no region row may name another endpoint than the bucket's.
-   A region made while it had a bucket of its own (`us-dev`) is the likely one: the earlier runbook
-   gave it the account's general endpoint, and the new bucket is in the EU jurisdiction, so its first
-   node (US1) would get credentials for a host without the bucket. Correct a row that answers with the
-   file of that section before the region's first node reads a credential; for a node that already
-   holds one, the same file makes it read a new one.
-2. With the owner's costed go, create the new bucket (same jurisdiction). Then give the Worker a
+   <database> --remote` shows only `0084` pending (`0083`, the credentials revision, is additive and goes before the
+   Worker that reads its column, so it is applied before the deploy below); if `0082` or `0083` is
+   pending, finish that first and run no `migrations apply` and no deploy with `--migrate` from this
+   commit meanwhile. Then deploy the Worker with `ARCHIVE_ENDPOINT_URL` set to
+   the endpoint of the bucket (the old bucket's, which is the new bucket's too) and the single
+   `ARCHIVE` binding still naming the old bucket, and only then apply `0084`. The Worker of this
+   commit reads neither region column, so it runs on the schema before `0084` (except that `POST
+   /v1/regions` fails until `0084` is applied, because its insert names no endpoint), while the Worker
+   before it reads both columns and cannot run on the schema after `0084`. From the deploy on, every
+   credential the Worker delivers names the endpoint of the variable, whatever the node's region: a
+   region that was made with the account's general endpoint for this EU-jurisdiction bucket (`us-dev`
+   was) needs no correction, because its row is no longer read. A node of such a region holds
+   credentials for the wrong host until its page names a new credential id; the rewrite of step 6
+   gives every page new ids, and an installation that applies this change without a move deletes the
+   `archive_credentials` rows of those nodes and runs the maintenance cycle on them instead.
+2. With the owner's costed go, create the new bucket (same account and jurisdiction, so
+   `ARCHIVE_ENDPOINT_URL` stays as it is). Then give the Worker a
    parent key that names both buckets, in one of two ways: add the new bucket to the policy of the
    token that is the parent key now, or create a second token whose policy names both buckets and set
-   `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY` to it. Keep the previous token, and keep
+   `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY` to it, both in one `wrangler secret
+   bulk` (two separate `secret put` calls deploy twice and leave a mismatched key pair live between
+   them). Keep the previous token, and keep
    the old bucket in every token that is a parent key, until step 11 revokes them: until step 6 every
    node archives into old-bucket paths with the credentials it holds, each signed by the previous
    token (the access key of a credential is the parent's), so deleting or narrowing that token ends all
@@ -267,8 +266,7 @@ bucket, made after the last write into it, closes any gap.
    only when it asks with `x-amz-checksum-mode`). An object whose checksum the copy lost is uploaded
    again with `register-node-image.ts` run with `PGCF_R2_BUCKET` set to the new bucket: until step
    5 the variable names the old one, where the script finds the object complete and sends nothing.
-4. Rehearse the rewrite below on a D1 export, and with it the correction of a region endpoint if
-   step 1's check answered a row. Check that no create, restore, move or base backup is in flight
+4. Rehearse the rewrite below on a D1 export. Check that no create, restore, move or base backup is in flight
    and that every node runs its region's release.
 5. Deploy the Worker with `ARCHIVE` bound to the new bucket and `ARCHIVE_BUCKET_NAME` set to it. Note
    the time (T_B) immediately before the deploy starts and after the last warm copy has ended: every
@@ -391,15 +389,17 @@ bucket, made after the last write into it, closes any gap.
     parent keys (step 2's) ends every credential signed with them, and the last pass then runs after
     the revocation.
 11. Retire the old keys: the previous parent token (the one that was the parent key before step 2),
-    the token that step 2 made when it made a second one, the token of the copy, the mirror token if
-    there was one, and every bucket-wide key. The Worker signs every credential a node holds from the
+    the token that step 2 made when it made a second one, the mirror token if there was one, and every
+    bucket-wide key, and then, after the last pass of 11.5, the token of the copy. The Worker signs every credential a node holds from the
     parent key and never stores one, a credential's access key is the parent's, and a node reads a
     credential only when its page names a new id (the API renews a row after a third of its seven
     days). Deleting an earlier parent token before the nodes hold credentials signed with the new one
     ends the credentials they hold and archiving fails until they read new ones
     (`database_archive_failing`). So, in this order:
     1. Create the new parent token: object read and write on the new bucket and no other. Set
-       `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY` to it and deploy the Worker. Note
+       `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY` to it (both in one `wrangler
+       secret bulk`) and deploy the Worker. From here until 11.4 a rollback also puts the parent key
+       back (the rollback's step 1); keep the tokens of step 2 and the previous one. Note
        the time the deploy ended (T_KEY): every credential the Worker delivers from then on is signed
        with the new key, and the ones the nodes already hold are not.
     2. Replace the credentials the nodes hold, in one of two ways. Wait one credential lifetime: read
@@ -426,27 +426,69 @@ bucket, made after the last write into it, closes any gap.
        backup and the WAL with a read-only credential).
     4. Only when all three pass, revoke the old keys (delete the tokens): both earlier parent tokens,
        the previous one and the one of step 2 (a single token when step 2 only added the new bucket to
-       the policy of the previous one), with the token of the copy, the mirror token and every
-       bucket-wide key. From here there is no rollback to the old bucket: nothing can sign for it any
-       more. Note the time (T_REVOKE).
+       the policy of the previous one), with the mirror token and every bucket-wide key. Keep the
+       token of the copy for 11.5: the last pass reads the old bucket and writes the new one with it,
+       and it signs nothing in the Worker's name. From here there is no rollback to the old bucket:
+       nothing can sign for it any more. Note the time (T_REVOKE).
     5. After the revocation, repeat the WAL archive check once, and run step 10's last pass, its
        cross-check and the tripwire: every credential for the old bucket is dead, so nothing is written
        into it after T_REVOKE and the pass copies what had arrived until then. A database that now
        fails to archive belongs to a node that never read a credential after T_KEY: delete the
        credential rows of its databases again (as in 2) and wait for its next pull; restarting
-       `pgcf-agent` makes it read every credential again.
+       `pgcf-agent` makes it read every credential again. Then delete the token of the copy.
 12. Only when step 11 is done, step 10's last pass ended without a failure and its check shows no gap,
     and with the owner's word, delete the old bucket.
 
-If a step fails. Before step 5, nothing in production changed (a failed copy is repeated). From step 5
-until step 11 revokes the earlier parent keys, every rollback is the same whole procedure, because nothing
-records whether a node switched and a check that no credential names the new bucket races the nodes'
-pulls every 60 seconds (after the revocation nothing signs for the old bucket and only fixing forward
-is left):
+What can be rolled back, step by step. The rollback is the procedure under "If a step fails" below;
+it returns the installation to the old bucket. It needs three things at once: a parent token that
+names the old bucket (something that still signs for it), the old bucket holding every key written
+there, and paths in D1 that can be swapped back. The steps end them one after the other, so the
+answer differs from step to step:
 
-1. Redeploy the old configuration (`ARCHIVE` and `ARCHIVE_BUCKET_NAME` name the old bucket). Until
-   step 2 ends, the retention step fails again for the rows that name the new bucket (expected). The
-   Worker signs nothing for the new bucket from now on. Read `max(expires_at)` of the
+- **Step 1.** The Worker with `ARCHIVE_ENDPOINT_URL` can be redeployed to its earlier version until
+  `0084` is applied. `0084` cannot be rolled back: it drops two columns with their data, only D1
+  Time Travel brings them back, and after it only a Worker of this change or a later one runs. Every
+  rollback below therefore runs on the new Worker, with the old bucket in its configuration.
+- **Steps 2 to 4.** Nothing in production uses the new bucket or the new token yet. A failed copy is
+  repeated, and the move can be given up by leaving the new bucket to the owner. What must not be
+  undone is step 2's rule: the previous parent token stays alive (and is not narrowed) until step
+  11.4, because every node archives into the old bucket with credentials that token signed.
+- **Steps 5 to 10.** The whole rollback applies (its steps 1 to 7). Redeploying the old
+  configuration alone undoes nothing: the paths in D1 and the nodes' credentials name the new bucket
+  until the rollback's step 2 and 3.
+- **Steps 11.1 to 11.3.** The whole rollback still applies, with one addition to its step 1: the
+  Worker's parent key goes back to the token that names the old bucket. Step 11.1 sets
+  `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY` to a token without the old bucket, and
+  a rollback that leaves it there signs every credential for the old bucket with a key R2 refuses
+  for it. This window lasts until 11.4, which is up to a credential lifetime (seven days) when
+  11.2 waits instead of forcing the refresh. The delete of 11.2 needs no undoing: the rollback's step
+  2 deletes the credential rows again.
+- **Step 11.4 and after (the revocation).** There is no rollback. The earlier parent tokens are
+  deleted, and with them every credential signed with them, so nothing the Worker or a node holds
+  can write into the old bucket, and no step of this section makes it able to. The old bucket still
+  holds everything written until T_REVOKE (step 11.5 copies the last of it), but returning to it is a
+  new procedure that the owner decides on (a new token for it, the rollback's swap and a mirror of
+  what the new bucket received since step 5), not this one. From here a fault is fixed forward in the
+  new bucket.
+- **Step 12.** Deleting the old bucket cannot be undone.
+
+If a step fails. Before step 5, nothing in production changed (a failed copy is repeated). From step 5
+until step 11.4 revokes the earlier parent tokens, every rollback is the same whole procedure,
+because nothing records whether a node switched and a check that no credential names the new bucket
+races the nodes' pulls every 60 seconds (after the revocation nothing signs for the old bucket and
+only fixing forward is left):
+
+1. Redeploy the old configuration (`ARCHIVE` and `ARCHIVE_BUCKET_NAME` name the old bucket;
+   `ARCHIVE_ENDPOINT_URL` stays). When step 11.1 has run, set `R2_PARENT_ACCESS_KEY_ID` and
+   `R2_PARENT_SECRET_ACCESS_KEY` in the same deploy back to the token that named the old bucket
+   before 11.1: the token of step 2, or the previous token when step 2 only added the new bucket to
+   its policy (both are alive until 11.4). The token of 11.1 names the new bucket only. Left as the
+   parent key, it signs every credential for the old bucket without that bucket, R2 refuses every
+   upload, every database raises `database_archive_failing`, none can sleep, and restarting
+   `pgcf-agent` (step 5) cannot help. Keep the 11.1 token until X_NEW (below) has passed: it is the
+   access key of the credentials that a node which did not switch still holds for the new bucket.
+   Until step 2 ends, the retention step fails again for the rows that name the new bucket (expected).
+   The Worker signs nothing for the new bucket from now on. Read `max(expires_at)` of the
    `archive_credentials` rows that name the new bucket (X_NEW) now: step 2 deletes them, and with them
    the only record of when the credentials signed for the new bucket die. A node that does not switch
    keeps writing into the new bucket with one until then (steps 4 and 7).

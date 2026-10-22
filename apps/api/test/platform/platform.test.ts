@@ -78,7 +78,6 @@ function regionBody() {
     provider: "contabo",
     provider_region: "test",
     gateway_url: `${url("gateway")}/pg`,
-    backup_endpoint_url: url("archive"),
   };
 }
 const size = {

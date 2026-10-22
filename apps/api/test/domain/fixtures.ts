@@ -243,13 +243,12 @@ export async function fixture(memory = 4096, storage: number | null = 30) {
   for (const id of [region, foreign])
     statements.push(
       env.DB.prepare(
-        "INSERT INTO regions(id,provider,provider_region,gateway_url,backup_endpoint_url,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO regions(id,provider,provider_region,gateway_url,created_at,updated_at) VALUES (?,?,?,?,?,?)",
       ).bind(
         id,
         "contabo",
         "test",
         `https://${["gateway", "invalid"].join(".")}`,
-        `https://${["archive", "invalid"].join(".")}`,
         now,
         now,
       ),

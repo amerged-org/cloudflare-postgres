@@ -19,7 +19,8 @@
   ],
   // One R2 bucket for every region: the backups and WAL of all databases, the node image releases
   // and the infrastructure backups. Name it without a region. ARCHIVE_BUCKET_NAME below names the
-  // same bucket, and the archive paths in D1 and the nodes' temporary credentials name it too.
+  // same bucket, ARCHIVE_ENDPOINT_URL its S3 endpoint, and the archive paths in D1 and the nodes'
+  // temporary credentials name them too.
   "r2_buckets": [
     {
       "binding": "ARCHIVE",
@@ -71,6 +72,10 @@
     "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>",
     // The name of the bucket the ARCHIVE binding is bound to.
     "ARCHIVE_BUCKET_NAME": "replace-r2-backup-bucket",
+    // The S3 endpoint of that bucket, the same for every region: the nodes' temporary credentials
+    // name it, and its account is the one that holds the nodes' Tunnels. A bucket of the EU
+    // jurisdiction (the binding's "jurisdiction": "eu") is served only at the ".eu." host.
+    "ARCHIVE_ENDPOINT_URL": "https://<CLOUDFLARE_ACCOUNT_ID>.eu.r2.cloudflarestorage.com",
   },
   "durable_objects": {
     "bindings": [

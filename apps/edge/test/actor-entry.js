@@ -54,16 +54,9 @@ export async function seedFixtureDatabase(
     ).bind(now, now),
     env.DB.prepare(
       `INSERT INTO regions (id, provider, provider_region, gateway_url,
-      gateway_binding, backup_endpoint_url, created_at, updated_at)
-      VALUES (?, 'test-provider', 'test-region', ?, ?, ?, ?, ?)`,
-    ).bind(
-      region,
-      gatewayUrl,
-      gatewayBinding,
-      `https://${["backup", "invalid"].join(".")}`,
-      now,
-      now,
-    ),
+      gateway_binding, created_at, updated_at)
+      VALUES (?, 'test-provider', 'test-region', ?, ?, ?, ?)`,
+    ).bind(region, gatewayUrl, gatewayBinding, now, now),
     env.DB.prepare(
       `INSERT INTO nodes (id, region_id, hostname, ready, schedulable,
        allocatable_memory_mib, allocatable_cpu_millicores, platform_reserved_memory_mib,

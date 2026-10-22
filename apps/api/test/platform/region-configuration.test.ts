@@ -40,7 +40,6 @@ it("refuses region creation when the gateway endpoint is missing /pg", async () 
     provider: "contabo",
     provider_region: "test",
     gateway_url: gateway().replace(/\/pg$/, ""),
-    backup_endpoint_url: `https://${["archive", "invalid"].join(".")}`,
   });
   try {
     expect(response.status).toBe(400);
@@ -61,7 +60,6 @@ it("repairs legacy routing through the admin API while preserving unrelated conf
         provider: "contabo",
         provider_region: "test",
         gateway_url: gateway(),
-        backup_endpoint_url: `https://${["archive", "invalid"].join(".")}`,
       })
     ).status,
   ).toBe(201);

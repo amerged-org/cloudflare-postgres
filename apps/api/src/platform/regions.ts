@@ -47,15 +47,14 @@ export async function createRegion(
         await c.env.DB.batch([
           c.env.DB.prepare(
             `INSERT INTO regions
-            (id, provider, provider_region, gateway_url, gateway_binding, backup_endpoint_url,
-             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            (id, provider, provider_region, gateway_url, gateway_binding,
+             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
           ).bind(
             body.id,
             body.provider,
             body.provider_region,
             body.gateway_url,
             body.gateway_binding ?? null,
-            body.backup_endpoint_url,
             now,
             now,
           ),
@@ -173,7 +172,6 @@ const configurationFields = [
   "provider_region",
   "gateway_url",
   "gateway_binding",
-  "backup_endpoint_url",
   "created_at",
   "updated_at",
 ] as const;
