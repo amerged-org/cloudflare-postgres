@@ -447,6 +447,19 @@ impl Rig {
     pub(crate) fn observation(&self, id: &str) -> Value {
         self.core.pending_observation(id).expect("an observation")
     }
+
+    /// The observation of a database once it says `state`. `Core::set` changes the phase and
+    /// queues the observation after it, so a test that waited for the phase can still read the
+    /// observation of the phase before.
+    pub(crate) async fn observed(&self, id: &str, state: &str) -> Value {
+        eventually(10, "the observation to name the state", || {
+            self.core
+                .pending_observation(id)
+                .is_some_and(|observation| observation["state"] == state)
+        })
+        .await;
+        self.observation(id)
+    }
 }
 
 /// What a fake gateway says of the sessions and the activity of every database.

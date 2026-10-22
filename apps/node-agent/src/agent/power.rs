@@ -564,10 +564,17 @@ impl<M: Machine> Core<M> {
     /// against the proven-sleep record, and starts PostgreSQL through admission. The answer is the
     /// gateway's to release or refuse its held connections with.
     pub async fn wake(self: &Arc<Self>, request: &WakeRequest) -> WakeResult {
+        self.wake_within(request, self.timing.wake_start).await
+    }
+
+    /// A wake that waits `budget` for PostgreSQL to accept connections (`Timing::wake_start`
+    /// for every wake of the agent). A test that needs one wake to give up early passes a short
+    /// one for it, and every other wake of its node keeps the normal budget.
+    async fn wake_within(self: &Arc<Self>, request: &WakeRequest, budget: Duration) -> WakeResult {
         let begun = Instant::now();
         let mut steps = BTreeMap::new();
         let mut stale = None;
-        let outcome = self.try_wake(request, &mut steps, &mut stale).await;
+        let outcome = self.try_wake(request, budget, &mut steps, &mut stale).await;
         let (outcome, reason, retry_after_seconds) = match &outcome {
             Ok(()) => (WakeOutcome::Started, None, None),
             Err((reason, retry)) => (WakeOutcome::Refused, Some((*reason).to_string()), *retry),
@@ -603,6 +610,7 @@ impl<M: Machine> Core<M> {
     async fn try_wake(
         self: &Arc<Self>,
         request: &WakeRequest,
+        budget: Duration,
         steps: &mut BTreeMap<String, u64>,
         stale: &mut Option<Stale>,
     ) -> Result<(), (&'static str, Option<u32>)> {
@@ -792,7 +800,7 @@ impl<M: Machine> Core<M> {
                     generation: request.generation,
                     operation: Some(&request.operation),
                 },
-                Some(self.timing.wake_start),
+                Some(budget),
             )
             .await;
         let (started, waited, steal) = match started {
@@ -2386,11 +2394,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_start_that_outlasts_its_wake_and_then_fails_leaves_the_database_wakeable() {
-        let timing = crate::agent::Timing {
-            wake_start: Duration::from_millis(300),
-            ..crate::agent::testing::timing()
-        };
-        let Some(rig) = Rig::with_timing("late-failure", timing).await else {
+        let Some(rig) = Rig::new("late-failure").await else {
             return;
         };
         let (entry, db) = rig.create().await;
@@ -2405,20 +2409,26 @@ mod tests {
         let original = std::fs::read_to_string(&auto).unwrap();
         std::fs::write(&auto, format!("{original}shared_buffers = 'none'\n")).unwrap();
         rig.machine.delay_next_start(Duration::from_millis(1500));
-        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        let result = rig
+            .core
+            .wake_within(&Rig::ticket(&entry), Duration::from_millis(300))
+            .await;
         assert_eq!(
             (result.outcome, result.reason.as_deref()),
             (WakeOutcome::Refused, Some("start_timeout"))
         );
 
         // The start failed: the database is asleep as it was, not starting for ever, and the
-        // next wake starts it once it can start.
+        // next wake starts it once it can start, with the budget every wake has.
         eventually(30, "the failed start to end", || {
             db.phase() == Phase::Asleep
         })
         .await;
         assert!(!rig.machine.running(&entry.id));
         std::fs::write(&auto, original).unwrap();
+        // The next start is slower than the first wake's budget, as a real one is on a loaded
+        // host (CI, 2026-10-22: 302 ms): the budget belongs to the wake, not to the node.
+        rig.machine.delay_next_start(Duration::from_millis(600));
         let result = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
         assert_eq!(db.phase(), Phase::Ready);

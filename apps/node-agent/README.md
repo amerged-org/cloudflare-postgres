@@ -211,12 +211,21 @@ the first release that runs slots again adopts them. Three things do it.
    `failed` and read again. Then the two newest complete minutes of the node in
    `node_minutes` (folded from its 15 s samples) have `samples` of at least 3 and `awake_max` 0: no
    sample counted a database whose PostgreSQL is active or starting. The node's admission counts
-   every wake and every start of a recovery (`Admitter::snapshot`).
+   every wake and every start of a recovery (`Admitter::snapshot`), at the instant of a sample, and
+   it holds nothing between two attempts of a recovery: it is no check of a database that is
+   `unproven` (step 4 and the paragraph "What the check cannot see").
 4. **Read the check, last.** List the node's databases (`GET /v1/databases?node_id=<node>`, every
    page, admin key). Every one reads `observed_state` `hibernated` and `suspension_reason`
    `manual`. In D1 that is
    `desired_state='suspended' AND suspension_reason='manual' AND observed_generation=generation AND observed_power='hibernated'`.
-   A database that fails is suspended again or waited for, and steps 3 and 4 are read again.
+   And the reinstall guard's query returns no row for the node (`reinstallBlockers` in
+   `apps/api/src/domain/reinstall-guard.ts`; D1 only, it has no route):
+   `SELECT d.id FROM databases d WHERE d.node_id=<node> AND d.deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM database_recovery_points p WHERE p.database_id=d.id AND p.node_id=d.node_id AND p.storage_generation=d.storage_generation AND p.generation>=d.generation AND p.state='asleep')`.
+   Every database of the node has a recovery point `asleep` at its current storage generation and
+   generation: the node's last word on it is a proven sleep, and nothing took that back. A database
+   that fails either half is suspended again or waited for (a database the query names is one whose
+   recovery has not proven its sleep yet: wait until the node reports it asleep), and steps 3 and 4
+   are read again.
 5. Assign the older release. Until the older agent runs, nothing is placed on the node (placement
    stays closed: `GET /v1/nodes/{id}` reads `database_placement_enabled` `false`, and no one starts
    a move), no integrator resumes a database of the node and nothing restarts the agent but the
@@ -239,19 +248,34 @@ postmaster over it. The reports `unproven`, `building` and `error` keep the earl
 suspension of a database in its wake is refused, one accepted after the wake's `ready` raises the
 generation, and the generation is observed only when the node says the database asleep at it.
 `manual` is needed because a database suspended for idleness reads `hibernated` too, and a
-connection wakes it into a slot at any time. Both halves are tested:
-`apps/api/test/domain/rollback-check.test.ts` and `a_wake_under_way_has_nothing_to_report_and_an_unproven_database_says_so`
-(`agent/report.rs`).
+connection wakes it into a slot at any time. The tests are
+`apps/api/test/domain/rollback-check.test.ts` (the public view, the guard's query and the case below)
+and `a_wake_under_way_has_nothing_to_report_and_an_unproven_database_says_so` (`agent/report.rs`).
 
-**What the check cannot see, and the count does.** When the agent starts and cannot prove the sleep
-of a database (`adopt_asleep`), it reports `unproven`, the API keeps the power, the generation and
-the state as they were, and the recovery starts PostgreSQL in a slot while D1 still reads
-`hibernated` (the third test of `rollback-check.test.ts` shows it). Only the node's count sees that
-recovery; a database whose delete was requested is no longer listed either, and the count keeps its
-unit until the agent has stopped it. A database that a move restores on the node is listed under
-its source node until the move is done: the read of the moves in step 3 sees it, and so does the
-count once its PostgreSQL runs. This is a rule for the operator and no guard, and it follows from reading
-the agent of `origin/main`; it was not run on a node.
+**What the check cannot see, and what sees it.** When the agent starts and cannot prove the sleep
+of a database (`adopt_asleep`), it reports `unproven`. The API keeps the power, the generation and
+the state as they were, so the listing of step 4 still reads `hibernated` and `manual`, and the
+recovery starts PostgreSQL in a slot while D1 says so (the third test of `rollback-check.test.ts`
+shows it). The report does change the recovery point: it becomes `unproven`
+(`recordRecoveryPoints` in `apps/api/src/domain/lifecycle-observations.ts`, migration 0065), and the
+reinstall guard's query, the second half of step 4, lists every database of the node without an
+`asleep` point at its current storage generation and generation. It is that query that sees the
+recovery, until the node reports the sleep proven again. The node's count does not: it sees an
+unproven database only while the recovery's PostgreSQL is starting or running at a sample (every
+15 s). Between attempts nothing counts it. `recover_once` (`agent/power.rs`) returns `Retry` before
+it starts anything when the archive credential is not delivered yet, when the node cannot read,
+repair or mount the volume, when the configuration cannot be refreshed, and when the start itself
+fails (no slot, a failed build, a refused admission); `spawn_recovery` then waits from 1 s up to
+30 s (`Timing::recovery_retry`) and admission holds nothing meanwhile, so `awake_max` is 0. The
+minutes of step 3 are also one to two minutes old when step 4 is read. D1 keeps the database
+`held` throughout, and the next attempt can start PostgreSQL in a slot while the older agent runs:
+the older agent's `adopt_asleep` finds `pg_control` "in production", recovers it and starts
+`pgcf-pg@<id>` beside the slot's postmaster. The cases the count does see are the ones D1 lists
+under no database of the node: a database whose delete was requested is no longer listed, and the
+count keeps its unit until the agent has stopped it; a database that a move restores on the node is
+listed under its source node until the move is done, which the read of the moves in step 3 sees and
+the count also does once its PostgreSQL runs. This is a rule for the operator and no guard, and it
+follows from reading the agent of `origin/main`; it was not run on a node.
 
 **The health check** runs the scratch database in the slot of its own (number 1023), so it takes no
 idle slot of the agent's pool and leaves none; it builds that slot (and makes its user) with its own

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // What the rollback rule of the slot pool reads (`apps/node-agent/README.md`, "Rolling back to an
 // earlier release"): before an older agent is assigned, every database of the node reads the public
-// `observed_state` `hibernated` with `suspension_reason` `manual`. `observed_power` alone says
-// nothing of a wake that is under way: the claim of a wake leaves it as it was, and the agent
-// reports nothing while it starts PostgreSQL. `unproven` is the one report the check cannot see.
+// `observed_state` `hibernated` with `suspension_reason` `manual`, and the reinstall guard's query
+// (`reinstallBlockers`) names no database of the node. `observed_power` alone says nothing of a
+// wake that is under way: the claim of a wake leaves it as it was, and the agent reports nothing
+// while it starts PostgreSQL. `unproven` is the one report the public view cannot see: it keeps the
+// power, the generation and the state, and only the recovery point (`unproven`) shows it.
 // Real D1 and Durable Object harness; no live evidence.
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it } from "vitest";
+import { reinstallBlockers } from "../../src/domain/reinstall-guard.ts";
 import { cleanupFixtures, refusal, report, request } from "./fixtures.ts";
 import { actor, reportReady, sleeping, untilWake } from "./wake-fixture.ts";
 
@@ -14,7 +17,10 @@ afterEach(cleanupFixtures);
 
 type Sleeper = Awaited<ReturnType<typeof sleeping>>;
 
-/** What an operator reads of the database: the public view, and the column the rule must not use. */
+/**
+ * What an operator reads of the database: the public view, the column the rule must not use, and
+ * the databases of the node that the reinstall guard's query names.
+ */
 async function read(f: Sleeper) {
   const response = await request(`/v1/databases/${f.id}`, f.admin);
   expect(response.status).toBe(200);
@@ -28,13 +34,17 @@ async function read(f: Sleeper) {
   )
     .bind(f.id)
     .first<{ observed_power: string }>();
-  return { ...view, observed_power: power!.observed_power };
+  const blockers = (await reinstallBlockers(env.DB, f.node)).map((b) => b.id);
+  return { ...view, observed_power: power!.observed_power, blockers };
 }
 const suspend = (f: Sleeper) =>
   request(`/v1/databases/${f.id}/suspend`, f.integrator, "POST");
-/** The rollback check: no slot can hold a database that reads this. */
-const held = (view: Awaited<ReturnType<typeof read>>) =>
+type View = Awaited<ReturnType<typeof read>>;
+/** The public half of the check: what `GET /v1/databases?node_id=<node>` shows. */
+const reads = (view: View) =>
   view.observed_state === "hibernated" && view.suspension_reason === "manual";
+/** The rollback check: no slot can hold a database that passes it. */
+const held = (view: View) => reads(view) && view.blockers.length === 0;
 
 it("passes only a database suspended by hand and proven asleep at its current generation", async () => {
   const f = await sleeping();
@@ -85,13 +95,36 @@ it("fails a database whose wake began before its suspension, though observed_pow
   expect(held(await read(f))).toBe(true);
 });
 
-it("keeps reading a held database as hibernated when the node finds its sleep unproven (the check's blind spot, which the node's own count covers)", async () => {
+it("keeps reading a held database as hibernated when the node finds its sleep unproven, and the reinstall guard's query names it until the node proves the sleep again", async () => {
   const f = await sleeping();
   expect((await suspend(f)).status).toBe(202);
   expect((await report(f, f.id, 3, "asleep")).status).toBe(200);
-  expect(held(await read(f))).toBe(true);
-  // An agent that starts and cannot prove the sleep reports unproven and recovers the database
-  // in a slot. The API keeps the power, the generation and the state as they were.
+  const proven = await read(f);
+  expect(held(proven)).toBe(true);
+  expect(proven.blockers).toEqual([]);
+  // An agent that starts and cannot prove the sleep reports unproven, and its recovery retries
+  // between attempts without PostgreSQL running (no credential yet, a volume to repair, a unit
+  // that did not start), so the node's count of awake databases does not see it. The API keeps the
+  // power, the generation and the state as they were: the public view still passes. The recovery
+  // point is `unproven` at the same generation, and the reinstall guard's query names the database.
   expect((await report(f, f.id, 3, "unproven")).status).toBe(200);
+  const unproven = await read(f);
+  expect(unproven).toMatchObject({
+    observed_state: "hibernated",
+    suspension_reason: "manual",
+    observed_power: "hibernated",
+  });
+  expect(reads(unproven)).toBe(true);
+  expect(unproven.blockers).toEqual([f.id]);
+  expect(held(unproven)).toBe(false);
+  expect(
+    await env.DB.prepare(
+      "SELECT state FROM database_recovery_points WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first<{ state: string }>(),
+  ).toEqual({ state: "unproven" });
+  // The recovery proves the sleep and the node reports it: the database passes again.
+  expect((await report(f, f.id, 3, "asleep")).status).toBe(200);
   expect(held(await read(f))).toBe(true);
 });

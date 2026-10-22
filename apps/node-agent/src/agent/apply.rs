@@ -1152,7 +1152,7 @@ mod tests {
             handle.phase() == Phase::Ready
         })
         .await;
-        assert_eq!(rig.observation(&id)["state"], "ready");
+        assert_eq!(rig.observed(&id, "ready").await["state"], "ready");
 
         // The generation was ready: the page no longer names how to build it. It suspends it.
         db.as_object_mut().unwrap().remove("origin");
@@ -1164,7 +1164,7 @@ mod tests {
             handle.phase() == Phase::Asleep
         })
         .await;
-        let observation = rig.observation(&id);
+        let observation = rig.observed(&id, "asleep").await;
         assert_eq!(
             (
                 observation["state"].as_str(),
