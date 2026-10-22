@@ -319,6 +319,8 @@ impl<M: Machine> Core<M> {
         let waited = permit.waited;
         self.event(event("admitted", waited, None));
         let mark = (Instant::now(), self.machine.cpu());
+        // Where the variant says so, the catalogs are read ahead while the slot is bound.
+        let _catalogs = self.readahead_catalogs(&db.id);
         let Some(bind) = self.bind_of(entry) else {
             permit.failed();
             return Err(StartFailure::Failed);
@@ -829,6 +831,7 @@ impl<M: Machine> Core<M> {
             view.refusal = None;
         });
         steps.insert("release".into(), millis(releasing.elapsed()));
+        self.readahead_hot_list(&db.id);
         self.detail_later(&db, started, steal);
         self.after_wake(&db).await;
         Ok(())

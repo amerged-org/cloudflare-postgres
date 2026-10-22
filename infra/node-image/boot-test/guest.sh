@@ -222,9 +222,15 @@ scratch_volumes() {
 }
 
 # Plan 9.1: `pgcf-agent check` creates a scratch database on a thin volume and queries it; after a
-# reboot the same database wakes again (no second volume appears).
+# reboot the same database wakes again (no second volume appears). The scratch database starts as
+# every database does, in a slot, but in the one the check alone has (number 1023): its unit has
+# ended when the check has, and no slot of the agent's pool is the check's.
 scratch_database() {
 	in_agent_namespace /var/lib/pgcf/bin/current/pgcf-agent check || return 1
+	if [ "$(systemctl is-active pgcf-slot@1023.service)" = active ]; then
+		echo "the check's slot is still active"
+		return 1
+	fi
 	local volumes
 	volumes=$(scratch_volumes)
 	if [ "$(wc -w <<<"$volumes")" -ne 1 ]; then
@@ -770,9 +776,11 @@ database_second_postmaster_is_refused() {
 # A slot is the sandbox of a database unit with a pooled user, and that user's uid (300000 + n) is
 # used by one database after another, so these checks are about everything that keeps something by
 # uid: every mount, every file the uid can write or read, the IPC namespace, the POSIX queues, the
-# keyrings and the journal. The agent does not start slots yet, and the supervisor is not under
-# test: a runtime drop-in swaps ExecStart= for a process that logs one line and waits, and every
-# other directive is the template's. The users are made the way the agent makes them.
+# keyrings and the journal. The agent starts slots (the scratch database of `pgcf-agent check` runs
+# in one), and what this section tests is the unit's sandbox, with a stand-in for the supervisor,
+# which has its own tests and the slot lab (`units/slot_lab.rs`): a runtime drop-in swaps ExecStart=
+# for a process that logs one line and waits, and every other directive is the template's. The
+# users are made the way the agent makes them.
 slot_test_n=1000
 slot_control_n=1001
 # A uid in the slots' range that no slot has: what an unrelated tenant can read.

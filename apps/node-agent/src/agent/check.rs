@@ -38,6 +38,8 @@ pub struct Checked {
     pub created: bool,
     /// The uid the postmaster ran as, which is its slot's.
     pub uid: u32,
+    /// The slot it ran in: the one the check has to itself.
+    pub slot: Option<u32>,
 }
 
 /// The room rule for the scratch volume: the pool takes it while it takes writes at all.
@@ -88,9 +90,9 @@ pub async fn run<M: Machine>(machine: &M, account: &Account) -> Result<Checked, 
     machine.prepare_socket_directory(SCRATCH, account)?;
     let answered = answer(machine, account, &data).await;
     let stopped = machine.stop(SCRATCH).await;
-    let uid = answered?;
+    let (uid, slot) = answered?;
     stopped?;
-    Ok(Checked { created, uid })
+    Ok(Checked { created, uid, slot })
 }
 
 /// Starts the unit and asks it: the postmaster runs as the database's user on the volume's data
@@ -99,7 +101,7 @@ async fn answer<M: Machine>(
     machine: &M,
     account: &Account,
     data: &std::path::Path,
-) -> Result<u32, Error> {
+) -> Result<(u32, Option<u32>), Error> {
     let volume = VolumeId::new(SCRATCH, 1)?;
     let bind = Bind {
         device: machine.device(&volume).into(),
@@ -134,7 +136,7 @@ async fn answer<M: Machine>(
     if std::fs::canonicalize(&reported)? != std::fs::canonicalize(data)? {
         return Err("the scratch database runs on another directory than its volume".into());
     }
-    Ok(started.uid)
+    Ok((started.uid, started.slot.map(|report| report.slot)))
 }
 
 #[cfg(test)]
@@ -177,13 +179,8 @@ mod tests {
             return;
         };
         let account = machine.ensure_account(SCRATCH).await.unwrap();
-        run(&machine, &account).await.unwrap();
-        let slots: Vec<u64> = crate::events::seen()
-            .into_iter()
-            .filter(|event| event["event"] == "slot_bound" && event["database_id"] == SCRATCH)
-            .filter_map(|event| event["fields"]["slot"].as_u64())
-            .collect();
-        assert_eq!(slots, [u64::from(crate::units::slots::CHECK_SLOT)]);
+        let checked = run(&machine, &account).await.unwrap();
+        assert_eq!(checked.slot, Some(crate::units::slots::CHECK_SLOT));
         assert_eq!(
             machine.slots(),
             crate::units::slots::Snapshot::default(),

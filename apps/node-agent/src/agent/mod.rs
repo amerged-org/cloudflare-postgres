@@ -14,6 +14,7 @@ pub mod check;
 mod entry;
 mod metering;
 mod power;
+mod readahead;
 #[cfg(test)]
 mod real_gateway;
 pub(crate) mod report;
@@ -21,6 +22,7 @@ pub(crate) mod report;
 pub(crate) mod testing;
 
 pub use entry::{Desired, Entry, Origin, Policy, Source};
+pub use readahead::{PREFETCH, Prefetch};
 
 use crate::{
     admission::{Admission, Admitter, Facts, Permit, Running},
@@ -122,6 +124,8 @@ pub struct Parts<M: Machine> {
     /// The policy of the first page.
     pub policy: Policy,
     pub timing: Timing,
+    /// What the agent reads ahead for a wake: the variant of the build (`PREFETCH`).
+    pub prefetch: Prefetch,
 }
 
 /// Where a database stands on the node.
@@ -322,6 +326,7 @@ pub struct Core<M: Machine> {
     pub(crate) gateway: Arc<Feed>,
     pub(crate) fences: Fences,
     pub(crate) timing: Timing,
+    pub(crate) prefetch: Prefetch,
     pub(crate) policy: Arc<RwLock<Policy>>,
     /// A maintenance order is open: new wakes are held with 57P03 (plan 9.3).
     pub(crate) maintenance: AtomicBool,
@@ -396,6 +401,7 @@ impl<M: Machine> Core<M> {
             gateway: parts.gateway,
             fences: parts.fences,
             timing: parts.timing,
+            prefetch: parts.prefetch,
             policy,
             maintenance: AtomicBool::new(false),
             taken: Mutex::new(std::collections::HashSet::new()),

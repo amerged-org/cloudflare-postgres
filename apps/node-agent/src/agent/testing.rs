@@ -3,7 +3,7 @@
 //! archive socket, its upload log, the jobs and the roles are the agent's own; R2 and barman are
 //! the fixture's executables, which take a real backup with the backup API of the database they
 //! are pointed at (see `archive::test_support`).
-use super::{Core, Entry, Parts, Policy, Timing};
+use super::{Core, Entry, PREFETCH, Parts, Policy, Prefetch, Timing};
 use crate::{
     admission::{EarlySleep, Running},
     archive::{
@@ -227,7 +227,13 @@ impl Rig {
     /// A node whose agent waits as `timing` says.
     pub(crate) async fn with_timing(label: &str, timing: Timing) -> Option<Self> {
         let (machine, fixture, root) = site(label, &root_socket)?;
-        Some(Self::boot(machine, fixture, root, Vec::new(), timing).await)
+        Some(Self::boot(machine, fixture, root, Vec::new(), timing, PREFETCH).await)
+    }
+
+    /// A node whose build reads ahead as `prefetch` says.
+    pub(crate) async fn with_prefetch(label: &str, prefetch: Prefetch) -> Option<Self> {
+        let (machine, fixture, root) = site(label, &root_socket)?;
+        Some(Self::boot(machine, fixture, root, Vec::new(), timing(), prefetch).await)
     }
 
     /// The agent process on a machine: its sockets, its tables and its core. A restart is another
@@ -238,6 +244,7 @@ impl Rig {
         root: PathBuf,
         running: Vec<Running>,
         timing: Timing,
+        prefetch: Prefetch,
     ) -> Self {
         let archive_socket = root.join("a.sock");
         let table = Arc::new(Table::default());
@@ -272,6 +279,7 @@ impl Rig {
                 fences,
                 policy: policy(),
                 timing,
+                prefetch,
             },
             running,
         );
@@ -317,6 +325,7 @@ impl Rig {
             self.root.clone(),
         );
         let timing = self.core.timing.clone();
+        let prefetch = self.core.prefetch;
         drop(self);
         // The agent's mount namespace ends with it: the volumes are mounted again by the next
         // one, which the units that run do not wait for. What it kept of the slots is gone too.
@@ -324,7 +333,7 @@ impl Rig {
         machine.adopt_slots().await.unwrap();
         // The old sockets close with the old tasks.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        Self::boot(machine, fixture, root, running, timing).await
+        Self::boot(machine, fixture, root, running, timing, prefetch).await
     }
 
     /// A page entry for a new database with the roles `app` and `reader`; the archive credential

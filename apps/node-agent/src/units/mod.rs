@@ -1,28 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The PostgreSQL units of a node (plan 4.4, 5.5, 5.6 job 4, Appendix C): `pgcf-pg@<id>.service`
-//! driven over systemd's D-Bus API.
+//! The PostgreSQL units of a node (plan 4.4, 5.5, 5.6 job 4, Appendix C), driven over systemd's
+//! D-Bus API.
 //!
-//! - A start is `StartUnit` and the wait for its `JobRemoved`. The unit is `Type=notify`, so the job
-//!   ends when the postmaster accepts connections: nothing polls. One read of `postmaster.pid`
-//!   (`ready`) then names the socket the gateway dials. The unit has no start timeout, because
-//!   crash recovery or a restore's replay can outlast any: the caller owns the deadline and may
-//!   drop the future, which leaves the start running.
-//! - Limits are unit properties set with `SetUnitProperties`, never a reload (`limits`). Size
-//!   limits are persistent. The CPU quota is applied after ready and outlives the stop of the unit
-//!   (a runtime property stays in `/run` until reboot, Stage 1), where it would throttle the next
-//!   start; `stop` lifts it, and so does `set_cpu_quota(.., None)`, which the agent also calls for
-//!   every stopped unit when it starts.
+//! - **Slots** (`slots`, `system`, `idmap`): PostgreSQL runs in a slot, the unit
+//!   `pgcf-slot@<n>.service` that the agent built before the wake for no database. `slots` is the
+//!   pool: take or build, bind, order, ready, stop and adopt; `system` is the node's systemd and
+//!   kernel for it; `idmap` hands the database's volume and socket directory to the slot.
+//! - A start waits for nothing it could poll: systemd's job for a slot's own start, the
+//!   supervisor's answer for the order, and `inotify` on `postmaster.pid` with the slot's pidfd for
+//!   PostgreSQL's readiness (`system`).
+//! - Limits are unit properties set with `SetUnitProperties`, never a reload (`limits`). A slot's
+//!   are set at the bind as runtime properties, and the idle ones again when its next incarnation
+//!   is built, because a runtime property outlives the stop of a unit until the next boot (Stage
+//!   1). The CPU quota is applied after ready.
+//! - **Units of their own** (`Units`, `pgcf-pg@<id>.service`): an agent of an earlier release
+//!   started one per database. The agent starts none; it finds those that run (`running`,
+//!   `wait_started`), serves them and puts them to sleep (`stop`) until none is left.
 //! - A database's Linux user and uid are `users`.
-//! - What a start took, off the path of a wake: systemd's fork of the main process and its handoff
-//!   to the postmaster, and the journal's times of PostgreSQL's three start messages (`timeline`,
-//!   `journal`).
+//! - What a start took, off the path of a wake: the slot's fork and handoff when it was built on
+//!   demand, and the journal's times of PostgreSQL's three start messages from the order
+//!   (`timeline`, `journal`).
 //!
 //! - The memory ceiling of `pgcf.slice`, which holds every database, is the operator's awake-database
 //!   budget (`set_slice_memory`): the kernel's backstop under either memory rule. The image's slice
 //!   has 80 % of RAM until the agent sets it.
-//! - A database's mounts for a sandbox that was built before the database was chosen: the volume
-//!   and the socket directory, handed over as idmapped clones into the sandbox's mount namespace
-//!   (`idmap`).
 //!
 //! The agent runs as root on the node; systemd answers these calls without further authorization.
 // `pgcf_idmap_lab` is set by RUSTFLAGS, not declared in the manifest.
@@ -780,6 +781,11 @@ impl Units {
 
 #[cfg(test)]
 pub(crate) mod lab;
+
+// The privileged lab of the pool of slots, like that of `idmap`, exists only in a build made for
+// it (`--cfg pgcf_slot_lab`).
+#[cfg(all(test, target_os = "linux", pgcf_slot_lab))]
+mod slot_lab;
 
 // The privileged lab of `idmap` exists only in a build made for it: the unprivileged kernel step
 // of CI runs every ignored test and must not meet it.

@@ -510,6 +510,11 @@ impl Machine for Node {
         if self.pool.set(database, &[cpu_quota(millicores)]).await? {
             return Ok(());
         }
+        // A unit of its own: a quota is lifted whether or not it runs (a crash can leave one on a
+        // stopped unit), and set only on one that does.
+        if millicores.is_some() && !self.units.state(database).await?.active.awake() {
+            return Ok(());
+        }
         self.units.set_cpu_quota(database, millicores).await
     }
     async fn set_slice_memory(&self, awake_budget_mib: u64) -> Result<(), units::Error> {

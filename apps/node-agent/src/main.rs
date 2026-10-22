@@ -157,7 +157,7 @@ mod linux {
         let checked = check::run(&node, &account).await?;
         println!(
             "{}",
-            json!({"event": "check", "database": SCRATCH, "created": checked.created})
+            json!({"event": "check", "database": SCRATCH, "created": checked.created, "slot": checked.slot})
         );
         Ok(())
     }

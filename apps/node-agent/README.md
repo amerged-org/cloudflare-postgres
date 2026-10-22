@@ -39,9 +39,9 @@ carries it, and a region whose policy is not set serves no page.
 | `pgcf-agent run`   | The service of `pgcf-agent.service` (`Type=notify`). It opens the node's storage, restores what a boot lost, signals `READY=1`, then enrolls and links to Cloudflare in the background, so a node that is not enrolled yet waits instead of crashing                    |
 | `pgcf-agent check` | Makes or wakes one scratch database (`SCRATCH`) on a thin volume, queries it over its socket and stops it, without Cloudflare. The image's boot test runs it after the first boot and again after a reboot, and a maintenance cycle runs it before it answers its order |
 
-An agent restart never stops a database: the databases are units of their own, and the agent finds
-them again from the running units. A release that changes the agent's own binary makes it exit so
-that systemd starts the new one.
+An agent restart never stops a database: PostgreSQL runs in slots (units of their own, below), and
+the agent reads them back from the kernel. A release that changes the agent's own binary makes it
+exit so that systemd starts the new one.
 
 ## Jobs and where they live
 
@@ -50,7 +50,7 @@ that systemd starts the new one.
 | Link to Cloudflare         | `link/`, `node_link.rs`: enrollment, the signed requests, the NodeActor WebSocket, the outbox                                                          |
 | Admission                  | `admission.rs`                                                                                                                                         |
 | Storage                    | `storage/`: the volume group and thin pool, one thin volume with its ext4 per database, the samples, the room rule, full-pool and full-volume recovery |
-| Units                      | `units/`: `pgcf-pg@<id>.service` over systemd's D-Bus API, limits as unit properties, the Linux users                                                  |
+| Units and slots            | `units/`: the pool of slots (`slots.rs`), the node's systemd and kernel for it (`system.rs`), the idmapped handoff (`idmap.rs`), limits as unit properties, the Linux users; the units of their own an earlier agent started |
 | Database lifecycle         | `agent/`: `apply.rs` (the page becomes action), `build.rs` (create, restore, move target, resize, delete), `power.rs` (wake, sleep, recovery)          |
 | Sleep proof and its record | `proof.rs`, `sleep.rs`, `pg_control.rs`, `state.rs`                                                                                                    |
 | Roles                      | `roles.rs`, `scram.rs`: PostgreSQL holds exactly the roles of the page, with verifiers, never passwords                                                |
@@ -71,6 +71,58 @@ One database has one flow at a time (a create, a wake, a sleep, a recovery or a 
 before the next begins). What the gateway and the observations read is the database's view, which
 every flow updates in small steps.
 
+## Slots
+
+PostgreSQL runs in a slot, the unit `pgcf-slot@<n>.service`, as the slot's own user
+(`pgcf-slot-<n>`, uid 300000 + _n_). The agent builds slots before a wake, for no database, and
+keeps as many idle as `start_concurrency` while no start is in flight or waits (`agent/power.rs`,
+`refill_pass`; a build costs about 80 ms of CPU, which a wake must not wait for, and a fence or a
+maintenance order stops the idle ones). An idle slot runs the supervisor (`pgcf-archive slot <n>`),
+which takes one order, from root. Every start takes one path: the admission permit, then
+
+1. **Take or build** (`slots::Pool::bind`): an idle slot, or a new one built inside the permit, so
+   that `start_concurrency` bounds the builds as it bounds the starts. The slot's user is made at
+   the refill, not on the wake's path, unless a miss needs a number that has none.
+2. **Bind**, in parallel: the database's limits as runtime properties of the slot, its volume and
+   its socket directory moved into the slot's mount namespace as idmapped clones (`units/idmap.rs`),
+   and a check that no unit of its own (`pgcf-pg@`) holds the database.
+3. **Order** (`exec`): sent only after all of that succeeded, because an idle slot's memory ceiling
+   is below `shared_buffers`. A failure before the order stops the slot, and the database stays
+   asleep with its proof: no PostgreSQL ran.
+4. **Ready**: an `inotify` watch on `postmaster.pid` and the slot's pidfd, never a poll.
+
+The wake's phases are `slot` (take or build), `bind` (properties, mounts, order) and `start`
+(order to ready), and its detail says `slot_from` (`pool` or `demand`), `slot_wait_us`, `bind_us`
+and `order_us`. A slot serves one database for one awake period and ends with its stop; only its
+number and its user come back, for a new, empty unit, and the refill sets the idle limits again
+because a runtime property outlives the stop of its unit.
+
+**One writer.** A slot's name says nothing of the database, so the pool enforces what one unit name
+per database used to: it binds no database while any slot holds it in any state, in any generation
+of its volume, until the slot has reached `inactive`; and the supervisor takes `flock` on the data
+directory before it executes PostgreSQL (the agent try-locks it before every bind and holds it while
+it writes a sleeping database's configuration). PostgreSQL's own guard cannot do it across two
+users: `kill(pid, 0)` of another user's process is `EPERM`, which `miscinit.c` takes for a stale
+`postmaster.pid`, and a segment in another IPC namespace is not found (the slot lab shows the second
+postmaster coming up without the lock).
+
+**The archive socket** knows a caller by the slot that holds it: the pool's table says which
+database a slot's uid belongs to, and only a process in that slot's cgroup and invocation (read from
+`/proc/<pid>/cgroup` and the `trusted.invocation_id` systemd keeps on the cgroup) is the holder's. A
+uid with no database now gets `peer_unknown`.
+
+**Adoption.** The table is never written to disk. When the agent starts it reads the units, each
+main process, `/proc/<pid>/exe`, its mount table and `/proc/locks` (`Pool::adopt`): an idle slot
+stays; one that holds a database it was never ordered to run, or whose postmaster does not hold the
+lock, is stopped and its database stays asleep; one whose PostgreSQL runs is kept, ready or still
+starting; one that is stopping is waited for, and its database is then decided by its control file.
+The units of their own that an earlier agent started are served and put to sleep as before, and the
+archive socket knows their callers by uid until they sleep; the release after the one that finds
+none left deletes that path.
+
+**The health check** runs the scratch database in the slot of its own (number 1023), so it takes no
+idle slot of the agent's pool and leaves none.
+
 ## What the agent keeps
 
 | Where                                          | What                                                                                                                                                                                                        |
@@ -84,7 +136,8 @@ every flow updates in small steps.
 | `/var/lib/pgcf/enrollment/seed.json`           | The installer's seed, deleted after the enrollment                                                                                                                                                          |
 | `/var/lib/pgcf/bin/<release>/`, `bin/current`  | The binaries of each release and the link to the one that runs                                                                                                                                              |
 | `/run/pgcf/<id>`                               | The database's socket directory (`pgcf-<id>:pgcf-gateway`, 0750), made again for every database when the agent starts                                                                                       |
-| `/run/pgcf/agent/gateway.sock`, `archive.sock` | The gateway's channel (the gateway's user only) and the archive socket (the databases, known by uid)                                                                                                        |
+| `/run/pgcf/slot/<n>/control`                   | A slot's supervisor socket (`RuntimeDirectory=` of the unit, mode 0700 for the slot's user; only root is served)                                                                                              |
+| `/run/pgcf/agent/gateway.sock`, `archive.sock` | The gateway's channel (the gateway's user only) and the archive socket (the databases, known by the slot that holds them)                                                                                     |
 
 `layout.rs` names the volumes, the agent's own directory, the databases' files, the jobs and the
 sockets, and tests give it another root. The rest are named where they are used: `credentials/`,
@@ -119,8 +172,8 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   background after the next start, where it competes with the first queries for the disk. Two of
   the worker slots are its leader and its worker; the sleep guard does not count its worker as a
   session.
-- **Readahead** (`prefetch.rs`, built, not called by any flow yet). Before a request the agent can
-  ask the kernel to read a sleeping database's hot files ahead with `posix_fadvise(WILLNEED)`:
+- **Readahead** (`prefetch.rs`, called from `agent/readahead.rs`). Before a request the agent
+  asks the kernel to read a sleeping database's hot files ahead with `posix_fadvise(WILLNEED)`:
   the catalog set (`pg_control`, 256 KiB of WAL at the latest checkpoint, `global/`, and in each
   user database its `PG_VERSION`, `pg_filenode.map` and the login's catalogs with their indexes
   and forks; about 5 MB) and the autoprewarm list (blocks merged where contiguous, the relations
@@ -134,9 +187,13 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   only the real directories of `base/` (at most 32 databases) whatever the list names, stops after
   512 files of a list that are not there, and stops at a budget and a cancel as the issuing does.
   Issuing stops at a time budget, a byte bound or a cancel and returns the counts, the bytes the
-  cache already held and the timings; they take the place of the residency diagnostic that
-  `cache.rs` made while a wake ran (deleted) once a flow calls it. `pg_internal.init` is left out:
-  PostgreSQL removes it at every start.
+  cache already held and the timings; they go to an event (`prefetch`: set, hook, why it ended and
+  the counts), which takes the place of the residency diagnostic that `cache.rs` made while a wake
+  ran (deleted). `pg_internal.init` is left out: PostgreSQL removes it at every start. Two hooks,
+  and a constant of the build (`readahead::PREFETCH`, not a policy of the node) says which run: the
+  hot list from ready with a budget of 150 ms (shipped), and the catalogs at the bind (code, off
+  until the interleaved A/B on the pooled path). `settings::AUTOPREWARM` is the build's other
+  switch, for the A/B arm without PostgreSQL's own autoprewarm.
 - **Login.** The node's root reaches the cluster's superuser `postgres` by peer authentication
   through `pg_ident.conf`; the backup role `pgcf_backup` is reached by the database's own Linux user
   the same way; every other role logs in over the socket with SCRAM-SHA-256. Replication connections
@@ -169,14 +226,15 @@ plan 9.3, "Changing the page"; it is written there once.
 
 - **Wake.** The gateway holds the client's startup and sends the agent the wake before it answers
   the upgrade. The agent checks the ticket against its page and volume, reads `pg_control` and
-  compares it with the proven-sleep record, passes admission, starts the unit and waits for the job
-  that ends at `READY=1`. It hands the gateway the unit's socket, uid, main PID and invocation ID in
-  the writer table, applies the database's CPU quota `cpu_boost_ms` after the release (at once when
-  that is 0; a build and a restart of the agent apply it at once, and a base backup that begins
-  inside the burst applies it first) and reports the phases of the wake as events; about 2 s later
-  a `wake_detail` event adds the split of the start, the CPU quota's throttling and the steal time.
-  A wake it already serves is answered
-  `wake_in_progress`, which is no result.
+  compares it with the proven-sleep record, passes admission, takes a slot, binds the database to
+  it, orders PostgreSQL to execute and waits until it is ready (see Slots). It hands the gateway the
+  slot's socket, uid, main PID and invocation ID in the writer table, applies the database's CPU
+  quota `cpu_boost_ms` after the release (at once when that is 0; a build and a restart of the agent
+  apply it at once, and a base backup that begins inside the burst applies it first), reads the hot
+  list ahead and reports the phases of the wake as events; about 2 s later a `wake_detail` event adds
+  the slot's origin and what the bind and the order took, the split of the start, the CPU quota's
+  throttling and the steal time. A wake it already serves is answered `wake_in_progress`, which is
+  no result.
 - **Sleep.** After the database's idle time the agent runs the sleep proof (plan 7.9): the gateway
   quiesces and closes idle sessions, the guard refuses while a session is busy or a transaction is
   prepared (`power_busy`), a checkpoint and a WAL switch close the last segment, the upload log must
@@ -271,6 +329,14 @@ runs as root on a systemd host inside `systemd-run --wait --pipe -p PrivateMount
 namespace and propagation of `pgcf-agent.service`, where every mount is shared (its header says
 how). A namespace made with `unshare --mount --propagation slave` has private mounts and hides a
 clone that is still a peer of the agent's mount, so the lab refuses it.
+`units/slot_lab.rs` runs the pool against the real stack (systemd, the kernel, the supervisor and a
+PostgreSQL 18): a database in a pooled slot, the one-writer lock and the hole it closes, readiness
+by `inotify` against the postmaster's `READY=1`, the reset of a slot's limits, the memory of idle
+slots, adoption after the agent dies and after a boot, and the bind's time against the agent's
+size. It is built only with `RUSTFLAGS='--cfg pgcf_slot_lab'` and runs as root on a systemd host
+with the image's `pgcf-slot@.service`, `pgcf.slice`, the supervisor at
+`/usr/libexec/pgcf/pgcf-archive` and PostgreSQL 18, inside `systemd-run --wait --pipe -p
+PrivateMounts=yes <test binary> --ignored --test-threads=1 units::slot_lab` (its header says how).
 `start_lab.rs` is the agent's start on a node with 300 databases, on the same real parts and with a
 disk that is slow to flush (its header says how to run it); the numbers it gave are in the plan
 (11.1, "Agent start and stop at 300 databases").

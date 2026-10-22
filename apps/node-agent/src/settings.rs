@@ -83,6 +83,12 @@ fn plain(text: &str) -> bool {
             .all(|b| b.is_ascii_graphic() && b != b'\'' && b != b'\\')
 }
 
+/// Whether PostgreSQL's own autoprewarm reads the list of the shared buffers after a start: the
+/// build's decision (`readahead`'s interleaved A/B has an arm that turns it off), not the node's.
+/// Off, the library stays loaded and the worker does not run, so no list is written at a stop and
+/// the readahead of the hot list reads the last one there is.
+pub const AUTOPREWARM: bool = true;
+
 /// `postgresql.conf`. `None` for a setting that cannot be written as it is.
 ///
 /// Every database runs autoprewarm: PostgreSQL's `pg_prewarm` library, loaded at start, writes the
@@ -117,7 +123,7 @@ pub fn postgresql_conf(settings: &Settings) -> Option<String> {
          huge_pages = off\n\
          jit = off\n\
          shared_preload_libraries = 'pg_prewarm'\n\
-         pg_prewarm.autoprewarm = on\n\
+         pg_prewarm.autoprewarm = {autoprewarm}\n\
          pg_prewarm.autoprewarm_interval = 0\n\
          wal_level = replica\n\
          {archive}\
@@ -130,6 +136,7 @@ pub fn postgresql_conf(settings: &Settings) -> Option<String> {
          password_encryption = scram-sha-256\n\
          log_line_prefix = '%m [%p] %q%u@%d '\n",
         max_connections = settings.max_connections,
+        autoprewarm = if AUTOPREWARM { "on" } else { "off" },
         shared = tuning.shared_buffers_mib,
         cache = tuning.effective_cache_size_mib,
         work = tuning.work_mem_mib,
@@ -354,6 +361,18 @@ mod tests {
         // The class boundary is the plan's: 512 MiB is small, one more is not.
         assert!(conf(512, 1).contains("max_wal_senders = 0"));
         assert!(!conf(513, 1).contains("max_wal_senders"));
+    }
+
+    /// The build decides whether PostgreSQL's own autoprewarm reads the list, and ships it on,
+    /// the measured variant; the text follows the constant.
+    #[test]
+    fn the_build_ships_autoprewarm_on_and_the_configuration_follows_it() {
+        assert!(AUTOPREWARM);
+        let text = conf(256, 1);
+        let line = text
+            .lines()
+            .find_map(|l| l.strip_prefix("pg_prewarm.autoprewarm = "));
+        assert_eq!(line, Some(if AUTOPREWARM { "on" } else { "off" }));
     }
 
     /// Every class runs autoprewarm: the library loads at start, the list of shared buffers is

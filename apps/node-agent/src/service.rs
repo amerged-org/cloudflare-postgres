@@ -251,6 +251,7 @@ impl<M: Machine> Service<M> {
                 fences,
                 policy,
                 timing: config.timing.clone(),
+                prefetch: crate::agent::PREFETCH,
             },
             running,
         );

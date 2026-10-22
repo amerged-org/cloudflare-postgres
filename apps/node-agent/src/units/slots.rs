@@ -525,7 +525,7 @@ impl<H: Host> Pool<H> {
             .get(&slot)
             .and_then(|held| held.invocation_id.clone())
             .ok_or(Error::Unexpected("a slot without an invocation"))?;
-        crate::timing::emit_event(json!({
+        crate::timing::log_line(json!({
             "event": "slot_bound", "database_id": database, "slot": slot,
             "invocation": invocation_id, "slot_from": from.word(),
         }));
@@ -589,7 +589,11 @@ impl<H: Host> Pool<H> {
                 return Err(error);
             }
         };
-        self.set_state(bound.slot, State::Serving(bound.database.clone()));
+        self.set_state_from(
+            bound.slot,
+            &State::Starting(bound.database.clone()),
+            State::Serving(bound.database.clone()),
+        );
         let micros = |duration: Duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
         Ok(Started {
             main_pid: pid,
@@ -896,7 +900,7 @@ impl<H: Host> Pool<H> {
             ours.then(|| table.slots.remove(&slot)).flatten()
         };
         if removed.is_some() {
-            crate::timing::emit_event(json!({
+            crate::timing::log_line(json!({
                 "event": "slot_ended", "database_id": database, "slot": slot, "reason": reason,
             }));
         }
@@ -995,7 +999,8 @@ impl<H: Host> Pool<H> {
         }
         let slot = self.reserve()?;
         let spawned = self.build(slot).await?;
-        crate::timing::emit_event(json!({
+        // The wake's own detail has what this one cost; the line is for the node's log.
+        crate::timing::log_line(json!({
             "event": "slot_spawned", "slot": slot, "invocation": spawned.invocation_id,
             "cause": "demand",
         }));
@@ -1019,7 +1024,7 @@ impl<H: Host> Pool<H> {
         if self.finish_stop(slot).await
             && let Some(database) = database
         {
-            crate::timing::emit_event(json!({
+            crate::timing::log_line(json!({
                 "event": "slot_ended", "database_id": database, "slot": slot,
                 "reason": "aborted",
             }));
@@ -1871,6 +1876,39 @@ mod tests {
         assert!(started.socket.ends_with(".s.PGSQL.5432"));
         assert_eq!(SlotFrom::Pool.word(), "pool");
         assert_eq!(SlotFrom::Demand.word(), "demand");
+    }
+
+    /// The fork of the supervisor and the executor's handoff are part of a wake's timeline only
+    /// when the slot was built inside it; the three messages of PostgreSQL's start are counted from
+    /// the order, which the journal of a machine without one cannot give.
+    #[tokio::test]
+    async fn a_timeline_has_the_slots_fork_and_handoff_only_for_a_slot_built_on_demand() {
+        let (sim, data) = (Sim::new(), data_directory("timeline"));
+        let pool = pool(&sim);
+        let miss = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
+        let started = pool.exec(&miss).await.unwrap();
+        let timeline = pool.timeline(D1, &started).await.unwrap();
+        // Sim's unit was asked to start at 1, forked at 100 and handed over at 160 (microseconds).
+        assert_eq!(timeline.job_to_fork_us, Some(99));
+        assert_eq!(timeline.fork_to_handoff_us, Some(60));
+        assert!(timeline.startup.is_none(), "no journal here");
+        assert!(pool.stop(D1).await.unwrap());
+
+        pool.refill(1).await.unwrap();
+        let hit = pool.bind(D2, &bind_of(D2, 1, &data)).await.unwrap();
+        assert_eq!(hit.from, SlotFrom::Pool);
+        let started = pool.exec(&hit).await.unwrap();
+        let timeline = pool.timeline(D2, &started).await.unwrap();
+        assert_eq!((timeline.job_to_fork_us, timeline.fork_to_handoff_us), (None, None));
+        // A start that is another invocation's has no timeline: the slot started again since.
+        let other = Started {
+            invocation_id: "00000000-0000-4000-8000-0000000000ff".into(),
+            ..started
+        };
+        assert_eq!(
+            pool.timeline(D2, &other).await.unwrap(),
+            crate::units::Timeline::default()
+        );
     }
 
     // The archive socket's holder.
