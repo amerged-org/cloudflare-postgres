@@ -174,7 +174,10 @@ impl<M: Machine> Core<M> {
         Ok((files, hash))
     }
 
-    /// Writes the cluster's configuration; its hash is returned. The unit must be stopped.
+    /// Writes the cluster's configuration; its hash is returned. No PostgreSQL may run on the
+    /// cluster: the agent holds the same lock a slot's supervisor takes before it executes
+    /// PostgreSQL while it writes, so a postmaster (or a backend that outlived one) that holds the
+    /// data directory refuses the write, and a slot that is bound meanwhile is refused.
     pub(crate) fn write_configuration(
         &self,
         entry: &Entry,
@@ -182,6 +185,7 @@ impl<M: Machine> Core<M> {
     ) -> Result<String, Error> {
         let (files, hash) = self.configuration(entry, account)?;
         let data = self.layout().data(&entry.id);
+        let _lock = crate::units::slots::DataLock::try_new(&data)?;
         for (name, content) in &files {
             write_owned(&data, name, content, account)?;
         }
@@ -210,8 +214,8 @@ impl<M: Machine> Core<M> {
         Ok(())
     }
 
-    /// The limits of a database's unit for its size.
-    fn limits(&self, entry: &Entry, volume: &VolumeId) -> Limits {
+    /// The limits of a database's slot for its size.
+    pub(crate) fn limits(&self, entry: &Entry, volume: &VolumeId) -> Limits {
         let policy = self.policy();
         Limits {
             memory_mib: entry.memory_mib,
@@ -226,7 +230,8 @@ impl<M: Machine> Core<M> {
         }
     }
 
-    /// Sets the unit's limits for the database's size: persistent properties, running or not.
+    /// Sets the limits of the database's size on the slot that runs it, now. A database that
+    /// sleeps holds no slot: its limits are those of its entry when it binds one.
     pub(crate) async fn apply_limits(&self, entry: &Entry) -> Result<(), Error> {
         let volume = Self::volume_id(entry).ok_or("the database has no volume")?;
         self.machine
@@ -490,9 +495,6 @@ impl<M: Machine> Core<M> {
             .map_err(|_| build_failed!())?;
         self.save_state(db, |state| state.config = Some(config))
             .map_err(|_| build_failed!())?;
-        self.apply_limits(entry)
-            .await
-            .map_err(|_| build_failed!())?;
         self.ensure_archive(db, entry);
         let (started, ..) = self
             .start_unit(
@@ -569,9 +571,6 @@ impl<M: Machine> Core<M> {
             .ok_or("archive_unusable")?;
         self.begin_state(db, entry)?;
         let (account, volume) = self.provision(entry).await?;
-        self.apply_limits(entry)
-            .await
-            .map_err(|_| build_failed!())?;
         // The restore writes the generation it builds: its device, whatever the database's link
         // names.
         let job_database = self.job_database(&volume, &account.name);

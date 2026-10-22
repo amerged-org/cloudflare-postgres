@@ -1343,8 +1343,8 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
     ["with-events", { ...observations(), events: [reportEvent] }, true],
     [
-      // The `wake_detail` of a wake on the slot path has 19 fields: the 15 of today's detail
-      // and `slot_from`, `slot_wait_us`, `bind_us` and `order_us`. The bound has to hold them.
+      // The `wake_detail` of a wake on the slot path has 13 fields: the 9 of the detail and
+      // `slot_from`, `slot_wait_us`, `bind_us` and `order_us`. The bound has to hold them.
       "event-with-the-fields-of-a-wake-on-the-slot-path",
       {
         ...observations(),
@@ -1360,19 +1360,13 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
               order_us: 1_200,
               job_to_fork_us: 2_300,
               fork_to_handoff_us: 33_886,
-              handoff_to_starting_us: 12_840,
+              order_to_starting_us: 12_840,
               starting_to_shut_down_us: 1_605,
               shut_down_to_ready_us: 1_522,
               nr_throttled: 2,
               throttled_usec: 7_500,
               steal_ms: 30,
               steal_window_ms: 2_000,
-              cache_files: 41,
-              cache_pages: 16_384,
-              cache_resident: 10_240,
-              cache_dirty: 7,
-              cache_evicted: 5_900,
-              cache_recently_evicted: 310,
             },
           },
         ],

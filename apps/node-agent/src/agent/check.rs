@@ -8,7 +8,9 @@
 //! The scratch database belongs to no page, so nothing of Cloudflare's reaches it: it has no
 //! archive, no roles and no admission, and it is not the agent's to place, wake or delete. Its
 //! user is a system account of the system's own range, so the agent's table of uids is never
-//! written by a second process.
+//! written by a second process. It starts as every database does, in a slot, but in the slot
+//! the check alone has (`slots::CHECK_SLOT`): it never takes an idle slot of the agent's pool and
+//! never finds one, and a check that was killed leaves a slot that the next one adopts.
 use super::build::write_owned;
 use crate::{
     Error,
@@ -16,6 +18,7 @@ use crate::{
     postgres, settings,
     settings::Settings,
     storage::{self, VolumeId},
+    units::{limits::Limits, slots::Bind},
 };
 use std::time::Duration;
 
@@ -25,6 +28,7 @@ pub const SCRATCH: &str = "pgcfcheckscratch0000";
 const VOLUME_BYTES: u64 = 1 << 30;
 const MEMORY_MIB: u64 = 256;
 const MAX_CONNECTIONS: u32 = 10;
+const TASKS_MAX: u64 = 64;
 const ARCHIVE_TIMEOUT_SECONDS: u32 = 60;
 
 /// What a check found.
@@ -32,7 +36,7 @@ const ARCHIVE_TIMEOUT_SECONDS: u32 = 60;
 pub struct Checked {
     /// Whether this call made the scratch database; later calls wake it.
     pub created: bool,
-    /// The uid the postmaster ran as, which is the database's own user.
+    /// The uid the postmaster ran as, which is its slot's.
     pub uid: u32,
 }
 
@@ -51,7 +55,8 @@ pub async fn run<M: Machine>(machine: &M, account: &Account) -> Result<Checked, 
     let volume = VolumeId::new(SCRATCH, 1)?;
     let layout = machine.layout();
     let data = layout.data(SCRATCH);
-    // A call that was killed left the unit running; the files are rewritten only while it is down.
+    // A call that was killed left its slot running; the files are rewritten only while it is down.
+    machine.adopt_slots().await?;
     machine.stop(SCRATCH).await?;
     machine.poll_pool().await?;
     // Finishes what an earlier call left: it makes the volume and its filesystem, or only mounts it.
@@ -95,9 +100,24 @@ async fn answer<M: Machine>(
     account: &Account,
     data: &std::path::Path,
 ) -> Result<u32, Error> {
-    let started = machine.start(SCRATCH).await?;
-    if started.uid != account.uid {
-        return Err("the scratch database runs as another user".into());
+    let volume = VolumeId::new(SCRATCH, 1)?;
+    let bind = Bind {
+        device: machine.device(&volume).into(),
+        data: machine.layout().data(SCRATCH),
+        properties: Limits {
+            memory_mib: MEMORY_MIB,
+            cpu_millicores: 1000,
+            tasks_max: TASKS_MAX,
+            io: None,
+        }
+        .properties(),
+        volume,
+        account: account.clone(),
+    };
+    let bound = machine.bind(SCRATCH, &bind).await?;
+    let started = machine.exec(&bound).await?;
+    if started.slot.is_none() {
+        return Err("the scratch database did not start in a slot".into());
     }
     let session = postgres::agent(&machine.layout().socket_directory(SCRATCH)).await?;
     let rows = session
@@ -146,6 +166,29 @@ mod tests {
         assert!(!machine.running(SCRATCH));
         assert_eq!(identity(&machine), made, "the same cluster, not a new one");
         assert_eq!(machine.volumes().len(), 1);
+    }
+
+    /// The check starts the scratch database as every database starts, in a slot, but in the one
+    /// that is its own: the process of `pgcf-agent check` has no other, so it can neither take an
+    /// idle slot of the agent's pool nor leave one behind.
+    #[tokio::test]
+    async fn the_check_runs_in_the_slot_of_its_own_and_no_other() {
+        let Some(machine) = Local::for_check("check-slot") else {
+            return;
+        };
+        let account = machine.ensure_account(SCRATCH).await.unwrap();
+        run(&machine, &account).await.unwrap();
+        let slots: Vec<u64> = crate::events::seen()
+            .into_iter()
+            .filter(|event| event["event"] == "slot_bound" && event["database_id"] == SCRATCH)
+            .filter_map(|event| event["fields"]["slot"].as_u64())
+            .collect();
+        assert_eq!(slots, [u64::from(crate::units::slots::CHECK_SLOT)]);
+        assert_eq!(
+            machine.slots(),
+            crate::units::slots::Snapshot::default(),
+            "the slot is free again"
+        );
     }
 
     #[tokio::test]

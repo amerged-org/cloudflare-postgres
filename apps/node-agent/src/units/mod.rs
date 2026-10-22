@@ -237,10 +237,6 @@ pub struct UnitState {
     pub slot: Option<u32>,
 }
 impl UnitState {
-    /// A unit that systemd has not loaded: it has no process.
-    fn not_loaded(database: &str) -> Self {
-        Self::of(database, Raw::not_loaded())
-    }
     /// The database's unit of its own (`pgcf-pg@`), as systemd says it is.
     pub fn of(database: &str, raw: Raw) -> Self {
         Self {
@@ -586,10 +582,7 @@ impl Units {
     /// The names of the loaded units that match `pattern` (`ListUnitsByPatterns`), whatever their
     /// state.
     pub(crate) async fn loaded(&self, pattern: &str) -> Result<Vec<String>, Error> {
-        let listed = self
-            .manager
-            .list_units_by_patterns(&[], &[pattern])
-            .await?;
+        let listed = self.manager.list_units_by_patterns(&[], &[pattern]).await?;
         Ok(listed.into_iter().map(|row| row.0).collect())
     }
 

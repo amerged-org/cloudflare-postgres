@@ -457,7 +457,7 @@ async fn a_start_has_a_timeline_of_the_fork_the_handoff_and_the_journals_three_m
         .startup
         .expect("the three messages of the start, the first after the handoff");
     for gap in [
-        startup.handoff_to_starting_us,
+        startup.order_to_starting_us,
         startup.starting_to_shut_down_us,
         startup.shut_down_to_ready_us,
     ] {

@@ -459,19 +459,13 @@ mod tests {
             "order_us",
             "job_to_fork_us",
             "fork_to_handoff_us",
-            "handoff_to_starting_us",
+            "order_to_starting_us",
             "starting_to_shut_down_us",
             "shut_down_to_ready_us",
             "nr_throttled",
             "throttled_usec",
             "steal_ms",
             "steal_window_ms",
-            "cache_files",
-            "cache_pages",
-            "cache_resident",
-            "cache_dirty",
-            "cache_evicted",
-            "cache_recently_evicted",
         ];
         for (n, name) in numbers.iter().enumerate() {
             line[*name] = (n as u64 + 1).into();

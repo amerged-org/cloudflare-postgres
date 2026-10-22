@@ -86,6 +86,8 @@ fn units_code(error: &crate::units::Error) -> String {
         }
         Error::Job { result, .. } => format!("job_{}", slug(result)),
         Error::NotReady(reason) => format!("not_ready_{}", slug(reason)),
+        Error::Refused(word) => format!("refused_{}", slug(word)),
+        Error::Io(error) => io_code(error),
         other => format!("units_{}", variant(other)),
     }
 }

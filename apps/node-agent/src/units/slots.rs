@@ -86,7 +86,8 @@ pub fn slot_uid(slot: u32) -> u32 {
 }
 /// The slot a uid belongs to, if it is one of the slots'.
 pub fn slot_of_uid(uid: u32) -> Option<u32> {
-    uid.checked_sub(SLOT_FIRST_UID).filter(|slot| *slot < SLOT_COUNT)
+    uid.checked_sub(SLOT_FIRST_UID)
+        .filter(|slot| *slot < SLOT_COUNT)
 }
 /// The name of slot `slot`'s user and group.
 pub fn slot_account(slot: u32) -> String {
@@ -249,6 +250,9 @@ pub struct Spawned {
 /// The supervisor's answer to an order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ordered {
+    /// The slot's main process once the order is carried out: the supervisor's own, which
+    /// replaced itself with PostgreSQL.
+    pub main_pid: u32,
     /// When the agent sent the order (`CLOCK_MONOTONIC`).
     pub sent_us: Option<u64>,
     pub took: Duration,
@@ -279,6 +283,8 @@ pub trait Host: Send + Sync + 'static {
     fn ping(&self, slot: u32) -> impl Future<Output = Result<(), Error>> + Send;
     /// Whether the slot's main process still lives (its pidfd is not readable).
     fn alive(&self, slot: u32) -> bool;
+    /// The uid the slot's process runs as: the slot user's, which PostgreSQL then runs as.
+    fn uid(&self, slot: u32) -> u32;
     /// Moves the database's volume and socket directory into the slot's mount namespace.
     fn mount(&self, slot: u32, bind: &Bind) -> impl Future<Output = Result<(), Error>> + Send;
     /// Sends `exec <database> <major>` and waits for the answer.
@@ -414,6 +420,10 @@ impl<H: Host> Pool<H> {
     pub fn host(&self) -> &H {
         &self.host
     }
+    /// The slot numbers this pool uses.
+    pub fn range(&self) -> Range<u32> {
+        self.range.clone()
+    }
     fn table(&self) -> MutexGuard<'_, Table> {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -435,6 +445,22 @@ impl<H: Host> Pool<H> {
             spawning: count(|state| *state == State::Spawning),
             held: count(|state| state.database().is_some()),
         }
+    }
+
+    /// Every database a slot holds.
+    pub fn databases(&self) -> Vec<String> {
+        self.table()
+            .slots
+            .values()
+            .filter_map(|held| held.state.database().map(str::to_string))
+            .collect()
+    }
+
+    /// How the agent reads the database's unit when its slot's unit is `active`: `None` when no
+    /// slot holds it. A slot is `active` as soon as its supervisor is idle, so the unit of a
+    /// database that is not ready is `activating`.
+    pub fn view_of(&self, database: &str, active: ActiveState) -> Option<ActiveState> {
+        Some(view(&self.held(database)?.1.state, active))
     }
 
     /// The slot that holds the database, in any state.
@@ -506,7 +532,7 @@ impl<H: Host> Pool<H> {
         Ok(Bound {
             slot,
             database: database.to_string(),
-            uid: slot_uid(slot),
+            uid: self.host.uid(slot),
             invocation_id,
             from,
             wait,
@@ -521,9 +547,9 @@ impl<H: Host> Pool<H> {
     /// WAL. A refusal of the supervisor, or a PostgreSQL that ends before it is ready, stops the
     /// slot; the database is then decided by its control file.
     pub async fn exec(&self, bound: &Bound) -> Result<Started, Error> {
-        let (pid, volume) = {
+        {
             let table = self.table();
-            let held = table
+            table
                 .slots
                 .get(&bound.slot)
                 .filter(|held| {
@@ -531,12 +557,7 @@ impl<H: Host> Pool<H> {
                         && held.invocation_id.as_deref() == Some(bound.invocation_id.as_str())
                 })
                 .ok_or(Error::Unexpected("the slot is not bound to this start"))?;
-            (
-                held.main_pid
-                    .ok_or(Error::Unexpected("a slot without a process"))?,
-                held.volume.clone(),
-            )
-        };
+        }
         let ordered = match self.host.order(bound.slot, &bound.database).await {
             Ok(ordered) => ordered,
             Err(error) => {
@@ -550,21 +571,25 @@ impl<H: Host> Pool<H> {
                 return Err(error);
             }
         };
-        self.set_state(bound.slot, State::Starting(bound.database.clone()));
+        let pid = ordered.main_pid;
+        if let Some(held) = self.table().slots.get_mut(&bound.slot) {
+            held.state = State::Starting(bound.database.clone());
+            held.main_pid = Some(pid);
+        }
         let starting = Instant::now();
-        let socket = match self
-            .host
-            .ready(bound.slot, &bound.database, pid)
-            .await
-        {
+        let socket = match self.host.ready(bound.slot, &bound.database, pid).await {
             Ok(socket) => socket,
             Err(error) => {
-                self.abort(bound.slot).await;
+                // PostgreSQL that ended is over, and its slot with it. What could not be observed
+                // is no evidence that PostgreSQL failed: it runs on, and the agent that asked
+                // learns of it from the unit.
+                if matches!(error, Error::NotReady("exited")) {
+                    self.abort(bound.slot).await;
+                }
                 return Err(error);
             }
         };
         self.set_state(bound.slot, State::Serving(bound.database.clone()));
-        let _ = volume;
         let micros = |duration: Duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
         Ok(Started {
             main_pid: pid,
@@ -604,7 +629,7 @@ impl<H: Host> Pool<H> {
             invocation_id: held
                 .invocation_id
                 .ok_or(Error::NotReady("no_invocation_id"))?,
-            uid: slot_uid(slot),
+            uid: self.host.uid(slot),
             socket,
             requested_us: None,
             slot: None,
@@ -633,7 +658,13 @@ impl<H: Host> Pool<H> {
             return Ok(None);
         };
         let unit = self.host.unit(slot).await?;
-        Ok(Some(unit_state(database, slot, &held, &unit)))
+        Ok(Some(unit_state(
+            database,
+            slot,
+            self.host.uid(slot),
+            &held,
+            &unit,
+        )))
     }
 
     /// The units of every database that a slot holds.
@@ -648,7 +679,13 @@ impl<H: Host> Pool<H> {
             .collect();
         futures_util::future::try_join_all(held.iter().map(|(database, slot, held)| async move {
             let unit = self.host.unit(*slot).await?;
-            Ok::<_, Error>(unit_state(database, *slot, held, &unit))
+            Ok::<_, Error>(unit_state(
+                database,
+                *slot,
+                self.host.uid(*slot),
+                held,
+                &unit,
+            ))
         }))
         .await
     }
@@ -759,7 +796,12 @@ impl<H: Host> Pool<H> {
     /// waited for. The agent decides on each database afterwards, from its volume, and the units
     /// it reads (`state`) are the slots' own.
     pub async fn adopt(&self) -> Result<Adopted, Error> {
-        self.table().users = self.host.users();
+        // An agent that starts remembers nothing: what it finds is what the kernel says.
+        {
+            let mut table = self.table();
+            table.slots.clear();
+            table.users = self.host.users();
+        }
         let units = self.host.units().await?;
         let mut adopted = Adopted::default();
         let mut stopping = Vec::new();
@@ -1058,8 +1100,10 @@ impl<H: Host> Pool<H> {
                 let (database, volume) = facts.databases[0].clone();
                 match facts.postmaster {
                     Some(ready::Status::Ready) => Class::Serving(database, volume),
-                    Some(ready::Status::Starting) => Class::Starting(database, volume),
-                    _ => Class::Stop {
+                    // It holds the lock and has not written a status yet, or says it starts: the
+                    // order was carried out and PostgreSQL comes up.
+                    Some(ready::Status::Starting) | None => Class::Starting(database, volume),
+                    Some(ready::Status::Stopping | ready::Status::Standby) => Class::Stop {
                         database: Some(database),
                         tainted: false,
                     },
@@ -1088,20 +1132,24 @@ enum Class {
 /// The database's unit as the agent reads it: the slot's, with the states a slot has that a unit
 /// of its own did not. A slot is `active` as soon as its supervisor is idle, so the unit of a
 /// database that is not ready is `activating`.
-fn unit_state(database: &str, slot: u32, held: &Slot, unit: &SlotUnit) -> UnitState {
-    let active = match (&held.state, unit.active) {
+fn unit_state(database: &str, slot: u32, uid: u32, held: &Slot, unit: &SlotUnit) -> UnitState {
+    UnitState {
+        database: database.to_string(),
+        active: view(&held.state, unit.active),
+        main_pid: unit.main_pid,
+        invocation_id: unit.invocation_id.clone(),
+        uid: Some(uid),
+        memory_max_bytes: unit.memory_max_bytes,
+        slot: Some(slot),
+    }
+}
+
+/// The unit's active state as the agent reads it, from the slot's state and systemd's.
+fn view(state: &State, active: ActiveState) -> ActiveState {
+    match (state, active) {
         (State::Taken(_) | State::Starting(_), ActiveState::Active) => ActiveState::Activating,
         (State::Stopping(_), ActiveState::Active) => ActiveState::Deactivating,
         (_, active) => active,
-    };
-    UnitState {
-        database: database.to_string(),
-        active,
-        main_pid: unit.main_pid,
-        invocation_id: unit.invocation_id.clone(),
-        uid: Some(slot_uid(slot)),
-        memory_max_bytes: unit.memory_max_bytes,
-        slot: Some(slot),
     }
 }
 
@@ -1193,7 +1241,9 @@ mod tests {
             state.locks.retain(|_, held| *held != slot);
         }
         fn properties(&self, slot: u32) -> Vec<Property> {
-            self.unit_of(slot).map(|unit| unit.properties).unwrap_or_default()
+            self.unit_of(slot)
+                .map(|unit| unit.properties)
+                .unwrap_or_default()
         }
     }
     fn refused(call: &'static str) -> Error {
@@ -1322,6 +1372,9 @@ mod tests {
             self.unit_of(slot)
                 .is_some_and(|unit| unit.pid.is_some() && unit.active == ActiveState::Active)
         }
+        fn uid(&self, slot: u32) -> u32 {
+            slot_uid(slot)
+        }
         async fn mount(&self, slot: u32, bind: &Bind) -> Result<(), Error> {
             if self.failing("mount") {
                 return Err(refused("mount"));
@@ -1348,7 +1401,13 @@ mod tests {
                 unit.exe = Exe::Postgres;
                 unit.status = Some(ready::Status::Starting);
             }
+            let main_pid = state
+                .units
+                .get(&slot)
+                .and_then(|unit| unit.pid)
+                .unwrap_or(0);
             Ok(Ordered {
+                main_pid,
                 sent_us: Some(2),
                 took: Duration::from_micros(10),
             })
@@ -1432,7 +1491,10 @@ mod tests {
         let bound = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
         // Taken, bound, ordered and serving are all held; so is another generation of the volume.
         assert_eq!(
-            pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap_err().to_string(),
+            pool.bind(D1, &bind_of(D1, 1, &data))
+                .await
+                .unwrap_err()
+                .to_string(),
             Error::Held.to_string()
         );
         assert!(matches!(
@@ -1471,7 +1533,11 @@ mod tests {
             pool.bind(D1, &bind_of(D1, 1, &data)).await,
             Err(Error::Held)
         ));
-        assert!(sim.calls().is_empty(), "nothing was taken: {:?}", sim.calls());
+        assert!(
+            sim.calls().is_empty(),
+            "nothing was taken: {:?}",
+            sim.calls()
+        );
         drop(holder);
         pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
         // The agent's own lock, held while it writes a sleeping database's files, is a lock too.
@@ -1508,13 +1574,19 @@ mod tests {
             // An idle slot, so that the failure is the bind's and not the build's.
             pool.refill(1).await.unwrap();
             sim.fail_next(failing);
-            assert!(pool.bind(D1, &bind_of(D1, 1, &data)).await.is_err(), "{failing}");
+            assert!(
+                pool.bind(D1, &bind_of(D1, 1, &data)).await.is_err(),
+                "{failing}"
+            );
             assert!(
                 !sim.calls().iter().any(|call| call.starts_with("order")),
                 "{failing}: {:?}",
                 sim.calls()
             );
-            assert!(sim.calls().iter().any(|call| call.starts_with("stop")), "{failing}");
+            assert!(
+                sim.calls().iter().any(|call| call.starts_with("stop")),
+                "{failing}"
+            );
             assert_eq!(pool.slot_of(D1), None);
             assert_eq!(pool.snapshot(), Snapshot::default(), "{failing}");
             assert!(pool.holder(slot_uid(0)).is_none());
@@ -1548,7 +1620,13 @@ mod tests {
         assert_eq!(sim.calls(), ["set 1", "mount 1"]);
         // A miss on a slot whose user is there does not make it again.
         sim.clear();
-        let again = pool.bind("cdefghijkl2345678901", &bind_of("cdefghijkl2345678901", 1, &data)).await.unwrap();
+        let again = pool
+            .bind(
+                "cdefghijkl2345678901",
+                &bind_of("cdefghijkl2345678901", 1, &data),
+            )
+            .await
+            .unwrap();
         assert_eq!(again.from, SlotFrom::Demand);
         assert_eq!(again.slot, 2, "the lowest free number");
         assert_eq!(
@@ -1569,7 +1647,14 @@ mod tests {
         assert_eq!(pool.snapshot().idle, 1);
         assert_eq!(pool.refill(2).await.unwrap(), Some(1));
         assert_eq!(pool.refill(2).await.unwrap(), None);
-        assert_eq!(pool.snapshot(), Snapshot { idle: 2, spawning: 0, held: 0 });
+        assert_eq!(
+            pool.snapshot(),
+            Snapshot {
+                idle: 2,
+                spawning: 0,
+                held: 0
+            }
+        );
         // An idle slot whose supervisor ended is dropped, and a new one built in its place.
         sim.die(0);
         assert_eq!(pool.refill(2).await.unwrap(), Some(0));
@@ -1589,10 +1674,16 @@ mod tests {
         pool.refill(2).await.unwrap();
         let bound = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
         assert_eq!(pool.drain_idle().await, 1);
-        assert_eq!(pool.snapshot(), Snapshot { idle: 0, spawning: 0, held: 1 });
+        assert_eq!(
+            pool.snapshot(),
+            Snapshot {
+                idle: 0,
+                spawning: 0,
+                held: 1
+            }
+        );
         assert_eq!(sim.active(bound.slot), ActiveState::Active);
     }
-
 
     // 3. A crash at each step.
 
@@ -1609,7 +1700,14 @@ mod tests {
         let second = pool(&sim);
         let adopted = second.adopt().await.unwrap();
         assert_eq!(adopted.idle, [0]);
-        assert_eq!(second.snapshot(), Snapshot { idle: 1, spawning: 0, held: 0 });
+        assert_eq!(
+            second.snapshot(),
+            Snapshot {
+                idle: 1,
+                spawning: 0,
+                held: 0
+            }
+        );
         assert_eq!(sim.properties(0), crate::units::limits::idle());
         let hit = second.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
         assert_eq!(hit.from, SlotFrom::Pool);
@@ -1747,7 +1845,10 @@ mod tests {
         let bound = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
         assert!(pool.wait_started(D1).await.is_err());
         pool.exec(&bound).await.unwrap();
-        assert_eq!(pool.wait_started(D1).await.unwrap().invocation_id, bound.invocation_id);
+        assert_eq!(
+            pool.wait_started(D1).await.unwrap().invocation_id,
+            bound.invocation_id
+        );
     }
 
     /// The report of a start carries every step, and a hit differs from a miss in the slot step
@@ -1761,7 +1862,11 @@ mod tests {
         let started = pool.exec(&bound).await.unwrap();
         let report = started.slot.unwrap();
         assert_eq!((report.slot, report.from), (0, SlotFrom::Pool));
-        assert_eq!(started.requested_us, Some(2), "the order, not the unit's start");
+        assert_eq!(
+            started.requested_us,
+            Some(2),
+            "the order, not the unit's start"
+        );
         assert_eq!(started.uid, slot_uid(0));
         assert!(started.socket.ends_with(".s.PGSQL.5432"));
         assert_eq!(SlotFrom::Pool.word(), "pool");
@@ -1804,8 +1909,16 @@ mod tests {
             "00000000-0000-4000-8000-000000000001".to_string(),
         );
         assert!(is_holder(&holder, Some(&cgroup), Some(&invocation)));
-        assert!(!is_holder(&holder, Some(&slot_cgroup(8)), Some(&invocation)));
-        assert!(!is_holder(&holder, Some("/user.slice/session-1.scope"), Some(&invocation)));
+        assert!(!is_holder(
+            &holder,
+            Some(&slot_cgroup(8)),
+            Some(&invocation)
+        ));
+        assert!(!is_holder(
+            &holder,
+            Some("/user.slice/session-1.scope"),
+            Some(&invocation)
+        ));
         assert!(!is_holder(
             &holder,
             Some(&cgroup),

@@ -696,8 +696,8 @@ describe("what a node reports", () => {
     expect(accepted(Array.from({ length: 65 }, () => event))).toBe(false);
     const fields = (count: number) =>
       Object.fromEntries(Array.from({ length: count }, (_, i) => [`f${i}`, i]));
-    expect(accepted([{ ...event, fields: fields(24) }])).toBe(true);
-    expect(accepted([{ ...event, fields: fields(25) }])).toBe(false);
+    expect(accepted([{ ...event, fields: fields(16) }])).toBe(true);
+    expect(accepted([{ ...event, fields: fields(17) }])).toBe(false);
     for (const broken of [
       { event: "Wake" },
       { event: "a".repeat(49) },

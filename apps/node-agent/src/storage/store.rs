@@ -1327,7 +1327,6 @@ mod tests {
         assert!(serves(&[mount(11, &at)]).is_err());
     }
 
-
     /// A process that holds database volumes is told by its mount table alone: every mount
     /// directly below the databases' directory that is the volume of the database it is named for.
     /// The agent adopts a slot from this when it starts, with no mount of its own.

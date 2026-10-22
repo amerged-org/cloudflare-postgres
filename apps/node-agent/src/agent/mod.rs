@@ -345,6 +345,8 @@ pub struct Core<M: Machine> {
     meter: Meter,
     /// Something in `reports` changed.
     pub(crate) changed: Notify,
+    /// A start took a slot or ended: the pool may want another idle one (`refill_pass`).
+    pub(crate) refill: Notify,
     /// The maintenance orders whose databases all sleep with their proofs: the packages and the
     /// check follow, which the service does, since it reaches the files.
     slept: Mutex<Vec<String>>,
@@ -410,6 +412,7 @@ impl<M: Machine> Core<M> {
             reports: Mutex::new(report::Reports::default()),
             meter: Meter::load(layout.agent().join("usage.json")),
             changed: Notify::new(),
+            refill: Notify::new(),
             slept: Mutex::new(Vec::new()),
             slept_signal: Notify::new(),
         });

@@ -15176,19 +15176,13 @@
               "order_us": 1200,
               "job_to_fork_us": 2300,
               "fork_to_handoff_us": 33886,
-              "handoff_to_starting_us": 12840,
+              "order_to_starting_us": 12840,
               "starting_to_shut_down_us": 1605,
               "shut_down_to_ready_us": 1522,
               "nr_throttled": 2,
               "throttled_usec": 7500,
               "steal_ms": 30,
-              "steal_window_ms": 2000,
-              "cache_files": 41,
-              "cache_pages": 16384,
-              "cache_resident": 10240,
-              "cache_dirty": 7,
-              "cache_evicted": 5900,
-              "cache_recently_evicted": 310
+              "steal_window_ms": 2000
             }
           }
         ]
@@ -15291,15 +15285,7 @@
               "f13": 13,
               "f14": 14,
               "f15": 15,
-              "f16": 16,
-              "f17": 17,
-              "f18": 18,
-              "f19": 19,
-              "f20": 20,
-              "f21": 21,
-              "f22": 22,
-              "f23": 23,
-              "f24": 24
+              "f16": 16
             }
           }
         ]

@@ -9,7 +9,11 @@ use crate::{
     layout::Layout,
     link::NodeIdentity,
     storage::{self, Inventory, NoRoom, PoolSample, Removal, VolumeId},
-    units::{self, Started, Timeline, UnitState, limits::Limits},
+    units::{
+        self, Started, Timeline, UnitState,
+        limits::Limits,
+        slots::{Adopted, Bind, Bound, Snapshot},
+    },
     update,
 };
 use serde_json::{Value, json};
@@ -308,12 +312,23 @@ pub trait Machine: Send + Sync + 'static {
         data: &std::path::Path,
     ) -> impl Future<Output = io::Result<()>> + Send;
 
-    // ---- the units
+    // ---- the units: slots, and the units of their own that an earlier agent started
+    /// The database's unit: the slot that holds it, or its unit of its own.
     fn unit(&self, database: &str) -> impl Future<Output = Result<UnitState, units::Error>> + Send;
-    /// Every loaded database unit, whatever its state.
+    /// Every database a slot holds, and every loaded unit of its own, whatever its state.
     fn units(&self) -> impl Future<Output = Result<Vec<UnitState>, units::Error>> + Send;
-    /// Starts the unit and returns when PostgreSQL accepts connections.
-    fn start(&self, database: &str) -> impl Future<Output = Result<Started, units::Error>> + Send;
+    /// The first half of every start of PostgreSQL: takes an idle slot or builds one, and binds the
+    /// database to it (its limits and its two mounts). Nothing runs in it yet; the caller makes the
+    /// archive socket know it, then calls `exec`. `Held` while any slot, or its unit of its own,
+    /// holds the database.
+    fn bind(
+        &self,
+        database: &str,
+        bind: &Bind,
+    ) -> impl Future<Output = Result<Bound, units::Error>> + Send;
+    /// The second half: the order to execute PostgreSQL, and the wait for it to accept
+    /// connections.
+    fn exec(&self, bound: &Bound) -> impl Future<Output = Result<Started, units::Error>> + Send;
     /// What systemd and the journal recorded of the start that gave `started`: empty where the
     /// unit started again since.
     fn start_timeline(
@@ -321,13 +336,16 @@ pub trait Machine: Send + Sync + 'static {
         database: &str,
         started: &Started,
     ) -> impl Future<Output = Result<Timeline, units::Error>> + Send;
-    /// Waits for a unit that is starting, one the agent found activating when it started.
+    /// Waits for PostgreSQL that is starting, one the agent found coming up when it started.
     fn wait_started(
         &self,
         database: &str,
     ) -> impl Future<Output = Result<Started, units::Error>> + Send;
-    /// A fast shutdown, returning when the unit is stopped; lifts its CPU quota.
+    /// A fast shutdown, returning when the unit is over; the slot that held the database is free
+    /// again then.
     fn stop(&self, database: &str) -> impl Future<Output = Result<(), units::Error>> + Send;
+    /// Sets the limits of the database's size on the slot that holds it, now. A database that is
+    /// asleep holds nothing; its limits are those of the entry at its next bind.
     fn set_limits(
         &self,
         database: &str,
@@ -343,6 +361,24 @@ pub trait Machine: Send + Sync + 'static {
         &self,
         awake_budget_mib: u64,
     ) -> impl Future<Output = Result<(), units::Error>> + Send;
+
+    // ---- the pool of slots
+    /// When the agent starts, before anything is admitted: reads the slots back from the kernel
+    /// (`slots::Pool::adopt`) and the units of their own that run.
+    fn adopt_slots(&self) -> impl Future<Output = Result<Adopted, units::Error>> + Send;
+    /// Builds one idle slot if fewer than `target` are idle; its number.
+    fn refill_slot(
+        &self,
+        target: usize,
+    ) -> impl Future<Output = Result<Option<u32>, units::Error>> + Send;
+    /// Stops every idle slot: a fence, a maintenance order, a release of the slot's unit.
+    fn drain_idle_slots(&self) -> impl Future<Output = usize> + Send;
+    /// What the pool holds.
+    fn slots(&self) -> Snapshot;
+    /// The database a caller of the archive socket runs for: the process `pid` of uid `uid`, from
+    /// the slot that holds it (its uid, its cgroup and its invocation) or, for a unit of its own
+    /// that is still running, from its uid.
+    fn caller(&self, uid: u32, pid: u32) -> Option<String>;
 
     // ---- the node's credentials
     /// Applies what Cloudflare delivered (`NodeCredentials`): the route keyring for the gateway and

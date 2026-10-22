@@ -116,9 +116,21 @@ printf '{{"backup_id":"%s","status":"DONE","timeline":%s,"systemid":"%s","end_wa
 }
 
 pub(crate) fn policy() -> Policy {
+    policy_with_start_concurrency(None)
+}
+
+/// The tests' policy with another number of starts at once, and so of idle slots; a start that
+/// waits for the others then waits as long as they take.
+pub(crate) fn policy_with_start_concurrency(starts: Option<usize>) -> Policy {
     let mut page = vector("NodeDesiredPage", "full-page");
+    if let Some(starts) = starts {
+        page["policy"]["admission"]["start_concurrency"] = json!(starts);
+        page["policy"]["admission"]["queue_wait_ms"] = json!(10_000);
+    }
     // Tests wait for what they wait for; nothing in them should be refused for want of time.
-    page["policy"]["admission"]["queue_wait_ms"] = json!(300);
+    if starts.is_none() {
+        page["policy"]["admission"]["queue_wait_ms"] = json!(300);
+    }
     // The quota comes with the wake, as the tests that read it expect; the tests of the burst set
     // theirs (`boost`).
     page["policy"]["admission"]["cpu_boost_ms"] = json!(0);
@@ -235,7 +247,13 @@ impl Rig {
             Limits::default(),
         ));
         let server = Arc::new(
-            Server::new(table.clone(), jobs.clone(), credentials.clone()).with_bound(AGENT_BOUND),
+            Server::new(
+                table.clone(),
+                jobs.clone(),
+                credentials.clone(),
+                machine.clone(),
+            )
+            .with_bound(AGENT_BOUND),
         );
         let server = tokio::spawn(server.serve(bind(&archive_socket).unwrap()));
         let gateway = Arc::new(Feed::new());
@@ -273,6 +291,8 @@ impl Rig {
     /// The agent restarts: a new process on the same node. What it keeps in memory is gone; the
     /// units run on, and it finds them as it finds them at boot.
     pub(crate) async fn restart(self) -> Self {
+        // The new process reads the slots back from the kernel before it reads the units.
+        self.machine.adopt_slots().await.unwrap();
         let units = self.machine.units().await.unwrap();
         let running = units
             .iter()
@@ -299,8 +319,9 @@ impl Rig {
         let timing = self.core.timing.clone();
         drop(self);
         // The agent's mount namespace ends with it: the volumes are mounted again by the next
-        // one, which the units that run do not wait for.
+        // one, which the units that run do not wait for. What it kept of the slots is gone too.
         machine.forget_mounts();
+        machine.adopt_slots().await.unwrap();
         // The old sockets close with the old tasks.
         tokio::time::sleep(Duration::from_millis(50)).await;
         Self::boot(machine, fixture, root, running, timing).await

@@ -240,7 +240,6 @@ mod tests {
         assert_eq!(slice_memory(9913).name(), "MemoryMax");
     }
 
-
     #[test]
     fn an_idle_slot_holds_the_units_idle_limits_and_none_of_a_database() {
         let idle = idle();
@@ -264,7 +263,10 @@ mod tests {
     fn the_write_limits_of_every_device_are_reset_with_an_empty_array() {
         // A runtime property outlives the stop of the unit, and a per-device limit that is set
         // again for another device adds to the first: an empty `a(st)` clears them all.
-        for property in [Property::IoWriteBandwidthMaxNone, Property::IoWriteIopsMaxNone] {
+        for property in [
+            Property::IoWriteBandwidthMaxNone,
+            Property::IoWriteIopsMaxNone,
+        ] {
             let (name, value) = dbus::encode(&property);
             assert_eq!(value.value_signature().to_string(), "a(st)");
             match value {
@@ -272,7 +274,10 @@ mod tests {
                 other => panic!("{name} is not an array: {other:?}"),
             }
         }
-        assert_eq!(Property::IoWriteBandwidthMaxNone.name(), "IOWriteBandwidthMax");
+        assert_eq!(
+            Property::IoWriteBandwidthMaxNone.name(),
+            "IOWriteBandwidthMax"
+        );
         assert_eq!(Property::IoWriteIopsMaxNone.name(), "IOWriteIOPSMax");
     }
 

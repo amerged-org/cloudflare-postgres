@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     layout::Layout,
-    storage::{Storage, SystemRunner},
+    storage::{CommandRunner, Storage, SystemRunner},
 };
 use std::{
     collections::{BTreeSet, HashMap},
@@ -35,8 +35,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     io::unix::AsyncFd,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
 
@@ -65,18 +65,19 @@ pub(crate) async fn run(program: &str, arguments: &[&str]) -> io::Result<()> {
     }
 }
 
-/// The node's systemd and kernel, for the slots.
-pub struct System {
+/// The node's systemd and kernel, for the slots. The storage's commands go where `R` says: to the
+/// system, on a node; a lab may stand in for LVM alone.
+pub struct System<R = SystemRunner> {
     units: Units,
     layout: Layout,
-    storage: Arc<Storage<SystemRunner>>,
+    storage: Arc<Storage<R>>,
     /// The pidfd of each slot's main process, with the process it is of.
     pidfds: Mutex<HashMap<u32, (u32, Arc<OwnedFd>)>>,
     gateway: OnceLock<u32>,
 }
 
-impl System {
-    pub fn new(units: Units, layout: Layout, storage: Arc<Storage<SystemRunner>>) -> Self {
+impl<R: CommandRunner + Send + Sync + 'static> System<R> {
+    pub fn new(units: Units, layout: Layout, storage: Arc<Storage<R>>) -> Self {
         Self {
             units,
             layout,
@@ -105,7 +106,11 @@ impl System {
 
     /// The control socket of a slot: `RuntimeDirectory=pgcf/slot/%i` of its unit.
     fn control(&self, slot: u32) -> PathBuf {
-        self.layout.run.join("slot").join(slot.to_string()).join("control")
+        self.layout
+            .run
+            .join("slot")
+            .join(slot.to_string())
+            .join("control")
     }
 
     /// One line to the supervisor and its one line back.
@@ -201,9 +206,7 @@ fn program_of(link: &Path, supervisor: &Path, postgres: &Path) -> Exe {
 /// of the words of its refusals.
 fn order_reply(line: &str) -> Result<u64, Error> {
     if let Some(micros) = line.strip_prefix("exec ") {
-        return micros
-            .parse()
-            .map_err(|_| Error::Refused("reply"));
+        return micros.parse().map_err(|_| Error::Refused("reply"));
     }
     Err(Error::Refused(
         ["order", "id", "major", "unbound", "held", "lock"]
@@ -260,6 +263,66 @@ fn holds_lock(pid: u32, data: &std::fs::Metadata, text: &str) -> bool {
     })
 }
 
+/// The cgroup of the process `pid` and the invocation ID systemd keeps on that cgroup, as the
+/// kernel and systemd say them: the slot a caller of the archive socket is in, and which start of
+/// it. `None` for what cannot be read, which no caller is trusted by.
+pub fn peer_unit(pid: u32) -> (Option<String>, Option<String>) {
+    if pid == 0 {
+        return (None, None);
+    }
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .and_then(|text| unified_cgroup(&text));
+    let invocation = cgroup.as_deref().and_then(invocation_of);
+    (cgroup, invocation)
+}
+
+/// The path of the unified hierarchy in the text of `/proc/<pid>/cgroup`: the line `0::<path>`.
+fn unified_cgroup(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .filter(|path| path.starts_with('/') && !path.split('/').any(|part| part == ".."))
+        .map(str::to_string)
+}
+
+/// The invocation of the unit whose cgroup is `cgroup`: systemd writes it as the 32 hexadecimal
+/// digits of `trusted.invocation_id` on the cgroup's directory, where only a process with
+/// `CAP_SYS_ADMIN` can write or change it, and the journal reads it from there.
+fn invocation_of(cgroup: &str) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(
+        Path::new("/sys/fs/cgroup")
+            .join(cgroup.trim_start_matches('/'))
+            .as_os_str()
+            .as_bytes(),
+    )
+    .ok()?;
+    let mut value = [0u8; 64];
+    // SAFETY: a NUL-terminated path and name, and a buffer of the length given.
+    let length = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            c"trusted.invocation_id".as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    let value = value.get(..usize::try_from(length).ok()?)?;
+    invocation_from_hex(std::str::from_utf8(value).ok()?)
+}
+
+/// The invocation ID as a UUID from its 32 hexadecimal digits.
+fn invocation_from_hex(hex: &str) -> Option<String> {
+    if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..16)
+        .map(|at| u8::from_str_radix(&hex[2 * at..2 * at + 2], 16))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    super::invocation_uuid(&bytes)
+}
+
 /// An `inotify` watch of one directory, for what is written in it.
 struct Watch(AsyncFd<OwnedFd>);
 impl Watch {
@@ -285,7 +348,10 @@ impl Watch {
         if watch < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self(AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)?))
+        Ok(Self(AsyncFd::with_interest(
+            fd,
+            tokio::io::Interest::READABLE,
+        )?))
     }
 
     /// Waits until something was written, and reads what is queued.
@@ -297,9 +363,8 @@ impl Watch {
             let mut buffer = [0u8; 4096];
             loop {
                 // SAFETY: reads into a buffer that is ours, of the length given.
-                let read = unsafe {
-                    libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len())
-                };
+                let read =
+                    unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
                 if read < 0 {
                     return Err::<(), _>(io::Error::last_os_error());
                 }
@@ -315,7 +380,7 @@ impl Watch {
     }
 }
 
-impl Host for System {
+impl<R: CommandRunner + Send + Sync + 'static> Host for System<R> {
     async fn unit(&self, slot: u32) -> Result<SlotUnit, Error> {
         let raw = self.units.raw(&slot_unit(slot)).await?;
         Ok(SlotUnit {
@@ -328,7 +393,10 @@ impl Host for System {
     }
 
     async fn units(&self) -> Result<Vec<SlotUnit>, Error> {
-        let names = self.units.loaded(&format!("{}*.service", slots::SLOT_PREFIX)).await?;
+        let names = self
+            .units
+            .loaded(&format!("{}*.service", slots::SLOT_PREFIX))
+            .await?;
         let found = futures_util::future::try_join_all(
             names
                 .iter()
@@ -429,6 +497,10 @@ impl Host for System {
         ready == 0
     }
 
+    fn uid(&self, slot: u32) -> u32 {
+        slot_uid(slot)
+    }
+
     async fn mount(&self, slot: u32, bind: &Bind) -> Result<(), Error> {
         let pidfd = self
             .pidfds()
@@ -477,7 +549,14 @@ impl Host for System {
             .converse(slot, &format!("exec {database} {MAJOR}"))
             .await?;
         order_reply(&answer)?;
+        // The supervisor replaced itself with PostgreSQL: the process, and its pidfd, are the same.
+        let main_pid = self
+            .pidfds()
+            .get(&slot)
+            .map(|(pid, _)| *pid)
+            .ok_or(Error::Unexpected("a slot without a pidfd"))?;
         Ok(Ordered {
+            main_pid,
             sent_us,
             took: began.elapsed(),
         })
@@ -498,7 +577,7 @@ impl Host for System {
             tokio::select! {
                 changed = watch.changed() => changed?,
                 exited = pidfd.readable() => {
-                    exited?;
+                    let _ = exited?;
                     // It wrote `ready` and ended, or it ended: one last look settles which.
                     return ready::ready_socket(&directory, main_pid)
                         .map_err(|_| Error::NotReady("exited"));
@@ -525,9 +604,10 @@ impl Host for System {
                 "/proc/{pid}/root{}",
                 self.layout.data(database).display()
             ));
-            if let (Ok(metadata), Ok(table)) =
-                (std::fs::metadata(&data), std::fs::read_to_string("/proc/locks"))
-            {
+            if let (Ok(metadata), Ok(table)) = (
+                std::fs::metadata(&data),
+                std::fs::read_to_string("/proc/locks"),
+            ) {
                 locked = holds_lock(pid, &metadata, &table);
             }
             postmaster = std::fs::read_to_string(data.join("postmaster.pid"))
@@ -558,6 +638,41 @@ impl Host for System {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cgroup_of_a_process_is_the_unified_line_of_its_cgroup_file() {
+        assert_eq!(
+            unified_cgroup("0::/pgcf.slice/pgcf-slot@12.service\n").as_deref(),
+            Some("/pgcf.slice/pgcf-slot@12.service")
+        );
+        assert_eq!(
+            unified_cgroup("12:memory:/old\n0::/user.slice/session-1.scope\n").as_deref(),
+            Some("/user.slice/session-1.scope")
+        );
+        for other in ["", "1:name=systemd:/x\n", "0::relative\n", "0::/a/../b\n"] {
+            assert_eq!(unified_cgroup(other), None, "{other:?}");
+        }
+        // The caller's own cgroup is readable, and no process 0 has one.
+        assert!(peer_unit(std::process::id()).0.is_some());
+        assert_eq!(peer_unit(0), (None, None));
+    }
+
+    #[test]
+    fn the_invocation_of_a_cgroup_is_a_uuid_of_the_32_digits_systemd_writes() {
+        assert_eq!(
+            invocation_from_hex("1d7e15fa5e6c47a0895fa72e000ab9fd").as_deref(),
+            Some("1d7e15fa-5e6c-47a0-895f-a72e000ab9fd")
+        );
+        for other in [
+            "",
+            "1d7e15fa",
+            "1d7e15fa5e6c47a0895fa72e000ab9fg",
+            "1d7e15fa5e6c47a0895fa72e000ab9fd0",
+        ] {
+            assert_eq!(invocation_from_hex(other), None, "{other:?}");
+        }
+        assert_eq!(invocation_from_hex(&"0".repeat(32)), None, "never started");
+    }
 
     #[test]
     fn the_slot_users_are_the_numbered_accounts_of_the_password_file() {
@@ -591,7 +706,10 @@ mod tests {
             program("/usr/libexec/pgcf/pgcf-archive (deleted)"),
             Exe::Supervisor
         );
-        assert_eq!(program("/usr/lib/postgresql/18/bin/postgres"), Exe::Postgres);
+        assert_eq!(
+            program("/usr/lib/postgresql/18/bin/postgres"),
+            Exe::Postgres
+        );
         assert_eq!(program("/usr/lib/postgresql/17/bin/postgres"), Exe::Other);
         assert_eq!(program("/bin/sh"), Exe::Other);
         assert_eq!(program("/tmp/usr/libexec/pgcf/pgcf-archive"), Exe::Other);
@@ -606,7 +724,14 @@ mod tests {
                 other => panic!("{word}: {other:?}"),
             }
         }
-        for other in ["", "exec", "exec soon", "refused", "refused everything", "pgcf-slot/1 idle"] {
+        for other in [
+            "",
+            "exec",
+            "exec soon",
+            "refused",
+            "refused everything",
+            "pgcf-slot/1 idle",
+        ] {
             assert!(
                 matches!(order_reply(other), Err(Error::Refused("reply"))),
                 "{other:?}"
@@ -628,7 +753,13 @@ mod tests {
         assert_eq!(found.len(), 4);
         assert_eq!(
             found[0],
-            Lock { flock: true, pid: 2461, major: 0xfc, minor: 4, inode: 1055 }
+            Lock {
+                flock: true,
+                pid: 2461,
+                major: 0xfc,
+                minor: 4,
+                inode: 1055
+            }
         );
         assert!(!found[1].flock);
         assert!(locks("").is_empty());
@@ -650,7 +781,11 @@ mod tests {
         assert!(holds_lock(2461, &metadata, &line("FLOCK", 2461, inode)));
         assert!(!holds_lock(2461, &metadata, &line("POSIX", 2461, inode)));
         assert!(!holds_lock(2461, &metadata, &line("FLOCK", 2462, inode)));
-        assert!(!holds_lock(2461, &metadata, &line("FLOCK", 2461, inode + 1)));
+        assert!(!holds_lock(
+            2461,
+            &metadata,
+            &line("FLOCK", 2461, inode + 1)
+        ));
         assert!(!holds_lock(2461, &metadata, ""));
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -680,7 +815,10 @@ mod tests {
     /// A pidfd of a process that has ended is readable, and one of a process that lives is not.
     #[tokio::test]
     async fn a_pidfd_is_readable_when_its_process_has_ended() {
-        let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
         let fd = AsyncFd::with_interest(
             pidfd_open(child.id()).unwrap(),
             tokio::io::Interest::READABLE,
@@ -690,7 +828,7 @@ mod tests {
         assert!(waiting.is_err(), "the process lives");
         child.kill().unwrap();
         child.wait().unwrap();
-        tokio::time::timeout(Duration::from_secs(5), fd.readable())
+        let _ready = tokio::time::timeout(Duration::from_secs(5), fd.readable())
             .await
             .expect("the end of the process was seen")
             .unwrap();
