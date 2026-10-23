@@ -21,7 +21,9 @@ policy, and reports each decision (plan 1.6, 5.2):
   reservations of the awake and starting databases plus _m_ and the overhead stay within the awake
   budget), and fewer than `start_concurrency` starts are in flight. Otherwise the start waits in a
   strict FIFO queue for `queue_wait_ms` and is then refused with `57P03` and the policy's retry
-  hint. systemd never restarts a database by itself, so no start bypasses these rules.
+  hint: DETAIL "node at awake capacity" (`no_headroom`) when the memory rule held it back, or a
+  start ahead of it, and DETAIL "node busy starting databases" (`start_queue`) when the start cap
+  alone did. systemd never restarts a database by itself, so no start bypasses these rules.
 - **Early sleep.** Only if the policy enables it, and only while a start waits for memory, the node
   puts one idle but awake database to sleep per waiting start, with the normal sleep proof.
 - **Recovery starts.** A database that stopped without a proof is started through admission and
@@ -36,12 +38,63 @@ carries it, and a region whose policy is not set serves no page.
 
 | Command            | What it does                                                                                                                                                                                                                                                            |
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pgcf-agent run`   | The service of `pgcf-agent.service` (`Type=notify`). It opens the node's storage, restores what a boot lost, signals `READY=1`, then enrolls and links to Cloudflare in the background, so a node that is not enrolled yet waits instead of crashing                    |
+| `pgcf-agent run`   | The service of `pgcf-agent.service` (`Type=notify`). It enrolls and links to Cloudflare and asks for its first page while it opens the node's storage, restores what a boot lost and signals `READY=1`, link or no link, so a node that is not enrolled yet waits instead of crashing |
 | `pgcf-agent check` | Makes or wakes one scratch database (`SCRATCH`) on a thin volume, queries it over its socket and stops it, without Cloudflare. The image's boot test runs it after the first boot and again after a reboot, and a maintenance cycle runs it before it answers its order |
+| `pgcf-agent hold`  | The one process of the transient unit `pgcf-mounts.service`, which `run` starts when the node has none and whose mount namespace it joins (`mount_holder.rs`, below). It tells systemd that it is ready and waits to be stopped, then unmounts the volumes 16 at a time |
 
 An agent restart never stops a database: PostgreSQL runs in slots (units of their own, below), and
 the agent reads them back from the kernel. A release that changes the agent's own binary makes it
 exit so that systemd starts the new one.
+
+**The volumes' mount namespace outlives the agent** (`mount_holder.rs`). The agent mounts the
+volume of every database it knows in a mount namespace of its own, so that the mounts stay out of
+PID 1's. A process that dies leaves its mount namespace and the kernel unmounts what it holds one
+volume after the other, each as slow as the disk's flushes: after a `kill -9` of the agent the old
+process took 14 s to exit on EU1 with 312 volumes (lab, 300 volumes on a disk with 10 ms flushes:
+13 to 21 s), and systemd starts the next agent only after that. So the namespace is held by
+`pgcf-agent hold`, the one process of the transient unit `pgcf-mounts.service`
+(`PrivateMounts=yes`, `Type=notify`; `systemd-run` makes it, once a boot), and `run` joins it with
+`setns(2)` before the runtime starts a thread. A killed agent then leaves nothing to unmount (lab,
+the real agent under systemd: 11 ms), the next agent finds the volumes mounted and joins in 12 ms,
+and the page cache of the sleeping databases stays. The agent's own exit no longer unmounts
+anything when it joined; where it could not (no systemd, the unit does not start, `setns` is
+refused) it says `mount_holder_unavailable` with a class and works in the namespace its unit gives
+it, as it did before, and its exit unmounts as before. The holder unmounts the volumes 16 at a time
+when it is stopped (a shutdown, `systemctl stop pgcf-mounts`), so stop the agent first. A shell
+reaches the namespace with
+`nsenter --target "$(systemctl show --property=MainPID --value pgcf-mounts.service)" --mount`.
+An agent of a release before this one does not know the holder: going back to such a release needs
+`systemctl stop pgcf-agent pgcf-mounts` first, or the volumes stay mounted in the holder's
+namespace, where the old agent's unmounts find them held (`Busy`).
+
+**The agent's start** (`main.rs`, `Service::start_with_page`) is a short path to the first served wake
+and a longer one behind it, because a restarted agent is a database's wake that waits (EU1,
+2026-10-23: 46 s from `kill -9` to the first served wake, of which the old process took 14 s to
+exit, the adoption of the slots 13.7 s, the archive credentials 4.7 s and the decisions on the
+databases that ran 7.1 s). The path to the first wake is: systemd starts the next process 100 ms
+after the old one ended (`RestartSec=100ms`); the connection to systemd and the node's tables; the
+link and the first page, which need the node's boot and packages and nothing of LVM, **at the same
+time as** the storage opening (`Node::connect_unopened`, `Node::open_storage`; a node that is set up
+asks lvm2 for `pvs`, `vgs` and `lvs` at once and activates nothing when the pool and every volume
+are active, which is what an agent that restarts finds); the device links and the runtime
+(`restore_runtime`); the slots and units read back from the kernel; the first page applied (the
+fences, the generations, the decisions on the databases that ran, which come first); and the
+gateway served once those are decided (`Core::settled`). A wake is never served before the first
+page, the fences and the generations are known. **The credentials are not on that path.** The
+archive credentials (one read each, 32 at a time, those of the databases that ran first) and the
+node's own (the Tunnel and the route keyring) are read after the first page is applied, in the
+background (`Service::pull_page`): a database that ran is registered with the archive socket when
+its credential arrives (`Core::deliver`), a build waits for its own up to `Timing::credential_wait`
+(300 s), begins when it arrives and fails with `archive_unusable` after the wait, and a page after
+the first reads its credentials before it is applied, as before. The phases `agent_start_phase` names: `storage_open`, `device_links`,
+`restore_runtime`, `linked` (how long the link outlasted the storage), `slots_adopted`,
+`units_read`, `apply`, `settled`, `gateway_table`, `service_started`, and beside the row (read by
+`at_ms`) `link_started`, `link_hello`, `first_page`, `credentials` and `first_wake_served`. A start
+that fails (the pool will not activate, `vgchange_exit_5`) says `agent_failed` and waits five
+seconds before it ends (`pause_after_failed_start`), so that the 100 ms restart does not run the
+failing commands ten times a second; a stop ends the wait. systemd's `RestartSteps=` is not used:
+it is not reset by a long run (systemd 257.13, measured), so it would slow the restart after a
+kill for as long as the node lives.
 
 ## Jobs and where they live
 
@@ -58,7 +111,7 @@ exit so that systemd starts the new one.
 | Fencing                    | `fence.rs`                                                                                                                                             |
 | Gateway channel            | `gateway.rs`: the writer table, the wakes, quiesce, close, status and activity                                                                         |
 | Metrics and diagnostics    | `usage.rs`, `sample.rs`, `events.rs`, `diagnostics/`                                                                                       |
-| Cold page cache            | `prefetch.rs`: readahead of the catalog set and the autoprewarm list with its own accounting; `cache.rs`: how files of the data directory are opened and counted |
+| Cold page cache            | `prefetch.rs`: readahead of the start set, the catalog set, the autoprewarm list and whole files with its own accounting; `program.rs`: the files of PostgreSQL's program; `cache.rs`: how files of the data directory are opened and counted |
 | Updates                    | `update.rs`, `release.rs`                                                                                                                              |
 | The loops                  | `service.rs`: what feeds the core and what it feeds                                                                                                    |
 
@@ -71,13 +124,41 @@ One database has one flow at a time (a create, a wake, a sleep, a recovery or a 
 before the next begins). What the gateway and the observations read is the database's view, which
 every flow updates in small steps.
 
+**The pool after a reset that was not clean** (`Storage::open`, `activate_group`). A hard power-off
+left one leaked data block in the pool's metadata on EU1 (2026-10-23): `thin_check -q` found it
+(exit 64), `vgchange --activate y` ended with 5, the agent crash-looped 798 times and every
+database of the node was down for 27 minutes. When the plain activation fails, the agent (1)
+deactivates a part of the pool that is active on its own (`pgcf_thinpool_tdata`, `_tmeta`: an
+inspection of the metadata with `lvchange --activate y --yes` leaves it so, and lvm2 then refuses
+the pool) and tries the plain activation again, and otherwise (2) activates once more with
+`thin_check --auto-repair` added to the host's own `thin_check_options` (`commands::REPAIRING_CHECK`),
+and reports `thin_pool_parts_released` and `thin_pool_repair_activation`. What `--auto-repair`
+does, from thin-provisioning-tools 1.1.0 and the lab: it "automatically repairs any trivial issues
+found with the metadata; currently only fixes metadata leaks", by rewriting the space map of a leak
+(a block the map counts as used that no mapping refers to) once the trees have been read without an
+error. It writes nothing when a tree or a checksum is wrong, because the leak check comes after the
+walk of the trees: a metadata image with a leaked block and a wrong checksum in the mapping tree is
+left byte for byte as it was, and the activation ends with the same exit 5. The exit status cannot
+tell a leak from damage (the Rust `thin_check` ends with 64 for every error, the man page's 1
+notwithstanding), so the option, not the status, is what keeps the repair to the leak. A damaged
+pool stays down: the agent exits with `vgchange_exit_5`, the node goes stale and
+`regional_node_stale` and `thin_storage_blocked` fire; no `thin_repair` and no `lvconvert
+--repair` run. The pool does not set `--clear-needs-check-flag`, which the host's list does not
+have either.
+
 ## Slots
 
 PostgreSQL runs in a slot, the unit `pgcf-slot@<n>.service`, as the slot's own user
 (`pgcf-slot-<n>`, uid 300000 + _n_). The agent builds slots before a wake, for no database, and
-keeps as many idle as `start_concurrency` while no start is in flight or waits (`agent/power.rs`,
-`refill_pass`; a build costs about 80 ms of CPU, which a wake must not wait for, and a fence or a
-maintenance order stops the idle ones). An idle slot runs the supervisor (`pgcf-archive slot <n>`),
+keeps four idle for each start that may run at once (`IDLE_PER_START`, so 32 on EU1 at 8 starts)
+while no start is in flight or waits (`agent/power.rs`, `refill_pass`). The pool must hold what a
+storm takes, because it is refilled only on a quiet node: a storm of 40 wakes found 8 idle slots
+and built the other 32 inside the wakes, 1 to 4 s each (EU1, 2026-10-23). An idle slot holds about
+0.6 MiB (live, with 309 volumes mounted), so the 32 cost about 20 MiB. A pool that a storm emptied
+is built `BUILDS_AT_ONCE` (4) slots at a time; the refills decide one at a time in the pool's turn
+(`Pool::refill`), so together they build no more than the target and make each user once. A build
+costs about 80 ms of CPU, which a wake must not wait for, and runs at the idle CPU weight from its
+first moment; a fence or a maintenance order stops the idle slots. An idle slot runs the supervisor (`pgcf-archive slot <n>`),
 which takes one order, from root. Every start takes one path: the admission permit, then
 
 1. **Take or build** (`slots::Pool::bind`): an idle slot, or a new one built inside the permit, so
@@ -130,7 +211,9 @@ database a slot's uid belongs to, and only a process in that slot's cgroup and i
 uid with no database now gets `peer_unknown`.
 
 **Adoption.** The table is never written to disk. When the agent starts it reads the units, each
-main process, `/proc/<pid>/exe`, its mount table and `/proc/locks` (`Pool::adopt`): an idle slot
+main process, `/proc/<pid>/exe`, its mount table and `/proc/locks` (`Pool::adopt`; the volume a
+mount is names itself from one listing of `lvs` for all the slots, where it ran `lvs` for each:
+13.7 s of the 28.7 s to the first wake with 104 slots on EU1, 2026-10-23): an idle slot
 stays; one that holds a database it was never ordered to run, or whose postmaster does not hold the
 lock, is stopped and its database stays asleep (every mount at a database's directory counts as
 holding it, also one the agent cannot name as a volume of that database: unknown means tainted, and
@@ -331,28 +414,53 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   background after the next start, where it competes with the first queries for the disk. Two of
   the worker slots are its leader and its worker; the sleep guard does not count its worker as a
   session.
-- **Readahead** (`prefetch.rs`, called from `agent/readahead.rs`). Before a request the agent
-  asks the kernel to read a sleeping database's hot files ahead with `posix_fadvise(WILLNEED)`:
-  the catalog set (`pg_control`, 256 KiB of WAL at the latest checkpoint, `global/`, and in each
-  user database its `PG_VERSION`, `pg_filenode.map` and the login's catalogs with their indexes
-  and forks; about 5 MB) and the autoprewarm list (blocks merged where contiguous, the relations
-  with the fewest listed blocks first, system databases left out). The mapped catalogs
-  (`pg_class`, `pg_attribute`, `pg_proc`, `pg_type` and their indexes) are found through the map
-  where `VACUUM FULL` moved them; the others are read at their OID, so a rewrite of one drops it
-  from the set, and the report's `missing` counts it. A plan is built first (blocking:
-  directories, `pg_control`, the maps and the list are read, each file is opened once for its
-  length), then issued in pieces of at most 128 KiB, because the kernel reads only the first
-  `read_ahead_kb` of a range per call. The data directory is the database user's, so a plan reads
-  only the real directories of `base/` (at most 32 databases) whatever the list names, stops after
-  512 files of a list that are not there, and stops at a budget and a cancel as the issuing does.
-  Issuing stops at a time budget, a byte bound or a cancel and returns the counts, the bytes the
-  cache already held and the timings; they go to an event (`prefetch`: set, hook, why it ended and
-  the counts), which takes the place of the residency diagnostic that `cache.rs` made while a wake
-  ran (deleted). `pg_internal.init` is left out: PostgreSQL removes it at every start. Two hooks,
-  and a constant of the build (`readahead::PREFETCH`, not a policy of the node) says which run: the
-  hot list from ready with a budget of 150 ms (shipped), and the catalogs at the bind (code, off
-  until the interleaved A/B on the pooled path). `settings::AUTOPREWARM` is the build's other
-  switch, for the A/B arm without PostgreSQL's own autoprewarm.
+- **Readahead** (`prefetch.rs` and `program.rs`, called from `agent/readahead.rs`). The agent
+  asks the kernel to read ahead with `posix_fadvise(WILLNEED)` the files a cold start and request
+  read, in four sets of a sleeping database and the program of PostgreSQL:
+  - the **start set**: what PostgreSQL reads between its exec and its ready (the configuration
+    and `PG_VERSION`; `pg_control`; 256 KiB of WAL at the latest checkpoint record and, after a
+    crash, at the redo point that `pg_control` holds; the last segment of `pg_xact` and of
+    `pg_multixact`'s two directories; `pg_stat/pgstat.stat`; `pg_logical/replorigin_checkpoint`;
+    `global/`; about 1 MB). `pg_internal.init` is left out: PostgreSQL removes it at every start;
+  - the **catalog set**: in each user database its `PG_VERSION`, `pg_filenode.map` and the
+    login's catalogs with their indexes and forks; about 5 MB. The mapped catalogs (`pg_class`,
+    `pg_attribute`, `pg_proc`, `pg_type` and their indexes) are found through the map where
+    `VACUUM FULL` moved them; the others are read at their OID, so a rewrite of one drops it from
+    the set, and the report's `missing` counts it;
+  - the **hot list**: the autoprewarm list (blocks merged where contiguous, the relations with
+    the fewest listed blocks first, system databases left out);
+  - the **program** (`program.rs`): the `postgres` binary, the libraries it links (found from the
+    `DT_NEEDED` entries of the binary and of each library, on the loader's default path), the
+    extension libraries of `settings::PRELOAD_LIBRARIES`, and the system files a postmaster
+    opens at its start (the time zone abbreviations, the C.UTF-8 locale, OpenSSL's configuration);
+    ICU's 32 MB data library, of which a postmaster touches 72 KiB, is left out because it is
+    data.
+
+  A plan is built first (blocking: directories, `pg_control`, the maps and the list are read,
+  each file is opened once for its length), then issued in pieces of at most 128 KiB, because the
+  kernel reads only the first `read_ahead_kb` of a range per call. A piece that `cachestat(2)`
+  shows the cache holds entirely is not advised, so a pass over a resident set reads nothing. The
+  data directory is the database user's, so a plan reads only the real directories of `base/` (at
+  most 32 databases) whatever the list names, stops after 512 files of a list that are not there,
+  and stops at a budget and a cancel as the issuing does. Issuing stops at a time budget, a byte
+  bound or a cancel and returns the counts, the bytes the cache already held and the timings; they
+  go to an event (`prefetch`: set, hook, why it ended and the counts; `program_warm` for the
+  program), which takes the place of the residency diagnostic that `cache.rs` made while a wake
+  ran (deleted).
+
+  Three hooks, and one constant of the build (`agent::PREFETCH`, not a policy of the node, so the
+  A/B needs a release and no API change) says which run:
+  - the **program**, from the pool's refill: one pass at the first refill after the agent starts
+    and then one every `Timing::program_every` (60 s), never while a start is in flight or waits,
+    and a start that begins ends the pass that runs (shipped);
+  - the **start set and the catalogs at the bind**, from the start's permit, in a task the order
+    does not wait for, for at most 50 ms (shipped as `Start::Alternate` for the live interleaved
+    A/B on the pooled path: it reads for every second start and says which in a `prefetch_arm`
+    event; the release after the A/B sets `Start::On` or `Start::Off`);
+  - the **hot list** from ready, with a budget of 150 ms (shipped).
+
+  `settings::AUTOPREWARM` is the build's other switch, for the A/B arm without PostgreSQL's own
+  autoprewarm.
 - **Login.** The node's root reaches the cluster's superuser `postgres` by peer authentication
   through `pg_ident.conf`; the backup role `pgcf_backup` is reached by the database's own Linux user
   the same way; every other role logs in over the socket with SCRAM-SHA-256. Replication connections
@@ -366,8 +474,8 @@ later request with that key, which binds the method, the path and the body. A re
 node with a new key, and Cloudflare restricts the key of a node declared lost to the fenced scope.
 The agent keeps the outbound WebSocket to the node's NodeActor, which carries its sample every 15 s
 and Cloudflare's request to pull the desired page; it also pulls the whole page every 60 s. It reads
-the gateway's keyring and the Tunnel token from `GET /node/v1/credentials` when it starts, and again
-when the page names a higher credentials revision, and R2 temporary credentials from
+the gateway's keyring and the Tunnel token from `GET /node/v1/credentials` after it has applied its
+first page, and again when the page names a higher credentials revision, and R2 temporary credentials from
 `GET /node/v1/archive-credentials/{id}` as the page names them. A node never holds the R2 parent key.
 
 The agent reads what Cloudflare sends it (the page, the credentials, the answers, the link's
@@ -392,11 +500,18 @@ plan 9.3, "Changing the page"; it is written there once.
   apply it at once, and a base backup that begins inside the burst applies it first), reads the hot
   list ahead and reports the phases of the wake as events; about 2 s later a `wake_detail` event adds
   the slot's origin and what the bind and the order took, the split of the start, the CPU quota's
-  throttling and the steal time. A wake it already serves is answered `wake_in_progress`, which is
+  throttling and the steal time. A ticket that is ahead of the agent's page (a connection right
+  after an idle sleep brings the generation the sleep made, and the page follows in 1 to 7 s) makes
+  the agent pull that database's page at once and hold the wake for it, up to `page_wait` (8 s)
+  after the gateway queued the wake (`Service::catch_up`, asked again every second): the checks
+  then run against the page it has, so a ticket the page does not order is refused `desired_stale`
+  as before, after the wait. A wake it already serves is answered `wake_in_progress`, which is
   no result. A start that fails writes a `unit_start_failed` event with the class of the error and
   answers `release_failed`; a slot that is awake or cannot be read at that point is stopped without a
   proof and recovered, so no database stays `starting`.
-- **Sleep.** After the database's idle time the agent runs the sleep proof (plan 7.9): the gateway
+- **Sleep.** After the database's idle time, `start_concurrency` databases at a time (the idle pass
+  looks at every database each five seconds, and a sleep that waits for the archive holds up none
+  of the others), the agent runs the sleep proof (plan 7.9): the gateway
   quiesces and closes idle sessions, the guard refuses while a session is busy or a transaction is
   prepared (`power_busy`), a checkpoint and a WAL switch close the last segment, the upload log must
   hold it and every segment before it, and only then the postmaster stops with a fast shutdown.
@@ -533,8 +648,9 @@ it ends with `systemctl revert pgcfbackup.slice`; the next job in the slice then
   list to its own rules just before it writes (a list they do not allow is refused for its files,
   once, and the binaries are installed all the same), and the files that differ are written
   atomically below `/` (hidden file, `fsync`, rename, `fsync` of the directory) in the allow-listed
-  directories only, never through a link. `systemd-sysusers` and `systemd-tmpfiles --create` run on
-  the files that say so, systemd reads its units again once, and what changed is restarted, the
+  directories only, never through a link. `systemd-sysusers` and `systemd-tmpfiles --create
+  --remove` run on the files that say so (`--create` alone ignores a file's `r` lines, which
+  remove: `pgcf-journal.conf` removes the per-uid journal files the split left behind), systemd reads its units again once, and what changed is restarted, the
   agent's own unit last (the agent leaves); a failure is tried again after a growing wait and keeps
   no other unit from its restart. The agent's own unit is written to `/run/systemd/system` first,
   and the agent that runs it moves it to its place after it has read its first page: a node whose

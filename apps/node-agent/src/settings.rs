@@ -159,6 +159,10 @@ fn plain(text: &str) -> bool {
             .all(|b| b.is_ascii_graphic() && b != b'\'' && b != b'\\')
 }
 
+/// The libraries `shared_preload_libraries` names: the postmaster loads them at its start, and the
+/// agent keeps their files in the page cache (`program`).
+pub const PRELOAD_LIBRARIES: &[&str] = &["pg_prewarm"];
+
 /// Whether PostgreSQL's own autoprewarm reads the list of the shared buffers after a start: the
 /// build's decision (`readahead`'s interleaved A/B has an arm that turns it off), not the node's.
 /// Off, the library stays loaded and the worker does not run, so no list is written at a stop and
@@ -198,7 +202,7 @@ pub fn postgresql_conf(settings: &Settings) -> Option<String> {
          maintenance_work_mem = {maintenance}MB\n\
          huge_pages = off\n\
          jit = off\n\
-         shared_preload_libraries = 'pg_prewarm'\n\
+         shared_preload_libraries = '{preload}'\n\
          pg_prewarm.autoprewarm = {autoprewarm}\n\
          pg_prewarm.autoprewarm_interval = 0\n\
          wal_level = replica\n\
@@ -212,6 +216,7 @@ pub fn postgresql_conf(settings: &Settings) -> Option<String> {
          password_encryption = scram-sha-256\n\
          log_line_prefix = '%m [%p] %q%u@%d '\n",
         max_connections = settings.max_connections,
+        preload = PRELOAD_LIBRARIES.join(","),
         autoprewarm = if AUTOPREWARM { "on" } else { "off" },
         shared = tuning.shared_buffers_mib,
         cache = tuning.effective_cache_size_mib,

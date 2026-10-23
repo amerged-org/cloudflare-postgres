@@ -25,6 +25,7 @@
     "WAKE_REASONS": [
       "no_room",
       "no_headroom",
+      "start_queue",
       "deleted",
       "suspended",
       "moving",
@@ -45,10 +46,11 @@
     ],
     "WAKE_AGAIN_REASON": "wake_in_progress",
     "WAKE_STALE": ["no_entry", "generation", "operation", "route", "role"],
-    "ADMISSION_REFUSALS": ["no_room", "no_headroom"],
+    "ADMISSION_REFUSALS": ["no_room", "no_headroom", "start_queue"],
     "ADMISSION_REFUSAL_DETAILS": {
       "no_room": "storage",
-      "no_headroom": "node at awake capacity"
+      "no_headroom": "node at awake capacity",
+      "start_queue": "node busy starting databases"
     },
     "AGENT_ARCHIVE_SOCKET": "/run/pgcf/agent/archive.sock",
     "ARCHIVE_SOCKET_ENVIRONMENT": "PGCF_AGENT_ARCHIVE_SOCKET",
@@ -429,6 +431,12 @@
       "reason": "no_headroom",
       "retry_after_seconds": 5,
       "detail": "node at awake capacity",
+      "hint": "retry after 5 s"
+    },
+    {
+      "reason": "start_queue",
+      "retry_after_seconds": 5,
+      "detail": "node busy starting databases",
       "hint": "retry after 5 s"
     },
     { "reason": "deleted" },

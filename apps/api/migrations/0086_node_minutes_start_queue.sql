@@ -1,0 +1,11 @@
+-- SPDX-License-Identifier: Apache-2.0
+-- Contract: a wake refused because the start cap kept it waiting past the queue wait has its own
+-- reason, `start_queue` (57P03 "node busy starting databases"), and the node's minute rollup counts
+-- it apart from the refusals for awake capacity (EU1, 2026-10-23: a storm of 40 wakes on a node
+-- at 17 % of its memory was refused "node at awake capacity" for the start cap of 8). Rows that
+-- exist keep 0: before the node release that names the reason, every such refusal counted as
+-- `refused_no_headroom`. The capacity alert sums both columns.
+--
+-- Deploy order: this migration and the API Worker first, then the node release: an API that does
+-- not know the reason refuses the node's events that carry it.
+ALTER TABLE node_minutes ADD COLUMN refused_start_queue INTEGER NOT NULL DEFAULT 0 CHECK(refused_start_queue>=0);

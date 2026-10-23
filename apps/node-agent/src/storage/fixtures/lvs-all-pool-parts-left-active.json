@@ -1,0 +1,14 @@
+{
+  "report": [
+    {
+      "lv": [
+        { "lv_name": "[lvol0_pmspare]", "lv_attr": "ewi-------" },
+        { "lv_name": "pool", "lv_attr": "twi---tz--" },
+        { "lv_name": "[pool_tdata]", "lv_attr": "TRi-a-----" },
+        { "lv_name": "[pool_tmeta]", "lv_attr": "eRi-a-----" },
+        { "lv_name": "v1", "lv_attr": "Vwi---tz--" }
+      ]
+    }
+  ],
+  "log": []
+}

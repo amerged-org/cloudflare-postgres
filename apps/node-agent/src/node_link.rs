@@ -256,14 +256,15 @@ fn usage_row_rules(row: &Value) -> bool {
             .as_i64()
             .is_none_or(|awake| i128::from(awake) <= end - start)
 }
-/// An event (`NodeEvent`): exactly a refusal names its reason, exactly the refusal of awake
-/// capacity (`no_headroom`) carries the retry hint, and only a stale ticket (`desired_stale`) of a
-/// wake says how it is stale.
+/// An event (`NodeEvent`): exactly a refusal names its reason, exactly the refusals that waiting
+/// undoes (awake capacity, `no_headroom`, and the start cap, `start_queue`) carry the retry hint,
+/// and only a stale ticket (`desired_stale`) of a wake says how it is stale.
 fn event_rules(event: &Value) -> bool {
     match event["type"].as_str() {
         Some("admission") => {
             (event["decision"] == "refused") == event.get("reason").is_some()
-                && (event["reason"] == "no_headroom") == event.get("retry_after_seconds").is_some()
+                && (event["reason"] == "no_headroom" || event["reason"] == "start_queue")
+                    == event.get("retry_after_seconds").is_some()
         }
         Some("wake") => {
             (event["outcome"] == "refused") == event.get("reason").is_some()

@@ -25,7 +25,7 @@ use crate::{
 use pgcf_native_protocol::wake::WakeRequest;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -37,8 +37,12 @@ use tokio::{
     task::JoinSet,
 };
 
-/// How many archive credentials are read from Cloudflare at once.
-const CREDENTIALS_AT_ONCE: usize = 8;
+/// How many archive credentials are read from Cloudflare at once. A read is one round trip to the
+/// Worker, which signs the credential from its parent key and calls no other service: 8 at once
+/// were 39 rounds of about 120 ms for the 311 databases of EU1, 4.7 s of the agent's start before
+/// the first page was applied (`kill -9`, 2026-10-23). 32 at once are 10 rounds; the plan's Open
+/// row has the live figure to read.
+const CREDENTIALS_AT_ONCE: usize = 32;
 
 /// How often each loop runs. The defaults are the plan's (4.3, 4.9); tests shorten them.
 #[derive(Clone, Debug)]
@@ -138,6 +142,9 @@ pub struct Service<M: Machine> {
     intervals: Intervals,
     /// The archive credentials read, by identifier.
     delivered: Mutex<HashSet<String>>,
+    /// One read of the credentials at a time: the first page's, which runs in the background, and
+    /// the pulls after it do not read the same credential twice.
+    reading: tokio::sync::Mutex<()>,
     /// The credentials the agent applied, if it has applied any since it started.
     credentials: Mutex<Option<AppliedCredentials>>,
     cpu: Mutex<Option<CpuTimes>>,
@@ -159,6 +166,9 @@ pub struct Service<M: Machine> {
     verdict: Mutex<Option<(update::Release, Result<(), update::ReleaseRefusal>)>>,
     /// The probes an administrator asked for that the agent has answered or is running (SEC-09).
     probes: probe::Answered,
+    /// The databases whose page a wake waits for (`catch_up`), which `wanted_pulls` pulls together.
+    wanted: Mutex<BTreeSet<String>>,
+    wanted_signal: Notify,
     /// A release is being installed.
     updating: AtomicBool,
     /// The release that was installed runs another agent: the agent restarts to run it.
@@ -171,6 +181,11 @@ pub struct Service<M: Machine> {
 /// How often the pool of idle slots is looked at when no start told it to.
 const SLOTS_EVERY: Duration = Duration::from_secs(5);
 
+/// How often a wake that waits for its page asks for it again, and how often it looks whether it
+/// came.
+const PAGE_RETRY: Duration = Duration::from_secs(1);
+const PAGE_POLL: Duration = Duration::from_millis(10);
+
 /// The identifiers of the archive credentials an entry of the page needs: its own, and the one
 /// that reads the archive it is built from.
 fn credential_ids(entry: &Entry) -> Vec<String> {
@@ -179,6 +194,39 @@ fn credential_ids(entry: &Entry) -> Vec<String> {
         ids.push(source.credential_id.clone());
     }
     ids
+}
+
+/// The identifiers of the archive credentials that the page's entries need and that were not read,
+/// those of the databases that run first: their archivers are the ones that wait for them.
+fn wanted_credentials(
+    entries: &[Entry],
+    delivered: &HashSet<String>,
+    runs: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let (running, others): (Vec<&Entry>, Vec<&Entry>) =
+        entries.iter().partition(|entry| runs(&entry.id));
+    let mut wanted: Vec<String> = Vec::new();
+    for id in running.into_iter().chain(others).flat_map(credential_ids) {
+        if !delivered.contains(&id) && !wanted.contains(&id) {
+            wanted.push(id);
+        }
+    }
+    wanted
+}
+
+/// How long a start that failed waits before the agent exits (`pause_after_failed_start`).
+pub const START_FAILURE_PAUSE: Duration = Duration::from_secs(5);
+
+/// Waits `pause` after a start that failed, or until `stop` ends, before the agent exits. systemd
+/// restarts a process that ended after 100 ms (`RestartSec=` of `pgcf-agent.service`, so that a
+/// kill costs a database's wake no more than that), and a node whose pool does not activate would
+/// otherwise run the same failing commands ten times a second (EU1, 2026-10-23: 798 starts in 27
+/// minutes at one a second and a half).
+pub async fn pause_after_failed_start(pause: Duration, stop: impl std::future::Future) {
+    tokio::select! {
+        () = tokio::time::sleep(pause) => {}
+        _ = stop => {}
+    }
 }
 
 /// The gateway's user and group, from `/etc/passwd`.
@@ -193,21 +241,10 @@ pub fn gateway_owner() -> Option<(u32, u32)> {
 }
 
 impl<M: Machine> Service<M> {
-    /// Starts the agent on a node: reads the first desired page, builds the core from the node's
-    /// units and the page's policy, serves the archive socket, hands the page to the core, serves
-    /// the gateway's channel once the databases that run are decided on, and starts the loops.
-    /// Returns once the node is up; the loops run until `stop`. The databases that sleep are
-    /// decided on after it returns, a few at a time, and a wake for one that is not yet has it
-    /// decided on at once.
-    pub async fn start(
-        machine: Arc<M>,
-        link: Link,
-        mut events: LinkEvents,
-        config: ServiceConfig,
-    ) -> Result<Arc<Self>, Error> {
-        let layout = machine.layout().clone();
-        let fences = Fences::load(layout.fences())?;
-        // Nothing can be decided without the policy of the page.
+    /// The first desired page: nothing can be decided without the policy of the page, and it is
+    /// asked for again until Cloudflare answers. It needs the link and nothing of the node's
+    /// storage, so the agent asks for it while the storage opens (`pgcf-agent run`).
+    pub async fn first_page(link: &Link) -> Page {
         let mut wait = Duration::from_secs(1);
         let page = loop {
             match link.desired_page(None).await {
@@ -221,7 +258,37 @@ impl<M: Machine> Service<M> {
                 }
             }
         };
-        crate::timing::phase("first_page");
+        // Beside the row: the page is asked for while the storage opens.
+        crate::timing::phase_once("first_page");
+        page
+    }
+
+    /// Starts the agent on a node: reads the first desired page, builds the core from the node's
+    /// units and the page's policy, serves the archive socket, hands the page to the core, serves
+    /// the gateway's channel once the databases that run are decided on, and starts the loops.
+    /// Returns once the node is up; the loops run until `stop`. The databases that sleep are
+    /// decided on after it returns, a few at a time, and a wake for one that is not yet has it
+    /// decided on at once.
+    pub async fn start(
+        machine: Arc<M>,
+        link: Link,
+        events: LinkEvents,
+        config: ServiceConfig,
+    ) -> Result<Arc<Self>, Error> {
+        let page = Self::first_page(&link).await;
+        Self::start_with_page(machine, link, events, page, config).await
+    }
+
+    /// `start` with the first page already read (`first_page`).
+    pub async fn start_with_page(
+        machine: Arc<M>,
+        link: Link,
+        mut events: LinkEvents,
+        page: Page,
+        config: ServiceConfig,
+    ) -> Result<Arc<Self>, Error> {
+        let layout = machine.layout().clone();
+        let fences = Fences::load(layout.fences())?;
         let policy = Policy::parse(&page.policy).ok_or("the desired page's policy is invalid")?;
         // The slots the last agent left are read back from the kernel before anything is admitted;
         // then the units are what the pool and the units of their own say.
@@ -261,6 +328,7 @@ impl<M: Machine> Service<M> {
             machine: machine.clone(),
             intervals: config.intervals,
             delivered: Mutex::new(HashSet::new()),
+            reading: tokio::sync::Mutex::new(()),
             credentials: Mutex::new(None),
             cpu: Mutex::new(None),
             tasks: Mutex::new(JoinSet::new()),
@@ -271,6 +339,8 @@ impl<M: Machine> Service<M> {
             release_key: config.release_key,
             verdict: Mutex::new(None),
             probes: probe::Answered::load(layout.agent().join("probes-done")),
+            wanted: Mutex::new(BTreeSet::new()),
+            wanted_signal: Notify::new(),
             updating: AtomicBool::new(false),
             restart: Notify::new(),
             superseded: AtomicBool::new(false),
@@ -329,6 +399,8 @@ impl<M: Machine> Service<M> {
         let s = service.clone();
         service.spawn(async move { s.follow(&mut events).await });
         let s = service.clone();
+        service.spawn(async move { s.wanted_pulls().await });
+        let s = service.clone();
         service.spawn(async move { s.maintenance().await });
         let s = service.clone();
         service.spawn(async move { s.serve_wakes(wakes).await });
@@ -382,22 +454,14 @@ impl<M: Machine> Service<M> {
     /// Cloudflare.
     async fn deliver_credentials(&self, page: &Page) {
         use futures_util::StreamExt;
-        let mut wanted: Vec<String> = Vec::new();
-        for id in page
-            .databases
-            .iter()
-            .filter_map(Entry::parse)
-            .flat_map(|entry| credential_ids(&entry))
-        {
+        let entries: Vec<Entry> = page.databases.iter().filter_map(Entry::parse).collect();
+        let wanted = {
             let delivered = self
                 .delivered
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .contains(&id);
-            if !delivered && !wanted.contains(&id) {
-                wanted.push(id);
-            }
-        }
+                .unwrap_or_else(PoisonError::into_inner);
+            wanted_credentials(&entries, &delivered, |id| self.core.ran_at_start(id))
+        };
         futures_util::stream::iter(wanted)
             .map(|id| async move {
                 let delivered = match self.link.archive_credential(&id).await {
@@ -422,6 +486,16 @@ impl<M: Machine> Service<M> {
                 }
             })
             .await;
+    }
+
+    /// The two reads from Cloudflare that a page needs: they do not depend on each other. The
+    /// archive credentials are for the jobs and the archive socket (`Core::deliver`), the node's
+    /// own for the gateway and the Tunnel (`apply_credentials`); they share no state. The node's
+    /// credentials are polled first because the Worker makes several calls to Cloudflare's API for
+    /// them.
+    async fn read_credentials(&self, page: &Page) {
+        let _one_at_a_time = self.reading.lock().await;
+        tokio::join!(self.apply_credentials(page), self.deliver_credentials(page));
     }
 
     /// The Tunnel token and the route keyring, when the page names a newer revision than the one
@@ -475,24 +549,29 @@ impl<M: Machine> Service<M> {
 
     /// Takes in a pull of the page. The first one, the agent's start, says how long each part took
     /// (`agent_start_phase`).
+    ///
+    /// The credentials come first for a page after the first: a database that is built needs its
+    /// own from its first step. The first page is applied at once and the credentials are read
+    /// after it, in the background: a node has 300 of them at 120 ms a round trip, and its gateway
+    /// and the wakes of its databases wait for the decisions on the databases that run and for
+    /// nothing else (EU1, 2026-10-23: the reads were 4.7 s of the 28.7 s to the first served wake).
+    /// A database that runs is registered with the archive socket when its credential arrives
+    /// (`Core::deliver`), those first (`wanted_credentials`), and a build waits for its own and
+    /// begins when it arrives (`Core::build`, `Core::deliver`).
     async fn pull_page(self: &Arc<Self>, page: Page, first: bool) {
-        let phase = |name| {
-            if first {
-                crate::timing::phase(name);
-            }
-        };
-        // The two reads do not depend on each other: the archive credentials are for the jobs
-        // and the archive socket (`Core::deliver`), the node's own for the gateway and the Tunnel
-        // (`apply_credentials`); they share no state, and the page is applied after both. The
-        // node's credentials are polled first because the Worker makes several calls to
-        // Cloudflare's API for them.
-        tokio::join!(
-            self.apply_credentials(&page),
-            self.deliver_credentials(&page)
-        );
-        phase("credentials");
-        self.core.apply(&page).await;
-        phase("apply");
+        if first {
+            self.core.apply(&page).await;
+            crate::timing::phase("apply");
+            let (service, credentials_page) = (self.clone(), page.clone());
+            self.spawn(async move {
+                service.read_credentials(&credentials_page).await;
+                // Beside the row: it ends when the reads do, whatever the start has reached.
+                crate::timing::phase_once("credentials");
+            });
+        } else {
+            self.read_credentials(&page).await;
+            self.core.apply(&page).await;
+        }
         self.answer_probes(&page);
         self.consider_update(&page.release);
     }
@@ -540,6 +619,66 @@ impl<M: Machine> Service<M> {
                 LinkEvent::Fenced => {}
             }
         }
+    }
+
+    /// The pulls the wakes ask for (`catch_up`): the databases that wait for their page are pulled
+    /// together, one request for up to 40 of them (more are pulled whole), and a pull that is under
+    /// way does not hold the next one's databases back from being collected. A pull of its own,
+    /// beside the link's hints and the whole page every minute: a wake does not wait for a hint
+    /// that has not come, and a slow pull holds up no other.
+    async fn wanted_pulls(self: &Arc<Self>) {
+        loop {
+            self.wanted_signal.notified().await;
+            let ids: Vec<String> =
+                std::mem::take(&mut *self.wanted.lock().unwrap_or_else(PoisonError::into_inner))
+                    .into_iter()
+                    .collect();
+            if !ids.is_empty() {
+                self.pull(Some(&ids)).await;
+            }
+        }
+    }
+
+    /// A wake whose ticket is ahead of the node's page (`Core::page_behind`): the page is pulled at
+    /// once, and the wake waits for it up to `Timing::page_wait` after the gateway queued it. EU1,
+    /// 2026-10-23: a connection right after an idle sleep brings the generation the sleep made,
+    /// the node has not pulled it, and 16.7 % of 1,000 cycle wakes were refused `desired_stale`
+    /// for 1 to 7 s, for 32.6 s with the link to the API down. Nothing else changes: when the wait
+    /// ends, the wake meets the same checks against the page it has, and a ticket the page does not
+    /// order is refused as before. The pull is asked for again every second while the page is
+    /// behind, as one that failed would otherwise cost the whole wait.
+    async fn catch_up(self: &Arc<Self>, request: &WakeRequest) {
+        if !self.core.page_behind(request) {
+            return;
+        }
+        let queued = Duration::from_millis(
+            u64::try_from(crate::agent::now_ms())
+                .unwrap_or(0)
+                .saturating_sub(request.queued_at_ms),
+        );
+        let deadline = Instant::now() + self.core.timing.page_wait.saturating_sub(queued);
+        let mut ask = Instant::now();
+        loop {
+            if Instant::now() >= ask {
+                self.want_page(&request.database);
+                ask = Instant::now() + PAGE_RETRY;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(PAGE_POLL).await;
+            if !self.core.page_behind(request) {
+                return;
+            }
+        }
+    }
+
+    fn want_page(&self, database: &str) {
+        self.wanted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(database.to_string());
+        self.wanted_signal.notify_one();
     }
 
     /// The whole page again at an interval: a message the link lost is made up for.
@@ -1108,11 +1247,14 @@ impl<M: Machine> Service<M> {
             let service = self.clone();
             tokio::spawn(async move {
                 // A database the page does not name yet: it is pulled once, as the page may be
-                // ahead of the node.
+                // ahead of the node. One it names, at a generation or a route the ticket is
+                // ahead of, is pulled at once, and the wake waits for the page.
                 if service.core.find(&request.database).is_none() {
                     service
                         .pull(Some(std::slice::from_ref(&request.database)))
                         .await;
+                } else {
+                    service.catch_up(&request).await;
                 }
                 let result = service.core.wake(&request).await;
                 // `wake_in_progress` is no answer: the gateway asks again.
@@ -1308,10 +1450,12 @@ impl<M: Machine> Service<M> {
 
     /// The pool of idle slots: kept at `start_concurrency` while no start is in flight or waits,
     /// when the pool was used, and now and then for what no start told it (a slot that ended, a
-    /// quiet node that began with an empty pool).
+    /// quiet node that began with an empty pool). PostgreSQL's program is kept in the page cache
+    /// at the same turns, at its own interval (`Core::warm_program`).
     async fn slots(&self) {
         loop {
             self.core.refill_pass().await;
+            self.core.warm_program().await;
             tokio::select! {
                 () = self.core.refill.notified() => {}
                 () = tokio::time::sleep(SLOTS_EVERY) => {}
@@ -1472,6 +1616,12 @@ mod tests {
         // The page's database is built, and the cloud is told it is ready, with its first backup.
         eventually(90, "the cloud to be told the database is ready", || {
             observed(&cloud, &id, "ready")
+        })
+        .await;
+        // The loop of the pool also keeps PostgreSQL's program in the page cache: the agent made
+        // its first pass over it once the node was quiet.
+        eventually(30, "the first pass over PostgreSQL's program", || {
+            service.core().readahead.program_passes() >= 1
         })
         .await;
         // The sample for placement, the volume report and the events arrive, each as the contract states
@@ -1946,8 +2096,161 @@ mod tests {
         service.stop();
     }
 
+    /// A connection right after an idle sleep brings a ticket of the generation the sleep made,
+    /// and the node's page is behind it (EU1, 2026-10-23: 16.7 % of 1,000 cycle wakes were refused
+    /// `desired_stale`, for 1 to 7 s, and for 32.6 s with the link to the API down). The node pulls
+    /// the page of the database at once and the wake waits for it, up to the wait: a ticket the
+    /// page then matches is admitted, one it still does not match is refused as before, and none is
+    /// admitted that the page does not order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_ahead_of_the_page_pulls_it_at_once_and_waits_for_it_within_a_bound() {
+        let Some((machine, _fixture, _root)) =
+            site("wake-ahead", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let (link, events) = Link::start(
+            LinkConfig {
+                paths: crate::link::Paths::new(&base),
+                image_version: "25".into(),
+                agent_version: "0.1.0".into(),
+                release_id: None,
+                os: crate::machine::os_report(&*machine).await.unwrap(),
+                timing: LinkTiming {
+                    interval: Duration::from_millis(300),
+                    ..LinkTiming::default()
+                },
+            },
+            Transport::new(cloud.roots()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut db = new_entry_json();
+        let id = db["id"].as_str().unwrap().to_string();
+        let credential = db["archive"]["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        cloud.with(|inner| {
+            inner.databases = vec![db.clone()];
+            inner.credential_paths.insert(credential, path);
+        });
+        let service = Service::start(
+            machine.clone(),
+            link,
+            events,
+            ServiceConfig {
+                intervals: quick(),
+                timing: crate::agent::Timing {
+                    page_wait: Duration::from_millis(1500),
+                    ..timing()
+                },
+                gateway: None,
+                release_key: test_release_key(),
+            },
+        )
+        .await
+        .unwrap();
+        eventually(90, "the cloud to be told the database is ready", || {
+            observed(&cloud, &id, "ready")
+        })
+        .await;
+        let mut gateway = FakeGateway::connect(&machine.layout().gateway_socket()).await;
+        let node = service
+            .core()
+            .find(&id)
+            .unwrap()
+            .view()
+            .entry
+            .clone()
+            .unwrap();
+        // D1 moved on by one generation, with a route revision more, and no hint has reached the
+        // node: its page is behind. The ticket is the next generation of what D1 has.
+        db.as_object_mut().unwrap().remove("origin");
+        db["generation"] = (node.generation + 1).into();
+        db["operation"] = "op_dddddddddddddddddddd".into();
+        db["route_revision"] = (node.route_revision + 1).into();
+        cloud.with(|inner| inner.databases = vec![db.clone()]);
+        let ahead = crate::agent::Entry::parse(&db).unwrap();
+        let answered = |gateway: &FakeGateway, operation: &str| {
+            gateway
+                .received()
+                .into_iter()
+                .filter_map(|message| match message {
+                    ToGateway::WakeResult { result } if result.operation == operation => {
+                        Some(result)
+                    }
+                    _ => None,
+                })
+                .next_back()
+        };
+
+        // A ticket the page can match: the node pulls the database's page, and the wake is admitted
+        // well inside the wait.
+        let began = Instant::now();
+        let mut ticket = Rig::ticket(&ahead);
+        ticket.operation = "op_wwwwwwwwwwwwwwwwwwww".into();
+        gateway.send_wake(ticket.clone()).await;
+        eventually(30, "the wake to be answered", || {
+            answered(&gateway, &ticket.operation).is_some()
+        })
+        .await;
+        let result = answered(&gateway, &ticket.operation).unwrap();
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (Outcome::Started, None),
+            "{result:?}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(
+            service
+                .core()
+                .find(&id)
+                .unwrap()
+                .view()
+                .entry
+                .as_ref()
+                .unwrap()
+                .generation,
+            ahead.generation,
+            "the page was pulled"
+        );
+
+        // A ticket the page, once pulled, still does not match: the wake waits for the page up to
+        // the wait and is refused as it was.
+        let mut beyond = Rig::ticket(&ahead);
+        beyond.generation += 1;
+        beyond.operation = "op_xxxxxxxxxxxxxxxxxxxx".into();
+        let began = Instant::now();
+        gateway.send_wake(beyond.clone()).await;
+        eventually(30, "the wake beyond the page to be answered", || {
+            answered(&gateway, &beyond.operation).is_some()
+        })
+        .await;
+        let result = answered(&gateway, &beyond.operation).unwrap();
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (Outcome::Refused, Some("desired_stale")),
+            "{result:?}"
+        );
+        assert!(
+            began.elapsed() >= Duration::from_millis(1400),
+            "it waited for the page: {:?}",
+            began.elapsed()
+        );
+        service.stop();
+    }
+
     /// A node has a credential for each of its databases, and each is a round trip to Cloudflare:
-    /// the agent reads several at once, and has all of them before it applies the page.
+    /// the agent reads several at once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_archive_credentials_of_the_databases_are_read_several_at_a_time() {
         let Some((machine, _fixture, _root)) =
@@ -1976,25 +2279,35 @@ mod tests {
         });
         let began = std::time::Instant::now();
         let service = serve(&machine, &cloud, &base).await;
-        let took = began.elapsed();
-        for db in &databases {
-            let path = db["archive"]["path"].as_str().unwrap();
-            assert!(
-                service
-                    .core()
-                    .store(path, crate::credentials::Access::ReadWrite)
-                    .is_some(),
-                "{path}"
-            );
-        }
+        eventually(10, "every credential to arrive", || {
+            stored(&service, &databases) == databases.len()
+        })
+        .await;
         // One after the other, 24 round trips of 150 ms are 3.6 s.
+        let took = began.elapsed();
         assert!(took < Duration::from_millis(2000), "{took:?}");
         service.stop();
     }
 
+    /// How many of the databases the node holds the archive credential of.
+    fn stored(service: &Service<crate::machine::local::Local>, databases: &[Value]) -> usize {
+        databases
+            .iter()
+            .filter(|db| {
+                service
+                    .core()
+                    .store(
+                        db["archive"]["path"].as_str().unwrap(),
+                        crate::credentials::Access::ReadWrite,
+                    )
+                    .is_some()
+            })
+            .count()
+    }
+
     /// The archive credentials of the databases and the node's own credentials (the Tunnel and the
-    /// route keyring) are two reads from Cloudflare, and neither needs the other: the first page
-    /// is applied in about the time of the slower one, and not of both added.
+    /// route keyring) are two reads from Cloudflare, and neither needs the other: both are done in
+    /// about the time of the slower one, and not of both added.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_archive_credentials_and_the_nodes_credentials_are_read_at_the_same_time() {
         let Some((machine, _fixture, _root)) = site("credentials-both", &|root| {
@@ -2004,7 +2317,8 @@ mod tests {
         };
         let cloud = Cloud::start().await;
         let base = tempdir();
-        let databases: Vec<Value> = (0..CREDENTIALS_AT_ONCE)
+        // Eight databases, fewer than are read at once: one round of reads, and a page this small.
+        let databases: Vec<Value> = (0..8.min(CREDENTIALS_AT_ONCE))
             .map(|n| {
                 let mut db = database(&database_id(n));
                 db["archive"]["credential"]["id"] = json!(format!("crd_{n:020}"));
@@ -2025,22 +2339,101 @@ mod tests {
         });
         let began = std::time::Instant::now();
         let service = serve(&machine, &cloud, &base).await;
+        eventually(10, "both reads to be applied", || {
+            machine.credentials_applied().len() == 1 && stored(&service, &databases) == 8
+        })
+        .await;
         let took = began.elapsed();
-        for db in &databases {
-            let path = db["archive"]["path"].as_str().unwrap();
-            assert!(
-                service
-                    .core()
-                    .store(path, crate::credentials::Access::ReadWrite)
-                    .is_some(),
-                "{path}"
-            );
-        }
-        assert_eq!(machine.credentials_applied().len(), 1);
         // One after the other the two are 1.8 s; at the same time they are the 1.2 s of the slower.
         assert!(took >= Duration::from_millis(1200), "{took:?}");
-        assert!(took < Duration::from_millis(1600), "{took:?}");
+        assert!(took < Duration::from_millis(1700), "{took:?}");
         service.stop();
+    }
+
+    /// The first page is applied and the gateway served while the credentials are still being
+    /// read: a node that restarts has its databases decided on and its wakes answered after a
+    /// page and not after 300 round trips to Cloudflare (EU1, 2026-10-23: 4.7 s of the start).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_gateway_is_served_before_the_credentials_have_been_read() {
+        let Some((machine, _fixture, _root)) = site("credentials-after", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let databases: Vec<Value> = (0..4)
+            .map(|n| {
+                let mut db = database(&database_id(n));
+                db["archive"]["credential"]["id"] = json!(format!("crd_{n:020}"));
+                db
+            })
+            .collect();
+        cloud.with(|inner| {
+            for db in &databases {
+                inner.credential_paths.insert(
+                    db["archive"]["credential"]["id"].as_str().unwrap().into(),
+                    db["archive"]["path"].as_str().unwrap().into(),
+                );
+            }
+            inner.databases = databases.clone();
+            inner.credential_delay = Duration::from_millis(1500);
+            inner.node_credentials_delay = Duration::from_millis(1500);
+        });
+        let began = std::time::Instant::now();
+        let service = serve(&machine, &cloud, &base).await;
+        let took = began.elapsed();
+        assert!(took < Duration::from_millis(1000), "{took:?}");
+        assert_eq!(stored(&service, &databases), 0, "not read yet");
+        assert!(machine.credentials_applied().is_empty());
+        eventually(10, "the credentials to arrive", || {
+            stored(&service, &databases) == databases.len()
+                && machine.credentials_applied().len() == 1
+        })
+        .await;
+        service.stop();
+    }
+
+    /// The credentials of the databases that run when the agent starts are read first: their
+    /// archivers are the ones that wait for them.
+    #[test]
+    fn the_credentials_of_the_databases_that_run_are_read_first() {
+        let entries: Vec<Entry> = (0..5)
+            .map(|n| {
+                let mut db = database(&database_id(n));
+                db["archive"]["credential"]["id"] = json!(format!("crd_{n:020}"));
+                Entry::parse(&db).unwrap()
+            })
+            .collect();
+        let runs = |id: &str| id == database_id(3) || id == database_id(4);
+        let delivered = HashSet::from([format!("crd_{:020}", 4)]);
+        assert_eq!(
+            wanted_credentials(&entries, &delivered, runs),
+            [
+                format!("crd_{:020}", 3),
+                format!("crd_{:020}", 0),
+                format!("crd_{:020}", 1),
+                format!("crd_{:020}", 2),
+            ],
+            "the one that runs and was read is not read again, the others follow in the page's order"
+        );
+    }
+
+    /// A start that failed does not end at once: systemd restarts the agent after 100 ms, and a
+    /// node whose pool will not activate would run the same failing commands ten times a second.
+    /// The pause ends as soon as the agent is told to stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_start_waits_before_it_ends_and_a_stop_ends_the_wait() {
+        let began = tokio::time::Instant::now();
+        pause_after_failed_start(START_FAILURE_PAUSE, std::future::pending::<()>()).await;
+        assert_eq!(began.elapsed(), START_FAILURE_PAUSE);
+        let began = tokio::time::Instant::now();
+        pause_after_failed_start(
+            START_FAILURE_PAUSE,
+            tokio::time::sleep(Duration::from_millis(200)),
+        )
+        .await;
+        assert_eq!(began.elapsed(), Duration::from_millis(200));
     }
 
     // ---- updates (plan 9.3)
