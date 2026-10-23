@@ -812,8 +812,11 @@ export const MoveSource = RestoreSource.omit({ target_time: true }).extend({
 export type MoveSource = z.infer<typeof MoveSource>;
 /**
  * How the node builds the storage generation: `create` (initdb, only onto an empty archive path),
- * `restore` (into a new database) or `move` (this database's previous storage generation, to the
- * end of its WAL). Absent once the generation was ready: a missing volume is then an error and
+ * `restore` (into a new database), `move` (this database's previous storage generation, to the
+ * end of its WAL), or `replace` (PITR under the same identity, preserving the proven prior
+ * generation in a durable local journal until cutover or forward-generation rollback).
+ * `replace` is sent only to a converged node advertising `restore_in_place_v1`.
+ * Absent once the generation was ready: a missing volume is then an error and
  * never a fresh build.
  *
  * A move target restores `source.backup_id` and replays the WAL of `end.timeline` until every
@@ -829,6 +832,14 @@ export const DatabaseOrigin = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("create") }),
   z.strictObject({ kind: z.literal("restore"), source: RestoreSource }),
   z.strictObject({ kind: z.literal("move"), source: MoveSource }),
+  z.strictObject({
+    kind: z.literal("replace"),
+    source: RestoreSource.extend({ target_time: Timestamp }),
+    previous: z.strictObject({
+      storage_generation: Positive,
+      end: ProvenSleepRecord,
+    }),
+  }),
 ]);
 export type DatabaseOrigin = z.infer<typeof DatabaseOrigin>;
 
@@ -899,7 +910,16 @@ export const NodeDesiredDatabase = z
           code: "custom",
           path: ["origin"],
           message:
-            "A restore reads another database; a move reads this database's earlier generation to its end",
+            "A restore reads another database; a move or replacement reads this database's earlier generation",
+        });
+      if (
+        db.origin.kind === "replace" &&
+        from?.generation !== db.origin.previous.storage_generation
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["origin", "previous"],
+          message: "A replacement preserves the generation it restores from",
         });
     }
     refineRoles(db.roles, db.desired_state !== "deleted", ctx);
@@ -1416,6 +1436,8 @@ export const NodeSample = z
     queued: Count,
     /** The `NodeCredentials` revision the node applied; null before its first read. */
     credentials_revision: Positive.nullable(),
+    /** Sent only after the API accepts the capability; absence means unsupported. */
+    capabilities: z.array(z.literal("restore_in_place_v1")).max(1).optional(),
   })
   .superRefine((sample, ctx) => {
     const issue = (message: string) =>

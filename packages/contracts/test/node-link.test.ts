@@ -332,6 +332,64 @@ describe("the per-node desired page", () => {
       ).toBe(valid);
   });
 
+  it("replaces only the same database's proven prior generation with an explicit PITR target", () => {
+    const replacement = {
+      ...database,
+      storage_generation: 2,
+      archive: {
+        path: `s3://pgcf-eu/eu-dev/${id}/g2-${operation}`,
+        credential,
+      },
+      origin: {
+        kind: "replace",
+        source: {
+          database_id: id,
+          path: database.archive.path,
+          backup_id: "20261017T110000",
+          target_time: "2026-10-17T11:30:00.000Z",
+          credential,
+        },
+        previous: { storage_generation: 1, end: proof },
+      },
+    };
+    const valid = (entry: unknown) =>
+      NodeDesiredPage.safeParse({ ...page, databases: [entry] }).success;
+    expect(valid(replacement)).toBe(true);
+    expect(
+      valid({
+        ...replacement,
+        origin: { ...replacement.origin, previous: undefined },
+      }),
+    ).toBe(false);
+    expect(
+      valid({
+        ...replacement,
+        origin: {
+          ...replacement.origin,
+          previous: { storage_generation: 2, end: proof },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      valid({
+        ...replacement,
+        origin: {
+          ...replacement.origin,
+          source: { ...replacement.origin.source, target_time: undefined },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      valid({
+        ...replacement,
+        origin: {
+          ...replacement.origin,
+          source: { ...replacement.origin.source, database_id: "x".repeat(20) },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("proves a move's end with the source's proven-sleep record, and a restore has none", () => {
     // The target can check that replay reached every committed transaction only against the
     // record that proved the source's sleep (plan 7.9, 9.5).
