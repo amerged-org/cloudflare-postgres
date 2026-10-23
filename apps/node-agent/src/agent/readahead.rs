@@ -822,8 +822,9 @@ mod tests {
         assert!(passes.found.is_none() && passes.passes == 0);
     }
 
-    /// A start raises the flag that ends a pass, and a pass lowers it first. That the pass obeys
-    /// the flag is the next test's.
+    /// A start raises the flag that ends a pass when it has its permit, before its unit is ordered
+    /// and for as long as it is in flight, and a pass lowers it first. That the pass obeys the flag
+    /// is the next test's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_start_raises_the_flag_that_ends_a_pass_and_a_pass_lowers_it() {
         let Some(rig) = Rig::with_timing("readahead-start-ends-pass", timing()).await else {
@@ -838,7 +839,26 @@ mod tests {
         rig.core.warm_program().await;
         assert!(!rig.core.readahead.start_began.load(Ordering::Relaxed));
         assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
-        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert!(
+            !rig.core.readahead.start_began.load(Ordering::Relaxed),
+            "a sleep is not a start"
+        );
+        // The wake is held in flight: its postmaster is up and the start has not ended. The flag
+        // is up already, and not only once the start has succeeded, for a pass that began in
+        // between would read from the disk the start is waiting for.
+        rig.machine.delay_next_start(Duration::from_millis(1200));
+        let (core, ticket) = (rig.core.clone(), Rig::ticket(&entry));
+        let waking = tokio::spawn(async move { core.wake(&ticket).await });
+        eventually(10, "the start to be ordered", || {
+            rig.machine.running(&entry.id)
+        })
+        .await;
+        assert!(
+            rig.core.readahead.start_began.load(Ordering::Relaxed),
+            "a start in flight has raised the flag"
+        );
+        assert!(!waking.is_finished(), "the start is still in flight");
+        let result = waking.await.unwrap();
         assert_eq!(result.outcome, Outcome::Started, "{result:?}");
         assert!(rig.core.readahead.start_began.load(Ordering::Relaxed));
     }
