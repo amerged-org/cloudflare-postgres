@@ -36,6 +36,10 @@ const WAL_SEGMENT_BYTES: u64 = 16 << 20;
 /// What the data directory needs outside `base` and `global` besides the WAL: the commit logs,
 /// the statistics and the files of a checkpoint (lab: below 25 MiB).
 const SLACK_BYTES: u64 = 64 << 20;
+/// The least that the WAL may pass `max_wal_size` by. It is a soft limit, and what it passes it by
+/// is the WAL written while a checkpoint runs: in the lab, with the disk unthrottled, 16 to 128
+/// MiB for volumes of 2 and 5 GiB, not in proportion to the size.
+const OVERSHOOT_BYTES: u64 = 128 << 20;
 /// The inodes that the files outside the project use besides the WAL segments: the commit logs,
 /// the statistics, the replication directories and the top-level files of the data directory.
 const OTHER_INODES: u64 = 1024;
@@ -51,14 +55,14 @@ pub struct Limits {
 
 /// The limits for a filesystem of `usable_bytes` and `inodes` (`statvfs` of the mount), on a
 /// volume of `volume_bytes`: what is left after the room that the WAL has up to `max_wal_size`
-/// and a quarter more, and the files of the rest of the data directory. `max_wal_size` is a soft
-/// limit: the lab saw `pg_wal` 16 to 112 MiB over it at the peak of a `DELETE` of every row at
-/// the limit, and a write of the WAL that finds no room panics the server, so the room is
-/// generous. Never more than half of the filesystem is taken out, so that a volume smaller than
-/// its own WAL (a lab's) still has a share for the tenant.
+/// and a quarter more (at least `OVERSHOOT_BYTES`), and the files of the rest of the data
+/// directory. `max_wal_size` is a soft limit: the lab saw `pg_wal` 16 to 128 MiB over it at the
+/// peak of a `DELETE` of every row at the limit, and a write of the WAL that finds no room panics
+/// the server, so the room is generous. Never more than half of the filesystem is taken out, so
+/// that a volume smaller than its own WAL (a lab's) still has a share for the tenant.
 pub fn limits(usable_bytes: u64, inodes: u64, volume_bytes: u64) -> Limits {
     let wal = max_wal_bytes(volume_bytes);
-    let outside = (wal + wal / 4 + SLACK_BYTES).min(usable_bytes / 2);
+    let outside = (wal + (wal / 4).max(OVERSHOOT_BYTES) + SLACK_BYTES).min(usable_bytes / 2);
     let outside_inodes =
         (wal / WAL_SEGMENT_BYTES + wal / WAL_SEGMENT_BYTES / 8 + OTHER_INODES).min(inodes / 2);
     Limits {
@@ -100,8 +104,10 @@ mod tests {
             assert!(now > last && now < gib * GIB, "{gib} GiB: {now}");
             last = now;
         }
-        // 62 to 67 percent of a volume at every size: `max_wal_size` is a quarter of it.
-        assert!(share(1) * 100 / GIB > 55 && share(65536) * 100 / (65536 * GIB) > 66);
+        // 55 to 67 percent of a volume at every size: `max_wal_size` is a quarter of it, and the
+        // WAL of the smallest volumes has room for its overshoot.
+        assert!(share(1) * 100 / GIB > 50 && share(1) * 100 / GIB < 58);
+        assert!(share(2) * 100 / (2 * GIB) > 60 && share(65536) * 100 / (65536 * GIB) > 66);
     }
 
     /// The lab's volumes of 64 and 256 MiB are smaller than the WAL they would have: the tenant

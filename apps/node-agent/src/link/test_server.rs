@@ -169,6 +169,8 @@ pub struct Inner {
     /// The same for a read of the node's credentials (the Tunnel and the route keyring), which the
     /// Worker answers after several calls to Cloudflare's API.
     pub node_credentials_delay: Duration,
+    /// The same for a read of the desired page (the Worker reads D1 and builds the page).
+    pub page_delay: Duration,
     /// Files served to anyone at `/files/...`, as a release's binaries are by their URLs.
     pub files: std::collections::HashMap<String, Vec<u8>>,
     /// The release the pages name, where it is not the example's.
@@ -250,6 +252,7 @@ impl Cloud {
             credential_paths: Default::default(),
             credential_delay: Duration::ZERO,
             node_credentials_delay: Duration::ZERO,
+            page_delay: Duration::ZERO,
             files: Default::default(),
             release: None,
             credentials: None,
@@ -731,6 +734,12 @@ async fn serve(
             inner.credential_delay
         } else if request.target == paths["credentials"].as_str().unwrap() {
             inner.node_credentials_delay
+        } else if request.method == "GET"
+            && request
+                .target
+                .starts_with(paths["desired"].as_str().unwrap())
+        {
+            inner.page_delay
         } else {
             Duration::ZERO
         };

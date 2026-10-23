@@ -37,6 +37,19 @@ pub fn bin_directory() -> Option<PathBuf> {
     found_or_skip(found, std::env::var_os("CI").is_some())
 }
 
+/// The directory of the extension libraries (`pkglibdir`) of the PostgreSQL whose programs are in
+/// `bin`: what its `pg_config` says where it has one, else `lib` beside `bin` (Debian's layout).
+pub fn lib_directory(bin: &Path) -> PathBuf {
+    Command::new(bin.join("pg_config"))
+        .arg("--pkglibdir")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| bin.join("../lib"))
+}
+
 fn found_or_skip(found: Option<PathBuf>, in_ci: bool) -> Option<PathBuf> {
     if found.is_none() {
         assert!(
@@ -115,6 +128,7 @@ impl Cluster {
         let layout = Layout {
             state: root.join("s"),
             run: root.join("r"),
+            postgres_lib: lib_directory(&bin),
             postgres_bin: bin,
             ..Layout::default()
         };
@@ -197,6 +211,13 @@ impl Cluster {
     /// Starts the postmaster as the unit does and returns when it is ready (`READY=1`, which the
     /// postmaster's status line precedes).
     pub fn start(&self) {
+        self.start_timed();
+    }
+
+    /// `start`, and how long the postmaster took from its spawn to its ready line, which is read
+    /// every millisecond.
+    pub fn start_timed(&self) -> Duration {
+        let spawned = Instant::now();
         let child = Command::new(self.layout.postgres_bin.join("postgres"))
             .arg("-D")
             .arg(self.data())
@@ -217,7 +238,7 @@ impl Cluster {
         let started = Instant::now();
         loop {
             if ready::ready_socket(&self.volume(), pid).is_ok() {
-                return;
+                return spawned.elapsed();
             }
             if let Some(status) = self
                 .child
@@ -235,7 +256,7 @@ impl Cluster {
                 "the postmaster is not ready:\n{}",
                 self.log()
             );
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
     /// Stops the postmaster with SIGINT, a fast shutdown, as the unit's `KillSignal` does.

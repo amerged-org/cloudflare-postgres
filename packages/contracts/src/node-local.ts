@@ -78,8 +78,10 @@ export const WAKE_OUTCOMES = ["started", "refused"] as const;
 export type WakeOutcome = (typeof WAKE_OUTCOMES)[number];
 /**
  * Every reason a wake result, a failed wake order and a wake event may name. `no_room` (the room
- * rule, 57P03 "storage") and `no_headroom` (the wait for awake capacity expired) are the
- * admission refusals of plan 4.6. The holds and states that refuse a wake follow: `deleted`;
+ * rule, 57P03 "storage"), `no_headroom` (the wait for awake capacity expired: the memory rule held
+ * the start back) and `start_queue` (the wait expired with the memory rule satisfied: the start
+ * cap alone held the start back) are the admission refusals of plan 4.6. The holds and states that
+ * refuse a wake follow: `deleted`;
  * `suspended` (a manual suspend never wakes on connect); `moving` (the hold of a move source);
  * `maintenance`; `fenced`; `superseded` (a retired storage generation); `unproven` (recovery
  * pending or running, plan 7.10); `storage_full` (the volume cannot start). Then the checks of
@@ -91,6 +93,7 @@ export type WakeOutcome = (typeof WAKE_OUTCOMES)[number];
 export const WAKE_REASONS = [
   "no_room",
   "no_headroom",
+  "start_queue",
   "deleted",
   "suspended",
   "moving",
@@ -135,7 +138,11 @@ export const WAKE_STALE = [
 export type WakeStale = (typeof WAKE_STALE)[number];
 
 /** The refusals of the admission loop (plan 4.6). */
-export const ADMISSION_REFUSALS = ["no_room", "no_headroom"] as const;
+export const ADMISSION_REFUSALS = [
+  "no_room",
+  "no_headroom",
+  "start_queue",
+] as const;
 /**
  * The DETAIL of the 57P03 that answers each admission refusal. The gateway sends it with every
  * refused held connection; the other reasons of `WAKE_REASONS` have no detail.
@@ -143,14 +150,16 @@ export const ADMISSION_REFUSALS = ["no_room", "no_headroom"] as const;
 export const ADMISSION_REFUSAL_DETAILS = {
   no_room: "storage",
   no_headroom: "node at awake capacity",
+  start_queue: "node busy starting databases",
 } as const satisfies Record<(typeof ADMISSION_REFUSALS)[number], string>;
 /**
- * Only the wait for awake capacity has a retry hint (policy `retry_after_seconds`): the gateway
+ * Only the refusals that waiting undoes have a retry hint (policy `retry_after_seconds`): the wait
+ * for awake capacity (`no_headroom`) and the wait for the start cap (`start_queue`). The gateway
  * sends it as the HINT `retry after <n> s`. `no_room` and every other reason carry none, because
  * waiting does not make room.
  */
 export const refusalRetryHint = (reason: WakeReason): boolean =>
-  reason === "no_headroom";
+  reason === "no_headroom" || reason === "start_queue";
 
 /**
  * What the gateway sends with the 57P03 of a refused wake besides its message: the DETAIL of an
@@ -252,7 +261,7 @@ export const WakeResult = z
     generation: Positive,
     outcome: z.enum(WAKE_OUTCOMES),
     reason: z.enum(WAKE_REASONS).optional(),
-    /** The HINT of the 57P03, exactly with `no_headroom` (`refusalRetryHint`). */
+    /** The HINT of the 57P03, exactly with `no_headroom` and `start_queue` (`refusalRetryHint`). */
     retry_after_seconds: z.number().int().min(1).max(300).optional(),
     /** Measured steps; the agent names the phases of `WAKE_PHASES`. */
     steps_ms: z
@@ -276,7 +285,7 @@ export const WakeResult = z
       (result.reason !== undefined && refusalRetryHint(result.reason)),
     {
       path: ["retry_after_seconds"],
-      message: "Exactly the refusal of awake capacity carries a retry hint",
+      message: "Exactly the refusals that waiting undoes carry a retry hint",
     },
   );
 export type WakeResult = z.infer<typeof WakeResult>;

@@ -133,6 +133,7 @@ describe("the agent's gateway channel", () => {
     for (const reason of [
       "no_room",
       "no_headroom",
+      "start_queue",
       "deleted",
       "suspended",
       "moving",
@@ -187,6 +188,10 @@ describe("the agent's gateway channel", () => {
       detail: "node at awake capacity",
       hint: "retry after 5 s",
     });
+    expect(refusalFields("start_queue", 5)).toEqual({
+      detail: "node busy starting databases",
+      hint: "retry after 5 s",
+    });
     expect(refusalFields("no_room")).toEqual({ detail: "storage" });
     // The other reasons answer the 57P03 alone.
     for (const reason of WAKE_REASONS)
@@ -194,17 +199,24 @@ describe("the agent's gateway channel", () => {
         expect(refusalFields(reason)).toEqual({});
   });
 
-  it("gives the retry hint of the 57P03 to exactly the refusal of awake capacity", () => {
+  it("gives the retry hint of the 57P03 to exactly the refusals that waiting undoes", () => {
     const result = { database, operation, generation: 4, outcome: "refused" };
     expect(refusalRetryHint("no_headroom")).toBe(true);
+    expect(refusalRetryHint("start_queue")).toBe(true);
     expect(refusalRetryHint("no_room")).toBe(false);
     expect(
       ADMISSION_REFUSALS.map((reason) => ADMISSION_REFUSAL_DETAILS[reason]),
-    ).toEqual(["storage", "node at awake capacity"]);
+    ).toEqual([
+      "storage",
+      "node at awake capacity",
+      "node busy starting databases",
+    ]);
     for (const [fields, valid] of [
       [{ reason: "no_headroom", retry_after_seconds: 5 }, true],
+      [{ reason: "start_queue", retry_after_seconds: 5 }, true],
       [{ reason: "no_room" }, true],
       [{ reason: "moving" }, true],
+      [{ reason: "start_queue" }, false],
       [{ reason: "no_headroom" }, false],
       [{ reason: "no_room", retry_after_seconds: 5 }, false],
       [{ reason: "no_headroom", retry_after_seconds: 0 }, false],

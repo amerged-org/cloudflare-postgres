@@ -76,8 +76,8 @@ export const HOST_FILE_UNITS = [
  * alone is enough; `restart_unit:<unit>` restarts a running unit; `next_start` is for a unit that
  * runs per database and is never restarted for a file: it takes the new file when it next starts
  * (its stop settings already at its next stop); `sysusers` runs
- * `systemd-sysusers <file>` and `tmpfiles` runs `systemd-tmpfiles --create <file>`, once the
- * reload is done and before any restart. Both are idempotent, as the postinst of a package runs
+ * `systemd-sysusers <file>` and `tmpfiles` runs `systemd-tmpfiles --create --remove <file>` (`--create`
+ * alone ignores the `r` lines that remove), once the reload is done and before any restart. Both are idempotent, as the postinst of a package runs
  * them, and neither waits for a boot: systemd-sysusers.service runs at a boot only when /usr is
  * newer than /etc/.updated, which a file in /usr/lib/sysusers.d does not make it.
  */

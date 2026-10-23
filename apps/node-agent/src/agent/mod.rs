@@ -22,7 +22,7 @@ pub(crate) mod report;
 pub(crate) mod testing;
 
 pub use entry::{Desired, Entry, Origin, Policy, Source};
-pub use readahead::{PREFETCH, Prefetch};
+pub use readahead::{PREFETCH, Prefetch, Start};
 
 use crate::{
     admission::{Admission, Admitter, Facts, Permit, Running},
@@ -75,6 +75,12 @@ pub struct Timing {
     /// run, before it is refused with `wake_in_progress` and the gateway delivers it again (after
     /// `REDELIVER_MS`, 3 s): shorter, so that a wait never overlaps its own redelivery.
     pub adopt_wait: Duration,
+    /// How long a wake whose ticket is ahead of the node's page waits for the page, counted from
+    /// the moment the gateway queued the wake (`Service::catch_up`). A connection right after an
+    /// idle sleep brings the generation the sleep made, and the page follows in 1 to 7 s (EU1,
+    /// 2026-10-23): this covers that, and stays well under the gateway's 25 s bound, so the start
+    /// that follows still has its time.
+    pub page_wait: Duration,
     /// The wait before the first repeat of the boot report that Cloudflare could not take, and the
     /// longest wait.
     pub report_retry: Duration,
@@ -94,9 +100,14 @@ pub struct Timing {
     pub detail: Duration,
     /// How long a build waits for an archive credential that has not been delivered (its own, or
     /// its source's) before it fails with `archive_unusable`: the pull that begins or resumes a
-    /// build is also the one that reads the credentials, and a read that failed is made again by
-    /// the next pull (`Core::build`).
+    /// build is also the one that reads the credentials (the first page's are read after it is
+    /// applied), a read that failed is made again by the next pull, and a credential that arrives
+    /// (`Core::deliver`) begins the waiting build at once (`Core::build`).
     pub credential_wait: Duration,
+    /// How often the agent keeps PostgreSQL's program in the page cache (`readahead`): a pass
+    /// that finds nothing lost counts the pages of 37 MB and reads nothing, and the pages the
+    /// kernel drops under memory pressure are read back within this time.
+    pub program_every: Duration,
 }
 impl Default for Timing {
     fn default() -> Self {
@@ -108,6 +119,7 @@ impl Default for Timing {
             recovery_retry: Duration::from_secs(1),
             recovery_retry_maximum: Duration::from_secs(30),
             adopt_wait: Duration::from_secs(2),
+            page_wait: Duration::from_secs(8),
             report_retry: Duration::from_secs(2),
             report_retry_maximum: Duration::from_secs(60),
             host_files_retry: Duration::from_secs(5),
@@ -115,6 +127,7 @@ impl Default for Timing {
             settle: Duration::from_secs(10),
             detail: Duration::from_secs(2),
             credential_wait: Duration::from_secs(300),
+            program_every: Duration::from_secs(60),
         }
     }
 }
@@ -352,6 +365,8 @@ pub struct Core<M: Machine> {
     pub(crate) fences: Fences,
     pub(crate) timing: Timing,
     pub(crate) prefetch: Prefetch,
+    /// What the readings remember: the program found, the passes, the starts counted for the A/B.
+    pub(crate) readahead: readahead::Readahead,
     pub(crate) policy: Arc<RwLock<Policy>>,
     /// A maintenance order is open: new wakes are held with 57P03 (plan 9.3).
     pub(crate) maintenance: AtomicBool,
@@ -359,6 +374,9 @@ pub struct Core<M: Machine> {
     taken: Mutex<std::collections::HashSet<String>>,
     /// The R2 endpoint each archive path was delivered with.
     endpoints: Mutex<HashMap<String, String>>,
+    /// The databases whose archive could not be registered because their credential had not
+    /// arrived (`ensure_archive`): the first page is applied before the credentials are read.
+    archive_waiting: Mutex<std::collections::HashSet<String>>,
     dbs: Mutex<HashMap<String, Arc<Db>>>,
     /// The databases whose unit was awake when the agent started: the gateway's first table must
     /// show them running (`settled`).
@@ -427,10 +445,12 @@ impl<M: Machine> Core<M> {
             fences: parts.fences,
             timing: parts.timing,
             prefetch: parts.prefetch,
+            readahead: readahead::Readahead::new(),
             policy,
             maintenance: AtomicBool::new(false),
             taken: Mutex::new(std::collections::HashSet::new()),
             endpoints: Mutex::new(HashMap::new()),
+            archive_waiting: Mutex::new(std::collections::HashSet::new()),
             dbs: Mutex::new(HashMap::new()),
             awake_at_start,
             resumed: Mutex::new(
@@ -575,7 +595,7 @@ impl<M: Machine> Core<M> {
 
     /// A credential Cloudflare delivered (`ArchiveCredential`): kept for the jobs and the archive
     /// socket, with the R2 endpoint of its archive path.
-    pub fn deliver(&self, credential: &serde_json::Value) -> Result<(), crate::Error> {
+    pub fn deliver(self: &Arc<Self>, credential: &serde_json::Value) -> Result<(), crate::Error> {
         let text = |key: &str| credential[key].as_str().ok_or("credential field missing");
         let access = match text("access")? {
             "read_write" => Access::ReadWrite,
@@ -602,8 +622,37 @@ impl<M: Machine> Core<M> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(path.to_string(), text("endpoint_url")?.to_string());
+        // The databases that were decided on before their credential came reach R2 now, not at
+        // PostgreSQL's next try.
+        let waiting: Vec<String> = self
+            .archive_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .collect();
+        for id in waiting {
+            if let Some(db) = self.find(&id)
+                && let Some(entry) = db.view().entry.clone()
+            {
+                self.ensure_archive(&db, &entry);
+            }
+        }
+        // A build that waits for a credential (`Core::build`) begins when it arrives, not at the
+        // next pull: the first page is applied before the credentials are read.
+        for db in self.all() {
+            if db.view().credential_missing_since_ms.is_some() {
+                self.schedule(&db);
+            }
+        }
         Ok(())
     }
+
+    /// Whether the agent held the database when it started with a unit that ran: its archiver is
+    /// the one that waits for the credential (`deliver`).
+    pub fn ran_at_start(&self, id: &str) -> bool {
+        self.awake_at_start.contains(id)
+    }
+
     /// The store of an archive path the node holds a credential for; `None` before it was delivered.
     pub(crate) fn store(&self, path: &str, access: Access) -> Option<Store> {
         let endpoint = self
