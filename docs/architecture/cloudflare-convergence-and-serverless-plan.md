@@ -1,3 +1,86 @@
+# Production readiness update — 2026-10-24
+
+**Current objective:** finish EU1 and US1 for production on the same accepted release and OS state, with a cold whole-request p95 **below 1 second** on each region. This delivery ends at verified PGCF production readiness and a complete generic integration handover. Integrator implementation, customer migration and the integrator control database belong to the next task. **The owner explicitly removed the 72-hour canary requirement on 2026-10-24.** Production readiness is not yet achieved.
+
+**Reading rule:** this dated update sets the current priorities and reconciles status. The complete existing ULTRA plan is retained below, including architecture, decisions, implementation detail and measurements. Requirements and safety invariants remain in force; an old “not deployed” or “TODO” row must be checked against the baseline before it becomes work again. Detailed history is not deleted or replaced by this update.
+
+**Baseline:** `origin/main` at `b75dae82`, node release `sha-b75dae82d08a`, API/Edge deployed and D1 migrations through `0086`. This describes the deployed system, not an older local code checkout. Keep the current Debian/systemd/Rust-node runtime and its existing slot pool; no further architecture migration is required to complete this plan. The pool was allowed again by the owner on October 20, superseding its removal in the older introductory scope.
+
+## Existing databases: only cold and warm
+
+- **Warm:** the PostgreSQL instance serving this database is running.
+- **Cold:** that instance is not running; an eligible request must start it against the retained data before SQL can complete.
+
+A minute, an hour or days asleep are all **cold**. A free prestarted slot, warm Actor or cached pages do not make the customer's database warm. There is no parked, hot-idle or third temperature tier. Suspension, recovery and maintenance remain lifecycle/admission conditions, not temperature tiers; explicit suspension still requires authorized resume.
+
+**The strictly-under-one-second target is the first complete real application request**, including connection, wake, authentication and SQL, at p95. Keep the established six-statement workload and one-hour/24-hour cold-cohort protocol. A trivial query, connect-only timing or a newly created database cannot pass the gate. A single HTTP transaction is accepted; WebSocket compatibility remains required. There is no additional 750 ms release gate.
+
+Measure EU1 and US1 independently from a Cloudflare Worker through the public endpoint. Record release, colo, class, dataset, actual density and background load, including normal backups; report p50/p95/max, errors and capacity waits. Count every scheduled first request and its elapsed time; do not remove slow requests, retries or pool misses. Report the Germany-laptop path separately. EU1 measurements do not certify US1, and an empty-node result does not certify the intended loaded capacity.
+
+## What is already established, and what is not
+
+| Area | Reconciled baseline |
+| --- | --- |
+| Deployment | Both active nodes were ready, schedulable and release-converged at the 2026-10-23 22:15 UTC read. Both still reported `os_converged: false`. |
+| Cold request | Last full EU1 pass: p50/p95/max 948/1,583/1,851 ms, 59 requests after about 50 hours asleep: failed. The interrupted 36 trivial-query samples close no gate. |
+| Kill-test safety | Release B preserved all 9,081 acknowledged commits, with no replay or second writer. This is completed safety evidence for the tested events. |
+| Agent-restart availability | The 2.68–10.81 s `first_wake_served` values counted refusals. Actual database-start wakes took 4.35 s quiet and 6.06–11.33 s loaded; client results took 4.82 and 6.51–11.78 s, with clock uncertainty. The existing 3 s target remains open, not waived. |
+| Density | The previous release passed the one-hour pattern and 1,000 exact-counter cycles. Storm p95 7.9–17.2 s failed. Release B changed storm/sleep behavior; that affected campaign needs one final rerun. |
+| Backup and alerts | G5 delivery and G6 real decrypt/import plus export-window checks passed. Reuse them. Verify the next scheduled backup in the new bucket; the 2026-10-24 00:00 UTC run was still future at the baseline read. |
+| Outstanding test resources | EU1 retains 311 test databases, including the 59 cold-gate databases. US1 retains two leaked deleted-database volumes/accounts. Preserve the cold cohort until measured and uncommitted `volfmt`/`ci-race` work until reconciled. |
+
+## Completion sequence
+
+### A. Finish one correctness release
+
+Use the existing fix branches; verify their current diffs instead of restarting completed review rounds. Keep only changes required for observed defects, with failing regressions first and the existing single CI workflow.
+
+| Work | Required closure |
+| --- | --- |
+| Storage growth | Fix the observed ext4 grow boundary; measure actual filesystem capacity before reporting success. Missing evidence cannot mean success. Cover existing volumes and creates/restores spanning a release. |
+| Delete and pool recovery | Confirm runtime/account/volume removal and reclaimed space before success. Retry and alert on incomplete cleanup, rediscover owned leftovers after restart, and recover affected volumes when the pool has room again. `vollife` already contains retries and an alert; finish verification. |
+| Full own volume/inodes | Keep 80%/90% alerts, no lost commits and verified recovery by growth. The owner chose recovery by growth: omit the project-quota proposal and any hidden reduction of usable storage. Do not promise arbitrary VACUUM/TRUNCATE at the limit. |
+| Small-class memory | Reproduce wide-row ANALYZE and expression-index/statistics cases; verify supported defaults, confinement and recovery. Do not promise arbitrary SQL fits in 256 MiB. |
+| Control plane | Close measured cron stalls, misleading placement alerts and audit-write failures; retain fail-closed accountability. Recheck create-to-ready against the existing 30.7 s target in its stated workload. |
+| Wake and restart | Correct the success metric; address or disprove initial pool-sample refusals, serial adoption/excessive unit reads and the separate Edge admission stalls. Preserve one writer and running-instance adoption. |
+| Restore and moves | Verify the deployed restore queue/timeout/restart changes. Bound batches by memory. Reject same-node moves before mutation. PITR is mandatory; close the Neon-parity gap of restoring a historical state while retaining the client connection identity, with exclusive-writer fencing, failure-safe cutover and recovery of the prior state. The existing restore-to-new-ID operation remains compatible. |
+| Verification | Finish the two narrow flaky-test fixes with bounded waits. Remove scratch investigations from the final patch. Require green signed main, not a lucky rerun. |
+
+Choose the final prefetch setting through one bounded comparison, then remove experimental alternation before final cold acceptance. Do not add another cache/protocol/uploader without a measured blocker. Preserve the existing API/agent compatibility table in section 9.3 and rollback restrictions; preparatory releases may be necessary. Roll out **US1 first, then EU1**, verifying convergence and basic acceptance between nodes.
+
+### B. Qualify both nodes on the final release
+
+- **Each node:** public routing/Access, create after first DONE backup, roles and SQL, sleep/wake, suspend/resume, truthful resize, delete/reclaim, base backup/WAL, full restore/PITR and actual archive lag. US1 must prove its own storage and EU-bucket archive path. Clear its known orphans by verified ownership.
+- **Storage failure checks:** prove old/new-volume compatibility, own-volume/inode recovery and reserve/full-pool behavior on real disposable storage, including alerts, other databases remaining safe and unchanged recovered digests. Reuse unchanged common-code evidence rather than duplicate a class × region × transport matrix.
+- **EU1 density campaign:** at least 300 databases, 5–10% awake for at least one hour, a 40-database storm with one crash-looping database and 1,000 wake/sleep cycles. Preserve the existing storm target, exact counters, memory bounds and service-stability criteria. State US1's separately verified capacity envelope.
+- **Faults and recovery:** process kills under writes for affected paths; on each node, one at a time, R2 outage with reboot/recovery and a hard reset proving automatic pool activation. Stop on lost commits, duplicate writers or isolation failure. Remove every temporary fault injection afterwards. The restart target must pass with successful client SQL or receive an explicit owner decision; a refusal is not success.
+- **Restore and operations:** a memory-bounded restore batch exceeding the former 20-minute timeout, restart during fetch and after first backup, exact digests, retention-boundary behavior and truthful failed targets. Exercise broken-agent recovery on US1. After pool-repair proof, run maintenance one node at a time and verify `os_converged`, maintenance refusal, resumed SQL and useful diagnostics.
+- **Final cold acceptance:** after disruptive tests, run the one-hour/24-hour cohorts on both nodes at their declared production load. Meet the whole-request p95 <1 s objective with the established sample/sign-off protocol. Reuse earlier evidence only when its relevant release, configuration and workload are unchanged.
+
+A failed check creates a specific fix and affected rerun, not another open-ended campaign. No production data participates in destructive acceptance.
+
+### C. Close operations and prepare the integration handover
+
+Keep the original gate IDs and history, with these owner-approved changes: G1–G10 remain the platform gates; G11 ends at the verified generic contract and handover, without an integrator implementation or written integrator acknowledgement in this task; G12's 72-hour canary is removed. Update original status rows only with actual measured results. G1 must cover the final release; G2–G4 and G9 remain incomplete. Reuse G5/G6. Reconcile G7's reported completion with its measured receipt, or perform one bounded check of sleeping-hour zero traffic, finalized rollups, pruning and aggregate growth. Finish G8 custody/revocations, scheduled new-bucket backup verification and authorized old-bucket retirement. For G10, disable test classes and remove test populations only after dependent measurements.
+
+Retain required signature-refusal, read-only administrator, tenant-isolation and credential-custody checks; do not drop an unresolved protection because its task row is old. Preserve signed releases, per-node scoped R2 credentials and safe recovery/rollback. Complete the old control VPS retirement under existing owner authority; preserve custody material before deletion. New paid resources and production writes still need the owner's explicit, costed go.
+
+Refresh the existing runbooks and integrator handover for G11. State actual capacity, connection limits, maintenance/contact arrangements, retry semantics and restore/new-ID mapping. **Normal archive timeout plus upload is not an unconditional RPO during backlog or R2 failure.** Measure both regions. The prior 2.2–3.4 h recovery estimate covers 167 databases; it is not a measured bound for the current population.
+
+Verify the provider contract with disposable PGCF databases in both regions: transport and supported driver settings; startup/timeouts/extensions; API-based roles; async polling/idempotency; actual alert schema and recurrence deduplication; PITR and connection identity; bridge/export/import compatibility. Deliver measured results and the public contract. Do not edit or deploy the integrator in this task. Its regional selector must be able to use both regions through the same PGCF API; the customer will choose the region in the subsequent integration task.
+
+### D. Finish at PGCF production readiness
+
+Finish only after both nodes have the same accepted release and compatible policy, converged OS state, successful functional/storage/recovery/operational acceptance and independently measured cold whole-request p95 below 1,000 ms. Replace the removed timed canary with the bounded end-to-end provider acceptance above, not with an unverified readiness claim. There are only cold and warm database states.
+
+The completion report must name the accepted commit and immutable release, both regional measurements, durability/recovery results and remaining documented limits. The next task connects the integrator and migrates new and existing customer workloads under its own scoped release authority; no customer switching or integrator control-database migration occurs here. Measure PGCF archive/load capacity and expose the limits needed for that later migration.
+
+**Scope boundary:** finish these gates on the existing nodes. No new HA/rebalancing/branching project, return to Kubernetes, new control server or obligatory Rust/Wasm Edge conversion. Existing approved targets remain, but do not expand this readiness campaign. The owner requested implementation of this plan on 2026-10-24, including the existing Dev acceptance and release work. New paid resources and production writes still require explicit costed authority; never infer permission to switch existing customer workloads.
+
+---
+
+**Existing ULTRA plan retained in full below.** Where historical scope/status conflicts with the dated update above, use the update for current execution; the original detail and evidence remain available for verification.
+
 - **What still needs a new image.** The bootloader and the kernel command line (`grub.cfg`), the partition layout and first-boot partitioning (`repart.d`), `fstab`, the firewall (`nftables.conf`), sshd's data files and the generator mask outside the unit directories, the presets (which units are enabled), the links to the binaries (`/usr/libexec/pgcf`), the packages' own files outside the lock's maintenance cycle, the initial boot and the first agent that can write host files. A release that changes the mount topology (`MountImages=` or `PrivateMounts=` of V4h's volumes out of PID 1's namespace) in these files is written to every running node and nothing refuses it: the running databases keep the topology they started with and each takes the new one at its next start, which nothing has measured, so such a release must not be assigned to a region with running nodes (nothing enforces this; the V4h change reaches EU1 by the reinstall already decided, 11.2). The agent that first writes host files comes with an image: an agent of an earlier build refuses a page whose release lists host files (its generated schema is strict and its release has none), and the API refuses its hello without the digest, so every node needs the image that carries the first such agent; from that agent on the page states only the shape of the list, and a release that widens a rule reaches every node.
 
 # ULTRA: serverless PostgreSQL on plain Linux nodes
