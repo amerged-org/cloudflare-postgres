@@ -17,20 +17,14 @@ export default {
   },
   scheduled(_controller, env, context) {
     // One line per invocation makes bounded background work, such as the usage sample pruning,
-    // observable while it drains. It carries the colo the run executed in and the time of each
-    // step: a run of 60 to 340 s whose statements each cross an ocean to D1 shows as a far colo.
+    // observable while it drains. It carries the time of each step (`step_ms`); the colo of the
+    // run and its start are in Cloudflare's invocation analytics, not in this line.
     context.waitUntil(
-      Promise.all([import("./cron.ts"), import("./colo.ts")]).then(
-        async ([{ runCron }, { traceColo }]) => {
-          const [result, colo] = await Promise.all([
-            runCron(env),
-            traceColo(1500),
-          ]);
-          console.log(
-            JSON.stringify({ event: "cron_completed", colo, ...result }),
-          );
-        },
-      ),
+      import("./cron.ts")
+        .then(({ runCron }) => runCron(env))
+        .then((result) =>
+          console.log(JSON.stringify({ event: "cron_completed", ...result })),
+        ),
     );
   },
 } satisfies ExportedHandler<Env>;

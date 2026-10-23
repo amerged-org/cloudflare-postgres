@@ -99,9 +99,10 @@ export async function evaluateAlerts(
  * The clock of the alerts: a Durable Object alarm once a minute that evaluates every alert
  * (`evaluateAlerts`), including its judgement of the minute cron's heartbeat. An alarm is
  * scheduled by this object's own storage, not by the Worker's cron trigger, so it keeps firing
- * when the trigger is removed or its invocations do not start (2026-10-23: no run began between
- * 16:06:28 and 16:15:15), when a cron step hangs and when every step fails: the cron only arms it,
- * and each alarm schedules the next before it evaluates anything.
+ * when the trigger is removed or the platform does not start it, when a cron step hangs and when
+ * every step fails: the cron only arms it, and each alarm schedules the next before it evaluates
+ * anything. On 2026-10-23 the platform started no cron invocation from 14:41 to 14:54 and from
+ * 16:03 to 16:21 UTC, and this alarm fired in 435 of the 435 minutes from 11:00 to 18:15.
  */
 export class CronWatchdog extends DurableObject<Env> {
   /** Idempotent: keeps the pending alarm and starts the chain when there is none. */

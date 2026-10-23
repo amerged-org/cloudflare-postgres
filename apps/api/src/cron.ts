@@ -26,14 +26,17 @@ import {
 import { armCronWatchdog } from "./cron-watchdog.ts";
 
 /**
- * How long one step may take before the run leaves it behind. Measured on 2026-10-23 (323 runs
- * logged between 11:00 and 18:15 UTC), steps waited for a D1 or Durable Object call that never
- * answered: `actor_warmers` failed 6,056 s after its run began, and a whole run ended 10,090 s
- * after its schedule, while the slowest healthy step, the usage step at its limit of 600
- * statements, took about two to three minutes in the runs that did the most. The bound is above
- * that and below the 300 s after which the stall alarm fires. The step is counted
- * as failed (`step_timeout`) and the next one starts; what the step left unfinished is picked up
- * by the next minute's run, as after any failure.
+ * How long one step may take before the run leaves it behind. It is a guarantee, not an answer to
+ * a hung step that was seen: Cloudflare's invocation analytics show 335 runs between 11:00 and
+ * 18:15 UTC on 2026-10-23, and the longest took 340 s in all (median 96 s, because the platform
+ * ran them in Asia-Pacific and US colos while D1 is in WEUR); the five `cron_step_failed` lines
+ * that could be matched to their run came 3 to 157 s after it began, and none of those runs
+ * lasted longer than 169 s. Without a bound a step that does hang would hold back every step
+ * after it. Only 3 of the 335 whole runs took longer than 240 s (262, 277 and 340 s),
+ * so a step meets the bound only when it is nearly all of a slow run, and the bound is below the
+ * 300 s after which the stall alarm fires. The step is counted as failed (`step_timeout`) and the next one starts; what the step
+ * left unfinished is picked up by the next minute's run, as after any failure. `step_ms` in the
+ * `cron_completed` line is what shows whether a step comes near it.
  */
 export const CRON_STEP_TIMEOUT_MS = 240_000;
 

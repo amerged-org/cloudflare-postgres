@@ -50,7 +50,6 @@
 //   sized for 300 ms a visit (`ACTOR_WARM_VISIT_PLAN_MS`), the reading under which the limit
 //   applies: `actorWarmShardSize`.
 import type { ActorWarmerShape } from "../actor-warmer.ts";
-import { traceColo } from "../colo.ts";
 import type { Env } from "../env.ts";
 import { cronErrorCode } from "./cron-health.ts";
 import { databaseActor } from "./database-actor-sync.ts";
@@ -213,6 +212,7 @@ export function actorWarmer(
   );
 }
 
+const TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace";
 const TRACE_TIMEOUT_MS = 2_000;
 
 /**
@@ -232,7 +232,12 @@ export async function reportPlacement(
 ): Promise<void> {
   if (cache.placed) return;
   cache.placed = true;
-  const colo = await traceColo(TRACE_TIMEOUT_MS);
+  const colo = await fetch(TRACE_URL, {
+    signal: AbortSignal.timeout(TRACE_TIMEOUT_MS),
+  })
+    .then((response) => response.text())
+    .then((trace) => /^colo=([A-Z]{3})$/m.exec(trace)?.[1] ?? null)
+    .catch(() => null);
   console.log(
     JSON.stringify({
       event: "actor_warmer_placed",

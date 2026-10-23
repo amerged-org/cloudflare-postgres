@@ -469,13 +469,38 @@ The minute cron runs these steps in order: `infrastructure_backup_dispatch`, the
 `backup_retention`. **The alerts are no step of the cron.** The `CronWatchdog` Durable Object
 evaluates every alert of every region from its own alarm once a minute (the health alarms, the
 capacity alarms and the judgement of the cron's heartbeat), so a step that is slow or hangs, a
-run that does not start and a cron trigger that is gone cannot hold an alert back. Measured on
-2026-10-23 (323 runs logged between 11:00 and 18:15 UTC, EU1 under test load): a run took 125 s
-at the median, 491 s at the 90th percentile and up to 10,090 s, only 13 % ended within the minute,
-and no run completed for 925 s (14:42:20 to 14:57:45) and for 1,163 s (16:04:34 to about 16:24),
-while the alarm chain kept firing. The inode alert of that afternoon came 315 s after the refusal
-at 14:55:03; the node posts volumes every 60 s, and the logs do not separate that interval from
-the late runs.
+run that does not start and a cron trigger that is gone cannot hold an alert back.
+
+**What the platform does with the trigger (measured on 2026-10-23, 11:00 to 18:15 UTC, EU1 under
+test load, from Cloudflare's invocation analytics).** The cron trigger is not reliable in time or
+place, and the Worker's own log lines mislead about it:
+
+- *No start.* The platform started no cron invocation from 14:41 to 14:54 (848 s between the
+  starts of 14:40:54 and 14:55:02) and from 16:03 to 16:21 (1,156 s, 16:02:46 to 16:22:02): the
+  triggers of 14 and 19 minutes were not delivered, and no step was hanging. Some triggers arrive
+  together afterwards (10 invocations in the same second at 14:07:02 in HKG and 10 at 14:23:02 in
+  SIN). Everything the cron does waits meanwhile: the keep-warm leases of the `ActorWarmer`
+  objects last 180 s and lapsed in 20 minutes of that day (`actor_warm_stopped`).
+- *A far colo.* The 335 runs that can be told apart ran in Asia-Pacific colos (280) and US colos
+  (55), none in Europe, while D1's primary is in WEUR: 96 s at the median, 168 s at the 90th
+  percentile, 340 s at most, with CPU at 313 ms at the median and 947 ms at most. From 18:35 UTC
+  the platform ran it in European colos and the 22 runs there took 22 s at the median (12 to 34
+  s). A run is long because each of its statements crosses to D1, not because a step is slow.
+- *The alarm is steady.* The `CronWatchdog` alarm fired in 435 of the 435 minutes (longest gap
+  between two alarms 61 s), every minute of both windows included, in SIN, in 1.0 s at the median
+  and 4.6 s at most.
+- *`scheduledTime` is not a start.* `$workers.event.scheduledTime` of a log line repeats (14:27:02
+  is the scheduled time of four invocations that logged at 15:05:08, 16:08:31, 17:15:12 and
+  18:51:54, the last on a script version that did not exist at 14:27), so a duration computed from
+  it is wrong. Read the start and the colo from the analytics: GraphQL `workersInvocationsAdaptive`
+  for the Worker (an API token with Account Analytics: Read, read-only), fields `datetime` (the
+  start of an invocation), `coloCode`, `status` and `sum{requests subrequests wallTime
+  cpuTimeUs}` (`wallTime` in microseconds), in slices of 15 minutes (a query returns at most
+  10,000 rows). A cron run is a row with one request, at least 100 subrequests and 10 s or more.
+
+The inode alert of that afternoon came 315 s after the refusal at 14:55:03. Runs had begun at
+14:55:02 and every minute after it, and evaluated the alerts first, so the gap in the trigger does
+not explain it; the node posts volumes every 60 s, and no line says which evaluation found them.
 
 Each step runs in its own failure boundary and has 240 s. A step that throws is logged as
 `cron_step_failed` (`step`, `error_code`, a redacted `message` and `ms`; the heartbeat and the
@@ -487,10 +512,8 @@ other regions, and one kind that fails to evaluate does not stop the other kinds
 The Worker's own cron outcome stays successful when steps fail: read `cron` in the health route
 and the alarms, not the cron trigger's error rate.
 
-The run logs one `cron_completed` line: the `colo` it ran in and `step_ms`, the milliseconds of
-each step in the order they ran. A step that is slow only because every D1 statement crosses an
-ocean shows as a colo far from the D1 primary (WEUR for Dev) with `step_ms` that grow with the
-statements of the step.
+The run logs one `cron_completed` line with `step_ms`, the milliseconds of each step in the order
+they ran. It does not name the colo: the analytics above do.
 
 The alarm logs one `alert_evaluation` line a minute: `duration_ms`, `phase_ms` for its three
 phases (`health_alerts`, `capacity_alerts`, `cron_watchdog`) and `failed`, the phases that threw or
@@ -525,7 +548,8 @@ completed run, so a `control_cron_step_failing` episode is kept and neither star
 Reading a stall: `last_started_at` recent with `last_completed_at` old means runs begin
 but do not finish (a step is slow: `cron_step_failed` with `step_timeout` and `cron_completed`'s
 `step_ms` name it; the alerts keep running because they are no step), both old means no run
-starts (the cron trigger or the deployment).
+starts (the platform did not deliver the trigger, or the trigger or the deployment is gone:
+the analytics above show which).
 
 ## Proving delivery
 
