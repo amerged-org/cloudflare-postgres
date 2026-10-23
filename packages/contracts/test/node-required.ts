@@ -10,6 +10,31 @@
  * adds the property is a breaking change, and the plan's row for the release says why it is safe.
  */
 export const NODE_REQUIRED: Record<string, string[]> = {
+  "NodeDesiredPage.databases[].origin|kind=replace_rollback": [
+    "kind",
+    "previous",
+    "replacement_generation",
+    "source",
+  ],
+  "NodeDesiredPage.databases[].origin|kind=replace_rollback.source": [
+    "backup_id",
+    "credential",
+    "database_id",
+    "path",
+  ],
+  "NodeDesiredPage.databases[].origin|kind=replace_rollback.source.credential":
+    ["expires_at", "id"],
+  "NodeDesiredPage.databases[].origin|kind=replace_rollback.previous": [
+    "end",
+    "storage_generation",
+  ],
+  "NodeDesiredPage.databases[].origin|kind=replace_rollback.previous.end": [
+    "checkpoint_lsn",
+    "last_archived_segment",
+    "proven_at",
+    "system_identifier",
+    "timeline",
+  ],
   // New variant: API capability-gates delivery until the native consumer is deployed.
   "NodeDesiredPage.databases[].origin|kind=replace": [
     "kind",

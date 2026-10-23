@@ -840,6 +840,15 @@ export const DatabaseOrigin = z.discriminatedUnion("kind", [
       end: ProvenSleepRecord,
     }),
   }),
+  z.strictObject({
+    kind: z.literal("replace_rollback"),
+    source: RestoreSource.omit({ target_time: true }),
+    previous: z.strictObject({
+      storage_generation: Positive,
+      end: ProvenSleepRecord,
+    }),
+    replacement_generation: Positive,
+  }),
 ]);
 export type DatabaseOrigin = z.infer<typeof DatabaseOrigin>;
 
@@ -913,13 +922,27 @@ export const NodeDesiredDatabase = z
             "A restore reads another database; a move or replacement reads this database's earlier generation",
         });
       if (
-        db.origin.kind === "replace" &&
+        (db.origin.kind === "replace" ||
+          db.origin.kind === "replace_rollback") &&
         from?.generation !== db.origin.previous.storage_generation
       )
         ctx.addIssue({
           code: "custom",
           path: ["origin", "previous"],
           message: "A replacement preserves the generation it restores from",
+        });
+      if (
+        db.origin.kind === "replace_rollback" &&
+        !(
+          db.origin.previous.storage_generation <
+            db.origin.replacement_generation &&
+          db.origin.replacement_generation < db.storage_generation
+        )
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["origin", "replacement_generation"],
+          message: "Rollback advances beyond the failed replacement generation",
         });
     }
     refineRoles(db.roles, db.desired_state !== "deleted", ctx);
