@@ -39,7 +39,7 @@ operator procedures are in the other runbooks ([recovery](recovery.md),
 | Runtime | Databases run on two nodes installed from one PGCF image: EU1 (region `eu-dev`) and US1 (region `us-dev`). Each runs one sandboxed systemd PostgreSQL 18 service per database on its own thin LVM volume, a pool of idle sandbox slots that a wake takes instead of building one, and one Rust node agent; there is no Kubernetes. Live acceptance on EU1: Stage 5.1 (lifecycle) passed **on the `xs` class** (2 of 8 creates took longer than the 5.1 target of 30.7 s), while the `md` lifecycle and the restore of an `md` database into a smaller class have not run yet: they wait for EU1 to place a database of that size ([2.1](#21-create)); Stages 5.2 (sleep and wake), 5.8(b) and 5.8(c) (isolation) passed; Stage 5.4 (crashes) ran on 2026-10-20 with no lost acknowledged commit and one check not met, the agent's restart gap of 36.6 s against 15 s (the start has since been shortened to 5.3 s; the check has not been rerun, [7.1](#71-what-happens-in-each-situation)); Stages 5.3 (cold p95), 5.5 (storage) and 5.6 (density) are open. US1 passed its database acceptance on 2026-10-23 with one `sm` database. No plan row records a lifecycle run of the `lg` class. The plan's gates decide what still blocks go-live. |
 | First request after a wake | The whole request is one HTTP `/sql` transaction of six statements, sent from a Worker over the public hostname. After about 50 h asleep, 59 samples on 2026-10-23: p50 948 ms, p95 1,583 ms, 26 of 59 at or above 1 s. After 1 h or more asleep, 59 samples on 2026-10-20: p50 1,126 ms, p95 1,814 ms. **The go-live target, a p95 of at most 1 s with 750 ms as the aim, is not met yet** ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)). |
 | Backups | Every database archives its WAL and base backups into the installation's one R2 bucket, which is in the EU jurisdiction, for both regions (cutover 2026-10-23). A new database is ready only after its first base backup is DONE. The four production classes keep a 7-day recovery window ([2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point)). |
-| Redundancy | One node per region, one PostgreSQL instance per database, no replica, no second node in a region. Losing a node stops every database on it until it is restored from R2 into new IDs. **Extrapolated** on 2026-10-23 for EU1's 167 databases and 23.4 GB of archives from a sample of 8 restores, of which 7 became ready: about 2.8 to 3.6 h in all, if every restore succeeds. The eighth failed `archive_unusable`; the total assumes that defect is fixed, and its fix is not merged ([7.3](#73-recovery-time), [7.4](#74-eu1-lost)). |
+| Redundancy | One node per region, one PostgreSQL instance per database, no replica, no second node in a region. Losing a node stops every database on it until it is restored from R2 into new IDs. **Extrapolated** on 2026-10-23 for EU1's 167 databases and 23.4 GB of archives from a sample of 8 restores, of which 7 became ready: about 2.2 to 3.4 h in all, if every restore succeeds. The eighth failed `archive_unusable`; the total assumes that defect is fixed, and its fix is not merged ([7.3](#73-recovery-time), [7.4](#74-eu1-lost)). |
 | Capacity numbers | The density test (Stage 5.6, at least 300 databases) and the pool-full and volume-full tests (Stage 5.5) have not run. The numbers in [4](#4-capacity-and-limits-you-must-enforce) are the plan's admission rules and starting values, except where a measurement with a date is named. |
 | New databases | Every database lives on a thin LVM volume of its node, placed by the 80 % rule of [2.1](#21-create). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced. After a burst of awake databases a node stays closed for the length of the placement window: 3 days (owner decision O6 of 2026-10-23; the code on main has it and the installation applies it once the API release is deployed, [2.1](#21-create)). |
 | Alerts | Infrastructure alerts go to the operator's alert webhook and the owner receives them (go-live gate G5 met on 2026-10-20); you receive none from PGCF ([6](#6-alerts-and-operations)). |
@@ -618,9 +618,9 @@ without a report. The node reports a build that is under way as `building` with 
 page, and each report restarts the 20 minutes, so a restore that waits for the node's one big-job
 slot (one base fetch or base backup at a time, first come first served, for every restore and
 create on the node) behind other restores is not failed while its node reports it, however long
-the queue. Restores requested together on one node take turns: each holds the slot for about 18 s
-(xs-sized) to 130 to 180 s (about 0.5 GiB of data), so the last of a large batch is ready after the
-sum of the slot times of all of them. A build the node reports nothing about for 20 minutes (the
+the queue. Restores requested together on one node take turns: each holds the slot for 18.2 s
+(xs-sized) and 99 to 170 s (557 MB of data), as measured, so the last of a large batch is ready
+after the sum of the slot times of all of them. A build the node reports nothing about for 20 minutes (the
 node or its link is down) is failed `operation_timeout`; it is failed 20 minutes after its
 placement if the node never reported it. A create or a restore that is still `building` 24 hours
 after its placement is failed `operation_timeout` as well, whatever the node reports ("Build
@@ -643,7 +643,7 @@ you send together on one node queue for the same slot and are awake together too
 On an installation whose release does not have the report-based timeout, the 20 minutes run from
 the first `building` report whatever the progress and include the wait for the slot: restores
 requested together on one node time out far below 2.5 GiB of data, more than about 65 xs-sized or
-7 to 9 gate-sized restores at once are longer in the queue than 20 minutes and most or all of them
+7 to 12 gate-sized restores at once are longer in the queue than 20 minutes and most or all of them
 are failed, and the build can end ready on the node and archive WAL while the API keeps the target
 `provisioning` with the operation `failed`. There delete such a target and request the restore
 again, and keep each batch's summed slot time well within 20 minutes. A release rollout restarts
@@ -666,8 +666,11 @@ A restore needs capacity like a create; without it the target waits unplaced and
 stays `pending`. **Measured on EU1** (2026-10-23, "Live acceptance on the slot-pool release, part
 1", test data): a point-in-time restore was ready 50.1 s after the request and a full restore
 44.7 s with an equal digest; of 8 restores, 7 became ready, the `xs`-sized ones in 34.5 to 50.9 s
-and the gate-sized ones (the size of the cold gate's databases) in 248.7 s and 319.3 s (those two
-overlapped, the second waited for the slot behind the first, so neither is a single restore). A node runs
+and the gate-sized ones (the size of the cold gate's databases, 557 MB) in 248.7 s and 319.3 s. The
+248.7 s restore ran alone: its data lay in WAL (889 MB replayed in 139 s off the slot) and it held
+the slot for 99 s. The 319.3 s restore, with its data in the base backup, overlapped the agent's own
+rebuild of a failed restore of the same backup, waited 6.4 s for its listing and 112 s for its first
+base backup, held the slot for 170 s, and took about 200 s without the waits. A node runs
 one base-backup or restore job at a time (`backup.base_backups` 1), which serialises the base
 fetch and first backup of every restore on it: a restore was ready 154.6 s after the request when
 alone and 309.5 s with three at once on 2026-10-18 ("Stage 5.1 restore, PITR and delete on EU1").
@@ -1315,7 +1318,8 @@ each class.
 A restore is a base backup restore plus WAL replay on a new volume, so it depends on the database
 size and on capacity being available. Per database, measured on EU1 on 2026-10-23: a point-in-time
 restore was ready after 50.1 s, a full restore after 44.7 s, `xs`-sized restores after 34.5 to 50.9 s
-and gate-sized ones after 248.7 s and 319.3 s, which overlapped, so neither is a single restore
+and gate-sized ones (557 MB) after 248.7 s alone and 319.3 s, which overlapped the agent's rebuild of
+a failed restore and took about 200 s without its waits
 ([2.7](#27-backups-restorable-window-and-restore)).
 
 **A whole node.** The loss of a node has not been run: EU1 was not wiped. The plan extrapolates the
@@ -1324,9 +1328,10 @@ restore duration). **Of the 8 sample restores 7 became ready.** The eighth faile
 ("tar Unexpected EOF", with the base-backup job at its 256 MiB limit), and its target stayed
 `provisioning` for over 13 minutes ([8](#8-not-available-yet)); its fix is on branch `fx-restore` and
 is not merged. EU1's 167 databases hold 23.4 GB of archives. A node runs one base-backup or restore
-job at a time, which serialises the restores, so a full node restore would take at least about 2.7
-to 3.5 h; with the fence (30 s) and the reinstall of the server (174 to 197 s) the total would be at
-least about 2.8 to 3.6 h, or about 3 h. **The figure is a floor and assumes that every restore
+job at a time, which serialises the restores, so a full node restore would take at least about 2.2
+to 3.3 h (130 to 200 min: 108 `xs`-sized databases at the measured 18.2 s of slot time each, and
+59 gate-sized ones at the measured 99 to 170 s each); with the fence (30 s) and the reinstall of
+the server (174 to 197 s) the total would be at least about 2.2 to 3.4 h. **The figure is a floor and assumes that every restore
 succeeds, which the sample did not show:** until the `archive_unusable` defect is fixed and shown
 fixed, some databases of a real node loss may not restore within that total, and each stays
 unrestored until you delete its failed target and restore again. It is a floor also because the
@@ -1455,7 +1460,7 @@ be measured* (see the header), with its date. The source column gives the title 
 | Outage classes and maintenance windows | Idle sleep, suspend, maintenance cycle (67 s), agent restart (serving after 5.3 s), gateway release, node reboot or crash (the node reported again 26.8 s after a power cut's start request; the writer was acknowledged again 84.3 s after a VM restart), archiving failing, volume full, pool full, node lost, Cloudflare unavailable. Default window: Tuesday 02:00 to 04:00 UTC, which the operator forwards to you (the alert webhook reaches only the operator and the owner), until the owner names another | durations measured 2026-10-18 to 2026-10-20; the need for an announced window decided 2026-10-19 (D10); the default window is a plan default, decided as such (D15, 11.5) | "First live maintenance cycle on EU1"; "First release through the normal flow, with an agent change"; "Stage 5.4 results on EU1, runner `s5_chaos.py`"; plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
 | Security reboots | Within 7 days of a Debian security advisory that fixes the kernel, in an announced window (default Tuesday 02:00 to 04:00 UTC), one node at a time; every other reboot also needs the owner's go | decided 2026-10-19 (D10); window: plan default D15 | plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
 | IDs after restore, move and node loss | Restore: a new ID. Move: the ID is kept. Node loss: new IDs, restored from R2 | restore decided 2026-10-15 (plan 11.3); a move keeps the ID (plan 11.4) and has not been timed (**to be measured**, Stage 5.7); node loss is D4, the plan's default | "Moves keep the ID; automatic rebalancing after go-live" (plan 11.4); plan 11.5, D4 | [1.2](#12-regions), [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) |
-| Losing a node | About 2.8 to 3.6 h for EU1's 167 databases and 23.4 GB if every restore succeeds: fence 30 s, reinstall 174 to 197 s, restores about 2.7 to 3.5 h. **7 of the 8 sample restores succeeded; the total assumes the `archive_unusable` defect is fixed** (fix on branch `fx-restore`, not merged) | extrapolated 2026-10-23 from a sample of restores; fence and reinstall measured 2026-10-19 and 2026-10-22; the full drill has not been run | "Live acceptance on the slot-pool release, part 1"; "G9: what is left after the 2026-10-19 loss and reinstall"; "US1 installed into `us-dev` from the image" | [7.3](#73-recovery-time), [7.4](#74-eu1-lost) |
+| Losing a node | About 2.2 to 3.4 h for EU1's 167 databases and 23.4 GB if every restore succeeds: fence 30 s, reinstall 174 to 197 s, restores about 2.2 to 3.3 h. **7 of the 8 sample restores succeeded; the total assumes the `archive_unusable` defect is fixed** (fix on branch `fx-restore`, not merged) | extrapolated 2026-10-23 from a sample of restores; fence and reinstall measured 2026-10-19 and 2026-10-22; the full drill has not been run | "Live acceptance on the slot-pool release, part 1"; "G9: what is left after the 2026-10-19 loss and reinstall"; "US1 installed into `us-dev` from the image" | [7.3](#73-recovery-time), [7.4](#74-eu1-lost) |
 | Capacity caps | Placement fills a node to 80 % of its 30-minute peak of active RAM or CPU; pool closed at 80 % data or 50 % metadata; sold storage at most 4 times the pool; 1,000 volumes; 8 starts at once on EU1; a storm of 40 wakes answered in at most 5.8 s (HTTP) and 7.1 s (WebSocket) with none refused | dated rows in the table of 4.4 are measured (2026-10-17 and 2026-10-20); density and the storage limits are **to be measured** (Stage 5.6 and 5.5) | "Stage 1 Block 1: LVM at scale"; "Stage 5.6 wake storm, first measurement" | [4.4](#44-capacity-caps) |
 | Reserved role names | **Contract on main:** the API refuses `postgres`, `pgcf_backup`, `public`, `none` and every name that starts with `pg_` (`400`); `streaming_replica`, `cnpg_*` and `pgcf_maintenance` are ordinary role names. **Deployed on Dev today:** the previous list: the API refuses `postgres`, `streaming_replica` and every name that starts with `pg_` or `cnpg_`, refuses to create or delete `pgcf_maintenance` or to name it in `member_of`, and accepts `pgcf_backup`, `public` and `none`, which must not be used | decided (plan decisions W2-C and W2-C2) and built; the contract on main is the new list, the deployment is **to be done** (migration `0085`, a node release, the API Worker, the Edge Worker, in that order), 2026-10-23 | "Role names of the Kubernetes runtime released: migration `0085`, on branch `pr-w2c`"; "Role names released: deploy and live acceptance (W2-C)" (Open table); `packages/contracts/src/ids-core.ts`; the served OpenAPI, schema `RoleName` | [2.3](#23-roles-connection-uri-and-passwords) |
 | Regions and the archive bucket | Two regions, `eu-dev` (EU1) and `us-dev` (US1), and one R2 archive bucket in the EU jurisdiction for both | measured 2026-10-22 and 2026-10-23 | "US1 installed into `us-dev` from the image"; "US1 database acceptance in `us-dev`"; "G8 one archive bucket: the cutover on Dev, steps 1 to 11" | [1.2](#12-regions) |

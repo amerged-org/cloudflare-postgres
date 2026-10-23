@@ -51,9 +51,9 @@ passed at the second request, the one time it was seen.
 
 **The operation timeout and the node's one slot.** A node restores through one big-job slot
 (`backup.base_backups` is 1): every backup listing, base fetch and base backup of every restore and
-create on the node takes a turn, first come first served. The slot time of one restore is 18 s for
-an xs-sized database and 130 to 180 s for one with about 0.5 GiB of data, so the restores of a
-population take the sum of their slot times, one after another. The operation timeout of 20 minutes
+create on the node takes a turn, first come first served. The slot time of one restore, measured
+on EU1, is 18.2 s for an xs-sized database and 99 s and 170 s for one with 557 MB of data (below),
+so the restores of a population take the sum of their slot times, one after another. The operation timeout of 20 minutes
 counts the time without a report: the node says `building` for a restore or a create with every
 pull of its page, and each of these reports restarts the count. A restore that waits for the slot
 behind others is therefore not failed while its node reports it, whatever its place in the queue. A
@@ -67,9 +67,9 @@ as below ends in a fraction of that. This is built and tested and not yet deploy
 acceptance, a batch longer than 20 minutes, is open (the plan's 11.2). **On an installation whose
 release does not have it** the 20 minutes ran from the first `building` report whatever the
 progress and included the wait for the slot, so restores requested together on one node timed out
-far below 2.5 GiB of data (on EU1, two overlapping restores of about 0.5 GiB waited 6 s and 111 s
-for the slot) and a queue of more than about 65 xs-sized or 7 to 9 gate-sized restores failed most
-or all of its restores, which ended ready on the node and archived WAL while the API kept the
+far below 2.5 GiB of data (on EU1, a restore of about 0.5 GiB waited 6 s for its listing and 112 s
+for its first base backup behind another build) and a queue of more than about 65 xs-sized or 7 to
+12 gate-sized restores failed most or all of its restores, which ended ready on the node and archived WAL while the API kept the
 target `provisioning` with the operation `failed`: there submit the restores (and creates) of one
 node in batches whose summed slot time ends well within 20 minutes, and delete a target left that
 way and submit the restore again.
@@ -194,13 +194,20 @@ database measured, the total extrapolated.** The test databases had been deleted
 reinstall, so no node's population has been restored; EU1 was not wiped again. On 2026-10-23
 (release `sha-967f602d5c9b`) restores into new databases took 34.5 to 50.9 s for xs-sized databases
 (4 to 12 MB of archive; 18.2 s of it in the big-job slot) and 248.7 s and 319.3 s for a database
-with 557 MB of data. Those two overlapped: the 319.3 s restore waited 6.4 s for its listing and 111
-s of its first base backup for the slot behind the other, so neither is a single restore; a single
-one of that size is estimated at 150 to 220 s (130 to 180 s of it slot time) from the report of the
-slot. The one big-job slot serialises the listing, the base fetch and the first base backup of every
-restore on the node, so the slot time summed over a population is a floor for its restore time: for
-EU1's 167 databases (108 xs-sized, 59 gate-sized, 23.4 GB of archives) 161 to 210 min, 2.7 to 3.5 h,
-and with the fence (30 s) and the reinstall (174 to 197 s) about 2.8 to 3.6 h for the loss of EU1.
+with 557 MB of data. The 248.7 s restore ran alone and is a single restore: its 557 MB came from
+WAL (the base backup it fetched was small), 889 MB of which it replayed in 139 s off the slot, and
+it held the slot for 99 s (listing 0.9 s, fetch 1.5 s, first base backup 96.2 s, listing 0.8 s). The 319.3
+s restore was a restore of that database with its 557 MB in the base backup; it overlapped the
+agent's own rebuild of a failed restore of the same backup (the defect of the plan's 11.1 row "A
+build that failed is abandoned and not begun again") and waited 6.4 s for its listing and 112 s for
+its first base backup for the slot, which it then held for 170 s (listing 0.9 s, fetch 40.5 s,
+first base backup 125.0 s, listing 3.5 s); without the two waits it took about 200 s. The one
+big-job slot serialises the listing, the base fetch and the first base backup of every restore on
+the node, so the slot time summed over a population is a floor for its restore time. From the
+measured slot times, 18.2 s for each of EU1's 108 xs-sized databases (33 min) and 99 to 170 s for
+each of its 59 gate-sized ones (97 to 167 min; 23.4 GB of archives in all), that is 130 to 200 min,
+2.2 to 3.3 h, and with the fence (30 s) and the reinstall (174 to 197 s) about 2.2 to 3.4 h for the
+loss of EU1.
 **That total is an extrapolation and not a measured run**: it is a floor, because the population
 goes in batches that fit the awake memory (above: EU1's 167 databases have about 86 GiB of class
 memory against a budget of 9,937 MiB, so at least 9 batches) and the end of a batch, the last

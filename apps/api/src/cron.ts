@@ -37,8 +37,8 @@ export const ALERT_DELIVERY_BUDGET_MS = 20_000;
  * 20-minute clock of the operation (`Statements.running`), so a build that never ends keeps its
  * operation running for ever; this ceiling ends it. It is generous: the restores of a whole
  * node's population, requested in batches as the recovery runbook says, take the sum of their
- * time in the node's one big-job slot (extrapolated at 3.5 h for the 167 databases of EU1), and
- * the operations of one batch are far younger than that.
+ * time in the node's one big-job slot (extrapolated at 2.2 to 3.3 h for the 167 databases of
+ * EU1), and the operations of one batch are far younger than that.
  */
 export const BUILD_CEILING_MS = 24 * 3_600_000;
 
