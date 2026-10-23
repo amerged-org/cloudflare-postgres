@@ -78,6 +78,7 @@ it("covers the database, Thin storage and cron conditions beside the infrastruct
       "database_archive_failing",
       "database_base_backup_stale",
       "thin_storage_blocked",
+      "database_delete_incomplete",
       "control_cron_stalled",
       "control_cron_step_failing",
     ]),

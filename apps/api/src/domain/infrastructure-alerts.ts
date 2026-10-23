@@ -666,6 +666,14 @@ type RegionSubjects = Map<
   { failing: Subject[]; unresolved: number }
 >;
 /**
+ * A database deleted this long ago that its node still has not finished (it is still on the node's
+ * desired page, `nodeDesiredPage`: not reported deleted, or a volume of it still reported) is an
+ * alert. The agent tries again every 30 s at most; the integrator's delete operation ends
+ * `operation_timeout` at 20 minutes, which this precedes.
+ */
+const DELETE_INCOMPLETE_ALERT_MS = 600_000;
+
+/**
  * One statement reads every database and Thin storage condition of a region. `failing` rows are
  * the subjects that hold the condition now; `unresolved` rows are the subjects a still active
  * episode names that are not yet known to be fine, so an unknown measurement keeps the episode.
@@ -685,7 +693,7 @@ async function readRegionSubjects(
       AND ${baseline}>=p.backup_before)`;
   const result = await db
     .prepare(
-      `WITH p AS (SELECT ? region,? fresh,? backup_before)
+      `WITH p AS (SELECT ? region,? fresh,? backup_before,? delete_before)
       SELECT * FROM (SELECT 'database_archive_failing' kind,
           CASE WHEN d.observed_state='ready' AND d.observed_power='awake' AND d.archiving_health='failing' THEN 'failing' ELSE 'unresolved' END state,
           d.id subject,NULL detail
@@ -703,7 +711,13 @@ async function readRegionSubjects(
             OR (d.id IN(SELECT n.value FROM infrastructure_alerts a,json_each(a.payload,'$.database_ids') n
               WHERE a.region_id=d.region_id AND a.kind='database_base_backup_stale' AND a.active=1)
               AND NOT ${backupGood}))
-        ORDER BY state,${baseline},d.id LIMIT 64)`,
+        ORDER BY state,${baseline},d.id LIMIT 64)
+      UNION ALL SELECT * FROM (SELECT 'database_delete_incomplete','failing',d.id,NULL
+        FROM databases d JOIN nodes n ON n.id=d.node_id AND n.lost_at IS NULL,p
+        WHERE d.region_id=p.region AND d.desired_state='deleted' AND d.deleted_at<p.delete_before
+          AND (d.observed_state<>'deleted' OR d.observed_generation<>d.generation
+            OR EXISTS(SELECT 1 FROM node_volumes v WHERE v.node_id=d.node_id AND v.database_id=d.id))
+        ORDER BY d.deleted_at,d.id LIMIT 64)`,
     )
     .bind(
       regionId,
@@ -711,6 +725,7 @@ async function readRegionSubjects(
       // anti-entropy period, not once in each minute.
       new Date(now - NODE_DATABASE_STALE_MS).toISOString(),
       new Date(now - BASE_BACKUP_MAX_AGE_MS).toISOString(),
+      new Date(now - DELETE_INCOMPLETE_ALERT_MS).toISOString(),
     )
     .all<SubjectRow>();
   return collectSubjects(result.results);
@@ -817,6 +832,7 @@ const HEALTH_KINDS = [
   "database_archive_failing",
   "database_base_backup_stale",
   "thin_storage_blocked",
+  "database_delete_incomplete",
   "regional_node_capacity_refusals",
   "regional_node_pool_closed",
   "database_volume_warning",
@@ -981,6 +997,12 @@ async function regionHealthAlerts(
           node_id: subject.id,
           error_code: subject.detail,
         })),
+      })),
+    ],
+    [
+      "database_delete_incomplete",
+      subjectOf("database_delete_incomplete", (failing) => ({
+        database_ids: failing.map((subject) => subject.id),
       })),
     ],
     [
