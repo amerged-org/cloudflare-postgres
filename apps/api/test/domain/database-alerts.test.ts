@@ -468,6 +468,47 @@ it("still judges nodes when the database reads fail and keeps the unread kinds a
   expect(logged).toHaveBeenCalled();
 });
 
+it("keeps a failing read of the pool-closed kind from holding back the database kinds", async () => {
+  const f = await fixture(),
+    now = Date.now(),
+    hook = receiver();
+  await database(
+    f,
+    "archive",
+    awake(now, {
+      archiving_health: "failing",
+      archiving_health_since: ago(now, HOUR),
+    }),
+  );
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  // The read of the smallest class on offer is the pool-closed kind's own; only it fails.
+  const broken = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          if (sql.startsWith("SELECT * FROM size_classes WHERE enabled=1"))
+            throw new Error("injected_class_read_failure");
+          return target.prepare(sql);
+        };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  await expect(
+    runInfrastructureHealthAlerts(
+      { ...hook.env, DB: broken },
+      now,
+      hook.fetcher,
+    ),
+  ).rejects.toThrow("injected_class_read_failure");
+  // The database kind was judged and raised; the pool-closed kind is unknown and starts nothing.
+  expect(await status(f, "database_archive_failing")).toMatchObject({
+    active: true,
+  });
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+  expect(logged).toHaveBeenCalled();
+});
+
 it("still judges every region's nodes and databases when the backup health read fails", async () => {
   const f = await fixture(),
     now = Date.now(),
