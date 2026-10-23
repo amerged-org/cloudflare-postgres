@@ -48,10 +48,26 @@ the node has nothing of the target and the page names no source for a failed res
 target and submit the restore again with a new `Idempotency-Key`; a failure that is not the
 source's (a `tar` that ended early while the archive was read: 1 of 9 restores on 2026-10-23)
 passed at the second request, the one time it was seen. One case is open (the plan's 11.2): a
-restore that runs longer than 20 minutes is failed by the operation timeout while the node goes on
-building it. That build ends ready on the node and archives WAL, and the API keeps the target
-`provisioning` with the operation `failed`. It is not abandoned. Delete that target as well, and
-submit the restore again.
+restore is failed by the operation timeout when it has not ended 20 minutes after its first
+`building` report, while the node goes on building it. Those 20 minutes include the time the
+restore waits for the node's one big-job slot (`backup.base_backups` is 1): every backup listing,
+base fetch and base backup of every restore and create on the node takes a turn, first come first
+served. A restore that has the node to itself reaches the limit only at about 2.5 GiB of data, but
+restores requested together on one node queue behind each other and time out far below that (on
+EU1, two overlapping restores of about 0.5 GiB waited 6 s and 111 s for the slot). The slot time of
+one restore is 18 s for an xs-sized database and 130 to 180 s for one with about 0.5 GiB of data,
+so a queue of more than about 65 xs-sized or 7 to 9 gate-sized restores is longer than 20 minutes,
+and because every step queues again, the restores of such a batch end close together and most or
+all of them are failed. A restore failed this way ends ready on the node and archives WAL, and the API
+keeps the target `provisioning` with the operation `failed`. It is not abandoned. Delete that
+target as well, and submit the restore again. A create on the same node is failed by the same rule
+and waits for the same slot.
+
+**Submit restores in batches.** Until that case is closed, submit the restores (and creates) of one
+node in batches whose summed slot time ends well within 20 minutes, and submit the next batch when
+every operation of the previous one has ended. At most 40 xs-sized or 4 gate-sized restores at a
+time leave room for the node's other base backups, which use the same slot; these sizes are
+derived from the measured slot times and have not been tried live.
 
 A deleted source can be restored within its configured retention window. Keep its encrypted
 credentials and the corresponding `CREDENTIAL_KEYS` key IDs until that window ends. Expired
@@ -113,7 +129,8 @@ database moves (plan 7.11, 9.4).
 4. Only when the status is `fenced`, restore the affected databases onto healthy capacity with the
    separate-target restore procedure above. Each restore is a new database with a new ID; the
    integrator rebinds. The last archived commit is what comes back, not the last acknowledged one
-   (a database with a proven-sleep record loses nothing).
+   (a database with a proven-sleep record loses nothing). The node restores through one big-job
+   slot, so request the restores of a whole population in batches, as above, and not all at once.
 5. A node that comes back after the fence pulls a page that holds the fence and the superseded
    orders and no database. The agent writes them to disk before it acts, never lifts one because it
    left the page, starts and archives none of those databases, and keeps their volumes. A fence
@@ -132,13 +149,18 @@ database moves (plan 7.11, 9.4).
 **Measured (EU1).** Fence: within 30 s of `mark-lost` (2026-10-19). Reinstall: AddNode in recover
 mode reached `ready` after 231 s on 2026-10-19; the pull install alone took 196.5 s from the rescue
 request to the enrolled node in Stage 4 (2026-10-18; the steps are under
-[adding a node](operator-installation.md#adding-reinstalling-and-updating-a-node)). **Restore: not
-measured yet.** The test databases had been deleted before that reinstall, so no node's population
-has been restored and timed. It is measured without wiping EU1 again: restore a sample of each size
-class into new databases on the release that runs the canary, record the time per database, the
-time per GiB and the node's restore concurrency, and extrapolate to the node's population. The
-total for the loss of a node (fence, reinstall and restores) is written here next to the two
-measured times; until then this runbook states no total.
+[adding a node](operator-installation.md#adding-reinstalling-and-updating-a-node)). **Restore: per
+database only, no total.** The test databases had been deleted before that reinstall, so no node's
+population has been restored; EU1 was not wiped again. On 2026-10-23 (release `sha-967f602d5c9b`)
+single restores into new databases took 34.5 to 50.9 s for xs-sized databases (4 to 12 MB of
+archive; 18.2 s of it in the big-job slot) and 248.7 s and 319.3 s for a database with 557 MB of
+data (130 to 180 s of slot time). The one big-job slot serialises the listing, the base fetch and
+the first base backup of every restore on the node, so the slot time summed over a population is a
+floor for its restore time: for EU1's 167 databases (108 xs-sized, 59 gate-sized, 23.4 GB of
+archives) 161 to 210 min. It is not a total that can be reached today: restores requested together
+are failed by the operation timeout when their queue is longer than 20 minutes (above; the plan's
+11.2), so a total exists only for batches. This runbook states none until that case is closed or a
+batched run has been timed.
 
 ## Looking at a node
 

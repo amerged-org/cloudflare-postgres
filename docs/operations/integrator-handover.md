@@ -265,8 +265,9 @@ is DONE, so it is never writable before it is restorable. The idle time
 - **No capacity.** If no node qualifies, the call still returns `202`: `node_id` is `null`,
   `observed_state` is `pending` and `status_message` is `Waiting for verified regional capacity`.
   A minute cron places it when a node qualifies.
-  This wait has no timeout of its own (every other operation fails with `operation_timeout` after
-  20 minutes without progress); set your own deadline and delete the database to cancel.
+  This wait has no timeout of its own (every other operation fails with `operation_timeout` 20
+  minutes after it was placed or began, and progress does not restart the count); set your own
+  deadline and delete the database to cancel.
 - Errors: `400` for an unknown or disabled class or region, `404` for an unknown project, `409`
   with reason `name_in_use` for a name that a live database of the project already uses.
 - Engine: PostgreSQL 18 (18.6 at the time of writing, unmodified engine, `pgvector` 0.8.7). Which
@@ -532,11 +533,21 @@ or `archive_unusable` after the `202`) is not tried again by the node: it abando
 the target stays in `error` and holds nothing on the node. Its error code can change to
 `volume_missing` after the node's agent restarts, because the node has nothing of the target and
 the API names no source for a failed restore. Delete the target and request the restore again with
-a new `Idempotency-Key`. One failure is not covered: a restore that runs longer than 20 minutes is
-failed by the operation timeout (`operation_timeout`) while the node goes on building it. That
-build can end ready on the node and archive WAL while the API keeps the target `provisioning` with
-the operation `failed` (the plan's 11.2 lists it as open). Treat that target the same way: delete
-it and request the restore again.
+a new `Idempotency-Key`. One failure is not covered: a restore is failed by the operation timeout
+(`operation_timeout`) when it has not ended 20 minutes after the node's first `building` report,
+and the node goes on building it. Those 20 minutes include the time the restore waits for the
+node's one big-job slot (one base fetch or base backup at a time, first come first served, for
+every restore and create on the node). A restore that has the node to itself reaches the limit
+only at about 2.5 GiB of data, but restores requested together on one node take turns and time
+out far below that: each holds the slot for about 18 s (xs-sized) to 130 to 180 s (about 0.5 GiB
+of data), so more than about 65 xs-sized or 7 to 9 gate-sized restores at once are longer in the
+queue than 20 minutes, and most or all of them are failed. The build can end ready on the node and
+archive WAL while the API keeps the target `provisioning` with the operation `failed` (the plan's
+11.2 lists it as open). Treat that target the same way: delete it and request the restore again.
+Until it is closed, request restores in batches (at most 40 xs-sized or 4 gate-sized at a time,
+derived from the measured slot times and not tried live), and request the next batch when every
+operation of the previous one has ended. The same wait counts for a create: creates that you send
+together on one node queue for the same slot.
 
 | `409` reason         | Meaning                                                                                                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -1193,7 +1204,7 @@ there is.
 | `error.code`                                                    | Meaning                                                                                                                                                                                           |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `superseded`                                                    | a newer intent (resize, delete or power change) replaced it; not a platform fault                                                                                                                 |
-| `operation_timeout`                                             | no progress for 20 minutes ("Regional operation exceeded 20 minutes")                                                                                                                             |
+| `operation_timeout`                                             | 20 minutes after the operation was placed or began, whatever progress it made, waiting for the node's big-job slot included ("Regional operation exceeded 20 minutes")                            |
 | `power_busy`, `power_archive`, `power_unknown`, `power_timeout` | a suspend or hibernation was refused or timed out; the database returned to running                                                                                                               |
 | `role_not_droppable`                                            | `database.role.delete`: the role owns objects or holds privileges, so PostgreSQL cannot drop it; it stays unable to log in until they are removed ([2.3](#23-roles-connection-uri-and-passwords)) |
 
