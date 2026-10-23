@@ -457,6 +457,10 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
         query: "select 1",
       });
       expect(await refusal(response)).toBe(code);
+      if (sqlstate === "08006")
+        expect(JSON.parse(logs.mock.calls.at(-1)![0] as string)).toMatchObject({
+          admit_error: "actor_failure",
+        });
     }
     const refused = { limit: async () => ({ success: false }) } as RateLimit;
     expect(
@@ -468,6 +472,33 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
       ),
     ).toBe("53300");
     expect(await forwarded()).toHaveLength(0);
+  });
+
+  it("logs only the RPC failure category and boolean flags before forwarding SQL", async () => {
+    const canary = crypto.randomUUID();
+    const bindings = admitting(async () => {
+      throw Object.assign(new Error(canary, { cause: { password: canary } }), {
+        name: canary,
+        retryable: canary,
+        overloaded: true,
+        remote: canary,
+      });
+    });
+    const response = await post(bindings, { query: `select '${canary}'` });
+    const publicAnswer = await response.clone().text();
+    expect(await refusal(response)).toBe("08006");
+    expect(await forwarded()).toHaveLength(0);
+    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string)).toMatchObject({
+      event: "sql_admission",
+      outcome: "08006",
+      admit_error: "rpc_exception",
+      admit_retryable: false,
+      admit_overloaded: true,
+      admit_remote: false,
+    });
+    expect(JSON.stringify(logs.mock.calls)).not.toContain(canary);
+    expect(publicAnswer).not.toContain(canary);
+    expect(JSON.stringify(logs.mock.calls)).not.toContain(password);
   });
 
   it("counts HTTP requests in their own buckets of the same limiters", async () => {
