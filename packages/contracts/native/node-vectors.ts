@@ -120,6 +120,17 @@ const replaced = {
     previous: { storage_generation: 3, end: proof },
   },
 };
+const rolledBack = {
+  ...replaced,
+  storage_generation: 5,
+  archive: { path: path(source, 5, op("m")), credential },
+  origin: {
+    kind: "replace_rollback",
+    source: { ...replaced.origin.source, target_time: undefined },
+    previous: replaced.origin.previous,
+    replacement_generation: 4,
+  },
+};
 const binary = {
   url: "https://releases.example/binary",
   sha256: "a".repeat(64),
@@ -696,6 +707,26 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
   ],
   NodeDesiredPage: [
+    [
+      "same-id-forward-rollback",
+      { ...page, orders: [], databases: [rolledBack] },
+      true,
+    ],
+    [
+      "rollback-must-advance-beyond-replacement",
+      {
+        ...page,
+        orders: [],
+        databases: [
+          {
+            ...rolledBack,
+            origin: { ...rolledBack.origin, replacement_generation: 5 },
+          },
+        ],
+      },
+      false,
+      true,
+    ],
     ["same-id-pitr", { ...page, orders: [], databases: [replaced] }, true],
     [
       "same-id-pitr-without-previous-state",
