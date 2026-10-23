@@ -54,33 +54,58 @@ passed at the second request, the one time it was seen.
 create on the node takes a turn, first come first served. The slot time of one restore is 18 s for
 an xs-sized database and 130 to 180 s for one with about 0.5 GiB of data, so the restores of a
 population take the sum of their slot times, one after another. The operation timeout of 20 minutes
-counts the time without progress: the node says `building` for a restore or a create with every
+counts the time without a report: the node says `building` for a restore or a create with every
 pull of its page, and each of these reports restarts the count. A restore that waits for the slot
-behind others is therefore not failed while its node reports it, whatever its place in the queue,
-and the restores of a whole population can be requested together. A restore whose node reports
-nothing about it for 20 minutes (the node or its link is down, or a credential that never arrives)
-is failed `operation_timeout`, 20 minutes after its placement if the node never reported it. This is
-built and tested and not yet deployed; its live acceptance, a batch longer than 20 minutes, is open
-(the plan's 11.2). **On an installation whose release does not have it** the 20 minutes ran from the
-first `building` report whatever the progress and included the wait for the slot, so restores
-requested together on one node timed out far below 2.5 GiB of data (on EU1, two overlapping
-restores of about 0.5 GiB waited 6 s and 111 s for the slot) and a queue of more than about 65
-xs-sized or 7 to 9 gate-sized restores failed most or all of its restores, which ended ready on
-the node and archived WAL while the API kept the target `provisioning` with the operation
-`failed`: there submit the restores (and creates) of one node in batches whose summed slot time ends
-well within 20 minutes, the next batch when every operation of the previous one has ended, at most
-40 xs-sized or 4 gate-sized restores at a time (these sizes are derived from the measured slot
-times and have not been tried live; they leave room for the node's other base backups, which use
-the same slot), and delete a target left that way and submit the restore again.
+behind others is therefore not failed while its node reports it, whatever its place in the queue. A
+restore whose node reports nothing about it for 20 minutes (the node or its link is down, or a
+credential that never arrives) is failed `operation_timeout`, 20 minutes after its placement if the
+node never reported it. **A restore or a create that is still `building` 24 hours after its
+placement is failed `operation_timeout` too** ("Build exceeded 24 hours after its placement"),
+whatever the node reports: `building` says that the node awaits the build and not that it moves,
+so a build whose task ended or whose call hangs would otherwise stay `running` for ever. A batch
+as below ends in a fraction of that. This is built and tested and not yet deployed; its live
+acceptance, a batch longer than 20 minutes, is open (the plan's 11.2). **On an installation whose
+release does not have it** the 20 minutes ran from the first `building` report whatever the
+progress and included the wait for the slot, so restores requested together on one node timed out
+far below 2.5 GiB of data (on EU1, two overlapping restores of about 0.5 GiB waited 6 s and 111 s
+for the slot) and a queue of more than about 65 xs-sized or 7 to 9 gate-sized restores failed most
+or all of its restores, which ended ready on the node and archived WAL while the API kept the
+target `provisioning` with the operation `failed`: there submit the restores (and creates) of one
+node in batches whose summed slot time ends well within 20 minutes, and delete a target left that
+way and submit the restore again.
+
+**Submit restores in batches that fit the node's awake memory.** On every release, request the
+restores of a node's population in batches, and the next batch when every operation of the
+previous one has ended (`succeeded` or `failed`). A batch is bounded by memory and not by the
+timeout: the summed class memory of its restores must stay within the awake budget of the region's
+node policy (`awake_budget_mib`, read at `GET /v1/regions/{id}/node-policy`; 9,937 MiB on EU1, so at
+most 38 xs-sized (256 MiB) or 9 gate-sized (1 GiB) restores, or a mix whose memory adds up to
+that; under the `reserved` memory rule count `reservation_overhead_mib` more for each, and leave
+what the node's other awake databases hold). The reason is that a restore starts its PostgreSQL
+through the node's admission right after its fetch and keeps it running through its first base
+backup and the listing after it, and both wait for the slot behind the fetches of the other
+restores of the batch. Nearly all restores of a batch are therefore awake at the same time before
+the first of them is ready, and a start that does not fit within the policy's `queue_wait_ms`
+(10 s on EU1) is refused: the restore fails `start_failed` and is abandoned. The placement of the
+population does not prevent it, since the population was placed by the peaks of its awake memory
+and not for being awake together. This bound is derived from the code and the policy and has not
+been tried live; a population-sized run replaces it by a measured one (the plan's 11.2). The batch
+also leaves room for the node's other base backups, which use the same slot.
 
 **A rollout during a restore.** A release rollout restarts the node's agent, and the agent that
-starts finds the restore it was building and begins it again from an empty directory: it stops the
-PostgreSQL and the restore job of the earlier run, removes the half-restored data directory of the
-new database (never a database that was served) and fetches again, so the restore starts over and
-takes its whole time again. A rollout during a batch therefore costs the time of the builds it
-interrupts but fails none of them, with one exception: a restore whose first base backup was
-already DONE in its own archive is refused `prefix_not_empty`; delete that target and submit the
-restore again. Live acceptance of this is open too (the plan's 11.2).
+starts finds the restore it was building and begins it again: it stops the PostgreSQL and the
+restore job of the earlier run, and then goes on according to what the earlier run left in the
+database's own archive. With no finished base backup there, it removes the half-restored data
+directory of the new database (never a database that was served) and fetches again, so the
+restore starts over and takes its whole time again. With the first base backup DONE there, and
+the cluster on the volume being the one that backup was taken of, it starts that promoted
+database, checks who it is and finishes over the backup, with no second fetch and no second
+backup; the stretch between the backup and the end of its listing is a long one in a batch, since
+the listing waits for the slot behind the other restores. A DONE backup that is not that
+cluster's refuses the restore `prefix_not_empty`; delete that target and submit the restore
+again. A rollout during a batch therefore costs the time of the builds it interrupts in their
+fetch, recovery or first backup, and fails none of them. Live acceptance of this is open (the
+plan's 11.2); roll a release out between batches when there is a choice.
 
 A deleted source can be restored within its configured retention window. Keep its encrypted
 credentials and the corresponding `CREDENTIAL_KEYS` key IDs until that window ends. Expired
@@ -144,8 +169,8 @@ database moves (plan 7.11, 9.4).
    integrator rebinds. The last archived commit is what comes back, not the last acknowledged one
    (a database with a proven-sleep record loses nothing). The node restores through one big-job
    slot, so the restores of a population take turns and take the sum of their slot times (below).
-   Request them together on a release that has the progress-based operation timeout, and in
-   batches, as above, on one that has not.
+   Request them in batches that fit the node's awake memory, the next when the previous has
+   ended, as above.
 5. A node that comes back after the fence pulls a page that holds the fence and the superseded
    orders and no database. The agent writes them to disk before it acts, never lifts one because it
    left the page, starts and archives none of those databases, and keeps their volumes. A fence
@@ -176,11 +201,15 @@ slot. The one big-job slot serialises the listing, the base fetch and the first 
 restore on the node, so the slot time summed over a population is a floor for its restore time: for
 EU1's 167 databases (108 xs-sized, 59 gate-sized, 23.4 GB of archives) 161 to 210 min, 2.7 to 3.5 h,
 and with the fence (30 s) and the reinstall (174 to 197 s) about 2.8 to 3.6 h for the loss of EU1.
-**That total is an extrapolation and not a measured run**: it assumes that every restore succeeds
-at its first request (1 of 9 attempts on 2026-10-23 failed `archive_unusable` and passed at the
-second request) and that the progress-based operation timeout above holds, which has not been run
-on a batch longer than 20 minutes. A batch of that length, on a release that has the timeout,
-measures the total (the plan's 11.2).
+**That total is an extrapolation and not a measured run**: it is a floor, because the population
+goes in batches that fit the awake memory (above: EU1's 167 databases have about 86 GiB of class
+memory against a budget of 9,937 MiB, so at least 9 batches) and the end of a batch, the last
+recovery and first backup, leaves the slot idle. It assumes that every restore succeeds at its
+first request (1 of 9 attempts on 2026-10-23 failed `archive_unusable` and passed at the second
+request) and that the report-based operation timeout above holds, which has not been run on a
+batch longer than 20 minutes. A batch of that length, on a release that has the timeout, measures
+the total, and a run of a whole population measures whether the batch bound above holds (the
+plan's 11.2).
 
 ## Looking at a node
 

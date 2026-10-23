@@ -2852,6 +2852,81 @@ mod tests {
         assert_eq!(rig.observation(&id)["state"], "ready");
     }
 
+    /// The agent restarts after the first base backup of a restore is DONE in the database's own
+    /// archive and before the state says built (in a batch the listing that follows the backup
+    /// waits for the node's one big-job slot behind the other restores, so a rollout often finds
+    /// a restore there). The build that is begun again finishes over that backup: no second fetch
+    /// into a directory barman refuses, no second backup, no failed operation (found by review,
+    /// the restore was refused `prefix_not_empty`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restore_the_agent_restarted_after_its_first_base_backup_is_finished_over_that_backup()
+     {
+        let Some(rig) = Rig::new("restore-restart-backup").await else {
+            return;
+        };
+        let (source_json, source_id, source_state) = source(&rig).await;
+        let backup = source_state.backup.clone().unwrap();
+        let source_path = source_json["archive"]["path"].as_str().unwrap().to_string();
+        rig.deliver(&source_path, "read_only");
+
+        let mut restored = rig.entry_json();
+        let id = id_of(&restored);
+        let own_path = restored["archive"]["path"].as_str().unwrap().to_string();
+        restored["origin"] = json!({"kind": "restore", "source": {
+            "database_id": source_id, "path": source_path, "backup_id": backup.backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"}}});
+        let entry = rig.entry_for(&restored);
+        let handle = rig.core.db(&id);
+        rig.core
+            .apply(&Rig::page(vec![restored.clone()], vec![]))
+            .await;
+        eventually(120, "the restore", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+        let first = handle.view().writer.clone().unwrap().pid;
+        let own = handle.state().unwrap().backup.unwrap();
+        // The agent went away with the first base backup DONE and the state not yet saying built.
+        rig.core
+            .files(&id)
+            .save(&crate::state::DatabaseState::new(entry.storage_generation))
+            .unwrap();
+        let rig = rig.restart().await;
+        rig.deliver(&source_path, "read_only");
+        rig.deliver(&own_path, "read_write");
+        let handle = rig.core.db(&id);
+        rig.core
+            .apply(&Rig::page(vec![restored.clone()], vec![]))
+            .await;
+        eventually(120, "the restore, begun again", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+
+        // The database of the first run, under a postmaster of the second, and its first backup.
+        let data = tenant(&rig, &id).await;
+        let rows = data.query("SELECT count(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 4000);
+        assert_ne!(handle.view().writer.clone().unwrap().pid, first);
+        let state = handle.state().unwrap();
+        assert!(state.built && state.record.is_none());
+        let kept = state.backup.unwrap();
+        assert_eq!(
+            (kept.backup_id.as_str(), kept.timeline),
+            (own.backup_id.as_str(), 2)
+        );
+        let backups = std::fs::read_dir(rig.fixture.store_directory().join(format!(
+            "objects/{}/database/base",
+            own_path.strip_prefix("s3://").unwrap()
+        )))
+        .unwrap()
+        .count();
+        assert_eq!(backups, 1, "no second base backup");
+        assert_eq!(rig.observation(&id)["state"], "ready");
+    }
+
     /// The first pull of an agent that has just started reads the archive credentials and resumes
     /// every create and restore the last agent left, and a credential whose read failed once is
     /// read again by the next pull (found live: `credential_not_delivered` on the first attempt

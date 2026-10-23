@@ -951,15 +951,33 @@ impl<M: Machine> Host for Rebuild<M> {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        // The database is the new database's before its first backup: its name, its roles.
+        // The database is the new database's before its first backup: its name, its roles. A
+        // build that finishes over the promoted database of the earlier run (`Resume::Finish`)
+        // finds the name changed already; one that finds neither name has no tenant database.
         if self.source_database != self.entry.id {
-            session
-                .batch(&format!(
-                    "ALTER DATABASE \"{}\" RENAME TO \"{}\"",
-                    self.source_database, self.entry.id
-                ))
+            let names = vec![self.source_database.clone(), self.entry.id.clone()];
+            let found: Vec<String> = session
+                .query(
+                    "SELECT datname::text FROM pg_catalog.pg_database WHERE datname::text = ANY($1)",
+                    &[&names],
+                )
                 .await
+                .map_err(|_| Failed)?
+                .iter()
+                .map(|row| row.try_get::<_, String>(0))
+                .collect::<Result<_, _>>()
                 .map_err(|_| Failed)?;
+            if found.contains(&self.source_database) {
+                session
+                    .batch(&format!(
+                        "ALTER DATABASE \"{}\" RENAME TO \"{}\"",
+                        self.source_database, self.entry.id
+                    ))
+                    .await
+                    .map_err(|_| Failed)?;
+            } else if !found.contains(&self.entry.id) {
+                return Err(Failed);
+            }
         }
         let applied = roles::apply(&session, &self.entry.roles, &Default::default(), true)
             .await

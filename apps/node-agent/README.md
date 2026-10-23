@@ -426,10 +426,16 @@ plan 9.3, "Changing the page"; it is written there once.
   the units of the earlier run outlive the agent: the agent stops the PostgreSQL of that run, stops
   the unit of its restore job if it runs (`pgcf-job-restore-<database>-<sequence>`, found with
   `systemctl list-units`), and removes the generation's data directory and its spool before the
-  fetch. Only the generation being built is touched, never a served one. It is refused with
-  `prefix_not_empty` when the database's own archive already holds a base backup, since the earlier
-  run got that far and the WAL this run archives next would replace the earlier run's under that
-  backup.
+  fetch. Only the generation being built is touched, never a served one. When the database's own
+  archive already holds a DONE base backup the earlier run got that far, and the WAL this run
+  archives next would replace the earlier run's under that backup, so nothing is fetched and
+  nothing is removed: if the newest DONE backup has the system identifier and the timeline of the
+  cluster on the volume, that cluster is the promoted database of the earlier run, and the build
+  starts it, checks who it is and finishes over that backup, taking no second one (a rollout
+  during a batch finds many restores in this stretch, since the listing that follows the first
+  backup waits for the one big-job slot behind the other restores); any other DONE backup refuses
+  the build with `prefix_not_empty`. A backup the earlier run began and did not finish (`STARTED`)
+  is no reason.
 - **A build that fails** (a create, a restore, a point-in-time restore or a move target, with any
   of the errors above) is abandoned once: the unit stops, the generation's volume goes, the user
   goes with the database's last volume, and the node's files of that generation go (its state and
@@ -469,9 +475,13 @@ plan 9.3, "Changing the page"; it is written there once.
 
   While a build runs, every pull of the page says `building` for it again, whatever the API
   holds: an entry that names an origin is awaited (`Core::report`). The API takes each of these
-  reports as progress of the create or restore (`running()` in `node-observations.ts`): its
+  reports as a sign of life of the create or restore (`running()` in `node-observations.ts`): its
   operation timeout of 20 minutes counts the time without such a report, so a restore that queues
-  for the node's one big-job slot behind others is not failed while its node reports it.
+  for the node's one big-job slot behind others is not failed while its node reports it. The
+  report says that the entry is awaited and not that the build moves: a build whose task ended (a
+  panic leaves `Building` for good) or whose call hangs reports `building` for ever, and the API
+  ends its create or restore 24 hours after its placement (`BUILD_CEILING_MS` in `cron.ts`),
+  whatever the node reports.
 
 ## Backups
 

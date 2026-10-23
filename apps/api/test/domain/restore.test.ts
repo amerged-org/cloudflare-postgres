@@ -359,7 +359,8 @@ it("restores into one separate target on replay with credentials encrypted for i
       .first(),
   ).toEqual({ desired_state: "running" });
 });
-it("counts the operation timeout from the node's last building report, so that a create or a restore waiting its turn for the node's big-job slot is not failed while it reports", async () => {
+/** A create and a restore of one node, both reported `building`, and what the tests do with them. */
+async function buildsOnOneNode() {
   const f = await archived();
   const restored = await request(
     `/v1/databases/${f.id}/restore`,
@@ -381,25 +382,8 @@ it("counts the operation timeout from the node's last building report, so that a
     { database: f.id, operation: create! },
     { database: result.target_database.id, operation: result.operation.id },
   ];
-  const state = async () =>
-    Promise.all(
-      builds.map(async ({ operation }) =>
-        env.DB.prepare("SELECT status,error_code FROM operations WHERE id=?")
-          .bind(operation)
-          .first(),
-      ),
-    );
-  const quiet = (minutes: number) =>
-    Promise.all(
-      builds.map(({ operation }) =>
-        env.DB.prepare("UPDATE operations SET updated_at=? WHERE id=?")
-          .bind(
-            new Date(Date.now() - minutes * 60_000).toISOString(),
-            operation,
-          )
-          .run(),
-      ),
-    );
+  const ago = (hours: number) =>
+    new Date(Date.now() - hours * 3_600_000).toISOString();
   const building = async () => {
     for (const { database } of builds)
       expect(await verdicts(await report(f, database, 1, "building"))).toEqual([
@@ -407,26 +391,81 @@ it("counts the operation timeout from the node's last building report, so that a
       ]);
   };
   await building();
-  expect(await state()).toEqual([
-    { status: "running", error_code: null },
-    { status: "running", error_code: null },
-  ]);
+  return {
+    state: async () =>
+      Promise.all(
+        builds.map(async ({ operation }) =>
+          env.DB.prepare("SELECT status,error_code FROM operations WHERE id=?")
+            .bind(operation)
+            .first(),
+        ),
+      ),
+    messages: async () =>
+      Promise.all(
+        builds.map(({ operation }) =>
+          env.DB.prepare("SELECT error_message FROM operations WHERE id=?")
+            .bind(operation)
+            .first<string>("error_message"),
+        ),
+      ),
+    building,
+    /** The operations' clock: the time of their last report. */
+    quiet: (minutes: number) =>
+      Promise.all(
+        builds.map(({ operation }) =>
+          env.DB.prepare("UPDATE operations SET updated_at=? WHERE id=?")
+            .bind(ago(minutes / 60), operation)
+            .run(),
+        ),
+      ),
+    /** The databases' placement, the other clock. */
+    placed: (hours: number) =>
+      Promise.all(
+        builds.map(({ database }) =>
+          env.DB.prepare("UPDATE databases SET placed_at=? WHERE id=?")
+            .bind(ago(hours), database)
+            .run(),
+        ),
+      ),
+  };
+}
+const running = [
+  { status: "running", error_code: null },
+  { status: "running", error_code: null },
+];
+const timedOut = [
+  { status: "failed", error_code: "operation_timeout" },
+  { status: "failed", error_code: "operation_timeout" },
+];
+it("counts the operation timeout from the node's last building report, so that a create or a restore waiting its turn for the node's big-job slot is not failed while it reports", async () => {
+  const b = await buildsOnOneNode();
+  expect(await b.state()).toEqual(running);
   // 21 minutes since the first report is no reason while the node says again that it builds: a
   // build that waits for the slot behind other restores is at work, and reports so with each pull.
-  await quiet(21);
-  await building();
+  await b.quiet(21);
+  await b.building();
   await runCron(env);
-  expect(await state()).toEqual([
-    { status: "running", error_code: null },
-    { status: "running", error_code: null },
-  ]);
+  expect(await b.state()).toEqual(running);
   // A build that reported nothing for 21 minutes is failed, as before.
-  await quiet(21);
+  await b.quiet(21);
   await runCron(env);
-  expect(await state()).toEqual([
-    { status: "failed", error_code: "operation_timeout" },
-    { status: "failed", error_code: "operation_timeout" },
-  ]);
+  expect(await b.state()).toEqual(timedOut);
+});
+it("fails a create or a restore that its node still reports building 24 hours after its placement, however often it reports", async () => {
+  const b = await buildsOnOneNode();
+  // A build that stands for 23 hours and reports now is at work: a batch of restores is long.
+  await b.placed(23);
+  await b.building();
+  await runCron(env);
+  expect(await b.state()).toEqual(running);
+  // A build that reports `building` for ever (its task ended, a call of it hangs) is not at work.
+  await b.placed(25);
+  await b.building();
+  await runCron(env);
+  expect(await b.state()).toEqual(timedOut);
+  expect(await b.messages()).toEqual(
+    Array(2).fill("Build exceeded 24 hours after its placement"),
+  );
 });
 it("retains deleted-source restore authority and rejects another tenant, missing region and expired archive", async () => {
   const f = await archived();

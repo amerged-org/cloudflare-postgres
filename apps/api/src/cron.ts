@@ -32,6 +32,17 @@ import { armCronWatchdog } from "./cron-watchdog.ts";
 export const ALERT_DELIVERY_BUDGET_MS = 20_000;
 
 /**
+ * How long after its placement a create or a restore may still be building. A node reports
+ * `building` with every pull for as long as its build task is not ended, which restarts the
+ * 20-minute clock of the operation (`Statements.running`), so a build that never ends keeps its
+ * operation running for ever; this ceiling ends it. It is generous: the restores of a whole
+ * node's population, requested in batches as the recovery runbook says, take the sum of their
+ * time in the node's one big-job slot (extrapolated at 3.5 h for the 167 databases of EU1), and
+ * the operations of one batch are far younger than that.
+ */
+export const BUILD_CEILING_MS = 24 * 3_600_000;
+
+/**
  * The power operations that the power timeout undoes itself, so that the generic operation sweep
  * leaves them to it: a suspension of a database that D1 does not know asleep (it may still run,
  * and the database goes back to running), and a resume or a wake of one it knows asleep (the
@@ -78,6 +89,7 @@ export async function runCron(
 }> {
   const timestamp = new Date(now).toISOString(),
     cutoff = new Date(now - 20 * 60_000).toISOString(),
+    buildCeiling = new Date(now - BUILD_CEILING_MS).toISOString(),
     step_failures: CronStepFailure[] = [];
   const attempt = async <T>(
     step: CronStep,
@@ -206,17 +218,22 @@ export async function runCron(
   );
   // An operation's `updated_at` is its clock: placement, the first report that moves it to
   // running, and, for a create or a restore the node reports `building`, each such report (a
-  // build waits for the node's one big-job slot behind others; `Statements.running`).
+  // build waits for the node's one big-job slot behind others; `Statements.running`). A node
+  // that reports `building` for ever (the task of the build ended, a call of it hangs) keeps that
+  // clock young, so a create or a restore also ends at a ceiling after its placement.
   const expired = await attempt("operation_timeouts", 0, async () => {
     const result = await env.DB.prepare(
-      `UPDATE operations SET status='failed',error_code='operation_timeout',error_message='Regional operation exceeded 20 minutes',updated_at=?,completed_at=? WHERE status IN('pending','running') AND updated_at<?
+      `UPDATE operations SET status='failed',error_code='operation_timeout',
+      error_message=CASE WHEN updated_at<? THEN 'Regional operation exceeded 20 minutes' ELSE 'Build exceeded 24 hours after its placement' END,
+      updated_at=?,completed_at=? WHERE status IN('pending','running') AND (updated_at<?
+        OR (kind IN('database.create','database.restore') AND EXISTS(SELECT 1 FROM databases b WHERE b.id=operations.database_id AND b.node_id IS NOT NULL AND b.placed_at<?)))
       AND NOT EXISTS(SELECT 1 FROM databases u WHERE u.id=operations.database_id AND u.node_id IS NULL AND u.desired_state='running' AND u.deleted_at IS NULL AND operations.kind IN('database.create','database.restore'))
       AND NOT EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
         WHERE d.power_operation=operations.id AND d.id=operations.database_id AND d.project_id=operations.project_id
         AND d.deleted_at IS NULL AND operations.generation<=d.generation
         AND ${undoneByPowerTimeout("d", "operations")})`,
     )
-      .bind(timestamp, timestamp, cutoff)
+      .bind(cutoff, timestamp, timestamp, cutoff, buildCeiling)
       .run();
     return result.meta.changes;
   });
