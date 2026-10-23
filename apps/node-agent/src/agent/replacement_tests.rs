@@ -128,7 +128,42 @@ async fn reviewed_rollback_stops_the_failed_target_left_running_before_releasing
     // durable before this failure; after restart only that target can be removed.
     let staged = VolumeId::new(&id, 2).unwrap();
     rig.machine.hold_volume(&staged);
+    rig.machine.fail_stops(1);
+    rig.machine.clear_calls();
     assert!(rig.core.prepare_replacement(&entry).await.is_err());
+    assert!(
+        !rig.machine.running(&id),
+        "a failed graceful stop must kill the journal-owned target before cleanup"
+    );
+    assert_eq!(rig.machine.unit_volume(&id).await.unwrap(), None);
+    let calls = rig.machine.calls();
+    let at = |call: String| {
+        calls
+            .iter()
+            .position(|seen| *seen == call)
+            .unwrap_or_else(|| panic!("missing {call}: {calls:?}"))
+    };
+    assert!(at(format!("stop {id}")) < at(format!("kill {id}")));
+    assert!(at(format!("kill {id}")) < at(format!("unmount {id}")));
+    assert!(
+        !calls.contains(&format!("remove {id}")),
+        "the other holder still prevents volume removal"
+    );
+    assert!(rig.machine.has_volume(&staged).await.unwrap());
+    assert!(
+        rig.machine
+            .has_volume(&VolumeId::new(&id, 1).unwrap())
+            .await
+            .unwrap(),
+        "cleanup preserves the proven source"
+    );
+    assert!(
+        !rig.machine
+            .has_volume(&VolumeId::new(&id, 3).unwrap())
+            .await
+            .unwrap(),
+        "rollback allocation waits until the failed target is reclaimed"
+    );
     let pending = rig.core.files(&id).load_replacement().unwrap().unwrap();
     assert_eq!(pending.attempt.generation, 3);
     assert_eq!(pending.retiring_generation, Some(2));

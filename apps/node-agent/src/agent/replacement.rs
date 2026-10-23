@@ -321,9 +321,13 @@ impl<M: Machine> Core<M> {
             .map_err(|_| "build_failed")?
             .as_ref()
             == Some(&staged)
-            && !self.stop_unit(&entry.id).await
         {
-            return Err("build_failed");
+            // A full failed target may fail its shutdown checkpoint. Only this journal-owned
+            // target may be killed; the source-generation guard above remains authoritative.
+            let ended = super::remove::end_unit(&*self.machine, &entry.id).await;
+            self.admission.stopped(&entry.id);
+            self.table.remove(&entry.id);
+            ended.map_err(|_| "build_failed")?;
         }
         // The source is proven asleep, and the per-database flow prevents new jobs. Jobs left
         // by the interrupted target may still hold its volume in their own mount namespaces.
