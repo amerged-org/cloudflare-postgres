@@ -82,7 +82,7 @@ pub enum Apply<'a> {
     NextStart,
     /// `systemd-sysusers <file>`.
     Sysusers,
-    /// `systemd-tmpfiles --create <file>`.
+    /// `systemd-tmpfiles --create --remove <file>`.
     Tmpfiles,
     RestartUnit(&'a str),
 }
@@ -556,7 +556,8 @@ pub enum Tool {
     /// `systemd-sysusers <file>`: the users and groups the file lists.
     #[serde(rename = "sysusers")]
     Sysusers,
-    /// `systemd-tmpfiles --create <file>`: the directories and files it lists.
+    /// `systemd-tmpfiles --create --remove <file>`: the directories and files it lists, and the
+    /// files its `r` lines name are removed.
     #[serde(rename = "tmpfiles")]
     Tmpfiles,
 }

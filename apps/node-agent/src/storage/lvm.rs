@@ -135,6 +135,36 @@ pub fn parse_lvs(json: &str) -> Result<Vec<LogicalVolume>, Error> {
         .collect()
 }
 
+/// The parts of the thin pool that are active while the pool is not: `pgcf_thinpool_tdata` and
+/// `pgcf_thinpool_tmeta`, from `lvs --all`. lvm2 refuses to activate a pool while one of its
+/// parts is active on its own ("Activation of logical volume ... is prohibited while logical
+/// volume ... is active"), and a part is active on its own only if something activated it by name:
+/// the read-only activation of the metadata for an inspection (`lvchange --activate y --yes`)
+/// does. A part of an active pool is the pool's, and a pool that is not there has no parts.
+pub fn active_pool_parts(pool: &str, json: &str) -> Result<Vec<String>, Error> {
+    let rows = rows(json, "lv")?;
+    let attr = |name: &str| -> Result<Option<&str>, Error> {
+        rows.iter()
+            .find(|row| row["lv_name"] == name)
+            .map(|row| text(row, "lv_attr"))
+            .transpose()
+    };
+    // The fifth character of `lv_attr` is `a` for an active volume.
+    let active =
+        |attr: Option<&str>| attr.is_some_and(|attr| attr.as_bytes().get(4) == Some(&b'a'));
+    if active(attr(pool)?) {
+        return Ok(vec![]);
+    }
+    let mut parts = Vec::new();
+    for suffix in ["tdata", "tmeta"] {
+        let part = format!("{pool}_{suffix}");
+        if active(attr(&format!("[{part}]"))?) {
+            parts.push(part);
+        }
+    }
+    Ok(parts)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum GroupStep {
     CreatePhysicalVolume,
@@ -424,5 +454,37 @@ mod tests {
         // Volumes without a pool cannot exist; whatever they are, they are not ours to adopt.
         let no_pool: Vec<_> = pool().into_iter().filter(|lv| !lv.is_pool()).collect();
         assert!(plan_pool(&config(), &group(), &no_pool).is_err());
+    }
+
+    /// What lvm2 2.03.31 listed (lab) for a pool whose metadata and data were activated for an
+    /// inspection with `lvchange --activate y --yes`: the pool inactive, its parts active and
+    /// read-only (`R`).
+    #[test]
+    fn parts_of_a_pool_that_an_inspection_left_active_are_found() {
+        let left = include_str!("fixtures/lvs-all-pool-parts-left-active.json");
+        assert_eq!(
+            active_pool_parts("pool", left).unwrap(),
+            ["pool_tdata", "pool_tmeta"]
+        );
+        // The same report for a pool of another name: its parts are not these.
+        assert_eq!(
+            active_pool_parts("other", left).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The parts of an active pool are the pool's own, and a pool the group does not have has
+    /// none.
+    #[test]
+    fn the_parts_of_an_active_pool_and_of_no_pool_are_left_alone() {
+        let active = r#"{"report":[{"lv":[
+            {"lv_name":"[lvol0_pmspare]","lv_attr":"ewi-------"},
+            {"lv_name":"pool","lv_attr":"twi-aotz--"},
+            {"lv_name":"[pool_tdata]","lv_attr":"Twi-ao----"},
+            {"lv_name":"[pool_tmeta]","lv_attr":"ewi-ao----"}]}]}"#;
+        assert!(active_pool_parts("pool", active).unwrap().is_empty());
+        let none = r#"{"report":[{"lv":[]}]}"#;
+        assert!(active_pool_parts("pool", none).unwrap().is_empty());
+        assert!(active_pool_parts("pool", "{").is_err());
     }
 }

@@ -39,6 +39,20 @@ pub use pool::{NoRoom, Policy, PoolMode, PoolSample};
 pub use store::Storage;
 pub use usage::{Alert, FsUsage, Inventory, MountInfo, Removal, ReserveAction, VolumeInfo};
 
+/// What `Storage::open` did to get the group active besides the plain `vgchange`: nothing, on
+/// every start but the one after a reset that was not clean. The agent reports each (the events
+/// `thin_pool_parts_released` and `thin_pool_repair_activation`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Activation {
+    /// Parts of the pool (`<pool>_tdata`, `<pool>_tmeta`) that were active on their own, which
+    /// keeps lvm2 from activating the pool, and were deactivated.
+    pub released_parts: Vec<String>,
+    /// The plain activation was refused and the one with `thin_check --auto-repair` passed. The
+    /// option repairs a leaked block and nothing else; whether the pool had one, `vgchange` does
+    /// not say.
+    pub repair_run: bool,
+}
+
 use crate::units::{DB_ROOT, DEVICE_LINKS};
 use std::{path::PathBuf, time::Duration};
 

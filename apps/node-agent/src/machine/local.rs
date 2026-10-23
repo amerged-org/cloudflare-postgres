@@ -1374,7 +1374,7 @@ impl Machine for Local {
         Ok(())
     }
 
-    /// `systemd-tmpfiles --create <file>`: makes the directories (`d`) it lists with the mode it
+    /// `systemd-tmpfiles --create --remove <file>`: makes the directories (`d`) it lists with the mode it
     /// gives, and leaves one that exists as it is; another type of line is not modelled and a
     /// line that is none is exit status 1.
     async fn run_tmpfiles(&self, file: &str) -> io::Result<()> {

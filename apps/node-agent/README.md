@@ -38,10 +38,32 @@ carries it, and a region whose policy is not set serves no page.
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `pgcf-agent run`   | The service of `pgcf-agent.service` (`Type=notify`). It opens the node's storage, restores what a boot lost, signals `READY=1`, then enrolls and links to Cloudflare in the background, so a node that is not enrolled yet waits instead of crashing                    |
 | `pgcf-agent check` | Makes or wakes one scratch database (`SCRATCH`) on a thin volume, queries it over its socket and stops it, without Cloudflare. The image's boot test runs it after the first boot and again after a reboot, and a maintenance cycle runs it before it answers its order |
+| `pgcf-agent hold`  | The one process of the transient unit `pgcf-mounts.service`, which `run` starts when the node has none and whose mount namespace it joins (`mount_holder.rs`, below). It tells systemd that it is ready and waits to be stopped, then unmounts the volumes 16 at a time |
 
 An agent restart never stops a database: PostgreSQL runs in slots (units of their own, below), and
 the agent reads them back from the kernel. A release that changes the agent's own binary makes it
 exit so that systemd starts the new one.
+
+**The volumes' mount namespace outlives the agent** (`mount_holder.rs`). The agent mounts the
+volume of every database it knows in a mount namespace of its own, so that the mounts stay out of
+PID 1's. A process that dies leaves its mount namespace and the kernel unmounts what it holds one
+volume after the other, each as slow as the disk's flushes: after a `kill -9` of the agent the old
+process took 14 s to exit on EU1 with 312 volumes (lab, 300 volumes on a disk with 10 ms flushes:
+13 to 21 s), and systemd starts the next agent only after that. So the namespace is held by
+`pgcf-agent hold`, the one process of the transient unit `pgcf-mounts.service`
+(`PrivateMounts=yes`, `Type=notify`; `systemd-run` makes it, once a boot), and `run` joins it with
+`setns(2)` before the runtime starts a thread. A killed agent then leaves nothing to unmount (lab,
+the real agent under systemd: 11 ms), the next agent finds the volumes mounted and joins in 12 ms,
+and the page cache of the sleeping databases stays. The agent's own exit no longer unmounts
+anything when it joined; where it could not (no systemd, the unit does not start, `setns` is
+refused) it says `mount_holder_unavailable` with a class and works in the namespace its unit gives
+it, as it did before, and its exit unmounts as before. The holder unmounts the volumes 16 at a time
+when it is stopped (a shutdown, `systemctl stop pgcf-mounts`), so stop the agent first. A shell
+reaches the namespace with
+`nsenter --target "$(systemctl show --property=MainPID --value pgcf-mounts.service)" --mount`.
+An agent of a release before this one does not know the holder: going back to such a release needs
+`systemctl stop pgcf-agent pgcf-mounts` first, or the volumes stay mounted in the holder's
+namespace, where the old agent's unmounts find them held (`Busy`).
 
 ## Jobs and where they live
 
@@ -70,6 +92,28 @@ PostgreSQL 18.
 One database has one flow at a time (a create, a wake, a sleep, a recovery or a delete finishes
 before the next begins). What the gateway and the observations read is the database's view, which
 every flow updates in small steps.
+
+**The pool after a reset that was not clean** (`Storage::open`, `activate_group`). A hard power-off
+left one leaked data block in the pool's metadata on EU1 (2026-10-23): `thin_check -q` found it
+(exit 64), `vgchange --activate y` ended with 5, the agent crash-looped 798 times and every
+database of the node was down for 27 minutes. When the plain activation fails, the agent (1)
+deactivates a part of the pool that is active on its own (`pgcf_thinpool_tdata`, `_tmeta`: an
+inspection of the metadata with `lvchange --activate y --yes` leaves it so, and lvm2 then refuses
+the pool) and tries the plain activation again, and otherwise (2) activates once more with
+`thin_check --auto-repair` added to the host's own `thin_check_options` (`commands::REPAIRING_CHECK`),
+and reports `thin_pool_parts_released` and `thin_pool_repair_activation`. What `--auto-repair`
+does, from thin-provisioning-tools 1.1.0 and the lab: it "automatically repairs any trivial issues
+found with the metadata; currently only fixes metadata leaks", by rewriting the space map of a leak
+(a block the map counts as used that no mapping refers to) once the trees have been read without an
+error. It writes nothing when a tree or a checksum is wrong, because the leak check comes after the
+walk of the trees: a metadata image with a leaked block and a wrong checksum in the mapping tree is
+left byte for byte as it was, and the activation ends with the same exit 5. The exit status cannot
+tell a leak from damage (the Rust `thin_check` ends with 64 for every error, the man page's 1
+notwithstanding), so the option, not the status, is what keeps the repair to the leak. A damaged
+pool stays down: the agent exits with `vgchange_exit_5`, the node goes stale and
+`regional_node_stale` and `thin_storage_blocked` fire; no `thin_repair` and no `lvconvert
+--repair` run. The pool does not set `--clear-needs-check-flag`, which the host's list does not
+have either.
 
 ## Slots
 
@@ -130,7 +174,9 @@ database a slot's uid belongs to, and only a process in that slot's cgroup and i
 uid with no database now gets `peer_unknown`.
 
 **Adoption.** The table is never written to disk. When the agent starts it reads the units, each
-main process, `/proc/<pid>/exe`, its mount table and `/proc/locks` (`Pool::adopt`): an idle slot
+main process, `/proc/<pid>/exe`, its mount table and `/proc/locks` (`Pool::adopt`; the volume a
+mount is names itself from one listing of `lvs` for all the slots, where it ran `lvs` for each:
+13.7 s of the 28.7 s to the first wake with 104 slots on EU1, 2026-10-23): an idle slot
 stays; one that holds a database it was never ordered to run, or whose postmaster does not hold the
 lock, is stopped and its database stays asleep (every mount at a database's directory counts as
 holding it, also one the agent cannot name as a volume of that database: unknown means tainted, and
@@ -472,8 +518,9 @@ it ends with `systemctl revert pgcfbackup.slice`; the next job in the slice then
   list to its own rules just before it writes (a list they do not allow is refused for its files,
   once, and the binaries are installed all the same), and the files that differ are written
   atomically below `/` (hidden file, `fsync`, rename, `fsync` of the directory) in the allow-listed
-  directories only, never through a link. `systemd-sysusers` and `systemd-tmpfiles --create` run on
-  the files that say so, systemd reads its units again once, and what changed is restarted, the
+  directories only, never through a link. `systemd-sysusers` and `systemd-tmpfiles --create
+  --remove` run on the files that say so (`--create` alone ignores a file's `r` lines, which
+  remove: `pgcf-journal.conf` removes the per-uid journal files the split left behind), systemd reads its units again once, and what changed is restarted, the
   agent's own unit last (the agent leaves); a failure is tried again after a growing wait and keeps
   no other unit from its restart. The agent's own unit is written to `/run/systemd/system` first,
   and the agent that runs it moves it to its place after it has read its first page: a node whose

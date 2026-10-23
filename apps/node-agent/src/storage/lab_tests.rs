@@ -13,7 +13,7 @@ use super::{
 };
 use std::{
     fs,
-    os::unix::fs::{MetadataExt, chown},
+    os::unix::fs::{FileExt, MetadataExt, chown},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     slice,
@@ -250,6 +250,183 @@ impl Lab {
         sh("sync", &[]);
         self.storage.poll_pool().unwrap().data_used_bytes
     }
+
+    // ---- the pool's metadata, on the loop device, while the group is inactive
+
+    fn deactivate_group(&self) {
+        sh(
+            "vgchange",
+            &["--quiet", "--activate", "n", &self.config().group],
+        );
+    }
+    /// The byte offset on the loop device of the pool's metadata (`<pool>_tmeta`), from the first
+    /// extent of the part and the physical volume's data start.
+    fn metadata_offset(&self) -> u64 {
+        let report = sh(
+            "lvs",
+            &[
+                "--all",
+                "--noheadings",
+                "--separator",
+                ",",
+                "--units",
+                "b",
+                "--nosuffix",
+                "-o",
+                "lv_name,seg_pe_ranges",
+                &self.config().group,
+            ],
+        );
+        let part = format!("[{}_tmeta]", self.config().pool);
+        let ranges = report
+            .lines()
+            .filter_map(|line| line.trim().split_once(','))
+            .find(|(name, _)| *name == part)
+            .map(|(_, ranges)| ranges.to_string())
+            .expect("the metadata part");
+        // "/dev/loop0:257-257"
+        let first: u64 = ranges
+            .rsplit_once(':')
+            .and_then(|(_, extents)| extents.split('-').next())
+            .and_then(|first| first.parse().ok())
+            .expect("an extent range");
+        let data_start: u64 = sh(
+            "pvs",
+            &[
+                "--noheadings",
+                "--units",
+                "b",
+                "--nosuffix",
+                "-o",
+                "pe_start",
+                &self.loop_device,
+            ],
+        )
+        .trim()
+        .parse()
+        .expect("the data start");
+        data_start + first * self.group().extent_bytes
+    }
+    fn metadata_block(&self, block: u64) -> Vec<u8> {
+        let mut bytes = vec![0u8; METADATA_BLOCK];
+        fs::File::open(&self.loop_device)
+            .unwrap()
+            .read_exact_at(
+                &mut bytes,
+                self.metadata_offset() + block * METADATA_BLOCK as u64,
+            )
+            .unwrap();
+        bytes
+    }
+    fn write_metadata_block(&self, block: u64, bytes: &[u8]) {
+        let device = fs::OpenOptions::new()
+            .write(true)
+            .open(&self.loop_device)
+            .unwrap();
+        device
+            .write_all_at(
+                bytes,
+                self.metadata_offset() + block * METADATA_BLOCK as u64,
+            )
+            .unwrap();
+        // lvm2 reads the device through device-mapper, not through this page cache.
+        device.sync_all().unwrap();
+    }
+    /// The whole metadata device as it is now.
+    fn metadata_image(&self) -> Vec<u8> {
+        let mut bytes = vec![0u8; self.config().pool_metadata_bytes as usize];
+        fs::File::open(&self.loop_device)
+            .unwrap()
+            .read_exact_at(&mut bytes, self.metadata_offset())
+            .unwrap();
+        bytes
+    }
+    /// What `thin_check` says of the metadata as it is on the device now: its exit status and what
+    /// it printed.
+    fn thin_check(&self) -> (i32, String) {
+        let image = self.dir.join("metadata.img");
+        fs::write(&image, self.metadata_image()).unwrap();
+        let output = Command::new("thin_check").arg(&image).output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        (output.status.code().unwrap(), text)
+    }
+    /// What a hard reset left on EU1 (2026-10-23): the data space map counts the pool's last data
+    /// block as used and no mapping uses it. The block is made used in the bitmap, the free count
+    /// of its bitmap and the total of the root are made to agree, and the three checksums are
+    /// written again, so that `thin_check` reads a well-formed map with a leak and no other
+    /// error. The pool must be inactive and hold no mapping at its last block.
+    fn leak_the_last_data_block(&self) {
+        let root = self.metadata_block(0);
+        let word =
+            |bytes: &[u8], at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        // `disk_sm_root` at byte 64 of the superblock: blocks, allocated, bitmap root (the
+        // index), reference count root.
+        let (blocks, allocated, index_root) = (word(&root, 64), word(&root, 72), word(&root, 80));
+        let block = blocks - 1;
+        let mut index = self.metadata_block(index_root);
+        assert_eq!(
+            u32::from_le_bytes(index[4..8].try_into().unwrap()),
+            2,
+            "a leaf: the lab's pool has few bitmaps"
+        );
+        let max_entries = u32::from_le_bytes(index[20..24].try_into().unwrap()) as usize;
+        let per_bitmap = (METADATA_BLOCK as u64 - 16) * 4;
+        // The entry of the bitmap that holds the block: block, free blocks, none free before.
+        let entry = 32 + 8 * max_entries + 16 * (block / per_bitmap) as usize;
+        let (bitmap_block, free) = (
+            word(&index, entry),
+            u32::from_le_bytes(index[entry + 8..entry + 12].try_into().unwrap()),
+        );
+        let mut bitmap = self.metadata_block(bitmap_block);
+        // Two bits a block, in little-endian words, the high bit of the count first.
+        let (position, bit) = (
+            16 + 8 * ((block % per_bitmap) / 32) as usize,
+            (block % 32) * 2,
+        );
+        let mut cells = word(&bitmap, position);
+        assert_eq!((cells >> bit) & 3, 0, "the last block is free");
+        cells |= 1 << (bit + 1);
+        bitmap[position..position + 8].copy_from_slice(&cells.to_le_bytes());
+        index[entry + 8..entry + 12].copy_from_slice(&(free - 1).to_le_bytes());
+        let mut root = root;
+        root[72..80].copy_from_slice(&(allocated + 1).to_le_bytes());
+        for (number, bytes, salt) in [
+            (bitmap_block, &mut bitmap, BITMAP_CHECKSUM_SALT),
+            (index_root, &mut index, BTREE_CHECKSUM_SALT),
+            (0, &mut root, SUPERBLOCK_CHECKSUM_SALT),
+        ] {
+            let checksum = crc32c(&bytes[4..]) ^ salt;
+            bytes[..4].copy_from_slice(&checksum.to_le_bytes());
+            self.write_metadata_block(number, bytes);
+        }
+    }
+    /// A wrong byte in the root of the mapping tree, whose checksum no longer holds: damage that
+    /// no leak check can read past.
+    fn damage_the_mapping_tree(&self) {
+        let root = self.metadata_block(0);
+        let mapping_root = u64::from_le_bytes(root[320..328].try_into().unwrap());
+        let mut node = self.metadata_block(mapping_root);
+        node[100] ^= 0xff;
+        self.write_metadata_block(mapping_root, &node);
+    }
+}
+
+const METADATA_BLOCK: usize = 4096;
+// The salts the kernel's persistent-data library gives the checksum of each kind of block.
+const SUPERBLOCK_CHECKSUM_SALT: u32 = 160_774;
+const BTREE_CHECKSUM_SALT: u32 = 121_107;
+const BITMAP_CHECKSUM_SALT: u32 = 240_779;
+/// CRC-32C as the kernel's `crc32c(~0, ...)` has it: the register, without the final inversion.
+fn crc32c(bytes: &[u8]) -> u32 {
+    let mut register = u32::MAX;
+    for byte in bytes {
+        register ^= u32::from(*byte);
+        for _ in 0..8 {
+            register = (register >> 1) ^ (0x82F6_3B78 & 0u32.wrapping_sub(register & 1));
+        }
+    }
+    register
 }
 
 impl Drop for Lab {
@@ -309,6 +486,126 @@ fn first_boot_makes_the_group_and_a_pool_over_the_whole_partition_and_repeats_as
     // No volume yet: nothing to report, and nothing nominal.
     let inventory = lab.storage.inventory().unwrap();
     assert_eq!((inventory.volumes.len(), inventory.nominal_bytes), (0, 0));
+}
+
+/// Found live on EU1 (2026-10-23): a hard power-off left one leaked data block in the pool's
+/// metadata; `thin_check -q` found it (exit 64), `vgchange --activate y` ended with 5, and the
+/// agent crash-looped (798 starts) with every database of the node down for 27 minutes.
+#[test]
+fn a_pool_with_a_leaked_block_after_a_reset_is_activated_repaired_and_reported() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 128);
+    fs::write(lab.dir_of(&a).join("kept"), b"committed").unwrap();
+    lab.storage.unmount_volume(&a).unwrap();
+    lab.deactivate_group();
+    lab.leak_the_last_data_block();
+    // The state of EU1: only a leak, the same words, exit 64, and the plain activation refused.
+    let (status, report) = lab.thin_check();
+    assert_eq!(status, 64, "{report}");
+    assert!(report.contains("1 data blocks have leaked"), "{report}");
+    let plain = SystemRunner.run(&commands::activate(lab.config())).unwrap();
+    assert_eq!(plain.code, 5, "{}", plain.stderr);
+
+    let opened = lab.storage.open().unwrap();
+    assert_eq!(
+        opened,
+        Activation {
+            released_parts: vec![],
+            repair_run: true
+        }
+    );
+    // The leak is repaired in the metadata, not only tolerated: the plain check passes now, and
+    // so does a plain activation after the next reset.
+    lab.deactivate_group();
+    assert_eq!(lab.thin_check().0, 0);
+    let plain = SystemRunner.run(&commands::activate(lab.config())).unwrap();
+    assert_eq!(plain.code, 0, "{}", plain.stderr);
+    // No committed byte was lost, and a clean start does not run the repairing activation.
+    assert_eq!(lab.storage.open().unwrap(), Activation::default());
+    assert!(
+        lab.storage
+            .mount_all(slice::from_ref(&a))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fs::read(lab.dir_of(&a).join("kept")).unwrap(), b"committed");
+}
+
+/// `--auto-repair` repairs a leak and nothing else: metadata that is damaged stays as it is, the
+/// pool stays down and the agent's start fails with the error of `vgchange`, so that the node goes
+/// stale and an operator decides. A leak beside the damage is not repaired either, because the
+/// check reads the trees first.
+#[test]
+fn a_pool_with_damaged_metadata_is_never_activated_or_repaired() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 128);
+    lab.storage.unmount_volume(&a).unwrap();
+    lab.deactivate_group();
+    lab.leak_the_last_data_block();
+    lab.damage_the_mapping_tree();
+    let before = lab.metadata_image();
+    let (status, report) = lab.thin_check();
+    assert_eq!(status, 64, "{report}");
+    assert!(report.contains("checksum error"), "{report}");
+
+    let result = lab.storage.open();
+    assert!(
+        matches!(&result, Err(Error::Command { program, code: 5, .. }) if program == "vgchange"),
+        "{result:?}"
+    );
+    assert!(
+        lab.metadata_image() == before,
+        "a byte of the metadata changed"
+    );
+    let pool = format!("{}/{}", lab.config().group, lab.config().pool);
+    let attributes = sh("lvs", &["--noheadings", "-o", "lv_attr", &pool]);
+    assert_eq!(attributes.trim().as_bytes()[4], b'-', "{attributes}");
+}
+
+/// The read-only activation of the pool's metadata for an inspection (`lvchange --activate y
+/// --yes` on the part, as the operator of EU1 did) leaves the part active, and lvm2 then refuses
+/// to activate the pool.
+#[test]
+fn parts_of_the_pool_that_an_inspection_left_active_are_deactivated_before_the_pool_is() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 128);
+    fs::write(lab.dir_of(&a).join("kept"), b"committed").unwrap();
+    lab.storage.unmount_volume(&a).unwrap();
+    lab.deactivate_group();
+    for part in ["tmeta", "tdata"] {
+        sh(
+            "lvchange",
+            &[
+                "--quiet",
+                "--activate",
+                "y",
+                "--yes",
+                &format!("{}/{}_{part}", lab.config().group, lab.config().pool),
+            ],
+        );
+    }
+    let plain = SystemRunner.run(&commands::activate(lab.config())).unwrap();
+    assert_eq!(plain.code, 5, "{}", plain.stderr);
+    assert!(plain.stderr.contains("prohibited"), "{}", plain.stderr);
+
+    let opened = lab.storage.open().unwrap();
+    assert_eq!(
+        opened,
+        Activation {
+            released_parts: vec!["pgcf_thinpool_tdata".into(), "pgcf_thinpool_tmeta".into()],
+            repair_run: false
+        }
+    );
+    assert!(
+        lab.storage
+            .mount_all(slice::from_ref(&a))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fs::read(lab.dir_of(&a).join("kept")).unwrap(), b"committed");
 }
 
 #[test]

@@ -37,8 +37,12 @@ use tokio::{
     task::JoinSet,
 };
 
-/// How many archive credentials are read from Cloudflare at once.
-const CREDENTIALS_AT_ONCE: usize = 8;
+/// How many archive credentials are read from Cloudflare at once. A read is one round trip to the
+/// Worker, which signs the credential from its parent key and calls no other service: 8 at once
+/// were 39 rounds of about 120 ms for the 311 databases of EU1, 4.7 s of the agent's start before
+/// the first page was applied (`kill -9`, 2026-10-23). 32 at once are 10 rounds; the plan's Open
+/// row has the live figure to read.
+const CREDENTIALS_AT_ONCE: usize = 32;
 
 /// How often each loop runs. The defaults are the plan's (4.3, 4.9); tests shorten them.
 #[derive(Clone, Debug)]
@@ -2004,7 +2008,8 @@ mod tests {
         };
         let cloud = Cloud::start().await;
         let base = tempdir();
-        let databases: Vec<Value> = (0..CREDENTIALS_AT_ONCE)
+        // Eight databases, fewer than are read at once: one round of reads, and a page this small.
+        let databases: Vec<Value> = (0..8.min(CREDENTIALS_AT_ONCE))
             .map(|n| {
                 let mut db = database(&database_id(n));
                 db["archive"]["credential"]["id"] = json!(format!("crd_{n:020}"));

@@ -5,8 +5,8 @@
 //! wake's two questions (`exists`, `needs_repair`) answer from the list, and only for a volume it
 //! shows as there and not suspect; any other volume is read from lvm2 again.
 use super::{
-    CommandRunner, Config, Error, NoRoom, Output, Policy, PoolSample, ReserveAction, SystemRunner,
-    VOLUME_LIST_MAX_AGE, VolumeId,
+    Activation, CommandRunner, Config, Error, NoRoom, Output, Policy, PoolSample, ReserveAction,
+    SystemRunner, VOLUME_LIST_MAX_AGE, VolumeId,
     commands::{self, FS_TAG, RESERVE_FREED_TAG, SUSPECT_TAG},
     host,
     ids::dm_name,
@@ -26,7 +26,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How many volumes the agent unmounts at once when it exits (`Storage::unmount_all`).
+/// How many volumes are unmounted at once when the namespace is about to end
+/// (`Storage::unmount_all`).
 const UNMOUNTS_AT_ONCE: usize = 16;
 
 /// A volume is a whole number of extents; the volume group is made with lvm2's 4 MiB.
@@ -240,8 +241,11 @@ impl<R: CommandRunner> Storage<R> {
         let Some(mount) = mounts.iter().rev().find(|mount| mount.mount_point == dir) else {
             return Ok(None);
         };
-        // The device's number says which of the database's volumes it is.
-        let lvs = self.read_lvs()?;
+        // The device's number says which of the database's volumes it is. The listing is the
+        // recent one where there is one: the agent's start asks this for every slot that holds a
+        // database, and an `lvs` for each took 13.7 s with 104 of them (EU1, 2026-10-23). Any
+        // command that changes a volume ends the listing (`Listing::changed`).
+        let lvs = self.volumes_for_mount()?;
         self.database_volumes(&lvs)
             .filter(|(id, _)| id.database() == database)
             .map(|(id, _)| id)
@@ -312,8 +316,9 @@ impl<R: CommandRunner> Storage<R> {
 
     /// First boot and every start of the agent: the volume group and the pool exist as plan 4.3
     /// describes, or are made; the group is active. A disk, group or pool that is something else
-    /// is an error, never repaired in place.
-    pub fn open(&self) -> Result<(), Error> {
+    /// is an error, never repaired in place. What the activation had to do besides `vgchange` is
+    /// in the answer, for the caller to report.
+    pub fn open(&self) -> Result<Activation, Error> {
         let _guard = self.lock();
         let device = fs::canonicalize(&self.config.device)?;
         let device = lvm::parse_pvs(&self.run(commands::pvs())?.stdout)?
@@ -327,7 +332,7 @@ impl<R: CommandRunner> Storage<R> {
             })?;
         }
         let group = self.read_group()?;
-        self.run(commands::activate(&self.config))?;
+        let activation = self.activate_group()?;
         for step in lvm::plan_pool(&self.config, &group, &self.read_lvs()?)? {
             self.run(match step {
                 PoolStep::Create { data_bytes } => commands::pool_create(&self.config, data_bytes),
@@ -338,7 +343,44 @@ impl<R: CommandRunner> Storage<R> {
         if !lvm::plan_pool(&self.config, &group, &self.read_lvs()?)?.is_empty() {
             return Err(Error::Unexpected("the thin pool after creating it"));
         }
-        Ok(())
+        Ok(activation)
+    }
+
+    /// Activates the group, and the pool with it. A reset that was not clean can leave the pool's
+    /// metadata with a leaked block (a block the space map counts that no mapping uses), which
+    /// lvm2's own check refuses: `vgchange` ends with 5 and the pool, with every database on the
+    /// node, stays down (found live on EU1, 2026-10-23, 27 minutes of a crash-looping agent).
+    /// When the plain activation fails:
+    ///
+    /// 1. A part of the pool that is active on its own keeps lvm2 from activating the pool (an
+    ///    inspection of the metadata does it). It is deactivated, which is safe because a pool
+    ///    that is not active has no active volume, and the plain activation is tried again.
+    /// 2. Otherwise the activation is tried once more with `thin_check --auto-repair`
+    ///    (`commands::REPAIRING_CHECK`), which repairs a leak and nothing else and writes nothing
+    ///    when the trees are damaged. A damaged pool stays down with the error of `vgchange`: the
+    ///    agent stops and the node goes stale, and only an operator decides what happens to it.
+    fn activate_group(&self) -> Result<Activation, Error> {
+        match self.run(commands::activate(&self.config)) {
+            Ok(_) => return Ok(Activation::default()),
+            Err(Error::Command { .. }) => {}
+            Err(other) => return Err(other),
+        }
+        let mut activation = Activation::default();
+        // A report that cannot be read leaves the parts to the operator; the repair still runs.
+        let listed = self
+            .run(commands::volume_attributes(&self.config))
+            .and_then(|output| lvm::active_pool_parts(&self.config.pool, &output.stdout))
+            .unwrap_or_default();
+        for part in &listed {
+            self.run(commands::deactivate_pool_part(&self.config, part))?;
+            activation.released_parts.push(part.clone());
+        }
+        if !listed.is_empty() && self.run(commands::activate(&self.config)).is_ok() {
+            return Ok(activation);
+        }
+        self.run(commands::activate_repairing(&self.config))?;
+        activation.repair_run = true;
+        Ok(activation)
     }
 
     /// Reads the pool now and keeps the reading for `room`. A read that fails leaves no reading,
@@ -822,7 +864,8 @@ impl<R: CommandRunner> Storage<R> {
         Ok(())
     }
 
-    /// The agent's exit: unmounts the volumes it has mounted, many at once. A process that exits
+    /// The exit of an agent that did not join the holder's namespace, and the stop of the holder
+    /// (`mount_holder`): unmounts the volumes mounted here, many at once. A process that exits
     /// leaves its mount namespace, and the kernel unmounts what the namespace holds one after the
     /// other, each as slow as the disk's flushes (lab: 89 ms each, and EU1's agent took 14 s to
     /// stop with 301 volumes). The process is not gone until it has, and systemd starts the next
@@ -1073,6 +1116,135 @@ mod tests {
                 stderr: String::new(),
             })
         }
+    }
+
+    /// Answers each command with the first of the queued answers whose words it contains, in
+    /// order, and with success when none is left; keeps the command lines it ran.
+    struct Scripted(
+        Mutex<Vec<(&'static str, i32, &'static str)>>,
+        Mutex<Vec<String>>,
+    );
+    impl Scripted {
+        fn new(answers: Vec<(&'static str, i32, &'static str)>) -> Storage<Self> {
+            Storage::new(
+                Self(Mutex::new(answers), Mutex::default()),
+                Config::default(),
+            )
+        }
+    }
+    impl CommandRunner for Scripted {
+        fn run(&self, command: &[String]) -> io::Result<Output> {
+            let line = command.join(" ");
+            self.1.lock().unwrap().push(line.clone());
+            let mut answers = self.0.lock().unwrap();
+            let at = answers
+                .iter()
+                .position(|(needle, ..)| line.contains(needle));
+            let (code, stdout) = at.map_or((0, ""), |at| {
+                let (_, code, stdout) = answers.remove(at);
+                (code, stdout)
+            });
+            Ok(Output {
+                code,
+                stdout: stdout.into(),
+                stderr: String::new(),
+            })
+        }
+    }
+    fn ran(storage: &Storage<Scripted>) -> Vec<String> {
+        storage.runner.1.lock().unwrap().clone()
+    }
+    const VGCHANGE: &str = "vgchange --quiet --activate y pgcf";
+    const REPAIRING: &str = r#"vgchange --quiet --config global{thin_check_options=["-q","--auto-repair"]} --activate y pgcf"#;
+    const PARTS_LEFT: &str = include_str!("fixtures/lvs-all-pool-parts-left-active.json");
+
+    #[test]
+    fn an_activation_that_works_runs_nothing_else() {
+        let storage = Scripted::new(vec![]);
+        assert_eq!(storage.activate_group().unwrap(), Activation::default());
+        assert_eq!(ran(&storage), [VGCHANGE]);
+    }
+
+    /// The pool's own check refused it (a leaked block after a reset that was not clean): one
+    /// more activation, with the repair, and the caller is told.
+    #[test]
+    fn a_refused_activation_is_tried_once_more_with_the_repair() {
+        let storage = Scripted::new(vec![(VGCHANGE, 5, "")]);
+        let activation = storage.activate_group().unwrap();
+        assert_eq!(
+            activation,
+            Activation {
+                released_parts: vec![],
+                repair_run: true
+            }
+        );
+        let ran = ran(&storage);
+        assert_eq!(ran[0], VGCHANGE);
+        assert!(ran[1].starts_with("lvs --all"), "{ran:?}");
+        assert_eq!(ran[2], REPAIRING);
+        assert_eq!(ran.len(), 3);
+    }
+
+    /// Damaged metadata: the repairing activation is refused as well, and the error is the
+    /// activation's. Nothing else is run (no `thin_repair`, no `lvconvert --repair`): the agent
+    /// does not decide what becomes of a pool whose trees are wrong.
+    #[test]
+    fn damaged_metadata_ends_in_the_error_of_the_activation_and_nothing_else() {
+        let storage = Scripted::new(vec![(VGCHANGE, 5, ""), ("--config", 5, "")]);
+        let result = storage.activate_group();
+        assert!(
+            matches!(&result, Err(Error::Command { program, code: 5, .. }) if program == "vgchange"),
+            "{result:?}"
+        );
+        let ran = ran(&storage);
+        assert_eq!(ran.len(), 3, "{ran:?}");
+        assert!(
+            ran.iter()
+                .all(|line| { line.starts_with("vgchange") || line.starts_with("lvs --all") })
+        );
+    }
+
+    /// An inspection that left the metadata active keeps the pool down: the parts are
+    /// deactivated and the plain activation is the one that works, with no repair.
+    #[test]
+    fn parts_an_inspection_left_active_are_deactivated_and_the_plain_activation_tried_again() {
+        let storage = Scripted::new(vec![(VGCHANGE, 5, ""), ("lvs --all", 0, PARTS_LEFT)]);
+        // The recorded report is of a pool named `pool`.
+        let storage = Storage::new(
+            storage.runner,
+            Config {
+                pool: "pool".into(),
+                ..Config::default()
+            },
+        );
+        let activation = storage.activate_group().unwrap();
+        assert_eq!(
+            activation,
+            Activation {
+                released_parts: vec!["pool_tdata".into(), "pool_tmeta".into()],
+                repair_run: false
+            }
+        );
+        let ran = ran(&storage);
+        assert_eq!(ran[0], VGCHANGE);
+        assert!(ran[1].starts_with("lvs --all"));
+        assert_eq!(ran[2], "lvchange --quiet --activate n pgcf/pool_tdata");
+        assert_eq!(ran[3], "lvchange --quiet --activate n pgcf/pool_tmeta");
+        assert_eq!(ran[4], VGCHANGE);
+        assert_eq!(ran.len(), 5);
+    }
+
+    /// A command that cannot even be started is not a refusal of the pool's check.
+    #[test]
+    fn a_failure_that_is_no_exit_status_is_not_retried() {
+        struct Missing;
+        impl CommandRunner for Missing {
+            fn run(&self, _: &[String]) -> io::Result<Output> {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            }
+        }
+        let storage = Storage::new(Missing, Config::default());
+        assert!(matches!(storage.activate_group(), Err(Error::Io(_))));
     }
 
     #[test]
@@ -1373,6 +1545,36 @@ mod tests {
         assert_eq!(held[0].1.as_ref().unwrap().generation(), 2);
         assert_eq!(held[1], ("k1l2m3n4o5p6q7r8s9t0".to_string(), None));
         assert!(storage.volumes_in(&[]).is_empty());
+    }
+
+    /// Found live (EU1, 2026-10-23, `kill -9` of the agent): the agent named the volume of each of
+    /// the 104 slots that held a database by running `lvs` for each, one after the other, 160 ms
+    /// each; the adoption of the slots took 13.7 s of a start of 28.7 s to the first wake. The
+    /// adoption asks once per slot, so the answer comes from one listing for all of them.
+    #[test]
+    fn the_volumes_that_many_slots_hold_are_named_from_one_listing() {
+        let mut storage = Storage::new(Listed::new(&two_generations()), Config::default());
+        storage.kernel = Kernel {
+            minor: |_| Ok(7),
+            ext4_errors: |_| Ok(0),
+        };
+        let at = format!("/var/lib/pgcf/db/{LISTED}");
+        let mount = Mount {
+            major: 252,
+            minor: 7,
+            mount_point: at.into(),
+            fstype: "ext4".into(),
+            source: "/dev/dm-7".into(),
+        };
+        for _ in 0..40 {
+            let held = storage.volumes_in(std::slice::from_ref(&mount));
+            assert!(held[0].1.is_some(), "{held:?}");
+        }
+        assert_eq!(storage.runner.ran("lvs"), 1);
+        // A change of a volume ends the listing: the next question is read again.
+        storage.listing.changed();
+        storage.volumes_in(std::slice::from_ref(&mount));
+        assert_eq!(storage.runner.ran("lvs"), 2);
     }
 
     /// Every mount at a database's directory is held, whether the agent can name its volume or

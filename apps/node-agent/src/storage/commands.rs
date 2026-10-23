@@ -77,6 +77,50 @@ pub fn vgcreate(config: &Config) -> Vec<String> {
 pub fn activate(config: &Config) -> Vec<String> {
     words(["vgchange", "--quiet", "--activate", "y", &config.group])
 }
+/// The check `vgchange` runs on a thin pool's metadata before it activates the pool, as Debian 13
+/// has it (`thin_check_options = ["-q"]`), with `--auto-repair` added. thin-provisioning-tools
+/// 1.1.0 documents the option as "automatically repair any trivial issues found with the
+/// metadata. Currently only fixes metadata leaks": once the trees have been read without an
+/// error, it rewrites the space map of a leak (a block the map counts as used that no tree
+/// refers to). It writes nothing when a tree or a checksum is wrong, because the leak check comes
+/// after the walk of the trees (lab: a metadata image with a leaked block and a wrong checksum in
+/// the mapping tree is left byte for byte as it was). Its exit status cannot tell the two apart:
+/// the Rust `thin_check` ends with 64 for every error, the man page's 1 notwithstanding.
+pub const REPAIRING_CHECK: &str = r#"global{thin_check_options=["-q","--auto-repair"]}"#;
+/// `activate` for a pool whose plain check was refused (found live on EU1, 2026-10-23: one leaked
+/// block after a hard reset made `vgchange` end with 5 and the agent crash-loop for 27 minutes).
+pub fn activate_repairing(config: &Config) -> Vec<String> {
+    words([
+        "vgchange",
+        "--quiet",
+        "--config",
+        REPAIRING_CHECK,
+        "--activate",
+        "y",
+        &config.group,
+    ])
+}
+/// Every volume of the group with its attributes, hidden ones included: the parts of the pool
+/// (`pgcf_thinpool_tdata`, `pgcf_thinpool_tmeta`) are listed only by `--all`.
+pub fn volume_attributes(config: &Config) -> Vec<String> {
+    let mut command = words(["lvs", "--all"]);
+    command.extend(REPORT.iter().map(|word| word.to_string()));
+    command.push("lv_name,lv_attr".to_string());
+    command.push(config.group.clone());
+    command
+}
+/// A part of the pool, which lvm2 activates only with the pool: `lvchange --activate n` ends the
+/// activation of a part that an inspection of the metadata (`lvchange --activate y --yes` on the
+/// part) left active, which keeps `vgchange` from activating the pool.
+pub fn deactivate_pool_part(config: &Config, part: &str) -> Vec<String> {
+    words([
+        "lvchange",
+        "--quiet",
+        "--activate",
+        "n",
+        &format!("{}/{part}", config.group),
+    ])
+}
 pub fn pool_create(config: &Config, data_bytes: u64) -> Vec<String> {
     words([
         "lvcreate",
@@ -296,6 +340,47 @@ mod tests {
             line(activate(&config)),
             "vgchange --quiet --activate y pgcf"
         );
+    }
+
+    /// The second activation changes the pool check and nothing else: the host's own options
+    /// (`-q`) stay, `--auto-repair` is the only addition, and it is one word of the command line
+    /// (no shell reads the brackets).
+    #[test]
+    fn the_repairing_activation_adds_auto_repair_to_the_hosts_check_and_nothing_else() {
+        let config = Config::default();
+        let command = activate_repairing(&config);
+        assert_eq!(
+            command,
+            [
+                "vgchange",
+                "--quiet",
+                "--config",
+                r#"global{thin_check_options=["-q","--auto-repair"]}"#,
+                "--activate",
+                "y",
+                "pgcf"
+            ]
+        );
+        assert!(!command.iter().any(|word| word.contains("ignore-non-fatal")));
+        assert!(changes_volumes(&command));
+    }
+
+    #[test]
+    fn the_parts_of_the_pool_are_listed_with_all_and_deactivated_by_name() {
+        let config = Config::default();
+        assert_eq!(
+            line(volume_attributes(&config)),
+            "lvs --all --reportformat json --units b --nosuffix --options lv_name,lv_attr pgcf"
+        );
+        assert!(!changes_volumes(&volume_attributes(&config)));
+        assert_eq!(
+            line(deactivate_pool_part(&config, "pgcf_thinpool_tmeta")),
+            "lvchange --quiet --activate n pgcf/pgcf_thinpool_tmeta"
+        );
+        assert!(changes_volumes(&deactivate_pool_part(
+            &config,
+            "pgcf_thinpool_tmeta"
+        )));
     }
 
     #[test]

@@ -88,7 +88,9 @@ database's record.
 The installation serves two regions: `eu-dev` (node EU1) and `us-dev` (node US1). The IDs carry the
 name `dev` and stay in v1. `GET /v1/regions` with your key lists `{id, provider_region}` of the
 regions that accept placement and nothing else about them: those with a node that is ready,
-schedulable, not lost and open for new databases. A region without such a node is not listed, and
+schedulable, not lost, open for new databases and has reported in the last 180 seconds (a node that
+goes silent closes its region until its next report; `regional_node_stale` is raised at the same
+moment). A region without such a node is not listed, and
 a database created in a region record that has none waits unplaced ("Waiting for verified regional
 capacity") until a node there opens.
 

@@ -8,6 +8,9 @@
 //!
 //! `pgcf-agent check` makes or wakes the scratch database and queries it, without Cloudflare
 //! (the image's boot test). It runs after the agent has signalled ready.
+//!
+//! `pgcf-agent hold` is the one process of `pgcf-mounts.service`, which `run` starts and whose
+//! mount namespace it joins, so that the volumes it mounts outlive it (`mount_holder`).
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -21,6 +24,7 @@ mod linux {
         layout::Layout,
         link::{Link, LinkConfig, LinkEvents, Paths, Timing as LinkTiming, Transport},
         machine::{Node, WARM_BOUND, os_report, restore_runtime, warm_start_path},
+        mount_holder,
         notify::notify,
         release,
         sample::uptime_seconds,
@@ -83,6 +87,28 @@ mod linux {
         .await
     }
 
+    /// Joins the namespace of the volumes' holder, before the first thread exists (`setns(2)` of a
+    /// mount namespace is refused in a process with threads).
+    pub fn join_mounts() {
+        let layout = Layout::default();
+        let agent = layout.bin().join("current").join("pgcf-agent");
+        match mount_holder::join(&layout, &agent) {
+            Ok(_) => emit_event(json!({"event": "mount_holder_joined"})),
+            Err(class) => {
+                emit_event(json!({"event": "mount_holder_unavailable", "class": class}));
+            }
+        }
+    }
+
+    /// The agent's exit: the mounts it made go before the process does, many at once, where the
+    /// kernel would end them one by one with the namespace. Where the holder has the namespace
+    /// they stay, with their page cache, for the next agent.
+    async fn release(node: &Node) {
+        if !mount_holder::held() {
+            node.release_mounts().await;
+        }
+    }
+
     pub async fn run() -> Result<(), Error> {
         timing::phase("process_start");
         let layout = Layout::default();
@@ -118,7 +144,7 @@ mod linux {
         let service = tokio::select! {
             service = start(node.clone(), &layout) => service?,
             () = &mut stop => {
-                node.release_mounts().await;
+                release(&node).await;
                 return Ok(());
             }
         };
@@ -134,11 +160,14 @@ mod linux {
             // starts the agent from the new link.
             () = service.restart_requested() => emit_event(json!({"event": "agent_restarting"})),
         }
-        // The databases run on: they are units of their own. The agent's mounts of their volumes
-        // go before the process does, many at once: the kernel would end them one by one.
+        // The databases run on: they are units of their own.
         service.stop();
-        node.release_mounts().await;
+        release(&node).await;
         Ok(())
+    }
+
+    pub async fn hold() -> Result<(), Error> {
+        mount_holder::hold().await
     }
 
     pub async fn check() -> Result<(), Error> {
@@ -180,19 +209,39 @@ fn finish(result: Result<(), pgcf_node_agent::Error>, command: &str) -> std::pro
     std::process::ExitCode::FAILURE
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
     let command = std::env::args().nth(1).unwrap_or_default();
-    if !matches!(command.as_str(), "run" | "check") {
-        eprintln!("usage: pgcf-agent run | check");
+    if !matches!(command.as_str(), "run" | "check" | "hold") {
+        eprintln!("usage: pgcf-agent run | check | hold");
         return std::process::ExitCode::from(2);
     }
+    // Before the runtime, which starts the threads: the mount namespace cannot be joined after.
     #[cfg(target_os = "linux")]
-    let result = match command.as_str() {
-        "run" => linux::run().await,
-        _ => linux::check().await,
+    if command == "run" {
+        linux::join_mounts();
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("pgcf-agent {command}: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
+    #[cfg(target_os = "linux")]
+    let result = runtime.block_on(async {
+        match command.as_str() {
+            "run" => linux::run().await,
+            "hold" => linux::hold().await,
+            _ => linux::check().await,
+        }
+    });
     #[cfg(not(target_os = "linux"))]
-    let result: Result<(), pgcf_node_agent::Error> = Err("pgcf-agent runs on Linux only".into());
+    let result: Result<(), pgcf_node_agent::Error> = {
+        let _ = &runtime;
+        Err("pgcf-agent runs on Linux only".into())
+    };
     finish(result, &command)
 }

@@ -57,8 +57,12 @@ changes nothing). A node is never declared lost from staleness alone, and fencin
 database moves (plan 7.11, 9.4).
 
 1. Read `/v1/operational-health?scope=nodes` and verify the actual node UID. A node whose newest
-   sample is older than 180 seconds is stale: placement excludes it and `regional_node_stale`
-   fires, and that does not declare it lost or authorize a replacement order. Look at the node
+   sample is older than 180 seconds is stale: placement excludes it, its region is no longer
+   listed to integrators as accepting placement until the node reports again, and
+   `regional_node_stale` fires; that does not declare it lost or authorize a replacement order.
+   Its `ready`, `schedulable` and placement flags stay as they were: they are the operator's and
+   the lost-node procedure's, and the closure is read from the observation each time, so nothing
+   stays closed once the node reports. Look at the node
    first ([below](#looking-at-a-node)); a silent node answers nothing, so check the instance in the
    Contabo panel.
 2. Submit `POST /v1/nodes/{id}/mark-lost` with
