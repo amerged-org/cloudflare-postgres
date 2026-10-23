@@ -399,12 +399,48 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   _m_/16 and at least 16 MB. For 256 MiB that is 32, 192, 2 and 16 MB; for 1 GiB, 128, 768, 4 and
   64 MB. `shared_buffers` stays small because shared memory cannot be reclaimed without swap; the
   page cache does the caching. `huge_pages` and `jit` are off.
+- **ANALYZE and autovacuum** are bounded by the memory for the table's own columns, and not for
+  the values of an index expression. `ANALYZE` keeps a sample of 300 × `default_statistics_target`
+  rows, each as it lies on its page: up to 8,200 bytes for rows that are never toasted
+  (`STORAGE PLAIN`; a row of ordinary columns is cut to 2 KB) and 9,260 with the expanded copy of one
+  compressed value (`settings.rs`, checked against PostgreSQL 18 by a test). PostgreSQL's default of
+  100 is 30,000 rows, 265 MiB at the widest rows: more than a 256 MiB database has.
+  `autovacuum_max_workers` is 1 up to 512 MiB, 2 up to 1 GiB and 3 above, and
+  `default_statistics_target` is the largest multiple of ten, from 10 to 100, at which the samples
+  of every autovacuum worker and of one manual `ANALYZE`, all at the widest rows, take at most half
+  of the memory: 20 for 256 MiB, 40 for 512 MiB, 60 for 1 GiB, 90 for 2 GiB and 100 from 2,304 MiB.
+  A vacuum's dead-item store is `maintenance_work_mem` (_m_/16), which is smaller than a sample's
+  share. What a tenant can still change: its session's or role's or database's
+  `default_statistics_target`, a column's target (`ALTER TABLE ... SET STATISTICS`, up to 10,000) and
+  its session's `maintenance_work_mem`. Each raises the sample, or the vacuum's store, in proportion;
+  past the class's bound the database is throttled at the unit's soft limit (every session of it, not
+  only the ANALYZE) and, at the ceiling, a backend is killed and the database runs crash recovery.
+  The workers and `autovacuum_work_mem` are the postmaster's, which the tenant's roles cannot set.
+  A lower target gives a column fewer most-common values and histogram buckets (20 for 256 MiB),
+  which planner estimates for skewed columns of large tables can show.
+  **Index and statistics expressions are not bounded by any class setting.** While the sample lives,
+  `ANALYZE` also copies the value of every index expression for every sampled row
+  (`compute_index_stats` in `analyze.c`; `CREATE STATISTICS` expressions do the same in
+  `compute_expr_stats`), one index or statistics object at a time, and the width of such a value is
+  whatever the expression makes it, not the row's. A full-text index on
+  `to_tsvector('simple', body)` over documents of 22 KB holds a tsvector of 26 KB for each sampled
+  row: 152 MiB for the 6,000 rows of a 256 MiB database (measured on the real unit, plan 4.4), where
+  the model above says 53 MiB; at the class's target a table with enough rows holds 455 MiB in 1 GiB,
+  682 MiB in 2 GiB and 758 MiB in 4 GiB (rows × width, not measured at those sizes). One such
+  `ANALYZE` fits every class (xs: 204 MiB of 230 MiB that the unit cannot give back), but the
+  autovacuum worker and a session at once do not fit xs: the unit stalled for memory about 30 % of
+  the time and the two had not ended after 700 s. A tenant ends it with `ALTER INDEX ... ALTER COLUMN
+  1 SET STATISTICS 0` (the expression gets no new statistics, +0 MiB) or with a stored generated
+  column that the index is on instead of the expression (+1 MiB); plan 4.4 and the integrator
+  handover give the cost of each. A `CREATE STATISTICS` object over expressions holds the same, and
+  `ALTER STATISTICS ... SET STATISTICS 0` skips it (read in `extended_stats.c`, not measured).
 - **From the size class:** `max_connections` and `archive_timeout`. `archive_mode` is on with
   `/usr/libexec/pgcf/pgcf-archive %p`, `wal_level` is `replica`, `wal_init_zero` is off,
   `wal_recycle` on, `min_wal_size` 32 MB, `max_wal_size` a quarter of the volume (at least 64 MiB),
   and crash recovery syncs the filesystem once (`recovery_init_sync_method = syncfs`).
-- **Small databases** (512 MiB and below) run one autovacuum worker out of two slots, one I/O
-  worker, no parallel query or maintenance workers, four background worker slots and no replication.
+- **Small databases** (512 MiB and below) run two autovacuum worker slots (one worker, above),
+  one I/O worker, no parallel query or maintenance workers, four background worker slots and no
+  replication.
   A restore runs with the larger of the backup's and the class's values during its recovery,
   because a recovery checks `max_connections`, the process, sender, prepared transaction and lock
   settings against its source's, and restarts onto the class's own afterwards.
@@ -707,6 +743,14 @@ with the image's `pgcf-slot@.service`, `pgcf.slice`, the supervisor at
 directory, as in the image: the kernel names the process's file by its real path, and the agent
 knows the supervisor by the file the link leads to now) and PostgreSQL 18, inside `systemd-run --wait --pipe -p
 PrivateMounts=yes <test binary> --ignored --test-threads=1 units::slot_lab` (its header says how).
+`units/slot_lab/analyze.rs` is part of it: a database of each class of the catalog (256 MiB to 4 GiB) in
+a pooled slot with the class's limits and its own `postgresql.conf`, tables of 100,000 rows of 8 KB that
+are never toasted, of 2 KB, and of the widest row an `ANALYZE` keeps, and a manual `ANALYZE`, a `VACUUM`,
+the autovacuum worker and as many `ANALYZE` at once as the class has workers plus one beside connections,
+each read from the unit's cgroup every 10 ms (peak memory, the ceiling, kills, stalls). Three tables of
+6,000 documents of 22 KB show what the model does not cover: a full-text index on an expression
+(+152 MiB in every class), the same with the statistics of its column off (+0) and a stored generated
+column (+1). It needs 8 GiB of disk and runs with the filter `units::slot_lab::analyze`.
 `start_lab.rs` is the agent's start on a node with 300 databases, on the same real parts and with a
 disk that is slow to flush (its header says how to run it); the numbers it gave are in the plan
 (11.1, "Agent start and stop at 300 databases").

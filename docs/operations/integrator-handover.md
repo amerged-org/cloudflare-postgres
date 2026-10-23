@@ -1061,6 +1061,58 @@ keeps reporting the truth.
 What you must do: keep `sleep_after_seconds` short, avoid always-warm classes except where needed,
 and shed load on `57P03` instead of retrying in a tight loop.
 
+**Statistics target and the sold memory.** PostgreSQL's `ANALYZE`, run by a session or by
+autovacuum, keeps a sample of 300 × `default_statistics_target` rows in memory, each as wide as it
+lies on its page: up to about 8 KB for rows that are never toasted (`STORAGE PLAIN` columns) and
+about 2 KB for ordinary rows. The default target of 100 is 265 MiB for the widest rows, more than a
+256 MiB database has. Each class therefore sets the target and the number of autovacuum workers by
+its memory, so that the samples of a table's own columns, taken by every worker and by one
+session's `ANALYZE` at once, fit in half of it: target 20 with one worker for 256 MiB, 40 with one
+for 512 MiB, 60 with two for 1 GiB, 90 with three for 2 GiB, and 100 from 2,304 MiB. A lower target
+gives each column fewer most-common values and histogram buckets, which the planner's estimates for
+skewed columns of large tables can show. Your roles may raise the target for their session, role or
+database (`SET`, `ALTER ROLE … SET`, `ALTER DATABASE … SET`), a column's target
+(`ALTER TABLE … ALTER COLUMN … SET STATISTICS`, up to 10,000) and `maintenance_work_mem`; they
+cannot set the autovacuum workers. The sample grows in proportion to the target, so one larger than
+the class holds throttles the whole database at 90 % of its memory and, at the ceiling, ends a
+backend (crash recovery; sessions drop; no acknowledged commit is lost). Raise a column's target
+only on tables of narrow rows.
+
+**Indexes on expressions are not covered by that.** While the sample lives, `ANALYZE` also keeps the
+value of every index expression for every sampled row, one index at a time (the expressions of a
+`CREATE STATISTICS` object the same), and a value is as wide as the expression makes it, not as
+wide as the row. No setting of a class limits it; the memory is 300 × the target (or all the rows of
+a smaller table) × the width of the value. The common case is full-text search: a GIN index on
+`to_tsvector('simple', body)` over documents of 22 KB keeps a tsvector of 26 KB for each sampled
+row. *Measured* (PostgreSQL 18.6, 2026-10-23, the real slot unit of each class, 6,000 documents):
+152 MiB for one `ANALYZE` in every class. In a 256 MiB database that is 204 MiB of the 230 MiB that
+the unit cannot give back, and it ends in 5 to 9 s; the autovacuum worker and a session analyzing
+two such tables at once did not end in 700 s, the unit stalled for memory about 30 % of the time,
+and a new connection waited more than 4 minutes to be served. For a table
+with enough rows the same index holds 455 MiB at the 1 GiB class's target, 682 MiB at the 2 GiB
+class's and 758 MiB at the 4 GiB class's (rows × width; the lab table has 6,000 rows). Check your
+tables for expression indexes whose value is wider than about 1 KB (`to_tsvector`, a large
+`jsonb` or `text` expression) and end the cost with one of two remedies, both measured:
+
+- `ALTER INDEX index_name ALTER COLUMN 1 SET STATISTICS 0` (the number is the expression's column
+  in the index). `ANALYZE` then skips the expression: the unit grew by 0.0 to 0.4 MiB in the class
+  lab and by 2.2 MiB for 8,000 documents in a 256 MiB unit, where the two tables above ended in
+  0.5 s. The cost is the expression's statistics. On a new index there are none and the planner
+  estimates every `@@` on it with its default of 0.5 % of the rows (a lexeme in all 4,000 rows of a
+  table estimated at 20 rows instead of 4,000); on an index that had statistics they stay in
+  `pg_stats`, no longer refreshed, until the index is dropped and created again.
+- A stored generated column, `tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED`,
+  with the GIN index on the column instead of the expression, and the queries on `tsv @@ …`. The
+  column is analyzed by its own type: the unit grew by 0.0 to 1.2 MiB in the class lab and by
+  2.5 MiB in the 256 MiB unit (two tables at once ended in 1.1 s), and `pg_stats` keeps 10 × the
+  target most-common lexemes (200 at target 20) as before. The cost is the tsvector in the table:
+  95 MB became 206 MB for 4,000 documents of 22 KB (the GIN index was 5,760 kB either way), and every
+  write of `body` computes it.
+
+The values are decided from the PostgreSQL 18 source and *measured in a lab* on 2026-10-23 (plan
+11.1, "ANALYZE and autovacuum stay inside every class's memory"); they apply to a database at its
+first wake after the agent release that carries them, and have not been measured live.
+
 ### 4.3 Thin storage
 
 Every database lives on its own thin LVM volume of its node's one thin pool. The volume's size is
