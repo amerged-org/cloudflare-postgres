@@ -212,7 +212,7 @@ export class NodeActor extends DurableObject<Env> {
           ? null
           : (JSON.parse(link.sample) as NodeSample).observed_at;
       await this.env.DB.prepare(
-        `UPDATE nodes SET agent_version=?,reported_release_id=?,
+        `UPDATE nodes SET agent_version=?,reported_release_id=?,restore_in_place_capable=?,
          os_previous_observed_at=CASE WHEN os_boot_id IS ? THEN os_previous_observed_at
            ELSE COALESCE(MAX(last_observed_at,?),?,last_observed_at) END,
          os_boot_id=?,os_booted_at=?,os_kernel_release=?,os_packages_sha256=?,os_host_files_sha256=?,
@@ -223,6 +223,9 @@ export class NodeActor extends DurableObject<Env> {
           parsed.data.release_id === null
             ? null
             : FleetReleaseId.parse(parsed.data.release_id),
+          Number(
+            parsed.data.capabilities?.includes("restore_in_place_v1") === true,
+          ),
           os.boot_id,
           held,
           held,

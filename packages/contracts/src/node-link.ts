@@ -1482,7 +1482,7 @@ export const NodeSample = z
     queued: Count,
     /** The `NodeCredentials` revision the node applied; null before its first read. */
     credentials_revision: Positive.nullable(),
-    /** Sent only after the API accepts the capability; absence means unsupported. */
+    /** Diagnostic copy of the binary capabilities; the connection hello is authoritative. */
     capabilities: z.array(z.literal("restore_in_place_v1")).max(1).optional(),
   })
   .superRefine((sample, ctx) => {

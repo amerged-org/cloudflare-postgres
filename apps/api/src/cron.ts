@@ -247,6 +247,7 @@ export async function runCron(
       updated_at=?,completed_at=? WHERE status IN('pending','running') AND kind<>'database.delete' AND (updated_at<?
         OR (kind IN('database.create','database.restore') AND EXISTS(SELECT 1 FROM databases b WHERE b.id=operations.database_id AND b.node_id IS NOT NULL AND b.placed_at<?)))
       AND NOT EXISTS(SELECT 1 FROM databases u WHERE u.id=operations.database_id AND u.node_id IS NULL AND u.desired_state='running' AND u.deleted_at IS NULL AND operations.kind IN('database.create','database.restore'))
+      AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.operation=operations.id AND rp.phase IN('proving','restoring','rolling_back'))
       AND NOT EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
         WHERE d.power_operation=operations.id AND d.id=operations.database_id AND d.project_id=operations.project_id
         AND d.deleted_at IS NULL AND operations.generation<=d.generation

@@ -105,7 +105,7 @@ export async function cleanupFixtures(): Promise<void> {
 
 /** The database mutations that refuse a request without an Idempotency-Key, as `METHOD path`. */
 const KEYED_DATABASE_MUTATION =
-  /^(?:(?:POST|PATCH|DELETE) \/v1\/databases(?:\/[a-z][a-z0-9]{19}(?:\/(?:suspend|resume|restore))?)?|PUT \/v1\/databases\/[a-z][a-z0-9]{19}\/(?:resource-profile|idle-time|resources))$/;
+  /^(?:(?:POST|PATCH|DELETE) \/v1\/databases(?:\/[a-z][a-z0-9]{19}(?:\/(?:suspend|resume|restore|restore-in-place))?)?|PUT \/v1\/databases\/[a-z][a-z0-9]{19}\/(?:resource-profile|idle-time|resources))$/;
 export async function request(
   path: string,
   key: string,

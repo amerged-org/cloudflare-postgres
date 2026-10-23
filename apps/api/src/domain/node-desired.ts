@@ -18,6 +18,7 @@ import { effectiveSleepAfterSql, type RoleRow } from "./rows.ts";
 import type { NodeCaller } from "./node-auth.ts";
 import { ensureArchiveCredentials } from "./archive-credentials.ts";
 import { moveTargets } from "./database-moves.ts";
+import { replacementTargets } from "./database-replacements.ts";
 import { openNodeOrders } from "./lifecycle-orders.ts";
 import { openDiagnosticRequests } from "./node-diagnostics.ts";
 import {
@@ -239,8 +240,9 @@ export async function nodeDesiredPage(
     `SELECT d.id,d.generation,d.desired_state,d.suspension_reason,d.storage_generation,d.archive_path,d.pg_major,
        COALESCE(ae.route_revision,1) route_revision,dr.memory_mib,dr.cpu_millicores,dr.storage_gib,s.max_connections,
        s.archive_timeout_seconds,${effectiveSleepAfterSql("d")} sleep_after_seconds,
-       (SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
-          ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1) operation,
+       COALESCE((SELECT rp.operation FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase='proving'),
+         (SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
+          ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1)) operation,
        (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,
           'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'deleted_at',r.deleted_at,
           'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'bypass_rls',r.bypass_rls))
@@ -257,11 +259,13 @@ export async function nodeDesiredPage(
        AND ((d.node_id=? AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL)
            AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation
              AND NOT EXISTS(SELECT 1 FROM node_volumes v WHERE v.node_id=d.node_id AND v.database_id=d.id)))
-         OR d.id IN(SELECT database_id FROM database_moves WHERE target_node_id=? AND status='restoring'))
+         OR d.id IN(SELECT database_id FROM database_moves WHERE target_node_id=? AND status='restoring')
+         OR d.id IN(SELECT database_id FROM database_replacements WHERE node_id=? AND phase IN('proving','restoring','rolling_back')))
        ${query.after ? "AND d.id>?" : ""} ${query.ids ? "AND d.id IN(SELECT value FROM json_each(?))" : ""} ORDER BY d.id LIMIT ?`,
   )
     .bind(
       node.region_id,
+      node.id,
       node.id,
       node.id,
       ...(query.after ? [query.after] : []),
@@ -273,7 +277,10 @@ export async function nodeDesiredPage(
     credentials = keyring(env.CREDENTIAL_KEYS);
   // The credentials the page names are issued here, a batch for the whole page. A database the
   // node may not hold one for is not on the page.
-  const staged = await moveTargets(env.DB, node.id, now),
+  const staged = new Map([
+      ...(await moveTargets(env.DB, node.id, now)),
+      ...(await replacementTargets(env, node.id, now)),
+    ]),
     issued = await ensureArchiveCredentials(
       env.DB,
       node.id,

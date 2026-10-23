@@ -20,6 +20,7 @@ interface SnapshotRow extends DatabaseRow {
   mutation_id: string | null;
   completed_mutation_id: string | null;
   roles_json: string;
+  replacement_active: number;
 }
 /** Trusted publication reads all authoritative nonsecret admission inputs together. */
 export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
@@ -29,6 +30,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
       `SELECT d.*,p.deleted_at project_deleted_at,n.ready node_ready,n.lost_at,${GATEWAY_COLUMNS("r", "n")},
     ae.database_id epoch_database_id,CASE WHEN p.updated_at>d.updated_at THEN p.updated_at ELSE d.updated_at END presence_updated_at,
     ae.admission_revision,ae.route_revision,ae.mutation_id,ae.completed_mutation_id,
+    EXISTS(SELECT 1 FROM database_replacements p WHERE p.database_id=d.id AND p.phase IN('proving','restoring','rolling_back')) replacement_active,
     (SELECT json_group_array(json_object('name',rr.name,'owner',rr.owner,'revision',rr.password_revision,'valid_until',rr.valid_until)) FROM roles rr WHERE rr.database_id=d.id AND rr.deleted_at IS NULL) roles_json
     FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions r ON r.id=d.region_id
     LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id WHERE d.id=?`,
@@ -79,6 +81,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
     /* A malformed report closes admission; it cannot repair desired state. */
   }
   const admissible =
+    row.replacement_active === 0 &&
     !deleted &&
     row.mutation_id === null &&
     row.node_id !== null &&
@@ -90,6 +93,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
     row.observed_generation === row.generation &&
     runtime !== null;
   const wakeable =
+    row.replacement_active === 0 &&
     !deleted &&
     row.mutation_id === null &&
     row.node_id !== null &&
@@ -124,6 +128,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
       deleted,
       admissible,
       wakeable,
+      replacement_active: row.replacement_active === 1,
       region: {
         id: row.region_id,
         gateway_url: row.gateway_url,

@@ -207,7 +207,7 @@ work.
 ## 2. Lifecycle API
 
 The machine-readable reference is `GET /v1/openapi.json` (no key needed). Its `info.version` is
-the version of the API contract (`1.3.0` for this document): it changes when the contract changes
+the version of the API contract (`1.4.0` for this document): it changes when the contract changes
 and not with a Worker release, which is named in `info.x-worker-version`. Rules a schema cannot
 state are in descriptions ([Appendix C](#appendix-c-what-the-served-openapi-document-states-in-words)).
 Its operation IDs are listed below. Examples assume:
@@ -594,7 +594,7 @@ bucket at the archive cutover took 52.4 s with the same digest (2026-10-23, "G8 
 the cutover on Dev, steps 1 to 11"). **To be measured:** a restore at the edge of a full 7-day
 window.
 
-**Restore** never overwrites. It creates a **new database**:
+**Restore into a new database** keeps the source unchanged:
 
 ```sh
 pgcf -i -X POST "$PGCF_API/v1/databases/<source-id>/restore" -H 'Content-Type: application/json' \
@@ -606,6 +606,39 @@ pgcf -i -X POST "$PGCF_API/v1/databases/<source-id>/restore" -H 'Content-Type: a
 `mode` is `full` (newest complete base backup plus all archived WAL) or `pitr` (`target_time`, not
 in the future). `region_id` is optional and, when given, must be the source's own region: a node
 reads only its own region's archives, so another region is refused with `region_unavailable`.
+
+**Restore while keeping the connection identity (implemented; live qualification pending).** `POST /v1/databases/{id}/restore-in-place`
+with `Idempotency-Key` and `{"mode":"pitr","target_time":"<UTC timestamp>"}` returns
+`{database,operation}` with the original database ID. The database name, connection address,
+region, roles and passwords remain the same. Existing sessions are ended as the source is stopped;
+new connections receive `57P03` until the operation has finished. Do not retry an uncertain write.
+The source must prove its last committed WAL is archived before its volume is unmounted and
+preserved. A fresh storage generation restores the requested time. Cutover requires a usable
+promoted database with its first DONE base backup. Other lifecycle and role mutations are refused
+with `409 mutation_in_progress` while this operation holds the database.
+
+An unsuccessful PITR restores the proven pre-request state into a further storage generation;
+no generation is lowered. The operation remains running while that rollback is incomplete,
+including while R2 is unavailable, and admission stays closed. It ends `failed` only once the
+prior state is restored and backed up (or if quiescing failed before any replacement was staged).
+The local source volume and state are preserved until either outcome is recoverable. The ordinary
+new-database restore timeout does not terminate an active in-place recovery. If the owning node is
+declared lost, the operation ends with `node_lost` and routing stays closed. The original database
+row and source archive remain the recovery authority; use the existing fenced-node recovery into
+a new database. This is the single-node loss boundary, not an automatic in-place rollback.
+
+`GET /v1/databases/{id}/restores/in-place` returns the newest 50 operations with their phase,
+requested time, failure and `retained_until`. A completed operation's pre-restore archive remains
+available through that retention deadline. To recover it into a new database, use the existing
+`/restore` request with `source_operation_id` set to that operation ID, plus `mode` and `name`.
+Omitting `source_operation_id` restores the database's current archive as before. Retention expiry
+claims the old archive before deletion and waits for any running restore reader to finish.
+
+Rollout is API/migration first, then native consumers. A request is refused until the owning node
+is converged and advertises `restore_in_place_v1` in its current connection hello. An older hello
+without that capability clears support; delayed samples cannot enable it. No old agent receives a `replace` origin. Before production enablement,
+prove the same-identity success, interrupted recovery, archive outage and prior-state recovery on
+both regions; local tests alone are not production acceptance.
 
 **The ID mapping you must keep.**
 
@@ -1472,7 +1505,7 @@ the operator supplies it at handover.** Send:
 - A second node in a region and redundancy; a drill that marks a node lost and restores all its
   databases (the restore time of a node's population is extrapolated from a sample of which 7 of 8
   restores succeeded, [7.3](#73-recovery-time)); automatic rebalancing (an operator can move a database under its ID,
-  and a move has not been timed; a restore always creates a new ID).
+  and a move has not been timed; `/restore` creates a new ID, while `/restore-in-place` preserves it).
 - The density, pool-full and volume-full tests ([4.4](#44-capacity-caps)).
 - Alerts for integrators (alerts go to the operator); alert history, acknowledgement and test send.
 - Finding deleted databases: the lists exclude them, so keep the IDs you were given.
@@ -1534,7 +1567,7 @@ be measured* (see the header), with its date. The source column gives the title 
 | Connection limits | 12,000 new connections per 60 s per database; 6,000 per 60 s per database, role and source network; 12,000 per 60 s from a service binding; 12,000 admissions per minute per database; 32 waiters per wake; 200 sessions per database through a gateway | Dev values, recorded 2026-10-23; the Dev installation becomes production at the canary | "Dev connection limits recorded (S6-03)" | [3.6](#36-connection-limits) |
 | Outage classes and maintenance windows | Idle sleep, suspend, maintenance cycle (67 s), agent restart (serving after 5.3 s at 167 volumes; after a kill -9, up to 46 s at 312 volumes), gateway release, node reboot or crash (the node reported again 26.8 s after a power cut's start request; the writer was acknowledged again 84.3 s after a VM restart), archiving failing, volume full, pool full, node lost, Cloudflare unavailable. Default window: Tuesday 02:00 to 04:00 UTC, which the operator forwards to you (the alert webhook reaches only the operator and the owner), until the owner names another | durations measured 2026-10-18 to 2026-10-20; the need for an announced window decided 2026-10-19 (D10); the default window is a plan default, decided as such (D15, 11.5) | "First live maintenance cycle on EU1"; "First release through the normal flow, with an agent change"; "Stage 5.4 results on EU1, runner `s5_chaos.py`"; "Live acceptance on the slot-pool release, part 3: fault tests 5.4 at density, and an outage"; plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
 | Security reboots | Within 7 days of a Debian security advisory that fixes the kernel, in an announced window (default Tuesday 02:00 to 04:00 UTC), one node at a time; every other reboot also needs the owner's go | decided 2026-10-19 (D10); window: plan default D15 | plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
-| IDs after restore, move and node loss | Restore: a new ID. Move: the ID is kept. Node loss: new IDs, restored from R2 | restore decided 2026-10-15 (plan 11.3); a move keeps the ID (plan 11.4) and has not been timed (**to be measured**, Stage 5.7); node loss is D4, the plan's default | "Moves keep the ID; automatic rebalancing after go-live" (plan 11.4); plan 11.5, D4 | [1.2](#12-regions), [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) |
+| IDs after restore, move and node loss | `/restore`: a new ID; `/restore-in-place`: same ID after capability-gated recovery. Move: the ID is kept. Node loss: new IDs, restored from R2 | restore decided 2026-10-15 (plan 11.3); a move keeps the ID (plan 11.4) and has not been timed (**to be measured**, Stage 5.7); node loss is D4, the plan's default | "Moves keep the ID; automatic rebalancing after go-live" (plan 11.4); plan 11.5, D4 | [1.2](#12-regions), [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) |
 | Losing a node | About 2.2 to 3.4 h for EU1's 167 databases and 23.4 GB if every restore succeeds: fence 30 s, reinstall 174 to 197 s, restores about 2.2 to 3.3 h. **7 of the 8 sample restores succeeded; the total assumes the `archive_unusable` defect is fixed** (fix on branch `fx-restore`, not merged) | extrapolated 2026-10-23 from a sample of restores; fence and reinstall measured 2026-10-19 and 2026-10-22; the full drill has not been run | "Live acceptance on the slot-pool release, part 1"; "G9: what is left after the 2026-10-19 loss and reinstall"; "US1 installed into `us-dev` from the image" | [7.3](#73-recovery-time), [7.4](#74-eu1-lost) |
 | Capacity caps | Placement requires CPU's three-day peak and projected RAM below 80 % (RAM includes the higher of peak and current sample, pending placements and the new class); pool closed at 80 % data or 50 % metadata; sold storage at most 4 times the pool; 1,000 volumes; 8 starts at once on EU1; a storm of 40 wakes answered in at most 5.8 s (HTTP) and 7.1 s (WebSocket) with none refused | dated rows in the table of 4.4 are measured (2026-10-17 and 2026-10-20); density and the storage limits are **to be measured** (Stage 5.6 and 5.5) | "Stage 1 Block 1: LVM at scale"; "Stage 5.6 wake storm, first measurement" | [4.4](#44-capacity-caps) |
 | Reserved role names | **Contract on main:** the API refuses `postgres`, `pgcf_backup`, `public`, `none` and every name that starts with `pg_` (`400`); `streaming_replica`, `cnpg_*` and `pgcf_maintenance` are ordinary role names. **Deployed on Dev today:** the previous list: the API refuses `postgres`, `streaming_replica` and every name that starts with `pg_` or `cnpg_`, refuses to create or delete `pgcf_maintenance` or to name it in `member_of`, and accepts `pgcf_backup`, `public` and `none`, which must not be used | decided (plan decisions W2-C and W2-C2) and built; the contract on main is the new list, the deployment is **to be done** (migration `0085`, a node release, the API Worker, the Edge Worker, in that order), 2026-10-23 | "Role names of the Kubernetes runtime released: migration `0085`, on branch `pr-w2c`"; "Role names released: deploy and live acceptance (W2-C)" (Open table); `packages/contracts/src/ids-core.ts`; the served OpenAPI, schema `RoleName` | [2.3](#23-roles-connection-uri-and-passwords) |

@@ -64,6 +64,8 @@ export const DIAGNOSTIC_ROUTES = new Set([
   "/v1/infrastructure-backups/config",
   "/v1/databases/:id/move",
   "/v1/databases/:id/moves",
+  "/v1/databases/:id/restore-in-place",
+  "/v1/databases/:id/restores/in-place",
   "/v1/costs/node-facts",
   "/healthz",
   "/v1/openapi.json",

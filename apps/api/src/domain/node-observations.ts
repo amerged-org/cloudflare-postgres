@@ -73,8 +73,9 @@ interface Row extends DatabaseRow {
  * that report runs, and no other writer does.
  */
 const SLEEP_EVENT = `EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.generation=d.generation AND e.kind IN('suspended','hibernated'))`;
-const OPERATION_OF_GENERATION = `(SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
-  ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1)`;
+const OPERATION_OF_GENERATION = `COALESCE((SELECT rp.operation FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase='proving'),
+  (SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
+  ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1))`;
 
 /**
  * Where the lifecycle row of a database stands for each state the node reports. These are the
@@ -163,6 +164,7 @@ class Statements {
           `UPDATE operations SET status='succeeded',updated_at=?,completed_at=?
            WHERE database_id=? AND project_id=? AND generation<=? AND status IN('pending','running')
              AND kind IN(SELECT value FROM json_each(?)) ${id ? "AND id=?" : ""}
+             AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.operation=operations.id)
              AND NOT EXISTS(SELECT 1 FROM operations newer WHERE newer.database_id=operations.database_id
                AND newer.kind=operations.kind AND newer.kind='database.resize' AND newer.generation>operations.generation)
              AND (kind<>'database.resize' OR ?>=(SELECT r.storage_gib FROM database_resources r
@@ -214,7 +216,8 @@ class Statements {
         .prepare(
           `UPDATE operations SET status='failed',error_code=?,error_message=?,updated_at=?,completed_at=?
            WHERE database_id=? AND project_id=? AND generation<=? AND status IN('pending','running')
-             AND kind IN(SELECT value FROM json_each(?)) AND ${applied.sql}`,
+             AND kind IN(SELECT value FROM json_each(?)) AND ${applied.sql}
+             AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.operation=operations.id)`,
         )
         .bind(
           code,

@@ -28,7 +28,7 @@ export { Timestamp, roleExpiryInstant } from "./timestamp.ts";
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.3.0";
+export const API_CONTRACT_VERSION = "1.4.0";
 
 /** The pattern of `Timestamp` in the contract's own JSON Schema, which the OpenAPI generator drops. */
 export const TIMESTAMP_PATTERN: string = (() => {
@@ -491,18 +491,44 @@ export type DatabaseIdleTime = z.infer<typeof DatabaseIdleTime>;
 const RestoreRegion = RegionId.describe(
   "The source's region, which is also the default. Another region is refused with 409 `region_unavailable`.",
 ).optional();
+export const DatabaseRestoreInPlace = z
+  .strictObject({
+    mode: z.literal("pitr"),
+    target_time: Timestamp,
+  })
+  .meta({ id: "DatabaseRestoreInPlace" });
+export type DatabaseRestoreInPlace = z.infer<typeof DatabaseRestoreInPlace>;
+export const DatabaseReplacementHistory = z
+  .strictObject({
+    operation: OperationId,
+    phase: z.enum([
+      "proving",
+      "restoring",
+      "rolling_back",
+      "succeeded",
+      "failed",
+    ]),
+    target_time: Timestamp,
+    failure: z.string().nullable(),
+    created_at: Timestamp,
+    completed_at: Timestamp.nullable(),
+    retained_until: Timestamp.nullable(),
+  })
+  .meta({ id: "DatabaseReplacementHistory" });
 export const DatabaseRestore = z
   .discriminatedUnion("mode", [
     z.strictObject({
       mode: z.literal("full"),
       name: DatabaseName,
       region_id: RestoreRegion,
+      source_operation_id: OperationId.optional(),
     }),
     z.strictObject({
       mode: z.literal("pitr"),
       name: DatabaseName,
       target_time: Timestamp,
       region_id: RestoreRegion,
+      source_operation_id: OperationId.optional(),
     }),
   ])
   .meta({ id: "DatabaseRestore" });

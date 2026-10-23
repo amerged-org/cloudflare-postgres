@@ -2,6 +2,7 @@
 import type { NodeObservationReport } from "@pgcf/contracts";
 import type { Env } from "../env.ts";
 import { progressMoves } from "./database-moves.ts";
+import { progressReplacements } from "./database-replacements.ts";
 import { isNodeFenced, recordOrderResults } from "./lifecycle-orders.ts";
 import { hintNode } from "./node-hints.ts";
 
@@ -29,6 +30,7 @@ export async function applyLifecycleObservations(
   // next full pull.
   if (maintenanceEnded) await hintNode(env, nodeId).catch(() => 0);
   if (await isNodeFenced(env.DB, nodeId)) return taken;
+  await progressReplacements(env, nodeId, report, now);
   await progressMoves(env, nodeId, report, now);
   await recordRecoveryPoints(env.DB, nodeId, report, now);
   return taken;

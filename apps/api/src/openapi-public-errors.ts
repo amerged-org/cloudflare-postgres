@@ -38,6 +38,8 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "PUT /v1/databases/{id}/resources": [400, 401, 403, 404, 409, 500, 503],
   "DELETE /v1/databases/{id}": [400, 401, 403, 404, 409, 500],
   "POST /v1/databases/{id}/restore": [400, 401, 403, 404, 409, 500],
+  "POST /v1/databases/{id}/restore-in-place": [400, 401, 403, 404, 409, 500],
+  "GET /v1/databases/{id}/restores/in-place": [400, 401, 404, 500],
   "POST /v1/databases/{id}/suspend": [400, 401, 403, 404, 409, 500],
   "POST /v1/databases/{id}/resume": [400, 401, 403, 404, 409, 500],
   "GET /v1/databases/{id}/roles": [400, 401, 404, 500],
@@ -127,6 +129,7 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "PUT /v1/databases/{id}/resources",
   "DELETE /v1/databases/{id}",
   "POST /v1/databases/{id}/restore",
+  "POST /v1/databases/{id}/restore-in-place",
   "POST /v1/databases/{id}/suspend",
   "POST /v1/databases/{id}/resume",
   "POST /v1/databases/{id}/roles",
@@ -156,6 +159,7 @@ export const requiredIdempotentPublicRoutes: ReadonlySet<string> = new Set([
   "PUT /v1/databases/{id}/resources",
   "DELETE /v1/databases/{id}",
   "POST /v1/databases/{id}/restore",
+  "POST /v1/databases/{id}/restore-in-place",
   "POST /v1/databases/{id}/suspend",
   "POST /v1/databases/{id}/resume",
   "PUT /v1/databases/{id}/resource-profile",
@@ -190,6 +194,9 @@ export const locationResponses: Readonly<
   },
   "POST /v1/databases/{id}/restore": {
     "202": "Database restore operation resource path.",
+  },
+  "POST /v1/databases/{id}/restore-in-place": {
+    "202": "In-place restore operation resource path.",
   },
   "POST /v1/databases/{id}/suspend": {
     "202": "Database suspension operation resource path.",

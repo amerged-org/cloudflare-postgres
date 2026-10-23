@@ -122,7 +122,8 @@ export const GATEWAY_COLUMNS = (region: string, node: string) =>
   `CASE WHEN ${node}.gateway_url IS NOT NULL THEN ${node}.gateway_url ELSE ${region}.gateway_url END gateway_url,CASE WHEN ${node}.gateway_url IS NOT NULL THEN NULL ELSE ${region}.gateway_binding END gateway_binding`;
 export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.storage_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
   d.runtime_json,COALESCE(e.route_revision,1) route_revision,r.name role_name,g.id,${GATEWAY_COLUMNS("g", "n")},n.id node_id,n.lost_at,
-  CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL) THEN 0 ELSE 1 END admission_blocked
+  CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL)
+    AND NOT EXISTS(SELECT 1 FROM database_replacements p WHERE p.database_id=d.id AND p.phase IN('proving','restoring','rolling_back')) THEN 0 ELSE 1 END admission_blocked
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
   LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
   LEFT JOIN database_admission_epochs e ON e.database_id=d.id
@@ -721,7 +722,12 @@ export class DatabaseActor extends DurableObject<Env> {
         trace.path = "ensure_awake";
         return await this.ensureAwake(id.data, role.data, options);
       }
-      const failure = this.earlyAdmission(id.data, role.data, read!.presence);
+      const failure = this.earlyAdmission(
+        id.data,
+        role.data,
+        read!.presence,
+        snapshot?.replacement_active ?? false,
+      );
       if (failure) return failure;
       const state = read!;
       if (state.barrier) {
@@ -1021,6 +1027,7 @@ export class DatabaseActor extends DurableObject<Env> {
     databaseId: unknown,
     user: unknown,
     presence?: DatabasePresence,
+    replacementActive?: boolean,
   ): DatabaseAdmission | undefined {
     const id = DatabaseId.safeParse(databaseId),
       role = RoleName.safeParse(user);
@@ -1031,6 +1038,11 @@ export class DatabaseActor extends DurableObject<Env> {
     if (!snapshot || snapshot.deleted) return { ok: false, sqlstate: "3D000" };
     if (!roleAdmitted(snapshot, role.data))
       return { ok: false, sqlstate: "28P01" };
+    if (
+      replacementActive ??
+      this.admissionState()?.snapshot?.replacement_active
+    )
+      return { ok: false, sqlstate: "57P03" };
     const configured = this.env.DATABASE_CONNECTION_LIMIT_PER_MINUTE ?? "12000";
     if (!/^[1-9][0-9]{0,4}$/.test(configured) || Number(configured) > 12000)
       return { ok: false, sqlstate: "53300" };
