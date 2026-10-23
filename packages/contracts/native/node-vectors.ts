@@ -106,6 +106,20 @@ const moved = {
     },
   },
 };
+const replaced = {
+  ...moved,
+  origin: {
+    kind: "replace",
+    source: {
+      database_id: source,
+      path: path(source, 3, op("d")),
+      backup_id: "20261017T110000",
+      target_time: "2026-10-17T11:30:00.000Z",
+      credential,
+    },
+    previous: { storage_generation: 3, end: proof },
+  },
+};
 const binary = {
   url: "https://releases.example/binary",
   sha256: "a".repeat(64),
@@ -682,6 +696,36 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
   ],
   NodeDesiredPage: [
+    ["same-id-pitr", { ...page, orders: [], databases: [replaced] }, true],
+    [
+      "same-id-pitr-without-previous-state",
+      {
+        ...page,
+        orders: [],
+        databases: [
+          { ...replaced, origin: { ...replaced.origin, previous: undefined } },
+        ],
+      },
+      false,
+    ],
+    [
+      "same-id-pitr-wrong-previous-generation",
+      {
+        ...page,
+        orders: [],
+        databases: [
+          {
+            ...replaced,
+            origin: {
+              ...replaced.origin,
+              previous: { ...replaced.origin.previous, storage_generation: 2 },
+            },
+          },
+        ],
+      },
+      false,
+      true,
+    ],
     ["full-page", page, true],
     ["fenced-page", fenced, true],
     ["fence-with-databases", { ...fenced, databases: [database] }, false, true],
@@ -1529,6 +1573,16 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ["an-unknown-key", { databases: [], orders: 0, hint: true }, false],
   ],
   NodeSample: [
+    [
+      "in-place-restore-capability",
+      { ...sample, capabilities: ["restore_in_place_v1"] },
+      true,
+    ],
+    [
+      "unknown-capability",
+      { ...sample, capabilities: ["restore_in_place_v2"] },
+      false,
+    ],
     ["sample", sample, true],
     ["no-pool", { ...sample, pool: null, awake: [] }, true],
     ["no-cores", { ...sample, cpu: { cores: 0, busy_millicores: 0 } }, false],

@@ -13,6 +13,8 @@
  * these sets, and the API deploys before the nodes.
  */
 export const NODE_CLOSED_SETS: Record<string, (string | number | boolean)[]> = {
+  // Emitted only for an advertised restore_in_place_v1 capability.
+  "NodeDesiredPage.databases[].origin|kind=replace.kind": ["replace"],
   "ArchiveCredential.access": ["read_only", "read_write"],
   "NodeDesiredPage.release|0.os.host_files[]|kind=file.kind": ["file"],
   "NodeDesiredPage.release|0.os.host_files[]|kind=symlink-to-dev-null.kind": [
