@@ -78,8 +78,9 @@ explicitly (drivers do). `replication` startup parameters are refused (`0A000`).
 A database lives on one node of one region, chosen at creation (`region_id`). The operator can move
 it to another node of the region under the same ID (`POST /v1/databases/{id}/move`, admin): the
 source proves the sleep, your connections get `57P03` while the move runs, and a move that fails
-leaves the database where it was. The target may be the database's own node (a move from one
-volume to another); a move to another node needs a second node in the region, and each region has
+leaves the database where it was. The target must be a different node in the same region;
+same-node moves return `400 invalid_request` before creating work. A move needs a second node in
+the region, and each region has
 one node until a second is needed (plan decision D9: it is bought then, with the owner's costed
 go). Automatic rebalancing comes after go-live. A move has not been timed: **to be measured** (plan
 Stage 5.7). The hostname is the same for every region; the Edge finds the region from the
