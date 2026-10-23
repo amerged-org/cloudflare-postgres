@@ -255,7 +255,8 @@ export async function nodeDesiredPage(
      LEFT JOIN operations ro ON ro.id=x.operation_id AND ro.kind='database.restore'
      WHERE d.region_id=? AND d.desired_state IN('running','suspended','deleted')
        AND ((d.node_id=? AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL)
-           AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation))
+           AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation
+             AND NOT EXISTS(SELECT 1 FROM node_volumes v WHERE v.node_id=d.node_id AND v.database_id=d.id)))
          OR d.id IN(SELECT database_id FROM database_moves WHERE target_node_id=? AND status='restoring'))
        ${query.after ? "AND d.id>?" : ""} ${query.ids ? "AND d.id IN(SELECT value FROM json_each(?))" : ""} ORDER BY d.id LIMIT ?`,
   )

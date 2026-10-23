@@ -485,6 +485,14 @@ impl<R: CommandRunner + Send + Sync + 'static> Host for System<R> {
         Ok(())
     }
 
+    async fn kill(&self, slot: u32) -> Result<(), Error> {
+        self.units.kill_all(&slot_unit(slot)).await
+    }
+
+    async fn reset(&self, slot: u32) -> Result<(), Error> {
+        self.units.reset_failed(&slot_unit(slot)).await
+    }
+
     async fn ping(&self, slot: u32) -> Result<(), Error> {
         if self.converse(slot, "ping").await? == IDLE {
             Ok(())

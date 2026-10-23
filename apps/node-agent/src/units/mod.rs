@@ -687,6 +687,27 @@ impl Units {
         self.job(unit, JobKind::Stop).await.map(drop)
     }
 
+    /// Ends every process of the unit `unit` with SIGKILL: what is done to a database that is
+    /// being deleted when its clean stop did not end it. The unit goes to `failed` or `inactive`
+    /// as its processes end; the stop job after it waits for that.
+    pub(crate) async fn kill_all(&self, unit: &str) -> Result<(), Error> {
+        self.calls
+            .within(self.manager.kill_unit(unit, "all", libc::SIGKILL))
+            .await?;
+        Ok(())
+    }
+
+    /// Takes a unit that ended `failed` back to `inactive`, so that systemd lists nothing of it.
+    /// Refused (`StrayProcesses`) while its cgroup holds a process: such a unit refuses every
+    /// start, and its `failed` state is what keeps its number out of the builds.
+    pub(crate) async fn reset_failed(&self, unit: &str) -> Result<(), Error> {
+        self.refuse_stray_processes(unit).await?;
+        self.calls
+            .within(self.manager.reset_failed_unit(unit))
+            .await?;
+        Ok(())
+    }
+
     /// Refuses a start over a process that outlived the last one. The cgroup of a unit that is
     /// stopped does not exist, so the common case is one failed `open`; the state is read only
     /// where the cgroup is populated, because a unit that runs, or is starting, holds processes
@@ -745,6 +766,14 @@ impl Units {
     pub async fn stop(&self, database: &str) -> Result<(), Error> {
         self.stop_job(&Self::unit_of(database)?).await?;
         self.set_cpu_quota(database, None).await
+    }
+
+    /// Ends the unit of its own by force (SIGKILL to every process), then stops it: the end of a
+    /// database that is being deleted, whose clean stop did not end it.
+    pub async fn kill(&self, database: &str) -> Result<(), Error> {
+        // A unit with no process to kill is stopped all the same.
+        let _ = self.kill_all(&Self::unit_of(database)?).await;
+        self.stop(database).await
     }
 
     /// Sets properties on `unit`, loaded or not; `runtime` keeps them until the next boot.

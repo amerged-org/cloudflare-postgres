@@ -32,6 +32,10 @@ pub trait Manager {
     fn get_unit(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
     fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
     fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
+    /// Sends `signal` to the processes of a unit: `whom` is `all`, `main` or `control`.
+    fn kill_unit(&self, name: &str, whom: &str, signal: i32) -> zbus::Result<()>;
+    /// Takes a unit out of the `failed` state, as `systemctl reset-failed` does.
+    fn reset_failed_unit(&self, name: &str) -> zbus::Result<()>;
     fn restart_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
     /// Sets properties on a unit that is loaded or not, without a reload. `runtime` keeps them
     /// until the next boot; otherwise systemd also writes a drop-in under `system.control`.
