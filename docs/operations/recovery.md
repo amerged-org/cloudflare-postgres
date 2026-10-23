@@ -41,6 +41,12 @@ recovers the same customer EU1.
 6. Switch the adopter's connection only after these checks. Once writes reach the target, do not
    switch back to an older source without reconciling those writes.
 
+A restore whose operation ends `failed` is not tried again by the node. It abandons the build once
+(the unit stops, the volume and the user go) and the target stays in `error` with that error until
+it is deleted. Delete the target and submit the restore again with a new `Idempotency-Key`; a
+failure that is not the source's (a `tar` that ended early while the archive was read: 1 of 9
+restores on 2026-10-23) passed at the second request, the one time it was seen.
+
 A deleted source can be restored within its configured retention window. Keep its encrypted
 credentials and the corresponding `CREDENTIAL_KEYS` key IDs until that window ends. Expired
 archive cleanup is bounded and uses only the exact owned prefix; do not modify archive timestamps

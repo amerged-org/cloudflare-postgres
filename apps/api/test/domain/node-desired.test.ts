@@ -830,6 +830,46 @@ describe("a restore on the page", () => {
     expect((await entry(f, target.id))!.origin).toBeUndefined();
   });
 
+  it("stops naming a restore whose operation failed, and issues no source credential for it", async () => {
+    const f = await fixture();
+    const source = await served(f, "source");
+    const target = await served(f, "target");
+    const operation = newOperationId(),
+      now = new Date().toISOString();
+    const sourcePath = (await env.DB.prepare(
+      "SELECT archive_path FROM databases WHERE id=?",
+    )
+      .bind(source.id)
+      .first<string>("archive_path"))!;
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO operations(id,kind,status,error_code,error_message,project_id,database_id,generation,created_at,updated_at,completed_at) SELECT ?,'database.restore','failed','no_recovery_point','The recovery paused',project_id,id,1,?,?,? FROM databases WHERE id=?",
+      ).bind(operation, now, now, now, target.id),
+      env.DB.prepare(
+        "INSERT INTO database_restores(target_database_id,operation_id,source_database_id,source_archive_path,source_storage_generation,backup_id,created_at) VALUES(?,?,?,?,1,?,?)",
+      ).bind(
+        target.id,
+        operation,
+        source.id,
+        sourcePath,
+        "20261017T110000",
+        now,
+      ),
+    ]);
+    // The node reported the failure and abandoned the target: the page keeps the database (it is
+    // to be deleted or kept as it is) and does not ask for the build again.
+    const page = await entry(f, target.id);
+    expect(page).toBeDefined();
+    expect(page!.origin).toBeUndefined();
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) n FROM archive_credentials WHERE archive_path=? AND access='read_only'",
+      )
+        .bind(sourcePath)
+        .first<number>("n"),
+    ).toBe(0);
+  });
+
   it("leaves out a restore whose source archive lies in another region, which this node holds no credential for", async () => {
     const f = await fixture();
     const source = await served(f, "source");

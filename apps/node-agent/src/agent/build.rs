@@ -446,6 +446,13 @@ impl<M: Machine> Core<M> {
 
     /// Builds the storage generation `entry.origin` names. Ready follows only the first base
     /// backup. The error is the node contract's.
+    ///
+    /// A build that began and failed is abandoned (`abandon_build`) and not begun again in this
+    /// run: the page names the build until the API has ended its operation, and a build that
+    /// began again could end ready on the node while the API, which failed the operation, refuses
+    /// that report. The database stays in its error until it is deleted. A build that was refused
+    /// before it began (the previous generation is still held) is no failed build: nothing was
+    /// written, and the next pull tries it again.
     pub(crate) async fn build(
         self: &Arc<Self>,
         db: &Arc<Db>,
@@ -460,7 +467,8 @@ impl<M: Machine> Core<M> {
         });
         // Before anything is written: the record of the generation that is released stays what
         // it is until it has been, so that a build that was refused is released again.
-        let built = if !self.release_previous_generation(entry).await {
+        let released = self.release_previous_generation(entry).await;
+        let built = if !released {
             Err("build_failed")
         } else {
             match origin {
@@ -478,12 +486,52 @@ impl<M: Machine> Core<M> {
                     "event": "build_failed", "database_id": db.id,
                     "operation": entry.operation, "error": error,
                 }));
+                if released {
+                    self.abandon_build(entry).await;
+                    self.files(&db.id).remove().ok();
+                }
                 self.set(db, |view| {
                     view.phase = Phase::Error;
                     view.error = Some(error);
+                    if released {
+                        view.abandoned_build = Some(entry.archive_path.clone());
+                        view.state = None;
+                    }
                 });
                 Err(error)
             }
+        }
+    }
+
+    /// Stops the unit of a build that failed and deletes its volume, and its user with the
+    /// database's last volume. A move on the node of its source leaves the source's volume, whose
+    /// files the user owns: the user, and its uid, go only with the database's last volume. The
+    /// restore executor has abandoned its own build already (`Host::abandon`); doing it again
+    /// finds nothing.
+    async fn abandon_build(&self, entry: &Entry) {
+        let _ = self.machine.stop(&entry.id).await;
+        self.admission.stopped(&entry.id);
+        self.table.remove(&entry.id);
+        if let Some(volume) = Self::volume_id(entry) {
+            let _ = self
+                .machine
+                .remove_volume(
+                    &volume,
+                    Removal::DatabaseDeleted {
+                        storage_generation: entry.storage_generation,
+                    },
+                )
+                .await;
+        }
+        let others = self.machine.inventory().await.map(|inventory| {
+            inventory
+                .volumes
+                .iter()
+                .any(|volume| volume.id.database() == entry.id)
+        });
+        if matches!(others, Ok(false)) {
+            let _ = std::fs::remove_dir_all(self.layout().socket_directory(&entry.id));
+            let _ = self.machine.remove_account(&entry.id).await;
         }
     }
 
@@ -686,14 +734,8 @@ impl<M: Machine> Core<M> {
             upload_log: &upload_log,
             operation: &entry.operation,
         };
-        let backup = match restorer.run(&order, &host).await {
-            Ok(backup) => backup,
-            Err(error) => {
-                // The executor abandoned the build: stopped, volume and user gone.
-                self.files(id).remove().ok();
-                return Err(error);
-            }
-        };
+        // A failure is the executor's abandoned build: stopped, volume and user gone (`build`).
+        let backup = restorer.run(&order, &host).await?;
         let completed = backup
             .completed_at_ms
             .map(facts::timestamp)
@@ -860,32 +902,7 @@ impl<M: Machine> Host for Rebuild<M> {
     }
 
     async fn abandon(&self) {
-        let core = &self.core;
-        let _ = core.machine.stop(&self.entry.id).await;
-        core.admission.stopped(&self.entry.id);
-        if let Some(volume) = Core::<M>::volume_id(&self.entry) {
-            let _ = core
-                .machine
-                .remove_volume(
-                    &volume,
-                    Removal::DatabaseDeleted {
-                        storage_generation: self.entry.storage_generation,
-                    },
-                )
-                .await;
-        }
-        // A move on the node of its source leaves the source's volume, whose files the user owns:
-        // the user, and its uid, go only with the database's last volume.
-        let others = core.machine.inventory().await.map(|inventory| {
-            inventory
-                .volumes
-                .iter()
-                .any(|volume| volume.id.database() == self.entry.id)
-        });
-        if matches!(others, Ok(false)) {
-            let _ = std::fs::remove_dir_all(core.layout().socket_directory(&self.entry.id));
-            let _ = core.machine.remove_account(&self.entry.id).await;
-        }
+        self.core.abandon_build(&self.entry).await;
     }
 }
 
@@ -1155,14 +1172,10 @@ mod tests {
         let _flow = db.lock.lock().await;
         assert_eq!(rig.core.build(&db, &entry).await, Err("prefix_not_empty"));
         assert_eq!(rig.observation(&entry.id)["error"], "prefix_not_empty");
-        // Nothing of the cluster or the archive was touched.
-        assert!(
-            rig.core
-                .layout()
-                .data(&entry.id)
-                .join("PG_VERSION")
-                .exists()
-        );
+        // Nothing of the archive was touched; the build is abandoned, and the cluster that was
+        // never ready goes with its volume.
+        assert!(rig.machine.volumes().is_empty());
+        assert!(!rig.machine.running(&entry.id));
         assert!(backup_files(&rig, &entry, &first.backup_id).exists());
         assert_eq!(
             std::fs::read_to_string(backup_files(&rig, &entry, "20261017T225342")).unwrap(),
@@ -1188,6 +1201,7 @@ mod tests {
         assert_eq!(rig.observation(&entry.id)["error"], "storage_full");
         assert_eq!(rig.observation(&entry.id)["state"], "error");
         assert!(!rig.machine.running(&entry.id));
+        assert!(!rig.machine.has_account(&entry.id));
         rig.machine.set_no_room(false);
 
         // An archive path that holds a backup is not a new database's.
@@ -1210,19 +1224,16 @@ mod tests {
                 .exists()
         );
 
-        // A start that fails is a failed build, and a build is tried again from where it stopped.
+        // A start that fails is a failed build: abandoned, with nothing of it left on the node
+        // (the build of the used archive above left none either), and not begun again by the next
+        // pull (`a_create_that_failed_is_abandoned_and_not_begun_again`).
         let entry = rig.entry();
         let db = rig.core.db(&entry.id);
         rig.core.accept(&db, entry.clone());
         rig.machine.fail_next_start();
         assert_eq!(rig.core.build(&db, &entry).await, Err("start_failed"));
         assert_eq!(rig.observation(&entry.id)["error"], "start_failed");
-        rig.core.build(&db, &entry).await.unwrap();
-        assert_eq!(rig.observation(&entry.id)["state"], "ready");
-        assert_eq!(
-            rig.machine.volumes().len(),
-            2,
-            "one volume per database, not per attempt"
-        );
+        assert!(rig.machine.volumes().is_empty());
+        assert!(!rig.machine.has_account(&entry.id));
     }
 }

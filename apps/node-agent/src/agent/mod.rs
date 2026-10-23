@@ -163,6 +163,10 @@ pub(crate) struct Claim {
 pub(crate) struct View {
     /// The newest entry of the page the node accepted.
     pub entry: Option<Entry>,
+    /// The archive path of the build that failed in this run and was abandoned. A path names one
+    /// build (it holds the operation, and a generation never writes into another's), and the page
+    /// keeps naming the build until the API has ended its operation: it is not begun again.
+    pub abandoned_build: Option<String>,
     pub phase: Phase,
     pub writer: Option<protocol::Writer>,
     /// The error of `Phase::Error` (`NODE_DATABASE_ERRORS`).
@@ -209,6 +213,7 @@ impl View {
     fn new() -> Self {
         Self {
             entry: None,
+            abandoned_build: None,
             phase: Phase::Asleep,
             writer: None,
             error: None,

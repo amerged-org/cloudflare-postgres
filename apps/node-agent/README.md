@@ -421,6 +421,15 @@ plan 9.3, "Changing the page"; it is written there once.
   setting above both the backup's and the class's) fails the restore with `no_recovery_point`. A
   move target replays through the segment named in the source's proven-sleep record before it may
   promote.
+- **A build that fails** (a create, a restore, a point-in-time restore or a move target, with any
+  of the errors above) is abandoned once: the unit stops, the volume goes, the user goes with the
+  database's last volume, and the database stays in `error` with that error until it is deleted.
+  It is not begun again in this run, however often the page still names it (`View::abandoned_build`,
+  keyed by the build's archive path): the API fails the operation on the report, and refuses a
+  `ready` report for a failed restore. The API's page stops naming a restore whose operation
+  failed, so that an agent that restarted does not begin it again either. A build that was refused
+  before it began (the previous storage generation is still held) wrote nothing and is tried at
+  the next pull. A create that a restart interrupted, with no failure reported, still resumes.
 
 ## Backups
 

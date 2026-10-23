@@ -33,6 +33,8 @@ pub(crate) struct Facts<'a> {
     pub superseded: bool,
     /// A sleep the page asked for was refused for this generation.
     pub refused: bool,
+    /// The build the entry names failed in this run and was abandoned (`View::abandoned_build`).
+    pub abandoned: bool,
 }
 
 /// What is to be done with an entry.
@@ -85,6 +87,8 @@ pub(crate) fn plan(f: &Facts) -> Step {
         None if !f.volume => Step::Fail("volume_missing"),
         None if f.unit_awake => Step::AdoptRunning,
         None => Step::AdoptAsleep,
+        // A build that failed is not begun again, whatever the page still says of it.
+        Some(_) if build && f.abandoned => Step::Nothing,
         Some(_) if build => Step::Build,
         Some(Phase::Ready) if entry.desired == Desired::Suspended && !f.refused => Step::Suspend,
         Some(_) => Step::Nothing,
@@ -391,6 +395,7 @@ impl<M: Machine> Core<M> {
                 fenced: self.fences.fenced(),
                 superseded: self.fences.blocks(&db.id, entry.storage_generation),
                 refused: view.refusal.is_some(),
+                abandoned: view.abandoned_build.as_deref() == Some(entry.archive_path.as_str()),
             })
         };
         if !matches!(step, Step::AdoptRunning | Step::AdoptAsleep) {
@@ -1010,6 +1015,7 @@ mod tests {
             fenced: false,
             superseded: false,
             refused: false,
+            abandoned: false,
         })
     }
 
@@ -1047,6 +1053,27 @@ mod tests {
                 false
             ),
             Step::Build
+        );
+        // A build that failed and was abandoned is not begun again, however often the page names
+        // it; the same entry is built if it was not abandoned (a refused release), and a
+        // generation that is built needs none either way.
+        let abandoned = |entry: &Entry, phase, state: Option<&DatabaseState>| {
+            plan(&Facts {
+                entry,
+                phase,
+                state,
+                volume: false,
+                unit_awake: false,
+                fenced: false,
+                superseded: false,
+                refused: false,
+                abandoned: true,
+            })
+        };
+        assert_eq!(abandoned(&create, Some(Phase::Error), None), Step::Nothing);
+        assert_eq!(
+            abandoned(&create, Some(Phase::Error), Some(&state(false, 1))),
+            Step::Nothing
         );
         assert_eq!(
             decide(&create, Some(Phase::Asleep), Some(&built), true, false),
@@ -1100,7 +1127,8 @@ mod tests {
                 unit_awake: true,
                 fenced: false,
                 superseded: false,
-                refused: true
+                refused: true,
+                abandoned: false,
             }),
             Step::Nothing
         );
@@ -1128,6 +1156,7 @@ mod tests {
                 fenced,
                 superseded,
                 refused: false,
+                abandoned: false,
             };
             assert_eq!(plan(&facts(Some(Phase::Ready))), Step::Retire);
             assert_eq!(plan(&facts(Some(Phase::Retired))), Step::Nothing);
@@ -2679,6 +2708,99 @@ mod tests {
         assert_eq!(own.timeline, 2);
     }
 
+    /// The pulls that still list a build that failed do not begin it again: the API's page names
+    /// the build until it has ended the operation, and an agent that has just reported the failure
+    /// pulls before it knows that. The database stays in its error with nothing of it on the node.
+    async fn pulled_again_stays_failed(rig: &Rig, id: &str, entry: &Value, error: &'static str) {
+        let handle = rig.core.db(id);
+        let starts = || {
+            rig.machine
+                .calls()
+                .iter()
+                .filter(|call| **call == format!("start {id}"))
+                .count()
+        };
+        let before = starts();
+        for _ in 0..3 {
+            rig.core
+                .apply(&Rig::page(vec![entry.clone()], vec![]))
+                .await;
+            for _ in 0..15 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert_eq!(
+                    handle.phase(),
+                    Phase::Error,
+                    "a build that failed is not begun again"
+                );
+            }
+        }
+        assert_eq!(starts(), before);
+        assert_eq!(handle.view().error, Some(error));
+        let observation = rig.observation(id);
+        assert_eq!(
+            (&observation["state"], &observation["error"]),
+            (&json!("error"), &json!(error))
+        );
+        // Abandoned: the unit is stopped, the volume and the user are gone, and so is the state.
+        assert!(!rig.machine.running(id));
+        assert!(!rig.machine.has_account(id));
+        assert!(
+            rig.machine
+                .volumes()
+                .iter()
+                .all(|(volume, _)| volume.database() != id)
+        );
+        assert_eq!(rig.core.files(id).load().unwrap(), None);
+    }
+
+    /// A restore that failed on a transient error of the archive: the node rebuilt it on the next
+    /// pull, the build succeeded, and the API (which had failed the operation) never took the
+    /// database as ready (found live, 2026-10-23, `tar` ending early).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restore_that_failed_is_not_rebuilt_by_the_pull_that_still_lists_it() {
+        let Some(rig) = Rig::new("restore-failed").await else {
+            return;
+        };
+        let (source_json, source_id, source_state) = source(&rig).await;
+        let backup = source_state.backup.clone().unwrap();
+        let source_path = source_json["archive"]["path"].as_str().unwrap().to_string();
+        rig.deliver(&source_path, "read_only");
+
+        let mut restored = rig.entry_json();
+        let id = id_of(&restored);
+        restored["origin"] = json!({"kind": "restore", "source": {
+            "database_id": source_id, "path": source_path, "backup_id": backup.backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"}}});
+        let handle = rig.core.db(&id);
+        rig.fixture.set("restore-fail", "");
+        rig.core
+            .apply(&Rig::page(vec![restored.clone()], vec![]))
+            .await;
+        eventually(60, "the restore to fail", || handle.phase() == Phase::Error).await;
+        assert_eq!(handle.view().error, Some("archive_unusable"));
+        // The archive answers again: the pull that lists the restore still does not build it.
+        rig.fixture.clear("restore-fail");
+        pulled_again_stays_failed(&rig, &id, &restored, "archive_unusable").await;
+    }
+
+    /// A create that failed after its unit was up (the first base backup): the unit is stopped and
+    /// the volume goes, and the pulls that still list the create do not begin it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_that_failed_is_abandoned_and_not_begun_again() {
+        let Some(rig) = Rig::new("create-failed").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.fixture.set("backup-fail", "");
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "the create to fail", || handle.phase() == Phase::Error).await;
+        assert_eq!(handle.view().error, Some("build_failed"));
+        rig.fixture.clear("backup-fail");
+        pulled_again_stays_failed(&rig, &id, &db, "build_failed").await;
+    }
+
     /// A source that was resized up after its backup and down again before the restore has a
     /// parameter change in its WAL above both the backup's settings and the class's. PostgreSQL
     /// pauses that recovery ("recovery has paused") and its postmaster still reports ready, so
@@ -2755,6 +2877,9 @@ mod tests {
                 .iter()
                 .all(|(volume, _)| volume.database() != id)
         );
+        // And it stays so: the node rebuilt this restore 11 times in 5 minutes, one on each pull
+        // that still listed it (found live, 2026-10-23).
+        pulled_again_stays_failed(&rig, &id, &restored, "no_recovery_point").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

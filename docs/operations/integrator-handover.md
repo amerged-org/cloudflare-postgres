@@ -527,7 +527,9 @@ the source without reconciling them. A stale ID fails with `28P01` ([A.4](#a4-sq
 
 The restore is ready when its operation is `succeeded`: recovery has promoted the database onto a
 later timeline, its roles are reset and the first base backup of the new timeline is DONE. Compare
-your markers before cutover.
+your markers before cutover. A restore whose operation ends `failed` (for example `no_recovery_point`
+or `archive_unusable` after the `202`) is not tried again: its target stays in `error` and holds
+nothing on the node. Delete the target and request the restore again with a new `Idempotency-Key`.
 
 | `409` reason         | Meaning                                                                                                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
