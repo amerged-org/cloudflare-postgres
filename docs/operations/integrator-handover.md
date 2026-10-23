@@ -1056,6 +1056,25 @@ keeps reporting the truth.
 What you must do: keep `sleep_after_seconds` short, avoid always-warm classes except where needed,
 and shed load on `57P03` instead of retrying in a tight loop.
 
+**Statistics target and the sold memory.** PostgreSQL's `ANALYZE`, run by a session or by
+autovacuum, keeps a sample of 300 × `default_statistics_target` rows in memory, each as wide as it
+lies on its page: up to about 8 KB for rows that are never toasted (`STORAGE PLAIN` columns) and
+about 2 KB for ordinary rows. The default target of 100 is 265 MiB for the widest rows, more than a
+256 MiB database has. Each class therefore sets the target and the number of autovacuum workers by
+its memory, so that every worker and one session's `ANALYZE` fit in half of it: target 20 with one
+worker for 256 MiB, 40 with one for 512 MiB, 60 with two for 1 GiB, 90 with three for 2 GiB, and 100
+from 2,304 MiB. A lower target gives each column fewer most-common values and histogram buckets,
+which the planner's estimates for skewed columns of large tables can show. Your roles may raise the
+target for their session, role or database (`SET`, `ALTER ROLE … SET`, `ALTER DATABASE … SET`), a
+column's target (`ALTER TABLE … ALTER COLUMN … SET STATISTICS`, up to 10,000) and
+`maintenance_work_mem`; they cannot set the autovacuum workers. The sample grows in proportion to
+the target, so one larger than the class holds throttles the whole database at 90 % of its memory
+and, at the ceiling, ends a backend (crash recovery; sessions drop; no acknowledged commit is lost).
+Raise a column's target only on tables of narrow rows. The values are decided from the PostgreSQL 18
+source and *measured in a lab* on 2026-10-23 (plan 11.1, "ANALYZE and autovacuum stay inside every
+class's memory"); they apply to a database at its first wake after the agent release that carries
+them, and have not been measured live.
+
 ### 4.3 Thin storage
 
 Every database lives on its own thin LVM volume of its node's one thin pool. The volume's size is

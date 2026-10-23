@@ -316,12 +316,31 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   _m_/16 and at least 16 MB. For 256 MiB that is 32, 192, 2 and 16 MB; for 1 GiB, 128, 768, 4 and
   64 MB. `shared_buffers` stays small because shared memory cannot be reclaimed without swap; the
   page cache does the caching. `huge_pages` and `jit` are off.
+- **ANALYZE and autovacuum** are bounded by the memory too. `ANALYZE` keeps a sample of 300 ×
+  `default_statistics_target` rows, each as it lies on its page: up to 8,200 bytes for rows that are
+  never toasted (`STORAGE PLAIN`; a row of ordinary columns is cut to 2 KB) and 9,260 with the
+  expanded copy of one compressed value (`settings.rs`, checked against PostgreSQL 18 by a test).
+  PostgreSQL's default of 100 is 30,000 rows, 265 MiB at the widest rows: more than a 256 MiB
+  database has. `autovacuum_max_workers` is 1 up to 512 MiB, 2 up to 1 GiB and 3 above, and
+  `default_statistics_target` is the largest multiple of ten, from 10 to 100, at which the samples
+  of every autovacuum worker and of one manual `ANALYZE`, all at the widest rows, take at most half
+  of the memory: 20 for 256 MiB, 40 for 512 MiB, 60 for 1 GiB, 90 for 2 GiB and 100 from 2,304 MiB.
+  A vacuum's dead-item store is `maintenance_work_mem` (_m_/16), which is smaller than a sample's
+  share. What a tenant can still change: its session's or role's or database's
+  `default_statistics_target`, a column's target (`ALTER TABLE ... SET STATISTICS`, up to 10,000) and
+  its session's `maintenance_work_mem`. Each raises the sample, or the vacuum's store, in proportion;
+  past the class's bound the database is throttled at the unit's soft limit (every session of it, not
+  only the ANALYZE) and, at the ceiling, a backend is killed and the database runs crash recovery.
+  The workers and `autovacuum_work_mem` are the postmaster's, which the tenant's roles cannot set.
+  A lower target gives a column fewer most-common values and histogram buckets (20 for 256 MiB),
+  which planner estimates for skewed columns of large tables can show.
 - **From the size class:** `max_connections` and `archive_timeout`. `archive_mode` is on with
   `/usr/libexec/pgcf/pgcf-archive %p`, `wal_level` is `replica`, `wal_init_zero` is off,
   `wal_recycle` on, `min_wal_size` 32 MB, `max_wal_size` a quarter of the volume (at least 64 MiB),
   and crash recovery syncs the filesystem once (`recovery_init_sync_method = syncfs`).
-- **Small databases** (512 MiB and below) run one autovacuum worker out of two slots, one I/O
-  worker, no parallel query or maintenance workers, four background worker slots and no replication.
+- **Small databases** (512 MiB and below) run two autovacuum worker slots (one worker, above),
+  one I/O worker, no parallel query or maintenance workers, four background worker slots and no
+  replication.
   A restore runs with the larger of the backup's and the class's values during its recovery,
   because a recovery checks `max_connections`, the process, sender, prepared transaction and lock
   settings against its source's, and restarts onto the class's own afterwards.
@@ -591,6 +610,12 @@ with the image's `pgcf-slot@.service`, `pgcf.slice`, the supervisor at
 directory, as in the image: the kernel names the process's file by its real path, and the agent
 knows the supervisor by the file the link leads to now) and PostgreSQL 18, inside `systemd-run --wait --pipe -p
 PrivateMounts=yes <test binary> --ignored --test-threads=1 units::slot_lab` (its header says how).
+`units/slot_lab/analyze.rs` is part of it: a database of each class of the catalog (256 MiB to 4 GiB) in
+a pooled slot with the class's limits and its own `postgresql.conf`, tables of 100,000 rows of 8 KB that
+are never toasted, of 2 KB, and of the widest row an `ANALYZE` keeps, and a manual `ANALYZE`, a `VACUUM`,
+the autovacuum worker and as many `ANALYZE` at once as the class has workers plus one beside connections,
+each read from the unit's cgroup every 10 ms (peak memory, the ceiling, kills, stalls); it needs 6 GiB of
+disk and runs with the filter `units::slot_lab::analyze`.
 `start_lab.rs` is the agent's start on a node with 300 databases, on the same real parts and with a
 disk that is slow to flush (its header says how to run it); the numbers it gave are in the plan
 (11.1, "Agent start and stop at 300 databases").

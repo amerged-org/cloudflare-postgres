@@ -13,18 +13,18 @@ pub use crate::archive::job::BACKUP_ROLE;
 /// Up to this size a database runs the settings of the small column of the plan's table.
 const SMALL_DATABASE_MEMORY_MIB: u64 = 512;
 
-/// What a small database runs besides the memory settings (plan Appendix C): one autovacuum worker
-/// out of two slots, one I/O worker, no parallel query or parallel maintenance, four background
-/// worker slots, and no replication of any kind. Autoprewarm needs two of the slots, its leader
-/// and its worker for one database at a time (with one slot the load fails with "registering
-/// dynamic bgworker autoprewarm failed", checked on PostgreSQL 18); the other two are spare for a
-/// parallel worker a session asks for. `max_parallel_workers` keeps its default of 8: it only
-/// caps the workers, which come from the free slots, and none is planned. Nothing replicates:
-/// `pg_hba.conf` refuses replication connections and barman's base backup uses the backup API, so
-/// no WAL sender, slot or logical worker (and no logical replication launcher process) is ever
-/// needed. A recovery compares these with the source's (`Capacity`), so a restore runs with more.
+/// What a small database runs besides the memory settings (plan Appendix C): two autovacuum worker
+/// slots (the worker count is the memory settings' own, `Tuning`), one I/O worker, no parallel
+/// query or parallel maintenance, four background worker slots, and no replication of any kind.
+/// Autoprewarm needs two of the slots, its leader and its worker for one database at a time (with
+/// one slot the load fails with "registering dynamic bgworker autoprewarm failed", checked on
+/// PostgreSQL 18); the other two are spare for a parallel worker a session asks for.
+/// `max_parallel_workers` keeps its default of 8: it only caps the workers, which come from the
+/// free slots, and none is planned. Nothing replicates: `pg_hba.conf` refuses replication
+/// connections and barman's base backup uses the backup API, so no WAL sender, slot or logical
+/// worker (and no logical replication launcher process) is ever needed. A recovery compares these
+/// with the source's (`Capacity`), so a restore runs with more.
 const SMALL_DATABASE_SETTINGS: &str = "\
-autovacuum_max_workers = 1\n\
 autovacuum_worker_slots = 2\n\
 io_workers = 1\n\
 max_parallel_workers_per_gather = 0\n\
@@ -34,18 +34,73 @@ max_logical_replication_workers = 0\n\
 max_wal_senders = 0\n\
 max_replication_slots = 0\n";
 
+/// The rows `ANALYZE` samples for each unit of a column's statistics target
+/// (`std_typanalyze` in `analyze.c`: `minrows = 300 * attstattarget`, and the sample is the largest
+/// of the table's columns').
+const ANALYZE_ROWS_PER_TARGET: u64 = 300;
+
+/// The most memory PostgreSQL 18 holds for one sampled row, at the widest rows it keeps. The sample
+/// is a copy of each sampled row as it lies on its page (`ExecCopySlotHeapTuple`): toasted columns
+/// stay out of line and a row of an extended-storage column is cut to 2,032 bytes, but a row of
+/// `STORAGE PLAIN` or fixed-width columns is as wide as a page allows, `MaxHeapTupleSize` (8,160
+/// bytes) and the 24-byte `HeapTupleData` before it. The allocator rounds that to its chunk of
+/// 8,192 bytes and adds the chunk's 8-byte header: 8,200. The sample's array adds a pointer (8),
+/// and the pass over one column adds the sort item and tuple link of a scalar (20) and, for a value
+/// that was compressed or has a short header, its expanded copy, which `WIDTH_THRESHOLD` limits to
+/// 1,024 bytes (1,032 with the header). A column's pass ends before the next begins, so only one
+/// copy lives at a time. Measured on PostgreSQL 18.6 (plan 4.4): 8,287 bytes per row of 8 KB PLAIN
+/// rows, 9,116 with a compressed column beside the PLAIN one, 4,163 for rows of 2 KB.
+const ANALYZE_ROW_BYTES: u64 = 8_200 + 8 + 1_032 + 20;
+
+/// What `ANALYZE` holds for the sample of a table at statistics target `target`, at the widest
+/// rows.
+pub fn analyze_sample_bytes(target: u32) -> u64 {
+    ANALYZE_ROWS_PER_TARGET * u64::from(target) * ANALYZE_ROW_BYTES
+}
+
+/// The autovacuum workers a database of `memory_mib` runs. Every worker may analyze a table, so
+/// the count is what the memory has room for beside the manual ANALYZE of a session; the 3 of a
+/// large database is PostgreSQL's default.
+fn autovacuum_workers(memory_mib: u64) -> u32 {
+    if memory_mib <= SMALL_DATABASE_MEMORY_MIB {
+        1
+    } else if memory_mib <= 1024 {
+        2
+    } else {
+        3
+    }
+}
+
+/// The statistics target of a database of `memory_mib` with `workers` autovacuum workers: the
+/// largest, in steps of ten, between 10 and PostgreSQL's default of 100, at which the samples of
+/// all the workers and of one manual ANALYZE at once, each at the widest rows, take no more than
+/// half of the memory. The other half is the shared buffers (an eighth), the connections and the
+/// page cache. A lower target gives each column fewer most-common values and histogram buckets
+/// (`pg_stats`) and a smaller sample to estimate the distinct values from.
+fn statistics_target(memory_mib: u64, workers: u32) -> u32 {
+    let sample = memory_mib.saturating_mul(MIB) / 2 / (u64::from(workers) + 1);
+    let target = sample / analyze_sample_bytes(1);
+    u32::try_from(target / 10 * 10).map_or(100, |t| t.clamp(10, 100))
+}
+
 /// What PostgreSQL's memory settings are for a database of `memory_mib` (plan Appendix C): the
 /// shared buffers stay small because shared memory cannot be reclaimed without swap, and the page
-/// cache does the caching. A small database (up to 512 MiB) also runs `SMALL_DATABASE_SETTINGS`.
+/// cache does the caching. The autovacuum workers and the statistics target bound what `VACUUM`
+/// and `ANALYZE` hold (`statistics_target`; the dead-item store of a vacuum is
+/// `maintenance_work_mem`, which a sample's share always exceeds). A small database (up to 512 MiB)
+/// also runs `SMALL_DATABASE_SETTINGS`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tuning {
     pub shared_buffers_mib: u64,
     pub effective_cache_size_mib: u64,
     pub work_mem_mib: u64,
     pub maintenance_work_mem_mib: u64,
+    pub autovacuum_max_workers: u32,
+    pub default_statistics_target: u32,
     pub small: bool,
 }
 pub fn tuning(memory_mib: u64) -> Tuning {
+    let autovacuum_max_workers = autovacuum_workers(memory_mib);
     Tuning {
         shared_buffers_mib: (memory_mib / 8).max(1),
         effective_cache_size_mib: memory_mib * 3 / 4,
@@ -55,6 +110,8 @@ pub fn tuning(memory_mib: u64) -> Tuning {
             _ => 8,
         },
         maintenance_work_mem_mib: (memory_mib / 16).max(16),
+        autovacuum_max_workers,
+        default_statistics_target: statistics_target(memory_mib, autovacuum_max_workers),
         small: memory_mib <= SMALL_DATABASE_MEMORY_MIB,
     }
 }
@@ -196,6 +253,8 @@ pub fn postgresql_conf(settings: &Settings) -> Option<String> {
          effective_cache_size = {cache}MB\n\
          work_mem = {work}MB\n\
          maintenance_work_mem = {maintenance}MB\n\
+         default_statistics_target = {statistics}\n\
+         autovacuum_max_workers = {workers}\n\
          huge_pages = off\n\
          jit = off\n\
          shared_preload_libraries = 'pg_prewarm'\n\
@@ -217,6 +276,8 @@ pub fn postgresql_conf(settings: &Settings) -> Option<String> {
         cache = tuning.effective_cache_size_mib,
         work = tuning.work_mem_mib,
         maintenance = tuning.maintenance_work_mem_mib,
+        statistics = tuning.default_statistics_target,
+        workers = tuning.autovacuum_max_workers,
         timeout = settings.archive_timeout_seconds,
         // Crash recovery syncs the whole file system once instead of every file. `syncfs` exists
         // on Linux, which is where the agent runs; a laptop's tests start without it.
@@ -291,6 +352,8 @@ mod tests {
                 effective_cache_size_mib: 192,
                 work_mem_mib: 2,
                 maintenance_work_mem_mib: 16,
+                autovacuum_max_workers: 1,
+                default_statistics_target: 20,
                 small: true
             }
         );
@@ -301,6 +364,8 @@ mod tests {
                 effective_cache_size_mib: 768,
                 work_mem_mib: 4,
                 maintenance_work_mem_mib: 64,
+                autovacuum_max_workers: 2,
+                default_statistics_target: 60,
                 small: false
             }
         );
@@ -311,6 +376,132 @@ mod tests {
         assert!(
             t.shared_buffers_mib + 25 * (t.work_mem_mib + 4) + t.maintenance_work_mem_mib + 15
                 < 230
+        );
+    }
+
+    /// ANALYZE keeps its sample in memory, and PostgreSQL's default target of 100 makes that 30,000
+    /// rows: of rows as wide as a page allows, more than a 256 MiB database has (the finding of
+    /// 2026-10-23: autovacuum workers throttled for 15 to 20 minutes at the unit's soft limit and one
+    /// killed). The target follows the class so that the samples of every autovacuum worker and of
+    /// one manual ANALYZE, all at the widest rows, stay within half of the memory.
+    #[test]
+    fn the_samples_of_analyze_stay_within_half_of_every_classes_memory() {
+        let default_sample = analyze_sample_bytes(100);
+        assert_eq!(default_sample, 30_000 * ANALYZE_ROW_BYTES);
+        assert!(
+            2 * default_sample > 256 * MIB / 2,
+            "the default does not fit 256 MiB"
+        );
+        // The production catalog's classes (plan 11.1, G10): xs, sm, md and lg.
+        for (memory, target, workers) in
+            [(256, 20, 1), (1024, 60, 2), (2048, 90, 3), (4096, 100, 3)]
+        {
+            let t = tuning(memory);
+            assert_eq!(
+                (t.default_statistics_target, t.autovacuum_max_workers),
+                (target, workers),
+                "{memory} MiB"
+            );
+        }
+        // Every memory a database can have, in the contract's steps.
+        for memory in (256..=1_048_576u64).step_by(256) {
+            let t = tuning(memory);
+            let samples = u64::from(t.autovacuum_max_workers) + 1;
+            assert!(
+                (10..=100).contains(&t.default_statistics_target),
+                "{memory} MiB"
+            );
+            assert!(
+                samples * analyze_sample_bytes(t.default_statistics_target) <= memory * MIB / 2,
+                "{memory} MiB: {samples} samples of target {}",
+                t.default_statistics_target
+            );
+            // A vacuum worker's dead-item store (`maintenance_work_mem`) is smaller than a
+            // sample's share, so the workers' peak is the sample's.
+            assert!(
+                t.maintenance_work_mem_mib * MIB <= memory * MIB / 2 / samples,
+                "{memory} MiB"
+            );
+            // The autovacuum slots hold the workers (the small class sets two).
+            if t.small {
+                assert_eq!(t.autovacuum_max_workers, 1, "{memory} MiB");
+            }
+        }
+    }
+
+    /// What ANALYZE keeps per sampled row, measured on PostgreSQL 18 for the widest rows it keeps:
+    /// one that a page holds alone (a column that is never toasted, `STORAGE PLAIN`, so that the
+    /// row is not cut to 2 KB) with a compressed column beside it, which the pass over that column
+    /// expands (`compute_scalar_stats`). The peak anonymous memory of the backend, over what it held
+    /// before, stays within the model and is not far from it, so the model is the sample and not
+    /// some other number.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn analyze_keeps_no_more_per_sampled_row_than_the_model_says() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let Some(cluster) = Cluster::create("analyze-memory") else {
+            return;
+        };
+        cluster.start();
+        let session = cluster.agent().await;
+        session
+            .batch_long(
+                "CREATE TABLE wide (id int, blob text, note text);
+                 ALTER TABLE wide ALTER COLUMN blob SET STORAGE PLAIN;
+                 INSERT INTO wide SELECT g, repeat(md5(g::text), 218), repeat('abcdefghij', 100)
+                   FROM generate_series(1, 3000) g",
+            )
+            .await
+            .unwrap();
+        let pid: i32 = session.query("SELECT pg_backend_pid()", &[]).await.unwrap()[0].get(0);
+        let anonymous = move || -> u64 {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+            let kib = status
+                .lines()
+                .find_map(|line| line.strip_prefix("RssAnon:"))
+                .unwrap();
+            kib.trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+                * 1024
+        };
+        let before = anonymous();
+        let done = Arc::new(AtomicBool::new(false));
+        let poller = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut peak = 0;
+                while !done.load(Ordering::Relaxed) {
+                    peak = peak.max(anonymous());
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                peak
+            })
+        };
+        // A target of 10 samples 3,000 rows: every row of the table.
+        session
+            .batch_long("SET default_statistics_target = 10; ANALYZE wide")
+            .await
+            .unwrap();
+        done.store(true, Ordering::Relaxed);
+        let grown = poller.join().unwrap().saturating_sub(before);
+        let model = analyze_sample_bytes(10);
+        println!(
+            "analyze_memory: the backend grew by {grown} bytes for 3000 rows, the model says {model}"
+        );
+        // The backend's other growth (caches, the executor) is a few MiB at most.
+        assert!(
+            grown <= model + 4 * MIB,
+            "ANALYZE grew the backend by {grown} bytes, the model says {model}"
+        );
+        assert!(
+            grown >= 3_000 * 8_200,
+            "ANALYZE grew the backend by {grown} bytes: the sample was not measured"
         );
     }
 
@@ -325,6 +516,8 @@ mod tests {
             "effective_cache_size = 192MB",
             "work_mem = 2MB",
             "maintenance_work_mem = 16MB",
+            "default_statistics_target = 20",
+            "autovacuum_max_workers = 1",
             "huge_pages = off",
             "jit = off",
             "shared_preload_libraries = 'pg_prewarm'",
@@ -337,7 +530,6 @@ mod tests {
             "wal_recycle = on",
             "min_wal_size = 32MB",
             "max_wal_size = 256MB",
-            "autovacuum_max_workers = 1",
             "autovacuum_worker_slots = 2",
             "io_workers = 1",
             "max_parallel_workers_per_gather = 0",
@@ -358,7 +550,6 @@ mod tests {
         // A larger database keeps PostgreSQL's defaults for these.
         let large = conf(1024, 100);
         for absent in [
-            "autovacuum_max_workers",
             "autovacuum_worker_slots",
             "io_workers",
             "max_parallel_workers_per_gather",
@@ -371,6 +562,12 @@ mod tests {
             assert!(!large.contains(absent), "{absent}");
         }
         assert!(large.contains("max_wal_size = 25600MB"));
+        // What its autovacuum workers and ANALYZE may keep in memory follows its size (`Tuning`).
+        assert!(large.contains("default_statistics_target = 60\n"));
+        assert!(large.contains("autovacuum_max_workers = 2\n"));
+        let largest = conf(4096, 100);
+        assert!(largest.contains("default_statistics_target = 100\n"));
+        assert!(largest.contains("autovacuum_max_workers = 3\n"));
     }
 
     /// The whole file of a 256 MiB and of a 1 GiB class, as PostgreSQL 18 reads it. The small
@@ -383,7 +580,13 @@ mod tests {
         } else {
             ""
         };
-        let head = |connections: u32, shared: u32, cache: u32, work: u32, maintenance: u32| {
+        let head = |connections: u32,
+                    shared: u32,
+                    cache: u32,
+                    work: u32,
+                    maintenance: u32,
+                    statistics: u32,
+                    workers: u32| {
             format!(
                 "# Written by pgcf-agent for every start of the database. Do not edit.\n\
                  listen_addresses = ''\n\
@@ -393,6 +596,8 @@ mod tests {
                  effective_cache_size = {cache}MB\n\
                  work_mem = {work}MB\n\
                  maintenance_work_mem = {maintenance}MB\n\
+                 default_statistics_target = {statistics}\n\
+                 autovacuum_max_workers = {workers}\n\
                  huge_pages = off\n\
                  jit = off\n\
                  shared_preload_libraries = 'pg_prewarm'\n\
@@ -413,7 +618,6 @@ mod tests {
             "{}max_wal_size = 256MB\n\
              password_encryption = scram-sha-256\n\
              log_line_prefix = '%m [%p] %q%u@%d '\n\
-             autovacuum_max_workers = 1\n\
              autovacuum_worker_slots = 2\n\
              io_workers = 1\n\
              max_parallel_workers_per_gather = 0\n\
@@ -423,7 +627,7 @@ mod tests {
              max_wal_senders = 0\n\
              max_replication_slots = 0\n\
              {tail}",
-            head(25, 32, 192, 2, 16)
+            head(25, 32, 192, 2, 16, 20, 1)
         );
         assert_eq!(conf(256, 1), small);
         let larger = format!(
@@ -431,7 +635,7 @@ mod tests {
              password_encryption = scram-sha-256\n\
              log_line_prefix = '%m [%p] %q%u@%d '\n\
              {tail}",
-            head(25, 128, 768, 4, 64)
+            head(25, 128, 768, 4, 64, 60, 2)
         );
         assert_eq!(conf(1024, 100), larger);
         // The class boundary is the plan's: 512 MiB is small, one more is not.
