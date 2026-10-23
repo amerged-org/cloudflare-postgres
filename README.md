@@ -4,9 +4,9 @@ Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare acc
 Contabo VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
 Each VPS is a self-contained Debian node installed from one image: real, unmodified PostgreSQL
 runs as one sandboxed systemd service per database on its own thin LVM volume, next to one Rust
-node agent. There is no Kubernetes and no control server. The deployment is EU only, with the
-customer node **EU1**, a Contabo Cloud VPS with **6 vCPU and 12 GB RAM**, which Cloudflare
-installed from the node image. Server loss is recovered from R2.
+node agent. There is no Kubernetes and no control server. The deployment has two regions: EU with
+the customer node **EU1** and US with **US1**, each a Contabo Cloud VPS with **6 vCPU and 12 GB
+RAM** that Cloudflare installed from the node image. Server loss is recovered from R2.
 
 - Create, resize, suspend, restore and delete databases through a versioned API.
 - Connect through Cloudflare: PostgreSQL over WebSocket. The VPS expose no database port.
@@ -20,7 +20,8 @@ installed from the node image. Server loss is recovered from R2.
 
 Integrators keep their adapters and any tooling that moves their existing databases in their own
 repositories; the [integrator handover](docs/operations/integrator-handover.md) describes the API,
-connections and limits they build on.
+connections and limits they build on, and states the measured values (cold request, recovery point,
+restore time, limits) with their dates and the plan rows that record them.
 
 ## Status
 
@@ -42,8 +43,8 @@ states what runs where; it does not repeat measurements.
 Placement follows the
 [ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#48-placement-in-cloudflare):
 a node takes new databases until its active RAM or its CPU load reaches 80 %, each measured as the
-highest 30-minute average of the last seven days, and among the nodes that qualify the fullest
-wins. A node that placement has closed (pool data at 80 %, pool metadata at 50 %, the sold storage
+highest 30-minute average within the placement window (7 days in the code; the owner decided on
+2026-10-23 to set it to 3 days), and among the nodes that qualify the fullest wins. A node that placement has closed (pool data at 80 %, pool metadata at 50 %, the sold storage
 at four times the pool's data, or 1,000 volumes) takes none. Each start is admitted by the node
 itself, from its own free RAM and pool. No lease expiry, stale sample or missing observation stops
 a running database: besides its own idle sleep and the node's early sleep, only explicit orders
@@ -162,7 +163,8 @@ licenses.
   (`db.example.com`): Workers, D1, Durable Objects, Workflows, R2, Tunnel and Access.
 - A Contabo account with API credentials. EU1 is a Cloud VPS with 6 vCPU and 12 GB RAM.
 
-The current target is the operator deployment on existing accounts with the customer node EU1.
+The current target is the operator deployment on existing accounts with the customer nodes EU1 and
+US1.
 Further nodes and regions use the same node image; see the
 [delivery stages](docs/architecture/cloudflare-convergence-and-serverless-plan.md#10-delivery-stages).
 Public-release installation polish follows separately; see [not in v1](docs/architecture/cloudflare-convergence-and-serverless-plan.md#111-not-in-v1) in the ULTRA plan.
@@ -288,7 +290,8 @@ Unit tests do not replace the live acceptance recorded in the ULTRA plan.
 - [PLAN.md](PLAN.md): entry point to the ULTRA plan: scope, delivery architecture, Done and Open
   status and the go-live path.
 - [Integrator handover](docs/operations/integrator-handover.md): the model, lifecycle API, client
-  behaviour, limits, metering and recovery for an integrator that creates databases on PGCF.
+  behaviour, limits, metering, recovery and the measured values for an integrator that creates
+  databases on PGCF.
 - Operator runbooks in [docs/operations](docs/operations): [installation](docs/operations/operator-installation.md),
   [recovery](docs/operations/recovery.md), [credential changes](docs/operations/credentials.md),
   [infrastructure backups and alerts](docs/operations/infrastructure-backups.md) and the
