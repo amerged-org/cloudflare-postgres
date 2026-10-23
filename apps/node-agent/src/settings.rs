@@ -515,11 +515,8 @@ mod tests {
             .await
             .unwrap();
         // A target of 10 samples 3,000 rows: every row of the table.
-        let grown = backend_growth(
-            &cluster,
-            "SET default_statistics_target = 10; ANALYZE wide",
-        )
-        .await;
+        let grown =
+            backend_growth(&cluster, "SET default_statistics_target = 10; ANALYZE wide").await;
         let model = analyze_sample_bytes(10);
         println!(
             "analyze_memory: the backend grew by {grown} bytes for 3000 rows, the model says {model}"
@@ -584,9 +581,7 @@ mod tests {
         drop(session);
         // The rows of the sample: all of them, whatever the target (300 × 10 is more than ROWS).
         let model = ROWS * ANALYZE_ROW_BYTES;
-        let analyze = |table: &str| {
-            format!("SET default_statistics_target = 20; ANALYZE {table}")
-        };
+        let analyze = |table: &str| format!("SET default_statistics_target = 20; ANALYZE {table}");
         let expression = backend_growth(&cluster, &analyze("docs_expr")).await;
         let off = backend_growth(&cluster, &analyze("docs_off")).await;
         let stored = backend_growth(&cluster, &analyze("docs_col")).await;

@@ -329,7 +329,9 @@ async fn analyze_and_vacuum_stay_inside_the_memory_of_every_class() {
             session.query("SELECT count(*) FROM dx", &[]).await.unwrap()[0].get::<_, i64>(0),
             DOCUMENTS as i64
         );
-        for table in ["wide", "narrow", "worst", "s1", "s2", "s3", "s4", "dx", "d0", "dc"] {
+        for table in [
+            "wide", "narrow", "worst", "s1", "s2", "s3", "s4", "dx", "d0", "dc",
+        ] {
             session
                 .batch_long(&format!("VACUUM (FREEZE) {table}"))
                 .await
