@@ -177,7 +177,13 @@ impl<M: Machine> Core<M> {
             // A move ends when the API has its result: the hold on the wakes ends with its order.
             for db in self.all() {
                 let held = db.view().moving.clone();
+                let replacing = db
+                    .view()
+                    .entry
+                    .as_ref()
+                    .is_some_and(Entry::replaces_storage);
                 if let Some(operation) = held
+                    && !replacing
                     && !page
                         .orders
                         .iter()
@@ -371,6 +377,15 @@ impl<M: Machine> Core<M> {
                 Err(error) => return Self::unread(db, "state", error.into()),
             }
         }
+        if self.replacement_blocks(db, &entry) {
+            self.set(db, |view| {
+                view.adopted = true;
+                view.phase = Phase::Error;
+                view.error = Some("build_failed");
+                view.writer = None;
+            });
+            return;
+        }
         // What cannot be read is not known: nothing is decided on a guess, and the decision is
         // tried again (`retry_until_adopted`). A volume taken for missing would fail the database;
         // a unit taken for stopped would put a database that runs through recovery.
@@ -406,7 +421,10 @@ impl<M: Machine> Core<M> {
         match step {
             Step::Nothing => {}
             Step::Build => {
-                let _ = self.build(db, &entry).await;
+                if self.build(db, &entry).await.is_err() && self.replacement_rollback(&entry) {
+                    self.set(db, |view| view.adopted = false);
+                    return;
+                }
             }
             Step::Delete => {
                 // What is left is decided again after the backoff; the database is not reported
@@ -923,6 +941,10 @@ impl<M: Machine> Core<M> {
             (None, _) => outcome = Err("unit_not_stopped"),
             (Some(false), _) => {}
         }
+        if remove_volume && !self.replacement_cleanup_ready(database, storage_generation) {
+            self.report_order(operation, Err("volume_not_removed"));
+            return;
+        }
         if remove_volume && let Ok(inventory) = self.machine.inventory().await {
             for volume in inventory.volumes.into_iter().filter(|volume| {
                 volume.id.database() == database && volume.id.generation() <= storage_generation
@@ -939,6 +961,11 @@ impl<M: Machine> Core<M> {
                     outcome = Err("volume_not_removed");
                 }
             }
+        }
+        if remove_volume && outcome.is_ok() {
+            outcome = self
+                .finish_replacement_cleanup(database, storage_generation)
+                .await;
         }
         self.report_order(operation, outcome);
     }

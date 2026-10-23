@@ -469,6 +469,14 @@ impl<M: Machine> Core<M> {
         entry: &Entry,
     ) -> Result<(), &'static str> {
         let origin = entry.origin.clone().ok_or_else(|| build_failed!())?;
+        if let Err(error) = self.prepare_replacement(entry).await {
+            self.set(db, |view| {
+                view.phase = Phase::Error;
+                view.error = Some(error);
+                view.writer = None;
+            });
+            return Err(error);
+        }
         if self.waits_for_credential(db, entry, &origin) {
             return Err("credential_not_delivered");
         }
@@ -481,13 +489,29 @@ impl<M: Machine> Core<M> {
         // Before anything is written: the record of the generation that is released stays what
         // it is until it has been, so that a build that was refused is released again.
         let released = self.release_previous_generation(entry).await;
+        if released && entry.replaces_storage() {
+            // The journal is durable and the original writer is proven, stopped and detached.
+            // The target's ready report can cut over without a stale source move hold.
+            self.set(db, |view| view.moving = None);
+        }
         let built = if !released {
             Err("build_failed")
         } else {
             match origin {
                 Origin::Create => self.build_create(db, entry).await,
                 Origin::Restore(source) => self.build_restored(db, entry, &source, None).await,
+                Origin::Replace(source, _, _) => {
+                    self.build_restored(db, entry, &source, None).await
+                }
                 Origin::Move(source, end) => {
+                    self.build_restored(db, entry, &source, Some(end)).await
+                }
+                Origin::ReplaceRollback(source, _, record, _) => {
+                    let end = End {
+                        system_identifier: record.system_identifier,
+                        timeline: record.timeline,
+                        last_segment: record.last_archived_segment,
+                    };
                     self.build_restored(db, entry, &source, Some(end)).await
                 }
             }
@@ -495,6 +519,16 @@ impl<M: Machine> Core<M> {
         match built {
             Ok(()) => Ok(()),
             Err(error) => {
+                let rollback = self.replacement_rollback(entry);
+                // Report a failure only after it survives a restart. Rollback failures remain
+                // retryable at this same forward generation; the source is never removed.
+                if released && self.fail_replacement(entry).is_err() {
+                    self.set(db, |view| {
+                        view.phase = Phase::Error;
+                        view.error = Some("build_failed");
+                    });
+                    return Err("build_failed");
+                }
                 crate::timing::emit_event(serde_json::json!({
                     "event": "build_failed", "database_id": db.id,
                     "operation": entry.operation, "error": error,
@@ -508,7 +542,7 @@ impl<M: Machine> Core<M> {
                 self.set(db, |view| {
                     view.phase = Phase::Error;
                     view.error = Some(error);
-                    if released {
+                    if released && !rollback {
                         view.abandoned_build = Some(entry.archive_path.clone());
                     }
                     if forgotten {
@@ -527,7 +561,10 @@ impl<M: Machine> Core<M> {
         let delivered = self.store(&entry.archive_path, Access::ReadWrite).is_some()
             && match origin {
                 Origin::Create => true,
-                Origin::Restore(source) | Origin::Move(source, _) => {
+                Origin::Restore(source)
+                | Origin::Move(source, _)
+                | Origin::Replace(source, _, _)
+                | Origin::ReplaceRollback(source, _, _, _) => {
                     self.store(&source.path, Access::ReadOnly).is_some()
                 }
             };
@@ -564,7 +601,7 @@ impl<M: Machine> Core<M> {
         let files = self.files(id);
         match files.load() {
             Ok(Some(state)) if state.storage_generation == storage_generation => {
-                files.remove().is_ok()
+                files.forget_generation(storage_generation).is_ok()
             }
             _ => false,
         }

@@ -221,7 +221,14 @@ impl<M: Machine> Core<M> {
             Phase::Starting | Phase::Retired => return None,
         };
         let stored = view.state.as_ref();
-        let storage_generation = stored.map_or(entry.storage_generation, |s| s.storage_generation);
+        // A replacement refused before `begin_state` deliberately retains the source's state.
+        // Its failure still concerns the target operation and must name that generation, or the
+        // API cannot accept it and initiate the forward rollback.
+        let storage_generation = if state == "error" && entry.replaces_storage() {
+            entry.storage_generation
+        } else {
+            stored.map_or(entry.storage_generation, |s| s.storage_generation)
+        };
         let (generation, operation) = match &view.claim {
             Some(claim) => (claim.generation, claim.operation.clone()),
             None => (entry.generation, entry.operation.clone()),

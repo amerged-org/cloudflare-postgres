@@ -19,6 +19,9 @@ mod readahead;
 mod real_gateway;
 pub(crate) mod remove;
 mod repair;
+mod replacement;
+#[cfg(test)]
+mod replacement_tests;
 pub(crate) mod report;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -737,18 +740,24 @@ impl<M: Machine> Core<M> {
     /// it knows: an entry below it is stale and `false`; one at it with another operation wins;
     /// a wake claim the page has caught up with is done.
     pub(crate) fn accept(&self, db: &Db, entry: Entry) -> bool {
-        let known = db
-            .view()
-            .entry
-            .as_ref()
-            .map(|known| (known.generation, known.operation.clone()));
-        if known
-            .as_ref()
-            .is_some_and(|(generation, _)| entry.generation < *generation)
-        {
+        let known = db.view().entry.as_ref().map(|known| {
+            (
+                known.generation,
+                known.operation.clone(),
+                known.storage_generation,
+            )
+        });
+        if known.as_ref().is_some_and(|(generation, _, storage)| {
+            entry.generation < *generation || entry.storage_generation < *storage
+        }) {
             return false;
         }
-        let changed = known.as_ref() != Some(&(entry.generation, entry.operation.clone()));
+        let changed = known.as_ref()
+            != Some(&(
+                entry.generation,
+                entry.operation.clone(),
+                entry.storage_generation,
+            ));
         self.set(db, |view| {
             if let Some(claim) = &view.claim
                 && (entry.generation > claim.generation
