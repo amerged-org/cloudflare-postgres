@@ -470,6 +470,9 @@ impl<M: Machine> Core<M> {
     ) -> Result<(), &'static str> {
         let origin = entry.origin.clone().ok_or_else(|| build_failed!())?;
         if let Err(error) = self.prepare_replacement(entry).await {
+            if error == super::replacement::CLEANUP_PENDING {
+                return Err(error);
+            }
             self.set(db, |view| {
                 view.phase = Phase::Error;
                 view.error = Some(error);

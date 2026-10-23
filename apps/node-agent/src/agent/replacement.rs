@@ -13,6 +13,8 @@ use crate::{
     storage::VolumeId,
 };
 
+pub(super) const CLEANUP_PENDING: &str = "replacement_cleanup_pending";
+
 fn attempt(entry: &Entry, rollback: bool) -> Attempt {
     Attempt {
         generation: entry.storage_generation,
@@ -83,6 +85,9 @@ impl<M: Machine> Core<M> {
             Ok(Some(journal)) => journal,
             Err(_) => return true,
         };
+        if self.prior_replacement_cleanup_pending(entry, &journal) {
+            return false;
+        }
         if entry.storage_generation < journal.attempt.generation
             || (entry.storage_generation == journal.attempt.generation && journal.attempt.failed)
         {
@@ -94,6 +99,35 @@ impl<M: Machine> Core<M> {
         } else {
             entry.storage_generation != journal.attempt.generation
         }
+    }
+
+    /// A new operation may arrive with the previous operation's source cleanup still pending.
+    /// Its source must be exactly that operation's backed-up promoted generation and proven
+    /// sleep. Keep the old journal until its own cleanup runs; this is no failed new restore.
+    fn prior_replacement_cleanup_pending(&self, entry: &Entry, journal: &Replacement) -> bool {
+        let (source, previous, end) = match &entry.origin {
+            Some(
+                Origin::Replace(source, previous, end)
+                | Origin::ReplaceRollback(source, previous, end, _),
+            ) => (source, previous, end),
+            _ => return false,
+        };
+        entry.operation != journal.operation
+            && !journal.attempt.failed
+            && *previous == journal.attempt.generation
+            && source.database_id == entry.id
+            && source.path == journal.attempt.archive_path
+            && self
+                .files(&entry.id)
+                .load()
+                .ok()
+                .flatten()
+                .is_some_and(|state| {
+                    state.built
+                        && state.backup.is_some()
+                        && state.storage_generation == *previous
+                        && state.record.as_ref() == Some(end)
+                })
     }
 
     /// Only a currently retained, built source whose exact full proof matches the instruction
@@ -158,18 +192,24 @@ impl<M: Machine> Core<M> {
     pub(super) async fn prepare_replacement(&self, entry: &Entry) -> Result<(), &'static str> {
         let files = self.files(&entry.id);
         if let Some(mut journal) = files.load_replacement().map_err(|_| "build_failed")? {
+            if self.prior_replacement_cleanup_pending(entry, &journal) {
+                return Err(CLEANUP_PENDING);
+            }
             if !matches_journal(entry, &journal) {
                 return Err("build_failed");
             }
-            self.release_staged_writer(entry, &journal).await?;
+            self.check_replacement_writer(entry, &journal).await?;
             if self.replacement_rollback(entry) {
                 let next = attempt(entry, true);
                 if journal.attempt != next {
+                    self.finish_staged_cleanup(entry, &mut journal).await?;
+                    journal.retiring_generation = Some(journal.attempt.generation);
                     journal.attempt = next;
                     files
                         .save_replacement(&journal)
                         .map_err(|_| "build_failed")?;
                 }
+                self.finish_staged_cleanup(entry, &mut journal).await?;
             }
             return Ok(());
         }
@@ -202,14 +242,14 @@ impl<M: Machine> Core<M> {
             target_time: source.target_time.clone(),
             source: held,
             attempt: attempt(entry, rollback),
+            retiring_generation: None,
         };
         files.save_replacement(&journal).map_err(|_| "build_failed")
     }
 
-    /// A crash may interrupt failure cleanup with the target still running. Only a writer whose
-    /// actual mounted generation is the journal's staged target may be stopped here. `stop_unit`
-    /// waits for its slot/cgroup to be over; unmount then independently refuses remaining holders.
-    async fn release_staged_writer(
+    /// Reject any writer whose actual mounted generation the journal does not own. The original
+    /// source is never stopped to manufacture a missing proof.
+    async fn check_replacement_writer(
         &self,
         entry: &Entry,
         journal: &Replacement,
@@ -242,12 +282,9 @@ impl<M: Machine> Core<M> {
                     return Err("build_failed");
                 }
             }
-            Some(held) if held.generation() == journal.attempt.generation => {
-                if entry.storage_generation > held.generation() && !self.stop_unit(&entry.id).await
-                {
-                    return Err("build_failed");
-                }
-            }
+            Some(held)
+                if held.generation() == journal.attempt.generation
+                    || Some(held.generation()) == journal.retiring_generation => {}
             Some(_) => return Err("build_failed"),
             None => {
                 if self
@@ -263,6 +300,73 @@ impl<M: Machine> Core<M> {
             }
         }
         Ok(())
+    }
+
+    /// Explicit rollback authorizes discarding this operation's unpublished target, never its
+    /// original source. The durable intent precedes stopping or deleting anything, so restart
+    /// can finish the same cleanup without requiring room for three database generations.
+    async fn finish_staged_cleanup(
+        &self,
+        entry: &Entry,
+        journal: &mut Replacement,
+    ) -> Result<(), &'static str> {
+        let Some(generation) = journal.retiring_generation else {
+            return Ok(());
+        };
+        let staged = VolumeId::new(&entry.id, generation).map_err(|_| "build_failed")?;
+        if self
+            .machine
+            .unit_volume(&entry.id)
+            .await
+            .map_err(|_| "build_failed")?
+            .as_ref()
+            == Some(&staged)
+            && !self.stop_unit(&entry.id).await
+        {
+            return Err("build_failed");
+        }
+        // The source is proven asleep, and the per-database flow prevents new jobs. Jobs left
+        // by the interrupted target may still hold its volume in their own mount namespaces.
+        use crate::archive::job::Kind;
+        for kind in [
+            Kind::Restore,
+            Kind::BaseBackup,
+            Kind::WalFetch,
+            Kind::WalArchive,
+            Kind::BackupList,
+        ] {
+            self.jobs
+                .stop_earlier(&entry.id, kind)
+                .await
+                .map_err(|_| "build_failed")?;
+        }
+        if self
+            .machine
+            .has_volume(&staged)
+            .await
+            .map_err(|_| "build_failed")?
+        {
+            self.machine
+                .unmount_volume(&staged)
+                .await
+                .map_err(|_| "build_failed")?;
+            self.machine
+                .remove_volume(
+                    &staged,
+                    crate::storage::Removal::Superseded {
+                        storage_generation: generation,
+                        remove_volume: true,
+                    },
+                )
+                .await
+                .map_err(|_| "build_failed")?;
+        }
+        let files = self.files(&entry.id);
+        files
+            .forget_generation(generation)
+            .map_err(|_| "build_failed")?;
+        journal.retiring_generation = None;
+        files.save_replacement(journal).map_err(|_| "build_failed")
     }
 
     pub(super) fn fail_replacement(&self, entry: &Entry) -> Result<(), &'static str> {
@@ -303,6 +407,7 @@ impl<M: Machine> Core<M> {
                 && state.storage_generation == journal.attempt.generation
                 && state.storage_generation > through
                 && !journal.attempt.failed
+                && journal.retiring_generation.is_none()
         })
     }
 

@@ -606,7 +606,8 @@ plan 9.3, "Changing the page"; it is written there once.
   backup waits for the one big-job slot behind the other restores); any other DONE backup refuses
   the build with `prefix_not_empty`. A backup the earlier run began and did not finish (`STARTED`)
   is no reason.
-- **In-place PITR.** Nodes advertise `restore_in_place_v1` in their samples. The explicit `replace`
+- **In-place PITR.** Nodes advertise `restore_in_place_v1` in their authenticated hello and repeat it
+  in samples for diagnostics. The explicit `replace`
   origin keeps the database ID, socket, Linux account and current roles, but builds a newer storage
   generation. Before replacing `state.json`, `agent/replacement.rs` verifies the original's exact
   proven sleep and stopped writer, then durably saves its state and archive identity in the private
@@ -614,9 +615,12 @@ plan 9.3, "Changing the page"; it is written there once.
   Failed targets never discard the source's journal or upload log. The explicit `replace_rollback`
   origin replays the source's proven archive end into another, higher generation under the same
   operation; it can recreate a missing journal only from the retained, matching original state.
-  An interrupted failure's staged writer is stopped before its volume is detached. Rollback retries
+  An interrupted failure's staged writer is stopped before its volume is detached. Explicit rollback
+  durably names and removes that unpublished target before allocating the next one, retaining the
+  original source; it does not require space for three generations. Rollback retries
   with the existing recovery backoff through an R2 outage, keeping admission closed and the original
   volume intact. The source move hold clears only after journal persistence and exclusive release.
+  A later operation waits for an earlier source cleanup without failing or overwriting its journal.
   An explicit superseded cleanup removes retained volumes and then the journal only after the newer
   generation has its first DONE backup. Local cleanup never deletes the retained R2 archive lineage.
 - **An ordinary build that fails** (a create, a restore, a point-in-time restore or a move target, with any

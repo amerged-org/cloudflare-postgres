@@ -421,7 +421,10 @@ impl<M: Machine> Core<M> {
         match step {
             Step::Nothing => {}
             Step::Build => {
-                if self.build(db, &entry).await.is_err() && self.replacement_rollback(&entry) {
+                let built = self.build(db, &entry).await;
+                if built == Err(super::replacement::CLEANUP_PENDING)
+                    || (built.is_err() && self.replacement_rollback(&entry))
+                {
                     self.set(db, |view| view.adopted = false);
                     return;
                 }

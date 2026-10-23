@@ -35,6 +35,9 @@ pub(crate) struct Replacement {
     pub source: DatabaseState,
     /// The highest generation begun by this operation. A rollback always moves this forward.
     pub attempt: Attempt,
+    /// A journal-owned, unpublished target to remove before allocating the forward rollback.
+    #[serde(default)]
+    pub retiring_generation: Option<u64>,
 }
 
 fn operation(id: &str) -> bool {
@@ -64,6 +67,12 @@ impl Replacement {
             && self.target_generation > self.source.storage_generation
             && self.attempt.generation >= self.target_generation
             && self.attempt.generation <= 9_007_199_254_740_991
+            && self.retiring_generation.is_none_or(|generation| {
+                self.attempt.rollback
+                    && generation >= self.target_generation
+                    && generation > self.source.storage_generation
+                    && generation < self.attempt.generation
+            })
             && operation(&self.operation)
             && operation(&self.attempt.operation)
             && if self.attempt.rollback {
@@ -179,6 +188,7 @@ mod tests {
                 rollback: false,
                 failed: false,
             },
+            retiring_generation: None,
         }
     }
 
