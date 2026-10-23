@@ -1185,9 +1185,35 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     [
-      "maintenance-role",
-      withDatabase({ roles: [owner, { ...reader, name: "pgcf_maintenance" }] }),
+      "backup-role",
+      withDatabase({ roles: [owner, { ...reader, name: "pgcf_backup" }] }),
       false,
+      true,
+    ],
+    // PostgreSQL refuses `CREATE ROLE "public"` and `"none"`: a page that named one would fail the
+    // role step of its database at every start.
+    [
+      "role-public",
+      withDatabase({ roles: [owner, { ...reader, name: "public" }] }),
+      false,
+      true,
+    ],
+    [
+      "role-none",
+      withDatabase({ roles: [owner, { ...reader, name: "none" }] }),
+      false,
+      true,
+    ],
+    [
+      "roles-named-as-the-kubernetes-runtime-named-its-own",
+      withDatabase({
+        roles: [
+          owner,
+          { ...reader, name: "cnpg_app" },
+          { ...reader, name: "streaming_replica" },
+          { ...reader, name: "pgcf_maintenance" },
+        ],
+      }),
       true,
     ],
     [

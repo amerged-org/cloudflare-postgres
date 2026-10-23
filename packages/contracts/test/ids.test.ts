@@ -79,26 +79,43 @@ describe("ids", () => {
     expect(RegionId.safeParse("a".repeat(33)).success).toBe(false);
   });
 
-  it("rejects reserved role names", () => {
+  it("rejects the names the node needs for itself and the names PostgreSQL refuses: postgres, pg_*, the backup role, public and none", () => {
     for (const name of [
       "postgres",
-      "streaming_replica",
       "pg_monitor",
       "pg_",
-      "cnpg_pooler_pgbouncer",
+      "pgcf_backup",
+      "public",
+      "none",
     ]) {
       expect(isReservedRoleName(name)).toBe(true);
       expect(isRoleName(name)).toBe(false);
       expect(RoleName.safeParse(name).success).toBe(false);
     }
+    // The names of the Kubernetes runtime (CloudNativePG's roles, the old maintenance role) mean
+    // nothing on a node: they are ordinary role names now.
     for (const name of [
       "app",
       "reader",
       "postgres2",
       "pgx",
+      "streaming_replica",
+      "cnpg_app",
+      "cnpg_pooler_pgbouncer",
+      "pgcf_maintenance",
+      "pgcf_backup2",
+      // PostgreSQL refuses `CREATE ROLE public` and `none` by exact name; near misses are fine, and
+      // so are the keywords it accepts as a quoted role name.
+      "public_reader",
+      "nonesuch",
+      "current_user",
+      "session_user",
+      "current_role",
       "a" + "b".repeat(62),
     ]) {
+      expect(isReservedRoleName(name)).toBe(false);
       expect(isRoleName(name)).toBe(true);
+      expect(RoleName.safeParse(name).success).toBe(true);
     }
     expect(isRoleName("a".repeat(64))).toBe(false);
     expect(isRoleName("App")).toBe(false);

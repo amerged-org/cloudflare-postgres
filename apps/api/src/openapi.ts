@@ -127,7 +127,7 @@ const componentDocumentation: Readonly<
   },
   RoleName: {
     description:
-      "A lower-case identifier of 1 to 63 characters. postgres, streaming_replica and names that start with pg_ or cnpg_ are reserved; creating a role also refuses pgcf_maintenance, and `app` is the owner.",
+      "A lower-case identifier of 1 to 63 characters. postgres, pgcf_backup (the role of the node's base backups), public and none (PostgreSQL refuses both) and names that start with pg_ are reserved, and `app` is the owner.",
   },
 };
 const SAFE_INTEGER = Number.MAX_SAFE_INTEGER;

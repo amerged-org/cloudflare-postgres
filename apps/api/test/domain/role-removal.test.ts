@@ -176,17 +176,19 @@ describe("role removal", () => {
     ).toBe(1);
   });
 
-  it("refuses the owner, the maintenance role, unknown roles and foreign projects", async () => {
+  it("refuses the owner, unknown roles and foreign projects", async () => {
     const f = await ready({ name: "report_job" });
-    for (const name of ["app", "pgcf_maintenance"]) {
-      const response = await removeRole(f, name);
-      expect(response.status, name).toBe(400);
-      expect(await response.json()).toMatchObject({
-        error: { code: "invalid_request" },
-      });
-    }
-    expect((await removeRole(f, "nobody")).status).toBe(404);
-    expect((await removeRole(f, "postgres")).status).toBe(400);
+    const response = await removeRole(f, "app");
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: { code: "invalid_request" },
+    });
+    // The names of the Kubernetes runtime are ordinary names: a role that does not exist is
+    // unknown, however it is called.
+    for (const name of ["nobody", "pgcf_maintenance", "cnpg_app"])
+      expect((await removeRole(f, name)).status, name).toBe(404);
+    for (const name of ["postgres", "pgcf_backup", "public", "none"])
+      expect((await removeRole(f, name)).status, name).toBe(400);
     expect((await removeRole(f, "report_job", null)).status).toBe(400);
     expect((await removeRole(f, "report_job", key(), f.otherKey)).status).toBe(
       404,
@@ -199,6 +201,20 @@ describe("role removal", () => {
         .bind(f.id)
         .first("count"),
     ).toBe(0);
+  });
+
+  it("removes a role that has the name of one the Kubernetes runtime reserved", async () => {
+    const f = await ready({ name: "cnpg_app" }, { name: "streaming_replica" });
+    const result = await removal(f, "cnpg_app");
+    expect(result.operation).toMatchObject({
+      kind: "database.role.delete",
+      status: "pending",
+    });
+    expect(await listed(f)).toEqual(["app", "streaming_replica"]);
+    expect((await desired(f)).roles).toContainEqual({
+      name: "cnpg_app",
+      state: "absent",
+    });
   });
 
   it("shows a removal operation only to its own project", async () => {

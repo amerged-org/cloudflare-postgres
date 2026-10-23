@@ -45,7 +45,7 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "POST /v1/databases/{id}/roles/{name}/reset-password": [
     400, 401, 403, 404, 409, 500,
   ],
-  // 400: the owner or the maintenance role; 409: a member_of target, a change in progress.
+  // 400: the owner; 409: a member_of target, a change in progress.
   "DELETE /v1/databases/{id}/roles/{name}": [400, 401, 403, 404, 409, 500],
   "GET /v1/databases/{id}/roles/{name}/connection-uri": [400, 401, 404, 500],
   "GET /v1/operations/{id}": [400, 401, 404, 500],

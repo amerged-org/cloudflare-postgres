@@ -10,7 +10,6 @@ import {
   RESERVED_ROLE_NAMES,
   RESERVED_ROLE_PREFIXES,
 } from "../src/ids.ts";
-import { MAINTENANCE_ROLE } from "../src/maintenance.ts";
 import {
   HOST_FILE_APPLIES,
   HOST_FILE_DIRECTORIES,
@@ -74,7 +73,6 @@ const files = {
       NODE_REQUEST_MAX_LENGTH: link.NODE_REQUEST_MAX_LENGTH,
       ARCHIVE_SERVER_NAME: link.ARCHIVE_SERVER_NAME,
       OWNER_ROLE_NAME,
-      MAINTENANCE_ROLE,
       RESERVED_ROLE_NAMES: [...RESERVED_ROLE_NAMES],
       RESERVED_ROLE_PREFIXES,
       // What a present role names and a removal never does: the node refuses a role that is both.

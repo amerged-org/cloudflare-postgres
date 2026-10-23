@@ -33,7 +33,7 @@
     },
     {
       "path": "docs/architecture/mermaider/d1-core.md",
-      "sha256": "0ae8cfa3dd76464e6a2ff1724c74d5a1aa3f06c766ce3b835511eef02bfbf51e"
+      "sha256": "f5dad9eba24faff55b0762f648f5071afb7d90052ffe08e43503c24087af2614"
     },
     {
       "path": "docs/architecture/mermaider/d1-core.mmd",
@@ -49,7 +49,7 @@
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "fcf83f1c92e72f27e8d51175f738321fe87bd4f73e26960deea0698543be6025"
+      "sha256": "70ab18dd08bb3bef119d79b4ddbb6642621a07a29c5e44bdee2074d85e54a924"
     }
   ],
   "fingerprint": "dd536ca978b715b13cda64bfa16b18302eff5ee2f44436bb7064d6bae5ac894b",

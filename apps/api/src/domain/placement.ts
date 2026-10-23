@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Placement by measured activity (ULTRA plan 4.8). A node takes new databases until its active
-// RAM or its CPU load reaches 80 %, each as the highest 30-minute average of the last seven days;
+// RAM or its CPU load reaches 80 %, each as the highest 30-minute average of the last three days;
 // among the nodes that qualify the fullest wins, and a node is added only when none does. A node
 // holding `MAX_VOLUMES_PER_NODE` volumes takes no more (plan 4.11). Cloudflare reads only what the
 // node reports: its newest sample (`nodes.last_sample_json`) and its per-minute rollups
@@ -29,7 +29,7 @@ const LOGICAL_CAP_FACTOR = 4;
 export const MAX_VOLUMES_PER_NODE = 1000;
 /** The averaging window of a load figure, and how far back its highest value counts. */
 export const AVERAGE_WINDOW_SECONDS = 1800;
-export const PEAK_WINDOW_MS = 7 * 86_400_000;
+export const PEAK_WINDOW_MS = 3 * 86_400_000;
 /** An average of fewer seconds of samples than this is not a 30-minute average (plan 4.8). */
 export const AVERAGE_MINIMUM_SPAN_SECONDS = 600;
 
@@ -63,7 +63,7 @@ export interface PlacementNode {
   pool_nominal_bytes: number | null;
   /** Every thin volume of the node in that sample, mounted or not. */
   volumes_total: number | null;
-  /** Highest 30-minute average of active RAM and of CPU load in the last seven days. */
+  /** Highest 30-minute average of active RAM and of CPU load in the last three days. */
   ram_peak_ppm: number | null;
   cpu_peak_ppm: number | null;
   /** Active RAM in the newest sample, in parts per million: what the 30-minute average has not caught up with. */

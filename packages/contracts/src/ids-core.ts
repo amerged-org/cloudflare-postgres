@@ -12,11 +12,22 @@ export const REGION_ID_PATTERN = /^[a-z][a-z0-9-]{1,30}[a-z0-9]$/;
 export const SIZE_CLASS_ID_PATTERN = /^[a-z][a-z0-9-]{0,30}[a-z0-9]$/;
 export const ROLE_NAME_PATTERN = /^[a-z][a-z0-9_]{0,62}$/;
 
+// What a customer role cannot take. Two names are the node's own: `postgres`, the superuser the
+// node agent runs as, and `pgcf_backup`, the role barman's base backups log in as, which the node
+// agent creates and never restores (a customer role of that name would be altered, lose its backup
+// privileges and could not be dropped). Two names PostgreSQL itself refuses in `CREATE ROLE`, quoted
+// or not: `public` and `none` ("role name is reserved"); a role of either name would fail the role
+// step of its database at every start. PostgreSQL also reserves the `pg_` prefix of its predefined
+// roles. The role names of the Kubernetes runtime (`streaming_replica`, `cnpg_*`,
+// `pgcf_maintenance`) mean nothing on a node and are ordinary names, and so are the keywords that
+// PostgreSQL accepts as a quoted role name (`current_user`, `session_user`, `current_role`).
 export const RESERVED_ROLE_NAMES: ReadonlySet<string> = new Set([
   "postgres",
-  "streaming_replica",
+  "pgcf_backup",
+  "public",
+  "none",
 ]);
-export const RESERVED_ROLE_PREFIXES = ["pg_", "cnpg_"] as const;
+export const RESERVED_ROLE_PREFIXES = ["pg_"] as const;
 
 export function isReservedRoleName(name: string): boolean {
   return (
