@@ -1237,7 +1237,7 @@ measurement is fresh and below the threshold. A recurrence has the same `event_i
 | `database_base_backup_stale`                                  | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count         | fixed                              |
 | `thin_storage_blocked`                                        | a node's newest sample says its thin pool has no room, or a node that holds databases has no sample of its pool within 180 s (`thin_pool_*`) | fixed                                             |
 | `regional_node_capacity_refusals`                             | a node refused 5 or more wakes for awake capacity (`57P03`) in 10 minutes                                                                    | fixed                                             |
-| `regional_node_pool_closed`                                   | a node's newest sample closes it for placement: pool data at 80 %, pool metadata at 50 %, sold storage at 4 times its data, or 1,000 volumes | fixed                                             |
+| `regional_node_pool_closed`                                   | the smallest size class on offer fits no node: pool data at 80 %, pool metadata at 50 %, sold storage plus that class past 4 times its data, 1,000 volumes, or no node with the RAM or CPU (80 % of the 30-minute average) | fixed                                             |
 | `database_volume_warning`, `database_volume_critical`         | a database volume's space or inodes are at least 80 % (below 90 %), or at least 90 %, used                                                   | fixed                                             |
 | `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed |
 | `node_unexpected_reboot` | a node rebooted and no maintenance order of it asked for it, within the last 24 h | fixed |
@@ -1245,13 +1245,15 @@ measurement is fresh and below the threshold. A recurrence has the same `event_i
 
 The values in the table are the plan's; the installation's own settings are read with
 `GET /v1/regions/{id}/capacity-policy`. Thresholds are integer parts per million (1,000,000 = 100 %, valid 1 to 1,000,000, `null`
-disables) set with `PUT /v1/regions/{id}/capacity-policy`. The minute cron evaluates the first
-four regions that have a policy; the fixed-rule kinds are evaluated for every region.
+disables) set with `PUT /v1/regions/{id}/capacity-policy`. The alert evaluation (a Durable Object
+alarm, once a minute) evaluates the first four regions that have a policy; the fixed-rule kinds
+are evaluated for every region.
 
 Every event carries a short runbook action in `action`. The database kinds are per database but
 one episode per region and kind lists up to 64 databases. Each minute-cron step runs in its own
-failure boundary, so one failing step is logged and counted and alerting still runs; the cron's
-own heartbeat is judged by a Durable Object alarm that does not depend on the cron
+failure boundary and has 240 s, so one failing or hanging step is logged and counted; the alerts
+are no step of the cron: a Durable Object alarm evaluates them every minute and judges the cron's
+own heartbeat, without depending on the cron
 ([operator runbook](infrastructure-backups.md#minute-cron-heartbeat-and-watchdog)).
 
 The control plane itself is protected by a daily encrypted D1 export in R2, read back in full

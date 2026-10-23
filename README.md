@@ -228,14 +228,15 @@ infrastructure backup, a running database whose WAL archive is failing
 awake time (`database_base_backup_stale`; sleeping databases are excluded), a thin pool without
 room or without a sample (`thin_storage_blocked`), a node that keeps refusing wakes for awake
 capacity (`regional_node_capacity_refusals`), a node that placement has closed
-(`regional_node_pool_closed`: pool data at 80 %, pool metadata at 50 %, the sold storage at four
-times the pool's data, or 1,000 volumes), a database volume at 80 % or 90 % of its space or
+(`regional_node_pool_closed`: the smallest size class on offer fits no node, for pool data at 80 %,
+pool metadata at 50 %, the sold storage plus that class past four times the pool's data, 1,000
+volumes, or RAM or CPU at 80 %), a database volume at 80 % or 90 % of its space or
 inodes (`database_volume_warning`, `database_volume_critical`), an enrollment token that was presented again or too late
 (`node_enrollment_refused`) and a node that rebooted without a maintenance order
-(`node_unexpected_reboot`). Each minute-cron step runs in its own failure boundary, and the
-`CronWatchdog` Durable Object (binding `CRON_WATCHDOG`) judges the cron's heartbeat from its own
-alarm, independently of the cron trigger, raising `control_cron_stalled` and
-`control_cron_step_failing`. Every event carries a short runbook `action`; the
+(`node_unexpected_reboot`). Each minute-cron step runs in its own failure boundary with a time
+bound of its own, and the `CronWatchdog` Durable Object (binding `CRON_WATCHDOG`) evaluates every
+alert once a minute from its own alarm, independently of the cron trigger, and judges the cron's
+heartbeat, raising `control_cron_stalled` and `control_cron_step_failing`. Every event carries a short runbook `action`; the
 [alert runbook](docs/operations/infrastructure-backups.md#alert-kinds-and-runbook-actions)
 lists each kind's rule and action.
 

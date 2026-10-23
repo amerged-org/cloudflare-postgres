@@ -81,8 +81,9 @@
     "bindings": [
       { "name": "NODE_ACTOR", "class_name": "NodeActor" },
       { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
-      // Checks the minute cron's heartbeat from its own alarm; keep the binding and the v4 migration
-      // in every deployed configuration so a stopped or failing cron is still reported.
+      // Evaluates every alert once a minute from its own alarm and checks the minute cron's heartbeat
+      // there; the cron only arms it. Keep the binding and the v4 migration in every deployed
+      // configuration: without them no alert is evaluated and a stopped cron is not reported.
       { "name": "CRON_WATCHDOG", "class_name": "CronWatchdog" },
       // Visits every DatabaseActor every DATABASE_ACTOR_WARM_INTERVAL_MS from its alarm; the minute
       // cron arms it. Keep the binding and the v7 migration while the interval is not 0.

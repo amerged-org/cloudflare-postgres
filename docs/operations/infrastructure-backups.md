@@ -25,12 +25,14 @@ Apply migration `0053_cron_heartbeat_and_alert_kinds.sql` with the Worker that
 introduces it, and keep the `CRON_WATCHDOG` Durable Object binding and its migration
 (`new_sqlite_classes: ["CronWatchdog"]`, tag `v4` in `apps/api/wrangler.example.jsonc`;
 use the next unused tag of the deployed configuration) in every deployed configuration:
-the [cron watchdog](#minute-cron-heartbeat-and-watchdog) reports a stopped or failing
-cron from that class's alarm. A Worker without the binding keeps running and logs
-`cron_watchdog_unavailable` once per run; a Worker without the table logs
-`cron_heartbeat_failed` and still runs every step. After the deploy, read
+the [cron watchdog](#minute-cron-heartbeat-and-watchdog) is the clock of every alert: its
+alarm evaluates all alerts of all regions once a minute and reports a stopped or failing
+cron. A Worker without the binding keeps running its cron steps and logs
+`cron_watchdog_unavailable` once per run, but evaluates no alert at all; a Worker without
+the table logs `cron_heartbeat_failed` and still runs every step. After the deploy, read
 `GET /v1/operational-health?scope=regions`: `cron.last_completed_at` must advance each
-minute and `cron.watchdog_checked_at` must follow. The watchdog is armed by the first cron
+minute and `cron.watchdog_checked_at` must follow, and the Worker's logs hold one
+`alert_evaluation` line a minute. The watchdog is armed by the first cron
 run after the deploy, so a cron that never runs again after it is not reported. Rolling the
 Worker back below this release first needs
 `DELETE FROM infrastructure_alerts WHERE kind IN ('database_archive_failing','database_base_backup_stale','thin_storage_blocked','control_cron_stalled','control_cron_step_failing')`,
@@ -400,7 +402,7 @@ the same error has the same event ID and a new `occurred_at`.
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time | fixed | Check its scheduled backup and R2 access; `backup.status` in `GET /v1/operational-health?scope=databases` |
 | `thin_storage_blocked` | a node's newest sample says its thin pool has no room, or a node that holds databases has no sample of its pool within 180 s | fixed | With `thin_pool_no_room`, free space by deleting databases on the node; with `thin_pool_unobserved`, fix the node's samples |
 | `regional_node_capacity_refusals` | a node refused 5 or more wakes for awake capacity (`57P03` "node at awake capacity") in the last 10 minutes | fixed | Move the node's most active databases to another node, or add a node |
-| `regional_node_pool_closed` | a node's newest sample closes the node for placement: thin pool data at 80 % or more, metadata at 50 % or more, the storage sold (its reported volumes plus the databases it has not finished) at 4 times its data, or 1,000 volumes or more | fixed | Nothing is created, restored or moved there; running databases keep running. Delete databases on the node, or add a node |
+| `regional_node_pool_closed` | the region cannot place the smallest size class on offer (the enabled class with the least memory, CPU and storage): a node's newest sample closes it, with thin pool data at 80 % or more, metadata at 50 % or more, the storage sold (its reported volumes plus the databases it has not finished) plus that class past 4 times its data, or 1,000 volumes or more; or no node that reports, is open for new databases and has a pool with room has the RAM or CPU for that class (the 80 % of the 30-minute average), and then every such node is listed | fixed; ends once the class fits again | Nothing is created, restored or moved there; running databases keep running. Delete databases on the node, or add a node |
 | `database_volume_warning` | a database volume's space or inodes are at least 80 % used and below 90 % | fixed; the volume's newest report of at most 180 s (the node posts one every 60 s) | Raise its storage with `PUT /v1/databases/{id}/resources`, or have the integrator free space |
 | `database_volume_critical` | a database volume's space or inodes are at least 90 % used | fixed; same report | Raise its storage now: a full volume stops the database |
 | `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed; the episode lists the nodes in `node_ids` | If you did not retry the install, treat the token as leaked: read the `node_enrollment_refused` log and reinstall the node, which issues new tokens |
@@ -460,25 +462,43 @@ Rules of the database and Thin storage kinds:
 
 ## Minute cron heartbeat and watchdog
 
-The minute cron runs these steps in order: `health_alerts`, `capacity_alerts`,
-`infrastructure_backup_dispatch`, then `admission_recovery`, `node_fencing`,
-`resource_profile_rollouts`, `power_timeouts`, `operation_timeouts`, `role_deletion_timeouts`,
-`idempotency_purge`, `node_hints`, `database_actors`, `actor_warmers`, `usage`,
-`node_capacity`, `retained_archives` and `backup_retention`. Alerting needs only D1 and a bounded send, so it
-leads, and the daily backup dispatch follows ahead of the steps that call out to other
-systems: a step that fails, is slow or exhausts the invocation's D1 statement budget cannot
-starve them. A step that hangs still holds back the steps after it in that run; the stall
-alarm reports it.
+The minute cron runs these steps in order: `infrastructure_backup_dispatch`, then
+`admission_recovery`, `node_fencing`, `resource_profile_rollouts`, `power_timeouts`,
+`operation_timeouts`, `role_deletion_timeouts`, `idempotency_purge`, `node_hints`,
+`database_actors`, `actor_warmers`, `usage`, `node_capacity`, `retained_archives` and
+`backup_retention`. **The alerts are no step of the cron.** The `CronWatchdog` Durable Object
+evaluates every alert of every region from its own alarm once a minute (the health alarms, the
+capacity alarms and the judgement of the cron's heartbeat), so a step that is slow or hangs, a
+run that does not start and a cron trigger that is gone cannot hold an alert back. Measured on
+2026-10-23 (323 runs logged between 11:00 and 18:15 UTC, EU1 under test load): a run took 125 s
+at the median, 491 s at the 90th percentile and up to 10,090 s, only 13 % ended within the minute,
+and no run completed for 925 s (14:42:20 to 14:57:45) and for 1,163 s (16:04:34 to about 16:24),
+while the alarm chain kept firing. The inode alert of that afternoon came 315 s after the refusal
+at 14:55:03; the node posts volumes every 60 s, and the logs do not separate that interval from
+the late runs.
 
-Each step runs in its own failure boundary. A step that throws is logged as
-`cron_step_failed` (`step`, `error_code` and a redacted `message`; the heartbeat and the
+Each step runs in its own failure boundary and has 240 s. A step that throws is logged as
+`cron_step_failed` (`step`, `error_code`, a redacted `message` and `ms`; the heartbeat and the
 alerts carry the code only), counted in the heartbeat and returned in the run's
-`step_failures`, and the steps after it still run. A region whose capacity decision or
-alert evaluation fails does not stop the other regions, and one kind that fails to evaluate
-does not stop the other kinds of its region. A run spends at most 20 s sending
-notifications; the rest stay unclaimed, are logged as `infrastructure_alert_deferred` and
-are sent by the next run. The Worker's own cron outcome stays successful when steps fail:
-read `cron` in the health route and the alarms, not the cron trigger's error rate.
+`step_failures`, and the steps after it still run. A step that has not answered after 240 s is
+abandoned the same way with the `error_code` `step_timeout`: what it left unfinished is picked up
+by the next run. A region whose capacity decision or alert evaluation fails does not stop the
+other regions, and one kind that fails to evaluate does not stop the other kinds of its region.
+The Worker's own cron outcome stays successful when steps fail: read `cron` in the health route
+and the alarms, not the cron trigger's error rate.
+
+The run logs one `cron_completed` line: the `colo` it ran in and `step_ms`, the milliseconds of
+each step in the order they ran. A step that is slow only because every D1 statement crosses an
+ocean shows as a colo far from the D1 primary (WEUR for Dev) with `step_ms` that grow with the
+statements of the step.
+
+The alarm logs one `alert_evaluation` line a minute: `duration_ms`, `phase_ms` for its three
+phases (`health_alerts`, `capacity_alerts`, `cron_watchdog`) and `failed`, the phases that threw or
+did not answer within 30 s (`alert_phase_failed` names the phase, the `error_code` and a redacted
+message). A phase that fails does not stop the phases after it. An evaluation spends at most 20 s
+sending notifications; the rest stay unclaimed, are logged as `infrastructure_alert_deferred` and
+are sent by the next evaluation. A line a minute, with `cron.watchdog_checked_at` following it,
+is the proof that the alerts are judged every minute.
 
 The run records its heartbeat in D1 (`cron_heartbeat`, one row): `started_at` when it
 begins and `completed_at` once every step was attempted, with each failing step's
@@ -492,21 +512,19 @@ with a `status`:
 | `stalled` | no run completed for more than 300 s |
 | `unknown` | no run has been recorded yet |
 
-The `CronWatchdog` Durable Object judges that heartbeat once a minute from its own alarm
-and raises `control_cron_stalled` and `control_cron_step_failing` in every region. It is
-independent of the cron because the cron does not schedule it: the cron only arms the
-alarm (idempotently, at the start of each run), and every alarm schedules the next one
-before it evaluates anything. It therefore keeps firing when the Worker's cron trigger is
-removed by a deployment, when a step hangs and runs never complete, and when every step
-fails. It does not cover the Worker being undeployed or D1 being unreachable. Its
-evaluations are visible as `watchdog_checked_at`; a value that stops advancing means the
-alarm chain is not running (check the `CRON_WATCHDOG` binding and its `v4` migration).
-While the cron is stalled its step counters are those of its last completed run, so a
-`control_cron_step_failing` episode is kept and neither started nor cleared.
+The watchdog's alarm is independent of the cron because the cron does not schedule it: the cron
+only arms the alarm (idempotently, at the start of each run), and every alarm schedules the next
+one before it evaluates anything. It therefore keeps firing when the Worker's cron trigger is
+removed by a deployment or its invocations do not start, when a step hangs and runs never
+complete, and when every step fails. It does not cover the Worker being undeployed or D1 being
+unreachable. Its evaluations are visible as `watchdog_checked_at`, the start of the latest one; a
+value that stops advancing means the alarm chain is not running (check the `CRON_WATCHDOG` binding
+and its `v4` migration). While the cron is stalled its step counters are those of its last
+completed run, so a `control_cron_step_failing` episode is kept and neither started nor cleared.
 
 Reading a stall: `last_started_at` recent with `last_completed_at` old means runs begin
-but do not finish (a step hangs; the invocation's trace shows which call is pending, and
-alerting and backup dispatch keep running because they come first), both old means no run
+but do not finish (a step is slow: `cron_step_failed` with `step_timeout` and `cron_completed`'s
+`step_ms` name it; the alerts keep running because they are no step), both old means no run
 starts (the cron trigger or the deployment).
 
 ## Proving delivery

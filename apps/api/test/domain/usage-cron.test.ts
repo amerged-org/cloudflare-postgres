@@ -32,6 +32,7 @@ const start = Date.parse("2026-01-01T00:00:00.000Z"),
 const resources = { memory_mib: 512, cpu_millicores: 500 };
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   await env.DB.batch([
     env.DB.prepare("DELETE FROM usage_cron_cursor"),
     env.DB.prepare("DELETE FROM region_hint_cursor"),
@@ -921,6 +922,12 @@ describe("raw usage sample retention", () => {
       .bind(id, iso(start + 10 * USAGE_HOUR_MS))
       .run();
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    // The run says which colo it executed in, read from Cloudflare's trace.
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      if (String(input) !== "https://www.cloudflare.com/cdn-cgi/trace")
+        throw new Error("unexpected_fetch");
+      return new Response("fl=1\ncolo=LHR\nip=203.0.113.9\n");
+    });
     const context = createExecutionContext();
     await worker.scheduled(
       createScheduledController({
@@ -940,6 +947,12 @@ describe("raw usage sample retention", () => {
       failed: 0,
       pruned: 6,
     });
+    // The line carries the colo and the time of each step, and nothing else of the trace.
+    expect(summaries[0]).toMatchObject({
+      colo: "LHR",
+      step_ms: { usage: expect.any(Number) },
+    });
+    expect(JSON.stringify(summaries[0])).not.toContain("203.0.113.9");
     // Only the invocation's own backup measurement of the current hour remains.
     const remaining = await perHour(id);
     expect(remaining[0]).toBeUndefined();

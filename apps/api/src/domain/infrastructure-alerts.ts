@@ -915,7 +915,7 @@ async function regionHealthAlerts(
       ...(await readRegionSubjects(env.DB, regionId, now)),
       ...(await readNodeSubjects(env.DB, regionId, now)),
     ]);
-    closed = await closedPools(env.DB, regionId);
+    closed = await closedPools(env.DB, regionId, now);
   } catch (error) {
     readFailure = { error };
   }
@@ -1173,8 +1173,9 @@ const CRON_KINDS = [
 
 /**
  * Judges the minute cron's heartbeat and raises its alarms in every region. It never runs inside
- * the cron: the CronWatchdog Durable Object alarm calls it, so a cron that is stopped, hanging or
- * failing is reported by a clock the cron does not own.
+ * the cron: the CronWatchdog Durable Object alarm calls it (`evaluateAlerts`, which also stamps
+ * `watchdog_checked_at`), so a cron that is stopped, hanging or failing is reported by a clock the
+ * cron does not own.
  */
 export async function runCronWatchdog(
   env: Env,
@@ -1184,11 +1185,6 @@ export async function runCronWatchdog(
   const health = await readCronHealth(env.DB, now);
   // Until the cron has recorded a run there is nothing to judge.
   if (health.status === "unknown") return;
-  await env.DB.prepare(
-    "UPDATE cron_heartbeat SET watchdog_checked_at=? WHERE singleton=1",
-  )
-    .bind(new Date(now).toISOString())
-    .run();
   const detail: EventDetail = {
     cron: {
       last_started_at: health.last_started_at,

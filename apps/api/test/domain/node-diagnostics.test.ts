@@ -12,6 +12,7 @@ import {
 } from "@pgcf/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 import { runCron } from "../../src/cron.ts";
+import { evaluateAlerts } from "../../src/cron-watchdog.ts";
 import { infrastructureAlertStatus } from "../../src/domain/infrastructure-alerts.ts";
 import {
   cleanupFixtures,
@@ -180,7 +181,7 @@ const reboot = async (f: F, body: ReturnType<typeof report> = report()) => {
   }>();
 };
 const episode = async (f: F) => {
-  await runCron(env, Date.now());
+  await evaluateAlerts(env);
   const row = await env.DB.prepare(
     "SELECT active,payload FROM infrastructure_alerts WHERE region_id=? AND kind='node_unexpected_reboot'",
   )
@@ -580,7 +581,7 @@ describe("the diagnostics of a node", () => {
     ).toBe(401);
   });
 
-  it("are deleted by the minute cron after 30 days", async () => {
+  it("are deleted by the alert evaluation after 30 days", async () => {
     const f = await fixture();
     const old = await reboot(
         f,
@@ -593,7 +594,7 @@ describe("the diagnostics of a node", () => {
     await env.DB.prepare("UPDATE node_diagnostics SET received_at=? WHERE id=?")
       .bind(ago(29 * 24 * 60 * MINUTE), recent.id)
       .run();
-    await runCron(env, Date.now());
+    await evaluateAlerts(env);
     const left = await env.DB.prepare(
       "SELECT id FROM node_diagnostics WHERE node_id=?",
     )

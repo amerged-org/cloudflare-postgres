@@ -3,15 +3,13 @@ import { z } from "zod";
 import { Timestamp, type InfraCronFailingStep } from "@pgcf/contracts";
 
 /**
- * The minute cron's steps in execution order. Alerting needs only D1 and a bounded send, so it
- * leads; the daily backup dispatch follows, ahead of the steps that call out to other systems. No
- * more than 20 steps: an alert event lists at most that many failing steps (a payload of 20 at
- * their longest stays under D1's 4 KB check). Every step runs in its own failure boundary (see
- * runCron).
+ * The minute cron's steps in execution order. The daily backup dispatch leads, ahead of the steps
+ * that call out to other systems. No more than 20 steps: an alert event lists at most that many
+ * failing steps (a payload of 20 at their longest stays under D1's 4 KB check). Every step runs in
+ * its own failure boundary and has a time of its own (see runCron). The alerts are no step: the
+ * CronWatchdog alarm evaluates them every minute.
  */
 export const CRON_STEPS = [
-  "health_alerts",
-  "capacity_alerts",
   "infrastructure_backup_dispatch",
   "admission_recovery",
   "node_fencing",
@@ -143,7 +141,7 @@ export const CronHealth = z.strictObject({
     "Latest run that attempted every step, whether or not steps failed.",
   ),
   watchdog_checked_at: Timestamp.nullable().describe(
-    "Latest evaluation by the CronWatchdog Durable Object alarm, which runs independently of the cron trigger; null if it never ran.",
+    "Start of the latest evaluation of the alerts by the CronWatchdog Durable Object alarm, which runs every minute independently of the cron trigger; null if it never ran.",
   ),
   failing_steps: z
     .array(

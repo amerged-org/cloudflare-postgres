@@ -1287,7 +1287,10 @@ data) and **1,000 thin volumes**, the largest count Stage 1 measured on EU1 and 
 `MAX_VOLUMES_PER_NODE` in `apps/api/src/domain/placement.ts`. The bound counts every volume the node
 reports, sleeping databases included, because each holds its volume; at 1,000 the node takes no
 create, restore or move, a resize of a database it already holds still works, and the alert
-`regional_node_pool_closed` fires. A node closed this way cannot take the database that waits, so
+`regional_node_pool_closed` fires. The alert is the region's, not only the node's: it fires when
+the smallest size class on offer (the enabled class with the least memory, CPU and storage) fits no
+node, for the pool, the volume bound, the logical cap (the storage sold plus that class past four
+times the pool's data) or, when no node that reports and is open has them, RAM or CPU at 80 %. A node closed this way cannot take the database that waits, so
 the capacity cron finds a shortage; with `autoscale_enabled` it then adopts the next unused
 `adopt_instance_ids` entry or, with `purchases_enabled` and an `order`, reserves an order addition
 (below). Volumes created between two samples can take a node a little past 1,000, and the bound
