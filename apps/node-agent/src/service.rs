@@ -181,10 +181,19 @@ pub struct Service<M: Machine> {
 /// How often the pool of idle slots is looked at when no start told it to.
 const SLOTS_EVERY: Duration = Duration::from_secs(5);
 
+/// Give the first storage reading a bounded head start before admitting wakes. If the read
+/// stalls, service still comes up, but unknown capacity continues to refuse starts.
+const FIRST_POOL_SAMPLE_BOUND: Duration = Duration::from_secs(1);
+
 /// How often a wake that waits for its page asks for it again, and how often it looks whether it
 /// came.
 const PAGE_RETRY: Duration = Duration::from_secs(1);
 const PAGE_POLL: Duration = Duration::from_millis(10);
+
+/// Which startup measurement a wake result completes.
+fn wake_phase(result: &pgcf_native_protocol::wake::WakeResult) -> Option<&'static str> {
+    (result.outcome == pgcf_native_protocol::wake::Outcome::Started).then_some("first_wake_served")
+}
 
 /// The identifiers of the archive credentials an entry of the page needs: its own, and the one
 /// that reads the archive it is built from.
@@ -292,8 +301,28 @@ impl<M: Machine> Service<M> {
         let policy = Policy::parse(&page.policy).ok_or("the desired page's policy is invalid")?;
         // The slots the last agent left are read back from the kernel before anything is admitted;
         // then the units are what the pool and the units of their own say.
-        machine.adopt_slots().await?;
-        crate::timing::phase("slots_adopted");
+        // The pool loop used to start after gateway service: its first wakes saw an unobserved
+        // pool and were refused despite free space. Sample while independent slot adoption runs,
+        // before constructing admission or serving the gateway. A failed or stuck sample never
+        // grants capacity; the regular pool loop will retry it.
+        let sample = async {
+            match tokio::time::timeout(FIRST_POOL_SAMPLE_BOUND, machine.poll_pool()).await {
+                Ok(Ok(_)) => crate::timing::phase_once("initial_pool_sample"),
+                result => crate::timing::emit_event(json!({
+                    "event": "initial_pool_sample_unavailable",
+                    "class": if result.is_err() { "timeout" } else { "read_failed" },
+                })),
+            }
+        };
+        let adopt = async {
+            let result = machine.adopt_slots().await;
+            if result.is_ok() {
+                crate::timing::phase("slots_adopted");
+            }
+            result
+        };
+        let (adopted, ()) = tokio::join!(adopt, sample);
+        adopted?;
         let units = machine.units().await?;
         crate::timing::phase("units_read");
         let running: Vec<Running> = units
@@ -1257,11 +1286,12 @@ impl<M: Machine> Service<M> {
                     service.catch_up(&request).await;
                 }
                 let result = service.core.wake(&request).await;
-                // `wake_in_progress` is no answer: the gateway asks again.
-                let answered = result.reason.as_deref() != Some("wake_in_progress");
+                // Only a started wake completes this agent-side measurement. A refusal is not
+                // successful availability; end-to-end first SQL is measured by the client.
+                let phase = wake_phase(&result);
                 service.core.gateway.wake_result(result);
-                if answered {
-                    crate::timing::phase_once("first_wake_served");
+                if let Some(phase) = phase {
+                    crate::timing::phase_once(phase);
                 }
             });
         }
@@ -1480,7 +1510,7 @@ impl<M: Machine> Service<M> {
 mod tests {
     use super::*;
     use crate::{
-        agent::testing::{FakeGateway, Rig, eventually, new_entry_json, site, timing},
+        agent::testing::{FakeGateway, Rig, eventually, new_entry_json, site, timing, within},
         link::{
             LinkConfig, Timing as LinkTiming, Transport,
             test_server::{Cloud, database, database_id, tempdir},
@@ -1564,6 +1594,112 @@ mod tests {
             .iter()
             .flat_map(|report| report["databases"].as_array().cloned().unwrap_or_default())
             .any(|db| db["id"] == id && db["state"] == state)
+    }
+
+    #[test]
+    fn a_refused_wake_never_finishes_the_successful_startup_measurement() {
+        use pgcf_native_protocol::wake::{Outcome, WakeResult};
+        let mut result = WakeResult {
+            database: "abcdefghijklmnopqrst".into(),
+            operation: "op_abcdefghijklmnopqrst".into(),
+            generation: 1,
+            outcome: Outcome::Refused,
+            reason: Some("no_room".into()),
+            retry_after_seconds: Some(1),
+            steps_ms: Default::default(),
+        };
+        assert_eq!(wake_phase(&result), None);
+        result.reason = Some("wake_in_progress".into());
+        assert_eq!(wake_phase(&result), None);
+        result.outcome = Outcome::Started;
+        result.reason = None;
+        result.retry_after_seconds = None;
+        assert_eq!(wake_phase(&result), Some("first_wake_served"));
+    }
+
+    /// The first wake used to race the first pool-loop sample and refuse `no_room` even with
+    /// capacity available. Gateway service must wait for that initial sample attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_pool_sample_precedes_gateway_service() {
+        let Some((machine, _fixture, _root)) =
+            site("first-pool", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let gate = machine.hold_pool_samples();
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let (link, events) = Link::start(
+            LinkConfig {
+                paths: crate::link::Paths::new(&base),
+                image_version: "25".into(),
+                agent_version: "0.1.0".into(),
+                release_id: None,
+                os: crate::machine::os_report(&*machine).await.unwrap(),
+                timing: LinkTiming::default(),
+            },
+            Transport::new(cloud.roots()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let starting = tokio::spawn(Service::start(
+            machine.clone(),
+            link,
+            events,
+            ServiceConfig {
+                intervals: quick(),
+                timing: timing(),
+                gateway: None,
+                release_key: test_release_key(),
+            },
+        ));
+        eventually(10, "the first pool read to begin", || {
+            machine.pool_reads() > 0
+        })
+        .await;
+        assert!(
+            !starting.is_finished(),
+            "gateway service preceded its first pool sample"
+        );
+        gate.add_permits(1);
+        let service = tokio::time::timeout(Duration::from_secs(10), starting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        service.stop();
+    }
+
+    /// An unreadable pool must not stall the service forever or admit a start on unknown room.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stuck_first_pool_sample_keeps_admission_closed_without_stalling_service() {
+        let Some((machine, _fixture, _root)) = site("first-pool-stuck", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        let gate = machine.hold_pool_samples();
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let service = within(
+            10,
+            "the service with an unreadable pool",
+            serve(&machine, &cloud, &base),
+        )
+        .await;
+        assert_eq!(
+            machine.room(&service.core.policy().storage),
+            Err(crate::storage::NoRoom::Unobserved)
+        );
+        gate.add_permits(1);
+        eventually(
+            5,
+            "the next successful pool sample to open admission",
+            || machine.room(&service.core.policy().storage).is_ok(),
+        )
+        .await;
+        service.stop();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2075,13 +2211,42 @@ mod tests {
             (Outcome::Refused, Some("wake_in_progress"))
         );
         assert!(!machine.calls().iter().any(|call| call.starts_with("start")));
-        // The bound asked systemd about its databases, and the two that were decided on, the
-        // database of the wake among them, asked again with the first pull of the link.
-        let service = starting.await.unwrap().unwrap();
+        let service = within(60, "the agent to start", starting)
+            .await
+            .unwrap()
+            .unwrap();
+        // The bound is on the databases that a page asked about. The two of the wakes are asked
+        // about outside it: the one that was decided on is asked again with each pull of the
+        // link, and the one that was not is asked about by its wake whether or not it holds one
+        // of the turns. The others are asked about once, by the turns, and none of them answers.
+        let by_the_turns = |reads: &std::collections::BTreeMap<String, u64>| {
+            reads
+                .iter()
+                .filter(|(id, _)| **id != ids[0] && **id != ids[1])
+                .map(|(id, count)| (id.clone(), *count))
+                .collect::<Vec<_>>()
+        };
+        // Every turn is taken: by 16 of the others, or by 15 when the database of the second
+        // wake holds one itself.
+        eventually(30, "the turns of the first pass to be taken", || {
+            by_the_turns(&machine.unit_reads_by_database()).len() + 1
+                >= crate::agent::FIRST_PASS_AT_ONCE
+        })
+        .await;
+        let reads = machine.unit_reads_by_database();
+        let asked = by_the_turns(&reads);
         assert!(
-            machine.reads().1 <= crate::agent::FIRST_PASS_AT_ONCE as u64 + 2,
-            "{} reads of units",
-            machine.reads().1
+            asked.len() <= crate::agent::FIRST_PASS_AT_ONCE,
+            "{} databases asked about by the first pass",
+            asked.len()
+        );
+        assert!(
+            asked.iter().all(|(_, count)| *count == 1),
+            "a database is asked about again while its first read waits: {asked:?}"
+        );
+        assert!(
+            reads.get(&ids[1]).is_none_or(|count| *count <= 1),
+            "the database of the second wake is asked about again while its first read waits"
         );
         let undecided = |service: &Service<crate::machine::local::Local>| {
             service
@@ -4436,6 +4601,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_gateway_that_does_not_answer_keeps_no_crash_from_being_found() {
+        use std::sync::atomic::{AtomicU64, Ordering};
         use tokio::io::{AsyncBufReadExt, BufReader};
         let Some((machine, _fixture, _root)) =
             site("watch-silent", &|root| root.join("r/agent/archive.sock"))
@@ -4489,26 +4655,47 @@ mod tests {
         eventually(90, "ready", || handle.phase() == crate::agent::Phase::Ready).await;
 
         // A gateway that reads the agent's requests and answers none: each idle check of the
-        // database waits for it in vain.
+        // database waits for it in vain. Keep the first request's id to prove it is still
+        // waiting when the independent unit watch finds the crash.
         let stream = tokio::net::UnixStream::connect(machine.layout().gateway_socket())
             .await
             .unwrap();
-        let mut lines = BufReader::new(stream).lines();
-        loop {
-            let line = lines.next_line().await.unwrap().unwrap();
-            if matches!(
-                pgcf_native_protocol::agent::decode_to_gateway(line.as_bytes()),
-                Ok(ToGateway::Activity { .. })
-            ) {
-                break;
+        let request = Arc::new(AtomicU64::new(0));
+        let reading = tokio::spawn({
+            let request = request.clone();
+            async move {
+                let mut lines = BufReader::new(stream).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(ToGateway::Activity { id, .. }) =
+                        pgcf_native_protocol::agent::decode_to_gateway(line.as_bytes())
+                    {
+                        let _ = request.compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst);
+                    }
+                }
             }
+        });
+        let asked = std::time::Instant::now();
+        while request.load(Ordering::SeqCst) == 0 {
+            assert!(
+                asked.elapsed() < Duration::from_secs(30),
+                "timed out: the idle check to ask the gateway about the database, which is {:?}",
+                handle.phase()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // The postmaster dies while an idle check waits: the watch of the units finds it at once.
+        // The postmaster dies while an idle check waits: the watch of the units finds it before
+        // that request gives up waiting for the gateway.
+        let request = request.load(Ordering::SeqCst);
         machine.crash(&id);
-        eventually(2, "the crash to be found", || {
+        eventually(30, "the crash to be found", || {
             handle.phase() != crate::agent::Phase::Ready
         })
         .await;
+        assert!(
+            service.core.gateway.waiting_for_reply(request),
+            "the crash was found after the idle check gave up waiting for the gateway"
+        );
+        reading.abort();
         service.stop();
     }
 }

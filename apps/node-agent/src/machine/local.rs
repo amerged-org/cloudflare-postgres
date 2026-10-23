@@ -186,8 +186,11 @@ struct State {
     /// systemd does, and the questions asked: what a reconciliation that retries costs.
     volume_reads_fail: u32,
     unit_reads_fail: u32,
+    pool_sample_gate: Option<Arc<tokio::sync::Semaphore>>,
+    pool_reads: u64,
+    pool_unobserved: bool,
     volume_reads: u64,
-    unit_reads: u64,
+    unit_reads: BTreeMap<String, u64>,
     /// The databases whose unit reads wait for `release_unit_reads`: a systemd that is slow to
     /// answer about them.
     held_units: BTreeSet<String>,
@@ -550,8 +553,9 @@ impl Local {
     }
     /// Whether `database` has a postmaster running, in a slot or as a unit of its own.
     pub fn running(&self, database: &str) -> bool {
+        let slot = self.pool.slot_of(database);
         let mut state = self.state();
-        if let Some(slot) = self.pool.slot_of(database) {
+        if let Some(slot) = slot {
             return state
                 .slots
                 .get_mut(&slot)
@@ -566,11 +570,11 @@ impl Local {
     /// Whether the postmaster of `database` has written `ready` to its `postmaster.pid`, which the
     /// kernel shows to whoever reads the volume, mounted by the agent or not.
     pub fn postmaster_ready(&self, database: &str) -> bool {
+        let Some(slot) = self.pool.slot_of(database) else {
+            return false;
+        };
         let pid = {
             let mut state = self.state();
-            let Some(slot) = self.pool.slot_of(database) else {
-                return false;
-            };
             let unit = state.slots.get_mut(&slot);
             unit.and_then(|unit| {
                 (unit.postgres && unit.alive())
@@ -582,8 +586,9 @@ impl Local {
     }
     /// SIGKILL: a crash the units do not report.
     pub fn crash(&self, database: &str) {
+        let slot = self.pool.slot_of(database);
         let mut state = self.state();
-        let child = match self.pool.slot_of(database) {
+        let child = match slot {
             Some(slot) => state.slots.get_mut(&slot).and_then(|unit| {
                 unit.lock = None;
                 unit.child.take().inspect(|_| unit.crashed = true)
@@ -662,6 +667,16 @@ impl Local {
     /// The size of the filesystem on the volume.
     pub fn filesystem(&self, id: &VolumeId) -> Option<u64> {
         self.state().filesystems.get(id).copied()
+    }
+    pub fn hold_pool_samples(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut state = self.state();
+        state.pool_sample_gate = Some(gate.clone());
+        state.pool_unobserved = true;
+        gate
+    }
+    pub fn pool_reads(&self) -> u64 {
+        self.state().pool_reads
     }
     pub fn set_no_room(&self, no_room: bool) {
         self.state().no_room = no_room;
@@ -781,7 +796,10 @@ impl Local {
     /// How often `has_volume` was asked, and how often `unit` was.
     pub fn reads(&self) -> (u64, u64) {
         let state = self.state();
-        (state.volume_reads, state.unit_reads)
+        (state.volume_reads, state.unit_reads.values().sum())
+    }
+    pub fn unit_reads_by_database(&self) -> BTreeMap<String, u64> {
+        self.state().unit_reads.clone()
     }
     /// A unit that exists and is stopped, as one is after a stop or a boot.
     pub fn add_stopped_unit(&self, database: &str) {
@@ -1231,6 +1249,15 @@ impl Machine for Local {
         })
     }
     async fn poll_pool(&self) -> Result<PoolSample, storage::Error> {
+        let gate = {
+            let mut state = self.state();
+            state.pool_reads += 1;
+            state.pool_sample_gate.clone()
+        };
+        if let Some(gate) = gate {
+            let _permit = gate.acquire().await.unwrap();
+        }
+        self.state().pool_unobserved = false;
         Ok(PoolSample {
             observed: Instant::now(),
             data_total_bytes: 100 << 30,
@@ -1242,7 +1269,10 @@ impl Machine for Local {
         })
     }
     fn room(&self, _policy: &storage::Policy) -> Result<(), NoRoom> {
-        if self.state().no_room {
+        let state = self.state();
+        if state.pool_unobserved {
+            Err(NoRoom::Unobserved)
+        } else if state.no_room {
             Err(NoRoom::Reserve)
         } else {
             Ok(())
@@ -1316,7 +1346,7 @@ impl Machine for Local {
     async fn unit(&self, database: &str) -> Result<UnitState, units::Error> {
         let held = {
             let mut state = self.state();
-            state.unit_reads += 1;
+            *state.unit_reads.entry(database.to_string()).or_default() += 1;
             state.held_units.contains(database)
         };
         if held {
@@ -1485,14 +1515,19 @@ impl Machine for Local {
     /// database a slot holds, if there is exactly one.
     fn caller(&self, _uid: u32, pid: u32) -> Option<String> {
         let databases = self.pool.databases();
+        // Never hold the machine's state while asking the pool: a pool sweep holds its table
+        // while it reads the machine's process state through `Host::alive`.
+        let slots: Vec<_> = databases
+            .iter()
+            .filter_map(|database| self.pool.slot_of(database).map(|slot| (database, slot)))
+            .collect();
         let postmasters: Vec<(String, u32)> = {
             let state = self.state();
-            databases
+            slots
                 .iter()
-                .filter_map(|database| {
-                    let slot = self.pool.slot_of(database)?;
-                    let main = state.slots.get(&slot)?.child.as_ref()?.id();
-                    Some((database.clone(), main))
+                .filter_map(|(database, slot)| {
+                    let main = state.slots.get(slot)?.child.as_ref()?.id();
+                    Some(((*database).clone(), main))
                 })
                 .collect()
         };

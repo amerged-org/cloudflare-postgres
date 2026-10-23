@@ -969,8 +969,21 @@ impl<H: Host> Pool<H> {
         for unit in &ended {
             self.mend(unit.slot, unit).await;
         }
-        for unit in units {
+        // The idle supervisors and their runtime limits are independent. EU1 took up to 6.4 s
+        // to adopt 82 slots serially; use the existing D-Bus call bound, while keeping publication
+        // in unit order. No bind can run before adoption finishes.
+        use futures_util::StreamExt;
+        let mut classified = futures_util::stream::iter(units.into_iter().map(|unit| async move {
             let class = self.classify(&unit).await?;
+            if matches!(class, Class::Idle) {
+                // Whatever the last agent set before it died, restore idle limits first.
+                self.host.set(unit.slot, &super::limits::idle()).await?;
+            }
+            Ok::<_, Error>((unit, class))
+        }))
+        .buffered(super::CALLS_IN_FLIGHT);
+        while let Some(next) = classified.next().await {
+            let (unit, class) = next?;
             let slot = unit.slot;
             let kept = |state: State, volume: Option<VolumeId>| Slot {
                 state,
@@ -981,8 +994,6 @@ impl<H: Host> Pool<H> {
             };
             match class {
                 Class::Idle => {
-                    // Whatever the last agent set before it died, the idle limits go on again.
-                    self.host.set(slot, &super::limits::idle()).await?;
                     self.table().slots.insert(slot, kept(State::Idle, None));
                     adopted.idle.push(slot);
                 }
@@ -1423,6 +1434,8 @@ mod tests {
         start_gate: Option<Arc<tokio::sync::Semaphore>>,
         /// Making a user waits here for a permit, as `useradd` takes its time.
         user_gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// Idle supervisor answers wait for permits during adoption.
+        ping_gate: Option<Arc<tokio::sync::Semaphore>>,
         /// Every user the pool asked for, in order.
         ensured: Vec<u32>,
     }
@@ -1668,7 +1681,14 @@ mod tests {
             if self.failing("ping") {
                 return Err(refused("ping"));
             }
-            self.state().calls.push(format!("ping {slot}"));
+            let gate = {
+                let mut state = self.state();
+                state.calls.push(format!("ping {slot}"));
+                state.ping_gate.clone()
+            };
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
             Ok(())
         }
         fn alive(&self, slot: u32) -> bool {
@@ -1781,6 +1801,46 @@ mod tests {
     }
     fn pool(sim: &Sim) -> Pool<Sim> {
         Pool::new(sim.clone(), POOL)
+    }
+
+    /// A restarted node has dozens of independent idle supervisors. One slow answer must not
+    /// serialize every other slot, and their fanout must stay within the D-Bus call bound.
+    #[tokio::test]
+    async fn adoption_checks_independent_slots_concurrently_with_a_bound() {
+        let sim = Sim::new();
+        let first = pool(&sim);
+        for _ in 0..20 {
+            first.refill(20).await.unwrap();
+        }
+        sim.clear();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        sim.state().ping_gate = Some(gate.clone());
+        let second = Arc::new(pool(&sim));
+        let adopting = tokio::spawn({
+            let second = second.clone();
+            async move { second.adopt().await }
+        });
+        let pings = || {
+            sim.calls()
+                .iter()
+                .filter(|call| call.starts_with("ping "))
+                .count()
+        };
+        crate::agent::testing::eventually(2, "the adoption checks to overlap", || pings() == 16)
+            .await;
+        assert!(!adopting.is_finished());
+        assert!(
+            second.snapshot().idle == 0,
+            "an unanswered slot is not idle"
+        );
+        gate.add_permits(20);
+        let adopted = tokio::time::timeout(Duration::from_secs(2), adopting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.idle, (0..20).collect::<Vec<_>>());
+        assert_eq!(pings(), 20);
     }
 
     // 1. The binding rule.
