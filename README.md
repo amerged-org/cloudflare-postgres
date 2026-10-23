@@ -227,10 +227,11 @@ infrastructure backup, a running database whose WAL archive is failing
 (`database_archive_failing`), an awake database with no completed base backup within 36 hours of
 awake time (`database_base_backup_stale`; sleeping databases are excluded), a thin pool without
 room or without a sample (`thin_storage_blocked`), a node that keeps refusing wakes for awake
-capacity (`regional_node_capacity_refusals`), a node that placement has closed
-(`regional_node_pool_closed`: the smallest size class on offer fits no node, for pool data at 80 %,
-pool metadata at 50 %, the sold storage plus that class past four times the pool's data, 1,000
-volumes, or RAM or CPU at 80 %), a database volume at 80 % or 90 % of its space or
+capacity (`regional_node_capacity_refusals`), a region that
+placement has closed (`regional_node_pool_closed`: the smallest size class on offer fits no node,
+for pool data at 80 %, pool metadata at 50 %, the sold storage plus that class past four times
+the pool's data, 1,000 volumes, or RAM or CPU at 80 %; a full node beside a node that takes the
+class is no episode), a database volume at 80 % or 90 % of its space or
 inodes (`database_volume_warning`, `database_volume_critical`), an enrollment token that was presented again or too late
 (`node_enrollment_refused`) and a node that rebooted without a maintenance order
 (`node_unexpected_reboot`). Each minute-cron step runs in its own failure boundary with a time

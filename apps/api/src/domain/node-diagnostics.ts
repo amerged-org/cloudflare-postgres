@@ -293,7 +293,7 @@ export async function openDiagnosticRequests(
   return rows.results.map((row) => NodeDiagnosticRequest.parse(row));
 }
 
-/** Deletes the reports older than 30 days. The minute cron calls it. */
+/** Deletes the reports older than 30 days. The health phase of the CronWatchdog alarm's alert evaluation calls it. */
 export async function purgeNodeDiagnostics(
   db: D1Database,
   now = Date.now(),

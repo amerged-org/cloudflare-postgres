@@ -21,6 +21,7 @@ import {
   placementNodes,
   type PlacementNeed,
 } from "../../src/domain/placement.ts";
+import { closedPools } from "../../src/domain/placement-closed.ts";
 import {
   forgetSamples,
   GIB,
@@ -414,6 +415,72 @@ it("closes the pool of a node that takes no new databases once the smallest clas
   await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
   expect(closed()).toHaveLength(1);
   expect(closed()[0]).toMatchObject({ node_ids: [f.node] });
+});
+
+it("calls a region closed for the pool only when no node can take the smallest class: one node at the logical cap beside an open node is no episode, and both at it are one that lists both", async () => {
+  const f = await fixture(0),
+    second = await addNode(f.region, 0),
+    hook = receiver(),
+    at = Date.now();
+  const closed = () =>
+    hook.events.filter((event) => event.kind === "regional_node_pool_closed");
+  // The pools of 100 GiB sell 400 GiB. The first has 396 GiB sold: the 5 GiB class does not fit
+  // under its cap. The second is open, at 10 % RAM, and placement chooses it.
+  const sold = pool({ nominal: 396 * GIB });
+  await seedSamples(f.node, steady(at, 40, { ramPpm: 100_000, pool: sold }));
+  await seedSamples(second, steady(at, 40, { ramPpm: 100_000 }));
+  const nodes = await placementNodes(env.DB, f.region, at);
+  expect(choosePlacement(nodes, SMALLEST, at)?.id).toBe(second);
+  expect(await closedPools(env.DB, f.region, at)).toEqual([]);
+  await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+  expect(closed()).toEqual([]);
+  // The second reaches the cap as well: no node takes the class, the region is closed and the
+  // episode names both nodes.
+  await seedSamples(second, [{ at: at + MINUTE, pool: sold }]);
+  await runInfrastructureHealthAlerts(hook.env, at + MINUTE, hook.fetcher);
+  expect(closed()).toHaveLength(1);
+  expect(closed()[0]?.node_ids?.slice().sort()).toEqual(
+    [f.node, second].sort(),
+  );
+  expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+    active: true,
+  });
+  // A database is deleted on the first: the class fits there again, and the episode ends with
+  // the second node still at the cap.
+  await seedSamples(f.node, [{ at: at + 2 * MINUTE, pool: pool({}) }]);
+  await runInfrastructureHealthAlerts(hook.env, at + 2 * MINUTE, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+    active: false,
+  });
+  expect(closed()).toHaveLength(1);
+});
+
+it("keeps the episode of a region whose open node is out of RAM while another is at the logical cap, and ends it when either node takes the class", async () => {
+  const f = await fixture(0),
+    second = await addNode(f.region, 0),
+    hook = receiver(),
+    at = Date.now();
+  const closed = () =>
+    hook.events.filter((event) => event.kind === "regional_node_pool_closed");
+  // The first node is at the cap; the second has a pool with room and 90 % RAM: nothing fits.
+  await seedSamples(
+    f.node,
+    steady(at, 40, { ramPpm: 100_000, pool: pool({ nominal: 396 * GIB }) }),
+  );
+  await seedSamples(second, steady(at, 40, { ramPpm: 900_000 }));
+  await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
+  expect(closed()).toHaveLength(1);
+  expect(closed()[0]?.node_ids?.slice().sort()).toEqual(
+    [f.node, second].sort(),
+  );
+  // The second one's RAM falls to 50 % over the window: it takes the class, the episode ends.
+  await forgetSamples(second);
+  await seedSamples(second, steady(at + 5 * MINUTE, 40, { ramPpm: 500_000 }));
+  await runInfrastructureHealthAlerts(hook.env, at + 5 * MINUTE, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+    active: false,
+  });
 });
 
 it("closes the region when its only node has no RAM or CPU left for the smallest class, and opens it when the node has", async () => {

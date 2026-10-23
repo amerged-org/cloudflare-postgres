@@ -332,8 +332,8 @@ and separately configured regional capacity alarms.
 Per-node threshold warnings use the same delivery. Set `node_ram_warning_threshold_ppm`,
 `node_cpu_warning_threshold_ppm` or `node_storage_warning_threshold_ppm` through
 `PUT /v1/regions/{id}/capacity-policy` to an integer from 1 to 1000000 parts per
-million (`850000` means 85%); `null` disables one. The cron checks every node of a
-policy region each minute:
+million (`850000` means 85%); `null` disables one. The alert evaluation of the `CronWatchdog`
+alarm checks every node of a policy region once a minute:
 
 - RAM is the 30-minute average of the node's active RAM, (MemTotal - MemAvailable) / MemTotal,
   over its own samples.
@@ -402,7 +402,7 @@ the same error has the same event ID and a new `occurred_at`.
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time | fixed | Check its scheduled backup and R2 access; `backup.status` in `GET /v1/operational-health?scope=databases` |
 | `thin_storage_blocked` | a node's newest sample says its thin pool has no room, or a node that holds databases has no sample of its pool within 180 s | fixed | With `thin_pool_no_room`, free space by deleting databases on the node; with `thin_pool_unobserved`, fix the node's samples |
 | `regional_node_capacity_refusals` | a node refused 5 or more wakes for awake capacity or for a full start queue (`57P03` "node at awake capacity" or "node busy starting databases") in the last 10 minutes | fixed | Move the node's most active databases to another node, or add a node |
-| `regional_node_pool_closed` | the region cannot place the smallest size class on offer (the enabled class with the least memory, CPU and storage): a node's newest sample closes it, with thin pool data at 80 % or more, metadata at 50 % or more, the storage sold (its reported volumes plus the databases it has not finished) plus that class past 4 times its data, or 1,000 volumes or more; or no node that reports, is open for new databases and has a pool with room has the RAM or CPU for that class (the 80 % of the 30-minute average), and then every such node is listed | fixed; ends once the class fits again | Nothing is created, restored or moved there; running databases keep running. Delete databases on the node, or add a node |
+| `regional_node_pool_closed` | the region cannot place the smallest size class on offer (the enabled class with the least memory, CPU and storage): no node that reports and is open for new databases takes it, by the rule of placement. One node that is full beside a node that takes the class is no episode. The event lists the nodes whose newest sample refuses the class, with thin pool data at 80 % or more, metadata at 50 % or more, the storage sold (its reported volumes plus the databases it has not finished) plus that class past 4 times its data, or 1,000 volumes or more, and, when the nodes that report, are open and have a pool with room have no RAM or CPU for that class (the 80 % of the 30-minute average), every one of those | fixed; ends as soon as one node takes the class again | Nothing is created, restored or moved in the region; running databases keep running. Delete databases on the listed nodes, or add a node |
 | `database_volume_warning` | a database volume's space or inodes are at least 80 % used and below 90 % | fixed; the volume's newest report of at most 180 s (the node posts one every 60 s) | Raise its storage with `PUT /v1/databases/{id}/resources`, or have the integrator free space |
 | `database_volume_critical` | a database volume's space or inodes are at least 90 % used | fixed; same report | Raise its storage now: a full volume stops the database |
 | `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed; the episode lists the nodes in `node_ids` | If you did not retry the install, treat the token as leaked: read the `node_enrollment_refused` log and reinstall the node, which issues new tokens |
@@ -438,7 +438,8 @@ Rules of the database and Thin storage kinds:
   acknowledging it ([recovery](recovery.md#thin-storage-admission-and-recovery)).
 - **Database volumes.** `database_volume_warning` and `database_volume_critical` read the node's
   newest volume report (posted every 60 s, at most 180 s old), not the stored storage sample, so
-  a crossing is seen at the next report and the next minute run raises it. A volume that crosses
+  a crossing is seen at the next report and the next alert evaluation of the `CronWatchdog` alarm
+  (once a minute) raises it. A volume that crosses
   both 80 % and 90 % between two reports raises only the critical alert; the warning is for
   growth slower than the report interval. The stored samples, one per minute for a database
   that can grow and one in each quarter hour (from its first report of it) for a hibernated one, feed `health.disk`, `storage` and
@@ -588,7 +589,7 @@ The notification path is proven by one real alarm rather than a test endpoint. S
 `RESEND_API_KEY` as a Worker secret, `notification_sender` on a domain verified in the
 Resend account and `notification_recipient` through `PUT /v1/infrastructure-backups/config`
 (this does not touch a running backup), then let any episode arm: an existing active
-undelivered one is sent by the next minute run, or read a region's complete policy with
+undelivered one is sent by the next alert evaluation of the `CronWatchdog` alarm (within a minute), or read a region's complete policy with
 `GET /v1/regions/{id}/capacity-policy`, send it back with `node_ram_warning_threshold_ppm`
 set to `1`, wait for the email and send the original object back (a PUT resets omitted
 fields that have a default). `delivered_at` in
