@@ -413,6 +413,26 @@ it("alarms a node that refused five wakes for awake capacity within ten minutes"
   });
 });
 
+it("counts the wakes a full start queue refused with those awake capacity refused", async () => {
+  // A node that cannot start databases fast enough refuses wakes for capacity as one that has no
+  // memory does: 2 + 3 within the window make five.
+  const f = await fixture(0),
+    hook = receiver(),
+    now = Math.floor(Date.now() / MINUTE) * MINUTE + 30_000;
+  await seedSamples(f.node, [
+    { at: now - 9 * MINUTE, refusals: 2 },
+    { at: now - 5 * MINUTE, startQueueRefusals: 2 },
+    { at: now, startQueueRefusals: 0 },
+  ]);
+  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+  expect(await status(f, "regional_node_capacity_refusals")).toBeUndefined();
+  await seedSamples(f.node, [{ at: now + 1000, startQueueRefusals: 1 }]);
+  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
+  expect(hook.events).toMatchObject([
+    { kind: "regional_node_capacity_refusals", node_ids: [f.node] },
+  ]);
+});
+
 async function placed(f: Fixture, name: string) {
   const created = DatabaseWithOperation.parse(
     await (await f.create(name)).json(),

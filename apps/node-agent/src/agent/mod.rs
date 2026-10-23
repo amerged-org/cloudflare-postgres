@@ -75,6 +75,12 @@ pub struct Timing {
     /// run, before it is refused with `wake_in_progress` and the gateway delivers it again (after
     /// `REDELIVER_MS`, 3 s): shorter, so that a wait never overlaps its own redelivery.
     pub adopt_wait: Duration,
+    /// How long a wake whose ticket is ahead of the node's page waits for the page, counted from
+    /// the moment the gateway queued the wake (`Service::catch_up`). A connection right after an
+    /// idle sleep brings the generation the sleep made, and the page follows in 1 to 7 s (EU1,
+    /// 2026-10-23): this covers that, and stays well under the gateway's 25 s bound, so the start
+    /// that follows still has its time.
+    pub page_wait: Duration,
     /// The wait before the first repeat of the boot report that Cloudflare could not take, and the
     /// longest wait.
     pub report_retry: Duration,
@@ -103,6 +109,7 @@ impl Default for Timing {
             recovery_retry: Duration::from_secs(1),
             recovery_retry_maximum: Duration::from_secs(30),
             adopt_wait: Duration::from_secs(2),
+            page_wait: Duration::from_secs(8),
             report_retry: Duration::from_secs(2),
             report_retry_maximum: Duration::from_secs(60),
             host_files_retry: Duration::from_secs(5),

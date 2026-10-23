@@ -895,7 +895,7 @@ describe("what a node reports", () => {
     ).toBe(false);
   });
 
-  it("names every admission refusal with its reason, the retry hint of awake capacity only, and every phase of a wake", () => {
+  it("names every admission refusal with its reason, the retry hint of the refusals that waiting undoes only, and every phase of a wake", () => {
     const eventId = (letter: string) =>
       `${letter.repeat(8)}-1111-4111-8111-111111111111`;
     const admission = {
@@ -957,6 +957,8 @@ describe("what a node reports", () => {
             reason: "no_room",
             retry_after_seconds: undefined,
           },
+          // The start cap alone held the start back past the queue wait.
+          { ...admission, id: eventId("9"), reason: "start_queue" },
           {
             type: "early_sleep",
             id: eventId("e"),
@@ -983,6 +985,7 @@ describe("what a node reports", () => {
       { ...admission, retry_after_seconds: undefined },
       { ...admission, retry_after_seconds: 0 },
       { ...admission, reason: "no_room" },
+      { ...admission, reason: "start_queue", retry_after_seconds: undefined },
       { ...admission, decision: "admitted", retry_after_seconds: undefined },
       { ...admission, decision: "admitted", reason: undefined },
       { ...wake, outcome: "refused" },
