@@ -611,21 +611,31 @@ or `archive_unusable` after the `202`) is not tried again by the node: it abando
 the target stays in `error` and holds nothing on the node. Its error code can change to
 `volume_missing` after the node's agent restarts, because the node has nothing of the target and
 the API names no source for a failed restore. Delete the target and request the restore again with
-a new `Idempotency-Key`. One failure is not covered: a restore is failed by the operation timeout
-(`operation_timeout`) when it has not ended 20 minutes after the node's first `building` report,
-and the node goes on building it. Those 20 minutes include the time the restore waits for the
-node's one big-job slot (one base fetch or base backup at a time, first come first served, for
-every restore and create on the node). A restore that has the node to itself reaches the limit
-only at about 2.5 GiB of data, but restores requested together on one node take turns and time
-out far below that: each holds the slot for about 18 s (xs-sized) to 130 to 180 s (about 0.5 GiB
-of data), so more than about 65 xs-sized or 7 to 9 gate-sized restores at once are longer in the
-queue than 20 minutes, and most or all of them are failed. The build can end ready on the node and
-archive WAL while the API keeps the target `provisioning` with the operation `failed` (the plan's
-11.2 lists it as open). Treat that target the same way: delete it and request the restore again.
-Until it is closed, request restores in batches (at most 40 xs-sized or 4 gate-sized at a time,
-derived from the measured slot times and not tried live), and request the next batch when every
-operation of the previous one has ended. The same wait counts for a create: creates that you send
-together on one node queue for the same slot.
+a new `Idempotency-Key`.
+
+A restore (or a create) is failed by the operation timeout (`operation_timeout`) after 20 minutes
+without progress. The node reports a build that is under way as `building` with every pull of its
+page, and each report restarts the 20 minutes, so a restore that waits for the node's one big-job
+slot (one base fetch or base backup at a time, first come first served, for every restore and create
+on the node) behind other restores is not failed while its node reports it, however long the queue.
+Restores requested together on one node take turns: each holds the slot for about 18 s (xs-sized) to
+130 to 180 s (about 0.5 GiB of data), so the last of a large batch is ready after the sum of the
+slot times of all of them. A build the node reports nothing about for 20 minutes (the node or its
+link is down) is failed `operation_timeout`; it is failed 20 minutes after its placement if the
+node never reported it. **This is built and tested and was not deployed when this was written** (the
+plan's 11.1 row "The operation timeout counts the time without a report" and its 11.2 acceptance).
+On an installation whose release does not have it, the 20 minutes run from the first `building`
+report whatever the progress and include the wait for the slot: restores requested together on one
+node time out far below 2.5 GiB of data, more than about 65 xs-sized or 7 to 9 gate-sized restores
+at once are longer in the queue than 20 minutes and most or all of them are failed, and the build
+can end ready on the node and archive WAL while the API keeps the target `provisioning` with the
+operation `failed`. There delete such a target and request the restore again, and request restores
+in batches (at most 40 xs-sized or 4 gate-sized at a time, derived from the measured slot times and
+not tried live), the next batch when every operation of the previous one has ended. The same wait
+counts for a create: creates that you send together on one node queue for the same slot. A release
+rollout restarts the node's agent, which builds a restore it was working on again from the
+beginning; that costs the restore its time again and does not fail it, except that a restore whose
+first base backup was already DONE is failed `prefix_not_empty` and is requested again.
 
 | `409` reason         | Meaning                                                                                                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -1302,7 +1312,10 @@ with the fence (30 s) and the reinstall of the server (174 to 197 s) the total w
 3.6 h, or about 3 h. **The figure assumes that every restore succeeds, which the sample did not
 show:** until the `archive_unusable` defect is fixed and shown fixed, some databases of a real node
 loss may not restore within that total, and each stays unrestored until you delete its failed target
-and restore again. It is an extrapolation from a sample and not a promise. If the server itself is
+and restore again. It also assumes that the restores of the whole node can be requested together,
+which holds on a release with the progress-based operation timeout (built, not deployed; on an
+older one they go in batches, [2.7](#27-backups-restorable-window-and-restore), and the time
+between batches adds to the total). It is an extrapolation from a sample and not a promise. If the server itself is
 destroyed, ordering a replacement comes first, and the time to order it is not measured.
 
 ### 7.4 EU1 lost
@@ -1488,7 +1501,7 @@ there is.
 | `error.code`                                                    | Meaning                                                                                                                                                                                           |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `superseded`                                                    | a newer intent (resize, delete or power change) replaced it; not a platform fault                                                                                                                 |
-| `operation_timeout`                                             | 20 minutes after the operation was placed or began, whatever progress it made, waiting for the node's big-job slot included ("Regional operation exceeded 20 minutes")                            |
+| `operation_timeout`                                             | no progress for 20 minutes: 20 minutes after the operation was placed, or after the node's last report that a create or restore is `building`, which each pull of the page repeats ("Regional operation exceeded 20 minutes") |
 | `power_busy`, `power_archive`, `power_unknown`, `power_timeout` | a suspend or hibernation was refused or timed out; the database returned to running                                                                                                               |
 | `role_not_droppable`                                            | `database.role.delete`: the role owns objects or holds privileges, so PostgreSQL cannot drop it; it stays unable to log in until they are removed ([2.3](#23-roles-connection-uri-and-passwords)) |
 

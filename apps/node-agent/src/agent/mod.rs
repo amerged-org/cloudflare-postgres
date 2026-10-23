@@ -92,6 +92,11 @@ pub struct Timing {
     /// that time otherwise, so with the default boost of 5 s the event is read inside the burst and
     /// counts no throttling, and at 0 it counts the quota's.
     pub detail: Duration,
+    /// How long a build waits for an archive credential that has not been delivered (its own, or
+    /// its source's) before it fails with `archive_unusable`: the pull that begins or resumes a
+    /// build is also the one that reads the credentials, and a read that failed is made again by
+    /// the next pull (`Core::build`).
+    pub credential_wait: Duration,
 }
 impl Default for Timing {
     fn default() -> Self {
@@ -109,6 +114,7 @@ impl Default for Timing {
             host_files_retry_maximum: Duration::from_secs(300),
             settle: Duration::from_secs(10),
             detail: Duration::from_secs(2),
+            credential_wait: Duration::from_secs(300),
         }
     }
 }
@@ -167,6 +173,9 @@ pub(crate) struct View {
     /// build (it holds the operation, and a generation never writes into another's), and the page
     /// keeps naming the build until the API has ended its operation: it is not begun again.
     pub abandoned_build: Option<String>,
+    /// Since when the build the entry names waits for an archive credential that has not been
+    /// delivered (`Core::build`): it has not begun, and says nothing.
+    pub credential_missing_since_ms: Option<i64>,
     pub phase: Phase,
     pub writer: Option<protocol::Writer>,
     /// The error of `Phase::Error` (`NODE_DATABASE_ERRORS`).
@@ -214,6 +223,7 @@ impl View {
         Self {
             entry: None,
             abandoned_build: None,
+            credential_missing_since_ms: None,
             phase: Phase::Asleep,
             writer: None,
             error: None,

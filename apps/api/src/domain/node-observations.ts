@@ -192,14 +192,21 @@ class Statements {
         ),
     );
   }
-  /** A report that is not an end moves the pending operations of its generation to running. */
-  running(): void {
+  /**
+   * A report that is not an end moves the pending operations of its generation to running. A
+   * create or a restore that the node reports `building` is at work, queued for the node's one
+   * big-job slot, fetching, recovering or taking its first backup, and the node says so with each
+   * pull: the report restarts the clock of its operation, so that the operation timeout counts the
+   * time without a report and not a build that takes turns on a busy node (`building`).
+   */
+  running(building: boolean): void {
     const applied = this.applied();
     this.list.push(
       this.db
         .prepare(
           `UPDATE operations SET status='running',updated_at=?
-           WHERE database_id=? AND project_id=? AND generation<=? AND status='pending' AND ${applied.sql}`,
+           WHERE database_id=? AND project_id=? AND generation<=? AND ${applied.sql}
+             AND (status='pending' OR (?=1 AND status='running' AND kind IN('database.create','database.restore')))`,
         )
         .bind(
           this.now,
@@ -207,6 +214,7 @@ class Statements {
           this.row.project_id,
           this.generation,
           ...applied.bindings,
+          Number(building),
         ),
     );
   }
@@ -625,7 +633,7 @@ async function applyObservation(
         );
         break;
       default:
-        statements.running();
+        statements.running(observation.state === "building");
     }
     return mutation
       ? mutation.batch(statements.list)

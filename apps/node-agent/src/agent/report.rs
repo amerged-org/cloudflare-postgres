@@ -204,6 +204,14 @@ impl<M: Machine> Core<M> {
         let entry = view.entry.as_ref()?;
         let (state, error) = match view.phase {
             Phase::Building => ("building", None),
+            // A build the node has not begun, because it waits for a credential (the agent has
+            // read the state file of the build that a restart cut off, and no more), has nothing
+            // to report.
+            Phase::Asleep | Phase::Unproven
+                if entry.origin.is_some() && !view.state.as_ref().is_some_and(|s| s.built) =>
+            {
+                return None;
+            }
             Phase::Ready | Phase::Quiesce => ("ready", None),
             Phase::Asleep if view.state.as_ref()?.record.is_some() => ("asleep", None),
             Phase::Asleep | Phase::Unproven => ("unproven", None),
@@ -916,6 +924,30 @@ mod tests {
         rig.core.report_posted(&fourth, &[]);
         rig.core.queue_observation(a);
         assert!(rig.core.take_report(&events).is_none());
+    }
+
+    /// The API fails an operation after 20 minutes without a report that its database is building
+    /// (`operation_timeout`): a build on a busy node queues for the node's one big-job slot for
+    /// hours, and what keeps its operation alive is this report with every pull.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_build_under_way_says_building_with_every_pull_however_often_the_api_took_it() {
+        let Some(rig) = Rig::new("report-building").await else {
+            return;
+        };
+        let events = Events::new(Duration::from_secs(60));
+        let entry = rig.entry();
+        let db = rig.core.db(&entry.id);
+        assert!(rig.core.accept(&db, entry.clone()));
+        rig.core.set(&db, |view| view.phase = Phase::Building);
+        for _ in 0..3 {
+            let report = rig.core.take_report(&events).unwrap();
+            assert_eq!(report["databases"][0]["id"], entry.id.as_str());
+            assert_eq!(report["databases"][0]["state"], "building");
+            rig.core
+                .report_posted(&report, std::slice::from_ref(&entry.id));
+            // The API took it; the next pull of the page says it again.
+            assert!(rig.core.accept(&db, entry.clone()));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -26,7 +26,7 @@
 //! abandoned (`Host::abandon`: stopped, its volume and user deleted).
 use super::{
     facts::{self, Backup},
-    job::{Database, Job, Jobs, Outcome, Store},
+    job::{Database, Job, Jobs, Kind, Outcome, Store},
     recovery::{self, Restored},
     server::{Recovery, Registration, Table, log_failed_job, unix_seconds},
     upload_log::UploadLog,
@@ -88,6 +88,9 @@ pub struct Order<'a> {
     pub upload_log: &'a UploadLog,
     /// The operation's id: it names the spool.
     pub operation: &'a str,
+    /// The build was begun before and cut off by a restart of the agent: what the earlier run
+    /// left is not trusted (`Restorer::begin_afresh`).
+    pub resumed: bool,
 }
 
 /// The node's table, jobs and credentials, which the executor works with.
@@ -139,6 +142,9 @@ impl Restorer<'_> {
         phase(order, "listed", &mut lap);
 
         // 2. Its files, into the new database's data directory.
+        if order.resumed {
+            self.begin_afresh(order).await?;
+        }
         let restore = Job::restore(order.source, order.backup_id, &database.data_directory());
         self.barman(order, order.source, restore, "restore")
             .await
@@ -226,6 +232,49 @@ impl Restorer<'_> {
             .ok_or("build_failed")?;
         phase(order, "first_backup", &mut lap);
         Ok(newest)
+    }
+
+    /// What a build that is begun again does before it fetches. The agent that began it went
+    /// away (a release restarts it), and what it started stays: the unit of its fetch, which
+    /// `barman-cloud-restore` would share the destination with and which refuses a destination
+    /// that holds anything, and the files it wrote. The generation is the build's own and no
+    /// client has been near it, so the fetch is stopped and the data directory and the spool go,
+    /// as `build_create` makes a half made cluster again. Nothing is touched when the database's
+    /// own archive already holds a DONE backup: the earlier run got that far, and the WAL this run
+    /// archives next would replace the earlier run's under it. A backup the earlier run began and
+    /// did not finish (barman uploads its `backup.info` as `STARTED` when it begins) is no backup
+    /// of anything and stays where it is.
+    async fn begin_afresh(&self, order: &Order<'_>) -> Result<(), &'static str> {
+        let database = order.database;
+        self.jobs
+            .stop_earlier(&database.id, Kind::Restore)
+            .await
+            .map_err(|_| "build_failed")?;
+        let listing = self
+            .barman(
+                order,
+                order.store,
+                Job::backup_list(order.store),
+                "backup-list",
+            )
+            .await
+            .map_err(|_| "archive_unusable")?;
+        let backups = facts::parse_backup_list(&listing.stdout).map_err(|_| "archive_unusable")?;
+        if backups.iter().any(|backup| backup.status == "DONE") {
+            return Err("prefix_not_empty");
+        }
+        for directory in [
+            database.data_directory(),
+            recovery::spool_directory(&database.volume, order.operation),
+        ] {
+            match std::fs::remove_dir_all(directory) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err("build_failed");
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Runs a barman job of the new database against `store`, to its end; `Failed` for any reason
@@ -327,6 +376,17 @@ mod tests {
         backup_id: &str,
         target_time: Option<&str>,
     ) -> (Result<Backup, &'static str>, Unreached, std::path::PathBuf) {
+        restore_again(node, name, backup_id, target_time, false).await
+    }
+
+    /// The same, of a build that was begun before (`resumed`) or not.
+    async fn restore_again(
+        node: &Node,
+        name: &str,
+        backup_id: &str,
+        target_time: Option<&str>,
+        resumed: bool,
+    ) -> (Result<Backup, &'static str>, Unreached, std::path::PathBuf) {
         use std::os::unix::fs::MetadataExt;
         let volume = node.root.join(name);
         // The user and group the agent hands the recovery files to: the test's own.
@@ -351,6 +411,7 @@ mod tests {
             store: &new_store,
             upload_log: &log,
             operation: "op_dddddddddddddddddddd",
+            resumed,
         };
         let host = Unreached::default();
         let restorer = Restorer {
@@ -405,6 +466,105 @@ mod tests {
                 .join("objects/pgcf-eu/eu-dev/abcdefghijklmnopqrst/g2-op_dddddddddddddddddddd")
                 .exists()
         );
+    }
+
+    /// The agent that began the build went away with the unit of its fetch still running (a unit
+    /// outlives the agent, and every rollout restarts the agent) and part of the destination
+    /// written. barman refuses a destination that holds anything, so the build that is begun
+    /// again must stop the earlier fetch and empty the directory of the generation it builds,
+    /// which no client has seen, before it fetches.
+    #[tokio::test]
+    async fn a_restore_begun_again_stops_the_fetch_of_the_earlier_run_and_fetches_into_an_empty_directory()
+     {
+        let node = Node::start("restore-again", AGENT_BOUND).await;
+        let files = backup_files("restore-again-files", Some(&Capacity::of_class(256, 20)));
+        node.fixture.put_backup(
+            SOURCE,
+            BACKUP,
+            &entry("DONE", Some(SEGMENT_BYTES)),
+            Some(&files),
+        );
+        // The earlier run: a fetch that wrote part of the data directory and is still under way.
+        let volume = node.root.join("again");
+        let earlier = database(&volume);
+        node.fixture.set("restore-slow", "30");
+        let run = tokio::spawn({
+            let (jobs, credentials) = (node.jobs.clone(), node.credentials.clone());
+            let earlier = earlier.clone();
+            async move {
+                let source = store(SOURCE, Access::ReadOnly);
+                let credential = credentials.get(&source.scope, unix_seconds()).unwrap();
+                let job = Job::restore(&source, BACKUP, &earlier.data_directory());
+                jobs.run(&earlier, &job, &credential, None).await
+            }
+        });
+        for _ in 0..200 {
+            if volume.join("data/PARTIAL").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(volume.join("data/PARTIAL").exists());
+        // The agent went away: its client dies, and the unit goes on.
+        run.abort();
+        let _ = run.await;
+        assert_eq!(node.fixture.running_units().len(), 1);
+        node.fixture.clear("restore-slow");
+
+        let (result, host, volume) = restore_again(&node, "again", BACKUP, None, true).await;
+        // The fetch ran to its end and the build went on to the start of the database, which the
+        // host here does not give.
+        assert_eq!(result.unwrap_err(), "start_failed");
+        assert!(host.started.load(Ordering::SeqCst));
+        assert!(node.fixture.running_units().is_empty());
+        assert!(!volume.join("data/PARTIAL").exists());
+        assert_eq!(
+            std::fs::read_to_string(volume.join("data/PG_VERSION")).unwrap(),
+            "18\n"
+        );
+    }
+
+    /// A build that is begun again may not go on over a first base backup that the earlier run
+    /// finished in the database's own archive: the WAL it archives next replaces the earlier
+    /// run's, and the backup would not fit it. One the earlier run did not finish is no reason.
+    #[tokio::test]
+    async fn a_restore_begun_again_is_refused_when_its_own_archive_holds_a_finished_backup() {
+        let node = Node::start("restore-again-archive", AGENT_BOUND).await;
+        let files = backup_files(
+            "restore-again-archive-files",
+            Some(&Capacity::of_class(256, 20)),
+        );
+        node.fixture.put_backup(
+            SOURCE,
+            BACKUP,
+            &entry("DONE", Some(SEGMENT_BYTES)),
+            Some(&files),
+        );
+        let own = "s3://pgcf-eu/eu-dev/abcdefghijklmnopqrst/g2-op_dddddddddddddddddddd";
+        // The earlier run began a first backup and did not finish it: the build goes on.
+        node.fixture.put_backup(
+            own,
+            "20261017T225900",
+            &entry("STARTED", Some(SEGMENT_BYTES)),
+            None,
+        );
+        let (result, host, _) = restore_again(&node, "again-started", BACKUP, None, true).await;
+        assert_eq!(result.unwrap_err(), "start_failed");
+        assert!(host.started.load(Ordering::SeqCst));
+        // One it finished: the build is refused.
+        node.fixture.put_backup(
+            own,
+            "20261017T230000",
+            &entry("DONE", Some(SEGMENT_BYTES)),
+            None,
+        );
+        let (result, host, volume) =
+            restore_again(&node, "again-archive", BACKUP, None, true).await;
+        assert_eq!(result.unwrap_err(), "prefix_not_empty");
+        assert!(!host.started.load(Ordering::SeqCst));
+        assert!(host.abandoned.load(Ordering::SeqCst));
+        // Nothing was fetched.
+        assert!(!volume.join("data").exists());
     }
 
     /// The files of a backup of a cluster that ran with `capacity`: no more than what a restore

@@ -456,12 +456,22 @@ impl<M: Machine> Core<M> {
     /// `volume_missing`; it builds nothing. A build that was refused before it began (the previous
     /// generation is still held) is no failed build: nothing was written, and the next pull tries
     /// it again.
+    ///
+    /// A build whose archive credential, its own or its source's, was not delivered at this pull
+    /// has not begun either: it says nothing and the next pull tries it again
+    /// (`credential_wait`), `Err("credential_not_delivered")`, which is no error of the contract.
+    /// The pull that begins or resumes a build is also the one that reads the credentials, and
+    /// the first one after a start reads every credential of the node; a read that failed once is
+    /// made again.
     pub(crate) async fn build(
         self: &Arc<Self>,
         db: &Arc<Db>,
         entry: &Entry,
     ) -> Result<(), &'static str> {
         let origin = entry.origin.clone().ok_or_else(|| build_failed!())?;
+        if self.waits_for_credential(db, entry, &origin) {
+            return Err("credential_not_delivered");
+        }
         self.set(db, |view| {
             view.phase = Phase::Building;
             view.error = None;
@@ -508,6 +518,41 @@ impl<M: Machine> Core<M> {
                 Err(error)
             }
         }
+    }
+
+    /// Whether the build waits for an archive credential (its own, or its source's) that has not
+    /// been delivered, and has not waited for it for `Timing::credential_wait` yet. Past that wait
+    /// the build is begun, and fails with `archive_unusable` like any build without its archive.
+    fn waits_for_credential(&self, db: &Db, entry: &Entry, origin: &Origin) -> bool {
+        let delivered = self.store(&entry.archive_path, Access::ReadWrite).is_some()
+            && match origin {
+                Origin::Create => true,
+                Origin::Restore(source) | Origin::Move(source, _) => {
+                    self.store(&source.path, Access::ReadOnly).is_some()
+                }
+            };
+        let now = super::now_ms();
+        let wait = i64::try_from(self.timing.credential_wait.as_millis()).unwrap_or(i64::MAX);
+        let mut view = db.view();
+        if delivered {
+            view.credential_missing_since_ms = None;
+            return false;
+        }
+        let first = view.credential_missing_since_ms.is_none();
+        let since = *view.credential_missing_since_ms.get_or_insert(now);
+        let waits = now - since < wait;
+        // The wait is over: the build begins and fails, and the next build starts its own wait.
+        if !waits {
+            view.credential_missing_since_ms = None;
+        }
+        drop(view);
+        if first {
+            crate::timing::emit_event(serde_json::json!({
+                "event": "build_waits_for_credential", "database_id": db.id,
+                "operation": entry.operation, "waits": waits,
+            }));
+        }
+        waits
     }
 
     /// Removes the node's files of a database (its state and the upload logs) when they are those
@@ -557,17 +602,19 @@ impl<M: Machine> Core<M> {
         }
     }
 
-    /// The state file of a build that begins: a new generation, or the one a crash left behind.
-    fn begin_state(&self, db: &Db, entry: &Entry) -> Result<(), &'static str> {
+    /// The state file of a build that begins: a new generation, or the one a crash or a restart of
+    /// the agent left behind. `true` for the latter: the build was begun before, and what it left
+    /// on the node is not trusted.
+    fn begin_state(&self, db: &Db, entry: &Entry) -> Result<bool, &'static str> {
         let held = self.files(&db.id).load().map_err(|_| build_failed!())?;
-        let state = held
-            .filter(|state| state.storage_generation == entry.storage_generation)
-            .unwrap_or_else(|| DatabaseState::new(entry.storage_generation));
+        let held = held.filter(|state| state.storage_generation == entry.storage_generation);
+        let resumed = held.is_some();
+        let state = held.unwrap_or_else(|| DatabaseState::new(entry.storage_generation));
         self.files(&db.id)
             .save(&state)
             .map_err(|_| build_failed!())?;
         self.set(db, |view| view.state = Some(state));
-        Ok(())
+        Ok(resumed)
     }
 
     /// Creates the user, the volume and its directories: the same for every origin.
@@ -603,7 +650,7 @@ impl<M: Machine> Core<M> {
         let store = self
             .store(&entry.archive_path, Access::ReadWrite)
             .ok_or("archive_unusable")?;
-        self.begin_state(db, entry)?;
+        let _ = self.begin_state(db, entry)?;
         let (account, volume) = self.provision(entry).await?;
         let job_database = self.job_database(&volume, &account.name);
         // The archive path is the database's own and must hold nothing but backups of the cluster
@@ -721,8 +768,15 @@ impl<M: Machine> Core<M> {
         let from = self
             .store(&source.path, Access::ReadOnly)
             .ok_or("archive_unusable")?;
-        self.begin_state(db, entry)?;
+        let resumed = self.begin_state(db, entry)?;
         let (account, volume) = self.provision(entry).await?;
+        // The agent that began this build went away with the units it started (a release restarts
+        // it): the PostgreSQL of the recovery may run on the data directory that the restore
+        // empties and fetches again (`Restorer::begin_afresh`), and it is stopped first. The
+        // previous generation is released (`build`), so a unit of this database is this build's.
+        if resumed && !self.stop_unit(&entry.id).await {
+            return Err("build_failed");
+        }
         // The restore writes the generation it builds: its device, whatever the database's link
         // names.
         let job_database = self.job_database(&volume, &account.name);
@@ -755,6 +809,7 @@ impl<M: Machine> Core<M> {
             store: &store,
             upload_log: &upload_log,
             operation: &entry.operation,
+            resumed,
         };
         // A failure is the executor's abandoned build: stopped, volume and user gone (`build`).
         let backup = restorer.run(&order, &host).await?;

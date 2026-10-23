@@ -204,6 +204,9 @@ export async function runCron(
       return { recovered, nodes };
     },
   );
+  // An operation's `updated_at` is its clock: placement, the first report that moves it to
+  // running, and, for a create or a restore the node reports `building`, each such report (a
+  // build waits for the node's one big-job slot behind others; `Statements.running`).
   const expired = await attempt("operation_timeouts", 0, async () => {
     const result = await env.DB.prepare(
       `UPDATE operations SET status='failed',error_code='operation_timeout',error_message='Regional operation exceeded 20 minutes',updated_at=?,completed_at=? WHERE status IN('pending','running') AND updated_at<?

@@ -420,7 +420,16 @@ plan 9.3, "Changing the page"; it is written there once.
   for is refused before it starts. A recovery that PostgreSQL pauses (the source's WAL raised a
   setting above both the backup's and the class's) fails the restore with `no_recovery_point`. A
   move target replays through the segment named in the source's proven-sleep record before it may
-  promote.
+  promote. A restore or a move target that a restart of the agent interrupted (every release
+  restarts it; its state file names the generation, the build is not built) is begun again from an
+  empty directory, because `barman-cloud-restore` refuses a destination that holds anything and
+  the units of the earlier run outlive the agent: the agent stops the PostgreSQL of that run, stops
+  the unit of its restore job if it runs (`pgcf-job-restore-<database>-<sequence>`, found with
+  `systemctl list-units`), and removes the generation's data directory and its spool before the
+  fetch. Only the generation being built is touched, never a served one. It is refused with
+  `prefix_not_empty` when the database's own archive already holds a base backup, since the earlier
+  run got that far and the WAL this run archives next would replace the earlier run's under that
+  backup.
 - **A build that fails** (a create, a restore, a point-in-time restore or a move target, with any
   of the errors above) is abandoned once: the unit stops, the generation's volume goes, the user
   goes with the database's last volume, and the node's files of that generation go (its state and
@@ -434,8 +443,9 @@ plan 9.3, "Changing the page"; it is written there once.
     deleted; the code of that error is the build's in this run, and `volume_missing` after the
     agent restarted (every rollout of the fleet restarts it), because it finds nothing of the
     database on its disk and its page names no origin. Nothing is started either way. A create or
-    a restore that a restart interrupted before any failure was reported still resumes, since the
-    page still names it.
+    a restore that a restart interrupted before any failure was reported is begun again, since the
+    page still names it: a create over its cluster, a restore over an emptied data directory (see
+    Create and Restore above).
   - A move target on another node: the API ends the move (`failMove`), the source serves again, and
     the target retires the staged generation through the superseded order. The database is not
     left in `error` for the customer to delete.
@@ -444,7 +454,24 @@ plan 9.3, "Changing the page"; it is written there once.
     generation (`Core::accept`). In this run the staged entry stays in `error` and the source is not
     served; its volume and its archive are untouched (plan 11.2).
   A build that was refused before it began (the previous storage generation is still held) wrote
-  nothing and is tried at the next pull.
+  nothing and is not abandoned: the node tries it at the next pull. Meanwhile it is reported as an
+  `error` (`build_failed`), and the API fails a move to the node of its source on that report
+  (`progressMoves`), so for that move the next attempt does not come (plan 11.2).
+
+  A build whose archive credential, its own or its source's, was not delivered at the pull that
+  begins or resumes it has not begun either, and is not refused: it reports nothing, writes
+  nothing and is tried at the next pull (`View::credential_missing_since_ms`, `Core::build`). The
+  first pull after a start reads every credential of the node and resumes every build in the same
+  turn, and a credential whose read failed once is read again by the next pull (seen live as
+  `credential_not_delivered` on the first attempt after a deploy). After `credential_wait` (300 s)
+  without it the build fails with `archive_unusable` like any build without its archive, and is
+  abandoned.
+
+  While a build runs, every pull of the page says `building` for it again, whatever the API
+  holds: an entry that names an origin is awaited (`Core::report`). The API takes each of these
+  reports as progress of the create or restore (`running()` in `node-observations.ts`): its
+  operation timeout of 20 minutes counts the time without such a report, so a restore that queues
+  for the node's one big-job slot behind others is not failed while its node reports it.
 
 ## Backups
 

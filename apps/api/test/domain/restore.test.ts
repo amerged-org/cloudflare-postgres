@@ -13,6 +13,7 @@ import {
   verdicts,
 } from "./fixtures.ts";
 import { createApp } from "../../src/app.ts";
+import { runCron } from "../../src/cron.ts";
 import {
   createExecutionContext,
   waitOnExecutionContext,
@@ -357,6 +358,75 @@ it("restores into one separate target on replay with credentials encrypted for i
       .bind(f.id)
       .first(),
   ).toEqual({ desired_state: "running" });
+});
+it("counts the operation timeout from the node's last building report, so that a create or a restore waiting its turn for the node's big-job slot is not failed while it reports", async () => {
+  const f = await archived();
+  const restored = await request(
+    `/v1/databases/${f.id}/restore`,
+    f.integrator,
+    "POST",
+    { name: "queued-restore", mode: "full" },
+  );
+  expect(restored.status).toBe(202);
+  const result = (await restored.json()) as {
+    target_database: { id: string };
+    operation: { id: string };
+  };
+  const create = await env.DB.prepare(
+    "SELECT id FROM operations WHERE database_id=? AND kind='database.create'",
+  )
+    .bind(f.id)
+    .first<string>("id");
+  const builds = [
+    { database: f.id, operation: create! },
+    { database: result.target_database.id, operation: result.operation.id },
+  ];
+  const state = async () =>
+    Promise.all(
+      builds.map(async ({ operation }) =>
+        env.DB.prepare("SELECT status,error_code FROM operations WHERE id=?")
+          .bind(operation)
+          .first(),
+      ),
+    );
+  const quiet = (minutes: number) =>
+    Promise.all(
+      builds.map(({ operation }) =>
+        env.DB.prepare("UPDATE operations SET updated_at=? WHERE id=?")
+          .bind(
+            new Date(Date.now() - minutes * 60_000).toISOString(),
+            operation,
+          )
+          .run(),
+      ),
+    );
+  const building = async () => {
+    for (const { database } of builds)
+      expect(await verdicts(await report(f, database, 1, "building"))).toEqual([
+        "accept",
+      ]);
+  };
+  await building();
+  expect(await state()).toEqual([
+    { status: "running", error_code: null },
+    { status: "running", error_code: null },
+  ]);
+  // 21 minutes since the first report is no reason while the node says again that it builds: a
+  // build that waits for the slot behind other restores is at work, and reports so with each pull.
+  await quiet(21);
+  await building();
+  await runCron(env);
+  expect(await state()).toEqual([
+    { status: "running", error_code: null },
+    { status: "running", error_code: null },
+  ]);
+  // A build that reported nothing for 21 minutes is failed, as before.
+  await quiet(21);
+  await runCron(env);
+  expect(await state()).toEqual([
+    { status: "failed", error_code: "operation_timeout" },
+    { status: "failed", error_code: "operation_timeout" },
+  ]);
 });
 it("retains deleted-source restore authority and rejects another tenant, missing region and expired archive", async () => {
   const f = await archived();

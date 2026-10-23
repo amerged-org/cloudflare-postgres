@@ -77,6 +77,9 @@ pub const BIG_JOB_BOUND: Duration = Duration::from_secs(6 * 3600);
 /// How long a job that outlived its `RuntimeMaxSec` may take to be reported before the agent
 /// kills its `systemd-run` client.
 const KILL_GRACE: Duration = Duration::from_secs(10);
+/// How long `systemctl` may take to list the units of earlier jobs or to stop one: a unit gets
+/// `TimeoutStopSec` (5 s) before it is killed.
+const SYSTEMCTL_BOUND: Duration = Duration::from_secs(30);
 /// What the agent keeps of a job's output.
 const STDOUT_LIMIT: usize = 4 << 20;
 const STDERR_TAIL: usize = 4 << 10;
@@ -436,6 +439,42 @@ impl Runner {
     pub fn with_grace(self, grace: Duration) -> Self {
         Self { grace, ..self }
     }
+    /// Stops the units of the jobs of `kind` that earlier runs of the agent started for `database`
+    /// and that still run: a job is a unit of its own and outlives the agent that started it, and
+    /// the agent that began again what the job was doing must not share the files with it.
+    pub async fn stop_earlier(&self, database: &str, kind: Kind) -> Result<(), Unstopped> {
+        let prefix = format!("{UNIT_PREFIX}{}-{database}-", kind.label());
+        let systemctl = self.systemd_run.with_file_name("systemctl");
+        let listed = systemctl_output(
+            &systemctl,
+            &[
+                "list-units",
+                "--all",
+                "--plain",
+                "--no-legend",
+                "--no-pager",
+                &format!("{prefix}*.service"),
+            ],
+        )
+        .await?;
+        // The first word of a line is the unit. Only a name of the shape a job's unit has is
+        // stopped: `<prefix><sequence>.service`.
+        for unit in listed
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+        {
+            let sequence = unit
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".service"));
+            if !sequence.is_some_and(|sequence| {
+                !sequence.is_empty() && sequence.bytes().all(|b| b.is_ascii_digit())
+            }) {
+                continue;
+            }
+            systemctl_output(&systemctl, &["stop", unit]).await?;
+        }
+        Ok(())
+    }
     /// Runs `job` as the database with `credential`, and returns when the unit has ended.
     pub async fn run(
         &self,
@@ -540,6 +579,31 @@ impl Runner {
     }
 }
 
+/// What `systemctl` printed for `arguments`; `Unstopped` when it did not run, failed or took
+/// longer than `SYSTEMCTL_BOUND`.
+async fn systemctl_output(systemctl: &Path, arguments: &[&str]) -> Result<String, Unstopped> {
+    let output = tokio::time::timeout(
+        SYSTEMCTL_BOUND,
+        tokio::process::Command::new(systemctl)
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| Unstopped)?
+    .map_err(|_| Unstopped)?;
+    if !output.status.success() {
+        return Err(Unstopped);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The units of earlier jobs could not be listed or stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unstopped;
+
 /// What `systemd-run --wait` reports on stderr unless it is `--quiet`: a line `Running as unit:`
 /// first and, after the command's own output, `Finished with result: <result>` and the unit's
 /// accounting (systemd 257 on Debian 13). The result is `success`, `exit-code`, `signal`,
@@ -624,6 +688,10 @@ impl Jobs {
             runner,
             limits,
         }
+    }
+    /// Stops the jobs of `kind` of `database` that an earlier agent started and that still run.
+    pub async fn stop_earlier(&self, database: &str, kind: Kind) -> Result<(), Unstopped> {
+        self.runner.stop_earlier(database, kind).await
     }
     /// Waits for a slot of the job's kind, then runs it. Both the wait and the run end at
     /// `deadline`, when there is one.
@@ -1105,6 +1173,71 @@ mod tests {
             )
             .unwrap();
             volume
+        }
+
+        /// A job is a unit of its own and outlives the agent that started it. The agent that
+        /// begins its work again stops it, and only it: a job of another kind (the source's base
+        /// backup of a move on one node) or of another database goes on.
+        #[tokio::test]
+        async fn the_running_jobs_of_a_kind_and_a_database_are_stopped_and_no_others() {
+            let fixture = Fixture::new("stop-earlier");
+            let runner = std::sync::Arc::new(fixture.runner());
+            let volume = volume();
+            let (db, wal) = wal_job(&volume, Duration::from_secs(60));
+            let other = Database {
+                id: "zyxwvutsrqponmlkjihg".into(),
+                ..db.clone()
+            };
+            let files = directory("stop-earlier-files");
+            std::fs::write(files.join("PG_VERSION"), "18\n").unwrap();
+            let archive = "s3://pgcf-eu/eu-dev/abcdefghijklmnopqrst/g1-op_aaaaaaaaaaaaaaaaaaaa";
+            fixture.put_backup(archive, "20261017T225342", "{}", Some(&files));
+            // The restore of each database writes part of its destination and takes its time; the
+            // upload takes its time too.
+            fixture.set("restore-slow", "30");
+            fixture.set("delay", "30");
+            let restore =
+                |name: &str| Job::restore(&store('a'), "20261017T225342", &volume.join(name));
+            let runs: Vec<_> = [
+                (db.clone(), restore("a")),
+                (other.clone(), restore("b")),
+                (db.clone(), wal),
+            ]
+            .into_iter()
+            .map(|(database, job)| {
+                let runner = runner.clone();
+                tokio::spawn(async move { runner.run(&database, &job, 128, &credential()).await })
+            })
+            .collect();
+            for _ in 0..200 {
+                if fixture.running_units().len() == 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let units = fixture.running_units();
+            assert_eq!(units.len(), 3, "{units:?}");
+
+            runner.stop_earlier(&db.id, Kind::Restore).await.unwrap();
+            let left = fixture.running_units();
+            assert_eq!(left.len(), 2, "{left:?}");
+            assert!(
+                left.iter()
+                    .all(|unit| { !unit.starts_with(&format!("{UNIT_PREFIX}restore-{}-", db.id)) })
+            );
+            assert!(
+                left.iter()
+                    .any(|unit| unit.contains("restore-zyxwvutsrqponmlkjihg-"))
+            );
+            assert!(
+                left.iter()
+                    .any(|unit| unit.contains("wal-archive-abcdefghijklmnopqrst-"))
+            );
+            // The client of the stopped unit saw it end: the job did not succeed.
+            let stopped = runs.into_iter().next().unwrap().await.unwrap();
+            assert!(!stopped.succeeded(), "{stopped:?}");
+            // Nothing running is nothing to stop.
+            runner.stop_earlier(&db.id, Kind::Restore).await.unwrap();
         }
 
         #[tokio::test]
