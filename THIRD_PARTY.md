@@ -91,7 +91,7 @@ snapshot and on apt-archive.postgresql.org.
 
 | Component | License | Role |
 | --- | --- | --- |
-| [Debian 13 "trixie"](https://www.debian.org/) packages at snapshot `20261016T133910Z`, Linux 6.12.113 (`6.12.113-1`) | Per package (DFSG); the kernel GPL-2.0 | Node operating system |
+| [Debian 13 "trixie"](https://www.debian.org/) packages at snapshot `20261022T203737Z`, Linux 6.12.113 (`6.12.113-1`) | Per package (DFSG); the kernel GPL-2.0 | Node operating system |
 | [systemd 257](https://github.com/systemd/systemd) (`257.13-1~deb13u1`) | LGPL-2.1-or-later | Units, sandboxing, cgroups, credentials, first-boot partitioning |
 | [GRUB 2](https://www.gnu.org/software/grub/) (`2.12-9+deb13u2`) | GPL-3.0-or-later | BIOS and UEFI boot loader |
 | [PostgreSQL 18.6](https://www.postgresql.org/) (PGDG `18.6-1.pgdg13+2`, with its `libpq5` pinned to the same version) | [PostgreSQL License](https://www.postgresql.org/about/licence/) | The database engine, unmodified |
