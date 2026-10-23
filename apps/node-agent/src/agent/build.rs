@@ -689,6 +689,12 @@ impl<M: Machine> Core<M> {
                 .await
                 .map_err(|_| build_failed!())?;
         }
+        // Every time, so that a build that stopped between `initdb` and here is finished: the
+        // tenant's data is limited to its share before PostgreSQL writes to it.
+        self.machine
+            .project_data(id)
+            .await
+            .map_err(|_| build_failed!())?;
         let config = self
             .write_configuration(entry, &account)
             .map_err(|_| build_failed!())?;
@@ -899,7 +905,13 @@ impl<M: Machine> Rebuild<M> {
 }
 impl<M: Machine> Host for Rebuild<M> {
     async fn start(&self) -> Result<(), Failed> {
-        // The restored files are the source's: the agent's own replace them before the start.
+        // The restored files are the source's: the agent's own replace them before the start, and
+        // the restored data is put in the volume's project quota like a new database's.
+        self.core
+            .machine
+            .project_data(&self.entry.id)
+            .await
+            .map_err(|_| Failed)?;
         self.core
             .write_configuration(&self.entry, &self.account)
             .map_err(|_| Failed)?;
@@ -1107,6 +1119,18 @@ mod tests {
         assert!(rig.machine.has_account(&entry.id));
         assert_eq!(rig.machine.volumes().len(), 1);
         assert!(layout.data(&entry.id).join("PG_VERSION").exists());
+        // The data of the tenant is put in the volume's project quota once, after `initdb` and
+        // before PostgreSQL starts on it.
+        let calls = rig.machine.calls();
+        let at = |call: &str| {
+            calls
+                .iter()
+                .position(|c| *c == format!("{call} {}", entry.id))
+        };
+        assert!(
+            at("project").is_some() && at("project") < at("start"),
+            "{calls:?}"
+        );
         let conf = std::fs::read_to_string(layout.data(&entry.id).join("postgresql.conf")).unwrap();
         assert!(conf.contains("max_connections = 25") && conf.contains("archive_mode = on"));
         assert!(rig.machine.running(&entry.id));

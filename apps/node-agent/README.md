@@ -574,7 +574,12 @@ Tests that need the kernel are `#[ignore]`d. CI runs them from
 alone (the mount API, for example).
 The lab tests need a Debian 13 host with systemd as PID 1, root, LVM and the image's units
 (`units/lab.rs`, `machine/node.rs`), or a privileged container with loop devices for
-`storage/lab_tests.rs`, which is built only with `RUSTFLAGS='--cfg pgcf_storage_lab'`.
+`storage/lab_tests.rs`, which is built only with `RUSTFLAGS='--cfg pgcf_storage_lab'`. Besides root,
+LVM and loop devices it needs the kernel module `quota_v2` (the volumes have a project quota), a
+PostgreSQL 18 (`PGCF_TEST_POSTGRES_BINDIR`) and a user with uid 1234 and a passwd entry, for the
+tests that run a tenant's PostgreSQL on a volume: filling its share to the limit and cleaning up,
+and growing under writes to a terabyte (`a_tenant_who_fills_its_share_of_a_volume_can_clean_up_and_the_database_never_panics`
+takes about eight minutes and 8 GiB of loop file).
 `units/idmap_lab.rs` runs the idmapped handoff of a database's volume and socket directory into
 a systemd sandbox (`units/idmap.rs`); it is built only with `RUSTFLAGS='--cfg pgcf_idmap_lab'` and
 runs as root on a systemd host inside `systemd-run --wait --pipe -p PrivateMounts=yes`, the mount

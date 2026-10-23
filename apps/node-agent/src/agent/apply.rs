@@ -565,7 +565,11 @@ impl<M: Machine> Core<M> {
 
     /// The database sizes of the entry are the unit's limits and the volume's: set again when
     /// they changed, running or asleep, and the admission knows it. A change of the settings is
-    /// written at the next start.
+    /// written at the next start. The observation carries the size that the filesystem has
+    /// (`View::storage_bytes`), read after the growth: Cloudflare ends a resize when the filesystem
+    /// has the size and not when the volume has, so a growth that failed (the kernel's -28, a pool
+    /// that took no writes) leaves the resize open, and it is tried again with every decision of
+    /// the database.
     pub(crate) async fn resize(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
         let current = Resources {
             memory_mib: entry.memory_mib,
@@ -577,7 +581,8 @@ impl<M: Machine> Core<M> {
             .state
             .as_ref()
             .and_then(|state| state.resources.clone());
-        if held.as_ref() != Some(&current) {
+        let changed = held.as_ref() != Some(&current);
+        if changed {
             let mut applied = self.apply_limits(entry).await.is_ok();
             if let (Some(held), Some(volume)) = (&held, Self::volume_id(entry))
                 && held.storage_gib < current.storage_gib
@@ -596,7 +601,15 @@ impl<M: Machine> Core<M> {
                 let _ = self.save_state(db, |state| state.resources = Some(current.clone()));
             }
             self.admission.resized(&db.id, entry.memory_mib);
-            self.set(db, |_| {});
+        }
+        let bytes = match Self::volume_id(entry) {
+            Some(volume) => self.machine.filesystem_bytes(&volume).await.ok(),
+            None => None,
+        };
+        if changed || (bytes.is_some() && bytes != db.view().storage_bytes) {
+            self.set(db, |view| {
+                view.storage_bytes = bytes.or(view.storage_bytes);
+            });
         }
     }
 
@@ -1507,6 +1520,66 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Started, "{:?}", result.reason);
         let limits = rig.machine.limits(&id).unwrap();
         assert_eq!((limits.memory_mib, limits.cpu_millicores), (512, 500));
+    }
+
+    /// A resize ends in Cloudflare when the filesystem has the size, so the observation of a
+    /// ready or sleeping database tells the size the filesystem has (its superblock's), also
+    /// after a growth, and a growth that the kernel refused leaves the old size in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_observation_tells_the_size_of_the_filesystem_and_a_refused_growth_leaves_it_as_it_is()
+     {
+        let Some(rig) = Rig::new("resize-fs").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        let (volume, created) = rig.machine.volumes()[0].clone();
+        let gap = crate::storage::FS_END_GAP_BYTES;
+        eventually(30, "the observation to tell the filesystem", || {
+            handle.view().storage_bytes == Some(created - gap)
+        })
+        .await;
+        assert_eq!(rig.observation(&id)["storage_bytes"], created - gap);
+
+        // The kernel refuses the growth: the volume has the size and the filesystem keeps its
+        // own, the page's size is not kept as applied, and the observation says so.
+        rig.machine.set_growth_refused(true);
+        next(&mut db, 6);
+        db["resources"] = json!({"memory_mib": 512, "cpu_millicores": 500, "storage_gib": 2});
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(30, "the volume to be grown", || {
+            rig.machine.volumes()[0].1 == 2 << 30
+        })
+        .await;
+        eventually(30, "the observation of the new generation", || {
+            rig.core
+                .pending_observation(&id)
+                .is_some_and(|observation| observation["generation"] == 6)
+        })
+        .await;
+        assert_eq!(rig.observation(&id)["storage_bytes"], created - gap);
+        assert_eq!(rig.machine.filesystem(&volume), Some(created - gap));
+        assert_ne!(
+            handle
+                .state()
+                .and_then(|state| state.resources)
+                .map(|resources| resources.storage_gib),
+            Some(2),
+            "a growth that failed is not kept as done"
+        );
+
+        // The next decision tries again, and the observation follows the filesystem.
+        rig.machine.set_growth_refused(false);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(30, "the filesystem to grow", || {
+            handle.view().storage_bytes == Some((2 << 30) - gap)
+        })
+        .await;
+        assert_eq!(rig.observation(&id)["storage_bytes"], (2u64 << 30) - gap);
+        assert_eq!(rig.machine.filesystem(&volume), Some((2 << 30) - gap));
     }
 
     /// The next generation of a page entry: the same database, moved on by the API.
@@ -2628,6 +2701,13 @@ mod tests {
         })
         .await;
         assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+        // The restored files are put in the volume's project quota before PostgreSQL runs on them.
+        let calls = rig.machine.calls();
+        let at = |call: &str| calls.iter().position(|c| *c == format!("{call} {id}"));
+        assert!(
+            at("project").is_some() && at("project") < at("start"),
+            "{calls:?}"
+        );
 
         // The data of the source, in a database of the new name, under the page's roles.
         let data = tenant(&rig, &id).await;

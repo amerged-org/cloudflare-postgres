@@ -260,6 +260,11 @@ impl<M: Machine> Core<M> {
                 observation["refusal"] = refusal.into();
             }
         }
+        if matches!(state, "ready" | "asleep")
+            && let Some(bytes) = view.storage_bytes
+        {
+            observation["storage_bytes"] = bytes.into();
+        }
         if state == "ready" && !(view.roles_removed.is_empty() && view.roles_blocked.is_empty()) {
             observation["roles"] =
                 json!({"removed": view.roles_removed, "blocked": view.roles_blocked});

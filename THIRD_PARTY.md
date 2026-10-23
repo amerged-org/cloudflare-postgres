@@ -99,7 +99,7 @@ snapshot and on apt-archive.postgresql.org.
 | [barman-cli-cloud 3.20.1](https://github.com/EnterpriseDB/barman) (PGDG `3.20.1-1.pgdg13+1`) | GPL-3.0 | WAL archive, base backup and restore to R2; run as a separate program, not linked |
 | [Python 3.13](https://www.python.org/) (`3.13.5-1`), [boto3 1.37.9](https://github.com/boto/boto3) and botocore (Debian `python3-boto3`, `python3-botocore`) | PSF-2.0; Apache-2.0 | The runtime barman-cloud runs on |
 | [lvm2 2.03.31](https://sourceware.org/lvm2/) (`2.03.31-2`), [thin-provisioning-tools 1.1.0](https://github.com/jthornber/thin-provisioning-tools) (`1.1.0-4+b1`) | GPL-2.0, LGPL-2.1 / GPL-3.0 | Thin pool and volumes, run as separate programs |
-| [e2fsprogs 1.47.2](https://e2fsprogs.sourceforge.net/) (`1.47.2-3+b12`) | GPL-2.0 (programs), LGPL-2.0 (libraries) | ext4 of each database volume (`mkfs.ext4`, `e2fsck`, `tune2fs`), run as separate programs |
+| [e2fsprogs 1.47.2](https://e2fsprogs.sourceforge.net/) (`1.47.2-3+b12`) | GPL-2.0 (programs), LGPL-2.0 (libraries) | ext4 of each database volume (`mkfs.ext4`, `resize2fs`, `e2fsck`, `debugfs`), run as separate programs |
 | [OpenSSH 10.0](https://www.openssh.com/) (`1:10.0p1-7+deb13u4`) | BSD-style | sshd of the operator shell, loopback only |
 | [nftables 1.1.3](https://netfilter.org/projects/nftables/) (`1.1.3-1`) | GPL-2.0-only | The inbound-drop firewall |
 | [cloudflared 2026.10.0](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/2026.10.0/LICENSE) | The node's Tunnel; release `.deb` pinned by sha256 `9721287c28f78cb623e77c7b95a63feea87e909054d75666a0ec9eff20e5d548` |

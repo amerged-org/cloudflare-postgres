@@ -222,9 +222,13 @@ export async function runCron(
   // that reports `building` for ever (the task of the build ended, a call of it hangs) keeps that
   // clock young, so a create or a restore also ends at a ceiling after its placement.
   const expired = await attempt("operation_timeouts", 0, async () => {
+    // A resize that the node reported and that is still running has a filesystem that did not
+    // reach the storage it asked for (`Statements.resizeRunning`): its own code says so.
     const result = await env.DB.prepare(
-      `UPDATE operations SET status='failed',error_code='operation_timeout',
-      error_message=CASE WHEN updated_at<? THEN 'Regional operation exceeded 20 minutes' ELSE 'Build exceeded 24 hours after its placement' END,
+      `UPDATE operations SET status='failed',
+      error_code=CASE WHEN kind='database.resize' AND status='running' THEN 'filesystem_not_grown' ELSE 'operation_timeout' END,
+      error_message=CASE WHEN kind='database.resize' AND status='running' THEN 'The filesystem did not reach the requested storage within 20 minutes; the node tries again'
+        WHEN updated_at<? THEN 'Regional operation exceeded 20 minutes' ELSE 'Build exceeded 24 hours after its placement' END,
       updated_at=?,completed_at=? WHERE status IN('pending','running') AND (updated_at<?
         OR (kind IN('database.create','database.restore') AND EXISTS(SELECT 1 FROM databases b WHERE b.id=operations.database_id AND b.node_id IS NOT NULL AND b.placed_at<?)))
       AND NOT EXISTS(SELECT 1 FROM databases u WHERE u.id=operations.database_id AND u.node_id IS NULL AND u.desired_state='running' AND u.deleted_at IS NULL AND operations.kind IN('database.create','database.restore'))

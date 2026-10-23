@@ -675,7 +675,7 @@ export const Operation = z
           .min(1)
           .max(64)
           .describe(
-            "Machine-readable reason of a failed operation, for example `operation_timeout`, `superseded`, `power_busy` or, for database.role.delete, `role_not_droppable`.",
+            "Machine-readable reason of a failed operation, for example `operation_timeout`, `superseded`, `power_busy`, for database.resize `filesystem_not_grown` (the filesystem did not reach the storage within 20 minutes of the node's report) or, for database.role.delete, `role_not_droppable`.",
           ),
         message: z.string().max(TEXT_MAX_LENGTH),
       })

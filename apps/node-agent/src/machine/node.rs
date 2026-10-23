@@ -340,6 +340,12 @@ impl Machine for Node {
             .await
     }
 
+    async fn filesystem_bytes(&self, id: &VolumeId) -> Result<u64, storage::Error> {
+        let id = id.clone();
+        self.storage(move |storage| storage.filesystem_bytes(&id))
+            .await
+    }
+
     async fn remove_volume(&self, id: &VolumeId, removal: Removal) -> Result<(), storage::Error> {
         let id = id.clone();
         self.storage(move |storage| match storage.remove_volume(&id, removal) {
@@ -413,6 +419,13 @@ impl Machine for Node {
         }
         chown(&directory, Some(account.uid), Some(gateway))?;
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750))
+    }
+
+    async fn project_data(&self, database: &str) -> io::Result<()> {
+        let data = self.layout.data(database);
+        tokio::task::spawn_blocking(move || storage::project_data(&data))
+            .await
+            .map_err(io::Error::other)?
     }
 
     async fn initdb(&self, account: &Account, data: &Path) -> io::Result<()> {

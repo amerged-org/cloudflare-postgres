@@ -5,15 +5,16 @@
 //! wake's two questions (`exists`, `needs_repair`) answer from the list, and only for a volume it
 //! shows as there and not suspect; any other volume is read from lvm2 again.
 use super::{
-    CommandRunner, Config, Error, NoRoom, Output, Policy, PoolSample, ReserveAction, SystemRunner,
+    CommandRunner, Config, Error, NoRoom, Output, Policy, PoolSample, SystemRunner,
     VOLUME_LIST_MAX_AGE, VolumeId,
-    commands::{self, FS_TAG, RESERVE_FREED_TAG, SUSPECT_TAG},
+    commands::{self, FS_TAG, SUSPECT_TAG},
     host,
     ids::dm_name,
     listing::Listing,
     lvm::{self, GroupStep, LogicalVolume, PoolStep},
     mountinfo::{self, Mount},
     pool::{self, parse_pool, parse_thin_mapped},
+    quota,
     usage::{Inventory, MountInfo, Removal, VolumeInfo},
 };
 use std::{
@@ -436,7 +437,7 @@ impl<R: CommandRunner> Storage<R> {
                 .ok_or(Error::Unexpected("a volume that is not active"))?;
             let mount = match self.mount_of(&id, &mounts) {
                 Some(mount) => Some(MountInfo {
-                    usage: host::fs_usage(&mount.mount_point)?,
+                    usage: host::tenant_usage(&mount.mount_point)?,
                 }),
                 None => None,
             };
@@ -446,7 +447,6 @@ impl<R: CommandRunner> Storage<R> {
                 size_bytes: lv.size_bytes,
                 pool_used_bytes,
                 formatted: lv.has_tag(FS_TAG),
-                reserve_released: lv.has_tag(RESERVE_FREED_TAG),
                 suspect: lv.has_tag(SUSPECT_TAG),
                 fs_errors,
                 mount,
@@ -664,6 +664,7 @@ impl<R: CommandRunner> Storage<R> {
             return if suspect {
                 self.drop_link(id)
             } else {
+                self.ensure_quota(id)?;
                 self.install_link(id)
             };
         }
@@ -681,12 +682,43 @@ impl<R: CommandRunner> Storage<R> {
             _ => {}
         }
         let began = Instant::now();
-        let mounted = host::mount_ext4(&device, &dir);
+        let mounted = self.mount_own(id);
         crate::timing::MOUNT.add(began.elapsed());
         mounted?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        self.ensure_quota(id)?;
         // Last: the link is the unit's permission to start, and exists only for what is mounted.
         self.install_link(id)
+    }
+
+    /// Mounts the volume's own filesystem at its directory, with its project quota enforced when it
+    /// has one (a filesystem of an earlier release has none).
+    fn mount_own(&self, id: &VolumeId) -> Result<(), Error> {
+        let device = commands::device(&self.config, id);
+        let quota = host::read_superblock(&device)?.project_quota();
+        host::mount_ext4(&device, &self.mount_dir(id), quota)?;
+        Ok(())
+    }
+
+    /// Sets the limits of the tenant's share of the volume (`quota::limits`) from the filesystem it
+    /// has now and the size the device has, unless they are set: at every attach, so that an agent
+    /// that restarts, a boot and a crash between a growth and its limits all end with the right
+    /// ones, and after every growth. A filesystem without a project quota has no share to limit.
+    fn ensure_quota(&self, id: &VolumeId) -> Result<(), Error> {
+        let device = commands::device(&self.config, id);
+        if !host::read_superblock(&device)?.project_quota() {
+            return Ok(());
+        }
+        let whole = host::fs_usage(&self.mount_dir(id))?;
+        let wanted = quota::limits(
+            whole.total_bytes,
+            whole.inodes_total,
+            host::device_bytes(&device)?,
+        );
+        if host::quota_limits(&device, quota::PROJECT_ID)? != wanted {
+            host::set_quota_limits(&device, quota::PROJECT_ID, wanted)?;
+        }
+        Ok(())
     }
 
     /// Makes `grow` or `mount` see a formatted volume.
@@ -703,9 +735,10 @@ impl<R: CommandRunner> Storage<R> {
     }
 
     /// Grows the volume and its filesystem online (plan 3.5: storage never shrinks). The logical
-    /// cap holds; a sleeping database's volume is mounted first, as `resize2fs` needs it. A
-    /// reserve that was freed goes back by the usual rule once the volume has room again, and a
-    /// suspect volume is repaired before it grows.
+    /// cap holds; a sleeping database's volume is mounted first, as `resize2fs` needs it, and a
+    /// suspect volume is repaired before it grows. It ends well only when the filesystem has the
+    /// size: `resize2fs` that ends 0 and leaves the filesystem as it was is an error, and the
+    /// tenant's limits follow the size that the filesystem has then.
     pub fn grow_volume(&self, id: &VolumeId, size_bytes: u64) -> Result<(), Error> {
         check_size(size_bytes)?;
         let guard = self.lock();
@@ -714,7 +747,7 @@ impl<R: CommandRunner> Storage<R> {
         if lv.has_tag(SUSPECT_TAG) {
             return Err(Error::NeedsRepair);
         }
-        let (current, released) = (lv.size_bytes, lv.has_tag(RESERVE_FREED_TAG));
+        let current = lv.size_bytes;
         if size_bytes < current {
             return Err(Error::Shrink);
         }
@@ -733,20 +766,19 @@ impl<R: CommandRunner> Storage<R> {
         // A filesystem that already has the size, or more (a volume made before the gap existed
         // fills it; a call that follows a crash after `resize2fs`), is left as it is: asked for
         // less, resize2fs refuses to shrink it, for ever.
-        if self.filesystem_kib(id)? < commands::fs_target_kib(size_bytes) {
+        let target = commands::fs_target_kib(size_bytes) * 1024;
+        if self.filesystem_bytes(id)? < target {
             self.run(commands::resize_fs(&self.config, id, size_bytes))?;
+            if self.filesystem_bytes(id)? < target {
+                return Err(Error::Unexpected("the filesystem did not grow"));
+            }
         }
-        if released {
-            let usage = host::fs_usage(&self.mount_dir(id))?;
-            self.apply_reserve(id, usage.reserve_action(true, false), true)?;
-        }
-        Ok(())
+        self.ensure_quota(id)
     }
 
-    /// The size of the volume's filesystem, from its superblock.
-    fn filesystem_kib(&self, id: &VolumeId) -> Result<u64, Error> {
-        let header = self.run(commands::fs_header(&self.config, id))?;
-        commands::parse_fs_kib(&header.stdout).ok_or(Error::Parse("the filesystem's header"))
+    /// The size of the volume's filesystem, from its superblock: what `resize2fs` made it.
+    pub fn filesystem_bytes(&self, id: &VolumeId) -> Result<u64, Error> {
+        Ok(host::read_superblock(&commands::device(&self.config, id))?.bytes())
     }
 
     pub fn mount_volume(&self, id: &VolumeId) -> Result<(), Error> {
@@ -816,7 +848,7 @@ impl<R: CommandRunner> Storage<R> {
             _ => error.into(),
         })?;
         if self.held(id)? {
-            host::mount_ext4(&commands::device(&self.config, id), &self.mount_dir(id))?;
+            self.mount_own(id)?;
             return Err(Error::Busy);
         }
         Ok(())
@@ -948,54 +980,6 @@ impl<R: CommandRunner> Storage<R> {
             return Err(Error::NotMounted);
         }
         self.run(commands::trim(&self.config, id))?;
-        Ok(())
-    }
-
-    /// Frees or restores the root-only 1 % reserve by `FsUsage::reserve_action` on the volume's
-    /// space now, and returns what it did. `write_failed` is whether the database's unit ended on
-    /// its own after a failed write: the one fact the caller knows and the volume does not.
-    pub fn set_reserve(&self, id: &VolumeId, write_failed: bool) -> Result<ReserveAction, Error> {
-        let _guard = self.lock();
-        let lvs = self.read_lvs()?;
-        let released = self.formatted(&lvs, id)?.has_tag(RESERVE_FREED_TAG);
-        let mounts = self.mounts()?;
-        let mount = self.mount_of(id, &mounts).ok_or(Error::NotMounted)?;
-        let action = host::fs_usage(&mount.mount_point)?.reserve_action(released, write_failed);
-        self.apply_reserve(id, action, released)?;
-        Ok(action)
-    }
-
-    /// The tag goes first when freeing and last when restoring, so a stop between the two steps
-    /// leaves a volume that the next sample frees or restores again.
-    fn apply_reserve(
-        &self,
-        id: &VolumeId,
-        action: ReserveAction,
-        released: bool,
-    ) -> Result<(), Error> {
-        match action {
-            ReserveAction::Keep => {}
-            ReserveAction::Release => {
-                if !released {
-                    self.run(commands::volumes_add_tag(
-                        &self.config,
-                        slice::from_ref(id),
-                        RESERVE_FREED_TAG,
-                    ))?;
-                }
-                self.run(commands::reserve(&self.config, id, 0))?;
-            }
-            ReserveAction::Restore => {
-                self.run(commands::reserve(&self.config, id, 1))?;
-                if released {
-                    self.run(commands::volume_delete_tag(
-                        &self.config,
-                        id,
-                        RESERVE_FREED_TAG,
-                    ))?;
-                }
-            }
-        }
         Ok(())
     }
 
