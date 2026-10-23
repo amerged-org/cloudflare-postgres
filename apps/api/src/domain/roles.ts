@@ -16,7 +16,11 @@ import { getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseOperationResponse, hint } from "./databases.ts";
 import { syncDatabaseActor } from "./database-actor-sync.ts";
-import { withAdmissionMutation } from "./admission-mutations.ts";
+import {
+  settleWithin,
+  withAdmissionMutation,
+  type AdmissionMutation,
+} from "./admission-mutations.ts";
 import {
   databaseForRequest,
   isConstraintError,
@@ -45,8 +49,39 @@ async function roleResponse(
   status: 200 | 201 = 200,
 ): Promise<Response> {
   const role = await roleForRequest(c, id, name);
-  await syncDatabaseActor(c, id);
   return c.json(roleView(role), status);
+}
+/**
+ * A guarded write whose request is answered after it: once it has committed, the publication of
+ * the Actor's snapshot is waited for a bound and cannot fail the answer (`settleWithin`).
+ */
+const mutateRole = <T>(
+  c: ApiContext,
+  id: string,
+  execute: (mutation: AdmissionMutation) => Promise<T>,
+) =>
+  withAdmissionMutation(
+    c.env,
+    [id],
+    execute,
+    undefined,
+    undefined,
+    settleWithin(c.executionCtx, id),
+  );
+/**
+ * The answer to a request the service answered before. Its first run may have lost the
+ * publication of the Actor's snapshot, so the replay makes it again, with the same bound and
+ * without letting it change the answer.
+ */
+async function replayedRole(
+  c: ApiContext,
+  id: string,
+  name: string,
+  status: 200 | 201 = 200,
+): Promise<Response> {
+  const response = await roleResponse(c, id, name, status);
+  await settleWithin(c.executionCtx, id)(syncDatabaseActor(c, id));
+  return response;
 }
 export async function listRoles(c: ApiContext, id: string): Promise<Response> {
   await databaseForRequest(c, id);
@@ -111,7 +146,7 @@ export async function createRole(
 ): Promise<Response> {
   const db = await databaseForRequest(c, id);
   return withIdempotency(c, {
-    replay: async (name) => roleResponse(c, id, name, 201),
+    replay: async (name) => replayedRole(c, id, name, 201),
     execute: async (lease) => {
       const attributes = await roleAttributes(c, id, body);
       const now = new Date().toISOString(),
@@ -124,7 +159,7 @@ export async function createRole(
       );
       let result: D1Result[];
       try {
-        result = await withAdmissionMutation(c.env, [id], async (mutation) => {
+        result = await mutateRole(c, id, async (mutation) => {
           const guard = mutation.guard(id);
           return mutation.batch([
             c.env.DB.prepare(
@@ -209,7 +244,7 @@ export async function resetPassword(
   const db = await databaseForRequest(c, id),
     row = await roleForRequest(c, id, name);
   return withIdempotency(c, {
-    replay: async (role) => roleResponse(c, id, role),
+    replay: async (role) => replayedRole(c, id, role),
     execute: async (lease) => {
       const now = new Date().toISOString(),
         password = await keyring(c.env.CREDENTIAL_KEYS).encrypt(
@@ -217,45 +252,41 @@ export async function resetPassword(
           name,
           newRolePassword(),
         );
-      const result = await withAdmissionMutation(
-        c.env,
-        [id],
-        async (mutation) => {
-          const guard = mutation.guard(id);
-          return mutation.batch([
-            c.env.DB.prepare(
-              `UPDATE roles SET password_ciphertext=?,password_iv=?,password_kid=?,password_revision=password_revision+1,updated_at=?
+      const result = await mutateRole(c, id, async (mutation) => {
+        const guard = mutation.guard(id);
+        return mutation.batch([
+          c.env.DB.prepare(
+            `UPDATE roles SET password_ciphertext=?,password_iv=?,password_kid=?,password_revision=password_revision+1,updated_at=?
         WHERE database_id=? AND name=? AND password_revision=? AND deleted_at IS NULL
         AND EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=roles.database_id AND d.project_id=? AND d.generation=? AND d.deleted_at IS NULL)
         AND ${guard.sql}`,
-            ).bind(
-              password.ciphertext,
-              password.iv,
-              password.kid,
-              now,
+          ).bind(
+            password.ciphertext,
+            password.iv,
+            password.kid,
+            now,
+            id,
+            name,
+            row.password_revision,
+            db.project_id,
+            db.generation,
+            ...guard.bindings,
+          ),
+          c.env.DB.prepare(
+            `UPDATE databases SET generation=generation+1,updated_at=? WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND ${guard.sql}`,
+          ).bind(now, id, db.project_id, db.generation, ...guard.bindings),
+          lease.completeStatement(name, 200, {
+            sql: "EXISTS(SELECT 1 FROM databases d JOIN roles r ON r.database_id=d.id WHERE d.id=? AND d.project_id=? AND d.generation=? AND r.name=? AND r.password_revision=?)",
+            bindings: [
               id,
-              name,
-              row.password_revision,
               db.project_id,
-              db.generation,
-              ...guard.bindings,
-            ),
-            c.env.DB.prepare(
-              `UPDATE databases SET generation=generation+1,updated_at=? WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND ${guard.sql}`,
-            ).bind(now, id, db.project_id, db.generation, ...guard.bindings),
-            lease.completeStatement(name, 200, {
-              sql: "EXISTS(SELECT 1 FROM databases d JOIN roles r ON r.database_id=d.id WHERE d.id=? AND d.project_id=? AND d.generation=? AND r.name=? AND r.password_revision=?)",
-              bindings: [
-                id,
-                db.project_id,
-                db.generation + 1,
-                name,
-                row.password_revision + 1,
-              ],
-            }),
-          ]);
-        },
-      );
+              db.generation + 1,
+              name,
+              row.password_revision + 1,
+            ],
+          }),
+        ]);
+      });
       if (result[0]!.meta.changes !== 1 || result[1]!.meta.changes !== 1)
         throw new ApiError(
           "conflict",

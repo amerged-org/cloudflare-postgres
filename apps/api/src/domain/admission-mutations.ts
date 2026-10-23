@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DatabaseId, NodeId, ProjectId, RegionId } from "@pgcf/contracts";
-import { ApiError } from "../api-error.ts";
+import { ApiError, failureCause } from "../api-error.ts";
 import type { Env } from "../env.ts";
 import type { AdmissionMutationIntent } from "./admission-state.ts";
 import { databaseActor, readDatabasePresence } from "./database-actor-sync.ts";
@@ -143,13 +143,65 @@ export class AdmissionMutation {
     return result.slice(0, statements.length);
   }
 }
-/** Trusted callers close Actors before a guarded authoritative write; no callback is retried. */
+/** How long a caller waits for the publication of an Actor's snapshot (about 0.1 s) before it answers. */
+export const ADMISSION_PUBLISH_ANSWER_MS = 1000;
+
+/** What a caller makes of the publication that follows its commit; see `withAdmissionMutation`. */
+export type PublicationSettlement = (
+  publishing: Promise<unknown>,
+) => Promise<void>;
+
+/**
+ * For a writer that answers a client after its commit. The write has committed, so nothing the
+ * publication does can change the answer: the caller waits for it for `ADMISSION_PUBLISH_ANSWER_MS`
+ * and answers, with the publication's failure logged, never raised. The Actor stays closed (it
+ * refuses a connection, fail closed) until the next publish, which the node's report of the new
+ * generation, the cron or a replay of the request makes. A publication still running after the
+ * bound goes on in the background.
+ */
+export function settleWithin(
+  context: Pick<ExecutionContext, "waitUntil">,
+  databaseId: string,
+): PublicationSettlement {
+  return async (publishing) => {
+    const finished = publishing.then(
+      () => undefined,
+      (error: unknown) =>
+        console.error(
+          JSON.stringify({
+            event: "admission_publish_failed",
+            database_id: databaseId,
+            error: error instanceof Error ? error.name : "error",
+            cause: failureCause(error),
+          }),
+        ),
+    );
+    context.waitUntil(finished);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      finished,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ADMISSION_PUBLISH_ANSWER_MS);
+      }),
+    ]).finally(() => clearTimeout(timer));
+  };
+}
+
+/**
+ * Trusted callers close Actors before a guarded authoritative write; no callback is retried. Once
+ * the write has committed, the Actors are published again and the nodes hinted. By default the call
+ * waits for that and fails with it, so a caller that is told again (a node's report) repairs it; a
+ * caller that answers a client passes `settle`, which decides how long to wait and whether the
+ * failure counts.
+ */
 export async function withAdmissionMutation<T>(
   env: Env,
   databaseIds: string[],
   execute: (mutation: AdmissionMutation) => Promise<T>,
   scope?: AdmissionScope,
   local?: LocalAdmissionActor,
+  settle: PublicationSettlement = (publishing) =>
+    publishing.then(() => undefined),
 ): Promise<T> {
   let ids = [...new Set(databaseIds.map((id) => DatabaseId.parse(id)))].sort();
   const mutationId = crypto.randomUUID(),
@@ -254,27 +306,28 @@ export async function withAdmissionMutation<T>(
     // returned has committed every epoch receipt it carried (a missing one throws), so the fence
     // that closes a failed mutation's delayed statements has nothing left to close here.
     mutation.assertSubmitted();
-    await publishMutation(env, intents, local);
-    if (!local)
-      await notifyAdmissionRevisions(
-        env,
-        intents.map((intent) => intent.database_id),
-      );
+    await settle(publishAfterCommit(env, intents, local));
     return result;
   } catch (error) {
     // The fence CAS invalidates delayed business statements before publication. Missing D1 leaves it closed.
     await fenceAdmissionMutation(env, mutationId, scope)
-      .then(async () => {
-        await publishMutation(env, intents, local);
-        if (!local)
-          await notifyAdmissionRevisions(
-            env,
-            intents.map((intent) => intent.database_id),
-          );
-      })
+      .then(() => publishAfterCommit(env, intents, local))
       .catch(() => undefined);
     throw error;
   }
+}
+
+async function publishAfterCommit(
+  env: Env,
+  intents: AdmissionMutationIntent[],
+  local?: LocalAdmissionActor,
+) {
+  await publishMutation(env, intents, local);
+  if (!local)
+    await notifyAdmissionRevisions(
+      env,
+      intents.map((intent) => intent.database_id),
+    );
 }
 
 async function publishMutation(
