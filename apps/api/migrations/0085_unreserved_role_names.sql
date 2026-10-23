@@ -52,7 +52,8 @@
 -- `streaming_replica` and `pgcf_maintenance`, so once such a role is in D1 every full pull of the
 -- node answers 500 and the node accepts no new connection from its next agent start on. The API
 -- Worker is not rolled back below this change while such a role exists, unless those rows are
--- deleted in D1 first.
+-- deleted in D1 first, after the roles that are a member of them have lost the name from their
+-- member_of_json (the old contract refuses such a list, and a membership of a role that is absent).
 -- Until the Edge Worker is redeployed, a role of a released name is created but every connection
 -- as it answers 28P01. The names it frees were refused before; the three above are the whole
 -- narrowing of this change.
