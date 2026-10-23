@@ -124,10 +124,28 @@ async fn reviewed_rollback_stops_the_failed_target_left_running_before_releasing
     let rollback = rollback(&source, &state, &target);
     credentials(&rig, &rollback);
     let entry = rig.entry_for(&rollback);
+    // A remaining holder prevents cleanup. The rollback generation and exact retired target are
+    // durable before this failure; after restart only that target can be removed.
+    let staged = VolumeId::new(&id, 2).unwrap();
+    rig.machine.hold_volume(&staged);
+    assert!(rig.core.prepare_replacement(&entry).await.is_err());
+    let pending = rig.core.files(&id).load_replacement().unwrap().unwrap();
+    assert_eq!(pending.attempt.generation, 3);
+    assert_eq!(pending.retiring_generation, Some(2));
+    let rig = rig.restart().await;
+    rig.machine.release_volume(&staged);
+    rig.machine.set_no_room(true);
     rig.core.prepare_replacement(&entry).await.unwrap();
     assert!(
         !rig.machine.running(&id),
         "the journal-owned failed target must stop before release"
+    );
+    assert!(
+        !rig.machine
+            .has_volume(&VolumeId::new(&id, 2).unwrap())
+            .await
+            .unwrap(),
+        "the unpublished failed target must release its pool space before rollback allocation"
     );
     assert!(rig.core.release_previous_generation(&entry).await);
     assert!(
@@ -136,6 +154,7 @@ async fn reviewed_rollback_stops_the_failed_target_left_running_before_releasing
             .await
             .unwrap()
     );
+    rig.machine.set_no_room(false);
     ready(&rig, &rollback).await;
     let session = tenant(&rig, &id).await;
     assert_eq!(
@@ -149,8 +168,8 @@ async fn reviewed_rollback_stops_the_failed_target_left_running_before_releasing
     drop(session);
     assert_eq!(
         rig.machine.volumes().len(),
-        3,
-        "source and staged failure remain until the backed-up rollback is accepted"
+        2,
+        "rollback needs room only for its preserved source and one new target"
     );
     let mut promoted = rollback;
     promoted.as_object_mut().unwrap().remove("origin");
@@ -201,7 +220,111 @@ async fn reviewed_a_built_replacement_does_not_adopt_tampered_origin_metadata_af
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sequential_replacements_wait_for_prior_cleanup_and_late_old_cleanup_keeps_the_new_journal()
+{
+    let Some(rig) = Rig::new("replace-sequential").await else {
+        return;
+    };
+    let (source, state, point) = source(&rig).await;
+    let first = replace(&rig, &source, &state, &point);
+    let id = source["id"].as_str().unwrap().to_string();
+    ready(&rig, &first).await;
+    let handle = rig.core.db(&id);
+    let session = tenant(&rig, &id).await;
+    session.batch("SELECT pg_sleep(0.005)").await.unwrap();
+    let point: String = session.query("SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')", &[]).await.unwrap()[0].get(0);
+    session
+        .batch("INSERT INTO replacement_marker VALUES (3)")
+        .await
+        .unwrap();
+    drop(session);
+    assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+    let retained = handle.state().unwrap();
+    let mut second = first.clone();
+    second["generation"] = json!(20);
+    second["storage_generation"] = json!(3);
+    second["operation"] = json!("op_nnnnnnnnnnnnnnnnnnnn");
+    second["archive"]["path"] = json!(format!(
+        "s3://pgcf-eu/eu-dev/{id}/g3-op_nnnnnnnnnnnnnnnnnnnn"
+    ));
+    second["origin"] = json!({"kind":"replace","source":{
+        "database_id":id,"path":first["archive"]["path"],"backup_id":retained.backup.as_ref().unwrap().backup_id,
+        "target_time":point,"credential":{"id":"crd_rrrrrrrrrrrrrrrrrrrr","expires_at":"2099-01-01T00:00:00.000Z"}},
+        "previous":{"storage_generation":2,"end":retained.record}});
+    credentials(&rig, &second);
+    rig.core
+        .apply(&Rig::page(vec![second.clone()], vec![]))
+        .await;
+    eventually(30, "the new operation to inspect the prior journal", || {
+        handle.view().reconcile == super::Reconcile::Idle
+    })
+    .await;
+    assert_ne!(
+        handle.phase(),
+        Phase::Error,
+        "a valid earlier cleanup must not fail the new operation"
+    );
+    assert_eq!(
+        rig.core
+            .files(&id)
+            .load_replacement()
+            .unwrap()
+            .unwrap()
+            .operation,
+        "op_rrrrrrrrrrrrrrrrrrrr"
+    );
+    assert!(
+        !rig.machine
+            .has_volume(&VolumeId::new(&id, 3).unwrap())
+            .await
+            .unwrap()
+    );
+    let cleanup = |operation: &str| crate::link::Order::Superseded {
+        operation: operation.into(),
+        database: id.clone(),
+        storage_generation: 1,
+        remove_volume: true,
+    };
+    rig.core
+        .apply(&Rig::page(
+            vec![second.clone()],
+            vec![cleanup("op_ssssssssssssssssssss")],
+        ))
+        .await;
+    eventually(120, "the new operation after prior cleanup", || {
+        handle.phase() == Phase::Ready
+    })
+    .await;
+    let current = rig.core.files(&id).load_replacement().unwrap().unwrap();
+    assert_eq!(current.operation, "op_nnnnnnnnnnnnnnnnnnnn");
+    assert_eq!(current.source.storage_generation, 2);
+    // A repeated old cleanup names a lower cutoff and cannot discard this new operation's proof.
+    rig.core
+        .apply(&Rig::page(
+            vec![second],
+            vec![cleanup("op_llllllllllllllllllll")],
+        ))
+        .await;
+    eventually(30, "the late old cleanup", || {
+        rig.core.pending_order("op_llllllllllllllllllll").is_some()
+    })
+    .await;
+    assert_eq!(
+        rig.core.files(&id).load_replacement().unwrap(),
+        Some(current)
+    );
+    assert!(
+        rig.machine
+            .has_volume(&VolumeId::new(&id, 2).unwrap())
+            .await
+            .unwrap()
+    );
+    assert_eq!(handle.phase(), Phase::Ready);
+}
+
 async fn ready(rig: &Rig, target: &Value) {
+    credentials(rig, target);
     let id = target["id"].as_str().unwrap();
     let handle = rig.core.db(id);
     rig.core.set(&handle, |view| {
