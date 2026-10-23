@@ -1476,6 +1476,12 @@ mod tests {
             observed(&cloud, &id, "ready")
         })
         .await;
+        // The loop of the pool also keeps PostgreSQL's program in the page cache: the agent made
+        // its first pass over it once the node was quiet.
+        eventually(30, "the first pass over PostgreSQL's program", || {
+            service.core().readahead.program_passes() >= 1
+        })
+        .await;
         // The sample for placement, the volume report and the events arrive, each as the contract states
         // (the double refuses what does not); the node applied its credentials.
         eventually(30, "the sample, the volumes and the events", || {

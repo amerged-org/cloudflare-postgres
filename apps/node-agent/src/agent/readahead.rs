@@ -195,6 +195,11 @@ impl Readahead {
     pub(crate) fn start_began(&self) {
         self.start_began.store(true, Ordering::Relaxed);
     }
+    /// The passes over the program the agent has made, for a test of the loop that makes them.
+    #[cfg(test)]
+    pub(crate) fn program_passes(&self) -> u64 {
+        self.passes().passes
+    }
     /// Whether this start reads at the bind.
     fn at_bind(&self, start: Start) -> bool {
         match start {
@@ -303,11 +308,12 @@ impl<M: Machine> Core<M> {
     /// One pass over the program of PostgreSQL, if the build keeps it and it is time: the first
     /// pass of the agent, then one every `Timing::program_every`. It does nothing while a start is
     /// in flight or waits, on a node that is fenced or in maintenance, and a start that begins
-    /// ends the pass at its next piece. The event says what the pass found lost and read back; a
-    /// pass that read nothing is silent after the first.
-    pub(crate) async fn warm_program(&self) {
+    /// ends the pass at its next file or piece. The event says what the pass found lost and read
+    /// back; a pass that read nothing is silent after the first. Returns what the pass did, or
+    /// `None` when none was made.
+    pub(crate) async fn warm_program(&self) -> Option<Report> {
         if !self.prefetch.program {
-            return;
+            return None;
         }
         let due = self
             .readahead
@@ -315,16 +321,16 @@ impl<M: Machine> Core<M> {
             .last
             .is_none_or(|at| at.elapsed() >= self.timing.program_every);
         if !due {
-            return;
+            return None;
         }
         // Lowered before the node is asked whether it is quiet: a start that gets its permit after
         // the answer raises it again, and one that got it before is not quiet.
         self.readahead.start_began.store(false, Ordering::Relaxed);
         if self.fences.fenced() || self.maintenance.load(Ordering::Relaxed) {
-            return;
+            return None;
         }
         if !self.admission.quiet().await {
-            return;
+            return None;
         }
         let known = self.readahead.passes().found.clone();
         let program = match known {
@@ -340,7 +346,7 @@ impl<M: Machine> Core<M> {
                 })
                 .await
                 else {
-                    return;
+                    return None;
                 };
                 let found = Arc::new(found);
                 self.readahead.passes().found = Some(found.clone());
@@ -360,7 +366,7 @@ impl<M: Machine> Core<M> {
         })
         .await
         else {
-            return;
+            return None;
         };
         let pass = {
             let mut passes = self.readahead.passes();
@@ -374,6 +380,7 @@ impl<M: Machine> Core<M> {
         if pass == 1 || report.advised > 0 {
             crate::timing::emit_event(program_line(pass, &program, &report));
         }
+        Some(report)
     }
 }
 
@@ -815,9 +822,10 @@ mod tests {
         assert!(passes.found.is_none() && passes.passes == 0);
     }
 
-    /// A start raises the flag that ends a pass, and a pass lowers it first.
+    /// A start raises the flag that ends a pass, and a pass lowers it first. That the pass obeys
+    /// the flag is the next test's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_start_ends_the_pass_over_the_program_that_is_running() {
+    async fn a_start_raises_the_flag_that_ends_a_pass_and_a_pass_lowers_it() {
         let Some(rig) = Rig::with_timing("readahead-start-ends-pass", timing()).await else {
             return;
         };
@@ -833,5 +841,74 @@ mod tests {
         let result = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(result.outcome, Outcome::Started, "{result:?}");
         assert!(rig.core.readahead.start_began.load(Ordering::Relaxed));
+    }
+
+    /// A start that begins while a pass runs ends it at its next file or piece, and the pass is
+    /// made again at the next refill, not at the interval. The program has 2000 files, so no pass
+    /// over it is over within the 2 ms after which the start is raised.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_that_begins_during_a_pass_ends_it_and_the_pass_is_made_again() {
+        let Some(rig) = Rig::with_timing(
+            "readahead-pass-ended",
+            Timing {
+                program_every: Duration::from_secs(3600),
+                ..timing()
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let dir = crate::testpg::directory("readahead-pass-ended");
+        let files: Vec<_> = (0..2000)
+            .map(|n| {
+                let path = dir.join(format!("lib{n}.so"));
+                std::fs::write(&path, [7u8; 4096]).unwrap();
+                path
+            })
+            .collect();
+        rig.core.readahead.passes().found = Some(Arc::new(Program::from_files(files)));
+
+        // A start has begun already, as the create of a database has: the pass lowers the flag
+        // as it begins, and this thread, which sees it lowered, raises it again 2 ms into the pass.
+        rig.core.readahead.start_began();
+        let core = rig.core.clone();
+        let start = std::thread::spawn(move || {
+            let waiting = Instant::now();
+            while core.readahead.start_began.load(Ordering::Relaxed) {
+                assert!(
+                    waiting.elapsed() < Duration::from_secs(30),
+                    "the pass never began"
+                );
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            core.readahead.start_began();
+        });
+        let ended = rig.core.warm_program().await.expect("a pass was made");
+        start.join().unwrap();
+        assert_eq!(ended.stop, prefetch::Stop::Cancelled, "{ended:?}");
+        assert!(ended.files < 2000, "the planning stopped: {ended:?}");
+        assert_eq!(ended.pieces, 0, "the issuing stopped: {ended:?}");
+        assert_eq!(rig.core.readahead.passes().passes, 1);
+        assert!(
+            rig.core.readahead.passes().last.is_none(),
+            "a pass that a start ended does not use up the interval"
+        );
+
+        // The next refill, long before the interval of an hour: the pass is made whole.
+        let whole = rig
+            .core
+            .warm_program()
+            .await
+            .expect("the pass was made again");
+        assert_ne!(whole.stop, prefetch::Stop::Cancelled, "{whole:?}");
+        assert!(whole.pieces > ended.pieces, "{whole:?}");
+        assert_eq!(rig.core.readahead.passes().passes, 2);
+        assert!(rig.core.readahead.passes().last.is_some());
+        assert!(
+            rig.core.warm_program().await.is_none(),
+            "a pass that ran to its end waits for the interval"
+        );
     }
 }
