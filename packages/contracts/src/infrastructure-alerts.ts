@@ -60,7 +60,7 @@ export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
   regional_node_capacity_refusals:
     "A listed node keeps refusing wakes because its awake capacity is full or it cannot start databases fast enough. Move its most active databases to another node, or add a node; see the capacity decision in GET /v1/regions/{id}/capacity-decision.",
   regional_node_pool_closed:
-    "The smallest class fits no node: pool/volume limits or insufficient RAM/CPU. RAM is max(3-day peak, current sample) plus class memory, excluding pending placements; CPU uses its 3-day peak and physical cores. Peaks are 30-minute averages; load must stay below 80 %. Creates, restores and moves wait; running databases continue. Delete databases or add a node.",
+    "No node fits the smallest class: pool data 80%, metadata 50%, sold storage plus class >4x pool, or 1,000 volumes. RAM=max(3-day peak,current)+class, excluding pending placements; CPU uses peak and physical cores. Peaks are 30-minute averages; load must stay below 80%. Creates/restores/moves wait; running databases continue. Delete databases or add a node.",
   database_volume_warning:
     "The filesystem of each listed database is at least 80 % full, in bytes or inodes. Raise its storage with PUT /v1/databases/{id}/resources, or have the integrator free space.",
   database_volume_critical:
