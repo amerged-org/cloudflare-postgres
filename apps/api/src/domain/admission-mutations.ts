@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DatabaseId, NodeId, ProjectId, RegionId } from "@pgcf/contracts";
 import { ApiError, failureCause } from "../api-error.ts";
-import type { Env } from "../env.ts";
+import type { ApiContext, Env } from "../env.ts";
 import type { AdmissionMutationIntent } from "./admission-state.ts";
-import { databaseActor, readDatabasePresence } from "./database-actor-sync.ts";
+import {
+  databaseActor,
+  readDatabasePresence,
+  syncDatabaseActor,
+} from "./database-actor-sync.ts";
 import { hintDatabases } from "./node-hints.ts";
 
 export interface AdmissionSqlGuard {
@@ -188,11 +192,23 @@ export function settleWithin(
 }
 
 /**
+ * The publication a response makes of a database's Actor, for a route that answers a client after
+ * its commit: a replay of the request, and the answer of a write that has committed. The answer
+ * waits for it as `settleWithin` says and never fails with it.
+ */
+export function publishForAnswer(c: ApiContext, databaseId: string) {
+  return settleWithin(
+    c.executionCtx,
+    databaseId,
+  )(syncDatabaseActor(c, databaseId));
+}
+
+/**
  * Trusted callers close Actors before a guarded authoritative write; no callback is retried. Once
- * the write has committed, the Actors are published again and the nodes hinted. By default the call
- * waits for that and fails with it, so a caller that is told again (a node's report) repairs it; a
- * caller that answers a client passes `settle`, which decides how long to wait and whether the
- * failure counts.
+ * the write has committed, or has been refused and its fence closed, the Actors are published again
+ * and the nodes hinted. By default the call waits for that and fails with it, so a caller that is
+ * told again (a node's report) repairs it; a caller that answers a client passes `settle`, which
+ * decides how long to wait, on either path, and whether the failure counts.
  */
 export async function withAdmissionMutation<T>(
   env: Env,
@@ -311,7 +327,7 @@ export async function withAdmissionMutation<T>(
   } catch (error) {
     // The fence CAS invalidates delayed business statements before publication. Missing D1 leaves it closed.
     await fenceAdmissionMutation(env, mutationId, scope)
-      .then(() => publishAfterCommit(env, intents, local))
+      .then(() => settle(publishAfterCommit(env, intents, local)))
       .catch(() => undefined);
     throw error;
   }

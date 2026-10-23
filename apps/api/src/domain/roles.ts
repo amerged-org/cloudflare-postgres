@@ -15,8 +15,8 @@ import type { ApiContext } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseOperationResponse, hint } from "./databases.ts";
-import { syncDatabaseActor } from "./database-actor-sync.ts";
 import {
+  publishForAnswer,
   settleWithin,
   withAdmissionMutation,
   type AdmissionMutation,
@@ -80,7 +80,7 @@ async function replayedRole(
   status: 200 | 201 = 200,
 ): Promise<Response> {
   const response = await roleResponse(c, id, name, status);
-  await settleWithin(c.executionCtx, id)(syncDatabaseActor(c, id));
+  await publishForAnswer(c, id);
   return response;
 }
 export async function listRoles(c: ApiContext, id: string): Promise<Response> {
@@ -369,57 +369,53 @@ export async function deleteRole(
         now = new Date().toISOString(),
         issuer = (await getAuth(c)).id,
         generation = db.generation + 1;
-      const result = await withAdmissionMutation(
-        c.env,
-        [id],
-        async (mutation) => {
-          const guard = mutation.guard(id);
-          const scope = `EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=roles.database_id AND d.project_id=? AND d.generation=? AND d.deleted_at IS NULL)`;
-          return mutation.batch([
-            c.env.DB.prepare(
-              `UPDATE roles SET deleted_at=COALESCE(deleted_at,?),updated_at=?,deleted_by_key_id=?,delete_operation_id=?
+      const result = await mutateRole(c, id, async (mutation) => {
+        const guard = mutation.guard(id);
+        const scope = `EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=roles.database_id AND d.project_id=? AND d.generation=? AND d.deleted_at IS NULL)`;
+        return mutation.batch([
+          c.env.DB.prepare(
+            `UPDATE roles SET deleted_at=COALESCE(deleted_at,?),updated_at=?,deleted_by_key_id=?,delete_operation_id=?
             WHERE database_id=? AND name=? AND owner=0
             AND ${tombstone ? "deleted_at IS NOT NULL AND delete_operation_id IS ?" : "deleted_at IS NULL"}
             AND ${scope}
             AND NOT EXISTS(SELECT 1 FROM roles m, json_each(m.member_of_json) j WHERE m.database_id=roles.database_id AND m.deleted_at IS NULL AND m.name<>roles.name AND j.value=roles.name)
             AND ${guard.sql}`,
-            ).bind(
-              now,
-              now,
-              issuer,
-              operation,
-              id,
-              name,
-              ...(tombstone ? [row.delete_operation_id] : []),
-              db.project_id,
-              db.generation,
-              ...guard.bindings,
-            ),
-            c.env.DB.prepare(
-              `UPDATE databases SET generation=generation+1,updated_at=? WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND ${guard.sql}`,
-            ).bind(now, id, db.project_id, db.generation, ...guard.bindings),
-            c.env.DB.prepare(
-              `INSERT INTO role_deletions(id,status,project_id,database_id,generation,role_name,created_at,updated_at,completed_at)
+          ).bind(
+            now,
+            now,
+            issuer,
+            operation,
+            id,
+            name,
+            ...(tombstone ? [row.delete_operation_id] : []),
+            db.project_id,
+            db.generation,
+            ...guard.bindings,
+          ),
+          c.env.DB.prepare(
+            `UPDATE databases SET generation=generation+1,updated_at=? WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND ${guard.sql}`,
+          ).bind(now, id, db.project_id, db.generation, ...guard.bindings),
+          c.env.DB.prepare(
+            `INSERT INTO role_deletions(id,status,project_id,database_id,generation,role_name,created_at,updated_at,completed_at)
             SELECT ?,?,project_id,id,generation,?,?,?,? FROM databases WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND ${guard.sql}`,
-            ).bind(
-              operation,
-              dormant ? "succeeded" : "pending",
-              name,
-              now,
-              now,
-              dormant ? now : null,
-              id,
-              db.project_id,
-              generation,
-              ...guard.bindings,
-            ),
-            lease.completeStatement(operation, 202, {
-              sql: "EXISTS(SELECT 1 FROM role_deletions WHERE id=? AND database_id=? AND project_id=?)",
-              bindings: [operation, id, db.project_id],
-            }),
-          ]);
-        },
-      );
+          ).bind(
+            operation,
+            dormant ? "succeeded" : "pending",
+            name,
+            now,
+            now,
+            dormant ? now : null,
+            id,
+            db.project_id,
+            generation,
+            ...guard.bindings,
+          ),
+          lease.completeStatement(operation, 202, {
+            sql: "EXISTS(SELECT 1 FROM role_deletions WHERE id=? AND database_id=? AND project_id=?)",
+            bindings: [operation, id, db.project_id],
+          }),
+        ]);
+      });
       if (result[0]!.meta.changes !== 1 || result[2]!.meta.changes !== 1)
         throw new ApiError(
           "conflict",

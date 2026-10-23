@@ -28,7 +28,7 @@ import {
   type RegionRow,
   type SizeRow,
 } from "./rows.ts";
-import { syncDatabaseActor } from "./database-actor-sync.ts";
+import { publishForAnswer } from "./admission-mutations.ts";
 import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
 import { restoreBackup } from "./restore-catalog.ts";
@@ -79,7 +79,7 @@ async function response(
 ): Promise<Response> {
   const operation = await operationForRequest(c, id),
     database = await databaseForRequest(c, operation.database_id, true);
-  await syncDatabaseActor(c, database.id);
+  await publishForAnswer(c, database.id);
   c.header("Location", `/v1/operations/${id}`);
   return Response.json(
     {
