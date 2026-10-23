@@ -78,7 +78,8 @@ const NOTHING: PlacementNeed = {
  * the list names the nodes whose thin pool refuses the class (data or metadata too full, the
  * storage sold plus that class past the logical cap, or `MAX_VOLUMES_PER_NODE` volumes) and, when
  * the nodes that report, are open for new databases and have a pool with room have no RAM or CPU
- * left for it (the 80 % of plan 4.8), every one of those. A pool without room or without a
+ * left for it (CPU peak below 80 %, RAM's higher of peak and current sample plus the class below
+ * 80 %, and enough physical CPU cores), every one of those. A pool without room or without a
  * reading, a node that went quiet, one that is closed by its flags or by a maintenance cycle and
  * one whose load is not known yet are other alarms', or unknown: they are never listed here,
  * though they can take no database either.

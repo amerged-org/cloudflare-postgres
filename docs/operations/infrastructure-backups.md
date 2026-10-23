@@ -402,7 +402,7 @@ the same error has the same event ID and a new `occurred_at`.
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time | fixed | Check its scheduled backup and R2 access; `backup.status` in `GET /v1/operational-health?scope=databases` |
 | `thin_storage_blocked` | a node's newest sample says its thin pool has no room, or a node that holds databases has no sample of its pool within 180 s | fixed | With `thin_pool_no_room`, free space by deleting databases on the node; with `thin_pool_unobserved`, fix the node's samples |
 | `regional_node_capacity_refusals` | a node refused 5 or more wakes for awake capacity or for a full start queue (`57P03` "node at awake capacity" or "node busy starting databases") in the last 10 minutes | fixed | Move the node's most active databases to another node, or add a node |
-| `regional_node_pool_closed` | the region cannot place the smallest size class on offer (the enabled class with the least memory, CPU and storage): no node that reports and is open for new databases takes it, by the rule of placement. One node that is full beside a node that takes the class is no episode. The event lists the nodes whose newest sample refuses the class, with thin pool data at 80 % or more, metadata at 50 % or more, the storage sold (its reported volumes plus the databases it has not finished) plus that class past 4 times its data, or 1,000 volumes or more, and, when the nodes that report, are open and have a pool with room have no RAM or CPU for that class (the 80 % of the 30-minute average), every one of those | fixed; ends as soon as one node takes the class again | Nothing is created, restored or moved in the region; running databases keep running. Delete databases on the listed nodes, or add a node |
+| `regional_node_pool_closed` | the region cannot place the smallest size class on offer (the enabled class with the least memory, CPU and storage): no node that reports and is open for new databases takes it, by the rule of placement. One node that is full beside a node that takes the class is no episode. The event lists the nodes whose newest sample refuses the class, with thin pool data at 80 % or more, metadata at 50 % or more, the storage sold (its reported volumes plus the databases it has not finished) plus that class past 4 times its data, or 1,000 volumes or more, and, when the nodes that report, are open and have a pool with room have no RAM or CPU for that class, every one of those. RAM counts max(three-day peak, current sample) plus class memory, excluding transient pending placements; CPU counts the three-day peak and the class must fit physical cores. Peaks are 30-minute averages; both loads must stay below 80 % | fixed; ends as soon as one node takes the class again | Nothing is created, restored or moved in the region; running databases keep running. Delete databases on the listed nodes, or add a node |
 | `database_volume_warning` | a database volume's space or inodes are at least 80 % used and below 90 % | fixed; the volume's newest report of at most 180 s (the node posts one every 60 s) | Raise its storage with `PUT /v1/databases/{id}/resources`, or have the integrator free space |
 | `database_volume_critical` | a database volume's space or inodes are at least 90 % used | fixed; same report | Raise its storage now: a full volume stops the database |
 | `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed; the episode lists the nodes in `node_ids` | If you did not retry the install, treat the token as leaked: read the `node_enrollment_refused` log and reinstall the node, which issues new tokens |
@@ -557,8 +557,11 @@ volume) it says whether a late alert was late in the report, the evaluation or t
 
 The run records its heartbeat in D1 (`cron_heartbeat`, one row): `started_at` when it
 begins and `completed_at` once every step was attempted, with each failing step's
-consecutive failed runs. `cron` in `GET /v1/operational-health?scope=regions` shows it
-with a `status`:
+consecutive failed runs. Both heartbeat writes use the same 240 s bound as a step; a lost response
+logs `cron_heartbeat_failed` with `cron_heartbeat_timeout` and cannot stop subsequent work or
+prevent the run from returning. The alarm bounds its `watchdog_checked_at` write at 30 s and logs
+`alert_evaluation_unrecorded` if it fails or times out, then still emits `alert_evaluation`.
+`cron` in `GET /v1/operational-health?scope=regions` shows it with a `status`:
 
 | `status` | Meaning |
 | --- | --- |
@@ -573,9 +576,11 @@ one before it evaluates anything. It therefore keeps firing when the Worker's cr
 removed by a deployment or its invocations do not start, when a step hangs and runs never
 complete, and when every step fails. It does not cover the Worker being undeployed or D1 being
 unreachable. Its evaluations are visible as `watchdog_checked_at`, the start of the latest one; a
-value that stops advancing means the alarm chain is not running (check the `CRON_WATCHDOG` binding
-and its `v4` migration). While the cron is stalled its step counters are those of its last
-completed run, so a `control_cron_step_failing` episode is kept and neither started nor cleared.
+value that stops advancing means either the alarm chain stopped (check the `CRON_WATCHDOG`
+binding and its `v4` migration) or its heartbeat write failed (check `alert_evaluation_unrecorded`
+and whether `alert_evaluation` still appears). While the cron is stalled its step counters are
+those of its last completed run, so a `control_cron_step_failing` episode is kept and neither
+started nor cleared.
 
 Reading a stall: `last_started_at` recent with `last_completed_at` old means runs begin
 but do not finish (a step is slow: `cron_step_failed` with `step_timeout` and `cron_completed`'s

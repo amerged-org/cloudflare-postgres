@@ -42,9 +42,11 @@ states what runs where; it does not repeat measurements.
 
 Placement follows the
 [ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#48-placement-in-cloudflare):
-a node takes new databases until its active RAM or its CPU load reaches 80 %, each measured as the
-highest 30-minute average of the last three days, and among the nodes that qualify the fullest
-wins. A node that placement has closed (pool data at 80 %, pool metadata at 50 %, the sold storage
+a node's CPU peak (its highest 30-minute average of the last three days) must be below 80 %.
+RAM uses the higher of its three-day peak and current sample, plus pending placements and the
+new database's full memory; that sum must also be below 80 %. The requested CPU must fit the
+node's physical cores. Among the nodes that qualify the fullest wins. A node that placement has
+closed (pool data at 80 %, pool metadata at 50 %, the sold storage
 at four times the pool's data, or 1,000 volumes) takes none. Each start is admitted by the node
 itself, from its own free RAM and pool. No lease expiry, stale sample or missing observation stops
 a running database: besides its own idle sleep and the node's early sleep, only explicit orders

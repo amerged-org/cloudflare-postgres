@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Placement by measured activity (ULTRA plan 4.8). A node takes new databases until its active
-// RAM or its CPU load reaches 80 %, each as the highest 30-minute average of the last three days;
-// among the nodes that qualify the fullest wins, and a node is added only when none does. A node
+// Placement by measured activity (ULTRA plan 4.8). CPU must stay below 80 % of the highest
+// 30-minute average of the last three days. RAM uses the higher of that peak and the newest sample,
+// plus pending placements and the new database's full memory, and must also stay below 80 %.
+// Among the nodes that qualify the fullest wins, and a node is added only when none does. A node
 // holding `MAX_VOLUMES_PER_NODE` volumes takes no more (plan 4.11). Cloudflare reads only what the
 // node reports: its newest sample (`nodes.last_sample_json`) and its per-minute rollups
 // (`node_minutes`); the node decides every start itself.
@@ -177,9 +178,9 @@ function memoryPpm(mib: number, total: number): bigint {
 }
 
 /**
- * How full a node is for placement: its RAM peak plus the memory of the databases no average
- * includes yet. Null while the node cannot take a database at all; `projected` is that load with
- * `addedMib` more.
+ * How full a node is for placement: the higher of its RAM peak and newest sample, plus the memory
+ * of databases placed since that sample. Null while the load is unknown; `projected` adds the new
+ * database's `addedMib`.
  */
 function load(
   node: PlacementNode,

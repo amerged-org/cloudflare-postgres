@@ -275,7 +275,10 @@ function hanging(prefix: string): Env {
         return (sql: string) =>
           sql.startsWith(prefix)
             ? ({
-                bind: () => ({ all: () => new Promise(() => {}) }),
+                bind: () => ({
+                  all: () => new Promise(() => {}),
+                  run: () => new Promise(() => {}),
+                }),
                 all: () => new Promise(() => {}),
               } as unknown as D1PreparedStatement)
             : target.prepare(sql);
@@ -409,6 +412,32 @@ it("abandons an evaluation phase that never answers, runs the phases after it an
   expect(evaluations(info)[0]).toMatchObject({
     failed: ["capacity_alerts"],
   });
+});
+
+it("completes and logs an evaluation when its heartbeat write never answers", async () => {
+  const now = Date.now();
+  await heartbeat(now, 10_000);
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const info = vi.spyOn(console, "log").mockImplementation(() => {});
+  const result = await evaluateAlerts(
+    hanging("UPDATE cron_heartbeat SET watchdog_checked_at"),
+    now,
+    fetch,
+    { phaseTimeoutMs: 150 },
+  );
+  expect(result.failed).toEqual([]);
+  expect(evaluations(info)).toHaveLength(1);
+  expect(
+    logged.mock.calls.map(([line]) => JSON.parse(String(line))),
+  ).toContainEqual({
+    event: "alert_evaluation_unrecorded",
+    error_code: "cron_heartbeat_timeout",
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT watchdog_checked_at FROM cron_heartbeat WHERE singleton=1",
+    ).first("watchdog_checked_at"),
+  ).toBeNull();
 });
 
 it("defers notifications beyond the evaluation's delivery budget and sends them at the next one", async () => {

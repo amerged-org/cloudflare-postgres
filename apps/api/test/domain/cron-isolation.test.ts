@@ -308,6 +308,44 @@ it("never lets a heartbeat write fault stop the steps", async () => {
   ).toBe(true);
 });
 
+it("abandons an unresponsive initial heartbeat and still attempts every step", async () => {
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const result = await runCron(
+    hanging("INSERT INTO cron_heartbeat"),
+    Date.now(),
+    150,
+  );
+  expect(Object.keys(result.step_ms)).toEqual([...CRON_STEPS]);
+  expect(result.step_failures).toEqual([]);
+  expect(await heartbeat()).toBeNull();
+  expect(
+    logged.mock.calls.map(([line]) => JSON.parse(String(line))),
+  ).toContainEqual({
+    event: "cron_heartbeat_failed",
+    phase: "start",
+    error_code: "cron_heartbeat_timeout",
+  });
+});
+
+it("returns after all steps when the completion heartbeat never answers", async () => {
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const result = await runCron(
+    hanging("UPDATE cron_heartbeat SET completed_at"),
+    Date.now(),
+    150,
+  );
+  expect(Object.keys(result.step_ms)).toEqual([...CRON_STEPS]);
+  expect(result.step_failures).toEqual([]);
+  expect((await heartbeat())?.completed_at).toBeNull();
+  expect(
+    logged.mock.calls.map(([line]) => JSON.parse(String(line))),
+  ).toContainEqual({
+    event: "cron_heartbeat_failed",
+    phase: "finish",
+    error_code: "cron_heartbeat_timeout",
+  });
+});
+
 it("redacts a thrown message before it reaches a log line", () => {
   const message = cronErrorMessage(
     new Error(

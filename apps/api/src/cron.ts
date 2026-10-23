@@ -133,10 +133,12 @@ export async function runCron(
       step_ms[step] = Date.now() - began;
     }
   };
-  // The heartbeat is bookkeeping: a fault there must never stop the work it describes.
+  // The heartbeat is bookkeeping: a fault or lost response must never stop the work it describes.
   let previous: Awaited<ReturnType<typeof beginCronRun>> | null = null;
   try {
-    previous = await beginCronRun(env.DB, now);
+    previous = await runWithin(stepTimeoutMs, "cron_heartbeat_timeout", () =>
+      beginCronRun(env.DB, now),
+    );
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -351,11 +353,13 @@ export async function runCron(
 
   if (previous !== null)
     try {
-      await finishCronRun(
-        env.DB,
-        previous,
-        step_failures,
-        Math.max(now, Date.now()),
+      await runWithin(stepTimeoutMs, "cron_heartbeat_timeout", () =>
+        finishCronRun(
+          env.DB,
+          previous,
+          step_failures,
+          Math.max(now, Date.now()),
+        ),
       );
     } catch (error) {
       console.error(

@@ -71,11 +71,13 @@ export async function evaluateAlerts(
     result.phase_ms[phase] = Date.now() - phaseBegan;
   }
   try {
-    await env.DB.prepare(
-      "UPDATE cron_heartbeat SET watchdog_checked_at=? WHERE singleton=1",
-    )
-      .bind(new Date(began).toISOString())
-      .run();
+    await runWithin(timeout, "cron_heartbeat_timeout", () =>
+      env.DB.prepare(
+        "UPDATE cron_heartbeat SET watchdog_checked_at=? WHERE singleton=1",
+      )
+        .bind(new Date(began).toISOString())
+        .run(),
+    );
   } catch (error) {
     console.error(
       JSON.stringify({
