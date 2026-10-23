@@ -55,6 +55,28 @@ async function sample(
       }),
     )
     .run();
+  const mounted = used !== null && allocated !== null;
+  await env.DB.prepare(
+    `INSERT INTO node_volumes(node_id,database_id,storage_generation,mounted,size_bytes,pool_used_bytes,
+      filesystem_total_bytes,filesystem_used_bytes,inodes_total,inodes_used,observed_at)
+     SELECT node_id,id,storage_generation,?,?,?,?,?,?,?,? FROM databases WHERE id=?
+     ON CONFLICT(node_id,database_id,storage_generation) DO UPDATE SET
+       mounted=excluded.mounted,size_bytes=excluded.size_bytes,pool_used_bytes=excluded.pool_used_bytes,
+       filesystem_total_bytes=excluded.filesystem_total_bytes,filesystem_used_bytes=excluded.filesystem_used_bytes,
+       inodes_total=excluded.inodes_total,inodes_used=excluded.inodes_used,observed_at=excluded.observed_at`,
+  )
+    .bind(
+      mounted ? 1 : 0,
+      allocated ?? 1,
+      used ?? 0,
+      mounted ? allocated : null,
+      mounted ? used : null,
+      mounted ? 1000 : null,
+      mounted ? 10 : null,
+      observedAt,
+      id,
+    )
+    .run();
 }
 const operatorRow = async (admin: string, id: string) => {
   const page = await (
@@ -166,4 +188,55 @@ it("carries the same fields in lists and in operation answers", async () => {
     ).json(),
   );
   expect(deleted.database.storage).toMatchObject({ allocated_bytes: 4 });
+});
+
+it("warns on the real filesystem after the logical volume grew without the filesystem", async () => {
+  const f = await created();
+  const now = new Date().toISOString();
+  await sample(f.id, now, 95, 200);
+  await env.DB.prepare(
+    "UPDATE node_volumes SET filesystem_total_bytes=100 WHERE database_id=?",
+  )
+    .bind(f.id)
+    .run();
+  const database = await read(f);
+  expect(database.health.disk).toEqual({ status: "warning", used_ratio: 0.95 });
+  // Metering still records the provisioned logical volume, not filesystem headroom.
+  expect(database.storage).toMatchObject({
+    used_bytes: 95,
+    allocated_bytes: 200,
+  });
+  expect((await operatorRow(f.admin, f.id)).disk).toMatchObject({
+    status: "warning",
+    used_fraction: 0.95,
+  });
+});
+
+it("does not use another storage generation or an unmounted volume as disk health", async () => {
+  const f = await created();
+  await sample(f.id, new Date().toISOString(), 95, 100);
+  await env.DB.prepare(
+    "UPDATE node_volumes SET storage_generation=storage_generation+1 WHERE database_id=?",
+  )
+    .bind(f.id)
+    .run();
+  expect((await read(f)).health.disk).toEqual({
+    status: "unknown",
+    used_ratio: null,
+  });
+  expect((await operatorRow(f.admin, f.id)).disk.status).toBe("unknown");
+  await env.DB.prepare(
+    `UPDATE node_volumes SET storage_generation=storage_generation-1,mounted=0,
+    filesystem_total_bytes=NULL,filesystem_used_bytes=NULL,inodes_total=NULL,inodes_used=NULL WHERE database_id=?`,
+  )
+    .bind(f.id)
+    .run();
+  expect((await read(f)).health.disk).toEqual({
+    status: "unknown",
+    used_ratio: null,
+  });
+  expect((await read(f)).storage).toMatchObject({
+    used_bytes: 95,
+    allocated_bytes: 100,
+  });
 });
