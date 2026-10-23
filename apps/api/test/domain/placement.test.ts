@@ -374,18 +374,18 @@ describe("the load of a node, read from its samples", () => {
     expect(n.cpu_peak_ppm).toBe(Math.floor((950_000 + 30 * 100_000) / 31));
   });
 
-  it("keeps a 30-minute stretch of high load for seven days", async () => {
+  it("keeps a 30-minute stretch of high load for three days", async () => {
     const { f, a } = await regionWith();
-    // Nearly seven days old, so only a window of seven days still sees it.
-    const high = steady(NOW - 6.9 * DAY, 31, { ramPpm: 850_000 });
+    // Nearly three days old, so only a window of three days still sees it.
+    const high = steady(NOW - 2.9 * DAY, 31, { ramPpm: 850_000 });
     const quiet = steady(NOW, 120, { ramPpm: 50_000 });
     await seedSamples(a, [...high, ...quiet]);
     expect((await load(f.region, a)).ram_peak_ppm).toBe(850_000);
   });
 
-  it("forgets what is older than seven days", async () => {
+  it("forgets what is older than three days", async () => {
     const { f, a } = await regionWith();
-    const old = steady(NOW - 8 * DAY, 60, { ramPpm: 900_000, cpuPpm: 900_000 });
+    const old = steady(NOW - 4 * DAY, 60, { ramPpm: 900_000, cpuPpm: 900_000 });
     const quiet = steady(NOW, 60, { ramPpm: 50_000, cpuPpm: 70_000 });
     await seedSamples(a, [...old, ...quiet]);
     const n = await load(f.region, a);
@@ -675,6 +675,32 @@ describe("the storage a node has not finished", () => {
 });
 
 describe("placement over real samples", () => {
+  it("is closed by a peak inside three days and open again once the peak is older", async () => {
+    const f = await fixture(0);
+    const recent = await addNode(f.region, 0),
+      older = await addNode(f.region, 0);
+    const now = Date.now();
+    // Both nodes peaked at 85 % of their RAM for 30 minutes and have been quiet since.
+    const peaked = (daysAgo: number) => [
+      ...steady(now - daysAgo * DAY, 31, { ramPpm: 850_000 }),
+      ...steady(now, 120, { ramPpm: 50_000 }),
+    ];
+    await seedSamples(recent, peaked(2.9));
+    await seedSamples(older, peaked(3.1));
+    const nodes = await placementNodes(env.DB, f.region, now);
+    expect(nodes.find((n) => n.id === recent)?.ram_peak_ppm).toBe(850_000);
+    expect(nodes.find((n) => n.id === older)?.ram_peak_ppm).toBe(50_000);
+    const need = { memory_mib: 256, cpu_millicores: 500, storage_gib: 5 };
+    expect(choosePlacement(nodes, need, now)?.id).toBe(older);
+    expect(
+      choosePlacement(
+        nodes.filter((n) => n.id !== older),
+        need,
+        now,
+      ),
+    ).toBeNull();
+  });
+
   it("stops a burst of creates at the logical cap before the node has reported any of them", async () => {
     const f = await fixture(0);
     // 30 GiB of pool data give a cap of 120 GiB; 115 GiB are sold when the node last reported.
