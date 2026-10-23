@@ -10,6 +10,34 @@
  * adds the property is a breaking change, and the plan's row for the release says why it is safe.
  */
 export const NODE_REQUIRED: Record<string, string[]> = {
+  // New variant: API capability-gates delivery until the native consumer is deployed.
+  "NodeDesiredPage.databases[].origin|kind=replace": [
+    "kind",
+    "previous",
+    "source",
+  ],
+  "NodeDesiredPage.databases[].origin|kind=replace.source": [
+    "backup_id",
+    "credential",
+    "database_id",
+    "path",
+    "target_time",
+  ],
+  "NodeDesiredPage.databases[].origin|kind=replace.source.credential": [
+    "expires_at",
+    "id",
+  ],
+  "NodeDesiredPage.databases[].origin|kind=replace.previous": [
+    "end",
+    "storage_generation",
+  ],
+  "NodeDesiredPage.databases[].origin|kind=replace.previous.end": [
+    "checkpoint_lsn",
+    "last_archived_segment",
+    "proven_at",
+    "system_identifier",
+    "timeline",
+  ],
   "AgentLinkMessage|type=hello": [
     "agent_version",
     "os",
