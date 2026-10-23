@@ -347,8 +347,9 @@ created at full size at first boot and does not grow.
   `reserve_bytes` and metadata below `metadata_no_room_percent`. The refusal is `57P03` with the
   DETAIL "storage"; running databases keep running. Cloudflare places no new database or restore on
   a node whose pool is at 80 % of its data or 50 % of its metadata, whose sold storage reached
-  four times its data, or that holds 1,000 volumes, the largest count Stage 1 measured
-  (`regional_node_pool_closed`; the bound counts sleeping databases too and is no policy field: only
+  four times its data (counting the smallest size class on offer as sold), or that holds 1,000
+  volumes, the largest count Stage 1 measured (`regional_node_pool_closed`, which fires when
+  no node of the region takes the smallest size class, for the pool, the RAM or the CPU; the bound counts sleeping databases too and is no policy field: only
   a measurement at a higher count raises it). Sold sizes do not reserve space. `thin_storage_blocked` fires when the pool has no room. Free space by deleting
   databases on the node.
 - **A full pool.** Writes fail at once (`--errorwhenfull y`) and no commit is acknowledged without

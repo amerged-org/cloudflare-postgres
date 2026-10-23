@@ -9,7 +9,6 @@ import {
   cronErrorCode,
   cronErrorMessage,
 } from "../../src/domain/cron-health.ts";
-import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import { infrastructureAlertStatus } from "../../src/domain/infrastructure-alerts.ts";
 import { configureInfrastructureBackups } from "../../src/domain/infrastructure-backups.ts";
 import type { Env } from "../../src/env.ts";
@@ -46,6 +45,27 @@ function failing(...prefixes: string[]): Env {
   });
   return { ...env, DB: db };
 }
+/** A database whose statements starting with `prefix` never answer, as a lost D1 request does. */
+function hanging(prefix: string): Env {
+  const db = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          if (!sql.startsWith(prefix)) return target.prepare(sql);
+          const never = () => new Promise<never>(() => {});
+          return {
+            bind: () => ({ all: never, first: never, run: never }),
+            all: never,
+            first: never,
+            run: never,
+          } as unknown as D1PreparedStatement;
+        };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { ...env, DB: db };
+}
 const heartbeat = () =>
   env.DB.prepare("SELECT * FROM cron_heartbeat WHERE singleton=1").first<{
     started_at: string;
@@ -69,15 +89,46 @@ it("records a heartbeat of every run and lists the steps it attempted", async ()
   expect(new Set(CRON_STEPS).size).toBe(CRON_STEPS.length);
   // An alert event lists at most 20 failing steps and a heartbeat row at most 4 KB of counters.
   expect(CRON_STEPS.length).toBeLessThanOrEqual(20);
-  // Alerting needs only D1 and a bounded send, so it leads; the dispatch's Workflow calls follow.
-  expect(CRON_STEPS.slice(0, 3)).toEqual([
-    "health_alerts",
-    "capacity_alerts",
-    "infrastructure_backup_dispatch",
-  ]);
+  // The alerts are no step: the CronWatchdog alarm evaluates them every minute. The daily
+  // backup's Workflow calls lead the steps that call out.
+  expect(CRON_STEPS[0]).toBe("infrastructure_backup_dispatch");
+  expect(CRON_STEPS).not.toContain("health_alerts");
+  expect(CRON_STEPS).not.toContain("capacity_alerts");
+  // Every step reports the time it took, in the order they ran.
+  expect(Object.keys(result.step_ms)).toEqual([...CRON_STEPS]);
+  for (const ms of Object.values(result.step_ms))
+    expect(Number.isInteger(ms)).toBe(true);
 });
 
-it("logs, counts and reports a failing step while alerting and backup dispatch still run", async () => {
+it("leaves the alerts to the watchdog's alarm: a stale node is not alarmed by a run", async () => {
+  const f = await fixture(),
+    at = Date.now();
+  await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
+    .bind(new Date(at - 600_000).toISOString(), f.node)
+    .run();
+  const statements: string[] = [];
+  const spied: Env = {
+    ...env,
+    DB: new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (sql: string) => {
+            statements.push(sql);
+            return target.prepare(sql);
+          };
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  };
+  await runCron(spied, at);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toEqual([]);
+  expect(statements.some((sql) => sql.includes("infrastructure_alerts"))).toBe(
+    false,
+  );
+});
+
+it("logs, counts and reports a failing step while the steps around it still run", async () => {
   const f = await fixture(),
     at = Date.now(),
     created: string[] = [];
@@ -105,19 +156,13 @@ it("logs, counts and reports a failing step while alerting and backup dispatch s
     },
     at - 3_600_000,
   );
-  await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
-    .bind(new Date(at - 600_000).toISOString(), f.node)
-    .run();
   const logged = vi.spyOn(console, "error").mockImplementation(() => {});
   const result = await runCron(binding, at);
   expect(result.step_failures).toEqual([
     { step: "admission_recovery", error_code: "injected_step_failure" },
     { step: "retained_archives", error_code: "injected_step_failure" },
   ]);
-  // Later steps ran: the stale node was alarmed and the due daily backup was dispatched.
-  expect(await infrastructureAlertStatus(env.DB, f.region)).toContainEqual(
-    expect.objectContaining({ kind: "regional_node_stale", active: true }),
-  );
+  // Later steps ran: the due daily backup was dispatched.
   expect(created).toHaveLength(1);
   const lines = logged.mock.calls
     .map(([line]) => String(line))
@@ -129,12 +174,14 @@ it("logs, counts and reports a failing step while alerting and backup dispatch s
       step: "admission_recovery",
       error_code: "injected_step_failure",
       message: "injected_step_failure",
+      ms: expect.any(Number),
     },
     {
       event: "cron_step_failed",
       step: "retained_archives",
       error_code: "injected_step_failure",
       message: "injected_step_failure",
+      ms: expect.any(Number),
     },
   ]);
   expect(JSON.parse((await heartbeat())!.failing_steps_json)).toEqual({
@@ -202,49 +249,58 @@ it("counts consecutive failed runs per step and forgets a step once it succeeds"
   expect((await heartbeat())!.failing_steps_json).toBe("{}");
 });
 
-it("evaluates a region's alerts even when its capacity decision fails", async () => {
-  const f = await fixture(8192, 40),
-    at = Date.now(),
-    provider = String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!);
-  await env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?")
-    .bind(provider, f.node)
+it("abandons a step that never answers and runs the steps after it, counting it as failed", async () => {
+  const f = await fixture(),
+    at = Date.now();
+  expect(
+    (await f.create("database", f.integrator, crypto.randomUUID())).status,
+  ).toBe(202);
+  // A day-old idempotency key: its purge follows the power timeouts, which never answer.
+  await env.DB.prepare("UPDATE idempotency_keys SET created_at=?")
+    .bind(new Date(at - 25 * 3_600_000).toISOString())
     .run();
-  // The one provider-assigned node is the cap of 1.
-  await configureNodeRegionPolicy(env.DB, {
-    region_id: f.region,
-    max_nodes: 1,
-    purchases_enabled: false,
-    cap_warning_enabled: true,
-    maximum_database_memory_mib: 4096,
-  });
-  vi.spyOn(console, "error").mockImplementation(() => {});
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const began = Date.now();
   const result = await runCron(
-    failing("SELECT * FROM node_region_policies WHERE region_id=?"),
+    hanging("SELECT database_id cursor FROM power_timeout_cursor"),
     at,
+    150,
   );
-  expect(result.step_failures.map((value) => value.step)).toEqual([
-    "node_capacity",
+  expect(Date.now() - began).toBeLessThan(10_000);
+  expect(result.step_failures).toEqual([
+    { step: "power_timeouts", error_code: "step_timeout" },
   ]);
-  expect(await infrastructureAlertStatus(env.DB, f.region)).toContainEqual(
-    expect.objectContaining({
-      kind: "regional_node_cap_reached",
-      active: true,
-    }),
-  );
+  expect(result.step_ms.power_timeouts).toBeGreaterThanOrEqual(150);
+  expect(result.purged).toBeGreaterThan(0);
+  const row = await heartbeat();
+  expect(row!.completed_at).not.toBeNull();
+  expect(JSON.parse(row!.failing_steps_json)).toEqual({
+    power_timeouts: { consecutive_failures: 1, error_code: "step_timeout" },
+  });
+  expect(
+    logged.mock.calls.some(
+      ([line]) =>
+        String(line).includes("cron_step_failed") &&
+        String(line).includes("power_timeouts") &&
+        String(line).includes("step_timeout"),
+    ),
+  ).toBe(true);
 });
 
 it("never lets a heartbeat write fault stop the steps", async () => {
   const f = await fixture(),
     at = Date.now();
-  await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
-    .bind(new Date(at - 600_000).toISOString(), f.node)
+  expect(
+    (await f.create("database", f.integrator, crypto.randomUUID())).status,
+  ).toBe(202);
+  await env.DB.prepare("UPDATE idempotency_keys SET created_at=?")
+    .bind(new Date(at - 25 * 3_600_000).toISOString())
     .run();
   const logged = vi.spyOn(console, "error").mockImplementation(() => {});
   const result = await runCron(failing("INSERT INTO cron_heartbeat"), at);
   expect(result.step_failures).toEqual([]);
-  expect(await infrastructureAlertStatus(env.DB, f.region)).toContainEqual(
-    expect.objectContaining({ kind: "regional_node_stale", active: true }),
-  );
+  // The steps ran: the old idempotency key was purged.
+  expect(result.purged).toBeGreaterThan(0);
   expect(
     logged.mock.calls.some(([line]) =>
       String(line).includes("cron_heartbeat_failed"),
@@ -252,54 +308,42 @@ it("never lets a heartbeat write fault stop the steps", async () => {
   ).toBe(true);
 });
 
-it("defers notifications beyond the run's delivery budget so a slow mail provider cannot hold back later steps", async () => {
-  const f = await fixture(),
-    at = Date.now(),
-    sent: string[] = [],
-    logged = vi.spyOn(console, "error").mockImplementation(() => {});
-  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
-    sent.push(String(input));
-    return new Response(null, { status: 204 });
-  });
-  const binding: Env = {
-    ...env,
-    INFRASTRUCTURE_ALERT_WEBHOOK_URL: "https://receiver.invalid/events",
-    INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN: "test-alert-receiver-token",
-  };
-  await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
-    .bind(new Date(at - 600_000).toISOString(), f.node)
-    .run();
-  // A zero budget attempts nothing, yet every other step of the run completes.
-  const result = await runCron(binding, at, 0);
+it("abandons an unresponsive initial heartbeat and still attempts every step", async () => {
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const result = await runCron(
+    hanging("INSERT INTO cron_heartbeat"),
+    Date.now(),
+    150,
+  );
+  expect(Object.keys(result.step_ms)).toEqual([...CRON_STEPS]);
   expect(result.step_failures).toEqual([]);
-  expect(sent).toEqual([]);
-  expect((await heartbeat())!.completed_at).not.toBeNull();
-  expect(await infrastructureAlertStatus(env.DB, f.region)).toContainEqual(
-    expect.objectContaining({
-      kind: "regional_node_stale",
-      active: true,
-      delivered_at: null,
-    }),
-  );
+  expect(await heartbeat()).toBeNull();
   expect(
-    logged.mock.calls.some(([line]) =>
-      String(line).includes("infrastructure_alert_deferred"),
-    ),
-  ).toBe(true);
-  // Nothing was claimed, so the retry interval is not spent on an attempt that never happened.
-  expect(
-    await env.DB.prepare(
-      "SELECT last_attempt_at FROM infrastructure_alerts WHERE region_id=? AND kind='regional_node_stale'",
-    )
-      .bind(f.region)
-      .first<string | null>("last_attempt_at"),
-  ).toBeNull();
-  // The next minute's run, with its own budget, sends the same event.
-  await runCron(binding, at + 61_000);
-  expect(sent).toEqual(["https://receiver.invalid/events"]);
-  expect(await infrastructureAlertStatus(env.DB, f.region)).toContainEqual(
-    expect.objectContaining({ kind: "regional_node_stale", active: true }),
+    logged.mock.calls.map(([line]) => JSON.parse(String(line))),
+  ).toContainEqual({
+    event: "cron_heartbeat_failed",
+    phase: "start",
+    error_code: "cron_heartbeat_timeout",
+  });
+});
+
+it("returns after all steps when the completion heartbeat never answers", async () => {
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const result = await runCron(
+    hanging("UPDATE cron_heartbeat SET completed_at"),
+    Date.now(),
+    150,
   );
+  expect(Object.keys(result.step_ms)).toEqual([...CRON_STEPS]);
+  expect(result.step_failures).toEqual([]);
+  expect((await heartbeat())?.completed_at).toBeNull();
+  expect(
+    logged.mock.calls.map(([line]) => JSON.parse(String(line))),
+  ).toContainEqual({
+    event: "cron_heartbeat_failed",
+    phase: "finish",
+    error_code: "cron_heartbeat_timeout",
+  });
 });
 
 it("redacts a thrown message before it reaches a log line", () => {

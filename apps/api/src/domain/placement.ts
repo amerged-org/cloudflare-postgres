@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Placement by measured activity (ULTRA plan 4.8). A node takes new databases until its active
-// RAM or its CPU load reaches 80 %, each as the highest 30-minute average of the last three days;
-// among the nodes that qualify the fullest wins, and a node is added only when none does. A node
+// Placement by measured activity (ULTRA plan 4.8). CPU must stay below 80 % of the highest
+// 30-minute average of the last three days. RAM uses the higher of that peak and the newest sample,
+// plus pending placements and the new database's full memory, and must also stay below 80 %.
+// Among the nodes that qualify the fullest wins, and a node is added only when none does. A node
 // holding `MAX_VOLUMES_PER_NODE` volumes takes no more (plan 4.11). Cloudflare reads only what the
 // node reports: its newest sample (`nodes.last_sample_json`) and its per-minute rollups
 // (`node_minutes`); the node decides every start itself.
@@ -106,7 +107,7 @@ export function nodeOnline(node: PlacementNode, now: number): boolean {
   return at >= now - NODE_OBSERVATION_MAX_AGE_MS && at <= now + CLOCK_SKEW_MS;
 }
 /** The node's own flags allow new databases. */
-function nodeOpen(node: PlacementNode): boolean {
+export function nodeOpen(node: PlacementNode): boolean {
   return (
     node.ready === 1 &&
     node.schedulable === 1 &&
@@ -128,7 +129,7 @@ type PoolState =
  * node; data, metadata and the volume count close it for new databases only and come after them,
  * the volume count last.
  */
-function poolState(
+export function poolState(
   pool: Pick<
     PlacementNode,
     | "room"
@@ -177,9 +178,9 @@ function memoryPpm(mib: number, total: number): bigint {
 }
 
 /**
- * How full a node is for placement: its RAM peak plus the memory of the databases no average
- * includes yet. Null while the node cannot take a database at all; `projected` is that load with
- * `addedMib` more.
+ * How full a node is for placement: the higher of its RAM peak and newest sample, plus the memory
+ * of databases placed since that sample. Null while the load is unknown; `projected` adds the new
+ * database's `addedMib`.
  */
 function load(
   node: PlacementNode,
@@ -364,32 +365,6 @@ export async function placementNodes(
     )
     .all<PlacementNode>();
   return result.results;
-}
-
-/**
- * The nodes of a region, not lost, that the newest sample closes for placement: the thin pool's
- * data or metadata is too full, the storage sold has reached the logical cap (plan 4.3), or the
- * node holds `MAX_VOLUMES_PER_NODE` volumes. A pool without room or without a reading is another
- * alarm's.
- */
-export async function closedPools(
-  db: D1Database,
-  regionId: string,
-): Promise<string[]> {
-  const result = await db
-    .prepare(
-      `SELECT n.id,l.room,l.pool_data_total_bytes,l.pool_data_used_bytes,l.pool_metadata_total_bytes,l.pool_metadata_used_bytes,
-        l.pool_nominal_bytes,l.volumes_total,${pendingStorageSql("n", "l.observed_at")} pending_storage_gib
-      FROM nodes n JOIN (${LATEST_SAMPLES_SQL}) l ON l.node_id=n.id
-      WHERE n.region_id=? AND n.lost_at IS NULL ORDER BY n.id`,
-    )
-    .bind(regionId)
-    .all<Parameters<typeof poolState>[0] & { id: string }>();
-  return result.results
-    .filter((node) =>
-      ["data", "metadata", "cap", "volumes"].includes(poolState(node)),
-    )
-    .map((node) => node.id);
 }
 
 const aliasOf = (alias: string) => {

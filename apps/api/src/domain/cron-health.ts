@@ -3,15 +3,13 @@ import { z } from "zod";
 import { Timestamp, type InfraCronFailingStep } from "@pgcf/contracts";
 
 /**
- * The minute cron's steps in execution order. Alerting needs only D1 and a bounded send, so it
- * leads; the daily backup dispatch follows, ahead of the steps that call out to other systems. No
- * more than 20 steps: an alert event lists at most that many failing steps (a payload of 20 at
- * their longest stays under D1's 4 KB check). Every step runs in its own failure boundary (see
- * runCron).
+ * The minute cron's steps in execution order. The daily backup dispatch leads, ahead of the steps
+ * that call out to other systems. No more than 20 steps: an alert event lists at most that many
+ * failing steps (a payload of 20 at their longest stays under D1's 4 KB check). Every step runs in
+ * its own failure boundary and has a time of its own (see runCron). The alerts are no step: the
+ * CronWatchdog alarm evaluates them every minute.
  */
 export const CRON_STEPS = [
-  "health_alerts",
-  "capacity_alerts",
   "infrastructure_backup_dispatch",
   "admission_recovery",
   "node_fencing",
@@ -32,6 +30,29 @@ export type CronStep = (typeof CRON_STEPS)[number];
 export interface CronStepFailure {
   step: CronStep;
   error_code: string;
+}
+
+/**
+ * The result of `run()`, or a rejection with `code` as its message once `ms` have passed without an
+ * answer. The call is not cancelled and its late result, or failure, is dropped: it is abandoned,
+ * and whatever it was waiting for can no longer hold the caller back.
+ */
+export async function runWithin<T>(
+  ms: number,
+  code: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      run(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(code)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** No run completed for this long: the cron is stalled. */
@@ -143,7 +164,7 @@ export const CronHealth = z.strictObject({
     "Latest run that attempted every step, whether or not steps failed.",
   ),
   watchdog_checked_at: Timestamp.nullable().describe(
-    "Latest evaluation by the CronWatchdog Durable Object alarm, which runs independently of the cron trigger; null if it never ran.",
+    "Start of the latest evaluation of the alerts by the CronWatchdog Durable Object alarm, which runs every minute independently of the cron trigger; null if it never ran.",
   ),
   failing_steps: z
     .array(

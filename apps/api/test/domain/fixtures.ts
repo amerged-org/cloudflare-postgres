@@ -113,6 +113,8 @@ export async function request(
   /** A string is sent as is; `null` sends none; omitted sends a fresh key where one is required. */
   idempotency?: string | null,
   extraHeaders?: HeadersInit,
+  /** Bindings the Worker sees instead of the test's own, such as a database that faults. */
+  bindings?: Partial<Env>,
 ): Promise<Response> {
   const context = createExecutionContext();
   const headers = new Headers(extraHeaders);
@@ -134,6 +136,7 @@ export async function request(
       ...env,
       DB_ENDPOINT_HOST: ["db", "invalid"].join("."),
       NODE_API_ORIGIN: API_ORIGIN,
+      ...bindings,
     },
     context,
   );

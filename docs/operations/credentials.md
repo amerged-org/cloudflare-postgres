@@ -56,8 +56,10 @@ to name.
 
 A change is written to the log **before** it runs, and its status is added when the answer is
 known. This order is deliberate: a change cannot be taken back, so a row written afterwards could
-be lost with the change already made. If the row cannot be written, the request is not run and
-answers `500` (log line `audit_write_failed`); the retry is safe. If only the status cannot be
+be lost with the change already made. A failed insert is retried up to three attempts with the same
+event ID; a lost response after D1 committed the row cannot create a duplicate. If all attempts
+fail, the request is not run and answers `500` (log line `audit_write_failed`); the retry is safe.
+If only the status cannot be
 written, the answer stands and the event keeps `status: null`, which says the outcome is unknown
 (also after a Worker that stopped mid-request), never that it succeeded. A refused key is
 refused whatever the log says. Look for `null` statuses after an incident.

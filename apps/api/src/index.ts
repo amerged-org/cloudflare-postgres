@@ -17,7 +17,11 @@ export default {
   },
   scheduled(_controller, env, context) {
     // One line per invocation makes bounded background work, such as the usage sample pruning,
-    // observable while it drains.
+    // observable while it drains. It carries the time of each step (`step_ms`), not the colo of the
+    // run, which would take a trace request in every run: Cloudflare's invocation analytics name a
+    // colo and a start for most invocations, not all (they are sampled and omit some), so they are
+    // read with `sampleInterval` and checked against these lines
+    // (docs/operations/infrastructure-backups.md).
     context.waitUntil(
       import("./cron.ts")
         .then(({ runCron }) => runCron(env))

@@ -6,6 +6,7 @@ import {
   placementGuard,
   placementNodes,
 } from "./placement.ts";
+import { smallestOfferedClass } from "./placement-closed.ts";
 import type { DatabaseRow, SizeRow } from "./rows.ts";
 import type { Env } from "../env.ts";
 import { cronErrorCode } from "./cron-health.ts";
@@ -206,9 +207,7 @@ export async function runNodeCapacity(
       )
         .bind(waiting.size_class_id)
         .first<SizeRow>()
-    : await env.DB.prepare(
-        "SELECT * FROM size_classes WHERE enabled=1 ORDER BY memory_mib,cpu_millicores,storage_gib,id LIMIT 1",
-      ).first<SizeRow>();
+    : await smallestOfferedClass(env.DB);
   // A disabled class cannot be placed, and a region without classes has nothing to place.
   if (!size)
     return waiting ? { ...result, action: "size_policy_unavailable" } : result;

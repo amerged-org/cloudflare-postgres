@@ -940,6 +940,10 @@ describe("raw usage sample retention", () => {
       failed: 0,
       pruned: 6,
     });
+    // The line carries the time of each step.
+    expect(summaries[0]).toMatchObject({
+      step_ms: { usage: expect.any(Number) },
+    });
     // Only the invocation's own backup measurement of the current hour remains.
     const remaining = await perHour(id);
     expect(remaining[0]).toBeUndefined();

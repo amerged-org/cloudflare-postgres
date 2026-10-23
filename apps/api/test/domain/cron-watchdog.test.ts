@@ -4,14 +4,17 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { INFRA_ALERT_ACTIONS, InfraAlert } from "@pgcf/contracts";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
+  ALERT_PHASE_TIMEOUT_MS,
   CRON_WATCHDOG_INTERVAL_MS,
   CronWatchdog,
+  evaluateAlerts,
 } from "../../src/cron-watchdog.ts";
 import { runCron } from "../../src/cron.ts";
 import {
   infrastructureAlertStatus,
   runCronWatchdog,
 } from "../../src/domain/infrastructure-alerts.ts";
+import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import type { Env } from "../../src/env.ts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
 
@@ -203,7 +206,7 @@ it("names a failing step in the event id: another step is another error, the sam
   await fail({ usage: 5, retained_archives: 1 }, 0);
   const first = await episode();
   await fail({}, 1000);
-  await fail({ health_alerts: 5 }, 2000);
+  await fail({ node_hints: 5 }, 2000);
   const other = await episode();
   await fail({}, 3000);
   await fail({ usage: 5 }, 4000);
@@ -248,13 +251,218 @@ it("keeps scheduling its next alarm when an evaluation fails", async () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    watchdog.env = { ...watchdog.env, DB: failing };
-    await watchdog.alarm();
-    expect(await state.storage.getAlarm()).not.toBeNull();
+    const healthy = watchdog.env;
+    watchdog.env = { ...healthy, DB: failing };
+    try {
+      await watchdog.alarm();
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    } finally {
+      watchdog.env = healthy;
+    }
   });
   expect(
     logged.mock.calls.some(([line]) =>
       String(line).includes("injected_watchdog_failure"),
     ),
   ).toBe(true);
+});
+
+/** A database whose statements starting with `prefix` never answer, as a D1 request that is lost does. */
+function hanging(prefix: string): Env {
+  const db = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) =>
+          sql.startsWith(prefix)
+            ? ({
+                bind: () => ({
+                  all: () => new Promise(() => {}),
+                  run: () => new Promise(() => {}),
+                }),
+                all: () => new Promise(() => {}),
+              } as unknown as D1PreparedStatement)
+            : target.prepare(sql);
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { ...env, DB: db };
+}
+const staleNode = (node: string, now: number) =>
+  env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
+    .bind(ago(now, 10 * MINUTE), node)
+    .run();
+const evaluations = (logged: { mock: { calls: unknown[][] } }) =>
+  logged.mock.calls
+    .map(([line]) => String(line))
+    .filter((line) => line.includes('"alert_evaluation"'))
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+it("evaluates the health and capacity alerts from its own alarm, with no cron run at all", async () => {
+  const f = await fixture(),
+    now = Date.now();
+  await staleNode(f.node, now);
+  // A cap of 1 provider-assigned node, which the region holds.
+  await env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?")
+    .bind(String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!), f.node)
+    .run();
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 1,
+    purchases_enabled: false,
+    cap_warning_enabled: true,
+    maximum_database_memory_mib: 4096,
+  });
+  // No heartbeat exists: the cron never ran. The alarm alone raises both episodes.
+  expect(
+    await env.DB.prepare("SELECT 1 FROM cron_heartbeat").first(),
+  ).toBeNull();
+  await runInDurableObject(stub(), async (_i, state) => {
+    await state.storage.setAlarm(Date.now() + 10_000);
+  });
+  const logged = vi.spyOn(console, "log").mockImplementation(() => {});
+  expect(await runDurableObjectAlarm(stub())).toBe(true);
+  const kinds = await episodes(f.region);
+  expect(kinds.get("regional_node_stale")).toMatchObject({ active: true });
+  expect(kinds.get("regional_node_cap_reached")).toMatchObject({
+    active: true,
+  });
+  expect(evaluations(logged)).toHaveLength(1);
+  expect(evaluations(logged)[0]).toMatchObject({
+    event: "alert_evaluation",
+    failed: [],
+    phase_ms: {
+      health_alerts: expect.any(Number),
+      capacity_alerts: expect.any(Number),
+      cron_watchdog: expect.any(Number),
+    },
+  });
+});
+
+it("evaluates the alerts at every alarm, whatever the cron is doing, and records each evaluation", async () => {
+  const f = await fixture(),
+    now = Date.now();
+  // The cron started a minute ago and has not finished: a step hangs.
+  await env.DB.prepare(
+    "INSERT INTO cron_heartbeat(singleton,started_at,completed_at,failing_steps_json) VALUES(1,?,?,'{}')",
+  )
+    .bind(ago(now, MINUTE), ago(now, 2 * MINUTE))
+    .run();
+  const logged = vi.spyOn(console, "log").mockImplementation(() => {});
+  const checked = async () =>
+    Date.parse(
+      (await env.DB.prepare(
+        "SELECT watchdog_checked_at FROM cron_heartbeat WHERE singleton=1",
+      ).first<string>("watchdog_checked_at"))!,
+    );
+  await runInDurableObject(stub(), async (_i, state) => {
+    await state.storage.setAlarm(Date.now() + 10_000);
+  });
+  expect(await runDurableObjectAlarm(stub())).toBe(true);
+  const first = await checked();
+  expect(first).toBeGreaterThanOrEqual(now);
+  // A node goes quiet between two alarms: the second alarm alone alerts.
+  await staleNode(f.node, now);
+  expect(await runDurableObjectAlarm(stub())).toBe(true);
+  expect(await checked()).toBeGreaterThanOrEqual(first);
+  expect((await episodes(f.region)).get("regional_node_stale")).toMatchObject({
+    active: true,
+  });
+  expect(evaluations(logged)).toHaveLength(2);
+  // Every alarm schedules the next one, a minute ahead.
+  const next = await runInDurableObject(stub(), (_i, state) =>
+    state.storage.getAlarm(),
+  );
+  expect(next).toBeGreaterThanOrEqual(
+    Date.now() + CRON_WATCHDOG_INTERVAL_MS - 2000,
+  );
+});
+
+it("abandons an evaluation phase that never answers, runs the phases after it and says so", async () => {
+  const f = await fixture(),
+    now = Date.now(),
+    started = Date.now();
+  await staleNode(f.node, now);
+  await heartbeat(now, 8 * MINUTE);
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const info = vi.spyOn(console, "log").mockImplementation(() => {});
+  // The capacity phase reads the policies first; that read is lost.
+  const result = await evaluateAlerts(
+    hanging("SELECT region_id FROM node_region_policies ORDER BY region_id"),
+    now,
+    fetch,
+    { phaseTimeoutMs: 100 },
+  );
+  expect(Date.now() - started).toBeLessThan(ALERT_PHASE_TIMEOUT_MS);
+  expect(result.failed).toEqual([
+    { phase: "capacity_alerts", error_code: "alert_phase_timeout" },
+  ]);
+  // The phases around it ran: the stale node and the stalled cron are both alarmed.
+  const kinds = await episodes(f.region);
+  expect(kinds.get("regional_node_stale")).toMatchObject({ active: true });
+  expect(kinds.get("control_cron_stalled")).toMatchObject({ active: true });
+  expect(
+    logged.mock.calls.some(
+      ([line]) =>
+        String(line).includes("alert_phase_failed") &&
+        String(line).includes("capacity_alerts") &&
+        String(line).includes("alert_phase_timeout"),
+    ),
+  ).toBe(true);
+  expect(evaluations(info)[0]).toMatchObject({
+    failed: ["capacity_alerts"],
+  });
+});
+
+it("completes and logs an evaluation when its heartbeat write never answers", async () => {
+  const now = Date.now();
+  await heartbeat(now, 10_000);
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const info = vi.spyOn(console, "log").mockImplementation(() => {});
+  const result = await evaluateAlerts(
+    hanging("UPDATE cron_heartbeat SET watchdog_checked_at"),
+    now,
+    fetch,
+    { phaseTimeoutMs: 150 },
+  );
+  expect(result.failed).toEqual([]);
+  expect(evaluations(info)).toHaveLength(1);
+  expect(
+    logged.mock.calls.map(([line]) => JSON.parse(String(line))),
+  ).toContainEqual({
+    event: "alert_evaluation_unrecorded",
+    error_code: "cron_heartbeat_timeout",
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT watchdog_checked_at FROM cron_heartbeat WHERE singleton=1",
+    ).first("watchdog_checked_at"),
+  ).toBeNull();
+});
+
+it("defers notifications beyond the evaluation's delivery budget and sends them at the next one", async () => {
+  const f = await fixture(),
+    now = Date.now(),
+    hook = receiver();
+  await staleNode(f.node, now);
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  // A zero budget attempts nothing, yet the episode is armed and every phase completes.
+  const first = await evaluateAlerts(hook.env, now, hook.fetcher, {
+    deliveryBudgetMs: 0,
+  });
+  expect(first.failed).toEqual([]);
+  expect(hook.events).toEqual([]);
+  expect((await episodes(f.region)).get("regional_node_stale")).toMatchObject({
+    active: true,
+    delivered_at: null,
+    last_attempt_at: null,
+  });
+  // The next evaluation, with its own budget, sends the same event.
+  await evaluateAlerts(hook.env, now + 61_000, hook.fetcher);
+  const mine = hook.events.filter(
+    (value) => value.event.region_id === f.region,
+  );
+  expect(mine.map((value) => value.event.kind)).toEqual([
+    "regional_node_stale",
+  ]);
 });

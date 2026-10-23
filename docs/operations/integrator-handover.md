@@ -291,11 +291,12 @@ pgcf -i -X POST "$PGCF_API/v1/databases" -H 'Content-Type: application/json' \
 
 What happens: the database record (generation 1) and the owner role `app` with a server-generated
 password are written; the
-placement step picks the node that is the fullest of those that stay under 80 % active RAM and 80 %
-CPU load, each as the highest 30-minute average of the last three days, and whose thin pool is
-open (data below 80 %, metadata below 50 %, sold storage within four times its data) and that holds
-fewer than 1,000 volumes. A database placed after the node's newest sample counts at its full
-memory until that sample exists, and the newest sample's active RAM counts when it is above the average. The node then creates the volume
+placement step picks the fullest qualifying node. Its CPU peak (the highest 30-minute average of
+the last three days) must stay under 80 %, and the requested CPU must fit its physical cores.
+RAM uses the higher of its three-day peak and current sample, plus the full memory of databases
+placed since that sample and the requested database; the sum must stay under 80 %. Its thin pool is
+open (data below 80 %, metadata below 50 %, sold storage within four times its data), and the node
+holds fewer than 1,000 volumes. The node then creates the volume
 and the cluster, applies the roles, starts PostgreSQL through its own admission and takes the first
 base backup; WAL archiving starts with the first start. The database is ready only when that backup
 is DONE, so it is never writable before it is restorable. The idle time
@@ -1111,7 +1112,7 @@ What bounds a node, with the kind of each value as in the header.
 | Cap | Value | Kind, date and source |
 | --- | --- | --- |
 | Node size | 6 vCPU, 12 GB RAM (11,967 MiB visible on EU1) and a thin pool of about 289 GiB | measured: US1 reported 11,966 MiB, 6,000 millicores and 289 GiB (2026-10-22, "US1 installed into `us-dev` from the image") |
-| Placement fills a node until its active RAM or CPU load reaches | 80 %, each as the highest 30-minute average of the last 3 days (the placement window) | decided: the owner's rule of 2026-10-17 and its window of 3 days on 2026-10-23 (plan 11.3, "2026-10-17" and "2026-10-23"); the installation applies the 3 days once the API release is deployed ([2.1](#21-create)) |
+| Placement RAM and CPU limits | Below 80 %: CPU uses the highest 30-minute average of the last 3 days; RAM uses max(three-day peak, current sample) plus pending placements and the new database's full memory. Requested CPU must fit physical cores | decided: the owner's rule of 2026-10-17 and its window of 3 days on 2026-10-23 (plan 11.3, "2026-10-17" and "2026-10-23"); see [2.1](#21-create) |
 | Pool closed for placement at | 80 % of its data or 50 % of its metadata | decided: the 80 % is the owner's number, the 50 % a plan default (plan 4.3) |
 | Sold storage per node | at most 4 times the pool's data (about 1,150 GiB on EU1) | decided: plan default, operator-configurable (plan 11.4, "Logical cap of 4 × pool, operator-configurable") |
 | Volumes per node | 1,000 | measured on 2026-10-17: the largest count tested, `lvcreate` p50 about 270 ms at 1,000 volumes ("Stage 1 Block 1: LVM at scale"); placement closes a node at 1,000 volumes (built 2026-10-20 and in the API deployed on 2026-10-22: "Placement closes a node at 1,000 volumes, and the capacity cron reserves no order while purchases are off"; "Release of main `69d2b245` live on EU1"). It is a technical bound, raised only after a measurement at a higher count, not a sales limit |
@@ -1241,7 +1242,7 @@ measurement is fresh and below the threshold. A recurrence has the same `event_i
 | `database_base_backup_stale`                                  | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count         | fixed                              |
 | `thin_storage_blocked`                                        | a node's newest sample says its thin pool has no room, or a node that holds databases has no sample of its pool within 180 s (`thin_pool_*`) | fixed                                             |
 | `regional_node_capacity_refusals`                             | a node refused 5 or more wakes for awake capacity or a full start queue (`57P03`) in 10 minutes                                                                    | fixed                                             |
-| `regional_node_pool_closed`                                   | a node's newest sample closes it for placement: pool data at 80 %, pool metadata at 50 %, sold storage at 4 times its data, or 1,000 volumes | fixed                                             |
+| `regional_node_pool_closed`                                   | the smallest size class on offer fits no node of the region (one full node beside a qualifying node is no episode): pool data at 80 %, metadata at 50 %, sold storage plus that class past 4 times pool data, 1,000 volumes, or insufficient RAM/CPU. RAM counts max(three-day peak, current sample) plus class memory; CPU uses the three-day peak and must fit physical cores. Peaks are 30-minute averages; both loads must stay below 80 %. Transient pending placements' RAM is excluded from this alert | fixed                                             |
 | `database_volume_warning`, `database_volume_critical`         | a database volume's space or inodes are at least 80 % (below 90 %), or at least 90 %, used                                                   | fixed                                             |
 | `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed |
 | `node_unexpected_reboot` | a node rebooted and no maintenance order of it asked for it, within the last 24 h | fixed |
@@ -1249,13 +1250,15 @@ measurement is fresh and below the threshold. A recurrence has the same `event_i
 
 The values in the table are the plan's; the installation's own settings are read with
 `GET /v1/regions/{id}/capacity-policy`. Thresholds are integer parts per million (1,000,000 = 100 %, valid 1 to 1,000,000, `null`
-disables) set with `PUT /v1/regions/{id}/capacity-policy`. The minute cron evaluates the first
-four regions that have a policy; the fixed-rule kinds are evaluated for every region.
+disables) set with `PUT /v1/regions/{id}/capacity-policy`. The alert evaluation (a Durable Object
+alarm, once a minute) evaluates the first four regions that have a policy; the fixed-rule kinds
+are evaluated for every region.
 
 Every event carries a short runbook action in `action`. The database kinds are per database but
 one episode per region and kind lists up to 64 databases. Each minute-cron step runs in its own
-failure boundary, so one failing step is logged and counted and alerting still runs; the cron's
-own heartbeat is judged by a Durable Object alarm that does not depend on the cron
+failure boundary and has 240 s, so one failing or hanging step is logged and counted; the alerts
+are no step of the cron: a Durable Object alarm evaluates them every minute and judges the cron's
+own heartbeat, without depending on the cron
 ([operator runbook](infrastructure-backups.md#minute-cron-heartbeat-and-watchdog)).
 
 The control plane itself is protected by a daily encrypted D1 export in R2, read back in full
@@ -1465,7 +1468,7 @@ be measured* (see the header), with its date. The source column gives the title 
 | Security reboots | Within 7 days of a Debian security advisory that fixes the kernel, in an announced window (default Tuesday 02:00 to 04:00 UTC), one node at a time; every other reboot also needs the owner's go | decided 2026-10-19 (D10); window: plan default D15 | plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
 | IDs after restore, move and node loss | Restore: a new ID. Move: the ID is kept. Node loss: new IDs, restored from R2 | restore decided 2026-10-15 (plan 11.3); a move keeps the ID (plan 11.4) and has not been timed (**to be measured**, Stage 5.7); node loss is D4, the plan's default | "Moves keep the ID; automatic rebalancing after go-live" (plan 11.4); plan 11.5, D4 | [1.2](#12-regions), [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) |
 | Losing a node | About 2.2 to 3.4 h for EU1's 167 databases and 23.4 GB if every restore succeeds: fence 30 s, reinstall 174 to 197 s, restores about 2.2 to 3.3 h. **7 of the 8 sample restores succeeded; the total assumes the `archive_unusable` defect is fixed** (fix on branch `fx-restore`, not merged) | extrapolated 2026-10-23 from a sample of restores; fence and reinstall measured 2026-10-19 and 2026-10-22; the full drill has not been run | "Live acceptance on the slot-pool release, part 1"; "G9: what is left after the 2026-10-19 loss and reinstall"; "US1 installed into `us-dev` from the image" | [7.3](#73-recovery-time), [7.4](#74-eu1-lost) |
-| Capacity caps | Placement fills a node to 80 % of its 30-minute peak of active RAM or CPU; pool closed at 80 % data or 50 % metadata; sold storage at most 4 times the pool; 1,000 volumes; 8 starts at once on EU1; a storm of 40 wakes answered in at most 5.8 s (HTTP) and 7.1 s (WebSocket) with none refused | dated rows in the table of 4.4 are measured (2026-10-17 and 2026-10-20); density and the storage limits are **to be measured** (Stage 5.6 and 5.5) | "Stage 1 Block 1: LVM at scale"; "Stage 5.6 wake storm, first measurement" | [4.4](#44-capacity-caps) |
+| Capacity caps | Placement requires CPU's three-day peak and projected RAM below 80 % (RAM includes the higher of peak and current sample, pending placements and the new class); pool closed at 80 % data or 50 % metadata; sold storage at most 4 times the pool; 1,000 volumes; 8 starts at once on EU1; a storm of 40 wakes answered in at most 5.8 s (HTTP) and 7.1 s (WebSocket) with none refused | dated rows in the table of 4.4 are measured (2026-10-17 and 2026-10-20); density and the storage limits are **to be measured** (Stage 5.6 and 5.5) | "Stage 1 Block 1: LVM at scale"; "Stage 5.6 wake storm, first measurement" | [4.4](#44-capacity-caps) |
 | Reserved role names | **Contract on main:** the API refuses `postgres`, `pgcf_backup`, `public`, `none` and every name that starts with `pg_` (`400`); `streaming_replica`, `cnpg_*` and `pgcf_maintenance` are ordinary role names. **Deployed on Dev today:** the previous list: the API refuses `postgres`, `streaming_replica` and every name that starts with `pg_` or `cnpg_`, refuses to create or delete `pgcf_maintenance` or to name it in `member_of`, and accepts `pgcf_backup`, `public` and `none`, which must not be used | decided (plan decisions W2-C and W2-C2) and built; the contract on main is the new list, the deployment is **to be done** (migration `0085`, a node release, the API Worker, the Edge Worker, in that order), 2026-10-23 | "Role names of the Kubernetes runtime released: migration `0085`, on branch `pr-w2c`"; "Role names released: deploy and live acceptance (W2-C)" (Open table); `packages/contracts/src/ids-core.ts`; the served OpenAPI, schema `RoleName` | [2.3](#23-roles-connection-uri-and-passwords) |
 | Regions and the archive bucket | Two regions, `eu-dev` (EU1) and `us-dev` (US1), and one R2 archive bucket in the EU jurisdiction for both | measured 2026-10-22 and 2026-10-23 | "US1 installed into `us-dev` from the image"; "US1 database acceptance in `us-dev`"; "G8 one archive bucket: the cutover on Dev, steps 1 to 11" | [1.2](#12-regions) |
 | Placement window | 3 days (the code on main; the installation applies it once the API release is deployed) | decided 2026-10-23 (O6, plan 11.3) | "Placement is closed for 3 days after a burst" (plan 11.2); plan 11.3 | [2.1](#21-create) |
