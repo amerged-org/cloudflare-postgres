@@ -527,11 +527,7 @@ is not reliable in time or place, and the Worker's own log lines mislead about i
   miss runs that did not end; neither is the whole truth. An earlier filter (one request, at least
   100 subrequests, 10 s or more) listed 335 rows to 18:15, 16 fewer than the recipe.
 
-The inode alert of that afternoon came 315 s after the refusal at 14:55:03, and its cause is not
-found. Runs had begun at 14:55:02 and every minute after it, and evaluated the alerts first, so the
-gap in the trigger does not explain it; the node posts volumes every 60 s, and no line says when the
-report of the full inodes reached D1 or which evaluation found it. The evaluation now logs each
-episode it opens (`alert_episode_opened`), so the next delay can be attributed.
+The inode alert of that afternoon was this gap. The log of the volume-full run has the refusal at 14:49:48 (53100 `could not create file`, 31,400 tables) and, before it, the `database_volume_warning` episode with `occurred_at` 14:49:11.328. An episode is stamped with `now` of the cron run that evaluated it, so a run began at 14:49:11; neither the analytics nor the logs list it (see above: the analytics are sampled and incomplete, and the logs hold no scheduled invocation from 14:42:20.518 to 14:57:45.796). At 14:53:50 the run logged that the `database_volume_critical` episode had not come in 240 s (its last `occurred_at` was 14:38:07.122 of an earlier phase), and `control_cron_stalled` was active since 14:48:13.451. The analytics list no cron start from 14:40:54 to 14:55:02; the first on-time run began at 14:55:02, evaluated the alerts first and raised the critical episode at about 14:55:03, which is 315 s after the refusal. So no evaluation ran from 14:49:11 to 14:55:02 while the `CronWatchdog` alarm fired in every minute of it: the cron was the only place that evaluated the health and capacity alerts, and the alarm judged the heartbeat alone. The alarm evaluates them now, so a gap in the trigger cannot hold an alert back, and each episode it opens logs `alert_episode_opened`, so that a late alert can be attributed to the node's report, the evaluation or the delivery.
 
 Each step runs in its own failure boundary and has 240 s. A step that throws is logged as
 `cron_step_failed` (`step`, `error_code`, a redacted `message` and `ms`; the heartbeat and the
