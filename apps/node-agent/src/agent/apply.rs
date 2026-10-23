@@ -649,9 +649,7 @@ impl<M: Machine> Core<M> {
         });
         let _ = self.machine.stop(&db.id).await;
         self.admission.stopped(&db.id);
-        if let Some(account) = self.machine.account(&db.id) {
-            self.table.remove(account.uid);
-        }
+        self.table.remove(&db.id);
         let generation = entry.storage_generation;
         let mut volumes = vec![];
         if let Ok(inventory) = self.machine.inventory().await {
@@ -696,9 +694,7 @@ impl<M: Machine> Core<M> {
     async fn stop_unit(&self, database: &str) -> bool {
         let stopped = self.machine.stop(database).await.is_ok();
         self.admission.stopped(database);
-        if let Some(account) = self.machine.account(database) {
-            self.table.remove(account.uid);
-        }
+        self.table.remove(database);
         stopped
     }
 
@@ -735,6 +731,8 @@ impl<M: Machine> Core<M> {
     /// its units running and a first page that holds the fence and no database.
     async fn enforce_fence(self: &Arc<Self>, operation: &str) {
         let mut stopped = true;
+        // The idle slots hold no database, but they are part of what runs.
+        self.machine.drain_idle_slots().await;
         for db in self.all() {
             let _flow = db.lock.lock().await;
             let named = db.view().entry.is_some();
@@ -1154,7 +1152,7 @@ mod tests {
             handle.phase() == Phase::Ready
         })
         .await;
-        assert_eq!(rig.observation(&id)["state"], "ready");
+        assert_eq!(rig.observed(&id, "ready").await["state"], "ready");
 
         // The generation was ready: the page no longer names how to build it. It suspends it.
         db.as_object_mut().unwrap().remove("origin");
@@ -1166,7 +1164,7 @@ mod tests {
             handle.phase() == Phase::Asleep
         })
         .await;
-        let observation = rig.observation(&id);
+        let observation = rig.observed(&id, "asleep").await;
         assert_eq!(
             (
                 observation["state"].as_str(),
@@ -1455,22 +1453,31 @@ mod tests {
         eventually(60, "ready", || handle.phase() == Phase::Ready).await;
         assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
 
-        // The page resizes the sleeping database: its unit and its volume take the new size
-        // before anything starts it, so that it never runs its new settings in its old limits.
+        // The page resizes the sleeping database: its volume takes the new size before anything
+        // starts it, and the slot it then binds takes the limits of the new size from its entry,
+        // so that it never runs its new settings in its old limits.
         next(&mut db, 6);
         db["resources"] = json!({"memory_mib": 512, "cpu_millicores": 500, "storage_gib": 2});
         rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
-        eventually(30, "the limits of the new size", || {
-            rig.machine
-                .limits(&id)
-                .is_some_and(|limits| limits.memory_mib == 512 && limits.cpu_millicores == 500)
+        eventually(30, "the new size to be kept", || {
+            handle
+                .state()
+                .as_ref()
+                .and_then(|state| state.resources.clone())
+                .is_some_and(|resources| resources.memory_mib == 512)
         })
         .await;
         assert_eq!(rig.machine.volumes()[0].1, 2 << 30);
         assert_eq!(handle.phase(), Phase::Asleep);
+        assert_eq!(
+            rig.machine.limits(&id),
+            None,
+            "a sleeping database holds no slot"
+        );
         let result = rig.core.wake(&Rig::ticket(&rig.entry_for(&db))).await;
         assert_eq!(result.outcome, Outcome::Started, "{:?}", result.reason);
-        assert_eq!(rig.machine.limits(&id).unwrap().memory_mib, 512);
+        let limits = rig.machine.limits(&id).unwrap();
+        assert_eq!((limits.memory_mib, limits.cpu_millicores), (512, 500));
     }
 
     /// The next generation of a page entry: the same database, moved on by the API.
@@ -1732,6 +1739,9 @@ mod tests {
         rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
         eventually(60, "ready", || handle.phase() == Phase::Ready).await;
         db.as_object_mut().unwrap().remove("origin");
+        // The pool holds idle slots when the order comes: they belong to what runs.
+        rig.core.refill_pass().await;
+        assert!(rig.machine.slots().idle > 0);
         let fence = Order::Fence {
             operation: "op_ffffffffffffffffffff".into(),
         };
@@ -1744,6 +1754,13 @@ mod tests {
             !rig.machine.running(&id),
             "what runs is stopped by the order"
         );
+        assert_eq!(
+            rig.machine.slots(),
+            crate::units::slots::Snapshot::default(),
+            "the idle slots are stopped too, and the slot of the database is free"
+        );
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slots().idle, 0, "a fenced node builds none");
         assert_eq!(handle.phase(), Phase::Retired);
         assert_eq!(rig.gateway.get(&id).unwrap().mode, Mode::Retired);
         assert_eq!(
@@ -1761,6 +1778,56 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!rig.machine.running(&id));
         assert_eq!(rig.core.db(&id).view().phase, Phase::Retired);
+    }
+
+    /// A database that runs in a unit of its own, as an agent of an earlier release started it, is
+    /// found, released and put to sleep as it was, and its next wake takes a slot. While the unit
+    /// runs no slot is bound for the database: a second PostgreSQL is what that keeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_unit_of_its_own_that_runs_is_adopted_and_put_to_sleep_and_the_next_wake_takes_a_slot()
+     {
+        let Some(rig) = Rig::new("legacy-unit").await else {
+            return;
+        };
+        rig.machine.direct_archive();
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let (entry, handle) = rig.create_from(&db).await;
+        db.as_object_mut().unwrap().remove("origin");
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+        rig.machine.start_legacy(&id).await.unwrap();
+
+        let rig = rig.restart().await;
+        rig.deliver(db["archive"]["path"].as_str().unwrap(), "read_write");
+        let unit = rig.machine.unit(&id).await.unwrap();
+        assert!(unit.active.awake() && unit.slot.is_none(), "{unit:?}");
+        // The unit of its own holds the database: no slot is bound for it meanwhile.
+        let volume = crate::storage::VolumeId::new(&id, 1).unwrap();
+        let mounted = rig
+            .machine
+            .mount_volumes(std::slice::from_ref(&volume))
+            .await;
+        assert!(mounted.unwrap().is_empty());
+        assert!(matches!(
+            rig.machine.start(&id).await,
+            Err(crate::units::Error::Held)
+        ));
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(60, "the unit to be released", || {
+            handle.phase() == Phase::Ready && handle.view().writer.is_some()
+        })
+        .await;
+        assert_eq!(rig.machine.slots().held, 0, "it runs in no slot");
+
+        // It sleeps with its proof as it always did, and wakes in a slot.
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+        assert!(!rig.machine.running(&id));
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(result.outcome, Outcome::Started, "{:?}", result.reason);
+        assert!(rig.machine.running(&id));
+        assert_eq!(rig.machine.slots().held, 1);
+        assert!(rig.machine.unit(&id).await.unwrap().slot.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2148,7 +2215,8 @@ mod tests {
             async move { machine.start(&id).await }
         });
         eventually(10, "the unit to be activating", || {
-            rig.machine.active_state(&id) == crate::units::ActiveState::Activating
+            rig.machine.running(&id)
+                && rig.machine.active_state(&id) == crate::units::ActiveState::Activating
         })
         .await;
         let rig = rig.restart().await;
@@ -2634,16 +2702,27 @@ mod tests {
             db["resources"]["memory_mib"] = json!(memory_mib);
             db["settings"]["max_connections"] = json!(max_connections);
             rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
-            eventually(30, "the limits of the new size", || {
-                rig.machine
-                    .limits(&source_id)
-                    .is_some_and(|limits| limits.memory_mib == memory_mib)
+            // A sleeping database holds no slot: the page's size is kept in its state, and the
+            // slot the wake binds takes the limits of that size.
+            eventually(30, "the new size to be kept", || {
+                source_handle
+                    .state()
+                    .as_ref()
+                    .and_then(|state| state.resources.clone())
+                    .is_some_and(|resources| resources.memory_mib == memory_mib)
             })
             .await;
             let mut ticket = Rig::ticket(&rig.entry_for(&db));
             ticket.operation = format!("op_{:0>20}", format!("w{generation}"));
             let woken = rig.core.wake(&ticket).await;
             assert_eq!(woken.outcome, Outcome::Started, "{:?}", woken.reason);
+            assert_eq!(
+                rig.machine
+                    .limits(&source_id)
+                    .map(|limits| limits.memory_mib),
+                Some(memory_mib),
+                "the slot has the limits of the new size"
+            );
             assert_eq!(
                 rig.core.sleep(&source_handle, Why::Idle).await,
                 Slept::Proven

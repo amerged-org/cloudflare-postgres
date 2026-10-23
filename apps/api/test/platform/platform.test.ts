@@ -78,8 +78,6 @@ function regionBody() {
     provider: "contabo",
     provider_region: "test",
     gateway_url: `${url("gateway")}/pg`,
-    backup_bucket: `backup-${crypto.randomUUID()}`,
-    backup_endpoint_url: url("archive"),
   };
 }
 const size = {
@@ -775,7 +773,7 @@ describe("API platform on real Workers D1", () => {
         owned.id,
         region.id,
         "referenced",
-        `s3://${region.backup_bucket}/${region.id}/${database}/archive`,
+        `s3://${env.ARCHIVE_BUCKET_NAME}/${region.id}/${database}/archive`,
         now,
         now,
       )
@@ -945,7 +943,7 @@ describe("API platform on real Workers D1", () => {
         owned.id,
         body.id,
         "waiting",
-        `s3://${body.backup_bucket}/${body.id}/${database}/archive`,
+        `s3://${env.ARCHIVE_BUCKET_NAME}/${body.id}/${database}/archive`,
         now,
         now,
         now,

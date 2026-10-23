@@ -204,6 +204,37 @@ impl<R: CommandRunner> Storage<R> {
         let table = fs::read_to_string(format!("/proc/{pid}/mountinfo"))?;
         self.volume_of_mount(database, &mountinfo::parse(&table)?)
     }
+    /// The database volumes mounted at their directories in the mount table of the process `pid`,
+    /// with the database each is for: what a slot holds. Read from its mount table alone, and
+    /// no mount of the agent's own is needed (the agent has none when it starts).
+    pub fn volumes_held_by(&self, pid: u32) -> Result<Vec<(String, Option<VolumeId>)>, Error> {
+        let table = fs::read_to_string(format!("/proc/{pid}/mountinfo"))?;
+        Ok(self.volumes_in(&mountinfo::parse(&table)?))
+    }
+    /// Every mount at a database's directory, with the volume it is: `None` for one that cannot be
+    /// named (the `lvs` listing failed, or the device is no volume of that database). Such a mount
+    /// is held all the same, because it is some filesystem in the process's namespace at a
+    /// tenant's directory, and what cannot be named cannot be called idle.
+    fn volumes_in(&self, mounts: &[Mount]) -> Vec<(String, Option<VolumeId>)> {
+        let mut found: Vec<(String, Option<VolumeId>)> = Vec::new();
+        for mount in mounts {
+            let Some(database) = mount
+                .mount_point
+                .strip_prefix(&self.config.mount_root)
+                .ok()
+                .and_then(|rest| rest.to_str())
+                .filter(|rest| pgcf_native_protocol::valid_pattern("database", rest))
+            else {
+                continue;
+            };
+            if found.iter().any(|(held, _)| held == database) {
+                continue;
+            }
+            let volume = self.volume_of_mount(database, mounts).ok().flatten();
+            found.push((database.to_string(), volume));
+        }
+        found
+    }
     fn volume_of_mount(&self, database: &str, mounts: &[Mount]) -> Result<Option<VolumeId>, Error> {
         let dir = self.config.mount_root.join(database);
         let Some(mount) = mounts.iter().rev().find(|mount| mount.mount_point == dir) else {
@@ -1297,6 +1328,97 @@ mod tests {
         );
         // A device that is no volume of the database is no answer, and no guess.
         assert!(serves(&[mount(11, &at)]).is_err());
+    }
+
+    /// A process that holds database volumes is told by its mount table alone: every mount
+    /// directly below the databases' directory that is the volume of the database it is named for.
+    /// The agent adopts a slot from this when it starts, with no mount of its own.
+    #[test]
+    fn the_volumes_a_process_holds_are_read_from_its_mount_table_alone() {
+        let mut storage = Storage::new(Listed::new(&two_generations()), Config::default());
+        storage.kernel = Kernel {
+            minor: |device| match device {
+                device if device.ends_with("_g1") => Ok(7),
+                device if device.ends_with("_g2") => Ok(9),
+                _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+            },
+            ext4_errors: |_| Ok(0),
+        };
+        let mount = |minor: u32, at: &str| Mount {
+            major: 252,
+            minor,
+            mount_point: at.into(),
+            fstype: "ext4".into(),
+            source: format!("/dev/dm-{minor}"),
+        };
+        let at = format!("/var/lib/pgcf/db/{LISTED}");
+        let tmpfs = Mount {
+            major: 0,
+            minor: 64,
+            mount_point: "/var/lib/pgcf/db/k1l2m3n4o5p6q7r8s9t0".into(),
+            fstype: "tmpfs".into(),
+            source: "tmpfs".into(),
+        };
+        let held = storage.volumes_in(&[
+            mount(7, "/var"),
+            mount(9, &at),
+            tmpfs,
+            mount(7, "/var/lib/pgcf/db/not-a-database-id"),
+            mount(7, &format!("{at}/data")),
+        ]);
+        // The tmpfs at another database's directory is held too, and nameless: a mount there that
+        // the agent cannot name as a volume of that database is no reason to leave it out.
+        assert_eq!(held.len(), 2, "{held:?}");
+        assert_eq!(held[0].0, LISTED);
+        assert_eq!(held[0].1.as_ref().unwrap().generation(), 2);
+        assert_eq!(held[1], ("k1l2m3n4o5p6q7r8s9t0".to_string(), None));
+        assert!(storage.volumes_in(&[]).is_empty());
+    }
+
+    /// Every mount at a database's directory is held, whether the agent can name its volume or
+    /// not: the process that has it holds some tenant's filesystem, and a slot that holds one is
+    /// never idle. The failures to name it are an `lvs` that cannot be read and a device that is
+    /// no volume of the database (D13: unknown means tainted, never dropped).
+    #[test]
+    fn a_mount_at_a_database_directory_is_held_when_its_volume_cannot_be_named() {
+        let at = format!("/var/lib/pgcf/db/{LISTED}");
+        let ext4 = |minor: u32| Mount {
+            major: 252,
+            minor,
+            mount_point: at.clone().into(),
+            fstype: "ext4".into(),
+            source: format!("/dev/dm-{minor}"),
+        };
+        // `lvs` answers what no report is: the volumes cannot be listed.
+        let mut unreadable = Storage::new(Listed::new("not a report"), Config::default());
+        unreadable.kernel = Kernel {
+            minor: |_| Ok(7),
+            ext4_errors: |_| Ok(0),
+        };
+        assert_eq!(
+            unreadable.volumes_in(&[ext4(7)]),
+            [(LISTED.to_string(), None)]
+        );
+        // The listing is fine and the mount is the device of no volume of the database.
+        let mut storage = Storage::new(Listed::new(&two_generations()), Config::default());
+        storage.kernel = Kernel {
+            minor: |device| {
+                if device.ends_with("_g1") {
+                    Ok(7)
+                } else {
+                    Ok(9)
+                }
+            },
+            ext4_errors: |_| Ok(0),
+        };
+        assert_eq!(
+            storage.volumes_in(&[ext4(11)]),
+            [(LISTED.to_string(), None)]
+        );
+        // A volume it can name is named.
+        let named = storage.volumes_in(&[ext4(7)]);
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].1.as_ref().map(VolumeId::generation), Some(1));
     }
 
     /// A storage whose kernel has a filesystem alive on the first generation's device only: the

@@ -17,7 +17,10 @@ use crate::{
     sleep::Refusal,
     state::{DatabaseState, ProvenSleepRecord},
     storage::VolumeId,
-    units::{Started, Timeline},
+    units::{
+        self, Started, Timeline,
+        slots::{Bind, Report},
+    },
 };
 use pgcf_native_protocol::{
     agent::{ControlAction, SessionStatus, Writer},
@@ -189,22 +192,32 @@ fn steal_since(from: CpuMark, now: Option<CpuTimes>) -> Option<(u64, u64)> {
 }
 
 /// The log line of a started wake's detail (plan 11.1): numbers only, and none for what could not
-/// be read. `throttle` is the throttling since the release, `steal` the stolen CPU time and the
-/// window it was counted over.
+/// be read. `slot` is what the slot path took: where the slot came from (`slot_from`, `pool` or
+/// `demand`), and the time to take or build it, to bind the database to it and to give the order
+/// (`slot_wait_us`, `bind_us`, `order_us`); a slot built on demand also has the fork of its
+/// supervisor and the executor's setup of its sandbox in `timeline`. `throttle` is the throttling
+/// since the release, `steal` the stolen CPU time and the window it was counted over.
 fn detail_line(
     database: &str,
     timeline: &Timeline,
     throttle: Option<Throttle>,
     steal: Option<(u64, u64)>,
+    slot: Option<Report>,
 ) -> serde_json::Value {
     let mut line = json!({"event": "wake_detail", "database_id": database});
+    if let Some(slot) = slot {
+        line["slot_from"] = slot.from.word().into();
+        line["slot_wait_us"] = slot.wait_us.into();
+        line["bind_us"] = slot.bind_us.into();
+        line["order_us"] = slot.order_us.into();
+    }
     let startup = timeline.startup.as_ref();
     for (name, value) in [
         ("job_to_fork_us", timeline.job_to_fork_us),
         ("fork_to_handoff_us", timeline.fork_to_handoff_us),
         (
-            "handoff_to_starting_us",
-            startup.map(|s| s.handoff_to_starting_us),
+            "order_to_starting_us",
+            startup.map(|s| s.order_to_starting_us),
         ),
         (
             "starting_to_shut_down_us",
@@ -249,10 +262,15 @@ impl<M: Machine> Core<M> {
         VolumeId::new(&entry.id, entry.storage_generation).ok()
     }
 
-    /// Starts the unit of `entry` through admission and waits for PostgreSQL to accept
-    /// connections, up to `deadline`: the start itself goes on after it. The admission decision is
-    /// an event. It gives the unit, how long admission made the start wait, and the CPU times read
-    /// just before the unit was asked to start.
+    /// Starts PostgreSQL for `entry` through admission and waits for it to accept connections, up
+    /// to `deadline`: the start itself goes on after it. The admission decision is an event. It
+    /// gives the start, how long admission made it wait, and the CPU times read just before the
+    /// start began.
+    ///
+    /// Every start takes one path: the permit, then a slot (an idle one, or one built inside the
+    /// permit), the database bound to it, the order, and the wait for ready. The steps run in a
+    /// task of their own, so that a deadline that passes leaves the slot as the start has it and
+    /// never between two steps: the late waiter below takes the task's result.
     pub(crate) async fn start_unit(
         self: &Arc<Self>,
         db: &Db,
@@ -290,10 +308,24 @@ impl<M: Machine> Core<M> {
                 ));
                 return Err(StartFailure::Refused(refused));
             }
-            // The database is awake, starting or already waiting: it is admitted.
+            // The database is awake, starting or already waiting: it is admitted. A start that is
+            // under way is waited for; one whose unit is gone is made.
             Err(AdmitError::Duplicate) => {
                 let mark = (Instant::now(), self.machine.cpu());
-                let started = self.machine.start(&db.id).await.map_err(|error| {
+                let started = if self.unit_awake(&db.id, true).await {
+                    self.machine.wait_started(&db.id).await
+                } else {
+                    match self.bind_of(entry) {
+                        Some(bind) => {
+                            let (core, id) = (self.clone(), db.id.clone());
+                            tokio::spawn(async move { core.start_in_slot(&id, &bind).await })
+                                .await
+                                .unwrap_or(Err(units::Error::NotReady("start_task_ended")))
+                        }
+                        None => Err(units::Error::NotReady("no_bind")),
+                    }
+                }
+                .map_err(|error| {
                     failed(db, start, &crate::diagnostics::error_code(&error.into()))
                 })?;
                 return Ok((started, Duration::ZERO, mark));
@@ -303,42 +335,53 @@ impl<M: Machine> Core<M> {
         let waited = permit.waited;
         self.event(event("admitted", waited, None));
         let mark = (Instant::now(), self.machine.cpu());
-        let running = self.machine.start(&db.id);
+        // Where the variant says so, the catalogs are read ahead while the slot is bound.
+        let _catalogs = self.readahead_catalogs(&db.id);
+        let Some(bind) = self.bind_of(entry) else {
+            permit.failed();
+            return Err(failed(db, start, "no_bind"));
+        };
+        let mut running = {
+            let (core, id) = (self.clone(), db.id.clone());
+            tokio::spawn(async move { core.start_in_slot(&id, &bind).await })
+        };
         let outcome = match deadline {
-            Some(deadline) => tokio::time::timeout(deadline, running).await,
-            None => Ok(running.await),
+            Some(deadline) => tokio::time::timeout(deadline, &mut running).await,
+            None => Ok((&mut running).await),
         };
         match outcome {
-            Ok(Ok(started)) => {
+            Ok(Ok(Ok(started))) => {
                 permit.ready();
+                self.refill.notify_one();
                 Ok((started, waited, mark))
             }
-            Ok(Err(error)) => {
+            Ok(ended) => {
+                let class = match ended {
+                    Ok(Err(error)) => crate::diagnostics::error_code(&error.into()),
+                    _ => "start_task_ended".to_string(),
+                };
                 // A unit that is awake still holds its memory: the permit stays counted until its
                 // unit is reported stopped. One that is not awake never started.
                 let awake = self.unit_awake(&db.id, true).await;
                 if !awake {
                     permit.failed();
                 }
-                Err(failed(
-                    db,
-                    start,
-                    &crate::diagnostics::error_code(&error.into()),
-                ))
+                self.refill.notify_one();
+                Err(failed(db, start, &class))
             }
             Err(_) => {
-                // The start goes on: the agent waits for it, and a database that comes up late is
-                // an awake database with nobody asking (it sleeps at its idle time).
+                // The start goes on: the agent waits for its result, and a database that comes up
+                // late is an awake database with nobody asking (it sleeps at its idle time).
                 let (core, id) = (self.clone(), db.id.clone());
                 tokio::spawn(async move {
-                    match core.machine.wait_started(&id).await {
-                        Ok(started) => {
+                    match running.await {
+                        Ok(Ok(started)) => {
                             permit.ready();
                             if let Some(db) = core.find(&id) {
                                 core.late_start(&db, started).await;
                             }
                         }
-                        Err(_) => {
+                        _ => {
                             let awake = core.unit_awake(&id, true).await;
                             if !awake {
                                 permit.failed();
@@ -348,8 +391,65 @@ impl<M: Machine> Core<M> {
                             }
                         }
                     }
+                    core.refill.notify_one();
                 });
                 Err(StartFailure::Timeout)
+            }
+        }
+    }
+
+    /// What the slot of a start binds to the database: its volume of the storage generation the
+    /// page serves, its user, the volume's device and data directory, and the limits of its size.
+    fn bind_of(&self, entry: &Entry) -> Option<Bind> {
+        let volume = Self::volume_id(entry)?;
+        let account = self.machine.account(&entry.id)?;
+        Some(Bind {
+            device: self.machine.device(&volume).into(),
+            data: self.layout().data(&entry.id),
+            properties: self.limits(entry, &volume).properties(),
+            volume,
+            account,
+        })
+    }
+
+    /// The path of every start, in one task: the slot and the database's bind to it, then the
+    /// order and the wait for PostgreSQL. A slot that fails in either is stopped by the pool, and
+    /// the database holds nothing.
+    async fn start_in_slot(
+        self: &Arc<Self>,
+        database: &str,
+        bind: &Bind,
+    ) -> Result<Started, units::Error> {
+        let bound = self.machine.bind(database, bind).await?;
+        self.machine.exec(&bound).await
+    }
+
+    /// One pass of the pool's refill (`slots`): while the node takes no start and waits for none,
+    /// one idle slot at a time up to `start_concurrency`, and then the users of the numbers that
+    /// have none, one at a time, to the end of the pool's range, so that a storm of wakes never
+    /// finds a number without its user (a wake makes none). A fenced node and one in maintenance
+    /// have no idle slots.
+    pub async fn refill_pass(self: &Arc<Self>) {
+        loop {
+            if self.fences.fenced() || self.maintenance.load(Ordering::Relaxed) {
+                self.machine.drain_idle_slots().await;
+                return;
+            }
+            // The build costs the node about 80 ms of CPU, which a wake must not wait for: it is
+            // made only when no start is in flight or waits. So is a user, which locks the node's
+            // account files for about 75 ms.
+            if !self.admission.quiet().await {
+                return;
+            }
+            let target = self.policy().admission.admission.start_concurrency;
+            // A build that fails ends no pass: the user of the next number is still to be made,
+            // which is what lets the next build leave the number that failed.
+            if let Ok(Some(_)) = self.machine.refill_slot(target).await {
+                continue;
+            }
+            match self.machine.make_slot_user().await {
+                Ok(Some(_)) => {}
+                _ => return,
             }
         }
     }
@@ -464,10 +564,17 @@ impl<M: Machine> Core<M> {
     /// against the proven-sleep record, and starts PostgreSQL through admission. The answer is the
     /// gateway's to release or refuse its held connections with.
     pub async fn wake(self: &Arc<Self>, request: &WakeRequest) -> WakeResult {
+        self.wake_within(request, self.timing.wake_start).await
+    }
+
+    /// A wake that waits `budget` for PostgreSQL to accept connections (`Timing::wake_start`
+    /// for every wake of the agent). A test that needs one wake to give up early passes a short
+    /// one for it, and every other wake of its node keeps the normal budget.
+    async fn wake_within(self: &Arc<Self>, request: &WakeRequest, budget: Duration) -> WakeResult {
         let begun = Instant::now();
         let mut steps = BTreeMap::new();
         let mut stale = None;
-        let outcome = self.try_wake(request, &mut steps, &mut stale).await;
+        let outcome = self.try_wake(request, budget, &mut steps, &mut stale).await;
         let (outcome, reason, retry_after_seconds) = match &outcome {
             Ok(()) => (WakeOutcome::Started, None, None),
             Err((reason, retry)) => (WakeOutcome::Refused, Some((*reason).to_string()), *retry),
@@ -503,6 +610,7 @@ impl<M: Machine> Core<M> {
     async fn try_wake(
         self: &Arc<Self>,
         request: &WakeRequest,
+        budget: Duration,
         steps: &mut BTreeMap<String, u64>,
         stale: &mut Option<Stale>,
     ) -> Result<(), (&'static str, Option<u32>)> {
@@ -692,7 +800,7 @@ impl<M: Machine> Core<M> {
                     generation: request.generation,
                     operation: Some(&request.operation),
                 },
-                Some(self.timing.wake_start),
+                Some(budget),
             )
             .await;
         let (started, waited, steal) = match started {
@@ -712,10 +820,25 @@ impl<M: Machine> Core<M> {
             }
         };
         steps.insert("queue_wait".into(), millis(waited));
-        steps.insert(
-            "start".into(),
-            millis(began.elapsed().saturating_sub(waited)),
-        );
+        match started.slot {
+            // The slot path: the slot, the bind (limits, mounts and the order), and PostgreSQL's
+            // own start from the order to ready.
+            Some(slot) => {
+                let micros = Duration::from_micros;
+                steps.insert("slot".into(), millis(micros(slot.wait_us)));
+                steps.insert(
+                    "bind".into(),
+                    millis(micros(slot.bind_us.saturating_add(slot.order_us))),
+                );
+                steps.insert("start".into(), millis(micros(slot.start_us)));
+            }
+            None => {
+                steps.insert(
+                    "start".into(),
+                    millis(began.elapsed().saturating_sub(waited)),
+                );
+            }
+        }
         // Roles the page changed while the database slept are written before anyone logs in.
         let releasing = Instant::now();
         let began = Instant::now();
@@ -736,6 +859,7 @@ impl<M: Machine> Core<M> {
             view.refusal = None;
         });
         steps.insert("release".into(), millis(releasing.elapsed()));
+        self.readahead_hot_list(&db.id);
         self.detail_later(&db, started, steal);
         self.after_wake(&db).await;
         Ok(())
@@ -776,6 +900,7 @@ impl<M: Machine> Core<M> {
             &timeline,
             throttle_since(throttle, self.machine.throttle(database)),
             steal_since(steal, self.machine.cpu()),
+            started.slot,
         )
     }
 
@@ -1097,14 +1222,13 @@ impl<M: Machine> Core<M> {
             return false;
         };
         let upload_log = self.files(&db.id).upload_log(entry.storage_generation);
-        if self.table.archives(account.uid, &store, &upload_log) {
+        if self.table.archives(&db.id, &store, &upload_log) {
             return true;
         }
         register(
             &self.table,
             self.layout(),
             &self.job_database(&volume, &account.name),
-            account.uid,
             store,
             upload_log,
         );
@@ -1270,13 +1394,11 @@ pub(crate) fn register(
     table: &Table,
     _layout: &Layout,
     database: &crate::archive::job::Database,
-    uid: u32,
     store: crate::archive::job::Store,
     upload_log: crate::archive::upload_log::UploadLog,
 ) {
     table.set(Registration {
         database: database.clone(),
-        uid,
         store,
         recovery: None,
         upload_log,
@@ -1633,10 +1755,19 @@ mod tests {
             job_to_fork_us: Some(2_300),
             fork_to_handoff_us: Some(33_886),
             startup: Some(crate::units::journal::Startup {
-                handoff_to_starting_us: 12_840,
+                order_to_starting_us: 12_840,
                 starting_to_shut_down_us: 1_605,
                 shut_down_to_ready_us: 1_522,
             }),
+        };
+        // A slot built on demand: the wake waited for it, bound the database to it and ordered.
+        let slot = Report {
+            slot: 7,
+            from: crate::units::slots::SlotFrom::Demand,
+            wait_us: 131_000,
+            bind_us: 2_800,
+            order_us: 1_500,
+            start_us: 115_000,
         };
         // The quota throttled the unit twice since the release; 3 ticks of 10 ms were stolen.
         let throttled = throttle_since(throttle(0, 0), throttle(2, 7_500));
@@ -1644,22 +1775,31 @@ mod tests {
         assert_eq!(throttled, throttle(2, 7_500));
         let (steal_ms, _window) = stolen.unwrap();
         assert_eq!(steal_ms, 30);
-        let line = detail_line("abcdefghijklmnopqrst", &timeline, throttled, stolen);
+        let line = detail_line(
+            "abcdefghijklmnopqrst",
+            &timeline,
+            throttled,
+            stolen,
+            Some(slot),
+        );
         assert_eq!(
             line,
             json!({
                 "event": "wake_detail", "database_id": "abcdefghijklmnopqrst",
+                "slot_from": "demand", "slot_wait_us": 131_000, "bind_us": 2_800,
+                "order_us": 1_500,
                 "job_to_fork_us": 2_300, "fork_to_handoff_us": 33_886,
-                "handoff_to_starting_us": 12_840, "starting_to_shut_down_us": 1_605,
+                "order_to_starting_us": 12_840, "starting_to_shut_down_us": 1_605,
                 "shut_down_to_ready_us": 1_522,
                 "nr_throttled": 2, "throttled_usec": 7_500, "steal_ms": 30,
                 "steal_window_ms": line["steal_window_ms"],
             })
         );
-        // What the node sends of it is what Cloudflare accepts: all 9 of its fields, within the bound.
+        // What the node sends of it is what Cloudflare accepts: all 13 of its fields, within the
+        // bound the contract gives an event.
         let at = "2026-10-18T10:11:12.345Z";
         let event = crate::events::sanitize(&line, at).unwrap();
-        assert_eq!(event["fields"].as_object().unwrap().len(), 9);
+        assert_eq!(event["fields"].as_object().unwrap().len(), 13);
         assert!(contract_valid(
             "NodeObservationReport",
             &json!({"observed_at": at, "databases": [], "orders": [], "events": [event]})
@@ -1667,7 +1807,13 @@ mod tests {
 
         // A journal that could not be read, a unit that is gone and a machine without a clock
         // leave their numbers out; the counters that went back are no reading.
-        let bare = detail_line("abcdefghijklmnopqrst", &Timeline::default(), None, None);
+        let bare = detail_line(
+            "abcdefghijklmnopqrst",
+            &Timeline::default(),
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             bare,
             json!({"event": "wake_detail", "database_id": "abcdefghijklmnopqrst"})
@@ -1703,12 +1849,17 @@ mod tests {
         assert_eq!(db.phase(), Phase::Ready);
         assert!(details().is_empty());
 
-        // This machine has no journal and no cgroup: the steal time of the window is all it reads.
+        // This machine has no journal and no cgroup: the steal time of the window and what the slot
+        // path took are all it reads. The pool was empty, so the wake built its slot.
         eventually(10, "the detail", || !details().is_empty()).await;
         let detail = details().remove(0);
         let fields = detail["fields"].as_object().unwrap();
         assert!(fields["steal_ms"].is_u64() && fields["steal_window_ms"].as_u64() >= Some(1));
-        assert_eq!(fields.len(), 2, "{detail}");
+        assert_eq!(fields["slot_from"], "demand", "{detail}");
+        for name in ["slot_wait_us", "bind_us", "order_us"] {
+            assert!(fields[name].is_u64(), "{name}: {detail}");
+        }
+        assert_eq!(fields.len(), 6, "{detail}");
 
         // The same wake again finds the database released: no start, no detail.
         assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
@@ -2243,11 +2394,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_start_that_outlasts_its_wake_and_then_fails_leaves_the_database_wakeable() {
-        let timing = crate::agent::Timing {
-            wake_start: Duration::from_millis(300),
-            ..crate::agent::testing::timing()
-        };
-        let Some(rig) = Rig::with_timing("late-failure", timing).await else {
+        let Some(rig) = Rig::new("late-failure").await else {
             return;
         };
         let (entry, db) = rig.create().await;
@@ -2262,20 +2409,26 @@ mod tests {
         let original = std::fs::read_to_string(&auto).unwrap();
         std::fs::write(&auto, format!("{original}shared_buffers = 'none'\n")).unwrap();
         rig.machine.delay_next_start(Duration::from_millis(1500));
-        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        let result = rig
+            .core
+            .wake_within(&Rig::ticket(&entry), Duration::from_millis(300))
+            .await;
         assert_eq!(
             (result.outcome, result.reason.as_deref()),
             (WakeOutcome::Refused, Some("start_timeout"))
         );
 
         // The start failed: the database is asleep as it was, not starting for ever, and the
-        // next wake starts it once it can start.
+        // next wake starts it once it can start, with the budget every wake has.
         eventually(30, "the failed start to end", || {
             db.phase() == Phase::Asleep
         })
         .await;
         assert!(!rig.machine.running(&entry.id));
         std::fs::write(&auto, original).unwrap();
+        // The next start is slower than the first wake's budget, as a real one is on a loaded
+        // host (CI, 2026-10-22: 302 ms): the budget belongs to the wake, not to the node.
+        rig.machine.delay_next_start(Duration::from_millis(600));
         let result = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
         assert_eq!(db.phase(), Phase::Ready);
@@ -3367,5 +3520,352 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(rig.machine.quota_calls(&entry.id), [quota, quota]);
         assert_eq!(db.phase(), Phase::Ready);
+    }
+
+    // ---- the slots (package P-e)
+
+    /// The wake log lines of `database` this process kept, oldest first.
+    fn wake_events(database: &str) -> Vec<Value> {
+        crate::events::seen()
+            .into_iter()
+            .filter(|event| event["event"] == "wake" && event["database_id"] == database)
+            .collect()
+    }
+    fn detail_events(database: &str) -> Vec<Value> {
+        crate::events::seen()
+            .into_iter()
+            .filter(|event| event["event"] == "wake_detail" && event["database_id"] == database)
+            .collect()
+    }
+
+    /// A wake takes one path whether the pool had a slot or not. The phases of the wake and its
+    /// detail say which: a slot built before the wake costs the wake the bind alone, and one built
+    /// inside it also the sandbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_from_the_pool_and_a_wake_on_demand_take_the_same_path_and_the_phases_say_which()
+    {
+        let timing = crate::agent::Timing {
+            detail: Duration::from_millis(200),
+            ..crate::agent::testing::timing()
+        };
+        let Some(rig) = Rig::with_timing("pool-or-demand", timing).await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        // Nothing builds slots here but the refill, which a test asks for.
+        rig.machine.drain_idle_slots().await;
+        assert_eq!(rig.machine.slots().idle, 0);
+
+        // A miss: the wake builds its slot inside its admission.
+        let ticket = Rig::ticket(&entry);
+        assert_eq!(rig.core.wake(&ticket).await.outcome, WakeOutcome::Started);
+        let phases = wake_events(&entry.id).pop().unwrap()["fields"].clone();
+        for phase in ["admission", "slot", "bind", "start", "roles", "release"] {
+            assert!(
+                phases.get(format!("step_{phase}")).is_some(),
+                "{phase}: {phases}"
+            );
+        }
+        eventually(10, "the detail of the miss", || {
+            !detail_events(&entry.id).is_empty()
+        })
+        .await;
+        assert_eq!(detail_events(&entry.id)[0]["fields"]["slot_from"], "demand");
+
+        // A hit: the refill built the pool before the wake.
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        rig.core.refill_pass().await;
+        assert_eq!(
+            rig.machine.slots().idle,
+            4,
+            "start_concurrency of the policy"
+        );
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        assert_eq!(rig.machine.slots().idle, 3);
+        eventually(10, "the detail of the hit", || {
+            detail_events(&db.id).len() == 2
+        })
+        .await;
+        let hit = detail_events(&db.id).pop().unwrap();
+        assert_eq!(hit["fields"]["slot_from"], "pool");
+        // No sandbox was built inside the wake: the supervisor's fork and handoff are no part
+        // of a hit's detail.
+        assert!(hit["fields"].get("job_to_fork_us").is_none(), "{hit}");
+    }
+
+    /// A start that finds no idle slot builds it inside its permit, so the starts at once bound
+    /// the builds at once: with one start at a time, a second wake does not build while the first
+    /// start is in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pool_miss_builds_inside_the_permit_so_start_concurrency_bounds_the_builds() {
+        let Some(rig) = Rig::new("miss-in-permit").await else {
+            return;
+        };
+        rig.core
+            .set_policy(crate::agent::testing::policy_with_start_concurrency(Some(
+                1,
+            )));
+        // One database awake at a time while they are made: the test machine tells the callers
+        // of the archive socket apart only when a single database holds a slot.
+        let (first, first_db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&first_db, Why::Idle).await, Slept::Proven);
+        let (second, second_db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&second_db, Why::Idle).await, Slept::Proven);
+        rig.machine.drain_idle_slots().await;
+
+        // The first start is in flight for a while: its slot is the only one the node has built.
+        rig.machine.delay_next_start(Duration::from_millis(1200));
+        let (core, ticket) = (rig.core.clone(), Rig::ticket(&first));
+        let waking = tokio::spawn(async move { core.wake(&ticket).await });
+        eventually(10, "the first start to be ordered", || {
+            rig.machine.running(&first.id)
+        })
+        .await;
+        let (core, ticket) = (rig.core.clone(), Rig::ticket(&second));
+        let queued = tokio::spawn(async move { core.wake(&ticket).await });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            rig.machine.slots(),
+            crate::units::slots::Snapshot {
+                idle: 0,
+                spawning: 0,
+                held: 1
+            },
+            "the waiting wake has built nothing"
+        );
+        assert_eq!(waking.await.unwrap().outcome, WakeOutcome::Started);
+        assert_eq!(queued.await.unwrap().outcome, WakeOutcome::Started);
+        assert_eq!(rig.machine.slots().held, 2);
+        let second_detail = |event: &Value| event["fields"]["slot_from"] == "demand";
+        eventually(10, "both details", || {
+            detail_events(&second.id).iter().any(second_detail)
+        })
+        .await;
+    }
+
+    /// The refill builds nothing while a start is in flight or waits, nor on a node that is fenced
+    /// or in maintenance, and builds one slot at a time up to `start_concurrency` when the node is
+    /// quiet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_refill_pauses_while_a_start_is_in_flight_and_while_the_node_is_fenced_or_in_maintenance()
+     {
+        let Some(rig) = Rig::new("refill-pause").await else {
+            return;
+        };
+        rig.core
+            .set_policy(crate::agent::testing::policy_with_start_concurrency(Some(
+                2,
+            )));
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        rig.machine.drain_idle_slots().await;
+
+        rig.machine.delay_next_start(Duration::from_millis(1200));
+        let (core, ticket) = (rig.core.clone(), Rig::ticket(&entry));
+        let waking = tokio::spawn(async move { core.wake(&ticket).await });
+        eventually(10, "the start to be ordered", || {
+            rig.machine.running(&entry.id)
+        })
+        .await;
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slots().idle, 0, "a start is in flight");
+        assert_eq!(waking.await.unwrap().outcome, WakeOutcome::Started);
+
+        // Quiet: two idle slots, as many as the starts at once.
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slots().idle, 2);
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slots().idle, 2, "no more than the target");
+
+        // In maintenance the idle slots stop and none is built.
+        rig.core.maintenance.store(true, Ordering::Relaxed);
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slots().idle, 0);
+        rig.core.maintenance.store(false, Ordering::Relaxed);
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slots().idle, 2);
+        // A fence stops them too, and the node builds none while it stands.
+        rig.core.fences.fence("op_ffffffffffffffffffff").unwrap();
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slots().idle, 0);
+    }
+
+    /// The refill makes the users of the whole range once the idle slots are in place, one at a
+    /// time and only while the node is quiet: a start in flight makes none, and then a storm of
+    /// wakes cannot run out of numbers with a user, which a wake never makes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_refill_makes_the_users_of_the_whole_range_while_the_node_is_quiet() {
+        let Some(rig) = Rig::new("refill-users").await else {
+            return;
+        };
+        rig.core
+            .set_policy(crate::agent::testing::policy_with_start_concurrency(Some(
+                2,
+            )));
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        rig.machine.drain_idle_slots().await;
+        // A node just installed: the users of the first four numbers exist.
+        rig.machine.limit_slot_users(4).await;
+        assert_eq!(rig.machine.slot_users(), 4);
+
+        // A start is in flight: the refill makes no slot and no user.
+        rig.machine.delay_next_start(Duration::from_millis(1200));
+        let (core, ticket) = (rig.core.clone(), Rig::ticket(&entry));
+        let waking = tokio::spawn(async move { core.wake(&ticket).await });
+        eventually(10, "the start to be ordered", || {
+            rig.machine.running(&entry.id)
+        })
+        .await;
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slot_users(), 4, "a start is in flight");
+        assert_eq!(waking.await.unwrap().outcome, WakeOutcome::Started);
+
+        // Quiet: the idle slots first, then every number of the range has its user.
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slots().idle, 2);
+        assert_eq!(
+            rig.machine.slot_users(),
+            crate::units::slots::POOL.len(),
+            "the users of the whole range, and none for the health check's slot"
+        );
+    }
+
+    /// A build that fails does not end the refill's pass before the next user is made: on a node
+    /// that has only the user of a number whose unit refuses to start, the pass makes the next
+    /// user and builds the idle slot there, and the number that failed stays out of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_build_does_not_end_the_refill_before_it_makes_the_next_user() {
+        let Some(rig) = Rig::new("refill-failed-build").await else {
+            return;
+        };
+        rig.core
+            .set_policy(crate::agent::testing::policy_with_start_concurrency(Some(
+                1,
+            )));
+        rig.machine.drain_idle_slots().await;
+        // A node just installed: only the user of number 0 exists, and its unit holds a process.
+        rig.machine.limit_slot_users(1).await;
+        rig.machine.stray_slot(0);
+
+        rig.core.refill_pass().await;
+        assert_eq!(rig.machine.slots().idle, 1, "built on the next number");
+        assert_eq!(
+            rig.machine.slot_users(),
+            crate::units::slots::POOL.len(),
+            "and the quiet pass went on to the users of the whole range"
+        );
+    }
+
+    /// A bind that cannot move the mounts in leaves the database asleep with its proof: the order
+    /// is not sent, no PostgreSQL ran, and the next wake works.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bind_that_fails_leaves_the_database_asleep_with_its_proof_and_starts_nothing() {
+        let Some(rig) = Rig::new("bind-fails").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let record = db.state().unwrap().record.clone();
+        assert!(record.is_some());
+        rig.machine.clear_calls();
+
+        rig.machine.fail_next_handoff();
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (WakeOutcome::Refused, Some("release_failed"))
+        );
+        assert!(
+            !rig.machine
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("start")),
+            "{:?}",
+            rig.machine.calls()
+        );
+        assert!(!rig.machine.running(&entry.id));
+        assert_eq!(db.phase(), Phase::Asleep);
+        assert_eq!(db.state().unwrap().record, record, "the proof stands");
+        assert_eq!(
+            rig.machine.slots().held,
+            0,
+            "the slot is gone with the database"
+        );
+        let failed = crate::events::seen().into_iter().find(|event| {
+            event["event"] == "unit_start_failed" && event["database_id"] == entry.id.as_str()
+        });
+        assert_eq!(
+            failed.expect("a failed start is an event")["fields"]["class"],
+            "job_assert"
+        );
+
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+    }
+
+    /// The agent holds the data directory's lock while it writes the configuration of a database
+    /// that sleeps, and a process that holds it keeps the write, and the wake, from happening:
+    /// the configuration file is not rewritten, and the bind takes no slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_whose_data_directory_is_locked_is_neither_configured_nor_woken() {
+        let Some(rig) = Rig::new("locked-data").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        // An idle slot, which a wake that is not refused takes.
+        rig.core.refill_pass().await;
+        let idle = rig.machine.slots().idle;
+        assert!(idle > 0);
+        let conf = rig.machine.layout().data(&entry.id).join("postgresql.conf");
+        let before = std::fs::read(&conf).unwrap();
+        // A process of the earlier postmaster still holds the data directory.
+        let held = std::fs::File::open(rig.machine.layout().data(&entry.id)).unwrap();
+        held.lock().unwrap();
+
+        // The data directory is locked and the size does not change: the bind is refused by its
+        // own try-lock, before it takes a slot.
+        let ticket = Rig::ticket(&entry);
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (WakeOutcome::Refused, Some("release_failed")),
+            "{result:?}"
+        );
+        assert_eq!(rig.machine.slots().idle, idle, "no slot was taken");
+        assert_eq!(rig.machine.slots().held, 0);
+
+        // A change of the size changes what the configuration says, so the next wake writes it:
+        // the write is refused by the lock, and the file is the one it was.
+        let mut changed = entry.clone();
+        changed.max_connections += 1;
+        assert!(rig.core.accept(&db, changed));
+        let ticket = Rig::ticket(&rig.core.db(&entry.id).view().entry.clone().unwrap());
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (WakeOutcome::Refused, Some("release_failed")),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&conf).unwrap(),
+            before,
+            "postgresql.conf was not rewritten under a lock"
+        );
+        assert_eq!(rig.machine.slots().idle, idle, "no slot was taken");
+        assert!(!rig.machine.running(&entry.id));
+
+        // Without the lock the same wake writes the new configuration and starts.
+        drop(held);
+        let result = rig.core.wake(&ticket).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        assert_ne!(
+            std::fs::read(&conf).unwrap(),
+            before,
+            "the new size is written"
+        );
     }
 }

@@ -96,8 +96,6 @@ export interface OperationRow {
 }
 export interface RegionRow {
   id: string;
-  backup_bucket: string;
-  backup_endpoint_url: string;
 }
 export interface SizeRow extends Omit<SizeClass, "enabled"> {
   enabled: number;

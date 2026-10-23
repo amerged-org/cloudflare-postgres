@@ -168,6 +168,9 @@ pub struct Service<M: Machine> {
     superseded: AtomicBool,
 }
 
+/// How often the pool of idle slots is looked at when no start told it to.
+const SLOTS_EVERY: Duration = Duration::from_secs(5);
+
 /// The identifiers of the archive credentials an entry of the page needs: its own, and the one
 /// that reads the archive it is built from.
 fn credential_ids(entry: &Entry) -> Vec<String> {
@@ -220,6 +223,10 @@ impl<M: Machine> Service<M> {
         };
         crate::timing::phase("first_page");
         let policy = Policy::parse(&page.policy).ok_or("the desired page's policy is invalid")?;
+        // The slots the last agent left are read back from the kernel before anything is admitted;
+        // then the units are what the pool and the units of their own say.
+        machine.adopt_slots().await?;
+        crate::timing::phase("slots_adopted");
         let units = machine.units().await?;
         crate::timing::phase("units_read");
         let running: Vec<Running> = units
@@ -244,6 +251,7 @@ impl<M: Machine> Service<M> {
                 fences,
                 policy,
                 timing: config.timing.clone(),
+                prefetch: crate::agent::PREFETCH,
             },
             running,
         );
@@ -270,7 +278,7 @@ impl<M: Machine> Service<M> {
 
         // The two sockets of the agent: the archive socket for the databases' units, and the
         // gateway's channel, which only the gateway's user may reach.
-        let archive = Arc::new(Server::new(table, jobs, credentials));
+        let archive = Arc::new(Server::new(table, jobs, credentials, machine.clone()));
         let listener = bind_archive(&layout.archive_socket())?;
         let channel = bind_gateway(&layout.gateway_socket(), 0o600, config.gateway)?;
         let (wake_sender, wakes) = mpsc::unbounded_channel();
@@ -342,6 +350,8 @@ impl<M: Machine> Service<M> {
         service.spawn(async move { s.idle().await });
         let s = service.clone();
         service.spawn(async move { s.early_sleeps(early).await });
+        let s = service.clone();
+        service.spawn(async move { s.slots().await });
         Ok(service)
     }
 
@@ -904,6 +914,10 @@ impl<M: Machine> Service<M> {
             }
             state.reload = false;
             saved(&state)?;
+            // The idle slots hold the definition of the unit from before the reload, and a slot
+            // that is bound keeps it until its database sleeps: the idle ones are built again.
+            self.machine.drain_idle_slots().await;
+            self.core.refill.notify_one();
         }
         let (units, agent) = hostfiles::restart_order(&state);
         for unit in units {
@@ -1289,6 +1303,19 @@ impl<M: Machine> Service<M> {
         loop {
             tick.tick().await;
             self.core.idle_pass().await;
+        }
+    }
+
+    /// The pool of idle slots: kept at `start_concurrency` while no start is in flight or waits,
+    /// when the pool was used, and now and then for what no start told it (a slot that ended, a
+    /// quiet node that began with an empty pool).
+    async fn slots(&self) {
+        loop {
+            self.core.refill_pass().await;
+            tokio::select! {
+                () = self.core.refill.notified() => {}
+                () = tokio::time::sleep(SLOTS_EVERY) => {}
+            }
         }
     }
 
@@ -1758,7 +1785,7 @@ mod tests {
             async move { machine.start(&id).await }
         });
         eventually(10, "the unit to be activating", || {
-            machine.active_state(&id) == ActiveState::Activating
+            machine.running(&id) && machine.active_state(&id) == ActiveState::Activating
         })
         .await;
         machine.forget_mounts();
@@ -1780,9 +1807,10 @@ mod tests {
             "the start in flight is counted"
         );
 
-        // The start ends before the agent has mounted the volume.
-        eventually(30, "the unit to be active", || {
-            machine.active_state(&id) == ActiveState::Active
+        // The start ends before the agent has mounted the volume: PostgreSQL is ready, and the
+        // agent cannot see it through a mount it does not have.
+        eventually(30, "PostgreSQL to be ready", || {
+            machine.postmaster_ready(&id)
         })
         .await;
         tokio::time::sleep(Duration::from_millis(300)).await;

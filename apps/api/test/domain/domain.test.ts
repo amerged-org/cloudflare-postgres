@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
 import { runCron } from "../../src/cron.ts";
 import { databaseInsertStatement } from "../../src/domain/databases.ts";
-import type { RoleRow, SizeRow, RegionRow } from "../../src/domain/rows.ts";
+import type { RoleRow, SizeRow } from "../../src/domain/rows.ts";
 import {
   cleanupFixtures,
   desiredPage,
@@ -79,9 +79,6 @@ describe("database domain on real Workers D1", () => {
     const size = (await env.DB.prepare("SELECT * FROM size_classes WHERE id=?")
       .bind(f.size)
       .first<SizeRow>())!;
-    const region = (await env.DB.prepare("SELECT * FROM regions WHERE id=?")
-      .bind(f.region)
-      .first<RegionRow>())!;
     const id = newDatabaseId(),
       now = new Date().toISOString();
     const snapshot = {
@@ -92,12 +89,11 @@ describe("database domain on real Workers D1", () => {
         size_class_id: f.size,
       },
       size,
-      region,
       nodeId: f.node,
       id,
       archivePath: archiveDestinationPath(
-        region.backup_bucket,
-        region.id,
+        env.ARCHIVE_BUCKET_NAME,
+        f.region,
         id,
         1,
         newOperationId(),
@@ -440,7 +436,7 @@ describe("database domain on real Workers D1", () => {
         .first<string>("status_message"),
     ).toBe(Array.from(`start_failed: ${bounded}`).slice(0, 4096).join(""));
   });
-  it("lists real R2 backup catalogs and WAL and rejects a mismatched region binding", async () => {
+  it("lists real R2 backup catalogs and WAL and rejects a path that names another bucket", async () => {
     const f = await fixture(),
       body = await created(f),
       id = body.database.id;
@@ -472,8 +468,14 @@ describe("database domain on real Workers D1", () => {
     } finally {
       await env.ARCHIVE.delete(keys);
     }
-    await env.DB.prepare("UPDATE regions SET backup_bucket=? WHERE id=?")
-      .bind("other-" + crypto.randomUUID().replaceAll("-", ""), f.region)
+    await env.DB.prepare("UPDATE databases SET archive_path=? WHERE id=?")
+      .bind(
+        archive!.replace(
+          `s3://${env.ARCHIVE_BUCKET_NAME}/`,
+          "s3://an-older-bucket/",
+        ),
+        id,
+      )
       .run();
     expect(
       (await request(`/v1/databases/${id}/archive`, f.integrator)).status,

@@ -15,21 +15,28 @@ use crate::{
     testpg,
     units::{
         self, ActiveState, Started, Timeline, UnitState,
-        limits::{Limits, Property},
+        limits::{Limits, Property, cpu_quota},
         ready,
+        slots::{
+            self, Adopted, Bind, Bound, Exe, Facts, Host, Ordered, Pool, SlotUnit, Snapshot,
+            Spawned,
+        },
     },
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs, io,
     num::NonZeroU32,
-    path::Path,
+    ops::Deref,
+    path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
-/// A unit as the test machine keeps it.
+/// A database's unit of its own (`pgcf-pg@`), which an agent of an earlier release started and
+/// the agent finds running: PostgreSQL started as that unit started it, in the directories that
+/// stand for the thin volumes. Nothing starts one but a test (`Local::start_legacy`).
 struct Unit {
     child: Option<Child>,
     /// The postmaster ended without being asked to: a crash.
@@ -45,9 +52,56 @@ struct Unit {
     activating: Option<Instant>,
 }
 
+/// A slot of the test machine (`pgcf-slot@<n>`): a placeholder process for the supervisor until
+/// the order, PostgreSQL after it, started as the supervisor starts it.
+struct Slot {
+    /// The supervisor, a `sleep`, until the order; PostgreSQL after it.
+    child: Option<Child>,
+    /// The process ended on its own after the order: a crash.
+    crashed: bool,
+    invocations: u64,
+    invocation_id: Option<String>,
+    /// The database whose volume and socket directory the handoff moved in, and the volume.
+    mounted: Option<(String, VolumeId)>,
+    properties: Vec<Property>,
+    /// The order was given: the process is PostgreSQL.
+    postgres: bool,
+    /// The supervisor's `flock` of the data directory, which PostgreSQL inherits.
+    lock: Option<fs::File>,
+}
+impl Slot {
+    fn new() -> Self {
+        Self {
+            child: None,
+            crashed: false,
+            invocations: 0,
+            invocation_id: None,
+            mounted: None,
+            properties: Vec::new(),
+            postgres: false,
+            lock: None,
+        }
+    }
+    /// Whether the slot's process lives; one that ended on its own is a crash.
+    fn alive(&mut self) -> bool {
+        let ended = self
+            .child
+            .as_mut()
+            .is_some_and(|child| child.try_wait().ok().flatten().is_some());
+        if ended {
+            self.child = None;
+            self.crashed = true;
+            self.lock = None;
+        }
+        self.child.is_some()
+    }
+}
+
 #[derive(Default)]
 struct State {
-    units: HashMap<String, Unit>,
+    /// The units of their own that run on the machine: only what a test started.
+    legacy: HashMap<String, Unit>,
+    slots: BTreeMap<u32, Slot>,
     volumes: BTreeMap<VolumeId, u64>,
     /// The volumes the agent has mounted in its mount namespace, each with its link for the
     /// database's unit: what the agent's restart ends. A unit that runs keeps its own mount.
@@ -56,7 +110,12 @@ struct State {
     /// `hold_volume` and `release_volume`.
     jobs: BTreeSet<VolumeId>,
     accounts: Vec<String>,
-    limits: HashMap<String, Limits>,
+    /// The slot numbers whose user exists. A node that has run for a while has them all; the
+    /// process of the health check starts with none, and its refill makes the one it needs.
+    slot_users: BTreeSet<u32>,
+    /// The slot numbers whose unit refuses to start, as one does with a process left in its
+    /// cgroup (`StrayProcesses`).
+    stray_slots: BTreeSet<u32>,
     quotas: HashMap<String, Option<NonZeroU32>>,
     /// Every `set_cpu_quota` the agent made, in order: (database, quota). A stop lifts a quota
     /// without a call, as systemd's does.
@@ -69,10 +128,12 @@ struct State {
     slice_memory_mib: Option<u64>,
     /// `create_volume` fails once with this.
     volume_error: Option<storage::Error>,
-    /// `start` fails once.
+    /// The order to execute PostgreSQL fails once: the supervisor's exec does not happen.
     start_fails: bool,
-    /// `start` fails once after its unit is up, as the real one can (EU1, 2026-10-20): the unit
-    /// runs on.
+    /// The handoff of the next bind fails once.
+    handoff_fails: bool,
+    /// The order fails once after PostgreSQL is up, as the real one can (EU1, 2026-10-20): the
+    /// slot runs on.
     start_fails_after_up: bool,
     /// `reboot` fails once, and the node keeps running.
     reboot_fails: bool,
@@ -151,6 +212,14 @@ fn tool_failed(program: &str, file: &str) -> io::Error {
     ))
 }
 
+/// The parent of process `pid` as `/proc/<pid>/stat` names it, `None` for a process that is gone.
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The name may hold spaces and parentheses: the fields follow its last one.
+    let after = stat.get(stat.rfind(')')? + 1..)?;
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// What a read of a unit fails with when the bus refuses the call, as dbus-daemon does past its
 /// limit of calls that are not answered yet: an error reply named `LimitsExceeded`, which is what
 /// `Units::state` gets from `GetUnit` (a method call's refusal is a `MethodError`).
@@ -176,7 +245,8 @@ fn boot_id(boots: u64) -> String {
     format!("00000000-0000-4000-8000-{boots:012x}")
 }
 
-pub struct Local {
+/// What the machine and its slots' host share.
+pub struct Shared {
     layout: Layout,
     user: String,
     uid: u32,
@@ -186,6 +256,39 @@ pub struct Local {
     unit_gate: tokio::sync::watch::Sender<bool>,
     /// `false` while the agent's mounts wait: a disk that answers late.
     mount_gate: tokio::sync::watch::Sender<bool>,
+}
+
+/// The test machine: the same pool of slots as a node has, over a host that starts real
+/// PostgreSQL processes in place of units.
+pub struct Local {
+    shared: Arc<Shared>,
+    pool: Pool<LocalHost>,
+}
+impl Deref for Local {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+/// systemd and the kernel of the test machine, for the pool of slots (`slots::Host`).
+pub struct LocalHost(Arc<Shared>);
+
+impl Shared {
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn release_shared_memory(&self, database: &str) {
+        let pid_file = fs::read_to_string(self.layout.data(database).join("postmaster.pid"))
+            .unwrap_or_default();
+        if let Some(id) = pid_file
+            .lines()
+            .nth(6)
+            .and_then(|line| line.split_whitespace().nth(1))
+        {
+            let _ = Command::new("ipcrm").args(["-m", id]).output();
+        }
+    }
 }
 
 impl Local {
@@ -227,7 +330,7 @@ impl Local {
             )
             .unwrap();
         }
-        let machine = Self {
+        let machine = Self::wrap(Shared {
             layout,
             user: testpg::current_user(),
             uid,
@@ -235,13 +338,40 @@ impl Local {
             state: Mutex::new(State {
                 available_bytes: 8 << 30,
                 kernel_release: "6.12.111+deb13-amd64".into(),
+                slot_users: (0..slots::SLOT_COUNT).collect(),
                 ..State::default()
             }),
             unit_gate: tokio::sync::watch::channel(true).0,
             mount_gate: tokio::sync::watch::channel(true).0,
-        };
+        });
         machine.load_units();
         Some(machine)
+    }
+
+    fn wrap(shared: Shared) -> Self {
+        Self::wrap_in(shared, slots::POOL)
+    }
+
+    fn wrap_in(shared: Shared, range: std::ops::Range<u32>) -> Self {
+        let shared = Arc::new(shared);
+        Self {
+            pool: Pool::new(LocalHost(shared.clone()), range),
+            shared,
+        }
+    }
+
+    /// A machine whose pool has the one slot of the health check alone, as the process of
+    /// `pgcf-agent check` has.
+    pub fn for_check(label: &str) -> Option<Self> {
+        let Self { shared, pool } = Self::new(label)?;
+        drop(pool);
+        let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| panic!("not shared yet"));
+        // A process that never made a slot: no slot user exists yet.
+        shared.state().slot_users.clear();
+        Some(Self::wrap_in(
+            shared,
+            slots::CHECK_SLOT..slots::CHECK_SLOT + 1,
+        ))
     }
 
     /// The unit files below the root, as systemd's search path finds them: `/etc` before
@@ -330,12 +460,14 @@ impl Local {
     pub fn created_directories(&self) -> BTreeMap<String, String> {
         self.state().directories.clone()
     }
-    pub fn with_layout(mut self, change: impl FnOnce(&mut Layout)) -> Self {
-        change(&mut self.layout);
-        self
-    }
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    pub fn with_layout(self, change: impl FnOnce(&mut Layout)) -> Self {
+        let Self { shared, pool } = self;
+        let range = pool.range();
+        drop(pool);
+        let mut shared =
+            Arc::try_unwrap(shared).unwrap_or_else(|_| panic!("the machine is not shared yet"));
+        change(&mut shared.layout);
+        Self::wrap_in(shared, range)
     }
     pub fn calls(&self) -> Vec<String> {
         self.state().calls.clone()
@@ -358,41 +490,96 @@ impl Local {
             .map(|(name, version)| (name.to_string(), version.to_string()))
             .collect();
     }
-    /// Whether `database` has a postmaster running.
+    /// How many slot numbers have a user on this machine.
+    pub fn slot_users(&self) -> usize {
+        self.state().slot_users.len()
+    }
+    /// A node that made the users of the first `count` slot numbers only, as one just installed
+    /// has: the pool reads them again, as an agent that starts does.
+    pub async fn limit_slot_users(&self, count: u32) {
+        self.state().slot_users = (0..count).collect();
+        self.pool.adopt().await.unwrap();
+    }
+    /// The unit of slot `number` refuses to start until the process in its cgroup ends.
+    pub fn stray_slot(&self, number: u32) {
+        self.state().stray_slots.insert(number);
+    }
+    /// Whether `database` has a postmaster running, in a slot or as a unit of its own.
     pub fn running(&self, database: &str) -> bool {
         let mut state = self.state();
+        if let Some(slot) = self.pool.slot_of(database) {
+            return state
+                .slots
+                .get_mut(&slot)
+                .is_some_and(|unit| unit.postgres && unit.alive());
+        }
         state
-            .units
+            .legacy
             .get_mut(database)
             .and_then(|unit| unit.child.as_mut())
             .is_some_and(|child| child.try_wait().ok().flatten().is_none())
     }
+    /// Whether the postmaster of `database` has written `ready` to its `postmaster.pid`, which the
+    /// kernel shows to whoever reads the volume, mounted by the agent or not.
+    pub fn postmaster_ready(&self, database: &str) -> bool {
+        let pid = {
+            let mut state = self.state();
+            let Some(slot) = self.pool.slot_of(database) else {
+                return false;
+            };
+            let unit = state.slots.get_mut(&slot);
+            unit.and_then(|unit| {
+                (unit.postgres && unit.alive())
+                    .then(|| unit.child.as_ref().map(Child::id))
+                    .flatten()
+            })
+        };
+        pid.is_some_and(|pid| ready::ready_socket(&self.layout.volume(database), pid).is_ok())
+    }
     /// SIGKILL: a crash the units do not report.
     pub fn crash(&self, database: &str) {
         let mut state = self.state();
-        if let Some(unit) = state.units.get_mut(database)
-            && let Some(mut child) = unit.child.take()
-        {
+        let child = match self.pool.slot_of(database) {
+            Some(slot) => state.slots.get_mut(&slot).and_then(|unit| {
+                unit.lock = None;
+                unit.child.take().inspect(|_| unit.crashed = true)
+            }),
+            None => state
+                .legacy
+                .get_mut(database)
+                .and_then(|unit| unit.child.take().inspect(|_| unit.crashed = true)),
+        };
+        if let Some(mut child) = child {
             let _ = child.kill();
             let _ = child.wait();
-            unit.crashed = true;
             drop(state);
             self.release_shared_memory(database);
         }
     }
-    fn release_shared_memory(&self, database: &str) {
-        let pid_file = fs::read_to_string(self.layout.data(database).join("postmaster.pid"))
-            .unwrap_or_default();
-        if let Some(id) = pid_file
-            .lines()
-            .nth(6)
-            .and_then(|line| line.split_whitespace().nth(1))
-        {
-            let _ = Command::new("ipcrm").args(["-m", id]).output();
-        }
-    }
+    /// The limits the slot that holds the database was given at its bind, or since.
     pub fn limits(&self, database: &str) -> Option<Limits> {
-        self.state().limits.get(database).cloned()
+        let slot = self.pool.slot_of(database)?;
+        let state = self.state();
+        let properties = &state.slots.get(&slot)?.properties;
+        let number = |wanted: fn(&Property) -> Option<u64>| properties.iter().find_map(wanted);
+        Some(Limits {
+            memory_mib: number(|p| match p {
+                Property::MemoryMax(bytes) => Some(*bytes),
+                _ => None,
+            })? >> 20,
+            cpu_millicores: u32::try_from(
+                number(|p| match p {
+                    Property::CpuWeight(weight) => Some(*weight),
+                    _ => None,
+                })? * 10,
+            )
+            .ok()?,
+            tasks_max: number(|p| match p {
+                Property::TasksMax(tasks) => Some(*tasks),
+                _ => None,
+            })?,
+            io: None,
+        })
     }
     pub fn quota(&self, database: &str) -> Option<Option<NonZeroU32>> {
         self.state().quotas.get(database).copied()
@@ -434,6 +621,10 @@ impl Local {
     }
     pub fn fail_next_start(&self) {
         self.state().start_fails = true;
+    }
+    /// The next bind cannot move the database's mounts into its slot.
+    pub fn fail_next_handoff(&self) {
+        self.state().handoff_fails = true;
     }
     /// The next start fails after the unit is up and keeps running.
     pub fn fail_next_start_after_up(&self) {
@@ -488,7 +679,7 @@ impl Local {
     }
     /// A unit that exists and is stopped, as one is after a stop or a boot.
     pub fn add_stopped_unit(&self, database: &str) {
-        self.state().units.insert(
+        self.state().legacy.insert(
             database.to_string(),
             Unit {
                 child: None,
@@ -531,13 +722,24 @@ impl Local {
     }
     fn holders(&self, id: &VolumeId, wanted: impl Fn(&VolumeId) -> bool) -> bool {
         let running = self.running(id.database());
-        let state = self.state();
+        let slot = self.pool.slot_of(id.database());
+        let mut state = self.state();
+        // A slot holds the filesystem while its process lives, bound or running: the mount is in
+        // its namespace.
+        let in_slot = slot.and_then(|slot| {
+            let unit = state.slots.get_mut(&slot)?;
+            unit.alive()
+                .then(|| unit.mounted.as_ref().map(|(_, volume)| volume.clone()))
+                .flatten()
+        });
         let unit = state
-            .units
+            .legacy
             .get(id.database())
             .filter(|_| running)
-            .and_then(|unit| unit.volume.as_ref());
-        unit.into_iter()
+            .and_then(|unit| unit.volume.clone());
+        in_slot
+            .iter()
+            .chain(unit.iter())
             .chain(state.jobs.iter())
             .any(|held| held.database() == id.database() && wanted(held))
     }
@@ -545,27 +747,36 @@ impl Local {
         self.state().accounts.iter().any(|a| a == database)
     }
 }
-impl Drop for Local {
+impl Drop for Shared {
     fn drop(&mut self) {
-        let databases: Vec<String> = self.state().units.keys().cloned().collect();
-        for database in databases {
-            let child = self
-                .state()
-                .units
-                .get_mut(&database)
-                .and_then(|unit| unit.child.take());
-            if let Some(mut child) = child {
-                let _ = Command::new("kill")
-                    .args(["-INT", &child.id().to_string()])
-                    .status();
-                let started = Instant::now();
-                while started.elapsed() < Duration::from_secs(10)
-                    && child.try_wait().ok().flatten().is_none()
-                {
-                    std::thread::sleep(Duration::from_millis(10));
+        let mut ending: Vec<(Child, Option<String>)> = Vec::new();
+        {
+            let mut state = self.state();
+            for unit in state.slots.values_mut() {
+                let database = unit.mounted.as_ref().map(|(database, _)| database.clone());
+                if let Some(child) = unit.child.take() {
+                    ending.push((child, database));
                 }
-                let _ = child.kill();
-                let _ = child.wait();
+            }
+            for (database, unit) in state.legacy.iter_mut() {
+                if let Some(child) = unit.child.take() {
+                    ending.push((child, Some(database.clone())));
+                }
+            }
+        }
+        for (mut child, database) in ending {
+            let _ = Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status();
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(10)
+                && child.try_wait().ok().flatten().is_none()
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(database) = database {
                 self.release_shared_memory(&database);
             }
         }
@@ -657,9 +868,12 @@ impl Machine for Local {
         if !self.running(database) {
             return Ok(None);
         }
+        if let Some(volume) = self.pool.volume_of(database) {
+            return Ok(Some(volume));
+        }
         let state = self.state();
         match state
-            .units
+            .legacy
             .get(database)
             .and_then(|unit| unit.volume.clone())
         {
@@ -916,20 +1130,17 @@ impl Machine for Local {
                 }
             }
         }
-        let mut state = self.state();
-        if state.units_unreadable || state.unit_reads_fail > 0 {
-            state.unit_reads_fail = state.unit_reads_fail.saturating_sub(1);
-            return Err(bus_refused());
+        {
+            let mut state = self.state();
+            if state.units_unreadable || state.unit_reads_fail > 0 {
+                state.unit_reads_fail = state.unit_reads_fail.saturating_sub(1);
+                return Err(bus_refused());
+            }
         }
-        let memory_max = state.limits.get(database).and_then(|limits| {
-            limits
-                .properties()
-                .iter()
-                .find_map(|property| match property {
-                    Property::MemoryMax(bytes) => Some(*bytes),
-                    _ => None,
-                })
-        });
+        if let Some(unit) = self.pool.state(database).await? {
+            return Ok(unit);
+        }
+        let mut state = self.state();
         let (active, main_pid, invocation_id) = self.unit_facts(&mut state, database);
         Ok(UnitState {
             database: database.to_string(),
@@ -937,113 +1148,31 @@ impl Machine for Local {
             main_pid,
             invocation_id,
             uid: (active == ActiveState::Active).then_some(self.uid),
-            memory_max_bytes: memory_max.or(Some(256 << 20)),
+            memory_max_bytes: Some(256 << 20),
+            slot: None,
         })
     }
     async fn units(&self) -> Result<Vec<UnitState>, units::Error> {
-        let databases: Vec<String> = self.state().units.keys().cloned().collect();
+        let mut databases = self.pool.databases();
+        databases.extend(self.state().legacy.keys().cloned());
+        databases.sort();
+        databases.dedup();
         let mut states = Vec::new();
         for database in databases {
             states.push(self.unit(&database).await?);
         }
         Ok(states)
     }
-    async fn start(&self, database: &str) -> Result<Started, units::Error> {
-        {
-            let mut state = self.state();
-            state.calls.push(format!("start {database}"));
-            if state.start_fails {
-                state.start_fails = false;
-                return Err(units::Error::Job {
-                    unit: units::unit_name(database),
-                    result: "failed".into(),
-                });
-            }
+    async fn bind(&self, database: &str, bind: &Bind) -> Result<Bound, units::Error> {
+        self.pool.bind(database, bind).await
+    }
+    async fn exec(&self, bound: &Bound) -> Result<Started, units::Error> {
+        self.state().calls.push(format!("start {}", bound.database));
+        let started = self.pool.exec(bound).await?;
+        if std::mem::take(&mut self.state().start_fails_after_up) {
+            return Err(bus_refused());
         }
-        if self.running(database) {
-            return self.wait_started(database).await;
-        }
-        // The unit asserts the agent's link, and mounts the volume the link names.
-        let attached = {
-            let state = self.state();
-            state
-                .attached
-                .iter()
-                .find(|volume| volume.database() == database)
-                .cloned()
-        };
-        let Some(attached) = attached else {
-            return Err(units::Error::Job {
-                unit: units::unit_name(database),
-                result: "assert".into(),
-            });
-        };
-        let volume = self.layout.volume(database);
-        if !self.layout.data(database).join("PG_VERSION").exists() {
-            return Err(units::Error::Job {
-                unit: units::unit_name(database),
-                result: "failed".into(),
-            });
-        }
-        let log = fs::File::create(volume.join("postgres.log"))
-            .map_err(|error| units::Error::Bus(zbus::Error::Failure(error.to_string())))?;
-        let child = Command::new(self.layout.postgres_bin.join("postgres"))
-            .arg("-D")
-            .arg(self.layout.data(database))
-            .arg("-c")
-            .arg("listen_addresses=")
-            .arg("-c")
-            .arg(format!(
-                "unix_socket_directories={}",
-                self.layout.socket_directory(database).display()
-            ))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .map_err(|error| units::Error::Bus(zbus::Error::Failure(error.to_string())))?;
-        {
-            let mut state = self.state();
-            // A start that takes long, as a recovery does, goes on in systemd whether or not the
-            // caller still waits for it: the unit is activating until the job ends.
-            let delay = state.start_delay.take().unwrap_or_default();
-            let unit = state.units.entry(database.to_string()).or_insert(Unit {
-                child: None,
-                crashed: false,
-                invocations: 0,
-                invocation_id: None,
-                volume: None,
-                activating: None,
-            });
-            unit.volume = Some(attached);
-            unit.invocations += 1;
-            unit.crashed = false;
-            unit.child = Some(child);
-            unit.invocation_id = Some(format!("00000000-0000-4000-8000-{:012x}", unit.invocations));
-            unit.activating = Some(Instant::now() + delay);
-        }
-        let started = Instant::now();
-        loop {
-            match self.active_state(database) {
-                ActiveState::Active => {
-                    if std::mem::take(&mut self.state().start_fails_after_up) {
-                        return Err(bus_refused());
-                    }
-                    return self.started(database);
-                }
-                ActiveState::Activating => {}
-                _ => {
-                    return Err(units::Error::Job {
-                        unit: units::unit_name(database),
-                        result: "failed".into(),
-                    });
-                }
-            }
-            if started.elapsed() > Duration::from_secs(60) {
-                return Err(units::Error::NotReady("postmaster_not_ready"));
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        Ok(started)
     }
     /// Neither systemd nor a journal runs here: nothing was recorded.
     async fn start_timeline(&self, _: &str, _: &Started) -> Result<Timeline, units::Error> {
@@ -1057,6 +1186,9 @@ impl Machine for Local {
                 return Err(bus_refused());
             }
         }
+        if self.pool.slot_of(database).is_some() {
+            return self.pool.wait_started(database).await;
+        }
         // As the unit's own answer does: it waits while the unit is activating, reads the files
         // once when the unit is active, and a unit that is not active is not ready.
         loop {
@@ -1069,15 +1201,19 @@ impl Machine for Local {
         }
     }
     async fn stop(&self, database: &str) -> Result<(), units::Error> {
-        let child = {
+        {
             let mut state = self.state();
             state.calls.push(format!("stop {database}"));
             state.quotas.insert(database.to_string(), None);
-            state
-                .units
-                .get_mut(database)
-                .and_then(|unit| unit.child.take())
-        };
+        }
+        if self.pool.stop(database).await? {
+            return Ok(());
+        }
+        let child = self
+            .state()
+            .legacy
+            .get_mut(database)
+            .and_then(|unit| unit.child.take());
         if let Some(mut child) = child {
             let _ = Command::new("kill")
                 .args(["-INT", &child.id().to_string()])
@@ -1095,9 +1231,7 @@ impl Machine for Local {
         Ok(())
     }
     async fn set_limits(&self, database: &str, limits: &Limits) -> Result<(), units::Error> {
-        self.state()
-            .limits
-            .insert(database.to_string(), limits.clone());
+        self.pool.set(database, &limits.properties()).await?;
         Ok(())
     }
     async fn set_cpu_quota(
@@ -1105,14 +1239,62 @@ impl Machine for Local {
         database: &str,
         millicores: Option<NonZeroU32>,
     ) -> Result<(), units::Error> {
-        let mut state = self.state();
-        state.quotas.insert(database.to_string(), millicores);
-        state.quota_calls.push((database.to_string(), millicores));
+        {
+            let mut state = self.state();
+            state.quotas.insert(database.to_string(), millicores);
+            state.quota_calls.push((database.to_string(), millicores));
+        }
+        self.pool.set(database, &[cpu_quota(millicores)]).await?;
         Ok(())
     }
     async fn set_slice_memory(&self, awake_budget_mib: u64) -> Result<(), units::Error> {
         self.state().slice_memory_mib = Some(awake_budget_mib);
         Ok(())
+    }
+
+    async fn adopt_slots(&self) -> Result<Adopted, units::Error> {
+        self.pool.adopt().await
+    }
+    async fn refill_slot(&self, target: usize) -> Result<Option<u32>, units::Error> {
+        self.pool.refill(target).await
+    }
+    async fn make_slot_user(&self) -> Result<Option<u32>, units::Error> {
+        self.pool.make_user().await
+    }
+    async fn drain_idle_slots(&self) -> usize {
+        self.pool.drain_idle().await
+    }
+    fn slots(&self) -> Snapshot {
+        self.pool.snapshot()
+    }
+    /// The processes of the machine all run as one user, so a caller is the database whose
+    /// postmaster is an ancestor of its process (a node tells slots apart by their uids, cgroups
+    /// and invocations). A caller that is none of them (the test's own process) is the one
+    /// database a slot holds, if there is exactly one.
+    fn caller(&self, _uid: u32, pid: u32) -> Option<String> {
+        let databases = self.pool.databases();
+        let postmasters: Vec<(String, u32)> = {
+            let state = self.state();
+            databases
+                .iter()
+                .filter_map(|database| {
+                    let slot = self.pool.slot_of(database)?;
+                    let main = state.slots.get(&slot)?.child.as_ref()?.id();
+                    Some((database.clone(), main))
+                })
+                .collect()
+        };
+        let mut at = pid;
+        while at > 1 {
+            if let Some((database, _)) = postmasters.iter().find(|(_, main)| *main == at) {
+                return Some(database.clone());
+            }
+            at = parent_of(at)?;
+        }
+        match databases.as_slice() {
+            [database] => Some(database.clone()),
+            _ => None,
+        }
     }
 
     async fn apply_credentials(
@@ -1433,8 +1615,8 @@ impl Machine for Local {
 }
 
 impl Local {
-    /// What systemd says of a unit: its active state, its main process and its invocation. A
-    /// postmaster that ended on its own is a crash. A unit whose start job is open is
+    /// What systemd says of a unit of its own: its active state, its main process and its
+    /// invocation. A postmaster that ended on its own is a crash. A unit whose start job is open is
     /// `activating`: until its postmaster is ready, and, for a start that takes long
     /// (`delay_next_start`), not before the job may end, ready or failed.
     fn unit_facts(
@@ -1442,7 +1624,7 @@ impl Local {
         state: &mut State,
         database: &str,
     ) -> (ActiveState, Option<u32>, Option<String>) {
-        let Some(unit) = state.units.get_mut(database) else {
+        let Some(unit) = state.legacy.get_mut(database) else {
             return (ActiveState::Inactive, None, None);
         };
         if unit.child.is_none() {
@@ -1486,17 +1668,36 @@ impl Local {
         (active, Some(pid), unit.invocation_id.clone())
     }
 
-    /// The unit's active state, which reading it counts as no read of the test.
+    /// The database's unit as the agent reads it, which reading it counts as no read of the test:
+    /// its slot's, mapped as the pool maps it, or its unit of its own.
     pub fn active_state(&self, database: &str) -> ActiveState {
+        if let Some(slot) = self.pool.slot_of(database) {
+            let active = {
+                let mut state = self.state();
+                match state.slots.get_mut(&slot) {
+                    Some(unit) => {
+                        if unit.alive() {
+                            ActiveState::Active
+                        } else if unit.crashed {
+                            ActiveState::Failed
+                        } else {
+                            ActiveState::Inactive
+                        }
+                    }
+                    None => ActiveState::Inactive,
+                }
+            };
+            return self.pool.view_of(database, active).unwrap_or(active);
+        }
         self.unit_facts(&mut self.state(), database).0
     }
 
-    /// The facts of a unit that is ready, read as the agent reads them: through its own mount of
-    /// the volume, where an agent that has not attached it finds an empty directory.
+    /// The facts of a unit of its own that is ready, read as the agent reads them: through its own
+    /// mount of the volume, where an agent that has not attached it finds an empty directory.
     fn started(&self, database: &str) -> Result<Started, units::Error> {
         let mut state = self.state();
         let unit = state
-            .units
+            .legacy
             .get_mut(database)
             .ok_or(units::Error::NotReady("unit_not_active"))?;
         let child = unit
@@ -1524,6 +1725,474 @@ impl Local {
             uid: self.uid,
             socket,
             requested_us: None,
+            slot: None,
         })
+    }
+
+    /// PostgreSQL started in a slot on the volume the agent has attached, as the agent starts it
+    /// (the pool's bind and the order), without the agent: what a test does to have a database
+    /// running that an agent then finds.
+    pub async fn start(&self, database: &str) -> Result<Started, units::Error> {
+        let (volume, account) = {
+            let state = self.state();
+            (
+                state
+                    .attached
+                    .iter()
+                    .find(|volume| volume.database() == database)
+                    .cloned(),
+                state.accounts.iter().any(|held| held == database),
+            )
+        };
+        let (Some(volume), true) = (volume, account) else {
+            return Err(units::Error::Job {
+                unit: units::unit_name(database),
+                result: "assert".into(),
+            });
+        };
+        let bind = Bind {
+            device: self.device(&volume).into(),
+            data: self.layout.data(database),
+            properties: Limits {
+                memory_mib: 256,
+                cpu_millicores: 1000,
+                tasks_max: 64,
+                io: None,
+            }
+            .properties(),
+            volume,
+            account: Account {
+                name: self.user.clone(),
+                uid: self.uid,
+                gid: self.gid,
+            },
+        };
+        let bound = self.bind(database, &bind).await?;
+        self.exec(&bound).await
+    }
+
+    /// PostgreSQL started the way an agent of an earlier release started it: as the database's
+    /// unit of its own, with no slot, on the volume the agent has attached. The agent that finds
+    /// it adopts it and puts it to sleep as it did; nothing but a test starts one.
+    pub async fn start_legacy(&self, database: &str) -> Result<Started, units::Error> {
+        let volume = {
+            let state = self.state();
+            state
+                .attached
+                .iter()
+                .find(|volume| volume.database() == database)
+                .cloned()
+        };
+        let Some(volume) = volume else {
+            return Err(units::Error::Job {
+                unit: units::unit_name(database),
+                result: "assert".into(),
+            });
+        };
+        let log = fs::File::create(self.layout.volume(database).join("postgres.log"))
+            .map_err(|error| units::Error::Bus(zbus::Error::Failure(error.to_string())))?;
+        let child = Command::new(self.layout.postgres_bin.join("postgres"))
+            .arg("-D")
+            .arg(self.layout.data(database))
+            .arg("-c")
+            .arg("listen_addresses=")
+            .arg("-c")
+            .arg(format!(
+                "unix_socket_directories={}",
+                self.layout.socket_directory(database).display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .map_err(|error| units::Error::Bus(zbus::Error::Failure(error.to_string())))?;
+        {
+            let mut state = self.state();
+            let unit = state.legacy.entry(database.to_string()).or_insert(Unit {
+                child: None,
+                crashed: false,
+                invocations: 0,
+                invocation_id: None,
+                volume: None,
+                activating: None,
+            });
+            unit.volume = Some(volume);
+            unit.invocations += 1;
+            unit.crashed = false;
+            unit.child = Some(child);
+            unit.invocation_id = Some(format!("00000000-0000-4000-8000-{:012x}", unit.invocations));
+            unit.activating = Some(Instant::now());
+        }
+        let started = Instant::now();
+        loop {
+            match self.active_state(database) {
+                ActiveState::Active => return self.started(database),
+                ActiveState::Activating => {}
+                _ => {
+                    return Err(units::Error::Job {
+                        unit: units::unit_name(database),
+                        result: "failed".into(),
+                    });
+                }
+            }
+            if started.elapsed() > Duration::from_secs(60) {
+                return Err(units::Error::NotReady("postmaster_not_ready"));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// Merges properties into a slot's: a property replaces the one of its name, as systemd's
+/// `SetUnitProperties` does for the setting it names.
+fn merge(held: &mut Vec<Property>, set: &[Property]) {
+    for property in set {
+        match held.iter_mut().find(|held| held.name() == property.name()) {
+            Some(held) => *held = property.clone(),
+            None => held.push(property.clone()),
+        }
+    }
+}
+
+fn unit_assert(slot: u32) -> units::Error {
+    units::Error::Job {
+        unit: slots::slot_unit(slot),
+        result: "assert".into(),
+    }
+}
+
+impl Host for LocalHost {
+    async fn unit(&self, slot: u32) -> Result<SlotUnit, units::Error> {
+        let mut state = self.0.state();
+        let Some(unit) = state.slots.get_mut(&slot) else {
+            return Ok(SlotUnit {
+                slot,
+                active: ActiveState::Inactive,
+                main_pid: None,
+                invocation_id: None,
+                memory_max_bytes: None,
+            });
+        };
+        let alive = unit.alive();
+        let active = if alive {
+            ActiveState::Active
+        } else if unit.crashed {
+            ActiveState::Failed
+        } else {
+            ActiveState::Inactive
+        };
+        Ok(SlotUnit {
+            slot,
+            active,
+            main_pid: unit.child.as_ref().map(Child::id),
+            invocation_id: unit.invocation_id.clone(),
+            memory_max_bytes: unit
+                .properties
+                .iter()
+                .find_map(|property| match property {
+                    Property::MemoryMax(bytes) => Some(*bytes),
+                    _ => None,
+                })
+                .or(Some(256 << 20)),
+        })
+    }
+
+    async fn units(&self) -> Result<Vec<SlotUnit>, units::Error> {
+        let slots: Vec<u32> = self.0.state().slots.keys().copied().collect();
+        let mut units = Vec::new();
+        for slot in slots {
+            units.push(self.unit(slot).await?);
+        }
+        Ok(units)
+    }
+
+    /// The processes of the machine all run as the user of the test, so no slot has an account of
+    /// its own: a number "has a user" when the test machine says so.
+    fn users(&self) -> BTreeSet<u32> {
+        self.0.state().slot_users.clone()
+    }
+
+    async fn ensure_user(&self, slot: u32) -> Result<(), units::Error> {
+        self.0.state().slot_users.insert(slot);
+        Ok(())
+    }
+
+    async fn set(&self, slot: u32, properties: &[Property]) -> Result<(), units::Error> {
+        let mut state = self.0.state();
+        let unit = state.slots.entry(slot).or_insert_with(Slot::new);
+        merge(&mut unit.properties, properties);
+        Ok(())
+    }
+
+    /// The unit starts with a process that waits, which stands for the supervisor.
+    async fn start(&self, slot: u32) -> Result<Spawned, units::Error> {
+        if self.0.state().stray_slots.contains(&slot) {
+            return Err(units::Error::StrayProcesses);
+        }
+        let child = Command::new("sleep")
+            .arg("3600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(units::Error::Io)?;
+        let mut state = self.0.state();
+        let unit = state.slots.entry(slot).or_insert_with(Slot::new);
+        unit.invocations += 1;
+        // An RFC 4122 UUID (variant 8) that names the slot and the start.
+        let invocation = format!("00000000-0000-4000-8{slot:03x}-{:012x}", unit.invocations);
+        let main_pid = child.id();
+        unit.child = Some(child);
+        unit.crashed = false;
+        unit.postgres = false;
+        unit.mounted = None;
+        unit.lock = None;
+        unit.invocation_id = Some(invocation.clone());
+        Ok(Spawned {
+            main_pid,
+            invocation_id: invocation,
+            requested_us: None,
+        })
+    }
+
+    async fn stop(&self, slot: u32) -> Result<(), units::Error> {
+        let (child, database) = {
+            let mut state = self.0.state();
+            let Some(unit) = state.slots.get_mut(&slot) else {
+                return Ok(());
+            };
+            let database = unit.mounted.take().map(|(database, _)| database);
+            let postgres = std::mem::replace(&mut unit.postgres, false);
+            unit.lock = None;
+            unit.crashed = false;
+            (unit.child.take().map(|child| (child, postgres)), database)
+        };
+        if let Some((mut child, postgres)) = child {
+            if postgres {
+                let _ = Command::new("kill")
+                    .args(["-INT", &child.id().to_string()])
+                    .status();
+                let started = Instant::now();
+                while child.try_wait().ok().flatten().is_none() {
+                    if started.elapsed() > Duration::from_secs(30) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(database) = database {
+                self.0.release_shared_memory(&database);
+            }
+        }
+        Ok(())
+    }
+
+    async fn ping(&self, slot: u32) -> Result<(), units::Error> {
+        let mut state = self.0.state();
+        let idle = state
+            .slots
+            .get_mut(&slot)
+            .is_some_and(|unit| unit.alive() && !unit.postgres);
+        if idle {
+            Ok(())
+        } else {
+            Err(units::Error::Refused("reply"))
+        }
+    }
+
+    fn alive(&self, slot: u32) -> bool {
+        self.0.state().slots.get_mut(&slot).is_some_and(Slot::alive)
+    }
+
+    /// The processes of the machine all run as the user of the test.
+    fn uid(&self, _slot: u32) -> u32 {
+        self.0.uid
+    }
+
+    /// The handoff clones the agent's own mount of the volume: a volume the agent has not
+    /// attached cannot be moved in.
+    async fn mount(&self, slot: u32, bind: &Bind) -> Result<(), units::Error> {
+        let mut state = self.0.state();
+        if std::mem::take(&mut state.handoff_fails) || !state.attached.contains(&bind.volume) {
+            return Err(unit_assert(slot));
+        }
+        let unit = state.slots.entry(slot).or_insert_with(Slot::new);
+        if !unit.alive() {
+            return Err(unit_assert(slot));
+        }
+        unit.mounted = Some((bind.volume.database().to_string(), bind.volume.clone()));
+        Ok(())
+    }
+
+    /// The supervisor's order: the lock of the data directory, then PostgreSQL started as the
+    /// image's unit starts it, in the place of the supervisor.
+    async fn order(&self, slot: u32, database: &str) -> Result<Ordered, units::Error> {
+        let began = Instant::now();
+        let layout = self.0.layout.clone();
+        {
+            let mut state = self.0.state();
+            if std::mem::take(&mut state.start_fails) {
+                // The exec failed: the supervisor ends.
+                if let Some(unit) = state.slots.get_mut(&slot)
+                    && let Some(mut child) = unit.child.take()
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return Err(units::Error::Refused("reply"));
+            }
+        }
+        let refuse = |word: &'static str| units::Error::Refused(word);
+        if !layout.data(database).join("PG_VERSION").exists() {
+            return Err(refuse("unbound"));
+        }
+        let data = fs::File::open(layout.data(database)).map_err(units::Error::Io)?;
+        match data.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Err(refuse("held")),
+            Err(fs::TryLockError::Error(error)) => return Err(units::Error::Io(error)),
+        }
+        let log = fs::File::create(layout.volume(database).join("postgres.log"))
+            .map_err(units::Error::Io)?;
+        let delay = self.0.state().start_delay.take();
+        // A start that takes long, as a crash recovery does: the process is there, holds the lock
+        // and has written no status yet. The process that waits executes PostgreSQL, as the
+        // supervisor does, so that it is the same process.
+        let mut command = match delay {
+            Some(delay) => {
+                let mut command = Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg("sleep \"$1\"; shift; exec \"$@\"")
+                    .arg("sh")
+                    .arg(format!("{:.3}", delay.as_secs_f64()))
+                    .arg(layout.postgres_bin.join("postgres"));
+                command
+            }
+            None => Command::new(layout.postgres_bin.join("postgres")),
+        };
+        let child = command
+            .arg("-D")
+            .arg(layout.data(database))
+            .arg("-c")
+            .arg("listen_addresses=")
+            .arg("-c")
+            .arg(format!(
+                "unix_socket_directories={}",
+                layout.socket_directory(database).display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .map_err(units::Error::Io)?;
+        let mut state = self.0.state();
+        let unit = state.slots.entry(slot).or_insert_with(Slot::new);
+        if let Some(mut supervisor) = unit.child.replace(child) {
+            let _ = supervisor.kill();
+            let _ = supervisor.wait();
+        }
+        unit.postgres = true;
+        unit.crashed = false;
+        unit.lock = Some(data);
+        let main_pid = unit.child.as_ref().map_or(0, Child::id);
+        Ok(Ordered {
+            main_pid,
+            sent_us: None,
+            took: began.elapsed(),
+        })
+    }
+
+    async fn ready(
+        &self,
+        slot: u32,
+        database: &str,
+        main_pid: u32,
+    ) -> Result<PathBuf, units::Error> {
+        let began = Instant::now();
+        loop {
+            {
+                let mut state = self.0.state();
+                let mounted = state
+                    .attached
+                    .iter()
+                    .any(|volume| volume.database() == database);
+                let unit = state
+                    .slots
+                    .get_mut(&slot)
+                    .ok_or(units::Error::NotReady("exited"))?;
+                if !unit.alive() {
+                    return Err(units::Error::NotReady("exited"));
+                }
+                if !mounted {
+                    return Err(units::Error::NotReady("postmaster_pid_missing"));
+                }
+                if let Ok(socket) = ready::ready_socket(&self.0.layout.volume(database), main_pid) {
+                    return Ok(socket);
+                }
+            }
+            if began.elapsed() > Duration::from_secs(60) {
+                return Err(units::Error::NotReady("postmaster_not_ready"));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// What the kernel says of the slot's process: the program it runs, the databases whose
+    /// volume it has mounted, whether it holds the lock, and the status in `postmaster.pid`.
+    fn facts(&self, slot: u32, _pid: Option<u32>) -> Result<Option<Facts>, units::Error> {
+        let mut state = self.0.state();
+        let Some(unit) = state.slots.get_mut(&slot) else {
+            return Ok(None);
+        };
+        if !unit.alive() {
+            return Ok(None);
+        }
+        let pid = unit.child.as_ref().map_or(0, Child::id);
+        let databases: Vec<_> = unit
+            .mounted
+            .iter()
+            .map(|(database, volume)| (database.clone(), Some(volume.clone())))
+            .collect();
+        let postmaster = unit
+            .postgres
+            .then(|| databases.first())
+            .flatten()
+            .and_then(|(database, _)| {
+                fs::read_to_string(self.0.layout.data(database).join("postmaster.pid")).ok()
+            })
+            .and_then(|text| ready::parse(&text).ok())
+            .filter(|postmaster| postmaster.pid == pid)
+            .map(|postmaster| postmaster.status);
+        Ok(Some(Facts {
+            pid,
+            exe: if unit.postgres {
+                Exe::Postgres
+            } else {
+                Exe::Supervisor
+            },
+            databases,
+            locked: unit.lock.is_some(),
+            postmaster,
+        }))
+    }
+
+    async fn legacy_holds(&self, database: &str) -> Result<bool, units::Error> {
+        Ok(self
+            .0
+            .state()
+            .legacy
+            .get_mut(database)
+            .and_then(|unit| unit.child.as_mut())
+            .is_some_and(|child| child.try_wait().ok().flatten().is_none()))
+    }
+
+    async fn timestamps(&self, _slot: u32) -> Result<Option<(u64, u64)>, units::Error> {
+        Ok(None)
     }
 }

@@ -466,7 +466,11 @@ package from creating a default cluster.
   `SplitMode=none` and removes the files at the source: journald makes no new per-uid file (lab,
   systemd 257.13: without the file `user-301000.journal` appears with the first line a slot logs,
   readable by uid 301000 and not by an unrelated uid; with it the line is in the system journal). The files
-  made before stay until journald vacuums them by age, and the unit does not see them.
+  made before stay until journald vacuums them by age, and the unit does not see them. The boot test
+  makes a user of its own with the last uid of the agent's database range (299,999; the scratch
+  database's user is a system account, which journald never splits), has it log a line, requires the
+  line in a `system.journal` file and no `user-*.journal` file in either directory, removes the user,
+  and requires the agent's own lines in `journalctl --boot=0`.
   **Scratch space.** `PrivateTmp=yes` made `/tmp` and `/var/tmp` directories on the host's root
   filesystem (8 GiB, no quota), and disk blocks are no memory that `MemoryMax` counts: an awake
   tenant could fill the root filesystem, which stops the journal and the agent's state writes for the
@@ -590,9 +594,11 @@ The agent then binds the database (its limits as unit properties, its volume and
 as mounts moved into the slot's mount namespace, each a clone that maps the slot's user to the
 database's uid on disk), and sends one order, `exec <id> <major>`; the supervisor locks the data
 directory and executes the postgres command line of `pgcf-pg@.service` in place. A slot serves one
-database for one awake period and ends with its stop. The unit file, its tests and the host files
-are done; the supervisor (`apps/pgcf-archive`) and the agent's pool are other packages, so nothing
-starts a slot yet.
+database for one awake period and ends with its stop. The agent's pool (`apps/node-agent/src/units/slots.rs`)
+starts every slot and takes every start of PostgreSQL through one: a wake, a create, a restore, a move
+target, a recovery, and the health check, which has the slot number 1023 to itself. The unit file,
+its tests and the host files are this directory's; the supervisor is `apps/pgcf-archive`, and the
+slot lab (`apps/node-agent/src/units/slot_lab.rs`) runs the pool against the unit.
 
 - **The sandbox is the database unit's, directive by directive (D13).** `units.test.ts` holds three
   tables, each row with its reason, and fails when a directive of `pgcf-pg@.service` is missing
@@ -602,8 +608,9 @@ starts a slot yet.
   group, `ExecStart=` (the supervisor) and the idle limits (`MemoryMax=32M`, `MemoryHigh=28M`,
   `CPUWeight=10`; `MemorySwapMax=0` and `TasksMax=64` as before): the agent sets the database's own
   at the bind and these again when it builds the slot for its next incarnation, because a runtime
-  property outlives a stop, and the 32M is the placeholder that the lab of idle slots (memory and
-  slab of eight of them) replaces. Added: `StartLimitIntervalSec=0` (slot numbers restart all the
+  property outlives a stop. The 32M was a placeholder until the slot lab measured it (plan 11.1): an
+  idle slot holds 0.4 MiB, and 2.4 MiB at most while its unit is built, so the ceiling holds each
+  with room to spare and stays. Added: `StartLimitIntervalSec=0` (slot numbers restart all the
   time, and systemd's limit of five starts in ten seconds would refuse them) and
   `RuntimeDirectory=pgcf/slot/%i` with mode 0700. Everything else is carried, and the tests that
   state the isolation of a database unit (no start process, the system-call filter, `/dev/shm`,

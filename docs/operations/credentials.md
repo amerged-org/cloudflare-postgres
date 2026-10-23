@@ -92,26 +92,65 @@ verified account and compare secret **names**, never print values.
 For `ROUTE_MASTER_KEYS` (`{"active":"<kid>","keys":{"<kid>":"<base64url>"}}`), the API and the Edge
 Worker hold the master keyring and sign with the active key. A node's gateway verifies with the
 keys derived for that node from every master key. The agent reads them from Cloudflare when it
-starts (and again when its desired page names a higher credentials revision, which no API route
-raises today) and writes them to `gateway.env`; a running gateway reads that file only when its
-unit starts. **This rotation has never been exercised, and nothing reports which key IDs a node's
-gateway holds**, so no check tells you beforehand that every gateway has the new key. The only
-restarts of a running gateway are a release that changes the gateway's binary and a reboot that is
-due anyway (a maintenance cycle in its announced window; never a reboot made for this purpose, which
-needs the owner's go and, from the canary on, an announced window, plan 9.3). A gateway restart
-ends every open client session: the gateway stops accepting (its socket is systemd's, so a
+starts and again when its desired page names a higher credentials revision than the one it applied,
+writes them to `gateway.env` and the Tunnel's token to its encrypted credential, and restarts the
+gateway and `cloudflared` when the keyring or the token differs from the one they run on. No
+database stop is ordered. A running gateway reads `gateway.env` only when its unit starts.
+
+**What raises the revision.** The API Worker keeps, per node, a digest of the keyring it derived
+for the node (`nodes.route_keyring_state`, migration `0083`): the SHA-256 of its active key ID, its
+key IDs and its keys, in whatever order the variable lists them. D1 never holds a key. The first
+desired page or credentials read of a node after a deploy that changed the digest records the new
+one and raises the node's `credentials_revision` once, in one statement, so the page and the read
+name the same revision whichever of them sees the change first. While two versions of the Worker
+serve at once, the revision rises again for each change of hands, and each rise can restart the node
+again: deploy a step in one go. The shell's state raises the revision the same way. The Tunnel's
+token is not part of it: a node reads the token with every credentials read, and the agent
+restarts the Tunnel for a token that is not the one it runs on, so a token that changes at
+Cloudflare reaches a node only at its next credentials read (the agent's start, or a revision that
+rose for another reason). A `ROUTE_MASTER_KEYS` that the Worker cannot parse leaves the revision as
+it is and does not refuse the page, which carries the fence and the wakes: every page logs
+`node_keyring_unreadable` and the credentials read fails until the variable is fixed.
+
+Apply migration `0083` (an added column, null for every node) before the Worker that reads it. A
+node records its first digest at its first pull after that deploy and raises nothing, so a keyring
+that changed before it did is not seen as a change by that node: let every node pull once, and read
+that `nodes.route_keyring_state` is set on each, before the first rotation.
+
+To rotate, the keyring reaches the nodes by itself; no release and no reboot is needed:
+
+1. Add the new key beside the old one, the old one still active, and deploy the API and the Edge.
+   At its next pull (a full pull every 60 s) every node reads its credentials and restarts its
+   gateway and `cloudflared`.
+2. Make the new key active and deploy both again. The active key ID is part of the digest, so this
+   is a change too and every node restarts both again. Existing routing tokens expire within 30
+   seconds. Open a fresh connection to a database on every node: a node whose gateway lacks the key
+   refuses it, and making the old key active again, which is still in the keyring, restores it.
+3. Retire the old key from the keyring only after every node passed. This changes the keys, so every
+   node restarts both again.
+
+**What each step costs the clients.** Each of the three steps restarts the gateway and `cloudflared`
+on every node, at the node's next pull after the deploy (at most about a minute). The gateway's
+restart ends every open client session: the gateway stops accepting (its socket is systemd's, so a
 connection that arrives meanwhile waits for the next gateway), closes the idle sessions at once,
-gives a busy one 10 seconds, and clients reconnect. A
-release that changes both the agent and the gateway restarts the gateway before the agent has
-written the new file, so the gateway needs a later release or reboot of its own. To rotate: add the
-new key beside the old one with the old one still active, deploy the API and the Edge, let every
-node's agent start once (a release that changes the agent), let every gateway start afterwards,
-make the new key active and deploy both again. Existing routing tokens expire within 30 seconds.
-After the switch open a fresh connection to a database on every node: a node whose gateway lacks the
-key refuses it, and making the old key active again, which is still in the keyring, restores it.
-Retire the old key from the keyring only after every node passed. Until `credentials_revision` can
-be raised by an API route, treat rotating this key as a planned operation with the owner's go, not
-as routine.
+gives a busy one 10 seconds, and clients reconnect. The socket handover does not cover
+`cloudflared`: while it registers with Cloudflare again, the Edge cannot reach the node and a new
+connection fails. **How long that gap lasts has not been measured.** The owner's go and, from the
+canary on, an announced window apply to each step.
+
+**What is not known.** No route reports which key IDs a node's gateway holds. D1 holds the revision
+it has for the node (`nodes.credentials_revision`), and the node's newest sample
+(`last_sample_json`) carries the revision the node applied (`$.credentials_revision`). A node whose
+sample shows the revision D1 holds has applied the credentials it read at that revision, and the
+`journal` probe ([Looking at a node](recovery.md#looking-at-a-node)) shows the starts of
+`pgcf-gateway` and `pgcf-cloudflared`. An agent that has just started writes the file and starts the
+units but restarts none (it has no earlier keyring to compare with), so a keyring that an agent
+first reads at its start, because it restarted (a release, for example) before it applied the
+change, reaches a gateway that is already running only at that gateway's next start: the fresh
+connection on every node after step 2 is what finds it. This mechanism has not been run on EU1; its
+live acceptance is one real rotation with no database stopped, which records per node and per step
+the revision, the restarts of both units and the gap above (ULTRA plan, S3-07). Until it has passed,
+treat a rotation as a planned operation with the owner's go, not as routine.
 
 For the Edge's Access service token (`ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET`), rotate the
 token's secret in Zero Trust with a grace period; the Client ID stays the same
@@ -159,10 +198,13 @@ A node holds no secret of the image. Its credentials come from the install and f
   (`R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`): one archive prefix of one
   database generation, no delete right, 7 days, renewed after a third of that. Nodes never hold the
   parent key or a bucket-wide key. To replace the parent key, create the new R2 API token (object
-  read and write on the archive buckets), set both Worker secrets and deploy; credentials delivered
+  read and write on the archive bucket), set both Worker secrets and deploy; credentials delivered
   afterwards are signed with the new key. Delete the old token only after the credentials it signed
-  have expired, 7 days after the deploy: deleting it earlier ends the credentials the nodes hold,
-  and archiving fails until they read new ones (`database_archive_failing`).
+  have expired, 7 days after the deploy, or after a forced refresh that every node has read and a
+  base backup, a WAL archive and a restore read on the new key
+  ([the bucket move](operator-installation.md#moving-to-another-archive-bucket), step 11): deleting it
+  earlier ends the credentials the nodes hold, and archiving fails until they read new ones
+  (`database_archive_failing`).
 
 ## Provider and account credentials
 
@@ -178,6 +220,16 @@ Credentials of the retired Kubernetes runtime (the Talos and Kubernetes authorit
 credentials, region agent keys, bucket-wide R2 keys and old Tunnel tokens) are revoked under
 Stage 0 step 4 of the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md).
 Keep every `CREDENTIAL_KEYS` ID that older D1 exports reference.
+
+**Stage 0 rotation record, 2026-10-22.** Deleted that day:
+
+- the two Tunnels of the Kubernetes era, `pgcf-eu-dev` and `pgcf-bootstrap-relay-eu-dev`, which had
+  been down since early October with no connection (their tokens ended with them);
+- the two API Worker secrets that no code reads, `BOOTSTRAP_RELAY_SIGNING_KEYS` and
+  `CONTABO_RESCUE_CONFIGURATION`;
+- the Worker `pgcf-node-source-control-dev`;
+- the proxied DNS record of the retired node, whose Tunnel was gone. Only `pgcf-` records whose
+  Tunnel target was one of the account's own deleted Tunnels were eligible.
 
 Record changed key IDs, dates and successful checks in private custody. Refresh the encrypted
 operator backup and its independent offline copy. Do not record secret values in `PLAN.md`, Git,

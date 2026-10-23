@@ -98,6 +98,9 @@ pub fn encode(property: &Property) -> (&'static str, Value<'static>) {
         Property::IoWriteBandwidthMax(device, value) | Property::IoWriteIopsMax(device, value) => {
             Value::new(vec![(device.clone(), *value)])
         }
+        Property::IoWriteBandwidthMaxNone | Property::IoWriteIopsMaxNone => {
+            Value::new(Vec::<(String, u64)>::new())
+        }
     };
     (property.name(), value)
 }

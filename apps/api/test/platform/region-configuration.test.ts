@@ -40,8 +40,6 @@ it("refuses region creation when the gateway endpoint is missing /pg", async () 
     provider: "contabo",
     provider_region: "test",
     gateway_url: gateway().replace(/\/pg$/, ""),
-    backup_bucket: "test-archive",
-    backup_endpoint_url: `https://${["archive", "invalid"].join(".")}`,
   });
   try {
     expect(response.status).toBe(400);
@@ -62,8 +60,6 @@ it("repairs legacy routing through the admin API while preserving unrelated conf
         provider: "contabo",
         provider_region: "test",
         gateway_url: gateway(),
-        backup_bucket: "test-archive",
-        backup_endpoint_url: `https://${["archive", "invalid"].join(".")}`,
       })
     ).status,
   ).toBe(201);
@@ -212,7 +208,7 @@ it("requires administrator scope for reads and writes and prevents protected-fie
     (
       await request(path(state.region), state.admin, "PUT", {
         ...update(before),
-        backup_bucket: "replacement",
+        backup_endpoint_url: `https://${["replacement", "invalid"].join(".")}`,
       })
     ).status,
   ).toBe(400);

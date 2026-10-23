@@ -25,8 +25,8 @@ that completes once the agent can fetch again.
 `pgcf-archive slot <n>` is the same binary in a second role (a separate binary would change the
 signed release's set of files): the supervisor that waits in the idle PostgreSQL sandbox
 `pgcf-slot@<n>.service` as the slot's own user, with no capability, until the node agent orders
-the start of one database (the slot pool of ULTRA plan 3.1; the slot unit and the agent's side are
-separate changes, so nothing starts this mode yet). It listens on `$RUNTIME_DIRECTORY/control`,
+the start of one database (the slot pool of ULTRA plan 3.1; the node agent's pool starts it, in
+`apps/node-agent/src/units/slots.rs`). It listens on `$RUNTIME_DIRECTORY/control`,
 reports `READY=1` to systemd, and answers only a peer whose uid is 0, one line per connection:
 
 | Line | Answer |

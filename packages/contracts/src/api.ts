@@ -221,8 +221,6 @@ const RegionFields = {
     .string()
     .regex(/^[A-Z][A-Z0-9_]{0,63}$/)
     .nullable(),
-  backup_bucket: BucketName,
-  backup_endpoint_url: HttpsUrl,
 };
 
 /** Admin view. `agent_last_seen_at` is the newest link message of any node of the region. */

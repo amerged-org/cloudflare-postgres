@@ -400,13 +400,16 @@ pgcf -i -X DELETE "$PGCF_API/v1/databases/<database-id>/roles/report_a1b2c3" \
 
 `POST /v1/databases/{id}/suspend` is a **manual** suspension: connections are refused with `57P03`
 until `POST /v1/databases/{id}/resume`. A connection never wakes a manually suspended database.
-The database must be `ready` (`409 "Database configuration is not ready"` otherwise). The node
+The database must be `ready`, or an idle sleeper that is already `hibernated` with a verified
+sleep (`409 "Database configuration is not ready"` otherwise, for example while a wake is in
+flight). An idle sleeper is claimed at once: it needs no node action, its `suspension_reason`
+becomes `manual`, and a connection no longer wakes it. For a `ready` database the node
 runs the sleep proof: it stops new work, closes idle sessions, checkpoints, switches the WAL
 segment, waits until every committed segment is in R2 and only then stops PostgreSQL; the volume
 stays mounted. If sessions are busy, a prepared transaction exists or the
 archive does not drain, the operation fails with `power_busy` or `power_archive` and the database
-keeps running: drain your pools first. Suspending an already suspended database returns its
-existing operation.
+keeps running: drain your pools first. Suspending a database that is already manually suspended returns
+its existing operation.
 
 `resume` also works as a **pre-wake** of an idle-hibernated database: it is the supported way to
 wake before traffic (poll the operation, then run `SELECT 1`). When the node cannot take the

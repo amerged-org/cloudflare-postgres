@@ -106,7 +106,7 @@ impl Restorer<'_> {
     pub async fn run<H: Host>(&self, order: &Order<'_>, host: &H) -> Result<Backup, &'static str> {
         let result = self.build(order, host).await;
         if result.is_err() {
-            self.table.remove(order.uid);
+            self.table.remove(&order.database.id);
             host.abandon().await;
         }
         result
@@ -171,7 +171,6 @@ impl Restorer<'_> {
         let spool = recovery::spool_directory(&database.volume, order.operation);
         let registration = |recovery| Registration {
             database: database.clone(),
-            uid: order.uid,
             store: order.store.clone(),
             recovery,
             upload_log: order.upload_log.clone(),

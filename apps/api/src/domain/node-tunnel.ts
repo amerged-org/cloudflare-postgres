@@ -66,15 +66,6 @@ export async function cnameRecord(
   )[0];
 }
 
-/** The Cloudflare account of a region: the one its R2 endpoint names. */
-export function accountOf(endpoint: string): string | null {
-  try {
-    return /^([0-9a-f]{32})\./.exec(new URL(endpoint).host)?.[1] ?? null;
-  } catch {
-    return null;
-  }
-}
-
 export interface NodeTunnelServices {
   token: string;
   /** The Cloudflare account that holds the Tunnel. */

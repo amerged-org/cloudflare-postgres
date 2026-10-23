@@ -4,12 +4,13 @@
 //! the journal's monotonic timestamps leave this module: a message is matched, never kept.
 use std::io;
 
-/// The gaps between the handoff to the postmaster and the three messages of its start, in
+/// The gaps between the order to the postmaster and the three messages of its start, in
 /// microseconds of the journal's receive times.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Startup {
-    /// The handoff, when systemd-executor was about to execute postgres, to `starting PostgreSQL`.
-    pub handoff_to_starting_us: u64,
+    /// The order, when the agent told the slot's supervisor to execute postgres, to
+    /// `starting PostgreSQL`.
+    pub order_to_starting_us: u64,
     /// `starting PostgreSQL` to `database system was shut down at`.
     pub starting_to_shut_down_us: u64,
     /// `database system was shut down at` to `database system is ready to accept connections`.
@@ -24,11 +25,10 @@ const MARKS: [&str; 3] = [
 ];
 
 /// The three gaps of the start in `journal`, the lines of `journalctl -o json` for one invocation,
-/// when systemd handed the unit over to the postmaster at `handoff_us`
-/// (`ExecMainHandoffTimestampMonotonic`: the executor's sandbox is set up, the execve is next).
-/// `None` when a message is missing, as after a crash, which writes no `shut down at` line, or
-/// when the messages are not in this order after the handoff.
-pub fn startup(journal: &str, handoff_us: u64) -> Option<Startup> {
+/// when the agent gave the order to execute postgres at `order_us` (`CLOCK_MONOTONIC`, as the
+/// journal's times are). `None` when a message is missing, as after a crash, which writes no
+/// `shut down at` line, or when the messages are not in this order after the order.
+pub fn startup(journal: &str, order_us: u64) -> Option<Startup> {
     let mut marks = [None; 3];
     for line in journal.lines() {
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -50,7 +50,7 @@ pub fn startup(journal: &str, handoff_us: u64) -> Option<Startup> {
     }
     let [starting, shut_down, ready] = marks;
     Some(Startup {
-        handoff_to_starting_us: starting?.checked_sub(handoff_us)?,
+        order_to_starting_us: starting?.checked_sub(order_us)?,
         starting_to_shut_down_us: shut_down?.checked_sub(starting?)?,
         shut_down_to_ready_us: ready?.checked_sub(shut_down?)?,
     })
@@ -99,7 +99,7 @@ mod tests {
         assert_eq!(
             startup(CLEAN, CLEAN_HANDOFF_US),
             Some(Startup {
-                handoff_to_starting_us: 12_840,
+                order_to_starting_us: 12_840,
                 starting_to_shut_down_us: 1_605,
                 shut_down_to_ready_us: 1_522,
             })

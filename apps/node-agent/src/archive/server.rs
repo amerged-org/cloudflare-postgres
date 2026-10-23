@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The archive socket (plan 7.5, 7.8). PostgreSQL's `archive_command` and `restore_command` reach
-//! it from inside the database's sandbox. The agent knows the caller by the uid the kernel reports
-//! for the connection, runs barman-cloud as that database's user, and answers `ok` to an archive
-//! request only when the object is durably in R2 and the segment is in the fsynced upload log.
-//! Anything else is `failed`, and PostgreSQL retries. The agent never deletes in R2.
+//! it from inside the database's sandbox. The agent knows the caller by what the kernel reports
+//! for the connection (its uid and its process) and what the machine says of who holds that uid
+//! (`Callers`): a slot's uid is a database's only while the slot holds it, and only for a process in
+//! the slot's cgroup and invocation. It runs barman-cloud as that database's user, and answers `ok`
+//! to an archive request only when the object is durably in R2 and the segment is in the fsynced
+//! upload log. Anything else is `failed`, and PostgreSQL retries. The agent never deletes in R2.
 use super::{
     job::{Busy, Database, Exit, Job, Jobs, Outcome, Store, WAL_PREFETCH},
     protocol::{AGENT_BOUND, MAX_LINE_BYTES, Reply, Request, is_segment},
@@ -54,12 +56,22 @@ impl Recovery {
     }
 }
 
+/// Who a caller of the archive socket runs for.
+pub trait Callers: Send + Sync + 'static {
+    /// The database that the process `pid` of uid `uid` speaks for; `None` for a uid that holds
+    /// no database now, and for a process that is not where that database's holder runs.
+    fn database_of(&self, uid: u32, pid: u32) -> Option<String>;
+}
+impl<M: crate::machine::Machine> Callers for M {
+    fn database_of(&self, uid: u32, pid: u32) -> Option<String> {
+        self.caller(uid, pid)
+    }
+}
+
 /// What the agent knows of one database for its archive calls.
 #[derive(Clone, Debug)]
 pub struct Registration {
     pub database: Database,
-    /// The uid the kernel reports for the database's processes.
-    pub uid: u32,
     /// The database's own archive.
     pub store: Store,
     pub recovery: Option<Recovery>,
@@ -70,18 +82,18 @@ struct Entry {
     registration: Registration,
     /// Held for the length of a call: a database has one at a time (plan 7.5 step 6). PostgreSQL's
     /// archiver and recovery ask one after the other, so a second call is a client that gave up
-    /// on the first, or a process of the database's uid that wants the node's slots.
+    /// on the first, or a process of the database that wants the node's slots.
     serial: tokio::sync::Mutex<()>,
     /// When the current run of failed archive calls began (Unix milliseconds).
     failing_since_ms: Mutex<Option<i64>>,
 }
-/// The registered databases by uid; the agent keeps it as the desired page says.
+/// The registered databases by ID; the agent keeps it as the desired page says.
 #[derive(Default)]
 pub struct Table {
-    entries: RwLock<HashMap<u32, Arc<Entry>>>,
+    entries: RwLock<HashMap<String, Arc<Entry>>>,
 }
 impl Table {
-    /// Registers a database, replacing an earlier registration of the same uid.
+    /// Registers a database, replacing an earlier registration of it.
     pub fn set(&self, registration: Registration) {
         let entry = Arc::new(Entry {
             registration,
@@ -91,18 +103,22 @@ impl Table {
         self.entries
             .write()
             .expect("table lock")
-            .insert(entry.registration.uid, entry);
+            .insert(entry.registration.database.id.clone(), entry);
     }
-    pub fn remove(&self, uid: u32) {
-        self.entries.write().expect("table lock").remove(&uid);
+    pub fn remove(&self, database: &str) {
+        self.entries.write().expect("table lock").remove(database);
     }
-    fn get(&self, uid: u32) -> Option<Arc<Entry>> {
-        self.entries.read().expect("table lock").get(&uid).cloned()
+    fn get(&self, database: &str) -> Option<Arc<Entry>> {
+        self.entries
+            .read()
+            .expect("table lock")
+            .get(database)
+            .cloned()
     }
-    /// Whether `uid` archives into `store` with `upload_log`, out of recovery: registered as that
-    /// already, which a registration again would only start anew.
-    pub fn archives(&self, uid: u32, store: &Store, upload_log: &UploadLog) -> bool {
-        self.get(uid).is_some_and(|entry| {
+    /// Whether `database` archives into `store` with `upload_log`, out of recovery: registered as
+    /// that already, which a registration again would only start anew.
+    pub fn archives(&self, database: &str, store: &Store, upload_log: &UploadLog) -> bool {
+        self.get(database).is_some_and(|entry| {
             let registration = &entry.registration;
             registration.recovery.is_none()
                 && registration.store == *store
@@ -124,11 +140,12 @@ pub struct Server {
     table: Arc<Table>,
     jobs: Arc<Jobs>,
     credentials: Arc<Credentials>,
+    callers: Arc<dyn Callers>,
     bound: Duration,
 }
 
 /// Binds the archive socket, replacing the socket of an agent that is gone. Any local user may
-/// connect: the kernel's report of the caller's uid decides what a connection may do.
+/// connect: the kernel's report of the caller decides what a connection may do.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     if let Some(parent) = path.parent() {
@@ -151,11 +168,17 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 }
 
 impl Server {
-    pub fn new(table: Arc<Table>, jobs: Arc<Jobs>, credentials: Arc<Credentials>) -> Self {
+    pub fn new(
+        table: Arc<Table>,
+        jobs: Arc<Jobs>,
+        credentials: Arc<Credentials>,
+        callers: Arc<dyn Callers>,
+    ) -> Self {
         Self {
             table,
             jobs,
             credentials,
+            callers,
             bound: AGENT_BOUND,
         }
     }
@@ -178,7 +201,16 @@ impl Server {
     }
     async fn handle(&self, mut stream: UnixStream) {
         let reply = match (stream.peer_cred(), read_line(&mut stream).await) {
-            (Ok(peer), Some(line)) => self.answer(peer.uid(), &line).await,
+            (Ok(peer), Some(line)) => {
+                let caller = peer
+                    .pid()
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .and_then(|pid| self.callers.database_of(peer.uid(), pid));
+                match caller {
+                    Some(database) => self.answer(&database, &line).await,
+                    None => Reply::Failed(Some("peer_unknown")),
+                }
+            }
             (Err(_), _) => Reply::Failed(Some("peer_unknown")),
             (_, None) => Reply::Failed(Some("bad_request")),
         };
@@ -188,9 +220,9 @@ impl Server {
         })
         .await;
     }
-    async fn answer(&self, uid: u32, line: &[u8]) -> Reply {
+    async fn answer(&self, database: &str, line: &[u8]) -> Reply {
         let deadline = Instant::now() + self.bound;
-        let Some(entry) = self.table.get(uid) else {
+        let Some(entry) = self.table.get(database) else {
             return Reply::Failed(Some("unknown_database"));
         };
         let Ok(request) = Request::decode(line) else {
@@ -436,7 +468,8 @@ mod tests {
     use super::*;
     use crate::{
         archive::test_support::{
-            ARCHIVE, Node, SEGMENT, SEGMENT_BYTES, SOURCE, credential, directory, now, store,
+            ARCHIVE, DATABASE, Node, SEGMENT, SEGMENT_BYTES, SOURCE, TestCallers, credential,
+            directory, now, store,
         },
         credentials::{Access, Credential},
     };
@@ -530,7 +563,7 @@ mod tests {
         let neighbour_store = store(neighbour_archive, Access::ReadWrite);
         node.credentials
             .hold(neighbour_store.scope.clone(), credential());
-        let neighbour_uid = node.uid + 1;
+        let neighbour = "zyxwvutsrqponmlkjihg";
         node.table.set(Registration {
             database: Database {
                 id: "zyxwvutsrqponmlkjihg".into(),
@@ -539,7 +572,6 @@ mod tests {
                 device: "/dev/mapper/pgcf-db_zyxwvutsrqponmlkjihg_g1".into(),
                 socket_directory: neighbour_volume.join("socket"),
             },
-            uid: neighbour_uid,
             store: neighbour_store,
             recovery: None,
             upload_log: UploadLog::new(neighbour_volume.join("uploads")),
@@ -553,25 +585,33 @@ mod tests {
             node.fixture.runner().with_grace(Duration::ZERO),
             Limits::default(),
         ));
-        let server = Server::new(node.table.clone(), jobs, node.credentials.clone());
+        let server = Server::new(
+            node.table.clone(),
+            jobs,
+            node.credentials.clone(),
+            Arc::new(TestCallers(node.uid)),
+        );
         node.fixture.set("delay", "1");
-        let archive = async |uid: u32, name: String| {
+        let archive = async |database: &str, name: String| {
             server
-                .answer(uid, format!("pgcf-archive/1 archive {name}").as_bytes())
+                .answer(
+                    database,
+                    format!("pgcf-archive/1 archive {name}").as_bytes(),
+                )
                 .await
         };
-        let first = archive(node.uid, SEGMENT.into());
+        let first = archive(DATABASE, SEGMENT.into());
         let others = async {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let started = std::time::Instant::now();
             // More calls of the same database, from any connection, are refused at once ...
             let again = futures_util::future::join_all(
-                (2..5).map(|n| archive(node.uid, format!("00000001000000000000000{n}"))),
+                (2..5).map(|n| archive(DATABASE, format!("00000001000000000000000{n}"))),
             )
             .await;
             let refused_in = started.elapsed();
             // ... and take no slot from the database next to it.
-            let neighbour = archive(neighbour_uid, SEGMENT.into()).await;
+            let neighbour = archive(neighbour, SEGMENT.into()).await;
             (again, refused_in, neighbour)
         };
         let (first, (again, refused_in, neighbour)) = tokio::join!(first, others);
@@ -585,7 +625,7 @@ mod tests {
         assert_eq!(node.log().entries().unwrap(), [SEGMENT]);
         // Once the call is over the database can ask again.
         assert_eq!(
-            archive(node.uid, "000000010000000000000002".into()).await,
+            archive(DATABASE, "000000010000000000000002".into()).await,
             Reply::Ok
         );
     }
@@ -604,9 +644,41 @@ mod tests {
         );
         let long = format!("pgcf-archive/1 archive {}\n", "0".repeat(300));
         assert_eq!(node.ask(&long).await, "failed bad_request\n");
-        node.table.remove(node.uid);
+        node.table.remove(DATABASE);
         assert_eq!(node.archive(SEGMENT).await, "failed unknown_database\n");
         assert_eq!(node.fixture.key_id(), None);
+    }
+
+    /// A caller that holds no database now (a slot's uid before its bind or after its stop, or a
+    /// process outside the holder's cgroup) is told so, whatever it asks, and starts no job.
+    #[tokio::test]
+    async fn a_caller_that_holds_no_database_is_unknown_and_starts_no_job() {
+        let node = Node::start("peer-unknown", AGENT_BOUND).await;
+        let jobs = Arc::new(Jobs::new(
+            node.fixture.runner().with_grace(Duration::ZERO),
+            crate::archive::job::Limits::default(),
+        ));
+        // The machine knows no caller of this uid.
+        let server = Arc::new(Server::new(
+            node.table.clone(),
+            jobs,
+            node.credentials.clone(),
+            Arc::new(TestCallers(node.uid.wrapping_add(1))),
+        ));
+        let (near, mut far) = tokio::net::UnixStream::pair().unwrap();
+        let handling = tokio::spawn({
+            let server = server.clone();
+            async move { server.handle(near).await }
+        });
+        far.write_all(format!("pgcf-archive/1 archive {SEGMENT}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        far.read_to_string(&mut answer).await.unwrap();
+        handling.await.unwrap();
+        assert_eq!(answer, "failed peer_unknown\n");
+        assert_eq!(node.fixture.key_id(), None, "no job ran");
+        assert!(node.log().entries().unwrap().is_empty());
     }
 
     #[tokio::test]

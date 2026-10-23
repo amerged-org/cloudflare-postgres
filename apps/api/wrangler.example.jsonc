@@ -17,15 +17,15 @@
       "migrations_dir": "migrations",
     },
   ],
+  // One R2 bucket for every region: the backups and WAL of all databases, the node image releases
+  // and the infrastructure backups. Name it without a region. ARCHIVE_BUCKET_NAME below names the
+  // same bucket, ARCHIVE_ENDPOINT_URL its S3 endpoint, and the archive paths in D1 and the nodes'
+  // temporary credentials name them too.
   "r2_buckets": [
     {
       "binding": "ARCHIVE",
       "bucket_name": "replace-r2-backup-bucket",
       "jurisdiction": "eu",
-    },
-    {
-      "binding": "ARCHIVE_US",
-      "bucket_name": "replace-r2-us-backup-bucket",
     },
   ],
   // Optional authenticated alert receiver; direct Resend also supports API-configured sender/recipient.
@@ -63,7 +63,6 @@
     // With Workers Logs on, each visit may also be one billed invocation log event: the same page
     // says how to check it and how to turn it off ("observability.logs.invocation_logs": false).
     "DATABASE_ACTOR_WARM_INTERVAL_MS": "8000",
-    "ARCHIVE_BINDINGS": "{\"<EU_REGION_ID>\":{\"binding\":\"ARCHIVE\",\"bucket\":\"replace-r2-backup-bucket\"},\"<US_REGION_ID>\":{\"binding\":\"ARCHIVE_US\",\"bucket\":\"replace-r2-us-backup-bucket\"}}",
     // The id of the Contabo firewall every node sits behind: active, created once with no inbound
     // rule, as docs/operations/operator-installation.md describes. AddNode sends the installer's
     // rescue only once the firewall lists the instance.
@@ -71,7 +70,12 @@
     "CONTABO_ORDER_DEFAULT_USER": "<CONTABO_ORDER_DEFAULT_USER>",
     "CONTABO_ORDER_SSH_KEY_IDS": "<CONTABO_ORDER_SSH_KEY_IDS_JSON>",
     "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>",
+    // The name of the bucket the ARCHIVE binding is bound to.
     "ARCHIVE_BUCKET_NAME": "replace-r2-backup-bucket",
+    // The S3 endpoint of that bucket, the same for every region: the nodes' temporary credentials
+    // name it, and its account is the one that holds the nodes' Tunnels. A bucket of the EU
+    // jurisdiction (the binding's "jurisdiction": "eu") is served only at the ".eu." host.
+    "ARCHIVE_ENDPOINT_URL": "https://<CLOUDFLARE_ACCOUNT_ID>.eu.r2.cloudflarestorage.com",
   },
   "durable_objects": {
     "bindings": [

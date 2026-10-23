@@ -27,6 +27,18 @@ use zbus::proxy::CacheProperties;
 
 const BIN: &str = "/usr/lib/postgresql/18/bin";
 
+impl Units {
+    /// Starts a database's unit of its own (`pgcf-pg@`), which only an agent of an earlier release
+    /// did: the agent starts slots now and adopts the units of its own that it finds running
+    /// (`wait_started`). The lab keeps starting them, to test what it still does with them. A unit
+    /// that does not run but whose cgroup holds a process is not started (`StrayProcesses`).
+    pub(crate) async fn start(&self, database: &str) -> Result<super::Started, Error> {
+        let unit = Self::unit_of(database)?;
+        let requested = self.start_job(&unit).await?;
+        self.started(database, requested).await
+    }
+}
+
 fn run(program: &str, args: &[&str]) {
     let output = Command::new(program).args(args).output().unwrap();
     assert!(
@@ -445,7 +457,7 @@ async fn a_start_has_a_timeline_of_the_fork_the_handoff_and_the_journals_three_m
         .startup
         .expect("the three messages of the start, the first after the handoff");
     for gap in [
-        startup.handoff_to_starting_us,
+        startup.order_to_starting_us,
         startup.starting_to_shut_down_us,
         startup.shut_down_to_ready_us,
     ] {
@@ -593,7 +605,7 @@ async fn a_start_that_fails_names_the_jobs_result() {
 
 /// Whether a database's unit has a cgroup that holds a process.
 fn cgroup_populated(database: &str) -> bool {
-    fs::read_to_string(super::cgroup_events_path(database).unwrap())
+    fs::read_to_string(super::unit_cgroup_events(&super::unit_name(database)))
         .is_ok_and(|events| super::populated(&events))
 }
 
@@ -619,7 +631,7 @@ impl Drop for Frozen {
 
 /// The processes in a database's unit cgroup.
 fn cgroup_processes(database: &str) -> Vec<u32> {
-    let events = super::cgroup_events_path(database).unwrap();
+    let events = super::unit_cgroup_events(&super::unit_name(database));
     fs::read_to_string(events.with_file_name("cgroup.procs"))
         .unwrap_or_default()
         .split_whitespace()
@@ -700,6 +712,9 @@ async fn a_start_is_refused_while_the_unit_stops_over_a_process_no_signal_ends()
     assert_eq!(state.active, ActiveState::Deactivating);
     assert_eq!(state.main_pid, None);
     assert!(cgroup_populated(id));
+    // The unit holds its database for a slot's bind (`Units::holds_database`, which the pool asks
+    // about the unit of its own before it binds).
+    assert!(units.holds_database(id).await.unwrap(), "deactivating");
     // Without the refusal the start waits for the stop to end and runs over the process, so it
     // does not answer within these seconds.
     let refused = tokio::time::timeout(Duration::from_secs(2), units.start(id)).await;
@@ -718,6 +733,14 @@ async fn a_start_is_refused_while_the_unit_stops_over_a_process_no_signal_ends()
     let failed = units.state(id).await.unwrap();
     assert_eq!(failed.active, ActiveState::Failed);
     assert!(cgroup_populated(id), "the process is still in the cgroup");
+    // Failed and not awake, with the process of the postmaster's earlier start still in the
+    // cgroup: it holds the database all the same. It never took a slot's lock, and PostgreSQL's
+    // own guard does not see it across users and IPC namespaces, so a bind beside it would run a
+    // second postmaster on the data directory.
+    assert!(
+        units.holds_database(id).await.unwrap(),
+        "failed with a process left in its cgroup"
+    );
     let refused = within(units.start(id)).await.unwrap_err();
     assert!(matches!(refused, Error::StrayProcesses), "{refused:?}");
     let after = units.state(id).await.unwrap();
@@ -746,6 +769,10 @@ async fn a_start_is_refused_while_the_unit_stops_over_a_process_no_signal_ends()
         same_unit(second)
     );
     within(units.stop(id)).await.unwrap();
+    assert!(
+        !units.holds_database(id).await.unwrap(),
+        "stopped, with no process left: nothing is held"
+    );
     let _ = client.kill();
     let _ = client.wait();
 }

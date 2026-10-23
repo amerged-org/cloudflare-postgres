@@ -78,7 +78,7 @@ fn storage_code(error: &crate::storage::Error) -> String {
 /// read's is an `FDO` error, and both are named the same), the result of a job, why PostgreSQL was
 /// not ready, or the kind of failure. `units_bus` is a bus error with no name of its own: a
 /// connection that broke, an I/O failure, a reply the agent could not read.
-fn units_code(error: &crate::units::Error) -> String {
+pub(crate) fn units_code(error: &crate::units::Error) -> String {
     use crate::units::Error;
     match error {
         Error::Bus(zbus::Error::MethodError(name, ..)) => bus_code(name.as_str()),
@@ -87,6 +87,8 @@ fn units_code(error: &crate::units::Error) -> String {
         }
         Error::Job { result, .. } => format!("job_{}", slug(result)),
         Error::NotReady(reason) => format!("not_ready_{}", slug(reason)),
+        Error::Refused(word) => format!("refused_{}", slug(word)),
+        Error::Io(error) => io_code(error),
         other => format!("units_{}", variant(other)),
     }
 }

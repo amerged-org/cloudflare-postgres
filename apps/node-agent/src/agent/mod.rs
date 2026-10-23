@@ -14,6 +14,7 @@ pub mod check;
 mod entry;
 mod metering;
 mod power;
+mod readahead;
 #[cfg(test)]
 mod real_gateway;
 pub(crate) mod report;
@@ -21,6 +22,7 @@ pub(crate) mod report;
 pub(crate) mod testing;
 
 pub use entry::{Desired, Entry, Origin, Policy, Source};
+pub use readahead::{PREFETCH, Prefetch};
 
 use crate::{
     admission::{Admission, Admitter, Facts, Permit, Running},
@@ -122,6 +124,8 @@ pub struct Parts<M: Machine> {
     /// The policy of the first page.
     pub policy: Policy,
     pub timing: Timing,
+    /// What the agent reads ahead for a wake: the variant of the build (`PREFETCH`).
+    pub prefetch: Prefetch,
 }
 
 /// Where a database stands on the node.
@@ -327,6 +331,7 @@ pub struct Core<M: Machine> {
     pub(crate) gateway: Arc<Feed>,
     pub(crate) fences: Fences,
     pub(crate) timing: Timing,
+    pub(crate) prefetch: Prefetch,
     pub(crate) policy: Arc<RwLock<Policy>>,
     /// A maintenance order is open: new wakes are held with 57P03 (plan 9.3).
     pub(crate) maintenance: AtomicBool,
@@ -350,6 +355,8 @@ pub struct Core<M: Machine> {
     meter: Meter,
     /// Something in `reports` changed.
     pub(crate) changed: Notify,
+    /// A start took a slot or ended: the pool may want another idle one (`refill_pass`).
+    pub(crate) refill: Notify,
     /// The maintenance orders whose databases all sleep with their proofs: the packages and the
     /// check follow, which the service does, since it reaches the files.
     slept: Mutex<Vec<String>>,
@@ -399,6 +406,7 @@ impl<M: Machine> Core<M> {
             gateway: parts.gateway,
             fences: parts.fences,
             timing: parts.timing,
+            prefetch: parts.prefetch,
             policy,
             maintenance: AtomicBool::new(false),
             taken: Mutex::new(std::collections::HashSet::new()),
@@ -415,6 +423,7 @@ impl<M: Machine> Core<M> {
             reports: Mutex::new(report::Reports::default()),
             meter: Meter::load(layout.agent().join("usage.json")),
             changed: Notify::new(),
+            refill: Notify::new(),
             slept: Mutex::new(Vec::new()),
             slept_signal: Notify::new(),
         });

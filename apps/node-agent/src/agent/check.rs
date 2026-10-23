@@ -8,7 +8,9 @@
 //! The scratch database belongs to no page, so nothing of Cloudflare's reaches it: it has no
 //! archive, no roles and no admission, and it is not the agent's to place, wake or delete. Its
 //! user is a system account of the system's own range, so the agent's table of uids is never
-//! written by a second process.
+//! written by a second process. It starts as every database does, in a slot, but in the slot
+//! the check alone has (`slots::CHECK_SLOT`): it never takes an idle slot of the agent's pool and
+//! never finds one, and a check that was killed leaves a slot that the next one adopts.
 use super::build::write_owned;
 use crate::{
     Error,
@@ -16,6 +18,7 @@ use crate::{
     postgres, settings,
     settings::Settings,
     storage::{self, VolumeId},
+    units::{limits::Limits, slots::Bind},
 };
 use std::time::Duration;
 
@@ -25,6 +28,7 @@ pub const SCRATCH: &str = "pgcfcheckscratch0000";
 const VOLUME_BYTES: u64 = 1 << 30;
 const MEMORY_MIB: u64 = 256;
 const MAX_CONNECTIONS: u32 = 10;
+const TASKS_MAX: u64 = 64;
 const ARCHIVE_TIMEOUT_SECONDS: u32 = 60;
 
 /// What a check found.
@@ -32,8 +36,10 @@ const ARCHIVE_TIMEOUT_SECONDS: u32 = 60;
 pub struct Checked {
     /// Whether this call made the scratch database; later calls wake it.
     pub created: bool,
-    /// The uid the postmaster ran as, which is the database's own user.
+    /// The uid the postmaster ran as, which is its slot's.
     pub uid: u32,
+    /// The slot it ran in: the one the check has to itself.
+    pub slot: Option<u32>,
 }
 
 /// The room rule for the scratch volume: the pool takes it while it takes writes at all.
@@ -51,7 +57,8 @@ pub async fn run<M: Machine>(machine: &M, account: &Account) -> Result<Checked, 
     let volume = VolumeId::new(SCRATCH, 1)?;
     let layout = machine.layout();
     let data = layout.data(SCRATCH);
-    // A call that was killed left the unit running; the files are rewritten only while it is down.
+    // A call that was killed left its slot running; the files are rewritten only while it is down.
+    machine.adopt_slots().await?;
     machine.stop(SCRATCH).await?;
     machine.poll_pool().await?;
     // Finishes what an earlier call left: it makes the volume and its filesystem, or only mounts it.
@@ -83,9 +90,9 @@ pub async fn run<M: Machine>(machine: &M, account: &Account) -> Result<Checked, 
     machine.prepare_socket_directory(SCRATCH, account)?;
     let answered = answer(machine, account, &data).await;
     let stopped = machine.stop(SCRATCH).await;
-    let uid = answered?;
+    let (uid, slot) = answered?;
     stopped?;
-    Ok(Checked { created, uid })
+    Ok(Checked { created, uid, slot })
 }
 
 /// Starts the unit and asks it: the postmaster runs as the database's user on the volume's data
@@ -94,10 +101,28 @@ async fn answer<M: Machine>(
     machine: &M,
     account: &Account,
     data: &std::path::Path,
-) -> Result<u32, Error> {
-    let started = machine.start(SCRATCH).await?;
-    if started.uid != account.uid {
-        return Err("the scratch database runs as another user".into());
+) -> Result<(u32, Option<u32>), Error> {
+    let volume = VolumeId::new(SCRATCH, 1)?;
+    let bind = Bind {
+        device: machine.device(&volume).into(),
+        data: machine.layout().data(SCRATCH),
+        properties: Limits {
+            memory_mib: MEMORY_MIB,
+            cpu_millicores: 1000,
+            tasks_max: TASKS_MAX,
+            io: None,
+        }
+        .properties(),
+        volume,
+        account: account.clone(),
+    };
+    // The check's slot is built like the pool's, here and not in the bind: its user is made by the
+    // refill, never by a start.
+    machine.refill_slot(1).await?;
+    let bound = machine.bind(SCRATCH, &bind).await?;
+    let started = machine.exec(&bound).await?;
+    if started.slot.is_none() {
+        return Err("the scratch database did not start in a slot".into());
     }
     let session = postgres::agent(&machine.layout().socket_directory(SCRATCH)).await?;
     let rows = session
@@ -114,7 +139,7 @@ async fn answer<M: Machine>(
     if std::fs::canonicalize(&reported)? != std::fs::canonicalize(data)? {
         return Err("the scratch database runs on another directory than its volume".into());
     }
-    Ok(started.uid)
+    Ok((started.uid, started.slot.map(|report| report.slot)))
 }
 
 #[cfg(test)]
@@ -146,6 +171,24 @@ mod tests {
         assert!(!machine.running(SCRATCH));
         assert_eq!(identity(&machine), made, "the same cluster, not a new one");
         assert_eq!(machine.volumes().len(), 1);
+    }
+
+    /// The check starts the scratch database as every database starts, in a slot, but in the one
+    /// that is its own: the process of `pgcf-agent check` has no other, so it can neither take an
+    /// idle slot of the agent's pool nor leave one behind.
+    #[tokio::test]
+    async fn the_check_runs_in_the_slot_of_its_own_and_no_other() {
+        let Some(machine) = Local::for_check("check-slot") else {
+            return;
+        };
+        let account = machine.ensure_account(SCRATCH).await.unwrap();
+        let checked = run(&machine, &account).await.unwrap();
+        assert_eq!(checked.slot, Some(crate::units::slots::CHECK_SLOT));
+        assert_eq!(
+            machine.slots(),
+            crate::units::slots::Snapshot::default(),
+            "the slot is free again"
+        );
     }
 
     #[tokio::test]

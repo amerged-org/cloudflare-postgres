@@ -7,12 +7,23 @@ const directory = new URL("../../../apps/api/migrations/", import.meta.url);
 const migrations = readdirSync(directory)
   .filter((name) => name.endsWith(".sql"))
   .sort();
-const MIGRATION = "0084_unreserved_role_names.sql";
+const MIGRATION = "0085_unreserved_role_names.sql";
+const plan = readFileSync(
+  new URL(
+    "../../../docs/architecture/cloudflare-convergence-and-serverless-plan.md",
+    import.meta.url,
+  ),
+  "utf8",
+);
+/** The statements the plan's step (0) and the migration's header give the operator, character for character. */
+const NAMES = "('pgcf_backup','public','none')";
+const CHECK = `SELECT database_id, name FROM roles WHERE name IN ${NAMES} OR EXISTS (SELECT 1 FROM json_each(member_of_json) WHERE value IN ${NAMES})`;
+const STRIP = `UPDATE roles SET member_of_json = (SELECT json_group_array(value) FROM json_each(member_of_json) WHERE value NOT IN ${NAMES}) WHERE EXISTS (SELECT 1 FROM json_each(member_of_json) WHERE value IN ${NAMES})`;
+const REMOVE = `DELETE FROM roles WHERE name IN ${NAMES}`;
 const NOW = "2026-10-22T10:00:00.000Z";
 const project = `prj_${"a".repeat(20)}`;
 const database = `a${"1".repeat(19)}`;
 const gateway = `https://${["gateway", "example", "com"].join(".")}`;
-const endpoint = `https://${["r2", "example", "com"].join(".")}`;
 let db: DatabaseSync;
 
 /** D1 applies a migration as one transaction. */
@@ -70,10 +81,9 @@ beforeEach(() => {
     NOW,
   );
   run(
-    `INSERT INTO regions(id,provider,provider_region,gateway_url,backup_bucket,backup_endpoint_url,created_at,updated_at)
-     VALUES('eu-a','contabo','EU',?,'pgcf-test',?,?,?)`,
+    `INSERT INTO regions(id,provider,provider_region,gateway_url,created_at,updated_at)
+     VALUES('eu-a','contabo','EU',?,?,?)`,
     gateway,
-    endpoint,
     NOW,
     NOW,
   );
@@ -210,4 +220,86 @@ it("keeps the primary key, one owner per database, the database reference and th
       )
       .all(),
   ).toHaveLength(1);
+});
+
+// The old API lets a role name any live role but the owner as `member_of` target, so a role can name
+// `pgcf_backup`, `public` or `none` while that row is live. Deleting only the named row in D1 leaves the
+// member naming a role that is absent, which no node page of the new contract carries.
+it("finds a role that is a member of a closed name, and the statements of the plan clear it before the row", () => {
+  insertRole("app", { owner: 1 });
+  insertRole("pgcf_backup");
+  insertRole("x", { member_of_json: '["other","pgcf_backup"]' });
+  insertRole("other");
+  insertRole("gone", {
+    member_of_json: '["public"]',
+    deleted_at: NOW,
+    delete_operation_id: `op_${"c".repeat(20)}`,
+  });
+  const check = () =>
+    db.prepare(CHECK).all() as { database_id: string; name: string }[];
+  expect(
+    check()
+      .map((row) => row.name)
+      .sort(),
+  ).toEqual(["gone", "pgcf_backup", "x"]);
+  // The row deleted alone: a check on `roles.name` answers nothing, and the member keeps the name.
+  run(REMOVE);
+  expect(
+    db
+      .prepare(
+        "SELECT name FROM roles WHERE name IN ('pgcf_backup', 'public', 'none')",
+      )
+      .all(),
+  ).toEqual([]);
+  expect(
+    check()
+      .map((row) => row.name)
+      .sort(),
+  ).toEqual(["gone", "x"]);
+  expect(() => apply(MIGRATION)).not.toThrow();
+});
+
+it("removes the closed names from the member lists of every role, tombstones included, and keeps the others", () => {
+  insertRole("app", { owner: 1 });
+  insertRole("pgcf_backup");
+  insertRole("x", { member_of_json: '["other","pgcf_backup"]' });
+  insertRole("y", { member_of_json: '["pgcf_backup"]' });
+  insertRole("other");
+  insertRole("gone", {
+    member_of_json: '["public"]',
+    deleted_at: NOW,
+    delete_operation_id: `op_${"c".repeat(20)}`,
+  });
+  const members = () =>
+    db.prepare("SELECT name, member_of_json FROM roles ORDER BY name").all();
+  run(STRIP);
+  run(REMOVE);
+  expect(db.prepare(CHECK).all()).toEqual([]);
+  expect(members()).toEqual([
+    { name: "app", member_of_json: "[]" },
+    { name: "gone", member_of_json: "[]" },
+    { name: "other", member_of_json: "[]" },
+    { name: "x", member_of_json: '["other"]' },
+    { name: "y", member_of_json: "[]" },
+  ]);
+  expect(() => apply(MIGRATION)).not.toThrow();
+});
+
+it("gives the operator those statements as they are tested, in the plan and in the migration's header", () => {
+  const header = readFileSync(new URL(MIGRATION, directory), "utf8")
+    .split("\n")
+    .filter((line) => line.startsWith("--"))
+    .map((line) => line.replace(/^-- ?/, ""))
+    .join(" ")
+    .replace(/\s+/g, " ");
+  expect(header).toContain(CHECK);
+  // Step (0) of the row and the Open row each give the check; step (0) gives the other two as well.
+  expect(plan.split(CHECK).length - 1).toBeGreaterThanOrEqual(2);
+  expect(plan).toContain(STRIP);
+  expect(plan).toContain(REMOVE);
+  // The old check on `roles.name` alone is not the check any more.
+  expect(plan).not.toContain(
+    "SELECT database_id, name FROM roles WHERE name IN ('pgcf_backup', 'public', 'none')",
+  );
+  expect(plan).not.toContain("SELECT count(*) FROM roles WHERE name IN");
 });

@@ -12,10 +12,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Writes one event line to the agent's log.
+/// Writes one event line to the agent's log, and keeps it for the next report to Cloudflare.
 pub fn emit_event(value: Value) {
     eprintln!("{value}");
     crate::events::record(&value);
+}
+
+/// Writes one line to the agent's log alone: what happens at every wake and every sleep and says
+/// nothing that the wake's own events do not (a report carries 64 events, and a storm of wakes
+/// would push the others out).
+pub fn log_line(value: Value) {
+    eprintln!("{value}");
 }
 
 /// The clock of the agent's start: when it began, when the last phase ended, and the phases that

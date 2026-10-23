@@ -222,9 +222,15 @@ scratch_volumes() {
 }
 
 # Plan 9.1: `pgcf-agent check` creates a scratch database on a thin volume and queries it; after a
-# reboot the same database wakes again (no second volume appears).
+# reboot the same database wakes again (no second volume appears). The scratch database starts as
+# every database does, in a slot, but in the one the check alone has (number 1023): its unit has
+# ended when the check has, and no slot of the agent's pool is the check's.
 scratch_database() {
 	in_agent_namespace /var/lib/pgcf/bin/current/pgcf-agent check || return 1
+	if [ "$(systemctl is-active pgcf-slot@1023.service)" = active ]; then
+		echo "the check's slot is still active"
+		return 1
+	fi
 	local volumes
 	volumes=$(scratch_volumes)
 	if [ "$(wc -w <<<"$volumes")" -ne 1 ]; then
@@ -695,6 +701,72 @@ database_user_reads_no_journal() {
 	[ "$result" = 0 ]
 }
 
+# The line $3 that uid $1 logged under the identifier $2 is in a system.journal file: --file reads
+# that file alone, so a line that journald kept in a user-<uid>.journal is not found.
+line_in_system_journal() {
+	local file lines
+	while IFS= read -r file; do
+		lines=$(journalctl --file="$file" --no-pager --output=cat "_UID=$1" "SYSLOG_IDENTIFIER=$2" 2>/dev/null)
+		grep -qxF "$3" <<<"$lines" && return 0
+	done < <(find /var/log/journal /run/log/journal -name system.journal 2>/dev/null)
+	return 1
+}
+
+# The agent finds PostgreSQL's lines in the system journal (by unit and invocation) and builds the
+# boot report from it. journald's SplitMode=uid (the default) keeps the lines of every user outside
+# systemd's system, dynamic and container ranges and nobody in a user-<uid>.journal of their own:
+# EU1 held 371 of them, one per database ever created, and journald vacuums them by age only (plan
+# 11.1). The probe's user logs a line the way a database's PostgreSQL does (the journal's stream):
+# the line is in the system journal, and no user-*.journal file exists anywhere. The user is the
+# probe's own, with the last uid of the agent's database range (units/users.rs, 200000 to 299999),
+# made the way the slot checks make theirs and removed afterwards: the scratch database cannot
+# stand for it, because its user is a system account (the agent's table of uids is never written by
+# a second process), and journald keeps the lines of a system uid in the system journal whatever
+# SplitMode is, so such a probe passes with no split configuration at all.
+journal_probe_uid=299999
+journal_probe_user=pgcf-boot-journal
+database_log_stays_in_the_system_journal() {
+	local uid=$journal_probe_uid user=$journal_probe_user tag=pgcf-boot-test-journal marker files result=0
+	# Neither call takes an id or a name that exists: a leftover user fails the check and is not deleted.
+	groupadd -g "$uid" "$user" || {
+		echo "the group $user (gid $uid) was not made"
+		return 1
+	}
+	useradd -u "$uid" -g "$user" -M -s /usr/sbin/nologin -d /nonexistent "$user" || {
+		echo "the user $user (uid $uid) was not made"
+		groupdel "$user"
+		return 1
+	}
+	marker=$tag-$$-$RANDOM
+	if ! setpriv --reuid="$uid" --regid="$uid" --clear-groups -- systemd-cat --identifier="$tag" echo "$marker"; then
+		echo "systemd-cat failed as uid $uid"
+		result=1
+	elif ! wait_for 10 line_in_system_journal "$uid" "$tag" "$marker"; then
+		echo "the line of uid $uid is not in the system journal"
+		result=1
+	else
+		files=$(find /var/log/journal /run/log/journal -name 'user-*.journal*' 2>/dev/null)
+		[ -z "$files" ] || {
+			echo "journald keeps user journal files: ${files//$'\n'/ }"
+			result=1
+		}
+	fi
+	userdel "$user" >/dev/null 2>&1
+	groupdel "$user" >/dev/null 2>&1
+	return "$result"
+}
+
+# The journal of this boot shows the agent's own lines (the unit's, not PID 1's lines about it): the
+# agent logs `agent_start_phase` from its first moment, and the checks begin when the system runs.
+journal_has_agent_lines() {
+	local lines
+	lines=$(journalctl --boot=0 --quiet --no-pager --output=cat --lines=1 _SYSTEMD_UNIT=pgcf-agent.service) || return 1
+	[ -n "$lines" ] || {
+		echo "journalctl --boot=0 shows no line of pgcf-agent.service"
+		return 1
+	}
+}
+
 # A database's scratch space is bounded. The private /tmp and /var/tmp used to be directories on the
 # host's root filesystem (8 GiB, no quota, and disk blocks are not memory the unit's MemoryMax
 # counts): one awake tenant could fill it, which stops the journal and the agent's state writes
@@ -770,9 +842,11 @@ database_second_postmaster_is_refused() {
 # A slot is the sandbox of a database unit with a pooled user, and that user's uid (300000 + n) is
 # used by one database after another, so these checks are about everything that keeps something by
 # uid: every mount, every file the uid can write or read, the IPC namespace, the POSIX queues, the
-# keyrings and the journal. The agent does not start slots yet, and the supervisor is not under
-# test: a runtime drop-in swaps ExecStart= for a process that logs one line and waits, and every
-# other directive is the template's. The users are made the way the agent makes them.
+# keyrings and the journal. The agent starts slots (the scratch database of `pgcf-agent check` runs
+# in one), and what this section tests is the unit's sandbox, with a stand-in for the supervisor,
+# which has its own tests and the slot lab (`units/slot_lab.rs`): a runtime drop-in swaps ExecStart=
+# for a process that logs one line and waits, and every other directive is the template's. The
+# users are made the way the agent makes them.
 slot_test_n=1000
 slot_control_n=1001
 # A uid in the slots' range that no slot has: what an unrelated tenant can read.
@@ -1058,6 +1132,7 @@ check loopback_only loopback_only
 check no_ssh_socket no_ssh_socket
 check journal_sync_interval journal_sync_interval
 check journal_not_split journal_not_split
+check journal_has_agent_lines journal_has_agent_lines
 check inbound_dropped inbound_dropped
 check binaries binaries
 check io_uring_disabled sysctl_is kernel.io_uring_disabled 2
@@ -1093,6 +1168,7 @@ if [ "$phase" = 1 ]; then
 	check database_user_reaches_no_block_device database_user_reaches_no_block_device
 	check database_user_shares_nothing_writable database_user_shares_nothing_writable
 	check database_user_reads_no_journal database_user_reads_no_journal
+	check database_log_stays_in_the_system_journal database_log_stays_in_the_system_journal
 	check database_scratch_space_is_bounded database_scratch_space_is_bounded
 	check database_second_postmaster_is_refused database_second_postmaster_is_refused
 	check slot_isolation slot_isolation

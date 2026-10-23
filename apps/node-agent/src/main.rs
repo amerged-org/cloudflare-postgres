@@ -27,6 +27,7 @@ mod linux {
         service::{Intervals, Service, ServiceConfig, gateway_owner},
         storage,
         timing::{self, emit_event},
+        units::slots,
         update,
     };
     use serde_json::json;
@@ -85,7 +86,8 @@ mod linux {
     pub async fn run() -> Result<(), Error> {
         timing::phase("process_start");
         let layout = Layout::default();
-        let node = Arc::new(Node::connect(layout.clone(), storage::Config::default()).await?);
+        let node =
+            Arc::new(Node::connect(layout.clone(), storage::Config::default(), slots::POOL).await?);
         timing::phase("storage_open");
         // The volumes the agent before mounted are unmounted with its namespace: so are their links.
         node.reset_device_links().await?;
@@ -145,12 +147,17 @@ mod linux {
             std::path::Path::new("/proc/self/ns/mnt"),
             std::path::Path::new("/proc/1/ns/mnt"),
         )?;
-        let node = Node::connect(Layout::default(), storage::Config::default()).await?;
+        let node = Node::connect(
+            Layout::default(),
+            storage::Config::default(),
+            slots::CHECK_SLOT..slots::CHECK_SLOT + 1,
+        )
+        .await?;
         let account = node.scratch_account(SCRATCH).await?;
         let checked = check::run(&node, &account).await?;
         println!(
             "{}",
-            json!({"event": "check", "database": SCRATCH, "created": checked.created})
+            json!({"event": "check", "database": SCRATCH, "created": checked.created, "slot": checked.slot})
         );
         Ok(())
     }

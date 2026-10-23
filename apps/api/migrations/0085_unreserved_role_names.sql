@@ -15,19 +15,27 @@
 -- is not a lower-case identifier of 1 to 63 characters. Nothing references `roles`, so no foreign
 -- key is in play.
 --
--- Deploy order: this migration first, then the node release that accepts these names (R-2), then
--- the API Worker, then the Edge Worker. Apply it from the commit that merged this change:
--- `wrangler d1 migrations apply` applies every pending file of the directory it runs from, so
--- `wrangler d1 migrations list` shows this file as the only pending migration just before the apply.
--- The migration of an API change that merges after this one is not applied with it. `0085` of the
--- single archive bucket change (plan W2-F) drops `regions.backup_bucket` and
--- `regions.backup_endpoint_url`, which the deployed Worker reads, and its Worker has to be live
--- first. That change waits, Worker and migration alike, until the API Worker of this change is out,
--- and its migration runs after its own Worker (plan W2-C, Freeze). Check first, as the last act
--- before the apply, that no row of `roles`, tombstones included, is named `pgcf_backup`, `public` or
--- `none`; the CHECK below refuses the copy of such a row, the migration stops and the table stays as
--- it was, so a row that appears after the check delays the apply and is deleted in D1 first. The
--- migration opens nothing: the Workers of today still refuse `cnpg_*`, `streaming_replica` and
+-- Deploy order: the check below and this migration first, then the node release that accepts these
+-- names (R-2), then the API Worker, then the Edge Worker. Apply it from the commit that merged this
+-- change: `wrangler d1 migrations apply` applies every pending file of the directory it runs from, so
+-- `wrangler d1 migrations list` shows this file as the only pending migration just before the apply
+-- (`0084_single_archive_bucket` of plan W2-F is applied already). The migration of an API change that
+-- merges after this one is not applied with it: a file that drops what the deployed Worker reads
+-- waits until the Worker that no longer reads it is out (plan W2-C, Freeze).
+-- Check first, as the last act before the apply, that this query answers no row:
+--   SELECT database_id, name FROM roles WHERE name IN ('pgcf_backup','public','none') OR EXISTS (SELECT 1 FROM json_each(member_of_json) WHERE value IN ('pgcf_backup','public','none'))
+-- It finds the rows named by one of the three names, tombstones included, and the roles that are a
+-- member of one. The old API accepts a `member_of` that names any live role but the owner, so a role
+-- can name `pgcf_backup` while that row is live; if the named row alone is deleted in D1, the member
+-- keeps a membership of a role that is absent, no node page of the new contract carries it, and the
+-- API answers 500 to every full pull of the node that holds the database. A row found is handled in
+-- the order of plan W2-C, step (0): the members lose the name first, then the named rows are deleted,
+-- in one D1 batch. The CHECK below refuses the copy of a row with one of the names, the migration
+-- stops and the table stays as it was, so a row that appears after the check delays the apply and is
+-- handled the same way. A hit on `pgcf_backup` also means that the node altered barman's role on that
+-- database (no LOGIN repair, memberships revoked): deleting the rows does not repair it, and that
+-- database's base backups need repair (plan W2-C).
+-- The migration opens nothing: the Workers of today still refuse `cnpg_*`, `streaming_replica` and
 -- `pgcf_maintenance`, and a restore copies only names that D1 already holds. What it closes are the
 -- three names above, which the old API accepted until now. The old API's insert of one of them fails
 -- on the CHECK, an error `isConstraintError` does not map (it matches only UNIQUE), so it answers 500

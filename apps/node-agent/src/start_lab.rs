@@ -50,6 +50,7 @@ use crate::{
     state::{DatabaseState, Files, ProvenSleepRecord, Resources},
     storage::{self, VolumeId},
     timing,
+    units::slots,
 };
 use pgcf_native_protocol::{
     agent::ToGateway,
@@ -301,7 +302,7 @@ async fn prepare() {
         return;
     };
     let node = Arc::new(
-        Node::connect(lab.layout.clone(), lab.config.clone())
+        Node::connect(lab.layout.clone(), lab.config.clone(), slots::POOL)
             .await
             .unwrap(),
     );
@@ -368,7 +369,7 @@ async fn start() {
     let began = Instant::now();
     timing::phase("process_start");
     let node = Arc::new(
-        Node::connect(lab.layout.clone(), lab.config.clone())
+        Node::connect(lab.layout.clone(), lab.config.clone(), slots::POOL)
             .await
             .unwrap(),
     );
@@ -448,7 +449,7 @@ async fn reset() {
     let Some(lab) = Lab::from_env() else {
         return;
     };
-    let node = Node::connect(lab.layout.clone(), lab.config.clone())
+    let node = Node::connect(lab.layout.clone(), lab.config.clone(), slots::POOL)
         .await
         .unwrap();
     for n in lab.awake..lab.real() {

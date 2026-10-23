@@ -3,7 +3,7 @@
 //! archive socket, its upload log, the jobs and the roles are the agent's own; R2 and barman are
 //! the fixture's executables, which take a real backup with the backup API of the database they
 //! are pointed at (see `archive::test_support`).
-use super::{Core, Entry, Parts, Policy, Timing};
+use super::{Core, Entry, PREFETCH, Parts, Policy, Prefetch, Timing};
 use crate::{
     admission::{EarlySleep, Running},
     archive::{
@@ -116,9 +116,21 @@ printf '{{"backup_id":"%s","status":"DONE","timeline":%s,"systemid":"%s","end_wa
 }
 
 pub(crate) fn policy() -> Policy {
+    policy_with_start_concurrency(None)
+}
+
+/// The tests' policy with another number of starts at once, and so of idle slots; a start that
+/// waits for the others then waits as long as they take.
+pub(crate) fn policy_with_start_concurrency(starts: Option<usize>) -> Policy {
     let mut page = vector("NodeDesiredPage", "full-page");
+    if let Some(starts) = starts {
+        page["policy"]["admission"]["start_concurrency"] = json!(starts);
+        page["policy"]["admission"]["queue_wait_ms"] = json!(10_000);
+    }
     // Tests wait for what they wait for; nothing in them should be refused for want of time.
-    page["policy"]["admission"]["queue_wait_ms"] = json!(300);
+    if starts.is_none() {
+        page["policy"]["admission"]["queue_wait_ms"] = json!(300);
+    }
     // The quota comes with the wake, as the tests that read it expect; the tests of the burst set
     // theirs (`boost`).
     page["policy"]["admission"]["cpu_boost_ms"] = json!(0);
@@ -215,7 +227,13 @@ impl Rig {
     /// A node whose agent waits as `timing` says.
     pub(crate) async fn with_timing(label: &str, timing: Timing) -> Option<Self> {
         let (machine, fixture, root) = site(label, &root_socket)?;
-        Some(Self::boot(machine, fixture, root, Vec::new(), timing).await)
+        Some(Self::boot(machine, fixture, root, Vec::new(), timing, PREFETCH).await)
+    }
+
+    /// A node whose build reads ahead as `prefetch` says.
+    pub(crate) async fn with_prefetch(label: &str, prefetch: Prefetch) -> Option<Self> {
+        let (machine, fixture, root) = site(label, &root_socket)?;
+        Some(Self::boot(machine, fixture, root, Vec::new(), timing(), prefetch).await)
     }
 
     /// The agent process on a machine: its sockets, its tables and its core. A restart is another
@@ -226,6 +244,7 @@ impl Rig {
         root: PathBuf,
         running: Vec<Running>,
         timing: Timing,
+        prefetch: Prefetch,
     ) -> Self {
         let archive_socket = root.join("a.sock");
         let table = Arc::new(Table::default());
@@ -235,7 +254,13 @@ impl Rig {
             Limits::default(),
         ));
         let server = Arc::new(
-            Server::new(table.clone(), jobs.clone(), credentials.clone()).with_bound(AGENT_BOUND),
+            Server::new(
+                table.clone(),
+                jobs.clone(),
+                credentials.clone(),
+                machine.clone(),
+            )
+            .with_bound(AGENT_BOUND),
         );
         let server = tokio::spawn(server.serve(bind(&archive_socket).unwrap()));
         let gateway = Arc::new(Feed::new());
@@ -254,6 +279,7 @@ impl Rig {
                 fences,
                 policy: policy(),
                 timing,
+                prefetch,
             },
             running,
         );
@@ -273,6 +299,8 @@ impl Rig {
     /// The agent restarts: a new process on the same node. What it keeps in memory is gone; the
     /// units run on, and it finds them as it finds them at boot.
     pub(crate) async fn restart(self) -> Self {
+        // The new process reads the slots back from the kernel before it reads the units.
+        self.machine.adopt_slots().await.unwrap();
         let units = self.machine.units().await.unwrap();
         let running = units
             .iter()
@@ -297,13 +325,15 @@ impl Rig {
             self.root.clone(),
         );
         let timing = self.core.timing.clone();
+        let prefetch = self.core.prefetch;
         drop(self);
         // The agent's mount namespace ends with it: the volumes are mounted again by the next
-        // one, which the units that run do not wait for.
+        // one, which the units that run do not wait for. What it kept of the slots is gone too.
         machine.forget_mounts();
+        machine.adopt_slots().await.unwrap();
         // The old sockets close with the old tasks.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        Self::boot(machine, fixture, root, running, timing).await
+        Self::boot(machine, fixture, root, running, timing, prefetch).await
     }
 
     /// A page entry for a new database with the roles `app` and `reader`; the archive credential
@@ -416,6 +446,19 @@ impl Rig {
     /// The observation the core queued last for a database.
     pub(crate) fn observation(&self, id: &str) -> Value {
         self.core.pending_observation(id).expect("an observation")
+    }
+
+    /// The observation of a database once it says `state`. `Core::set` changes the phase and
+    /// queues the observation after it, so a test that waited for the phase can still read the
+    /// observation of the phase before.
+    pub(crate) async fn observed(&self, id: &str, state: &str) -> Value {
+        eventually(10, "the observation to name the state", || {
+            self.core
+                .pending_observation(id)
+                .is_some_and(|observation| observation["state"] == state)
+        })
+        .await;
+        self.observation(id)
     }
 }
 

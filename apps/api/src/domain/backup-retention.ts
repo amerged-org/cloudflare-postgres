@@ -4,7 +4,7 @@ import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
 import { purgeArchiveCredentials } from "./archive-credentials.ts";
 import { validatedArchivePrefix } from "./archive.ts";
-import { regionArchive } from "./archive-bindings.ts";
+import { archiveBucket } from "./archive-bucket.ts";
 import { BACKUP_DATA, keysOf, walRangeArchived } from "./archive-chain.ts";
 import {
   parseBackupInfo,
@@ -191,7 +191,6 @@ interface DueRow {
   region_id: string;
   archive_path: string;
   storage_generation: number;
-  backup_bucket: string;
   backup_retention_days: number;
 }
 export interface RetentionRun {
@@ -217,8 +216,8 @@ export async function enforceBackupRetention(
   const at = new Date(now).toISOString();
   const due = (
     await env.DB.prepare(
-      `SELECT d.id,d.region_id,d.archive_path,d.storage_generation,r.backup_bucket,s.backup_retention_days
-      FROM databases d JOIN regions r ON r.id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
+      `SELECT d.id,d.region_id,d.archive_path,d.storage_generation,s.backup_retention_days
+      FROM databases d JOIN size_classes s ON s.id=d.size_class_id
       LEFT JOIN backup_retention_runs c ON c.database_id=d.id AND c.archive_path=d.archive_path
       LEFT JOIN database_recovery_points p ON p.database_id=d.id AND p.storage_generation=d.storage_generation
       WHERE d.node_id IS NOT NULL AND d.deleted_at IS NULL AND d.desired_state<>'deleted'
@@ -235,13 +234,10 @@ export async function enforceBackupRetention(
   for (const row of due) {
     run.checked++;
     try {
-      const selected = regionArchive(env, {
-        id: row.region_id,
-        backup_bucket: row.backup_bucket,
-      });
+      const selected = archiveBucket(env);
       const result = await retainBackups(
         selected.bucket,
-        validatedArchivePrefix(row, row, selected.bucketName),
+        validatedArchivePrefix(row, selected.bucketName),
         now - row.backup_retention_days * 86_400_000,
       );
       run.backups += result.backups;
@@ -283,36 +279,35 @@ export async function expireSupersededArchives(
   limit = DELETE_BATCH,
 ): Promise<{ archives: number; objects: number }> {
   const at = new Date(now).toISOString();
+  // An archive that names another bucket is out of this Worker's reach and is never selected: two
+  // of them would otherwise fill the batch of two and starve the archives after them.
+  const named = `s3://${archiveBucket(env).bucketName}/`;
   const due = (status: string, path: string, deleted: string, side: string) =>
-    `SELECT m.operation,m.region_id,m.${path} archive_path,d.archive_path current_path,r.backup_bucket,m.completed_at,'${side}' side
-    FROM database_moves m JOIN databases d ON d.id=m.database_id JOIN size_classes s ON s.id=d.size_class_id JOIN regions r ON r.id=m.region_id
+    `SELECT m.operation,m.region_id,m.${path} archive_path,d.archive_path current_path,m.completed_at,'${side}' side
+    FROM database_moves m JOIN databases d ON d.id=m.database_id JOIN size_classes s ON s.id=d.size_class_id
     WHERE m.status='${status}' AND m.${deleted} IS NULL AND m.${path} IS NOT NULL
     AND strftime('%Y-%m-%dT%H:%M:%fZ',m.completed_at,'+'||s.backup_retention_days||' days')<=?
-    AND m.${path}<>d.archive_path`;
+    AND substr(m.${path},1,length(?))=? AND m.${path}<>d.archive_path`;
   const rows = (
     await env.DB.prepare(
       `${due("done", "source_archive_path", "source_archive_deleted_at", "source")}
       UNION ALL ${due("failed", "target_archive_path", "target_archive_deleted_at", "target")}
       ORDER BY completed_at,operation LIMIT 2`,
     )
-      .bind(at, at)
+      .bind(at, named, named, at, named, named)
       .all<{
         operation: string;
         region_id: string;
         archive_path: string;
         current_path: string;
-        backup_bucket: string;
         side: "source" | "target";
       }>()
   ).results;
   const result = { archives: 0, objects: 0 };
   for (const row of rows) {
+    const selected = archiveBucket(env);
     const path = parseArchivePath(row.archive_path);
-    if (!path || path.bucket !== row.backup_bucket) continue;
-    const selected = regionArchive(env, {
-      id: row.region_id,
-      backup_bucket: row.backup_bucket,
-    });
+    if (!path || path.bucket !== selected.bucketName) continue;
     const prefix = `${path.region}/${path.database}/g${path.generation}-${path.operation}/`;
     const listed = await selected.bucket.list({
       prefix,

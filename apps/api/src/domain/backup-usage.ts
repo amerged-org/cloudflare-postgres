@@ -2,7 +2,7 @@
 import { DatabaseId, bytesToHex } from "@pgcf/contracts";
 import { USAGE_HOUR_MS, type UsageSample } from "@pgcf/contracts/usage";
 import { validatedArchivePrefix } from "./archive.ts";
-import { regionArchive, type ArchiveEnvironment } from "./archive-bindings.ts";
+import { archiveBucket, type ArchiveEnvironment } from "./archive-bucket.ts";
 import { recordUsageSample, type BackupUsageIdentity } from "./usage.ts";
 import type { Env } from "../env.ts";
 
@@ -18,7 +18,6 @@ interface ArchiveRow {
   archive_path: string;
   storage_generation: number;
   deleted_at: string | null;
-  backup_bucket: string;
 }
 export interface BackupMeasurementResult {
   status: "measured" | "unavailable";
@@ -30,7 +29,7 @@ type BackupEnvironment = Pick<Env, "DB"> & ArchiveEnvironment;
 const rowFor = (db: D1Database, id: string) =>
   db
     .prepare(
-      "SELECT d.id,d.region_id,d.archive_path,d.storage_generation,d.deleted_at,r.backup_bucket FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id=?",
+      "SELECT id,region_id,archive_path,storage_generation,deleted_at FROM databases WHERE id=?",
     )
     .bind(id)
     .first<ArchiveRow>();
@@ -40,8 +39,7 @@ const sameIdentity = (a: ArchiveRow, b: ArchiveRow | null): boolean =>
   a.region_id === b.region_id &&
   a.archive_path === b.archive_path &&
   a.storage_generation === b.storage_generation &&
-  a.deleted_at === b.deleted_at &&
-  a.backup_bucket === b.backup_bucket;
+  a.deleted_at === b.deleted_at;
 
 /**
  * A size equal to the newest recorded one of the same UTC hour adds nothing to the hourly maximum,
@@ -77,11 +75,8 @@ export async function measureBackupUsage(
   let bytes: number | null = null,
     objects: number | null = null;
   try {
-    const selected = regionArchive(env, {
-      id: row.region_id,
-      backup_bucket: row.backup_bucket,
-    });
-    const prefix = validatedArchivePrefix(row, row, selected.bucketName);
+    const selected = archiveBucket(env);
+    const prefix = validatedArchivePrefix(row, selected.bucketName);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let expired = false;
     const deadline = Date.now() + BACKUP_LIST_DEADLINE_MS;
@@ -170,7 +165,6 @@ export async function measureBackupUsage(
     identity: BackupUsageIdentity = {
       archive_path: row.archive_path,
       region_id: row.region_id,
-      backup_bucket: row.backup_bucket,
       deleted_at: row.deleted_at,
     };
   const digest = bytesToHex(

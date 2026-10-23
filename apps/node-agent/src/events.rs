@@ -459,7 +459,7 @@ mod tests {
             "order_us",
             "job_to_fork_us",
             "fork_to_handoff_us",
-            "handoff_to_starting_us",
+            "order_to_starting_us",
             "starting_to_shut_down_us",
             "shut_down_to_ready_us",
             "nr_throttled",

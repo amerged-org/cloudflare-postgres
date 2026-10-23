@@ -1386,7 +1386,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
               order_us: 1_200,
               job_to_fork_us: 2_300,
               fork_to_handoff_us: 33_886,
-              handoff_to_starting_us: 12_840,
+              order_to_starting_us: 12_840,
               starting_to_shut_down_us: 1_605,
               shut_down_to_ready_us: 1_522,
               nr_throttled: 2,

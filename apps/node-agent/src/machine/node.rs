@@ -13,7 +13,9 @@ use crate::{
     },
     units::{
         self, Started, Timeline, UnitState, Units,
-        limits::Limits,
+        limits::{Limits, cpu_quota},
+        slots::{self, Adopted, Bind, Bound, Pool, Snapshot},
+        system::{System, peer_unit, run},
         users::{Users, account_name},
     },
 };
@@ -21,6 +23,7 @@ use std::{
     collections::BTreeMap,
     io,
     num::NonZeroU32,
+    ops::Range,
     os::unix::fs::{DirBuilderExt, PermissionsExt, chown},
     path::Path,
     process::Stdio,
@@ -42,6 +45,11 @@ pub struct Node {
     storage: Arc<Storage<SystemRunner>>,
     units: Units,
     users: Mutex<Users>,
+    /// The slots PostgreSQL runs in.
+    pool: Arc<Pool<System>>,
+    /// The databases whose unit of its own (`pgcf-pg@`, which an earlier agent started) runs, by
+    /// the uid it runs as: the archive socket knows their callers by it until they sleep.
+    legacy: Mutex<BTreeMap<u32, String>>,
 }
 
 /// The first entry of a colon-separated database such as `/etc/passwd` or `/etc/group` whose first
@@ -54,28 +62,15 @@ fn lookup(path: &str, name: &str) -> Option<Vec<String>> {
         .map(|line| line.split(':').map(String::from).collect())
 }
 
-/// Runs a program of the system to its end; its failure carries what it said.
-async fn run(program: &str, arguments: &[&str]) -> io::Result<()> {
-    let output = tokio::process::Command::new(program)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .output()
-        .await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "{program} ended with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
-    }
-}
-
 impl Node {
     /// Connects to systemd and opens the node's storage: the volume group and the pool exist as
-    /// plan 4.3 describes, or are made.
-    pub async fn connect(layout: Layout, storage: Config) -> Result<Self, crate::Error> {
+    /// plan 4.3 describes, or are made. `slots` are the slot numbers this process uses: the
+    /// agent's pool, or the health check's one (`slots::CHECK_SLOT`), which never meets the other.
+    pub async fn connect(
+        layout: Layout,
+        storage: Config,
+        slots: Range<u32>,
+    ) -> Result<Self, crate::Error> {
         let units = Units::connect(layout.volumes()).await?;
         let storage = Arc::new(Storage::new(SystemRunner, storage));
         {
@@ -85,11 +80,17 @@ impl Node {
         // What the agent keeps of its own, below a directory only root reads.
         crate::link::file::create_private_directory(&layout.agent())?;
         let users = Users::load(layout.uids())?;
+        let pool = Arc::new(Pool::new(
+            System::new(units.clone(), layout.clone(), storage.clone()),
+            slots,
+        ));
         Ok(Self {
             layout,
             storage,
             units,
             users: Mutex::new(users),
+            pool,
+            legacy: Mutex::new(BTreeMap::new()),
         })
     }
     /// The agent's start, and only the agent's (not the check's, which runs `connect` too): the
@@ -294,6 +295,10 @@ impl Machine for Node {
     }
 
     async fn unit_volume(&self, database: &str) -> Result<Option<VolumeId>, storage::Error> {
+        // A slot holds the volume it was bound to, whatever the agent has attached since.
+        if let Some(volume) = self.pool.volume_of(database) {
+            return Ok(Some(volume));
+        }
         let unit = self
             .units
             .state(database)
@@ -433,15 +438,30 @@ impl Machine for Node {
     }
 
     async fn unit(&self, database: &str) -> Result<UnitState, units::Error> {
-        self.units.state(database).await
+        match self.pool.state(database).await? {
+            Some(state) => Ok(state),
+            None => self.units.state(database).await,
+        }
     }
     async fn units(&self) -> Result<Vec<UnitState>, units::Error> {
-        self.units.running().await
+        let mut states = self.pool.states().await?;
+        for unit in self.units.running().await? {
+            if !states.iter().any(|held| held.database == unit.database) {
+                states.push(unit);
+            }
+        }
+        Ok(states)
     }
-    async fn start(&self, database: &str) -> Result<Started, units::Error> {
-        self.units.start(database).await
+    async fn bind(&self, database: &str, bind: &Bind) -> Result<Bound, units::Error> {
+        self.pool.bind(database, bind).await
+    }
+    async fn exec(&self, bound: &Bound) -> Result<Started, units::Error> {
+        self.pool.exec(bound).await
     }
     async fn wait_started(&self, database: &str) -> Result<Started, units::Error> {
+        if self.pool.slot_of(database).is_some() {
+            return self.pool.wait_started(database).await;
+        }
         self.units.wait_started(database).await
     }
     async fn start_timeline(
@@ -449,23 +469,92 @@ impl Machine for Node {
         database: &str,
         started: &Started,
     ) -> Result<Timeline, units::Error> {
+        if started.slot.is_some() {
+            return self.pool.timeline(database, started).await;
+        }
         self.units.timeline(database, started).await
     }
     async fn stop(&self, database: &str) -> Result<(), units::Error> {
-        self.units.stop(database).await
+        if self.pool.stop(database).await? {
+            return Ok(());
+        }
+        // A unit of its own that an earlier agent started goes to sleep as it did; one that does
+        // not run is not asked, which would load it.
+        if self.units.state(database).await?.active.awake() {
+            let stopped = self.units.stop(database).await;
+            if stopped.is_ok() {
+                self.legacy
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|_, held| held != database);
+            }
+            return stopped;
+        }
+        Ok(())
     }
     async fn set_limits(&self, database: &str, limits: &Limits) -> Result<(), units::Error> {
-        self.units.set_limits(database, limits).await
+        if self.pool.set(database, &limits.properties()).await? {
+            return Ok(());
+        }
+        // A unit of its own that runs keeps its limits as it always did, across a reboot.
+        if self.units.state(database).await?.active.awake() {
+            return self.units.set_limits(database, limits).await;
+        }
+        Ok(())
     }
     async fn set_cpu_quota(
         &self,
         database: &str,
         millicores: Option<NonZeroU32>,
     ) -> Result<(), units::Error> {
+        if self.pool.set(database, &[cpu_quota(millicores)]).await? {
+            return Ok(());
+        }
+        // A unit of its own: a quota is lifted whether or not it runs (a crash can leave one on a
+        // stopped unit), and set only on one that does.
+        if millicores.is_some() && !self.units.state(database).await?.active.awake() {
+            return Ok(());
+        }
         self.units.set_cpu_quota(database, millicores).await
     }
     async fn set_slice_memory(&self, awake_budget_mib: u64) -> Result<(), units::Error> {
         self.units.set_slice_memory(awake_budget_mib).await
+    }
+
+    async fn adopt_slots(&self) -> Result<Adopted, units::Error> {
+        let adopted = self.pool.adopt().await?;
+        let mut legacy = BTreeMap::new();
+        for unit in self.units.running().await? {
+            if let (true, Some(uid)) = (unit.active.awake(), unit.uid) {
+                legacy.insert(uid, unit.database);
+            }
+        }
+        *self.legacy.lock().unwrap_or_else(PoisonError::into_inner) = legacy;
+        Ok(adopted)
+    }
+    async fn refill_slot(&self, target: usize) -> Result<Option<u32>, units::Error> {
+        self.pool.refill(target).await
+    }
+    async fn make_slot_user(&self) -> Result<Option<u32>, units::Error> {
+        self.pool.make_user().await
+    }
+    async fn drain_idle_slots(&self) -> usize {
+        self.pool.drain_idle().await
+    }
+    fn slots(&self) -> Snapshot {
+        self.pool.snapshot()
+    }
+    fn caller(&self, uid: u32, pid: u32) -> Option<String> {
+        if let Some(holder) = self.pool.holder(uid) {
+            let (cgroup, invocation) = peer_unit(pid);
+            return slots::is_holder(&holder, cgroup.as_deref(), invocation.as_deref())
+                .then_some(holder.database);
+        }
+        self.legacy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&uid)
+            .cloned()
     }
 
     async fn apply_credentials(
@@ -703,8 +792,11 @@ impl Machine for Node {
     }
 
     fn throttle(&self, database: &str) -> Option<Throttle> {
-        let text = std::fs::read_to_string(units::cpu_stat_path(database)?).ok()?;
-        crate::sample::throttle(&text)
+        let path = match self.pool.slot_of(database) {
+            Some(slot) => units::slot_cpu_stat_path(slot),
+            None => units::cpu_stat_path(database)?,
+        };
+        crate::sample::throttle(&std::fs::read_to_string(path).ok()?)
     }
 }
 
@@ -787,7 +879,7 @@ mod lab {
             let run = |program: &str, args: &[&str]| {
                 let _ = Command::new(program).args(args).output();
             };
-            run("systemctl", &["stop", &format!("pgcf-pg@{ID}.service")]);
+            run("systemctl", &["stop", &slots::slot_unit(0)]);
             run("umount", &[&format!("/var/lib/pgcf/db/{ID}")]);
             let _ = std::fs::remove_file(format!("/run/pgcf/dev/{ID}"));
             run("vgremove", &["-f", &self.group]);
@@ -826,6 +918,7 @@ mod lab {
                 group,
                 ..storage::Config::default()
             },
+            slots::POOL,
         )
         .await
         .unwrap();
@@ -889,37 +982,46 @@ mod lab {
             std::fs::write(data.join(name), content).unwrap();
             chown(data.join(name), Some(account.uid), Some(account.gid)).unwrap();
         }
-        let unit = format!("pgcf-pg@{ID}.service");
-        node.set_limits(
-            ID,
-            &Limits {
-                memory_mib: 512,
-                cpu_millicores: 500,
-                tasks_max: 64,
-                io: Some(Io::scaled(node.device(&volume), 20 << 20, 500, 512)),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(show(&unit, "MemoryMax"), (512u64 << 20).to_string());
-        assert_eq!(show(&unit, "CPUWeight"), "50");
-
-        // It starts as its user, answers the agent over the socket, takes a CPU quota that its
-        // stop lifts again.
+        // The limits of its size are set on the slot at the bind, with the mounts, and the order
+        // follows: the slot's user, not the database's, runs PostgreSQL.
+        let unit = slots::slot_unit(0);
+        let limits = Limits {
+            memory_mib: 512,
+            cpu_millicores: 500,
+            tasks_max: 64,
+            io: Some(Io::scaled(node.device(&volume), 20 << 20, 500, 512)),
+        };
+        let bind = Bind {
+            device: node.device(&volume).into(),
+            data: data.clone(),
+            properties: limits.properties(),
+            volume: volume.clone(),
+            account: account.clone(),
+        };
         assert!(node.attached(&volume));
         assert_eq!(node.unit_volume(ID).await.unwrap(), None);
-        let started = node.start(ID).await.unwrap();
-        assert_eq!(started.uid, account.uid);
-        // The unit has mounted the volume itself, and that mount is what tells which volume it
+        // A wake makes no user: the quiet passes of a node's refill have made them. The lab makes
+        // the one user of the slot it binds (the lowest number), as such a pass does.
+        node.make_slot_user().await.unwrap();
+        let bound = node.bind(ID, &bind).await.unwrap();
+        assert_eq!(bound.slot, 0, "the lowest number, built on demand");
+        assert_eq!(show(&unit, "MemoryMax"), (512u64 << 20).to_string());
+        assert_eq!(show(&unit, "CPUWeight"), "50");
+        // The order is the last step: until it is given, the database is the slot's and runs
+        // nothing.
+        assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
+        let started = node.exec(&bound).await.unwrap();
+        assert_eq!(started.uid, slots::slot_uid(0));
+        // The slot has mounted the volume itself, and that mount is what tells which volume it
         // serves, whatever the agent has mounted: the agent's namespace ending (its restart)
-        // leaves the unit, its mount and the answer as they are.
+        // leaves the slot, its mount and the answer as they are.
         assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
         sh("umount", &[&format!("/var/lib/pgcf/db/{ID}")]);
         node.reset_device_links().await.unwrap();
         assert!(!node.attached(&volume));
         assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
-        // The restarted agent has no mount of the volume, and the unit has: what the agent's mount
-        // table says is free is held. It is not detached, repaired or removed from under the unit,
+        // The restarted agent has no mount of the volume, and the slot has: what the agent's mount
+        // table says is free is held. It is not detached, repaired or removed from under the slot,
         // and the next generation is neither made nor mounted over it.
         let busy = |result: Result<(), storage::Error>| {
             assert!(matches!(result, Err(storage::Error::Busy)), "{result:?}");
@@ -939,7 +1041,7 @@ mod lab {
         );
         assert!(!node.has_volume(&next).await.unwrap());
         assert_eq!(node.unit_volume(ID).await.unwrap(), Some(volume.clone()));
-        // The agent's unmount of a volume that a unit holds is refused: it is mounted again.
+        // The agent's unmount of a volume that a slot holds is refused: it is mounted again.
         assert!(
             node.mount_volumes(std::slice::from_ref(&volume))
                 .await
@@ -950,6 +1052,11 @@ mod lab {
         let busy = node.unmount_volume(&volume).await.unwrap_err();
         assert!(matches!(busy, storage::Error::Busy), "{busy:?}");
         assert!(node.attached(&volume));
+        // A second bind of the database is refused while the slot holds it.
+        assert!(matches!(
+            node.bind(ID, &bind).await,
+            Err(units::Error::Held)
+        ));
         node.set_cpu_quota(ID, NonZeroU32::new(250)).await.unwrap();
         assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "250ms");
         let session = postgres::agent(&socket).await.unwrap();
@@ -964,9 +1071,17 @@ mod lab {
         );
         drop(session);
         node.stop(ID).await.unwrap();
-        assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "infinity");
         assert!(!node.unit(ID).await.unwrap().active.awake());
         assert_eq!(node.unit_volume(ID).await.unwrap(), None);
+        // A runtime property outlives the stop of the unit; the refill of the slot takes back the
+        // quota, the memory ceiling, the weight and the write limits of the database it served.
+        assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "250ms");
+        assert_eq!(node.refill_slot(1).await.unwrap(), Some(0));
+        assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "infinity");
+        assert_eq!(show(&unit, "MemoryMax"), (32u64 << 20).to_string());
+        assert_eq!(show(&unit, "CPUWeight"), "10");
+        assert_eq!(show(&unit, "IOWriteBandwidthMax"), "");
+        assert_eq!(node.drain_idle_slots().await, 1);
 
         // The volume grows online, is trimmed, unmounted and mounted again as after a boot.
         node.grow_volume(&volume, 2 << 30).await.unwrap();
@@ -987,14 +1102,12 @@ mod lab {
             listed(node.inventory().await.unwrap()),
             Some((2 << 30, false))
         );
-        // A volume that is not attached has no link: no start on its empty directory.
+        // A volume that is not attached has no link: no bind on its empty directory, and the slot
+        // that was taken for it is gone.
         assert!(!node.attached(&volume));
         assert!(std::fs::symlink_metadata(&link).is_err());
-        let refused = node.start(ID).await.unwrap_err();
-        assert!(
-            matches!(&refused, units::Error::Job { result, .. } if result == "assert"),
-            "{refused:?}"
-        );
+        assert!(node.bind(ID, &bind).await.is_err());
+        assert_eq!(node.slots(), Snapshot::default());
         assert!(
             node.mount_volumes(std::slice::from_ref(&volume))
                 .await

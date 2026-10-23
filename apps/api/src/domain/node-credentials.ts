@@ -10,16 +10,16 @@ import { ApiError } from "../api-error.ts";
 import type { ApiContext, Env } from "../env.ts";
 import type { NodeCaller } from "./node-auth.ts";
 import { nodeShell } from "./node-shell.ts";
-import {
-  accountOf,
-  ensureNodeTunnel,
-  type NodeTunnelServices,
-} from "./node-tunnel.ts";
+import { archiveEndpoint } from "./archive-bucket.ts";
+import { ensureNodeTunnel, type NodeTunnelServices } from "./node-tunnel.ts";
 
-/** What makes a node's Tunnel, or null while the Worker is not configured to. */
-function tunnelServices(env: Env, endpoint: string): NodeTunnelServices | null {
-  const accountId = accountOf(endpoint);
-  return accountId === null ||
+/**
+ * What makes a node's Tunnel, or null while the Worker is not configured to. The Tunnel is in the
+ * Cloudflare account that holds the installation's archive bucket (`ARCHIVE_ENDPOINT_URL`).
+ */
+function tunnelServices(env: Env): NodeTunnelServices | null {
+  const accountId = archiveEndpoint(env)?.accountId;
+  return accountId === undefined ||
     !env.CLOUDFLARE_API_TOKEN ||
     !env.NODE_GATEWAY_ZONE_ID ||
     !env.NODE_GATEWAY_DOMAIN
@@ -128,16 +128,14 @@ export async function nodeCredentials(
   node: NodeCaller,
 ): Promise<Response> {
   const row = await c.env.DB.prepare(
-    `SELECT n.credentials_revision,n.shell_state,n.route_keyring_state,r.backup_endpoint_url
-     FROM nodes n JOIN regions r ON r.id=n.region_id WHERE n.id=? AND n.node_uid=?`,
+    `SELECT credentials_revision,shell_state,route_keyring_state
+     FROM nodes WHERE id=? AND node_uid=?`,
   )
     .bind(node.id, node.uid)
-    .first<
-      Omit<CredentialsRow, "id" | "uid"> & { backup_endpoint_url: string }
-    >();
+    .first<Omit<CredentialsRow, "id" | "uid">>();
   if (row === null)
     throw new ApiError("unauthorized", "Invalid node credentials");
-  const services = tunnelServices(c.env, row.backup_endpoint_url);
+  const services = tunnelServices(c.env);
   if (services === null) throw new Error("node_tunnel_unconfigured");
   const shell = nodeShell(c.env);
   const tunnel = await ensureNodeTunnel(services, node.id);

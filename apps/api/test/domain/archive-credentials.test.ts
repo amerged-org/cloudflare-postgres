@@ -21,6 +21,7 @@ import {
 import { R2_ACTIONS } from "../../src/crypto/r2-credentials.ts";
 import {
   ACCOUNT_ID,
+  addNode,
   cleanup,
   ENDPOINT,
   keyedEnv,
@@ -125,6 +126,73 @@ it("signs the credential for the node's own prefix when the node reads it, and s
     PARENT_KEY.R2_PARENT_SECRET_ACCESS_KEY,
   ])
     expect(stored).not.toContain(secret);
+});
+
+it("names the one bucket's EU endpoint for a database in us-dev, which has no endpoint of its own", async () => {
+  const f = await lifecycle(),
+    now = Date.now();
+  // us-dev as the live installation has it: a region of its own whose database is archived into
+  // the one bucket, which is in the EU jurisdiction and served only at the .eu. endpoint. The
+  // region once named the account's general endpoint, and nothing could correct it.
+  const usNode = await addNode(f.foreign);
+  const before = await f.row();
+  const path = before.archive_path.replace(`/${f.region}/`, `/${f.foreign}/`);
+  await env.DB.prepare(
+    "UPDATE databases SET region_id=?,node_id=?,archive_path=? WHERE id=?",
+  )
+    .bind(f.foreign, usNode, path, f.id)
+    .run();
+  const reference = await ensureArchiveCredential(
+    env.DB,
+    { nodeId: usNode, archivePath: path, access: "read_write" },
+    now,
+  );
+  const credential = await deliverArchiveCredential(
+    keyedEnv(),
+    usNode,
+    reference.id,
+    now + 1000,
+  );
+  expect(credential).toMatchObject({ path, endpoint_url: ENDPOINT });
+  expect(claimsOf(credential!)).toMatchObject({
+    bucket: env.ARCHIVE_BUCKET_NAME,
+    sub: ACCOUNT_ID,
+    aud: `${ACCOUNT_ID}.eu.r2.cloudflarestorage.com`,
+  });
+  // The same endpoint for the region of the eu- node.
+  const eu = await ensureArchiveCredential(
+    env.DB,
+    { nodeId: f.node, archivePath: before.archive_path, access: "read_only" },
+    now,
+  );
+  expect(
+    await deliverArchiveCredential(keyedEnv(), f.node, eu.id, now + 1000),
+  ).toMatchObject({ endpoint_url: ENDPOINT });
+});
+
+it("is unavailable while the endpoint of the archive bucket is missing or names no account", async () => {
+  const f = await lifecycle(),
+    row = await f.row(),
+    now = Date.now();
+  const reference = await ensureArchiveCredential(
+    env.DB,
+    { nodeId: f.node, archivePath: row.archive_path, access: "read_write" },
+    now,
+  );
+  for (const ARCHIVE_ENDPOINT_URL of [
+    "",
+    "not a url",
+    `http://${ACCOUNT_ID}.eu.r2.cloudflarestorage.com`,
+    `https://${["archive", "invalid"].join(".")}`,
+  ])
+    await expect(
+      deliverArchiveCredential(
+        { ...keyedEnv(), ARCHIVE_ENDPOINT_URL },
+        f.node,
+        reference.id,
+        now,
+      ),
+    ).rejects.toThrow("archive_credentials_unavailable");
 });
 
 it("reads only for the node it was issued to, until it expires", async () => {
@@ -294,7 +362,7 @@ it("is unavailable, with nothing to leak, while the Worker has no parent key", a
   ).rejects.toThrow("archive_credentials_unavailable");
 });
 
-it("refuses a region whose bucket is not the one the path names", async () => {
+it("refuses a path whose bucket is not the one this Worker is bound to", async () => {
   const f = await lifecycle(),
     row = await f.row(),
     now = Date.now();
@@ -303,13 +371,13 @@ it("refuses a region whose bucket is not the one the path names", async () => {
     { nodeId: f.node, archivePath: row.archive_path, access: "read_write" },
     now,
   );
-  await env.DB.prepare(
-    "UPDATE regions SET backup_bucket='another-bucket' WHERE id=?",
-  )
-    .bind(f.region)
-    .run();
   await expect(
-    deliverArchiveCredential(keyedEnv(), f.node, reference.id, now),
+    deliverArchiveCredential(
+      { ...keyedEnv(), ARCHIVE_BUCKET_NAME: "another-bucket" },
+      f.node,
+      reference.id,
+      now,
+    ),
   ).rejects.toThrow("archive_credentials_unavailable");
 });
 

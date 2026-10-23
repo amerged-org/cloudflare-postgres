@@ -5,8 +5,8 @@ import type { Env } from "../env.ts";
 import { withAdmissionMutation } from "./admission-mutations.ts";
 import { failMovesOfLostNode } from "./database-moves.ts";
 import { fenceActionsFromEnv } from "./fence-actions.ts";
+import { archiveEndpoint } from "./archive-bucket.ts";
 import { hintNode } from "./node-hints.ts";
-import { accountOf } from "./node-tunnel.ts";
 import { reinstallBlockers, reinstallOverridden } from "./reinstall-guard.ts";
 import { markNodeLost, NodeStateError } from "./node-state.ts";
 
@@ -30,7 +30,7 @@ export interface FenceTarget {
   regionId: string;
   /** The provider's ID of the node's instance; null if the node was never bound to one. */
   providerInstanceId: string | null;
-  /** The Cloudflare account that holds the Tunnel; null if the region's endpoint does not name it. */
+  /** The Cloudflare account that holds the Tunnel; null if `ARCHIVE_ENDPOINT_URL` does not name it. */
   accountId: string | null;
   /**
    * Whether the node ever read its credentials, which makes its Tunnel under the name the node ID
@@ -212,7 +212,6 @@ interface FencingRow {
   node_id: string;
   region_id: string;
   provider_instance_id: string | null;
-  backup_endpoint_url: string;
   gateway_url: string | null;
   tunnel_deleted_at: string | null;
   power_off_requested_at: string | null;
@@ -229,19 +228,21 @@ const ACTION_ERRORS = new Set(["fence_unconfigured", "tunnel_unknown"]);
  * what a service said when it failed is never kept.
  */
 export async function runNodeFencing(
-  env: Pick<Env, "DB">,
+  env: Pick<Env, "DB" | "ARCHIVE_ENDPOINT_URL">,
   now: number,
   actions: FenceActions,
 ): Promise<string[]> {
   const rows = (
     await env.DB.prepare(
-      `SELECT l.node_id,l.region_id,n.provider_instance_id,r.backup_endpoint_url,n.gateway_url,l.tunnel_deleted_at,l.power_off_requested_at
-      FROM node_losses l JOIN nodes n ON n.id=l.node_id JOIN regions r ON r.id=l.region_id
+      `SELECT l.node_id,l.region_id,n.provider_instance_id,n.gateway_url,l.tunnel_deleted_at,l.power_off_requested_at
+      FROM node_losses l JOIN nodes n ON n.id=l.node_id
       WHERE l.powered_off_at IS NULL ORDER BY l.declared_at,l.node_id LIMIT ?`,
     )
       .bind(FENCING_PER_RUN)
       .all<FencingRow>()
   ).results;
+  // The Tunnels are in the account that holds the installation's archive bucket.
+  const accountId = archiveEndpoint(env)?.accountId ?? null;
   const at = iso(now),
     failures: string[] = [];
   for (const row of rows) {
@@ -249,7 +250,7 @@ export async function runNodeFencing(
       nodeId: row.node_id,
       regionId: row.region_id,
       providerInstanceId: row.provider_instance_id,
-      accountId: accountOf(row.backup_endpoint_url),
+      accountId,
       tunnelMade: row.gateway_url !== null,
     };
     const fail = async (code: string) => {

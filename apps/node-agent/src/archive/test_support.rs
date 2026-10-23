@@ -306,9 +306,21 @@ impl Drop for Fixture {
     }
 }
 
+/// The database of the test node.
+pub const DATABASE: &str = "abcdefghijklmnopqrst";
+
+/// The callers of the test node: the processes of one uid speak for its one database, as the
+/// machine's slots do for the database of the slot a process is in.
+pub struct TestCallers(pub u32);
+impl super::server::Callers for TestCallers {
+    fn database_of(&self, uid: u32, _pid: u32) -> Option<String> {
+        (uid == self.0).then(|| DATABASE.to_string())
+    }
+}
+
 pub fn database(volume: &Path) -> Database {
     Database {
-        id: "abcdefghijklmnopqrst".into(),
+        id: DATABASE.into(),
         user: "pgcf-abcdefghijklmnopqrst".into(),
         volume: volume.into(),
         device: "/dev/mapper/pgcf-db_abcdefghijklmnopqrst_g1".into(),
@@ -389,7 +401,13 @@ impl Node {
         ));
         let socket = root.join("a.sock");
         let server = Arc::new(
-            Server::new(table.clone(), jobs.clone(), credentials.clone()).with_bound(bound),
+            Server::new(
+                table.clone(),
+                jobs.clone(),
+                credentials.clone(),
+                Arc::new(TestCallers(uid)),
+            )
+            .with_bound(bound),
         );
         let task = tokio::spawn(server.serve(bind(&socket).unwrap()));
         let node = Self {
@@ -414,7 +432,6 @@ impl Node {
     pub fn register(&self, recovery: Option<Recovery>) {
         self.table.set(Registration {
             database: database(&self.volume()),
-            uid: self.uid,
             store: store(ARCHIVE, Access::ReadWrite),
             recovery,
             upload_log: self.log(),
