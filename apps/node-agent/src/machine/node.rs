@@ -71,12 +71,21 @@ impl Node {
         storage: Config,
         slots: Range<u32>,
     ) -> Result<Self, crate::Error> {
+        let node = Self::connect_unopened(layout, storage, slots).await?;
+        node.open_storage().await?;
+        Ok(node)
+    }
+
+    /// `connect` without the storage: the connection to systemd and the node's tables. The agent
+    /// asks Cloudflare for its first page while the storage opens (`open_storage`), and the link
+    /// needs the node's boot and packages and nothing of LVM.
+    pub async fn connect_unopened(
+        layout: Layout,
+        storage: Config,
+        slots: Range<u32>,
+    ) -> Result<Self, crate::Error> {
         let units = Units::connect(layout.volumes()).await?;
         let storage = Arc::new(Storage::new(SystemRunner, storage));
-        {
-            let storage = storage.clone();
-            tokio::task::spawn_blocking(move || storage.open()).await??;
-        }
         // What the agent keeps of its own, below a directory only root reads.
         crate::link::file::create_private_directory(&layout.agent())?;
         let users = Users::load(layout.uids())?;
@@ -93,14 +102,37 @@ impl Node {
             legacy: Mutex::new(BTreeMap::new()),
         })
     }
+
+    /// Opens the node's storage: the volume group and the pool exist as plan 4.3 describes, or are
+    /// made, and are active. A pool that needed more than `vgchange` after a reset that was not
+    /// clean is said so.
+    pub async fn open_storage(&self) -> Result<(), crate::Error> {
+        let activation = {
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || storage.open()).await??
+        };
+        // The pool needed more than `vgchange` after a reset that was not clean: say so.
+        if !activation.released_parts.is_empty() {
+            crate::timing::emit_event(serde_json::json!({
+                "event": "thin_pool_parts_released", "count": activation.released_parts.len(),
+            }));
+        }
+        if activation.repair_run {
+            crate::timing::emit_event(serde_json::json!({"event": "thin_pool_repair_activation"}));
+        }
+        Ok(())
+    }
     /// The agent's start, and only the agent's (not the check's, which runs `connect` too): the
-    /// device links of an earlier agent are dropped, because the namespace that held the volumes
-    /// they name is gone. Each volume gets its link back when it is attached.
+    /// device links of an earlier agent are dropped. Its namespace may be gone with the volumes the
+    /// links name (an agent that could not join the holder's, `mount_holder`), and where the holder
+    /// kept them mounted a link is made again at once when the database is decided on, because
+    /// the volume is attached already. Each volume gets its link back when it is attached.
     pub async fn reset_device_links(&self) -> Result<(), storage::Error> {
         self.storage(|storage| storage.reset_device_links()).await
     }
-    /// The agent's exit: its mounts of the volumes go, many at once, before the kernel would end
-    /// them one by one with the namespace (`Storage::unmount_all`).
+    /// The exit of an agent that did not join the holder's namespace (`mount_holder`): its mounts
+    /// of the volumes go, many at once, before the kernel would end them one by one with the
+    /// namespace (`Storage::unmount_all`).
     pub async fn release_mounts(&self) {
         let _ = self
             .storage(|storage| {
@@ -595,7 +627,7 @@ impl Machine for Node {
     }
 
     async fn run_tmpfiles(&self, file: &str) -> io::Result<()> {
-        run("systemd-tmpfiles", &["--create", file]).await
+        run("systemd-tmpfiles", &tmpfiles_arguments(file)).await
     }
 
     async fn installed_packages(&self) -> io::Result<BTreeMap<String, String>> {
@@ -800,9 +832,28 @@ impl Machine for Node {
     }
 }
 
+/// The words of the run of a tmpfiles file: what it creates, and what it removes. `--create` alone
+/// ignores the `r` lines (checked with systemd-tmpfiles 257.13); the files of the image that
+/// remove something, `pgcf-journal.conf`, are only run with `--remove`.
+fn tmpfiles_arguments(file: &str) -> [&str; 3] {
+    ["--create", "--remove", file]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tmpfiles_file_is_run_to_create_and_to_remove() {
+        assert_eq!(
+            tmpfiles_arguments("/usr/lib/tmpfiles.d/pgcf-journal.conf"),
+            [
+                "--create",
+                "--remove",
+                "/usr/lib/tmpfiles.d/pgcf-journal.conf"
+            ]
+        );
+    }
 
     /// A wake looks its database's user up twice, in a file with a line for every database.
     #[test]

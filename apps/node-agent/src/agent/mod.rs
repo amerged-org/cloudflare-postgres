@@ -100,8 +100,9 @@ pub struct Timing {
     pub detail: Duration,
     /// How long a build waits for an archive credential that has not been delivered (its own, or
     /// its source's) before it fails with `archive_unusable`: the pull that begins or resumes a
-    /// build is also the one that reads the credentials, and a read that failed is made again by
-    /// the next pull (`Core::build`).
+    /// build is also the one that reads the credentials (the first page's are read after it is
+    /// applied), a read that failed is made again by the next pull, and a credential that arrives
+    /// (`Core::deliver`) begins the waiting build at once (`Core::build`).
     pub credential_wait: Duration,
 }
 impl Default for Timing {
@@ -361,6 +362,9 @@ pub struct Core<M: Machine> {
     taken: Mutex<std::collections::HashSet<String>>,
     /// The R2 endpoint each archive path was delivered with.
     endpoints: Mutex<HashMap<String, String>>,
+    /// The databases whose archive could not be registered because their credential had not
+    /// arrived (`ensure_archive`): the first page is applied before the credentials are read.
+    archive_waiting: Mutex<std::collections::HashSet<String>>,
     dbs: Mutex<HashMap<String, Arc<Db>>>,
     /// The databases whose unit was awake when the agent started: the gateway's first table must
     /// show them running (`settled`).
@@ -433,6 +437,7 @@ impl<M: Machine> Core<M> {
             maintenance: AtomicBool::new(false),
             taken: Mutex::new(std::collections::HashSet::new()),
             endpoints: Mutex::new(HashMap::new()),
+            archive_waiting: Mutex::new(std::collections::HashSet::new()),
             dbs: Mutex::new(HashMap::new()),
             awake_at_start,
             resumed: Mutex::new(
@@ -577,7 +582,7 @@ impl<M: Machine> Core<M> {
 
     /// A credential Cloudflare delivered (`ArchiveCredential`): kept for the jobs and the archive
     /// socket, with the R2 endpoint of its archive path.
-    pub fn deliver(&self, credential: &serde_json::Value) -> Result<(), crate::Error> {
+    pub fn deliver(self: &Arc<Self>, credential: &serde_json::Value) -> Result<(), crate::Error> {
         let text = |key: &str| credential[key].as_str().ok_or("credential field missing");
         let access = match text("access")? {
             "read_write" => Access::ReadWrite,
@@ -604,8 +609,37 @@ impl<M: Machine> Core<M> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(path.to_string(), text("endpoint_url")?.to_string());
+        // The databases that were decided on before their credential came reach R2 now, not at
+        // PostgreSQL's next try.
+        let waiting: Vec<String> = self
+            .archive_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .collect();
+        for id in waiting {
+            if let Some(db) = self.find(&id)
+                && let Some(entry) = db.view().entry.clone()
+            {
+                self.ensure_archive(&db, &entry);
+            }
+        }
+        // A build that waits for a credential (`Core::build`) begins when it arrives, not at the
+        // next pull: the first page is applied before the credentials are read.
+        for db in self.all() {
+            if db.view().credential_missing_since_ms.is_some() {
+                self.schedule(&db);
+            }
+        }
         Ok(())
     }
+
+    /// Whether the agent held the database when it started with a unit that ran: its archiver is
+    /// the one that waits for the credential (`deliver`).
+    pub fn ran_at_start(&self, id: &str) -> bool {
+        self.awake_at_start.contains(id)
+    }
+
     /// The store of an archive path the node holds a credential for; `None` before it was delivered.
     pub(crate) fn store(&self, path: &str, access: Access) -> Option<Store> {
         let endpoint = self

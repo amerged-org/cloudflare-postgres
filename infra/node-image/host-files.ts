@@ -54,6 +54,7 @@ export const HOST_FILE_APPLY: Record<string, HostFile["apply"]> = {
   "/usr/lib/systemd/system/pgcf-slot@.service": "next_start",
   "/usr/lib/systemd/system/pgcf.slice": "daemon_reload",
   "/usr/lib/systemd/system/pgcfbackup.slice": "daemon_reload",
+  "/usr/lib/tmpfiles.d/pgcf-journal.conf": "tmpfiles",
   "/usr/lib/tmpfiles.d/pgcf.conf": "tmpfiles",
 };
 

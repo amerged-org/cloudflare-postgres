@@ -123,8 +123,12 @@ changes nothing). A node is never declared lost from staleness alone, and fencin
 database moves (plan 7.11, 9.4).
 
 1. Read `/v1/operational-health?scope=nodes` and verify the actual node UID. A node whose newest
-   sample is older than 180 seconds is stale: placement excludes it and `regional_node_stale`
-   fires, and that does not declare it lost or authorize a replacement order. Look at the node
+   sample is older than 180 seconds is stale: placement excludes it, its region is no longer
+   listed to integrators as accepting placement until the node reports again, and
+   `regional_node_stale` fires; that does not declare it lost or authorize a replacement order.
+   Its `ready`, `schedulable` and placement flags stay as they were: they are the operator's and
+   the lost-node procedure's, and the closure is read from the observation each time, so nothing
+   stays closed once the node reports. Look at the node
    first ([below](#looking-at-a-node)); a silent node answers nothing, so check the instance in the
    Contabo panel.
 2. Submit `POST /v1/nodes/{id}/mark-lost` with
@@ -367,6 +371,85 @@ Thin physical allocation metrics stay null until a real measurement exists; neit
 quota nor zero stands in for an unknown measurement. The agent's full-pool and full-volume recovery
 is tested against lab volumes; the live test (Stage 5.5 of the ULTRA plan) has not run yet.
 
+## The thin pool does not activate
+
+A node that was reset hard (a power cut, a Contabo `stop`, a host failure) can come back with its
+thin pool `pgcf/pgcf_thinpool` inactive and every database on it down. lvm2 runs `thin_check -q` on
+the pool's metadata when it activates the pool and refuses the pool when the check ends with a
+status other than 0. EU1 was down for 27 minutes in this state (2026-10-23): one leaked data block,
+`thin_check` status 64, `vgchange --activate y pgcf` status 5, and the agent restarted 798 times.
+
+**What the agent repairs by itself.** A leaked block is a data block that the space map counts as
+used and no mapping uses: free space lost, no data lost. When `vgchange` is refused, the agent
+(`Storage::open`)
+
+1. deactivates a part of the pool that is active on its own (`pgcf_thinpool_tmeta` or
+   `pgcf_thinpool_tdata`, which an inspection leaves active and which keeps lvm2 from activating
+   the pool) and activates again; the event is `thin_pool_parts_released`;
+2. otherwise, or when that activation is refused too, activates once more with `--auto-repair`
+   added to the check options the host has (`thin_check_options=["-q","--auto-repair"]`); the
+   event is `thin_pool_repair_activation`.
+
+`thin_check --auto-repair` is documented as "automatically repair any trivial issues found with the
+metadata, currently only fixes metadata leaks": it rewrites the data space map after it read the
+mapping trees without an error. When a tree or a checksum is wrong it writes nothing (lab: the
+metadata is the same bytes afterwards) and the activation is refused as before. The agent never runs
+`thin_repair` or `lvconvert --repair`: what becomes of a pool whose trees are wrong is the
+operator's decision.
+
+**Recognising the case the agent does not repair.** All of these hold:
+
+- the node's journal (`journalctl -u pgcf-agent`, or the boot report once the node links again)
+  says `agent_failed` with the class `vgchange_exit_5`, and the agent starts again about every six
+  seconds (a start that fails waits five seconds before it ends, so that a node does not run the
+  failing commands ten times a second; `systemctl show -p NRestarts pgcf-agent` keeps rising);
+- the node is stale: `regional_node_stale` fires, its newest sample in
+  `/v1/operational-health?scope=nodes` is older than 180 seconds, and its region is no longer
+  listed to integrators as accepting placement;
+- `lvs -a -o lv_name,lv_attr pgcf` shows the pool inactive (`twi---tz--`, no `a` in the fifth
+  place), and no database is running;
+- `thin_check` of the pool's metadata (below) ends with 64 and a message about a tree or a
+  checksum, for example `mapping top-level: node error: checksum error`. Status 64 alone cannot
+  tell a leak from damage: thin-provisioning-tools 1.1.0 ends with 64 for every error, also for an
+  input that does not exist. Read the text. "N data blocks have leaked" and "data space map
+  contains leaks" are the leak the agent repairs; anything else is damage.
+
+**What to do.** Through the operator shell, which is off by default:
+
+1. **Stop the agent first**, and only the agent: `systemctl stop pgcf-agent`. Leave
+   `pgcf-mounts.service` running; it holds the volumes' mount namespace and stopping it unmounts
+   them. Every start of the agent deactivates a part of the pool that it finds active and tries to
+   activate the pool, so a running agent takes away the device an inspection is reading, and on
+   damaged metadata repeats an activation that is refused. Do this before any inspection or repair,
+   and do not start the agent again until step 4 passes.
+2. Read the metadata without changing it. The component is activated read-only on its own, and
+   must be deactivated again before anything activates the pool: a part left active makes
+   `vgchange` refuse with "Activation of logical volume ... is prohibited while logical volume
+   ..._tmeta is active".
+
+   ```sh
+   lvchange --activate y --yes pgcf/pgcf_thinpool_tmeta
+   thin_check /dev/mapper/pgcf-pgcf_thinpool_tmeta; echo "status $?"
+   lvchange --activate n pgcf/pgcf_thinpool_tmeta
+   ```
+
+3. A leak only: activate the pool as the agent would,
+   `vgchange --activate y --config 'global{thin_check_options=["-q","--auto-repair"]}' pgcf`.
+   Damage: stop here. Do not activate, repair or write; nothing on the node repairs a pool whose
+   trees are wrong, and the databases of the node are restored from their R2 archives to another
+   node, as for a [lost node](#lost-node) (which is declared by the operator, never from staleness
+   alone).
+4. Validate before the agent starts again: the pool is active (`lvs -a -o lv_name,lv_attr pgcf`
+   shows `twi-aotz--` and the volumes `Vwi-a-tz--`), and a plain deactivation and activation
+   (`vgchange --activate n pgcf`, then `vgchange --activate y pgcf`) both end with 0, which is
+   lvm2's own `thin_check -q` passing without the repair option.
+5. `systemctl start pgcf-agent`. The agent says `agent_started`, the node reports again within a
+   minute, `regional_node_stale` clears and the region is listed again. The databases that ran when
+   the node was reset are unproven (plan 7.10): the agent starts each one, lets PostgreSQL recover
+   from its WAL and puts it to sleep with a proof, which for many of them at once waits on the WAL
+   uploads (2026-10-23: 68 databases, until about 13:30), and a wake of a database that is not
+   proven yet is refused with `unproven` until then.
+
 ## Node maintenance cycle
 
 The cycle installs the packages that a release pins (a newer Debian snapshot, a kernel update) on
@@ -418,8 +501,9 @@ over VNC or with a one-shot GRUB entry (plan 9.3).
 
 A node that took a release and then stops reporting (no sample, no link, wakes not answered) may
 have an agent that cannot start. Nothing on the node restarts it for good: `pgcf-agent.service`
-has `Restart=always` and `StartLimitIntervalSec=0`, so systemd starts it again every second, and
-with no agent there is no link, no wake and no WAL archiving (the archive socket is the agent's).
+has `Restart=always`, `RestartSec=100ms` and `StartLimitIntervalSec=0`, so systemd starts it again
+100 ms after it ended (a start that fails waits five seconds in the agent first), and with no agent
+there is no link, no wake and no WAL archiving (the archive socket is the agent's).
 Two causes are known, and both are a release that broke a rule of the
 [node image README](../../infra/node-image/README.md#changing-a-unit-or-a-configuration-file-without-a-new-image):
 the new `pgcf-agent.service` cannot start (a path, a user, a directory, a package of the new lock

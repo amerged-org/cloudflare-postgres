@@ -4,8 +4,12 @@
 # mounts stay out of PID 1's namespace, which every unit's executor copies and reads again and
 # again, so that the cost of a start does not grow with the number of volumes. The database units
 # and the jobs mount their volumes themselves (MountImages=, from the links the agent keeps in
-# /run/pgcf/dev). The namespace ends with the agent: its restart mounts every volume again, and
-# never stops a database, because database units are independent units with mounts of their own.
+# /run/pgcf/dev). The agent joins the namespace of pgcf-mounts.service, a transient unit it starts
+# (`pgcf-agent hold`), before its first thread: the namespace then outlives the agent, whose death
+# unmounts nothing (the kernel unmounts a dying process's namespace volume by volume: 14 s with 312
+# volumes). The namespace this unit makes is the one of an agent that could not join, and ends with
+# it. A restart never stops a database, because database units are independent units with mounts
+# of their own.
 [Unit]
 Description=PGCF node agent
 Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
@@ -17,7 +21,12 @@ StartLimitIntervalSec=0
 Type=notify
 ExecStart=/var/lib/pgcf/bin/current/pgcf-agent run
 Restart=always
-RestartSec=1s
+# A killed agent is started again at once: the first wake after `kill -9` waits for it (1 s of
+# the 46 s measured on EU1, 2026-10-23). A start that fails waits in the agent before it ends
+# (`pause_after_failed_start`, 5 s), so that a node whose pool will not activate does not run the
+# same failing commands ten times a second; RestartSteps= is not used because systemd does not
+# reset it after a long run.
+RestartSec=100ms
 KillMode=control-group
 # No filesystem sandboxing beyond this: the agent needs to see the node. Its mounts (volumes,
 # attach, fstrim, resize) are made in the private copy and never reach PID 1 or the executors.

@@ -226,7 +226,7 @@ export function registerPlatform(app: ApiApp): void {
       security,
       tags: ["Regions"],
       description:
-        "An administrator key reads the full region records. An integrator key reads `{id, provider_region}` of the regions that accept placement: at least one node that is ready, schedulable, not lost and open for new databases, and nothing else about nodes, capacity or cost. Choose `region_id` of a new database from this list.",
+        "An administrator key reads the full region records. An integrator key reads `{id, provider_region}` of the regions that accept placement: at least one node that is ready, schedulable, not lost, open for new databases and has reported in the last 180 seconds (a node that went silent closes its region until it reports again), and nothing else about nodes, capacity or cost. Choose `region_id` of a new database from this list.",
       request: { query: ListQuery },
       responses: response(
         z.union([listEnvelope(Region), listEnvelope(PlacementRegion)]),

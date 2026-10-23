@@ -82,15 +82,21 @@ export interface PlacementNeed {
 }
 
 /**
- * A region accepts placement while one of its nodes is ready, schedulable, not lost and open for
- * new databases. A moment without fresh samples or free capacity does not change that: the create
- * is accepted and waits for it.
+ * A region accepts placement while one of its nodes is ready, schedulable, not lost, open for new
+ * databases and has reported in the last 180 s (`NODE_OBSERVATION_MAX_AGE_MS`, the bound of
+ * `regional_node_stale` and of `choosePlacement`). Free capacity does not change that: the create
+ * is accepted and waits for it. A node that went silent closes its region for as long as it is
+ * silent and opens it with its next report; nothing is stored, so nothing can stay closed.
+ * Found live (EU1, 2026-10-23): a node down for 27 minutes stayed ready, schedulable and open, and
+ * its region stayed in an integrator's list.
  */
 export function regionAcceptsPlacementSql(region = "regions"): string {
   if (!/^[a-z][a-z0-9_]*$/.test(region))
     throw new Error("invalid_region_placement_alias");
   return `EXISTS(SELECT 1 FROM nodes accepting WHERE accepting.region_id=${region}.id AND accepting.ready=1 AND accepting.schedulable=1
-    AND accepting.lost_at IS NULL AND accepting.database_placement_enabled=1 AND accepting.database_placement_closed_at IS NULL)`;
+    AND accepting.lost_at IS NULL AND accepting.database_placement_enabled=1 AND accepting.database_placement_closed_at IS NULL
+    AND julianday(accepting.last_observed_at)>=julianday('now','-${NODE_OBSERVATION_MAX_AGE_MS / 1000} seconds')
+    AND julianday(accepting.last_observed_at)<=julianday('now','+${CLOCK_SKEW_MS / 1000} seconds'))`;
 }
 
 /** The node reported in the last 180 s. */

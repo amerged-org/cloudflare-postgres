@@ -21,8 +21,25 @@ use tokio::{sync::Notify, time::Instant};
 /// with it, or with the next observation report if that comes first.
 pub(crate) const ALONE_EVERY: Duration = Duration::from_secs(1);
 
-/// The events waiting for the next report, oldest first. A full ring drops its oldest event: a
-/// node that cannot report keeps its newest.
+/// The lines that say how the agent started, or why it did not, and what its storage needed to
+/// start: one or two a process, and the ones an operator reads first after a kill or a reset. A
+/// flood of other events (every refused wake is one) does not push them out of the ring.
+const KEPT: [&str; 6] = [
+    "agent_started",
+    "agent_failed",
+    "agent_restarting",
+    "mount_holder_unavailable",
+    "thin_pool_repair_activation",
+    "thin_pool_parts_released",
+];
+fn kept(event: &Value) -> bool {
+    event["event"]
+        .as_str()
+        .is_some_and(|name| KEPT.contains(&name))
+}
+
+/// The events waiting for the next report, oldest first. A full ring drops its oldest event, the
+/// kept ones last: a node that cannot report keeps its newest.
 pub(crate) struct Ring {
     events: VecDeque<Value>,
     /// When a report of events alone last took events.
@@ -43,9 +60,13 @@ impl Ring {
             .expect("generated bound") as usize
     }
 
+    /// Drops the oldest events beyond the bound, but the kept ones (`KEPT`) last: only a ring that
+    /// holds nothing else drops one of those.
     fn trim(&mut self) {
-        let excess = self.events.len().saturating_sub(Self::capacity());
-        self.events.drain(..excess);
+        while self.events.len() > Self::capacity() {
+            let oldest = self.events.iter().position(|event| !kept(event));
+            self.events.remove(oldest.unwrap_or(0));
+        }
     }
 
     pub(crate) fn push(&mut self, event: Value) {
@@ -277,6 +298,53 @@ mod tests {
         let mut again = json!({});
         ring.attach(&mut again);
         assert!(again.get("events").is_none());
+    }
+
+    /// Found live (EU1, 2026-10-23): after a `kill -9` the new agent's `agent_started` was in the
+    /// node's journal and never reached Workers Logs. The ring holds the newest 64 events, and the
+    /// first seconds of a restarted agent log more than that (every refused wake is an event: 119
+    /// in the first seconds, while the first reports of a node with 300 databases are still being
+    /// posted), so a flood drops the one line that says the agent started. The few lines that
+    /// explain a start are kept ahead of the rest.
+    #[test]
+    fn the_events_that_say_how_the_agent_started_survive_a_flood_of_others() {
+        let max = Ring::capacity() as u64;
+        let mut ring = Ring::new();
+        ring.push(event("wake", 0));
+        ring.push(event("agent_started", 1));
+        for n in 2..max + 40 {
+            ring.push(event("wake", n));
+        }
+        let mut report = json!({});
+        ring.attach(&mut report);
+        let seen = names(&report);
+        assert_eq!(seen.len() as u64, max);
+        // In the order they happened: the start, then the newest of the flood.
+        assert_eq!(seen[0], ("agent_started".to_string(), 1));
+        assert_eq!(seen[1], ("wake".to_string(), max + 40 - (max - 1)));
+        assert_eq!(seen.last(), Some(&("wake".to_string(), max + 39)));
+
+        // Events that went back after a post that failed are kept the same way.
+        ring.push(event("agent_failed", 7));
+        let mut failed = json!({});
+        ring.attach(&mut failed);
+        for n in 0..max + 5 {
+            ring.push(event("wake", 100 + n));
+        }
+        ring.give_back(&failed);
+        let mut again = json!({});
+        ring.attach(&mut again);
+        let seen = names(&again);
+        assert_eq!(seen.len() as u64, max);
+        assert_eq!(seen[0], ("agent_failed".to_string(), 7));
+
+        // Nothing but the kept kind cannot grow the ring past its bound either.
+        for n in 0..max + 3 {
+            ring.push(event("agent_started", n));
+        }
+        let mut only = json!({});
+        ring.attach(&mut only);
+        assert_eq!(names(&only).len() as u64, max);
     }
 
     #[test]

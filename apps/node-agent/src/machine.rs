@@ -406,7 +406,8 @@ pub trait Machine: Send + Sync + 'static {
     /// file that changed (systemd-sysusers.service runs at a boot only when /usr is newer than
     /// /etc/.updated, which a file in /usr/lib/sysusers.d does not make it).
     fn run_sysusers(&self, file: &str) -> impl Future<Output = io::Result<()>> + Send;
-    /// Runs `systemd-tmpfiles --create <file>`: makes the directories and files the file lists.
+    /// Runs `systemd-tmpfiles --create --remove <file>`: makes the directories and files the file
+    /// lists and removes the files its `r` lines name (`--create` alone leaves them).
     fn run_tmpfiles(&self, file: &str) -> impl Future<Output = io::Result<()>> + Send;
     /// The installed Debian packages and their versions.
     fn installed_packages(
