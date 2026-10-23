@@ -728,7 +728,10 @@ function collectSubjects(rows: readonly SubjectRow[]): RegionSubjects {
   return subjects;
 }
 
-/** A node refusing this many wakes for awake capacity within the window is an alert. */
+/**
+ * A node refusing this many wakes for awake capacity or for a full start queue within the window
+ * is an alert.
+ */
 const CAPACITY_REFUSAL_COUNT = 5;
 const CAPACITY_REFUSAL_WINDOW_MS = 600_000;
 /** The share of a volume's space or inodes from which the database is warned, and warned loudly. */
@@ -773,7 +776,7 @@ async function readNodeSubjects(
         ORDER BY n.id LIMIT 16)
       UNION ALL SELECT * FROM (SELECT 'regional_node_capacity_refusals','failing',n.id,NULL
         FROM nodes n,p WHERE n.region_id=p.region AND n.lost_at IS NULL
-          AND (SELECT COALESCE(SUM(refused_no_headroom),0) FROM node_minutes WHERE node_id=n.id AND minute>p.refused_since)>=${CAPACITY_REFUSAL_COUNT}
+          AND (SELECT COALESCE(SUM(refused_no_headroom+refused_start_queue),0) FROM node_minutes WHERE node_id=n.id AND minute>p.refused_since)>=${CAPACITY_REFUSAL_COUNT}
         ORDER BY n.id LIMIT 64)
       UNION ALL ${volume("database_volume_warning", `(${measured} AND ${reached(VOLUME_WARNING_PERCENT)} AND NOT ${reached(VOLUME_CRITICAL_PERCENT)})`)}
       UNION ALL ${volume("database_volume_critical", `(${measured} AND ${reached(VOLUME_CRITICAL_PERCENT)})`)}`,

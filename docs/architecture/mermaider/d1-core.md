@@ -149,5 +149,6 @@ erDiagram
 - [apps/api/migrations/0083_credentials_state.sql:1](../../../apps/api/migrations/0083_credentials_state.sql#L1)
 - [apps/api/migrations/0084_single_archive_bucket.sql:1](../../../apps/api/migrations/0084_single_archive_bucket.sql#L1)
 - [apps/api/migrations/0085_unreserved_role_names.sql:1](../../../apps/api/migrations/0085_unreserved_role_names.sql#L1)
+- [apps/api/migrations/0086_node_minutes_start_queue.sql:1](../../../apps/api/migrations/0086_node_minutes_start_queue.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

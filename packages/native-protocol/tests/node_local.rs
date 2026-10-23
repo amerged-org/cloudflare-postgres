@@ -98,8 +98,8 @@ fn a_refused_wake_is_answered_with_the_detail_and_hint_of_the_contract() {
         let seconds = vector["retry_after_seconds"].as_u64().map(|s| s as u32);
         assert_eq!(
             seconds.is_some(),
-            reason == wake::RETRY_REASON,
-            "{reason} carries the retry hint exactly when it is the one waiting can undo"
+            wake::RETRY_REASONS.contains(&reason),
+            "{reason} carries the retry hint exactly when it is one that waiting can undo"
         );
         assert_eq!(
             wake::refusal_detail(reason),
