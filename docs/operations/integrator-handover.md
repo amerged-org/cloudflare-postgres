@@ -247,7 +247,7 @@ pgcf -i -X POST "$PGCF_API/v1/databases" -H 'Content-Type: application/json' \
 What happens: the database record (generation 1) and the owner role `app` with a server-generated
 password are written (`pgcf_maintenance` is only a reserved name); the
 placement step picks the node that is the fullest of those that stay under 80 % active RAM and 80 %
-CPU load, each as the highest 30-minute average of the last seven days, and whose thin pool is
+CPU load, each as the highest 30-minute average of the last three days, and whose thin pool is
 open (data below 80 %, metadata below 50 %, sold storage within four times its data) and that holds
 fewer than 1,000 volumes. A database placed after the node's newest sample counts at its full
 memory until that sample exists, and the newest sample's active RAM counts when it is above the average. The node then creates the volume

@@ -19,7 +19,7 @@ export const NODE_UID_HEADER = "X-PGCF-Node-Uid";
 const MINUTE_MS = 60_000;
 /** Samples of the last minute are written this long after it ends if no later sample arrived. */
 const FLUSH_DELAY_MS = 5_000;
-/** The minute rollups placement reads are kept this long (plan 4.8: the peak of 7 days). */
+/** The minute rollups are kept this long: longer than the peak window placement reads (plan 4.8: 3 days). */
 const ROLLUP_RETENTION_MINUTES = 8 * 24 * 60;
 
 /** The sample columns of one `node_minutes` row, folded from the samples of that minute. */

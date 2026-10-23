@@ -1280,7 +1280,7 @@ or a reboot), so the two disagree until then.
 ## Capacity policy, purchases and notifications
 
 Placement follows plan 4.8 and needs no policy: a node takes new databases until its active RAM or
-its CPU load reaches 80 %, each measured as the highest 30-minute average of the last seven days,
+its CPU load reaches 80 %, each measured as the highest 30-minute average of the last three days,
 and the fullest qualifying node wins. Two more things close a node to new databases, and neither is
 a policy field: its thin pool (data at 80 %, metadata at 50 %, or the sold storage at four times its
 data) and **1,000 thin volumes**, the largest count Stage 1 measured on EU1 and the constant
