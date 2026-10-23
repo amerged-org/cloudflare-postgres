@@ -29,6 +29,20 @@ Measure EU1 and US1 independently from a Cloudflare Worker through the public en
 | Backup and alerts | G5 delivery and G6 real decrypt/import plus export-window checks passed. Reuse them. Verify the next scheduled backup in the new bucket; the 2026-10-24 00:00 UTC run was still future at the baseline read. |
 | Outstanding test resources | EU1 retains 311 test databases, including the 59 cold-gate databases. US1 retains two leaked deleted-database volumes/accounts. Preserve the cold cohort until measured and uncommitted `volfmt`/`ci-race` work until reconciled. |
 
+## Delivery progress — code integrated, live acceptance still open
+
+| Completed implementation | Validation and boundary |
+| --- | --- |
+| Scope committed (`756dd227`) | Original 2,220-line plan retained; no timed canary, no integrator implementation, growth-based full-volume recovery and PITR identity parity recorded. |
+| Same-node move refusal (`b96dabb6`) | Red-first regression; 24 API move tests passed. Refusal occurs before any mutation. |
+| Filesystem-based disk health (`a3d8a10f`) | Red-first full-filesystem/expanded-LV regression; 27 API tests passed. Current node/generation and mounted filesystem determine health; nominal usage allocation stays unchanged. Independent review found no correctness issue. |
+| Bounded control work (`fcac0947`) | Three unbounded heartbeat waits reproduced and fixed; package checks: 102 API and 5 contract tests. Capacity alerts follow the actual predicate; live cron placement/latency remains to verify. |
+| Small-class ANALYZE (`1ea3471b`) | Pinned Rust 1.99.0 and real PostgreSQL 18.6: 26 settings/recovery/limits tests passed. Ordinary samples bounded; expression workloads remain documented. No live acceptance claimed. |
+| Delete/reclaim and pool recovery (`3401ec40`) | Red-first timeout and corrupt-state regressions; 85 API, 6 contract and 8 native Linux tests passed. An accepted delete remains pending until confirmed cleanup; historical failed operations are not silently rewritten. |
+| Integrated API checks | 128 tests across 9 affected control/health/lifecycle suites passed after integration. Full final CI, image qualification and Dev deployment remain open. |
+
+The new PITR wire definition is integrated behind capability gating; its API and native consumer are still being implemented. No candidate release from this delivery has been deployed. Current live nodes remain on baseline B.
+
 ## Completion sequence
 
 ### A. Finish one correctness release
