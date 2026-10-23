@@ -316,8 +316,9 @@ is DONE, so it is never writable before it is restorable. The idle time
 - **No capacity.** If no node qualifies, the call still returns `202`: `node_id` is `null`,
   `observed_state` is `pending` and `status_message` is `Waiting for verified regional capacity`.
   A minute cron places it when a node qualifies.
-  This wait has no timeout of its own (every other operation fails with `operation_timeout` after
-  20 minutes without a report); set your own deadline and delete the database to cancel.
+  This wait has no timeout of its own; set your own deadline and delete the database to cancel.
+  Accepted deletions also have no timeout ([2.6](#26-delete)); other regional operations fail with
+  `operation_timeout` after 20 minutes without a report.
 - **Placement window.** The peak that placement counts is the highest 30-minute average of a
   node's active RAM and of its CPU load within the placement window. The window is 3 days (owner
   decision O6 of 2026-10-23, plan 11.3; `PEAK_WINDOW_MS` on main). The plan's Open row "Placement is
@@ -523,6 +524,13 @@ the slot-pool release, part 1"). The name is free at once. The backup archive is
 (the API does not return that date). Role credentials and attributes are retained with it; a role
 awaiting its removal is not. A project can be deleted only after all its databases have finished
 deleting. Retained archives are removed by a cron after expiry.
+
+An accepted deletion cannot be cancelled. Its operation stays `pending` or `running` until the
+node confirms that PostgreSQL, its owned volumes, its account and its local files are gone; only
+then does it succeed. It does not fail merely because cleanup takes more than 20 minutes. The
+agent retries failed cleanup steps and `database_delete_incomplete` alerts the operator after ten
+minutes without completed cleanup. Repeating `DELETE` returns the same operation. A client may
+stop polling at its own deadline, but that does not cancel deletion or prove cleanup complete.
 
 A `409 conflict` from `DELETE` deletes nothing. Reason `mutation_in_progress` means another change
 to the same database holds it at that moment: a wake, an idle sleep or its compensation, a move or a
@@ -1293,6 +1301,7 @@ measurement is fresh and below the threshold. A recurrence has the same `event_i
 | `database_archive_failing`                                    | a running, awake database reports `health.archiving: failing`                                                                                | fixed    |
 | `database_base_backup_stale`                                  | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count         | fixed                              |
 | `thin_storage_blocked`                                        | a node's newest sample says its thin pool has no room, or a node that holds databases has no sample of its pool within 180 s (`thin_pool_*`) | fixed                                             |
+| `database_delete_incomplete`                                  | a database was deleted more than 10 minutes ago and its node has not removed all of it (not reported `deleted`, or a volume of it still reported) | fixed                                             |
 | `regional_node_capacity_refusals`                             | a node refused 5 or more wakes for awake capacity or a full start queue (`57P03`) in 10 minutes                                                                    | fixed                                             |
 | `regional_node_pool_closed`                                   | the smallest size class on offer fits no node of the region (one full node beside a qualifying node is no episode): pool data at 80 %, metadata at 50 %, sold storage plus that class past 4 times pool data, 1,000 volumes, or insufficient RAM/CPU. RAM counts max(three-day peak, current sample) plus class memory; CPU uses the three-day peak and must fit physical cores. Peaks are 30-minute averages; both loads must stay below 80 %. Transient pending placements' RAM is excluded from this alert | fixed                                             |
 | `database_volume_warning`, `database_volume_critical`         | a database volume's space or inodes are at least 80 % (below 90 %), or at least 90 %, used                                                   | fixed                                             |
@@ -1585,7 +1594,7 @@ there is.
 | `error.code`                                                    | Meaning                                                                                                                                                                                           |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `superseded`                                                    | a newer intent (resize, delete or power change) replaced it; not a platform fault                                                                                                                 |
-| `operation_timeout`                                             | no report for 20 minutes: 20 minutes after the operation was placed, or after the node's last report that a create or restore is `building`, which each pull of the page repeats ("Regional operation exceeded 20 minutes"); or a create or restore still building 24 hours after its placement ("Build exceeded 24 hours after its placement") |
+| `operation_timeout`                                             | except for accepted `database.delete`: no report for 20 minutes after placement or the node's last repeated `building` report ("Regional operation exceeded 20 minutes"); or a create or restore still building 24 hours after placement ("Build exceeded 24 hours after its placement") |
 | `power_busy`, `power_archive`, `power_unknown`, `power_timeout` | a suspend or hibernation was refused or timed out; the database returned to running                                                                                                               |
 | `role_not_droppable`                                            | `database.role.delete`: the role owns objects or holds privileges, so PostgreSQL cannot drop it; it stays unable to log in until they are removed ([2.3](#23-roles-connection-uri-and-passwords)) |
 

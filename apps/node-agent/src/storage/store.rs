@@ -656,6 +656,19 @@ impl<R: CommandRunner> Storage<R> {
         self.fs_errors(id)
     }
 
+    /// The volumes a pool without writes tagged as suspect (`mark_suspects`) and no repair has
+    /// cleared since, whoever has them open: what the repair of the sleeping databases' volumes
+    /// goes through once the pool takes writes again. From the recent list, which any command
+    /// that changes a tag makes old; one lvm2 read otherwise.
+    pub fn suspects(&self) -> Result<Vec<VolumeId>, Error> {
+        let lvs = self.volumes_for_mount()?;
+        Ok(self
+            .database_volumes(&lvs)
+            .filter(|(_, lv)| lv.has_tag(SUSPECT_TAG))
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     /// The logical cap of plan 4.3: nominal sizes stay at or below a multiple of the pool.
     fn within_cap(
         &self,

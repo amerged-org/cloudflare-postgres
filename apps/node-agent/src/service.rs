@@ -1420,12 +1420,16 @@ impl<M: Machine> Service<M> {
         }
     }
 
-    /// The thin pool every 5 s, for the room rule.
+    /// The thin pool every 5 s, for the room rule. Once it takes writes with room, the volumes
+    /// that a pool without writes tagged are repaired, those of the databases that sleep
+    /// (`Core::repair_sleeping`), off this loop: the next reading of the pool does not wait.
     async fn pool(&self) {
         let mut tick = tokio::time::interval(self.intervals.pool);
         loop {
             tick.tick().await;
-            let _ = self.machine.poll_pool().await;
+            if self.machine.poll_pool().await.is_ok() {
+                self.core.spawn_repairs();
+            }
         }
     }
 

@@ -1274,6 +1274,178 @@ fn a_full_pool_marks_a_volume_that_only_a_unit_holds_and_leaves_one_that_nothing
     assert!(!lab.storage.needs_repair(&c).unwrap());
 }
 
+/// The finding of the code reading of 2026-10-23: a pool that takes no writes tags every volume
+/// that is open, the volume of a sleeping database included, and the first wake of that database
+/// was refused for it. Nothing writes to a volume whose database sleeps, and the lab (a pool with
+/// the agent's flags) takes it through a full data area clean: `e2fsck -p` exits 0, its data is
+/// unchanged, and the repair after space has returned lists it, clears the tag and attaches it.
+#[test]
+fn a_volume_nothing_writes_to_comes_through_a_full_data_area_clean_and_is_repaired_when_space_returns()
+ {
+    let lab = Lab::open(320);
+    let (idle, bulk) = (id(ID, 1), id(OTHER, 1));
+    lab.create(&idle, 64);
+    lab.create(&bulk, 256);
+    // The sleeping database's committed data, and the digest it is compared with at the end.
+    assert!(lab.tenant_dd(&idle, "kept", 2048, "/dev/urandom"));
+    sh("sync", &[]);
+    let kept = fs::read(lab.dir_of(&idle).join("kept")).unwrap();
+    assert!(lab.storage.suspects().unwrap().is_empty());
+
+    // Another tenant fills the pool; the pool fails its write at once and takes no more.
+    assert!(!lab.tenant_dd(&bulk, "bulk", 245_760, "/dev/urandom"));
+    sh("sync", &[]);
+    assert_eq!(
+        lab.storage.poll_pool().unwrap().mode,
+        PoolMode::OutOfDataSpace
+    );
+    let sorted = |lab: &Lab| {
+        let mut suspects = lab.storage.suspects().unwrap();
+        suspects.sort();
+        suspects
+    };
+    assert_eq!(sorted(&lab), vec![idle.clone(), bulk.clone()]);
+    // The repair writes, and the pool has no room for it yet.
+    assert!(matches!(
+        lab.storage.recover_volume(&idle, &policy()),
+        Err(Error::NoRoom(_))
+    ));
+    assert!(lab.mounted(&idle) && lab.link(&idle).is_none());
+
+    // The other database is deleted and its chunks return: the pool takes writes again.
+    lab.storage.unmount_volume(&bulk).unwrap();
+    lab.storage
+        .remove_volume(
+            &bulk,
+            Removal::DatabaseDeleted {
+                storage_generation: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(lab.storage.poll_pool().unwrap().mode, PoolMode::ReadWrite);
+    assert_eq!(lab.storage.room(&policy()), Ok(()));
+    assert_eq!(sorted(&lab), vec![idle.clone()]);
+
+    // Its filesystem is clean as it stands: nothing was written to it while the pool took none.
+    lab.storage.unmount_volume(&idle).unwrap();
+    let output = SystemRunner
+        .run(&commands::fsck(lab.config(), &idle))
+        .unwrap();
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    let began = std::time::Instant::now();
+    lab.storage.recover_volume(&idle, &policy()).unwrap();
+    eprintln!(
+        "lab: the repair of the idle volume took {} ms",
+        began.elapsed().as_millis()
+    );
+    assert!(lab.linked_to_the_mounted_volume(&idle));
+    assert!(lab.storage.suspects().unwrap().is_empty());
+    assert!(!lab.storage.needs_repair(&idle).unwrap());
+    assert_eq!(fs::read(lab.dir_of(&idle).join("kept")).unwrap(), kept);
+    assert!(lab.tenant_dd(&idle, "after", 1024, "/dev/zero"));
+}
+
+/// The same event with the pool's metadata: its area is full, the pool is read-only (the writes
+/// fail with EIO and not with ENOSPC), and every volume that is open is tagged. A larger metadata
+/// area (`lvextend --poolmetadatasize`, which an operator does) brings the pool back to read-write
+/// online, and the volume of the database that sleeps is repaired as after a full data area.
+#[test]
+fn a_volume_nothing_writes_to_comes_through_a_full_metadata_area_clean_and_is_repaired_when_it_has_room_again()
+ {
+    let lab = Lab::open(320);
+    let idle = id(ID, 1);
+    lab.create(&idle, 64);
+    assert!(lab.tenant_dd(&idle, "kept", 1024, "/dev/urandom"));
+    sh("sync", &[]);
+    let kept = fs::read(lab.dir_of(&idle).join("kept")).unwrap();
+    assert_eq!(lab.storage.poll_pool().unwrap().mode, PoolMode::ReadWrite);
+
+    // Every thin device takes a block of the pool's metadata for its tree: enough of them (made
+    // with the pool's own message, which is quick) fill the 8 MiB area, and the pool goes
+    // read-only. They are no volume of a database, and the agent does not list them.
+    let listed = lab.run(vec![
+        "dmsetup".into(),
+        "ls".into(),
+        "--target".into(),
+        "thin-pool".into(),
+    ]);
+    let pool = listed
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .find(|name| name.starts_with(&format!("{}-", lab.config().group)))
+        .unwrap()
+        .to_string();
+    let mut made = 0;
+    loop {
+        let output = SystemRunner
+            .run(&[
+                "dmsetup".into(),
+                "message".into(),
+                pool.clone(),
+                "0".into(),
+                format!("create_thin {}", 100_000 + made),
+            ])
+            .unwrap();
+        if output.code != 0 {
+            break;
+        }
+        made += 1;
+        assert!(made < 5000, "the metadata did not fill");
+    }
+    let sample = lab.storage.poll_pool().unwrap();
+    eprintln!("lab: the pool is {:?} after {made} devices", sample.mode);
+    assert_eq!(sample.mode, PoolMode::ReadOnly, "{sample:?}");
+    assert!(!sample.writable());
+    assert_eq!(lab.storage.suspects().unwrap(), vec![idle.clone()]);
+    assert!(matches!(
+        lab.storage.recover_volume(&idle, &policy()),
+        Err(Error::NoRoom(_))
+    ));
+
+    // The operator gives the pool more metadata: the disk grows by 32 MiB and the group with it.
+    let image = lab.dir.join("disk.img");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&image)
+        .unwrap()
+        .set_len((320 + 32) << 20)
+        .unwrap();
+    sh("losetup", &["-c", &lab.loop_device]);
+    sh("pvresize", &[&lab.loop_device]);
+    let target = format!("{}/{}", lab.config().group, lab.config().pool);
+    let began = std::time::Instant::now();
+    sh(
+        "lvextend",
+        &["--quiet", "--poolmetadatasize", "+4m", &target],
+    );
+    eprintln!(
+        "lab: lvextend --poolmetadatasize took {} ms",
+        began.elapsed().as_millis()
+    );
+    let sample = lab.storage.poll_pool().unwrap();
+    assert_eq!(sample.mode, PoolMode::ReadWrite, "{sample:?}");
+    assert!(sample.writable(), "{sample:?}");
+    assert_eq!(lab.storage.room(&policy()), Ok(()));
+
+    // The tag stays until the repair, which finds the filesystem clean.
+    assert_eq!(lab.storage.suspects().unwrap(), vec![idle.clone()]);
+    lab.storage.unmount_volume(&idle).unwrap();
+    let output = SystemRunner
+        .run(&commands::fsck(lab.config(), &idle))
+        .unwrap();
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    let began = std::time::Instant::now();
+    lab.storage.recover_volume(&idle, &policy()).unwrap();
+    eprintln!(
+        "lab: the repair of the idle volume took {} ms",
+        began.elapsed().as_millis()
+    );
+    assert!(lab.linked_to_the_mounted_volume(&idle));
+    assert!(lab.storage.suspects().unwrap().is_empty());
+    assert_eq!(fs::read(lab.dir_of(&idle).join("kept")).unwrap(), kept);
+    assert!(lab.tenant_dd(&idle, "after", 1024, "/dev/zero"));
+}
+
 /// A unit holds the filesystem in a namespace of its own, which the agent's unmount does not see:
 /// the agent's own mount goes, the superblock stays, and the volume is still in use. The unmount
 /// says so, keeps the volume attached and its link, and goes through once the unit has let go.

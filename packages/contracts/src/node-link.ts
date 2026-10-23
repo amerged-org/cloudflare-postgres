@@ -1039,8 +1039,12 @@ export type NodeDiagnosticRequest = z.infer<typeof NodeDiagnosticRequest>;
 
 /**
  * One page of the node's desired state. A database the pages do not name is never stopped or
- * deleted for that; only an order or a desired state does that. The page of a fenced node (it
- * has a `fence` order) holds no database, no release and only `fence` and `superseded` orders.
+ * deleted for that; only an order or a desired state does that. A database whose desired state is
+ * `deleted` stays on the page until its node has reported it `deleted` and the node's volume
+ * report (`NodeVolumeReport`) no longer names a volume of it: a volume an earlier agent left
+ * behind is found again that way, and only a volume of a database the page names as deleted is
+ * ever removed. The page of a fenced node (it has a `fence` order) holds no database, no release
+ * and only `fence` and `superseded` orders.
  */
 export const NodeDesiredPage = z
   .strictObject({
@@ -1130,7 +1134,9 @@ export type NodeDesiredPage = z.infer<typeof NodeDesiredPage>;
 /**
  * `building`: a create, restore or move runs; `ready`: PostgreSQL runs and the storage generation
  * has a DONE base backup; `asleep`: a proven sleep; `unproven`: stopped without a matching record,
- * recovery pending; `error`: see `error`; `deleted`: the volume is gone.
+ * recovery pending; `error`: see `error`; `deleted`: all of the database is gone from the node
+ * (its unit, its volumes, its user and its files); the node reports nothing of a delete that is
+ * not complete.
  */
 export const NODE_DATABASE_STATES = [
   "building",

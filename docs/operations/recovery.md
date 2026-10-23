@@ -358,7 +358,14 @@ created at full size at first boot and does not grow.
   database itself: it stops the unit, unmounts the volume, repairs it with `e2fsck -p`, mounts it
   again and wakes the database through admission; PostgreSQL runs crash recovery from its durable
   WAL, and every acknowledged commit survives. A volume it cannot repair (`e2fsck` refuses) needs an
-  operator. Running writers are never stopped for storage.
+  operator. Running writers are never stopped for storage. A pool whose metadata is full is
+  read-only, not full of data: give it more with `lvextend --poolmetadatasize +<size>` on the
+  thin pool (the volume group needs free extents), which brings it back to read-write online. The
+  volumes of the databases that sleep were tagged suspect meanwhile; once the pool takes writes
+  with room again the agent repairs them in the background without starting the databases, and a
+  wake that comes first repairs its volume and starts, so no wake is refused for the tag. A volume
+  the repair is refused (`e2fsck` refuses, a job holds it) goes through the recovery above at its
+  next wake.
 - **A full volume.** A tenant can fill its own volume by reaching its size, by using up its inodes
   or by keeping WAL during an R2 outage. The agent reports each volume's space and inodes every 60
   seconds, and `database_volume_warning` (80 %) and `database_volume_critical` (90 %) fire. Raise the
@@ -367,6 +374,27 @@ created at full size at first boot and does not grow.
   must write: the agent frees the filesystem's 1 % root-only reserve once so that recovery can
   finish and the integrator can delete data or resize; a database that still cannot start needs its
   size raised. Nothing extends a volume by itself.
+
+- **A delete that does not finish.** The node reports a database `deleted` only when its unit,
+  its volumes, its user and its files are gone. A step that fails is a `node_event` line in
+  Workers Logs, `delete_incomplete`, with the `step` (`unit`, `inventory`, `volume`,
+  `socket_directory`, `account`, `state`), its `class` and the `seconds` the delete has been
+  failing, and is tried again after 1 s, doubling to 30 s, for as long as it takes. The delete
+  operation stays `pending` or `running` until the node confirms cleanup; an accepted deletion
+  cannot be cancelled and has no operation timeout. The operator is told independently:
+  `database_delete_incomplete` fires when a database
+  deleted more than 10 minutes ago is still on its node's page (not reported `deleted`, or a volume
+  of it still reported by the node, which is also what an agent that did not run the whole delete
+  leaves) and ends when the node has reported it `deleted` and names no volume of it. A node marked
+  lost is ignored: nothing there can finish. A
+  `volume` step with `storage_busy` and an `account` step mean that something still holds the
+  volume or runs as the database's user, most likely a job of the database (`systemctl
+  list-units 'pgcf-job-*'`, a base backup or a WAL upload); the delete goes on when it ends. A
+  `unit` step means the clean stop and the kill both failed, and nothing is removed under a unit
+  that may still run. Cloudflare lists a deleted database on its node's page for as long as the
+  node's volume report (every 60 s) names a volume of it, so a volume that an earlier agent left
+  behind is found and removed by the agent that reads the page, with no hand step. A slot unit
+  that ended `failed` is taken back to `inactive` at its stop and when the agent starts.
 
 Thin physical allocation metrics stay null until a real measurement exists; neither a logical
 quota nor zero stands in for an unknown measurement. The agent's full-pool and full-volume recovery

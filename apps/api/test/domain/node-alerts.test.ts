@@ -2,6 +2,7 @@
 import { env } from "cloudflare:workers";
 import {
   DatabaseWithOperation,
+  INFRA_ALERT_ACTIONS,
   InfraAlert,
   type InfraAlertKind,
 } from "@pgcf/contracts";
@@ -796,6 +797,110 @@ it("announces a volume that fails after another one did", async () => {
   expect(new Set(hook.events[1]!.database_ids)).toEqual(
     new Set([first, second]),
   );
+});
+
+it("announces a delete its node has not finished after ten minutes and ends the episode once the database and its volumes are gone", async () => {
+  // F2 of the live run on US1: two databases the API called deleted kept their 80 GiB volumes and
+  // their users, and nothing told the operator. A delete that the node does not finish within ten
+  // minutes (the integrator's operation remains open until confirmed) is an alert, whether the node never
+  // reported the database deleted or reported it deleted and still names a volume of it.
+  const f = await fixture(),
+    hook = receiver(),
+    id = await placed(f, "leaking"),
+    now = Date.now(),
+    deleted = new Date(now).toISOString(),
+    // The node's samples go stale in these ten minutes and raise the Thin storage kind: not asked here.
+    raised = () =>
+      hook.events.filter(
+        (event) => event.kind === "database_delete_incomplete",
+      );
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='deleted',generation=generation+1,deleted_at=?,updated_at=? WHERE id=?",
+  )
+    .bind(deleted, deleted, id)
+    .run();
+  // Inside the bound the node is still at work.
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 10 * MINUTE - 1000,
+    hook.fetcher,
+  );
+  expect(await status(f, "database_delete_incomplete")).toBeUndefined();
+  // The node never reported the delete: the alert names the database and tells the operator what to read.
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 10 * MINUTE + 1000,
+    hook.fetcher,
+  );
+  expect(raised()).toMatchObject([
+    {
+      kind: "database_delete_incomplete",
+      database_ids: [id],
+      action: INFRA_ALERT_ACTIONS.database_delete_incomplete,
+    },
+  ]);
+  // Nothing new while it stays there.
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 11 * MINUTE,
+    hook.fetcher,
+  );
+  expect(raised()).toHaveLength(1);
+  // The node reports it deleted (an agent that stopped at the first error, or a report that was
+  // sent while a volume remained) and its volume report still names a volume of it: kept.
+  await volume(f, id, now + 11 * MINUTE, { used: GIB }).run();
+  await env.DB.prepare(
+    "UPDATE databases SET observed_state='deleted',observed_generation=generation WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 12 * MINUTE,
+    hook.fetcher,
+  );
+  expect(await status(f, "database_delete_incomplete")).toMatchObject({
+    active: true,
+  });
+  // The volume report no longer names a volume of it: all of it is gone.
+  await env.DB.prepare("DELETE FROM node_volumes WHERE database_id=?")
+    .bind(id)
+    .run();
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 13 * MINUTE,
+    hook.fetcher,
+  );
+  expect(await status(f, "database_delete_incomplete")).toMatchObject({
+    active: false,
+  });
+  expect(raised()).toHaveLength(1);
+});
+
+it("does not announce a delete on a node that is marked lost: nothing there can finish it", async () => {
+  const f = await fixture(),
+    hook = receiver(),
+    id = await placed(f, "on-a-lost-node"),
+    now = Date.now(),
+    deleted = new Date(now).toISOString();
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='deleted',generation=generation+1,deleted_at=?,updated_at=? WHERE id=?",
+  )
+    .bind(deleted, deleted, id)
+    .run();
+  const uid = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
+    .bind(f.node)
+    .first<string>("node_uid");
+  await markNodeLost(env.DB, f.node, {
+    expected_node_uid: uid!,
+    reason: "confirmed provider loss",
+  });
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 30 * MINUTE,
+    hook.fetcher,
+  );
+  expect(await status(f, "database_delete_incomplete")).toBeUndefined();
 });
 
 it("cannot arm or clear a node warning from a superseded concurrent read", async () => {

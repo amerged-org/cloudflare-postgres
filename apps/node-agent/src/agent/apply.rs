@@ -5,7 +5,7 @@
 //! desired state stops or removes what runs (plan 3.3, invariant 7): a page that does not name a
 //! database never does.
 use super::{
-    Core, Db, Desired, Entry, Phase, Policy, Reconcile,
+    Core, Db, Desired, Entry, Phase, Policy, Reconcile, now_ms,
     power::{Slept, Why, writer_of},
 };
 use crate::{
@@ -352,7 +352,9 @@ impl<M: Machine> Core<M> {
         let Some(entry) = db.view().entry.clone() else {
             return;
         };
-        if db.view().state.is_none() {
+        // Deletion is authorized by the page and volume identity, not by a local sleep proof.
+        // A damaged state file must block starts, but must not strand an explicitly deleted DB.
+        if entry.desired != Desired::Deleted && db.view().state.is_none() {
             match self.files(&db.id).load() {
                 Ok(state) => self.set(db, |view| view.state = state),
                 // A state that was read and cannot be trusted is not taken for a new database.
@@ -406,7 +408,13 @@ impl<M: Machine> Core<M> {
             Step::Build => {
                 let _ = self.build(db, &entry).await;
             }
-            Step::Delete => self.delete(db, &entry).await,
+            Step::Delete => {
+                // What is left is decided again after the backoff; the database is not reported
+                // deleted, and the node does not call it decided on.
+                if !self.delete(db, &entry).await {
+                    return;
+                }
+            }
             Step::Suspend => {
                 self.sleep_locked(db, Why::Order).await;
             }
@@ -645,52 +653,80 @@ impl<M: Machine> Core<M> {
         }
     }
 
-    /// The desired state is `deleted` (plan 5.10): the unit stops, the volume and the user go, and
+    /// The desired state is `deleted` (plan 5.10): the unit ends, the volumes and the user go, and
     /// the node keeps nothing of the database. The R2 archive is the Worker's to expire.
-    pub(crate) async fn delete(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
+    ///
+    /// The database is deleted when all of that is gone, and not before: the node reports it
+    /// `deleted` only then, and Cloudflare stops asking for it only when it has reported it and
+    /// no volume of it is reported any more. A step that fails is said (`delete_incomplete`, with
+    /// the step, its class and the seconds the delete has been failing) and the delete is decided
+    /// again after the recovery backoff (`retry_until_adopted`) up to its longest wait, for as
+    /// long as it takes, so that a volume on a full filesystem, a unit that no signal ends in
+    /// time or a user the system cannot lock never stays behind unseen. `true` when it is
+    /// deleted.
+    pub(crate) async fn delete(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) -> bool {
         self.set(db, |view| {
             view.phase = Phase::Retired;
             view.writer = None;
         });
-        let _ = self.machine.stop(&db.id).await;
-        self.admission.stopped(&db.id);
-        self.table.remove(&db.id);
-        let generation = entry.storage_generation;
-        let mut volumes = vec![];
-        if let Ok(inventory) = self.machine.inventory().await {
-            volumes = inventory
-                .volumes
-                .into_iter()
-                .filter(|volume| {
-                    volume.id.database() == db.id && volume.id.generation() <= generation
-                })
-                .map(|volume| volume.id)
-                .collect();
+        match self.remove_all(db, entry).await {
+            Ok(()) => {
+                self.set(db, |view| {
+                    view.phase = Phase::Deleted;
+                    view.state = None;
+                    view.error = None;
+                    view.delete_failing_since_ms = None;
+                });
+                true
+            }
+            Err((step, class)) => {
+                let now = now_ms();
+                let mut view = db.view();
+                let since = *view.delete_failing_since_ms.get_or_insert(now);
+                // The node has not made its decision on the database yet, which is what the
+                // retry waits for.
+                view.adopted = false;
+                drop(view);
+                crate::timing::emit_event(json!({
+                    "event": "delete_incomplete", "database_id": db.id, "step": step,
+                    "class": class, "seconds": (now - since).max(0) / 1000,
+                }));
+                false
+            }
         }
-        if volumes.is_empty()
-            && let Some(volume) = Self::volume_id(entry)
-        {
-            volumes.push(volume);
+    }
+
+    /// Every step of a delete, each of which finds what is gone gone: the first one that fails
+    /// ends the attempt with its name and class, since the next depends on it (a volume is not
+    /// removed while PostgreSQL may run on it, the user not while its files remain).
+    async fn remove_all(&self, db: &Db, entry: &Entry) -> Result<(), (&'static str, String)> {
+        let failed = |step, error: crate::Error| (step, crate::diagnostics::error_code(&error));
+        let id = &db.id;
+        let ended = super::remove::end_unit(&*self.machine, id).await;
+        self.admission.stopped(id);
+        self.table.remove(id);
+        ended.map_err(|error| failed("unit", error.into()))?;
+        let others = super::remove::remove_volumes(
+            &*self.machine,
+            id,
+            entry.storage_generation,
+            Self::volume_id(entry),
+        )
+        .await?;
+        // The socket directory, the user (with the database's last volume: a volume of a later
+        // generation that an order of its own removes keeps its owner) and the node's files.
+        match std::fs::remove_dir_all(self.layout().socket_directory(id)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(failed("socket_directory", error.into()));
+            }
+            _ => {}
         }
-        for volume in volumes {
-            let _ = self
-                .machine
-                .remove_volume(
-                    &volume,
-                    Removal::DatabaseDeleted {
-                        storage_generation: generation,
-                    },
-                )
-                .await;
+        if !others && let Err(error) = self.machine.remove_account(id).await {
+            return Err(failed("account", error.into()));
         }
-        let _ = std::fs::remove_dir_all(self.layout().socket_directory(&db.id));
-        let _ = self.machine.remove_account(&db.id).await;
-        let _ = self.files(&db.id).remove();
-        self.set(db, |view| {
-            view.phase = Phase::Deleted;
-            view.state = None;
-            view.error = None;
-        });
+        self.files(id)
+            .remove()
+            .map_err(|error| failed("state", error.into()))
     }
 
     /// Stops the unit of a database by its name, out of admission's awake set and off the archive
@@ -3516,6 +3552,253 @@ mod tests {
             rig.core.pending_order("op_tttttttttttttttttttt").unwrap()["status"],
             "done"
         );
+    }
+
+    /// The page of a database that is deleted.
+    fn deletion(db: &Value, generation: u64) -> Value {
+        let mut page = db.clone();
+        page.as_object_mut().unwrap().remove("origin");
+        page["desired_state"] = json!("deleted");
+        page["generation"] = json!(generation);
+        page["operation"] = json!(format!("op_{:0>20}", format!("d{generation}")));
+        page
+    }
+    /// The node has decided on the database, as it has for any database of the page that is up:
+    /// the delete that follows meets a database it knows.
+    async fn decided_on(rig: &Rig, db: &Value, handle: &Db) {
+        let mut page = db.clone();
+        page.as_object_mut().unwrap().remove("origin");
+        rig.core.apply(&Rig::page(vec![page], vec![])).await;
+        eventually(30, "the node to decide on the database", || {
+            handle.view().adopted
+        })
+        .await;
+    }
+    /// The events of a database that the node kept for Cloudflare.
+    fn events_of(id: &str, name: &str) -> Vec<Value> {
+        crate::events::seen()
+            .into_iter()
+            .filter(|e| e["event"] == name && e["database_id"] == id)
+            .collect()
+    }
+
+    /// The finding of the live run (US1, 2026-10-23): a delete that left the volume, the user
+    /// and a failed slot behind reported the database deleted, logged nothing, and never tried
+    /// again, so the volumes stayed (53 GB of the pool) for two databases the API called deleted.
+    /// Now nothing is reported until all of it is gone; each failed step is said, and the delete
+    /// is decided again until it is done.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_that_leaves_a_volume_or_a_user_is_not_reported_and_goes_on_until_all_is_gone()
+    {
+        let Some(rig) = Rig::new("delete-left").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let (_, handle) = rig.create_from(&db).await;
+        decided_on(&rig, &db, &handle).await;
+        // The volume is in use for as long as the test says, and the user cannot be locked once.
+        rig.machine.fail_volume_removals(u32::MAX);
+        rig.core
+            .apply(&Rig::page(vec![deletion(&db, 10)], vec![]))
+            .await;
+        eventually(30, "the delete to fail on the volume", || {
+            events_of(&id, "delete_incomplete").len() >= 2
+        })
+        .await;
+        let failures = events_of(&id, "delete_incomplete");
+        assert_eq!(failures[0]["fields"]["step"], "volume");
+        assert_eq!(failures[0]["fields"]["class"], "storage_busy");
+        // The unit is ended, the volume and the user are there, and nothing says deleted: the
+        // observation is the one a database being removed has, none.
+        assert!(!rig.machine.running(&id));
+        assert_eq!(rig.machine.volumes().len(), 1);
+        assert!(rig.machine.has_account(&id));
+        assert_ne!(handle.phase(), Phase::Deleted);
+        assert!(
+            rig.core
+                .pending_observation(&id)
+                .is_none_or(|observation| observation["state"] != "deleted"),
+            "{:?}",
+            rig.core.pending_observation(&id)
+        );
+        assert!(
+            rig.machine
+                .calls()
+                .iter()
+                .filter(|call| **call == format!("remove {id}"))
+                .count()
+                >= 2,
+            "the removal is tried again: {:?}",
+            rig.machine.calls()
+        );
+        // The volume lets go; the user cannot be locked once; then it is all gone.
+        rig.machine.fail_volume_removals(0);
+        rig.machine.fail_account_removals(1);
+        eventually(30, "the delete to finish", || {
+            handle.phase() == Phase::Deleted
+        })
+        .await;
+        assert!(
+            events_of(&id, "delete_incomplete")
+                .iter()
+                .any(|event| event["fields"]["step"] == "account"),
+            "{:?}",
+            events_of(&id, "delete_incomplete")
+        );
+        assert!(rig.machine.volumes().is_empty());
+        assert!(!rig.machine.has_account(&id));
+        assert_eq!(rig.core.files(&id).load().unwrap(), None);
+        assert_eq!(rig.observation(&id)["state"], "deleted");
+    }
+
+    /// Deletion is authorized by the desired page and the volume's identity. A broken sleep
+    /// proof must refuse a wake, but cannot prevent the owner from deleting the database.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_authorized_delete_cleans_up_after_a_restart_with_corrupt_local_state() {
+        let Some(rig) = Rig::new("delete-corrupt").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        rig.create_from(&db).await;
+        let rig = rig.restart().await;
+        std::fs::write(
+            rig.core.files(&id).directory().join("state.json"),
+            "{not a state",
+        )
+        .unwrap();
+        let deleted = deletion(&db, 2);
+        let handle = rig.core.db(&id);
+        handle.view().entry = Some(rig.entry_for(&deleted));
+        rig.core.reconcile(&handle, &mut None).await;
+        assert_eq!(handle.phase(), Phase::Deleted);
+        assert!(!rig.machine.running(&id));
+        assert!(rig.machine.volumes().is_empty());
+        assert!(!rig.machine.has_account(&id));
+        assert_eq!(rig.core.files(&id).load().unwrap(), None);
+        assert_eq!(rig.observation(&id)["state"], "deleted");
+    }
+
+    /// A clean stop that fails (a PANIC at the shutdown checkpoint of a full filesystem, a stop
+    /// job that does not end) is followed by the kill, and the volume is removed only once no
+    /// process of the unit is left: while PostgreSQL may still run, nothing is taken from under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_ends_a_unit_that_does_not_stop_by_force_and_removes_nothing_under_a_unit_that_runs()
+     {
+        let Some(rig) = Rig::new("delete-kill").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let (_, handle) = rig.create_from(&db).await;
+        decided_on(&rig, &db, &handle).await;
+        assert!(rig.machine.running(&id));
+        // The stop fails once, and the kill ends the unit.
+        rig.machine.fail_stops(1);
+        rig.core
+            .apply(&Rig::page(vec![deletion(&db, 10)], vec![]))
+            .await;
+        eventually(60, "the delete to finish", || {
+            handle.phase() == Phase::Deleted
+        })
+        .await;
+        assert!(!rig.machine.running(&id));
+        let calls = rig.machine.calls();
+        let at = |call: String| calls.iter().position(|c| *c == call);
+        assert!(
+            at(format!("stop {id}")) < at(format!("kill {id}"))
+                && at(format!("kill {id}")) < at(format!("remove {id}")),
+            "stop, then kill, then remove: {calls:?}"
+        );
+        assert_eq!(events_of(&id, "delete_unit_killed").len(), 1);
+        assert!(rig.machine.volumes().is_empty());
+
+        // A unit that nothing ends keeps its volume: the delete says which step and goes on.
+        let other = rig.entry_json();
+        let other_id = id_of(&other);
+        let (_, other_handle) = rig.create_from(&other).await;
+        decided_on(&rig, &other, &other_handle).await;
+        rig.machine.fail_stops(u32::MAX);
+        rig.core
+            .apply(&Rig::page(vec![deletion(&other, 10)], vec![]))
+            .await;
+        eventually(30, "the delete to fail on the unit", || {
+            events_of(&other_id, "delete_incomplete").len() >= 2
+        })
+        .await;
+        assert_eq!(
+            events_of(&other_id, "delete_incomplete")[0]["fields"]["step"],
+            "unit"
+        );
+        assert!(
+            !rig.machine.calls().contains(&format!("remove {other_id}")),
+            "the volume stays under a unit that may run"
+        );
+        assert_ne!(other_handle.phase(), Phase::Deleted);
+        rig.machine.fail_stops(0);
+        eventually(60, "the delete to finish", || {
+            other_handle.phase() == Phase::Deleted
+        })
+        .await;
+        assert!(rig.machine.volumes().is_empty());
+    }
+
+    /// The two databases of the live run: the API called them deleted, the node had no record
+    /// of them any more, and their volumes and users stayed. An agent that starts finds them
+    /// from the page, which now names a deleted database while the volume is reported, and
+    /// removes them. A volume of a database that exists, or of none the page names, is not
+    /// touched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_removes_the_volume_and_the_user_a_deleted_database_left_and_nothing_else()
+     {
+        let Some(rig) = Rig::new("delete-leaked").await else {
+            return;
+        };
+        let (leaked, kept) = (rig.entry_json(), rig.entry_json());
+        let (leaked_id, kept_id) = (id_of(&leaked), id_of(&kept));
+        let (_, leaked_handle) = rig.create_from(&leaked).await;
+        let (_, kept_handle) = rig.create_from(&kept).await;
+        assert_eq!(
+            rig.core.sleep(&leaked_handle, Why::Idle).await,
+            Slept::Proven
+        );
+        assert_eq!(rig.core.sleep(&kept_handle, Why::Idle).await, Slept::Proven);
+        // What the live delete left: the volume and the user, and no file of the node's.
+        rig.core.files(&leaked_id).remove().unwrap();
+        let rig = rig.restart().await;
+        for entry in [&leaked, &kept] {
+            rig.deliver(entry["archive"]["path"].as_str().unwrap(), "read_write");
+        }
+        assert_eq!(rig.machine.volumes().len(), 2);
+        let mut kept_page = kept.clone();
+        kept_page.as_object_mut().unwrap().remove("origin");
+        rig.core
+            .apply(&Rig::page(
+                vec![deletion(&leaked, 10), kept_page.clone()],
+                vec![],
+            ))
+            .await;
+        let handle = rig.core.db(&leaked_id);
+        eventually(60, "the leaked volume to be removed", || {
+            handle.phase() == Phase::Deleted
+        })
+        .await;
+        assert_eq!(
+            rig.machine
+                .volumes()
+                .iter()
+                .map(|(volume, _)| volume.database().to_string())
+                .collect::<Vec<_>>(),
+            vec![kept_id.clone()]
+        );
+        assert!(!rig.machine.has_account(&leaked_id));
+        assert!(rig.machine.has_account(&kept_id));
+        assert_eq!(rig.observation(&leaked_id)["state"], "deleted");
+        // A page that does not name a database, and one that names it running, remove nothing.
+        rig.core.apply(&Rig::page(vec![kept_page], vec![])).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(rig.machine.volumes().len(), 1);
     }
 
     /// The first page is applied before the archive credentials are read (the gateway is served

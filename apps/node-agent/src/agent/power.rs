@@ -788,12 +788,23 @@ impl<M: Machine> Core<M> {
             return refuse("volume_missing");
         }
         let began = Instant::now();
-        let repair = self.machine.needs_repair(&volume).await;
+        let mut repair = self.machine.needs_repair(&volume).await;
+        if matches!(repair, Ok(true)) {
+            // A pool that took no writes tagged the volume, and nothing wrote to it, since the
+            // database sleeps and this wake holds its flow: the wake repairs it, as the pass that
+            // repairs the sleeping databases' volumes does (`agent/repair.rs`), and goes on. Where
+            // the repair cannot be made (no room yet, a job that holds the volume) the volume may
+            // have lost writes, and recovery repairs it, proves the database and answers later wakes.
+            let repaired = self
+                .machine
+                .recover_volume(&volume, &self.policy().storage)
+                .await;
+            repair = Ok(repaired.is_err());
+        }
         steps.insert("repair_check".into(), millis(began.elapsed()));
         match repair {
             Ok(false) => {}
             Ok(true) => {
-                // The volume may have lost writes while the pool took none: recovery repairs it.
                 self.go_unproven(&db);
                 return refuse("volume_suspended");
             }
@@ -2380,8 +2391,10 @@ mod tests {
         assert_eq!(db.phase(), Phase::Asleep);
         rig.machine.set_volumes_unreadable(false);
 
-        // The volume may have lost writes: the wake does not start it, and recovery repairs it.
+        // The volume may have lost writes and the repair cannot be made (the pool has no room
+        // for it): the wake does not start it, and recovery repairs it when it can.
         rig.machine.set_needs_repair(true);
+        rig.machine.set_no_room(true);
         let result = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(
             (result.outcome, result.reason.as_deref()),
@@ -2390,6 +2403,34 @@ mod tests {
         assert!(!took(&result, &after_volume_check[1..]));
         assert!(!rig.machine.running(&entry.id));
         assert_eq!(db.phase(), Phase::Unproven);
+    }
+
+    /// The finding of the code reading of 2026-10-23: a pool that took no writes tags every
+    /// mounted volume, the sleeping databases' included, and the first wake of each was refused
+    /// (`volume_suspended`) and sent the database through recovery. A sleeping database's volume
+    /// has no writer, so the wake repairs it and starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_repairs_the_suspect_volume_of_a_database_that_sleeps_and_is_not_refused() {
+        let Some(rig) = Rig::new("wake-repairs").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let volume = crate::storage::VolumeId::new(&entry.id, 1).unwrap();
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        rig.machine.mark_suspect(&volume);
+        rig.machine.clear_calls();
+        let result = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
+        assert!(rig.machine.running(&entry.id));
+        assert!(!rig.machine.is_suspect(&volume));
+        let recoveries = rig
+            .machine
+            .calls()
+            .iter()
+            .filter(|call| **call == format!("recover {}", entry.id))
+            .count();
+        assert_eq!(recoveries, 1);
+        assert_eq!(db.phase(), Phase::Ready);
     }
 
     /// The repair detaches the volume first, which a job that holds it refuses: the recovery

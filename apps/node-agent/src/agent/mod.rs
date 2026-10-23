@@ -17,6 +17,8 @@ mod power;
 mod readahead;
 #[cfg(test)]
 mod real_gateway;
+pub(crate) mod remove;
+mod repair;
 pub(crate) mod report;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -222,6 +224,10 @@ pub(crate) struct View {
     pub queued: bool,
     /// The reconciliation of the entry: one runs, and runs again when the entry changed meanwhile.
     pub reconcile: Reconcile,
+    /// Since when the delete of the database has not been completed (`Core::delete`).
+    pub delete_failing_since_ms: Option<i64>,
+    /// When the repair of the sleeping database's volume last failed (`Core::repair_asleep`).
+    pub repair_failed_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,6 +260,8 @@ impl View {
             retrying: false,
             queued: false,
             reconcile: Reconcile::Idle,
+            delete_failing_since_ms: None,
+            repair_failed_ms: None,
         }
     }
 }
@@ -390,6 +398,8 @@ pub struct Core<M: Machine> {
     pub(crate) changed: Notify,
     /// A start took a slot or ended: the pool may want another idle one (`refill_pass`).
     pub(crate) refill: Notify,
+    /// A pass repairs the volumes of the sleeping databases (`repair_sleeping`).
+    repairing: AtomicBool,
     /// The maintenance orders whose databases all sleep with their proofs: the packages and the
     /// check follow, which the service does, since it reaches the files.
     slept: Mutex<Vec<String>>,
@@ -459,6 +469,7 @@ impl<M: Machine> Core<M> {
             meter: Meter::load(layout.agent().join("usage.json")),
             changed: Notify::new(),
             refill: Notify::new(),
+            repairing: AtomicBool::new(false),
             slept: Mutex::new(Vec::new()),
             slept_signal: Notify::new(),
         });

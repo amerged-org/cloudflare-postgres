@@ -104,7 +104,7 @@ kill for as long as the node lives.
 | Admission                  | `admission.rs`                                                                                                                                         |
 | Storage                    | `storage/`: the volume group and thin pool, one thin volume with its ext4 per database, the samples, the room rule, full-pool and full-volume recovery |
 | Units and slots            | `units/`: the pool of slots (`slots.rs`), the node's systemd and kernel for it (`system.rs`), the idmapped handoff (`idmap.rs`), limits as unit properties, the Linux users; the units of their own an earlier agent started |
-| Database lifecycle         | `agent/`: `apply.rs` (the page becomes action), `build.rs` (create, restore, move target, resize, delete), `power.rs` (wake, sleep, recovery)          |
+| Database lifecycle         | `agent/`: `apply.rs` (the page becomes action, and the delete), `remove.rs` (the machine's part of a delete), `build.rs` (create, restore, move target), `power.rs` (wake, sleep, recovery), `repair.rs` (the volumes of sleeping databases after a pool without writes) |
 | Sleep proof and its record | `proof.rs`, `sleep.rs`, `pg_control.rs`, `state.rs`                                                                                                    |
 | Roles                      | `roles.rs`, `scram.rs`: PostgreSQL holds exactly the roles of the page, with verifiers, never passwords                                                |
 | Backups                    | `archive/`: the archive socket, the barman-cloud jobs, restore and PITR recovery, the upload log                                                       |

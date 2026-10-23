@@ -281,6 +281,11 @@ pub trait Host: Send + Sync + 'static {
     fn start(&self, slot: u32) -> impl Future<Output = Result<Spawned, Error>> + Send;
     /// Stops the unit and waits for its job.
     fn stop(&self, slot: u32) -> impl Future<Output = Result<(), Error>> + Send;
+    /// Ends every process of the unit with SIGKILL, for a stop that did not end it.
+    fn kill(&self, slot: u32) -> impl Future<Output = Result<(), Error>> + Send;
+    /// Takes a unit that ended `failed` back to `inactive`; refused (`StrayProcesses`) while its
+    /// cgroup holds a process.
+    fn reset(&self, slot: u32) -> impl Future<Output = Result<(), Error>> + Send;
     /// Asks the supervisor whether it is idle and speaks this protocol.
     fn ping(&self, slot: u32) -> impl Future<Output = Result<(), Error>> + Send;
     /// Whether the slot's main process still lives (its pidfd is not readable).
@@ -694,17 +699,44 @@ impl<H: Host> Pool<H> {
     /// Stops the slot that holds the database and waits until its unit is over. `false` when no
     /// slot holds it.
     pub async fn stop(&self, database: &str) -> Result<bool, Error> {
+        self.end(database, false).await
+    }
+
+    /// Ends the slot that holds the database by force: every process of the unit gets SIGKILL
+    /// and the unit is stopped. For a database that is being deleted, whose clean stop failed (a
+    /// stop job that did not end, a process that no signal ended in time). `false` when no slot
+    /// holds it.
+    pub async fn kill(&self, database: &str) -> Result<bool, Error> {
+        self.end(database, true).await
+    }
+
+    async fn end(&self, database: &str, force: bool) -> Result<bool, Error> {
         let Some((slot, _)) = self.held(database) else {
             return Ok(false);
         };
         self.set_state(slot, State::Stopping(Some(database.to_string())));
+        if force {
+            // A unit that has no process to kill is stopped all the same.
+            let _ = self.host.kill(slot).await;
+        }
         self.host.stop(slot).await?;
         let unit = self.host.unit(slot).await?;
         if self.over(slot, &unit) {
             self.forget(slot, database, "stopped");
+            self.mend(slot, &unit).await;
             Ok(true)
         } else {
             Err(Error::Held)
+        }
+    }
+
+    /// A unit that ended `failed` at a stop (a PostgreSQL that died at its shutdown checkpoint, a
+    /// stop that needed the kill) is taken back to `inactive` once its cgroup is empty, and its
+    /// number is built on again. One that still holds a process stays `failed` and out of the
+    /// builds (`over`): the next stop of its number, or the agent's restart, looks again.
+    async fn mend(&self, slot: u32, unit: &SlotUnit) {
+        if unit.active == ActiveState::Failed && self.host.reset(slot).await.is_ok() {
+            self.table().failed.remove(&slot);
         }
     }
 
@@ -929,7 +961,15 @@ impl<H: Host> Pool<H> {
             .collect();
         let mut adopted = Adopted::default();
         let mut stopping = Vec::new();
-        for unit in units.into_iter().filter(|unit| !self.over(unit.slot, unit)) {
+        let (ended, units): (Vec<_>, Vec<_>) = units
+            .into_iter()
+            .partition(|unit| self.over(unit.slot, unit));
+        // A unit that ended `failed` before this agent began (a database deleted on a full
+        // filesystem left it so) is taken back to `inactive` once its cgroup is empty.
+        for unit in &ended {
+            self.mend(unit.slot, unit).await;
+        }
+        for unit in units {
             let class = self.classify(&unit).await?;
             let slot = unit.slot;
             let kept = |state: State, volume: Option<VolumeId>| Slot {
@@ -1576,6 +1616,12 @@ mod tests {
             })
         }
         async fn stop(&self, slot: u32) -> Result<(), Error> {
+            if self.failing("stop") {
+                return Err(Error::Job {
+                    unit: slot_unit(slot),
+                    result: "timeout".into(),
+                });
+            }
             let mut state = self.state();
             state.calls.push(format!("stop {slot}"));
             if let Some(unit) = state.units.get_mut(&slot) {
@@ -1589,6 +1635,33 @@ mod tests {
                 unit.exe = Exe::Supervisor;
             }
             state.locks.retain(|_, held| *held != slot);
+            Ok(())
+        }
+        async fn kill(&self, slot: u32) -> Result<(), Error> {
+            let mut state = self.state();
+            state.calls.push(format!("kill {slot}"));
+            // SIGKILL ends the unit's processes, and the unit ends `failed`.
+            if let Some(unit) = state.units.get_mut(&slot) {
+                unit.active = ActiveState::Failed;
+                unit.pid = None;
+            }
+            state.locks.retain(|_, held| *held != slot);
+            Ok(())
+        }
+        async fn reset(&self, slot: u32) -> Result<(), Error> {
+            if self.failing("reset") {
+                return Err(refused("reset"));
+            }
+            let mut state = self.state();
+            if state.stuck.contains(&slot) {
+                return Err(Error::StrayProcesses);
+            }
+            state.calls.push(format!("reset {slot}"));
+            if let Some(unit) = state.units.get_mut(&slot)
+                && unit.active == ActiveState::Failed
+            {
+                unit.active = ActiveState::Inactive;
+            }
             Ok(())
         }
         async fn ping(&self, slot: u32) -> Result<(), Error> {
@@ -2228,6 +2301,94 @@ mod tests {
             pool.refill(1).await,
             Err(Error::Unexpected("useradd"))
         ));
+    }
+
+    // 6b. The end of a database's slot.
+
+    /// A PostgreSQL that dies at its shutdown checkpoint (a full filesystem) leaves its unit
+    /// `failed` at the stop. Once its cgroup is empty the unit is taken back to `inactive` and its
+    /// number is built on again, as a slot that never failed; systemd lists nothing of it.
+    #[tokio::test]
+    async fn a_stop_that_ends_a_failed_unit_resets_it_and_builds_on_its_number_again() {
+        let (sim, data) = (Sim::new(), data_directory("stop-failed"));
+        let pool = pool(&sim);
+        let bound = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
+        pool.exec(&bound).await.unwrap();
+        // The postmaster died at the shutdown checkpoint: the unit is failed before the stop job.
+        sim.die(bound.slot);
+        assert!(pool.stop(D1).await.unwrap());
+        assert_eq!(sim.active(bound.slot), ActiveState::Inactive);
+        assert!(sim.calls().contains(&format!("reset {}", bound.slot)));
+        assert_eq!(pool.refill(1).await.unwrap(), Some(bound.slot));
+    }
+
+    /// A unit that still holds a process after the stop stays `failed` and out of the builds:
+    /// its next start would be refused.
+    #[tokio::test]
+    async fn a_failed_unit_that_still_holds_a_process_is_not_reset() {
+        let (sim, data) = (Sim::new(), data_directory("stop-stuck"));
+        let pool = pool(&sim);
+        let bound = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
+        pool.exec(&bound).await.unwrap();
+        sim.state().stuck.insert(bound.slot);
+        sim.die(bound.slot);
+        assert!(pool.stop(D1).await.unwrap());
+        assert_eq!(sim.active(bound.slot), ActiveState::Failed);
+        assert_ne!(pool.refill(1).await.unwrap(), Some(bound.slot));
+    }
+
+    /// A stop that fails leaves the database held by its slot, so that nothing starts it beside
+    /// a process that may still run; the kill ends the processes, and then the database is free.
+    #[tokio::test]
+    async fn a_stop_that_fails_keeps_the_database_held_until_the_kill_has_ended_it() {
+        let (sim, data) = (Sim::new(), data_directory("stop-kill"));
+        let pool = pool(&sim);
+        let bound = pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
+        pool.exec(&bound).await.unwrap();
+        sim.fail_next("stop");
+        assert!(matches!(pool.stop(D1).await, Err(Error::Job { .. })));
+        assert!(matches!(
+            pool.bind(D1, &bind_of(D1, 2, &data)).await,
+            Err(Error::Held)
+        ));
+        assert!(pool.kill(D1).await.unwrap());
+        let calls = sim.calls();
+        let kill = calls
+            .iter()
+            .position(|call| *call == format!("kill {}", bound.slot))
+            .unwrap();
+        assert!(
+            calls[kill..].contains(&format!("stop {}", bound.slot)),
+            "the stop follows the kill: {calls:?}"
+        );
+        assert_eq!(sim.active(bound.slot), ActiveState::Inactive);
+        pool.bind(D1, &bind_of(D1, 2, &data)).await.unwrap();
+        // A database no slot holds is not killed, and says so.
+        assert!(!pool.kill(D2).await.unwrap());
+    }
+
+    /// The units a delete on a full filesystem left `failed` (US1 had two of them): the agent
+    /// that starts takes them back to `inactive` and builds on their numbers; one that still
+    /// holds a process stays as it is.
+    #[tokio::test]
+    async fn the_agents_start_resets_the_failed_units_that_hold_no_process() {
+        let sim = Sim::new();
+        let first = pool(&sim);
+        first.refill(3).await.unwrap();
+        first.refill(3).await.unwrap();
+        first.refill(3).await.unwrap();
+        sim.state().stuck.insert(2);
+        for slot in [0, 2] {
+            sim.die(slot);
+        }
+        let second = pool(&sim);
+        let adopted = second.adopt().await.unwrap();
+        assert_eq!(adopted.idle, [1]);
+        assert_eq!(sim.active(0), ActiveState::Inactive);
+        assert_eq!(sim.active(2), ActiveState::Failed, "a process is left");
+        // The reset number is built on again, the other stays out of the builds.
+        assert_eq!(second.refill(3).await.unwrap(), Some(0));
+        assert_eq!(second.refill(3).await.unwrap(), Some(3));
     }
 
     // 7. The refill.

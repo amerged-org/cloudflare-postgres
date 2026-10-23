@@ -228,7 +228,8 @@ node that still has a database placed on it (`regional_node_stale`), a failing o
 infrastructure backup, a running database whose WAL archive is failing
 (`database_archive_failing`), an awake database with no completed base backup within 36 hours of
 awake time (`database_base_backup_stale`; sleeping databases are excluded), a thin pool without
-room or without a sample (`thin_storage_blocked`), a node that keeps refusing wakes for awake
+room or without a sample (`thin_storage_blocked`), a database deleted more than 10 minutes ago that
+its node has not finished removing (`database_delete_incomplete`), a node that keeps refusing wakes for awake
 capacity (`regional_node_capacity_refusals`), a region that
 placement has closed (`regional_node_pool_closed`: the smallest size class on offer fits no node,
 for pool data at 80 %, pool metadata at 50 %, the sold storage plus that class past four times

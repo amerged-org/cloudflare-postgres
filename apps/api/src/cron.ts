@@ -233,11 +233,14 @@ export async function runCron(
   // build waits for the node's one big-job slot behind others; `Statements.running`). A node
   // that reports `building` for ever (the task of the build ended, a call of it hangs) keeps that
   // clock young, so a create or a restore also ends at a ceiling after its placement.
+  // An accepted delete cannot be undone: the node continues removing its resources until done.
+  // Keep its operation open until that confirmation, rather than claim failure and delete later.
+  // The independent database_delete_incomplete alert reports a stalled cleanup after ten minutes.
   const expired = await attempt("operation_timeouts", 0, async () => {
     const result = await env.DB.prepare(
       `UPDATE operations SET status='failed',error_code='operation_timeout',
       error_message=CASE WHEN updated_at<? THEN 'Regional operation exceeded 20 minutes' ELSE 'Build exceeded 24 hours after its placement' END,
-      updated_at=?,completed_at=? WHERE status IN('pending','running') AND (updated_at<?
+      updated_at=?,completed_at=? WHERE status IN('pending','running') AND kind<>'database.delete' AND (updated_at<?
         OR (kind IN('database.create','database.restore') AND EXISTS(SELECT 1 FROM databases b WHERE b.id=operations.database_id AND b.node_id IS NOT NULL AND b.placed_at<?)))
       AND NOT EXISTS(SELECT 1 FROM databases u WHERE u.id=operations.database_id AND u.node_id IS NULL AND u.desired_state='running' AND u.deleted_at IS NULL AND operations.kind IN('database.create','database.restore'))
       AND NOT EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
