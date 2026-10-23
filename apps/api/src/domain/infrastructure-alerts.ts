@@ -18,7 +18,6 @@ import {
 import {
   AVERAGE_MINIMUM_SPAN_SECONDS,
   AVERAGE_WINDOW_SECONDS,
-  closedPools,
   LATEST_SAMPLES_SQL,
   minuteOf,
   NODE_OBSERVATION_MAX_AGE_MS,
@@ -28,6 +27,7 @@ import {
   cronErrorCode,
   readCronHealth,
 } from "./cron-health.ts";
+import { closedPools } from "./placement-closed.ts";
 import { purgeNodeDiagnostics } from "./node-diagnostics.ts";
 import type { Env } from "../env.ts";
 import { regionalNodeCountSql } from "./node-capacity-count.ts";

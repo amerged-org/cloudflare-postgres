@@ -19,11 +19,11 @@ import {
   cronErrorCode,
   cronErrorMessage,
   finishCronRun,
+  runWithin,
   type CronStep,
   type CronStepFailure,
 } from "./domain/cron-health.ts";
 import { armCronWatchdog } from "./cron-watchdog.ts";
-import { runWithin } from "./domain/bounded.ts";
 
 /**
  * How long one step may take before the run leaves it behind. Measured on 2026-10-23 (323 runs

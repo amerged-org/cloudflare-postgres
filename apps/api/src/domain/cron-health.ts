@@ -32,6 +32,29 @@ export interface CronStepFailure {
   error_code: string;
 }
 
+/**
+ * The result of `run()`, or a rejection with `code` as its message once `ms` have passed without an
+ * answer. The call is not cancelled and its late result, or failure, is dropped: it is abandoned,
+ * and whatever it was waiting for can no longer hold the caller back.
+ */
+export async function runWithin<T>(
+  ms: number,
+  code: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      run(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(code)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** No run completed for this long: the cron is stalled. */
 export const CRON_STALL_MS = 5 * 60_000;
 /** A step that failed in this many consecutive completed runs is failing. */

@@ -5,8 +5,8 @@ import {
   nodeOnline,
   placementGuard,
   placementNodes,
-  smallestOfferedClass,
 } from "./placement.ts";
+import { smallestOfferedClass } from "./placement-closed.ts";
 import type { DatabaseRow, SizeRow } from "./rows.ts";
 import type { Env } from "../env.ts";
 import { cronErrorCode } from "./cron-health.ts";
