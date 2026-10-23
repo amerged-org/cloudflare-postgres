@@ -77,10 +77,14 @@ link and the first page, which need the node's boot and packages and nothing of 
 time as** the storage opening (`Node::connect_unopened`, `Node::open_storage`; a node that is set up
 asks lvm2 for `pvs`, `vgs` and `lvs` at once and activates nothing when the pool and every volume
 are active, which is what an agent that restarts finds); the device links and the runtime
-(`restore_runtime`); the slots and units read back from the kernel; the first page applied (the
+(`restore_runtime`); the slots and units read back from the kernel, with up to 16 independent
+slot checks and idle-limit restorations at once; the first page applied (the
 fences, the generations, the decisions on the databases that ran, which come first); and the
 gateway served once those are decided (`Core::settled`). A wake is never served before the first
-page, the fences and the generations are known. **The credentials are not on that path.** The
+page, the fences and the generations are known. The first thin-pool sample runs beside slot
+adoption and completes before admission starts. A sample that fails or exceeds one second leaves
+capacity unknown and starts refused until a later sample succeeds; it never prevents the service
+from coming up indefinitely. **The credentials are not on that path.** The
 archive credentials (one read each, 32 at a time, those of the databases that ran first) and the
 node's own (the Tunnel and the route keyring) are read after the first page is applied, in the
 background (`Service::pull_page`): a database that ran is registered with the archive socket when
@@ -89,7 +93,10 @@ its credential arrives (`Core::deliver`), a build waits for its own up to `Timin
 the first reads its credentials before it is applied, as before. The phases `agent_start_phase` names: `storage_open`, `device_links`,
 `restore_runtime`, `linked` (how long the link outlasted the storage), `slots_adopted`,
 `units_read`, `apply`, `settled`, `gateway_table`, `service_started`, and beside the row (read by
-`at_ms`) `link_started`, `link_hello`, `first_page`, `credentials` and `first_wake_served`. A start
+`at_ms`) `link_started`, `link_hello`, `first_page`, `initial_pool_sample`, `credentials` and
+`first_wake_served`. The last phase requires a successful `started` wake, never a refusal; it
+measures agent-side readiness. The client measures successful first SQL and the complete cold
+request separately. A start
 that fails (the pool will not activate, `vgchange_exit_5`) says `agent_failed` and waits five
 seconds before it ends (`pause_after_failed_start`), so that the 100 ms restart does not run the
 failing commands ten times a second; a stop ends the wait. systemd's `RestartSteps=` is not used:

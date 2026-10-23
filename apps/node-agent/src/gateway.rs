@@ -210,6 +210,16 @@ impl Feed {
             | FromGateway::ConnStages(_) => None,
         }
     }
+    /// Whether a request still waits for its answer, for concurrency regressions that must
+    /// finish while the gateway remains silent, rather than after its timeout.
+    #[cfg(test)]
+    pub(crate) fn waiting_for_reply(&self, id: u64) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&id)
+    }
+
     /// The gateway's measurements of `database`. `None` when no gateway answers.
     pub async fn activity(&self, database: &str) -> Option<Activity> {
         let request = |id| ToGateway::Activity {

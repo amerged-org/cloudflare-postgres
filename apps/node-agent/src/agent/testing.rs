@@ -581,6 +581,14 @@ impl FakeGateway {
     }
 }
 
+/// Waits for `future` up to `seconds`: a test that waits for the agent on a socket or a channel
+/// fails with `what` when the wait outlasts the bound, where one without a bound hangs the job.
+pub(crate) async fn within<T>(seconds: u64, what: &str, future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(seconds), future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out: {what}"))
+}
+
 /// Waits for `condition`, which is polled, up to `seconds`.
 pub(crate) async fn eventually(seconds: u64, what: &str, mut condition: impl FnMut() -> bool) {
     let started = std::time::Instant::now();
