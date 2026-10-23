@@ -14,6 +14,8 @@ pub struct Layout {
     pub run: PathBuf,
     /// PostgreSQL's programs (`initdb`, `postgres`).
     pub postgres_bin: PathBuf,
+    /// PostgreSQL's extension libraries (`pg_prewarm.so`): its `pkglibdir`.
+    pub postgres_lib: PathBuf,
     /// The barman-cloud commands of the jobs.
     pub barman_bin: PathBuf,
     pub systemd_run: PathBuf,
@@ -37,6 +39,7 @@ impl Default for Layout {
             state: PathBuf::from("/var/lib/pgcf"),
             run: PathBuf::from("/run/pgcf"),
             postgres_bin: PathBuf::from("/usr/lib/postgresql/18/bin"),
+            postgres_lib: PathBuf::from("/usr/lib/postgresql/18/lib"),
             barman_bin: PathBuf::from("/usr/bin"),
             systemd_run: PathBuf::from("/usr/bin/systemd-run"),
             systemd_executor: PathBuf::from("/usr/lib/systemd/systemd-executor"),

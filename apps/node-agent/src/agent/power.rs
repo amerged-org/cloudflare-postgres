@@ -377,9 +377,13 @@ impl<M: Machine> Core<M> {
         };
         let waited = permit.waited;
         self.event(event("admitted", waited, None));
+        // A pass over the program that is running ends: a start has the disk.
+        self.readahead.start_began();
         let mark = (Instant::now(), self.machine.cpu());
-        // Where the variant says so, the catalogs are read ahead while the slot is bound.
-        let _catalogs = self.readahead_catalogs(&db.id);
+        // Where the variant says so for this start, the start set and the catalogs are read ahead
+        // while the slot is bound. The order does not wait for the reading, which ends at its
+        // budget or with the start.
+        let _at_bind = self.readahead_at_bind(&db.id);
         let Some(bind) = self.bind_of(entry) else {
             permit.failed();
             return Err(failed(db, start, "no_bind"));

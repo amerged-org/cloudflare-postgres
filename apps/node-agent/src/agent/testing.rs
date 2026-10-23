@@ -154,6 +154,7 @@ pub(crate) fn timing() -> Timing {
         settle: Duration::from_secs(10),
         detail: Duration::from_millis(100),
         credential_wait: Duration::from_secs(60),
+        program_every: Duration::from_secs(60),
     }
 }
 

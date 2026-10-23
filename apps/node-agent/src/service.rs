@@ -1450,10 +1450,12 @@ impl<M: Machine> Service<M> {
 
     /// The pool of idle slots: kept at `start_concurrency` while no start is in flight or waits,
     /// when the pool was used, and now and then for what no start told it (a slot that ended, a
-    /// quiet node that began with an empty pool).
+    /// quiet node that began with an empty pool). PostgreSQL's program is kept in the page cache
+    /// at the same turns, at its own interval (`Core::warm_program`).
     async fn slots(&self) {
         loop {
             self.core.refill_pass().await;
+            self.core.warm_program().await;
             tokio::select! {
                 () = self.core.refill.notified() => {}
                 () = tokio::time::sleep(SLOTS_EVERY) => {}
@@ -1614,6 +1616,12 @@ mod tests {
         // The page's database is built, and the cloud is told it is ready, with its first backup.
         eventually(90, "the cloud to be told the database is ready", || {
             observed(&cloud, &id, "ready")
+        })
+        .await;
+        // The loop of the pool also keeps PostgreSQL's program in the page cache: the agent made
+        // its first pass over it once the node was quiet.
+        eventually(30, "the first pass over PostgreSQL's program", || {
+            service.core().readahead.program_passes() >= 1
         })
         .await;
         // The sample for placement, the volume report and the events arrive, each as the contract states
