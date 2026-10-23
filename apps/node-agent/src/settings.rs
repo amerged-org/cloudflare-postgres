@@ -39,21 +39,32 @@ max_replication_slots = 0\n";
 /// of the table's columns').
 const ANALYZE_ROWS_PER_TARGET: u64 = 300;
 
-/// The most memory PostgreSQL 18 holds for one sampled row, at the widest rows it keeps. The sample
-/// is a copy of each sampled row as it lies on its page (`ExecCopySlotHeapTuple`): toasted columns
-/// stay out of line and a row of an extended-storage column is cut to 2,032 bytes, but a row of
-/// `STORAGE PLAIN` or fixed-width columns is as wide as a page allows, `MaxHeapTupleSize` (8,160
-/// bytes) and the 24-byte `HeapTupleData` before it. The allocator rounds that to its chunk of
-/// 8,192 bytes and adds the chunk's 8-byte header: 8,200. The sample's array adds a pointer (8),
-/// and the pass over one column adds the sort item and tuple link of a scalar (20) and, for a value
-/// that was compressed or has a short header, its expanded copy, which `WIDTH_THRESHOLD` limits to
-/// 1,024 bytes (1,032 with the header). A column's pass ends before the next begins, so only one
-/// copy lives at a time. Measured on PostgreSQL 18.6 (plan 4.4): 8,287 bytes per row of 8 KB PLAIN
-/// rows, 9,116 with a compressed column beside the PLAIN one, 4,163 for rows of 2 KB.
+/// The most memory PostgreSQL 18 holds for one sampled row of the table's own columns, at the
+/// widest rows it keeps. The sample is a copy of each sampled row as it lies on its page
+/// (`ExecCopySlotHeapTuple`): toasted columns stay out of line and a row of an extended-storage
+/// column is cut to 2,032 bytes, but a row of `STORAGE PLAIN` or fixed-width columns is as wide as
+/// a page allows, `MaxHeapTupleSize` (8,160 bytes) and the 24-byte `HeapTupleData` before it. The
+/// allocator rounds that to its chunk of 8,192 bytes and adds the chunk's 8-byte header: 8,200. The
+/// sample's array adds a pointer (8), and the pass over one column adds the sort item and tuple
+/// link of a scalar (20) and, for a value that was compressed or has a short header, its expanded
+/// copy, which `WIDTH_THRESHOLD` limits to 1,024 bytes (1,032 with the header). A column's pass
+/// ends before the next begins, so only one copy lives at a time. Measured on PostgreSQL 18.6 (plan
+/// 4.4): 8,287 bytes per row of 8 KB PLAIN rows, 9,116 with a compressed column beside the PLAIN
+/// one, 4,163 for rows of 2 KB.
+///
+/// **It is not a bound for a table whose indexes or statistics objects have an expression.**
+/// `compute_index_stats` copies the value of every index expression, for every sampled row, with
+/// `datumCopy` into a context that lives beside the sample, and `compute_expr_stats` does the same
+/// for the expressions of `CREATE STATISTICS`. Nothing limits the width of such a value to the
+/// row's: an index on `to_tsvector('simple', body)` over documents of 22 KB holds a tsvector of
+/// 26 KB for each sampled row (plan 4.4: 78 MiB for 3,000 rows, where this model says 27 MiB). No
+/// setting of a class bounds that, which is why the plan and the integrator handover say what it
+/// costs and how a tenant ends it (`ALTER INDEX ... ALTER COLUMN n SET STATISTICS 0`, or a stored
+/// generated column that the index is on instead of the expression).
 const ANALYZE_ROW_BYTES: u64 = 8_200 + 8 + 1_032 + 20;
 
-/// What `ANALYZE` holds for the sample of a table at statistics target `target`, at the widest
-/// rows.
+/// What `ANALYZE` holds for the sample of a table's own columns at statistics target `target`, at
+/// the widest rows, without the values of index and statistics expressions (`ANALYZE_ROW_BYTES`).
 pub fn analyze_sample_bytes(target: u32) -> u64 {
     ANALYZE_ROWS_PER_TARGET * u64::from(target) * ANALYZE_ROW_BYTES
 }
@@ -73,10 +84,12 @@ fn autovacuum_workers(memory_mib: u64) -> u32 {
 
 /// The statistics target of a database of `memory_mib` with `workers` autovacuum workers: the
 /// largest, in steps of ten, between 10 and PostgreSQL's default of 100, at which the samples of
-/// all the workers and of one manual ANALYZE at once, each at the widest rows, take no more than
-/// half of the memory. The other half is the shared buffers (an eighth), the connections and the
-/// page cache. A lower target gives each column fewer most-common values and histogram buckets
-/// (`pg_stats`) and a smaller sample to estimate the distinct values from.
+/// all the workers and of one manual ANALYZE at once, each at the widest rows of the table's own
+/// columns, take no more than half of the memory. The other half is the shared buffers (an eighth),
+/// the connections and the page cache. The values of index and statistics expressions come on top
+/// and no target bounds them (`ANALYZE_ROW_BYTES`). A lower target gives each column fewer
+/// most-common values and histogram buckets (`pg_stats`) and a smaller sample to estimate the
+/// distinct values from.
 fn statistics_target(memory_mib: u64, workers: u32) -> u32 {
     let sample = memory_mib.saturating_mul(MIB) / 2 / (u64::from(workers) + 1);
     let target = sample / analyze_sample_bytes(1);
@@ -86,9 +99,10 @@ fn statistics_target(memory_mib: u64, workers: u32) -> u32 {
 /// What PostgreSQL's memory settings are for a database of `memory_mib` (plan Appendix C): the
 /// shared buffers stay small because shared memory cannot be reclaimed without swap, and the page
 /// cache does the caching. The autovacuum workers and the statistics target bound what `VACUUM`
-/// and `ANALYZE` hold (`statistics_target`; the dead-item store of a vacuum is
-/// `maintenance_work_mem`, which a sample's share always exceeds). A small database (up to 512 MiB)
-/// also runs `SMALL_DATABASE_SETTINGS`.
+/// holds and what `ANALYZE` holds for the table's own columns (`statistics_target`; the dead-item
+/// store of a vacuum is `maintenance_work_mem`, which a sample's share always exceeds); they do not
+/// bound the values of index and statistics expressions (`ANALYZE_ROW_BYTES`). A small database
+/// (up to 512 MiB) also runs `SMALL_DATABASE_SETTINGS`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tuning {
     pub shared_buffers_mib: u64,
@@ -434,33 +448,16 @@ mod tests {
         }
     }
 
-    /// What ANALYZE keeps per sampled row, measured on PostgreSQL 18 for the widest rows it keeps:
-    /// one that a page holds alone (a column that is never toasted, `STORAGE PLAIN`, so that the
-    /// row is not cut to 2 KB) with a compressed column beside it, which the pass over that column
-    /// expands (`compute_scalar_stats`). The peak anonymous memory of the backend, over what it held
-    /// before, stays within the model and is not far from it, so the model is the sample and not
-    /// some other number.
+    /// The peak of the anonymous memory of a backend of its own, over what it held before it ran
+    /// `sql`: `RssAnon` of its process, read every 2 ms. A backend keeps what it freed, so each
+    /// measurement has a session of its own.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn analyze_keeps_no_more_per_sampled_row_than_the_model_says() {
+    async fn backend_growth(cluster: &Cluster, sql: &str) -> u64 {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         };
-        let Some(cluster) = Cluster::create("analyze-memory") else {
-            return;
-        };
-        cluster.start();
         let session = cluster.agent().await;
-        session
-            .batch_long(
-                "CREATE TABLE wide (id int, blob text, note text);
-                 ALTER TABLE wide ALTER COLUMN blob SET STORAGE PLAIN;
-                 INSERT INTO wide SELECT g, repeat(md5(g::text), 218), repeat('abcdefghij', 100)
-                   FROM generate_series(1, 3000) g",
-            )
-            .await
-            .unwrap();
         let pid: i32 = session.query("SELECT pg_backend_pid()", &[]).await.unwrap()[0].get(0);
         let anonymous = move || -> u64 {
             let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
@@ -488,13 +485,41 @@ mod tests {
                 peak
             })
         };
-        // A target of 10 samples 3,000 rows: every row of the table.
-        session
-            .batch_long("SET default_statistics_target = 10; ANALYZE wide")
+        session.batch_long(sql).await.unwrap();
+        done.store(true, Ordering::Relaxed);
+        poller.join().unwrap().saturating_sub(before)
+    }
+
+    /// What ANALYZE keeps per sampled row, measured on PostgreSQL 18 for the widest rows it keeps:
+    /// one that a page holds alone (a column that is never toasted, `STORAGE PLAIN`, so that the
+    /// row is not cut to 2 KB) with a compressed column beside it, which the pass over that column
+    /// expands (`compute_scalar_stats`). The peak anonymous memory of the backend, over what it held
+    /// before, stays within the model and is not far from it, so the model is the sample and not
+    /// some other number.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn analyze_keeps_no_more_per_sampled_row_than_the_model_says() {
+        let Some(cluster) = Cluster::create("analyze-memory") else {
+            return;
+        };
+        cluster.start();
+        cluster
+            .agent()
+            .await
+            .batch_long(
+                "CREATE TABLE wide (id int, blob text, note text);
+                 ALTER TABLE wide ALTER COLUMN blob SET STORAGE PLAIN;
+                 INSERT INTO wide SELECT g, repeat(md5(g::text), 218), repeat('abcdefghij', 100)
+                   FROM generate_series(1, 3000) g",
+            )
             .await
             .unwrap();
-        done.store(true, Ordering::Relaxed);
-        let grown = poller.join().unwrap().saturating_sub(before);
+        // A target of 10 samples 3,000 rows: every row of the table.
+        let grown = backend_growth(
+            &cluster,
+            "SET default_statistics_target = 10; ANALYZE wide",
+        )
+        .await;
         let model = analyze_sample_bytes(10);
         println!(
             "analyze_memory: the backend grew by {grown} bytes for 3000 rows, the model says {model}"
@@ -507,6 +532,100 @@ mod tests {
         assert!(
             grown >= 3_000 * 8_200,
             "ANALYZE grew the backend by {grown} bytes: the sample was not measured"
+        );
+    }
+
+    /// The model above is the sample of the table's own columns. `ANALYZE` keeps the value of every
+    /// index expression for every sampled row besides (`compute_index_stats`), and a value is as wide
+    /// as the expression makes it: a full-text index over documents of 22 KB holds a tsvector of
+    /// 26 KB for each row, three times a row's share of the model. No class setting bounds that, so
+    /// the plan and the integrator handover say what it costs and give two remedies, which this test
+    /// pins: the statistics of the index column off (`ALTER INDEX ... ALTER COLUMN 1 SET STATISTICS
+    /// 0`: the expression has none, and the backend grows by no more than the sample of the rows),
+    /// and a stored generated column that the index is on instead of the expression (the column has
+    /// its statistics, 10 × the target most-common elements, and its values stay out of line).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_index_expression_is_held_for_every_sampled_row_unless_its_statistics_are_off() {
+        let Some(cluster) = Cluster::create("analyze-expression") else {
+            return;
+        };
+        cluster.start();
+        const ROWS: u64 = 1_000;
+        let session = cluster.agent().await;
+        session
+            .batch_long(&format!(
+                "CREATE TABLE docs_expr (id int PRIMARY KEY, body text);
+                 INSERT INTO docs_expr SELECT g, (SELECT string_agg(md5(((power(random(), 2.5) * 60000)::int)::text), ' ')
+                                                    FROM generate_series(1, 680) i)
+                   FROM generate_series(1, {ROWS}) g;
+                 CREATE INDEX docs_expr_tsv ON docs_expr USING gin (to_tsvector('simple', body));
+                 CREATE TABLE docs_off (id int PRIMARY KEY, body text);
+                 INSERT INTO docs_off SELECT * FROM docs_expr;
+                 CREATE INDEX docs_off_tsv ON docs_off USING gin (to_tsvector('simple', body));
+                 ALTER INDEX docs_off_tsv ALTER COLUMN 1 SET STATISTICS 0;
+                 CREATE TABLE docs_col (id int PRIMARY KEY, body text,
+                   tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED);
+                 INSERT INTO docs_col (id, body) SELECT id, body FROM docs_expr;
+                 CREATE INDEX docs_col_tsv ON docs_col USING gin (tsv)"
+            ))
+            .await
+            .unwrap();
+        let value: u64 = session
+            .query(
+                "SELECT avg(pg_column_size(to_tsvector('simple', body)))::bigint FROM docs_expr",
+                &[],
+            )
+            .await
+            .unwrap()[0]
+            .get::<_, i64>(0)
+            .try_into()
+            .unwrap();
+        drop(session);
+        // The rows of the sample: all of them, whatever the target (300 × 10 is more than ROWS).
+        let model = ROWS * ANALYZE_ROW_BYTES;
+        let analyze = |table: &str| {
+            format!("SET default_statistics_target = 20; ANALYZE {table}")
+        };
+        let expression = backend_growth(&cluster, &analyze("docs_expr")).await;
+        let off = backend_growth(&cluster, &analyze("docs_off")).await;
+        let stored = backend_growth(&cluster, &analyze("docs_col")).await;
+        println!(
+            "analyze_expression: {ROWS} sampled rows with a value of {value} bytes; the backend grew by {expression} bytes with the expression index, {off} with its statistics off, {stored} with a stored column; the model of the table's columns says {model}"
+        );
+        assert!(
+            expression >= ROWS * value * 9 / 10,
+            "ANALYZE did not keep the expression's value of every sampled row: {expression} bytes"
+        );
+        assert!(
+            expression > model + 4 * MIB,
+            "the model is a bound for an index expression: {expression} bytes against {model}"
+        );
+        for (remedy, grown) in [("statistics off", off), ("stored column", stored)] {
+            assert!(
+                grown <= model + 4 * MIB,
+                "{remedy}: ANALYZE grew the backend by {grown} bytes, the model says {model}"
+            );
+        }
+        let stats = cluster.agent().await;
+        let count = |sql: &'static str| {
+            let stats = &stats;
+            async move { stats.query(sql, &[]).await.unwrap()[0].get::<_, i64>(0) }
+        };
+        assert!(
+            count("SELECT count(*) FROM pg_stats WHERE tablename = 'docs_expr_tsv'").await > 0,
+            "the expression index has statistics"
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM pg_stats WHERE tablename = 'docs_off_tsv'").await,
+            0,
+            "an index column with statistics off has none"
+        );
+        assert_eq!(
+            count("SELECT array_length(most_common_elems, 1)::bigint FROM pg_stats WHERE tablename = 'docs_col' AND attname = 'tsv'")
+                .await,
+            200,
+            "the stored column keeps 10 x the target most-common elements"
         );
     }
 

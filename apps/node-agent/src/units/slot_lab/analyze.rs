@@ -9,6 +9,11 @@
 //! reached the ceiling, that the memory the unit cannot give back (anonymous, shared and kernel)
 //! stayed below the soft limit, that the sample is no larger than `settings::analyze_sample_bytes`
 //! says, and that the unit was stalled for memory no longer than `STALL_MS_PER_SECOND` of the step.
+//! Three more tables of 6,000 documents of 22 KB show what the model does not cover: the values of
+//! an index expression, which `ANALYZE` keeps for every sampled row (`settings::ANALYZE_ROW_BYTES`).
+//! A full-text index on `to_tsvector(body)` holds 26 KB for each row, the same index with the
+//! statistics of its column off holds nothing, and a stored generated column that the index is on
+//! holds nothing: the lab measures all three in every class and asserts what the plan promises.
 //! Run as the pool's lab (the header of `slot_lab`), with the filter `units::slot_lab::analyze`.
 use super::*;
 use crate::units::slots::slot_cgroup;
@@ -25,9 +30,12 @@ const CLASSES: [(&str, u64, u32); 4] = [
     ("md", 2048, 200),
     ("lg", 4096, 300),
 ];
-/// The volume: three tables of 100,000 rows (1.8 GB), four of 35,000 (1.1 GB), and the WAL a
-/// quarter of the volume allows.
-const VOLUME: u64 = 6 << 30;
+/// The volume: three tables of 100,000 rows (1.8 GB), four of 35,000 (1.1 GB), three of 6,000
+/// documents (0.7 GB), and the WAL a quarter of the volume allows.
+const VOLUME: u64 = 8 << 30;
+/// The documents of the tables `dx`, `d0` and `dc`: 300 × the target of `xs` (20) is the sample of
+/// the smallest class, and every other class samples all of them.
+const DOCUMENTS: u64 = 6_000;
 /// The stall the unit may have for memory (`memory.pressure`, `full`) in a step, in milliseconds
 /// per second of the step, and a floor for the shortest steps. Reading a table larger than the unit
 /// fills its page cache to the soft limit, which the kernel gives back at once; that is not a stall
@@ -142,15 +150,8 @@ struct Sampled {
     connections: u64,
 }
 
-/// What a step must show.
-fn check(
-    class: &str,
-    step: &str,
-    cgroup: &Cgroup,
-    idle: &Measured,
-    m: &Measured,
-    sampled: Option<Sampled>,
-) {
+/// What a step measured, in a line.
+fn show(class: &str, step: &str, cgroup: &Cgroup, idle: &Measured, m: &Measured) {
     let high = cgroup.limit("memory.high");
     let max = cgroup.limit("memory.max");
     println!(
@@ -165,6 +166,19 @@ fn check(
         m.high,
         m.stalled_ms,
     );
+}
+
+/// What a step must show.
+fn check(
+    class: &str,
+    step: &str,
+    cgroup: &Cgroup,
+    idle: &Measured,
+    m: &Measured,
+    sampled: Option<Sampled>,
+) {
+    show(class, step, cgroup, idle, m);
+    let high = cgroup.limit("memory.high");
     assert_eq!(
         (m.oom_kill, m.max),
         (0, 0),
@@ -256,9 +270,12 @@ async fn serve(lab: &Lab, database: &Database, memory_mib: u64, max_connections:
 
 /// The tables. `wide` rows are 8 KB and never toasted, `narrow` rows 2 KB, `worst` rows hold a
 /// PLAIN column of 7 KB beside a compressed one, and `s1` to `s4` are 35,000 of those rows each,
-/// for the steps that run several ANALYZE at once. Autovacuum is off on all of them until a step
-/// turns it on.
-const LOAD: [&str; 8] = [
+/// for the steps that run several ANALYZE at once. `dx`, `d0` and `dc` are `DOCUMENTS` documents of
+/// 22 KB (680 words of a skewed vocabulary): `dx` has a full-text index on the expression
+/// `to_tsvector('simple', body)`, `d0` the same with the statistics of the index column off, and
+/// `dc` a stored generated tsvector column with the index on the column. Autovacuum is off on all of
+/// them until a step turns it on.
+const LOAD: [&str; 11] = [
     "CREATE TABLE wide (id int PRIMARY KEY, grp int, created timestamptz, payload text) WITH (autovacuum_enabled = false);
      ALTER TABLE wide ALTER COLUMN payload SET STORAGE PLAIN;
      INSERT INTO wide SELECT g, (random()*1000)::int, now() - (g || ' seconds')::interval, repeat(md5(g::text), 253) FROM generate_series(1, 100000) g",
@@ -279,13 +296,24 @@ const LOAD: [&str; 8] = [
     "CREATE TABLE s4 (LIKE worst INCLUDING ALL) WITH (autovacuum_enabled = false);
      ALTER TABLE s4 ALTER COLUMN blob SET STORAGE PLAIN;
      INSERT INTO s4 SELECT * FROM worst WHERE id <= 35000",
+    "CREATE TABLE dx (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = false);
+     INSERT INTO dx SELECT g, (SELECT string_agg(md5(((power(random(), 2.5) * 60000)::int)::text), ' ') FROM generate_series(1, 680) i) FROM generate_series(1, 6000) g;
+     CREATE INDEX dx_tsv ON dx USING gin (to_tsvector('simple', body))",
+    "CREATE TABLE d0 (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = false);
+     INSERT INTO d0 SELECT * FROM dx;
+     CREATE INDEX d0_tsv ON d0 USING gin (to_tsvector('simple', body));
+     ALTER INDEX d0_tsv ALTER COLUMN 1 SET STATISTICS 0",
+    "CREATE TABLE dc (id int PRIMARY KEY, body text, tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED) WITH (autovacuum_enabled = false);
+     INSERT INTO dc (id, body) SELECT id, body FROM dx;
+     CREATE INDEX dc_tsv ON dc USING gin (tsv)",
     "CREATE TABLE small (id int PRIMARY KEY, v int);
      INSERT INTO small SELECT g, g FROM generate_series(1, 1000) g",
 ];
 
 /// A manual ANALYZE of a table of each kind, a VACUUM of dead tuples, the autovacuum worker's
-/// VACUUM and ANALYZE of one table, and as many ANALYZE at once as the class has autovacuum workers
-/// plus the session's own, beside connections that ask small questions, each in every class.
+/// VACUUM and ANALYZE of one table, the ANALYZE of a table with a full-text index on an expression
+/// and of the two tables that end its cost, and as many ANALYZE at once as the class has autovacuum
+/// workers plus the session's own, beside connections that ask small questions, each in every class.
 #[tokio::test]
 #[ignore = "needs systemd as PID 1, root, PostgreSQL 18 and the node image's units (lab)"]
 async fn analyze_and_vacuum_stay_inside_the_memory_of_every_class() {
@@ -297,7 +325,11 @@ async fn analyze_and_vacuum_stay_inside_the_memory_of_every_class() {
         for statement in LOAD {
             session.batch_long(statement).await.unwrap();
         }
-        for table in ["wide", "narrow", "worst", "s1", "s2", "s3", "s4"] {
+        assert_eq!(
+            session.query("SELECT count(*) FROM dx", &[]).await.unwrap()[0].get::<_, i64>(0),
+            DOCUMENTS as i64
+        );
+        for table in ["wide", "narrow", "worst", "s1", "s2", "s3", "s4", "dx", "d0", "dc"] {
             session
                 .batch_long(&format!("VACUUM (FREEZE) {table}"))
                 .await
@@ -461,6 +493,63 @@ async fn analyze_and_vacuum_stay_inside_the_memory_of_every_class() {
                 connections: 1,
             }),
         );
+
+        // The values of an index expression, which the model does not cover: `dx` keeps one for
+        // every sampled row, and the two remedies keep none.
+        let value: u64 = {
+            let session = database.agent().await;
+            session
+                .query(
+                    "SELECT avg(pg_column_size(to_tsvector('simple', body)))::bigint FROM dx",
+                    &[],
+                )
+                .await
+                .unwrap()[0]
+                .get::<_, i64>(0)
+                .try_into()
+                .unwrap()
+        };
+        let documents = DOCUMENTS.min(300 * u64::from(target));
+        for table in ["dx", "d0", "dc"] {
+            settle(&cgroup, &idle).await;
+            let session = database.agent().await;
+            let (result, m) =
+                measured(&cgroup, session.batch_long(&format!("ANALYZE {table}"))).await;
+            result.unwrap();
+            drop(session);
+            let step = format!("ANALYZE {table}, {documents} documents");
+            if table == "dx" {
+                show(class, &step, &cgroup, &idle, &m);
+                let grew = m.anon.saturating_sub(idle.anon);
+                // Every sampled row's value is there, and the sample of the model is not the bound.
+                assert!(
+                    grew >= documents * value * 9 / 10,
+                    "{class} {step}: the unit grew by {grew} bytes, a value is {value} bytes"
+                );
+                assert!(
+                    grew > documents * settings::analyze_sample_bytes(1) / 300,
+                    "{class} {step}: the model bounds an index expression"
+                );
+                assert_eq!(
+                    (m.oom_kill, m.max),
+                    (0, 0),
+                    "{class} {step}: the kernel killed or hit the ceiling"
+                );
+            } else {
+                check(
+                    class,
+                    &step,
+                    &cgroup,
+                    &idle,
+                    &m,
+                    Some(Sampled {
+                        samples: 1,
+                        target,
+                        connections: 0,
+                    }),
+                );
+            }
+        }
 
         // The most that can run together: every autovacuum worker and one session analyze at the
         // widest rows, with connections that ask small questions beside them.
