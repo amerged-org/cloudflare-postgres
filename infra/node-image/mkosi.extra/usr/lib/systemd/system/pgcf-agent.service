@@ -21,7 +21,12 @@ StartLimitIntervalSec=0
 Type=notify
 ExecStart=/var/lib/pgcf/bin/current/pgcf-agent run
 Restart=always
-RestartSec=1s
+# A killed agent is started again at once: the first wake after `kill -9` waits for it (1 s of
+# the 46 s measured on EU1, 2026-10-23). A start that fails waits in the agent before it ends
+# (`pause_after_failed_start`, 5 s), so that a node whose pool will not activate does not run the
+# same failing commands ten times a second; RestartSteps= is not used because systemd does not
+# reset it after a long run.
+RestartSec=100ms
 KillMode=control-group
 # No filesystem sandboxing beyond this: the agent needs to see the node. Its mounts (volumes,
 # attach, fstrim, resize) are made in the private copy and never reach PID 1 or the executors.

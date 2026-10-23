@@ -44,6 +44,11 @@ impl LogicalVolume {
     pub fn is_thin(&self) -> bool {
         self.attr.starts_with('V')
     }
+    /// The volume is active: the fifth character of `lv_attr` is `a`. An agent that restarts finds
+    /// the pool and every volume active, as the last agent and the units left them.
+    pub fn is_active(&self) -> bool {
+        self.attr.as_bytes().get(4) == Some(&b'a')
+    }
     /// Something has the volume's device open: the filesystem is mounted, in any mount namespace
     /// (the agent's, a unit's, a job's), or a process has opened the device. It is the sixth
     /// character of `lv_attr`, which lvm2 reads from the device-mapper open count.

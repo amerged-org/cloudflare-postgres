@@ -1041,6 +1041,66 @@ fn the_agents_exit_unmounts_every_volume_it_mounted() {
     }
 }
 
+/// Runs the commands on the system and keeps the program of each.
+struct Recording(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl CommandRunner for Recording {
+    fn run(&self, command: &[String]) -> std::io::Result<Output> {
+        self.0.lock().unwrap().push(command[0].clone());
+        SystemRunner.run(command)
+    }
+}
+
+/// The agent opens its storage at every start, and a report of LVM takes 150 to 300 ms with 312
+/// volumes (EU1, 2026-10-23: 1.8 s to open, before the first page could be used). An agent that
+/// restarts finds the pool and every volume active: it asks for the three reports at once and
+/// activates nothing, and the volumes it read are the ones it keeps.
+#[test]
+fn opening_a_node_that_is_active_asks_for_three_reports_at_once_and_activates_nothing() {
+    let lab = Lab::open(512);
+    let a = id(ID, 1);
+    lab.create(&a, 128);
+    let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let storage = Storage::new(Recording(ran.clone()), lab.config().clone());
+    assert_eq!(storage.open().unwrap(), Activation::default());
+    let mut programs = ran.lock().unwrap().clone();
+    programs.sort();
+    assert_eq!(programs, ["lvs", "pvs", "vgs"]);
+    // The volumes it read answer the questions of the first decisions: no `lvs` more.
+    assert!(storage.exists(&a).unwrap());
+    assert_eq!(ran.lock().unwrap().len(), 3);
+}
+
+/// After a boot nothing is active: the group is activated, and the volumes are read again, so that
+/// the reading the agent keeps shows them active.
+#[test]
+fn opening_a_node_after_a_boot_activates_the_group_and_reads_the_volumes_again() {
+    let lab = Lab::open(512);
+    let a = id(ID, 1);
+    lab.create(&a, 128);
+    lab.storage.unmount_volume(&a).unwrap();
+    lab.run(vec![
+        "vgchange".into(),
+        "--quiet".into(),
+        "--activate".into(),
+        "n".into(),
+        lab.config().group.clone(),
+    ]);
+    let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let storage = Storage::new(Recording(ran.clone()), lab.config().clone());
+    assert_eq!(storage.open().unwrap(), Activation::default());
+    let mut programs = ran.lock().unwrap().clone();
+    programs.sort();
+    assert_eq!(programs, ["lvs", "lvs", "pvs", "vgchange", "vgs"]);
+    assert!(lab.lvs().iter().all(|lv| lv.is_active()));
+    assert!(storage.exists(&a).unwrap());
+    assert_eq!(
+        ran.lock().unwrap().len(),
+        5,
+        "the second reading is the one kept"
+    );
+}
+
 #[test]
 fn a_wake_asks_the_kernel_and_not_lvm2_about_a_mounted_volume() {
     let lab = Lab::open(512);

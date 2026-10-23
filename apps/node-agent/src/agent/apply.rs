@@ -399,6 +399,8 @@ impl<M: Machine> Core<M> {
         match step {
             Step::Nothing => {}
             Step::Build => {
+                // The credentials of the first page are read after the page is applied.
+                self.credentials_for(&entry).await;
                 let _ = self.build(db, &entry).await;
             }
             Step::Delete => self.delete(db, &entry).await,
@@ -974,7 +976,11 @@ impl<M: Machine> Core<M> {
 mod tests {
     use super::*;
     use crate::{
-        agent::testing::{Rig, eventually},
+        agent::{
+            Timing,
+            testing::{Rig, eventually, new_entry_json, timing},
+        },
+        credentials::Access,
         link::Order,
         node_link::contract_valid,
         postgres,
@@ -983,6 +989,7 @@ mod tests {
     };
     use pgcf_native_protocol::agent::Mode;
     use serde_json::{Value, json};
+    use std::time::Duration;
 
     fn entry(change: impl FnOnce(&mut Value)) -> Entry {
         let mut db = crate::link::test_server::database("dbbbbbbbbbbbbbbbbbbb");
@@ -3048,6 +3055,85 @@ mod tests {
         assert_eq!(
             rig.core.pending_order("op_tttttttttttttttttttt").unwrap()["status"],
             "done"
+        );
+    }
+
+    /// The first page is applied before the archive credentials are read (the gateway is served
+    /// without them), so a database that runs finds its credential missing when the agent decides
+    /// on it. It is registered with the archive socket when the credential arrives, not at its
+    /// next change: PostgreSQL's archiver would otherwise sit out its retry interval.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_found_running_before_its_credential_arrives_archives_when_it_does() {
+        let Some(rig) = Rig::new("late-credential").await else {
+            return;
+        };
+        rig.machine.direct_archive();
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(90, "ready", || rig.core.db(&id).phase() == Phase::Ready).await;
+        let mut db = db;
+        db.as_object_mut().unwrap().remove("origin");
+        // The agent restarts: the unit runs on, and no credential has been read yet.
+        let rig = rig.restart().await;
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "the decision on the unit that runs", || {
+            rig.core.db(&id).phase() == Phase::Ready
+        })
+        .await;
+        let entry = rig.entry_for(&db);
+        let upload_log = rig.core.files(&id).upload_log(entry.storage_generation);
+        assert!(
+            rig.core.store(&path, Access::ReadWrite).is_none(),
+            "no credential has arrived"
+        );
+        rig.deliver(&path, "read_write");
+        let store = rig.core.store(&path, Access::ReadWrite).unwrap();
+        eventually(5, "the archive socket to know the database", || {
+            rig.table.archives(&id, &store, &upload_log)
+        })
+        .await;
+    }
+
+    /// A database that is built needs its credential from its first step: the build waits for the
+    /// credential of the first page, which is read after the page is applied, and does not fail
+    /// as though the archive were unusable. Past the bound it fails as it did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_build_waits_for_its_archive_credential_and_fails_when_it_never_arrives() {
+        let Some(rig) = Rig::with_timing(
+            "build-waits",
+            Timing {
+                credential_wait: Duration::from_secs(3),
+                ..timing()
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let (waits, gives_up) = (new_entry_json(), new_entry_json());
+        let (waiting, giving_up) = (id_of(&waits), id_of(&gives_up));
+        rig.core
+            .apply(&Rig::page(vec![waits.clone(), gives_up.clone()], vec![]))
+            .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        for id in [&waiting, &giving_up] {
+            assert_ne!(rig.core.db(id).phase(), Phase::Error, "the build waits");
+            assert_ne!(rig.core.db(id).phase(), Phase::Ready);
+        }
+        rig.deliver(waits["archive"]["path"].as_str().unwrap(), "read_write");
+        eventually(90, "the build that was waiting", || {
+            rig.core.db(&waiting).phase() == Phase::Ready
+        })
+        .await;
+        eventually(10, "the build that was not given a credential", || {
+            rig.core.db(&giving_up).phase() == Phase::Error
+        })
+        .await;
+        assert_eq!(
+            rig.core.db(&giving_up).view().error,
+            Some("archive_unusable")
         );
     }
 

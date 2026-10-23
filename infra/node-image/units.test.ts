@@ -263,6 +263,23 @@ test("the agent runs in a mount namespace of its own: its volumes never reach PI
   }
 });
 
+test("a killed agent is started again within a quarter of a second, and a start that fails waits in the agent", () => {
+  // The first wake after `kill -9` of the agent waits for the next process: systemd starts it after
+  // RestartSec (1 s on EU1, 2026-10-23, of 46 s to the first served wake). The back-off of a start
+  // that fails is the agent's own (`pause_after_failed_start`, 5 s), because systemd's RestartSteps=
+  // is not reset by a long run (systemd 257.13: after a run of 6 s the delay stayed at its maximum),
+  // so it would slow the restart after a kill for as long as the node lives.
+  const unit = readFileSync(new URL("pgcf-agent.service", units), "utf8");
+  assert.deepEqual(assignments(unit, "Restart"), ["always"]);
+  assert.deepEqual(assignments(unit, "StartLimitIntervalSec"), ["0"]);
+  const [restart] = assignments(unit, "RestartSec");
+  const milliseconds = /^(\d+)ms$/.exec(restart ?? "");
+  assert.ok(milliseconds, `RestartSec= is given in milliseconds: ${restart}`);
+  assert.ok(Number(milliseconds[1]) <= 250, `RestartSec=${restart}`);
+  assert.deepEqual(assignments(unit, "RestartSteps"), []);
+  assert.deepEqual(assignments(unit, "RestartMaxDelaySec"), []);
+});
+
 test("the three oneshots that MountImages= pulls into every start are masked: a start forks none of them", () => {
   // modprobe@.service has no RemainAfterExit, so loop, dm_mod and dm_verity would run again for every
   // database that starts (about 7 ms, three forks). dm_mod loads on its own when the device-mapper

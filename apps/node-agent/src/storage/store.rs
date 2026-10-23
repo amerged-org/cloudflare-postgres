@@ -150,12 +150,6 @@ impl<R: CommandRunner> Storage<R> {
             None => self.read_lvs_shared(),
         }
     }
-    fn read_group(&self) -> Result<lvm::VolumeGroup, Error> {
-        lvm::parse_vgs(&self.run(commands::vgs())?.stdout)?
-            .into_iter()
-            .find(|group| group.name == self.config.group)
-            .ok_or(Error::Unexpected("the volume group"))
-    }
     fn mounts(&self) -> Result<Vec<Mount>, Error> {
         mountinfo::parse(&host::mount_table()?)
     }
@@ -318,22 +312,69 @@ impl<R: CommandRunner> Storage<R> {
     /// describes, or are made; the group is active. A disk, group or pool that is something else
     /// is an error, never repaired in place. What the activation had to do besides `vgchange` is
     /// in the answer, for the caller to report.
-    pub fn open(&self) -> Result<Activation, Error> {
+    pub fn open(&self) -> Result<Activation, Error>
+    where
+        R: Sync,
+    {
         let _guard = self.lock();
         let device = fs::canonicalize(&self.config.device)?;
-        let device = lvm::parse_pvs(&self.run(commands::pvs())?.stdout)?
+        // The three reports of a node that is set up do not depend on each other: they are asked
+        // for at once (each is 100 to 300 ms with hundreds of volumes, and the agent's start waits
+        // for the storage). The volumes are read on a node that has no group yet as well; that
+        // read fails, and the first boot goes on without it.
+        let (pvs, vgs, lvs) = std::thread::scope(|scope| {
+            let lvs = scope.spawn(|| self.read_lvs());
+            let pvs = scope.spawn(|| self.run(commands::pvs()));
+            let vgs = self.run(commands::vgs());
+            (
+                pvs.join()
+                    .unwrap_or(Err(Error::Unexpected("the physical volumes"))),
+                vgs,
+                lvs.join().unwrap_or(Err(Error::Unexpected("the volumes"))),
+            )
+        });
+        let device = lvm::parse_pvs(&pvs?.stdout)?
             .into_iter()
             .find(|pv| Path::new(&pv.name) == device);
-        let groups = lvm::parse_vgs(&self.run(commands::vgs())?.stdout)?;
-        for step in lvm::plan_group(&self.config, device.as_ref(), &groups)? {
-            self.run(match step {
-                GroupStep::CreatePhysicalVolume => commands::pvcreate(&self.config),
-                GroupStep::CreateGroup => commands::vgcreate(&self.config),
-            })?;
+        let mut groups = lvm::parse_vgs(&vgs?.stdout)?;
+        let steps = lvm::plan_group(&self.config, device.as_ref(), &groups)?;
+        // What was made is read again; what was not is the report the plan was made from.
+        let mut lvs = lvs.ok();
+        if !steps.is_empty() {
+            for step in steps {
+                self.run(match step {
+                    GroupStep::CreatePhysicalVolume => commands::pvcreate(&self.config),
+                    GroupStep::CreateGroup => commands::vgcreate(&self.config),
+                })?;
+            }
+            groups = lvm::parse_vgs(&self.run(commands::vgs())?.stdout)?;
+            lvs = None;
         }
-        let group = self.read_group()?;
-        let activation = self.activate_group()?;
-        for step in lvm::plan_pool(&self.config, &group, &self.read_lvs()?)? {
+        let group = groups
+            .into_iter()
+            .find(|group| group.name == self.config.group)
+            .ok_or(Error::Unexpected("the volume group"))?;
+        // An agent that restarts finds the pool and every volume active, and there is nothing to
+        // activate: `vgchange` reads the metadata of every volume to find that out (150 to 350
+        // ms with 312 of them). After a boot nothing is active, and it is run.
+        let active = lvs
+            .as_ref()
+            .is_some_and(|lvs| !lvs.is_empty() && lvs.iter().all(|lv| lv.is_active()));
+        let activation = if active {
+            Activation::default()
+        } else {
+            lvs = None;
+            self.activate_group()?
+        };
+        let lvs = match lvs {
+            Some(lvs) => lvs,
+            None => self.read_lvs()?,
+        };
+        let steps = lvm::plan_pool(&self.config, &group, &lvs)?;
+        if steps.is_empty() {
+            return Ok(activation);
+        }
+        for step in steps {
             self.run(match step {
                 PoolStep::Create { data_bytes } => commands::pool_create(&self.config, data_bytes),
                 PoolStep::ErrorWhenFull => commands::error_when_full(&self.config),

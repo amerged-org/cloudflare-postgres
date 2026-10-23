@@ -732,11 +732,14 @@ before inside the namespace; the database units and the backup jobs mount their 
   to EU1's mount time: 300 volumes, stop and start to the first served wake 76 s before the change
   and 6 s after it. On EU1 (167 volumes) it is measured in the plan (11.1, the rollout of
   `2f9901b3`); the events `agent_start_phase` of one restart (`process_start`, `storage_open`,
-  `device_links`, `restore_runtime`, `link_started`, `first_page`, `units_read`, `credentials`
-  (the archive credentials of the databases and the node's own, read at the same time), `apply`,
-  `settled`, `gateway_table`, `service_started`, with `link_hello` and `first_wake_served` beside
-  them, and `reconcile_first_pass` with the number and the summed time of the runs of `lvs`, the
-  mounts and the unit reads) say where its time went.
+  `device_links`, `restore_runtime`, `linked` (how long the link and the first page outlasted the
+  storage: both are asked for while it opens), `slots_adopted`, `units_read`, `apply`, `settled`,
+  `gateway_table`, `service_started`, with `link_started`, `link_hello`, `first_page`, `credentials`
+  (the archive credentials of the databases and the node's own, read at the same time after the
+  first page is applied) and `first_wake_served` beside them, read by `at_ms`, and
+  `reconcile_first_pass` with the number and the summed time of the runs of `lvs`, the mounts and
+  the unit reads) say where its time went. systemd starts the agent 100 ms after it ended
+  (`RestartSec=100ms`), and a start that failed waits five seconds in the agent first.
 - What the agent decides never rests on its own mount table alone, because a unit or a job mounts
   the volume in a namespace of its own, and the agent's own mounts end with its restart: whether a
   unit may start is the link (`attached`); which generation a running unit serves is its own

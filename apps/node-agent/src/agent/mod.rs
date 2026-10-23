@@ -92,6 +92,9 @@ pub struct Timing {
     /// that time otherwise, so with the default boost of 5 s the event is read inside the burst and
     /// counts no throttling, and at 0 it counts the quota's.
     pub detail: Duration,
+    /// How long a build waits for the archive credential of its database, which the first page's
+    /// reads deliver after the page is applied, before it fails with `archive_unusable`.
+    pub credential_wait: Duration,
 }
 impl Default for Timing {
     fn default() -> Self {
@@ -109,6 +112,7 @@ impl Default for Timing {
             host_files_retry_maximum: Duration::from_secs(300),
             settle: Duration::from_secs(10),
             detail: Duration::from_secs(2),
+            credential_wait: Duration::from_secs(60),
         }
     }
 }
@@ -339,6 +343,11 @@ pub struct Core<M: Machine> {
     taken: Mutex<std::collections::HashSet<String>>,
     /// The R2 endpoint each archive path was delivered with.
     endpoints: Mutex<HashMap<String, String>>,
+    /// The databases whose archive could not be registered because their credential had not
+    /// arrived (`ensure_archive`): the first page is applied before the credentials are read.
+    archive_waiting: Mutex<std::collections::HashSet<String>>,
+    /// A credential arrived (`deliver`): a build that waits for its own looks again.
+    credential_arrived: Notify,
     dbs: Mutex<HashMap<String, Arc<Db>>>,
     /// The databases whose unit was awake when the agent started: the gateway's first table must
     /// show them running (`settled`).
@@ -411,6 +420,8 @@ impl<M: Machine> Core<M> {
             maintenance: AtomicBool::new(false),
             taken: Mutex::new(std::collections::HashSet::new()),
             endpoints: Mutex::new(HashMap::new()),
+            archive_waiting: Mutex::new(std::collections::HashSet::new()),
+            credential_arrived: Notify::new(),
             dbs: Mutex::new(HashMap::new()),
             awake_at_start,
             resumed: Mutex::new(
@@ -582,7 +593,57 @@ impl<M: Machine> Core<M> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(path.to_string(), text("endpoint_url")?.to_string());
+        // The databases that were decided on before their credential came reach R2 now, not at
+        // PostgreSQL's next try.
+        let waiting: Vec<String> = self
+            .archive_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .collect();
+        for id in waiting {
+            if let Some(db) = self.find(&id)
+                && let Some(entry) = db.view().entry.clone()
+            {
+                self.ensure_archive(&db, &entry);
+            }
+        }
+        self.credential_arrived.notify_waiters();
         Ok(())
+    }
+
+    /// Whether the agent held the database when it started with a unit that ran: its archiver is
+    /// the one that waits for the credential (`deliver`).
+    pub fn ran_at_start(&self, id: &str) -> bool {
+        self.awake_at_start.contains(id)
+    }
+
+    /// Waits until the node holds the archive credentials the entry's build reads and writes with,
+    /// for at most `Timing::credential_wait`. A build that goes on without them fails with
+    /// `archive_unusable`, as it did when the agent read all credentials before it applied the
+    /// first page.
+    pub(crate) async fn credentials_for(&self, entry: &Entry) {
+        let held = || {
+            let source = match &entry.origin {
+                Some(Origin::Restore(source) | Origin::Move(source, _)) => Some(source),
+                _ => None,
+            };
+            self.store(&entry.archive_path, Access::ReadWrite).is_some()
+                && source.is_none_or(|source| self.store(&source.path, Access::ReadOnly).is_some())
+        };
+        let bound = tokio::time::Instant::now() + self.timing.credential_wait;
+        loop {
+            let arrived = self.credential_arrived.notified();
+            tokio::pin!(arrived);
+            // Registered before the look, so that a credential that arrives between is not missed.
+            arrived.as_mut().enable();
+            if held() {
+                return;
+            }
+            if tokio::time::timeout_at(bound, arrived).await.is_err() {
+                return;
+            }
+        }
     }
     /// The store of an archive path the node holds a credential for; `None` before it was delivered.
     pub(crate) fn store(&self, path: &str, access: Access) -> Option<Store> {

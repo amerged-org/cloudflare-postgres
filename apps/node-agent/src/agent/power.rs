@@ -1217,8 +1217,17 @@ impl<M: Machine> Core<M> {
         let Some(volume) = Self::volume_id(entry) else {
             return false;
         };
-        let Some(store) = self.store(&entry.archive_path, crate::credentials::Access::ReadWrite)
-        else {
+        let store = || self.store(&entry.archive_path, crate::credentials::Access::ReadWrite);
+        let Some(store) = store().or_else(|| {
+            // The credential has not arrived (the first page is applied before the credentials
+            // are read): `deliver` registers the database when it does. The second look closes the
+            // gap between the first and the entry in the set.
+            self.archive_waiting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(db.id.clone());
+            store()
+        }) else {
             return false;
         };
         let upload_log = self.files(&db.id).upload_log(entry.storage_generation);

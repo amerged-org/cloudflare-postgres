@@ -28,7 +28,10 @@ mod linux {
         notify::notify,
         release,
         sample::uptime_seconds,
-        service::{Intervals, Service, ServiceConfig, gateway_owner},
+        service::{
+            Intervals, START_FAILURE_PAUSE, Service, ServiceConfig, gateway_owner,
+            pause_after_failed_start,
+        },
         storage,
         timing::{self, emit_event},
         units::slots,
@@ -36,7 +39,14 @@ mod linux {
     };
     use serde_json::json;
     use std::{sync::Arc, time::Duration};
-    use tokio::signal::unix::{SignalKind, signal};
+    use tokio::{
+        signal::unix::{SignalKind, signal},
+        task::JoinSet,
+    };
+
+    /// What the agent gets from Cloudflare before it can decide on anything: the link, its events
+    /// and the first desired page.
+    type Linked = (Link, LinkEvents, pgcf_node_agent::link::Desired);
 
     /// One attempt to enroll, if the node is not, and to start the link.
     async fn link_once(node: &Node, layout: &Layout) -> Result<(Link, LinkEvents), Error> {
@@ -50,7 +60,8 @@ mod linux {
             timing: LinkTiming::default(),
         };
         let link = Link::start(config, Transport::production()?).await?;
-        timing::phase("link_started");
+        // Beside the row: the link is started while the storage opens.
+        timing::phase_once("link_started");
         Ok(link)
     }
 
@@ -70,13 +81,31 @@ mod linux {
         }
     }
 
-    async fn start(node: Arc<Node>, layout: &Layout) -> Result<Arc<Service<Node>>, Error> {
-        let (link, events) = link(&node, layout).await;
+    /// The link and the first page, asked for as the agent starts: they need the node's boot and
+    /// packages (`os_report`) and nothing of its storage, which takes seconds to open with
+    /// hundreds of volumes (EU1: 1.8 s of the 2.9 s to the first page).
+    async fn linked(node: Arc<Node>, layout: Layout) -> Linked {
+        let (link, events) = link(&node, &layout).await;
+        let page = Service::<Node>::first_page(&link).await;
+        (link, events, page)
+    }
+
+    async fn start(
+        node: Arc<Node>,
+        linking: &mut JoinSet<Linked>,
+    ) -> Result<Arc<Service<Node>>, Error> {
+        let (link, events, page) = linking
+            .join_next()
+            .await
+            .ok_or("the link was not started")?
+            .map_err(|error| Error::from(error.to_string()))?;
+        timing::phase("linked");
         let gateway = gateway_owner().ok_or("the gateway's user does not exist")?;
-        Service::start(
+        Service::start_with_page(
             node,
             link,
             events,
+            page,
             ServiceConfig {
                 intervals: Intervals::default(),
                 timing: Timing::default(),
@@ -110,10 +139,38 @@ mod linux {
     }
 
     pub async fn run() -> Result<(), Error> {
+        let result = serve().await;
+        if let Err(error) = &result {
+            emit_event(json!({"event": "agent_failed", "class": error_code(error)}));
+            // systemd starts the next process 100 ms after this one ends: a start that fails is
+            // not tried again at that pace (`pause_after_failed_start`). A stop ends the pause.
+            let stop = async {
+                if let (Ok(mut terminate), Ok(mut interrupt)) = (
+                    signal(SignalKind::terminate()),
+                    signal(SignalKind::interrupt()),
+                ) {
+                    tokio::select! {
+                        _ = terminate.recv() => {}
+                        _ = interrupt.recv() => {}
+                    }
+                }
+            };
+            pause_after_failed_start(START_FAILURE_PAUSE, stop).await;
+        }
+        result
+    }
+
+    async fn serve() -> Result<(), Error> {
         timing::phase("process_start");
         let layout = Layout::default();
-        let node =
-            Arc::new(Node::connect(layout.clone(), storage::Config::default(), slots::POOL).await?);
+        let node = Arc::new(
+            Node::connect_unopened(layout.clone(), storage::Config::default(), slots::POOL).await?,
+        );
+        // Cloudflare is asked while the storage opens. A set, so that a start that fails ends the
+        // link with it.
+        let mut linking = JoinSet::new();
+        linking.spawn(linked(node.clone(), layout.clone()));
+        node.open_storage().await?;
         timing::phase("storage_open");
         // The volumes the agent before mounted are unmounted with its namespace: so are their links.
         node.reset_device_links().await?;
@@ -142,7 +199,7 @@ mod linux {
         };
         tokio::pin!(stop);
         let service = tokio::select! {
-            service = start(node.clone(), &layout) => service?,
+            service = start(node.clone(), &mut linking) => service?,
             () = &mut stop => {
                 release(&node).await;
                 return Ok(());
@@ -199,11 +256,8 @@ fn finish(result: Result<(), pgcf_node_agent::Error>, command: &str) -> std::pro
     let Err(error) = result else {
         return std::process::ExitCode::SUCCESS;
     };
-    if command == "run" {
-        pgcf_node_agent::timing::emit_event(serde_json::json!({
-            "event": "agent_failed", "class": pgcf_node_agent::diagnostics::error_code(&error),
-        }));
-    } else {
+    // On Linux `run` has said `agent_failed` with the class and has waited (`linux::run`).
+    if command != "run" || cfg!(not(target_os = "linux")) {
         eprintln!("pgcf-agent {command}: {error}");
     }
     std::process::ExitCode::FAILURE

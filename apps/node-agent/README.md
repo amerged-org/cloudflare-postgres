@@ -36,7 +36,7 @@ carries it, and a region whose policy is not set serves no page.
 
 | Command            | What it does                                                                                                                                                                                                                                                            |
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pgcf-agent run`   | The service of `pgcf-agent.service` (`Type=notify`). It opens the node's storage, restores what a boot lost, signals `READY=1`, then enrolls and links to Cloudflare in the background, so a node that is not enrolled yet waits instead of crashing                    |
+| `pgcf-agent run`   | The service of `pgcf-agent.service` (`Type=notify`). It enrolls and links to Cloudflare and asks for its first page while it opens the node's storage, restores what a boot lost and signals `READY=1`, link or no link, so a node that is not enrolled yet waits instead of crashing |
 | `pgcf-agent check` | Makes or wakes one scratch database (`SCRATCH`) on a thin volume, queries it over its socket and stops it, without Cloudflare. The image's boot test runs it after the first boot and again after a reboot, and a maintenance cycle runs it before it answers its order |
 | `pgcf-agent hold`  | The one process of the transient unit `pgcf-mounts.service`, which `run` starts when the node has none and whose mount namespace it joins (`mount_holder.rs`, below). It tells systemd that it is ready and waits to be stopped, then unmounts the volumes 16 at a time |
 
@@ -64,6 +64,35 @@ reaches the namespace with
 An agent of a release before this one does not know the holder: going back to such a release needs
 `systemctl stop pgcf-agent pgcf-mounts` first, or the volumes stay mounted in the holder's
 namespace, where the old agent's unmounts find them held (`Busy`).
+
+**The agent's start** (`main.rs`, `Service::start_with_page`) is a short path to the first served wake
+and a longer one behind it, because a restarted agent is a database's wake that waits (EU1,
+2026-10-23: 46 s from `kill -9` to the first served wake, of which the old process took 14 s to
+exit, the adoption of the slots 13.7 s, the archive credentials 4.7 s and the decisions on the
+databases that ran 7.1 s). The path to the first wake is: systemd starts the next process 100 ms
+after the old one ended (`RestartSec=100ms`); the connection to systemd and the node's tables; the
+link and the first page, which need the node's boot and packages and nothing of LVM, **at the same
+time as** the storage opening (`Node::connect_unopened`, `Node::open_storage`; a node that is set up
+asks lvm2 for `pvs`, `vgs` and `lvs` at once and activates nothing when the pool and every volume
+are active, which is what an agent that restarts finds); the device links and the runtime
+(`restore_runtime`); the slots and units read back from the kernel; the first page applied (the
+fences, the generations, the decisions on the databases that ran, which come first); and the
+gateway served once those are decided (`Core::settled`). A wake is never served before the first
+page, the fences and the generations are known. **The credentials are not on that path.** The
+archive credentials (one read each, 32 at a time, those of the databases that ran first) and the
+node's own (the Tunnel and the route keyring) are read after the first page is applied, in the
+background (`Service::pull_page`): a database that ran is registered with the archive socket when
+its credential arrives (`Core::deliver`), a build waits for its own up to `Timing::credential_wait`
+and fails with `archive_unusable` after it, and a page after the first reads its credentials before
+it is applied, as before. The phases `agent_start_phase` names: `storage_open`, `device_links`,
+`restore_runtime`, `linked` (how long the link outlasted the storage), `slots_adopted`,
+`units_read`, `apply`, `settled`, `gateway_table`, `service_started`, and beside the row (read by
+`at_ms`) `link_started`, `link_hello`, `first_page`, `credentials` and `first_wake_served`. A start
+that fails (the pool will not activate, `vgchange_exit_5`) says `agent_failed` and waits five
+seconds before it ends (`pause_after_failed_start`), so that the 100 ms restart does not run the
+failing commands ten times a second; a stop ends the wait. systemd's `RestartSteps=` is not used:
+it is not reset by a long run (systemd 257.13, measured), so it would slow the restart after a
+kill for as long as the node lives.
 
 ## Jobs and where they live
 
@@ -412,8 +441,8 @@ later request with that key, which binds the method, the path and the body. A re
 node with a new key, and Cloudflare restricts the key of a node declared lost to the fenced scope.
 The agent keeps the outbound WebSocket to the node's NodeActor, which carries its sample every 15 s
 and Cloudflare's request to pull the desired page; it also pulls the whole page every 60 s. It reads
-the gateway's keyring and the Tunnel token from `GET /node/v1/credentials` when it starts, and again
-when the page names a higher credentials revision, and R2 temporary credentials from
+the gateway's keyring and the Tunnel token from `GET /node/v1/credentials` after it has applied its
+first page, and again when the page names a higher credentials revision, and R2 temporary credentials from
 `GET /node/v1/archive-credentials/{id}` as the page names them. A node never holds the R2 parent key.
 
 The agent reads what Cloudflare sends it (the page, the credentials, the answers, the link's

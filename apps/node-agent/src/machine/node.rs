@@ -71,21 +71,21 @@ impl Node {
         storage: Config,
         slots: Range<u32>,
     ) -> Result<Self, crate::Error> {
+        let node = Self::connect_unopened(layout, storage, slots).await?;
+        node.open_storage().await?;
+        Ok(node)
+    }
+
+    /// `connect` without the storage: the connection to systemd and the node's tables. The agent
+    /// asks Cloudflare for its first page while the storage opens (`open_storage`), and the link
+    /// needs the node's boot and packages and nothing of LVM.
+    pub async fn connect_unopened(
+        layout: Layout,
+        storage: Config,
+        slots: Range<u32>,
+    ) -> Result<Self, crate::Error> {
         let units = Units::connect(layout.volumes()).await?;
         let storage = Arc::new(Storage::new(SystemRunner, storage));
-        let activation = {
-            let storage = storage.clone();
-            tokio::task::spawn_blocking(move || storage.open()).await??
-        };
-        // The pool needed more than `vgchange` after a reset that was not clean: say so.
-        if !activation.released_parts.is_empty() {
-            crate::timing::emit_event(serde_json::json!({
-                "event": "thin_pool_parts_released", "count": activation.released_parts.len(),
-            }));
-        }
-        if activation.repair_run {
-            crate::timing::emit_event(serde_json::json!({"event": "thin_pool_repair_activation"}));
-        }
         // What the agent keeps of its own, below a directory only root reads.
         crate::link::file::create_private_directory(&layout.agent())?;
         let users = Users::load(layout.uids())?;
@@ -101,6 +101,26 @@ impl Node {
             pool,
             legacy: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Opens the node's storage: the volume group and the pool exist as plan 4.3 describes, or are
+    /// made, and are active. A pool that needed more than `vgchange` after a reset that was not
+    /// clean is said so.
+    pub async fn open_storage(&self) -> Result<(), crate::Error> {
+        let activation = {
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || storage.open()).await??
+        };
+        // The pool needed more than `vgchange` after a reset that was not clean: say so.
+        if !activation.released_parts.is_empty() {
+            crate::timing::emit_event(serde_json::json!({
+                "event": "thin_pool_parts_released", "count": activation.released_parts.len(),
+            }));
+        }
+        if activation.repair_run {
+            crate::timing::emit_event(serde_json::json!({"event": "thin_pool_repair_activation"}));
+        }
+        Ok(())
     }
     /// The agent's start, and only the agent's (not the check's, which runs `connect` too): the
     /// device links of an earlier agent are dropped. Its namespace may be gone with the volumes the
