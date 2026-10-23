@@ -271,6 +271,23 @@ function callback(
   }
 }
 
+/**
+ * One line for each episode an evaluation opens (or opens again): with the `alert_evaluation` line
+ * of the same invocation it says which run raised an alarm and when, so that a late alert can be
+ * attributed to the node's report, the evaluation or the delivery.
+ */
+function logEpisodeOpened(event: InfraAlert): void {
+  console.log(
+    JSON.stringify({
+      event: "alert_episode_opened",
+      region_id: event.region_id,
+      kind: event.kind,
+      event_id: event.event_id,
+      occurred_at: event.occurred_at,
+    }),
+  );
+}
+
 /** At-least-once authenticated callback: the receiver must durably deduplicate event_id and payload. */
 export async function runInfrastructureAlerts(
   env: Env,
@@ -343,7 +360,7 @@ export async function runInfrastructureAlerts(
       action: INFRA_ALERT_ACTIONS[kind],
       ...detail,
     });
-    await env.DB.prepare(
+    const written = await env.DB.prepare(
       `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)
       SELECT ?,?,1,?,? WHERE ${snapshot.sql} ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,
         payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0${
@@ -359,6 +376,7 @@ export async function runInfrastructureAlerts(
         ...(takeover?.bindings ?? []),
       )
       .run();
+    if (written.meta.changes > 0) logEpisodeOpened(event);
   }
   const pending = await env.DB.prepare(
     "SELECT * FROM infrastructure_alerts WHERE region_id=? AND active=1 AND delivered_at IS NULL ORDER BY kind",
@@ -614,7 +632,7 @@ async function reconcileEpisode(
     ...observation.detail,
   });
   // Arms a cleared episode, or replaces exactly the one this evaluation read.
-  await env.DB.prepare(
+  const written = await env.DB.prepare(
     `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES(?,?,1,?,?) ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0 OR (infrastructure_alerts.event_id=? AND infrastructure_alerts.payload=?)`,
   )
     .bind(
@@ -626,6 +644,7 @@ async function reconcileEpisode(
       current?.payload ?? null,
     )
     .run();
+  if (written.meta.changes > 0) logEpisodeOpened(event);
   return true;
 }
 

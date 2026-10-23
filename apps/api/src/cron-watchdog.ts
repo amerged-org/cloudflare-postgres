@@ -101,8 +101,10 @@ export async function evaluateAlerts(
  * scheduled by this object's own storage, not by the Worker's cron trigger, so it keeps firing
  * when the trigger is removed or the platform does not start it, when a cron step hangs and when
  * every step fails: the cron only arms it, and each alarm schedules the next before it evaluates
- * anything. On 2026-10-23 the platform started no cron invocation from 14:41 to 14:54 and from
- * 16:03 to 16:21 UTC, and this alarm fired in 435 of the 435 minutes from 11:00 to 18:15.
+ * anything. On 2026-10-23 no cron trigger was delivered on time from 14:41 to 14:54 and from
+ * 16:03 to 16:21 UTC (two re-deliveries of the 14:27 and 14:28 triggers ran from about 16:06,
+ * which the invocation analytics do not list), and this alarm fired in 435 of the 435 minutes from
+ * 11:00 to 18:15.
  */
 export class CronWatchdog extends DurableObject<Env> {
   /** Idempotent: keeps the pending alarm and starts the chain when there is none. */

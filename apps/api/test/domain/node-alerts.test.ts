@@ -390,6 +390,32 @@ it("closes the pool for the smallest class on offer: 4 GiB below the logical cap
   }
 });
 
+it("closes the pool of a node that takes no new databases once the smallest class no longer fits under the logical cap: the pool judges it, not the load", async () => {
+  const f = await fixture(0),
+    hook = receiver(),
+    now = Date.now();
+  // Placement is switched off on the node, so no RAM or CPU judgement reaches it: only the pool
+  // can call it closed, and it must judge the cap with the storage of the class on offer.
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_enabled=0 WHERE id=?",
+  )
+    .bind(f.node)
+    .run();
+  const closed = () =>
+    hook.events.filter((event) => event.kind === "regional_node_pool_closed");
+  // 395 GiB of the 400 GiB sold: the 5 GiB class still fits.
+  await seedSamples(f.node, [{ at: now, pool: pool({ nominal: 395 * GIB }) }]);
+  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+  // 396 GiB: 4 GiB are left, the pool is below its cap and the smallest class does not fit.
+  await seedSamples(f.node, [
+    { at: now + 1000, pool: pool({ nominal: 396 * GIB }) },
+  ]);
+  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
+  expect(closed()).toHaveLength(1);
+  expect(closed()[0]).toMatchObject({ node_ids: [f.node] });
+});
+
 it("closes the region when its only node has no RAM or CPU left for the smallest class, and opens it when the node has", async () => {
   const f = await fixture(0),
     hook = receiver(),

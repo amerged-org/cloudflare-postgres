@@ -471,36 +471,67 @@ evaluates every alert of every region from its own alarm once a minute (the heal
 capacity alarms and the judgement of the cron's heartbeat), so a step that is slow or hangs, a
 run that does not start and a cron trigger that is gone cannot hold an alert back.
 
-**What the platform does with the trigger (measured on 2026-10-23, 11:00 to 18:15 UTC, EU1 under
-test load, from Cloudflare's invocation analytics).** The cron trigger is not reliable in time or
-place, and the Worker's own log lines mislead about it:
+**What the platform does with the trigger (measured on 2026-10-23, 11:00 to 19:50 UTC, EU1 under
+test load, from Cloudflare's invocation analytics and the Worker's log lines).** The cron trigger
+is not reliable in time or place, and the Worker's own log lines mislead about it:
 
-- *No start.* The platform started no cron invocation from 14:41 to 14:54 (848 s between the
-  starts of 14:40:54 and 14:55:02) and from 16:03 to 16:21 (1,156 s, 16:02:46 to 16:22:02): the
-  triggers of 14 and 19 minutes were not delivered, and no step was hanging. Some triggers arrive
-  together afterwards (10 invocations in the same second at 14:07:02 in HKG and 10 at 14:23:02 in
-  SIN). Everything the cron does waits meanwhile: the keep-warm leases of the `ActorWarmer`
-  objects last 180 s and lapsed in 20 minutes of that day (`actor_warm_stopped`).
-- *A far colo.* The 335 runs that can be told apart ran in Asia-Pacific colos (280) and US colos
-  (55), none in Europe, while D1's primary is in WEUR: 96 s at the median, 168 s at the 90th
-  percentile, 340 s at most, with CPU at 313 ms at the median and 947 ms at most. From 18:35 UTC
-  the platform ran it in European colos and the 22 runs there took 22 s at the median (12 to 34
-  s). A run is long because each of its statements crosses to D1, not because a step is slow.
-- *The alarm is steady.* The `CronWatchdog` alarm fired in 435 of the 435 minutes (longest gap
-  between two alarms 61 s), every minute of both windows included, in SIN, in 1.0 s at the median
-  and 4.6 s at most.
+- *Late triggers.* No trigger was delivered on time from 14:41 to 14:54 or from 16:03 to 16:21.
+  The analytics list no start from 14:41 to 14:54 (848 s between the starts of 14:40:54 and
+  14:55:02) and none from 16:03 to 16:21 (1,156 s between the starts of 16:02:46 and
+  16:22:02); the logs hold no scheduled invocation from 14:42:20 to 14:57:45. In the second window
+  two re-deliveries of old triggers ran from about 16:06 (request `dead0744`, scheduled time
+  14:27:02: `cron_step_failed` `actor_warmers` at 16:07:58 and `node_capacity_decision` at 16:08:31;
+  request `04be5dbc`, 14:28:02: `node_capacity_decision` at 16:09:29; neither logged
+  `cron_completed`); the analytics do not list them, because that minute was sampled (the 16:06:33
+  row of FRA has `sampleInterval` 4). Once the delivered triggers arrived bunched: four starts
+  within 50 s from 17:07:52 (each `sampleInterval` 1) after 350 s without one. Everything the cron
+  does waits meanwhile: the keep-warm leases of the `ActorWarmer` objects last 180 s and lapsed in
+  20 minutes of that day (`actor_warm_stopped`).
+- *A far colo.* The 351 rows of 11:00 to 18:15 that the recipe below lists ran in Asia-Pacific
+  colos (296) and US colos (55), none in Europe, while D1's primary is in WEUR: 97 s at the median,
+  166 s at the 90th percentile, 340 s at most, with CPU at 310 ms at the median and 947 ms at
+  most. The platform did not move the cron to Europe later; it ran some invocations there. Of the
+  78 rows from 18:35 to 19:50, 22 ran in European colos (21.5 s at the median, 11.7 to 34.0 s), 39
+  in US colos (66.8 s) and 17 in Asia-Pacific colos (89.3 s): inside one window, the run time
+  follows the distance to D1. A run is long because each of its statements crosses to D1, not
+  because a step is slow.
+- *The alarm is steady.* The `CronWatchdog` alarm fired in 435 of the 435 minutes (435 rows, each
+  `sampleInterval` 1; longest gap between two alarms 61 s), every minute of both windows included,
+  in SIN, in 1.0 s at the median and 4.6 s at most.
 - *`scheduledTime` is not a start.* `$workers.event.scheduledTime` of a log line repeats (14:27:02
   is the scheduled time of four invocations that logged at 15:05:08, 16:08:31, 17:15:12 and
   18:51:54, the last on a script version that did not exist at 14:27), so a duration computed from
-  it is wrong. Read the start and the colo from the analytics: GraphQL `workersInvocationsAdaptive`
-  for the Worker (an API token with Account Analytics: Read, read-only), fields `datetime` (the
-  start of an invocation), `coloCode`, `status` and `sum{requests subrequests wallTime
-  cpuTimeUs}` (`wallTime` in microseconds), in slices of 15 minutes (a query returns at most
-  10,000 rows). A cron run is a row with one request, at least 100 subrequests and 10 s or more.
+  it is wrong.
+- *The analytics are sampled and incomplete.* GraphQL `workersInvocationsAdaptive` for the Worker
+  (an API token with Account Analytics: Read, read-only) is the only place that names a colo and a
+  start, and it needs care. Read `avg{sampleInterval}` with every row: a row with `requests` above
+  1 can be one invocation weighted by its `sampleInterval` (the rows of 14:07:02 in HKG and
+  14:23:02 in SIN have `requests` 10, `sampleInterval` 10 and a maximum wall time equal to the
+  mean, 81.7 and 119.4 s; the logs hold one `cron_completed` for the second and none for nine
+  others, so they are no burst of ten starts). `subrequests` stops at 255 for an invocation (245
+  of the 351 rows show exactly 255) and can be far below what a run made (16:35:02 in SIN shows 47;
+  its `cron_completed` of 16:37:01 reports 435 usage statements), so a filter on many subrequests
+  drops real runs (12:01:02 in NRT: 249 s, 8 subrequests). And invocations the logs show are
+  missing (the two of 16:06).
 
-The inode alert of that afternoon came 315 s after the refusal at 14:55:03. Runs had begun at
-14:55:02 and every minute after it, and evaluated the alerts first, so the gap in the trigger does
-not explain it; the node posts volumes every 60 s, and no line says which evaluation found them.
+  The recipe: fields `datetime` (the start of an invocation), `coloCode`, `status`,
+  `sum{requests subrequests wallTime cpuTimeUs}` (`wallTime` in microseconds),
+  `avg{sampleInterval}`, `max{wallTime}` and `quantiles{requestDurationP50}`, in slices of 10
+  minutes (a query returns at most 10,000 rows). A cron run is a row whose `requestDurationP50` is 0
+  (a scheduled invocation has no request) and that has at least 5 subrequests per request (HTTP
+  streams that ended as `clientDisconnected` or `responseStreamDisconnected` also show 0, with one
+  subrequest or none). A run delivered on time starts in second 02 of the minute (247 of the 351
+  rows); the others are late deliveries. Then cross-check against the logs: of the 418
+  `cron_completed` lines of 11:00 to 19:50, 372 have such a row ending (start plus wall time) within
+  25 s of the line, and 376 of the 447 rows have a line, so the analytics miss runs and the logs
+  miss runs that did not end; neither is the whole truth. An earlier filter (one request, at least
+  100 subrequests, 10 s or more) listed 335 rows to 18:15, 16 fewer than the recipe.
+
+The inode alert of that afternoon came 315 s after the refusal at 14:55:03, and its cause is not
+found. Runs had begun at 14:55:02 and every minute after it, and evaluated the alerts first, so the
+gap in the trigger does not explain it; the node posts volumes every 60 s, and no line says when the
+report of the full inodes reached D1 or which evaluation found it. The evaluation now logs each
+episode it opens (`alert_episode_opened`), so the next delay can be attributed.
 
 Each step runs in its own failure boundary and has 240 s. A step that throws is logged as
 `cron_step_failed` (`step`, `error_code`, a redacted `message` and `ms`; the heartbeat and the
@@ -513,7 +544,8 @@ The Worker's own cron outcome stays successful when steps fail: read `cron` in t
 and the alarms, not the cron trigger's error rate.
 
 The run logs one `cron_completed` line with `step_ms`, the milliseconds of each step in the order
-they ran. It does not name the colo: the analytics above do.
+they ran. It does not name the colo (that would take a trace request in every run): read it
+from the analytics above, and cross-check it against these lines.
 
 The alarm logs one `alert_evaluation` line a minute: `duration_ms`, `phase_ms` for its three
 phases (`health_alerts`, `capacity_alerts`, `cron_watchdog`) and `failed`, the phases that threw or
@@ -521,7 +553,10 @@ did not answer within 30 s (`alert_phase_failed` names the phase, the `error_cod
 message). A phase that fails does not stop the phases after it. An evaluation spends at most 20 s
 sending notifications; the rest stay unclaimed, are logged as `infrastructure_alert_deferred` and
 are sent by the next evaluation. A line a minute, with `cron.watchdog_checked_at` following it,
-is the proof that the alerts are judged every minute.
+is the proof that the alerts are judged every minute. Each episode an evaluation opens (or opens
+again) logs an `alert_episode_opened` line (`region_id`, `kind`, `event_id`, `occurred_at`) in the
+same invocation: with the time of the node's report in D1 (`node_volumes.observed_at` for a
+volume) it says whether a late alert was late in the report, the evaluation or the delivery.
 
 The run records its heartbeat in D1 (`cron_heartbeat`, one row): `started_at` when it
 begins and `completed_at` once every step was attempted, with each failing step's
