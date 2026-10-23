@@ -7,7 +7,7 @@ has measured and what is not available yet.
 
 Every statement is derived from the code and contracts of this repository; Appendix B lists where,
 and Appendix C lists what the served OpenAPI document states in words rather than in schema.
-Behaviour without a live acceptance is marked **not yet verified**. A number is of one of three
+Behaviour without a live acceptance is marked **not yet verified**. A number is of one of four
 kinds, and the text says which:
 
 - **Measured** values carry their date and the title of the row of the
@@ -17,8 +17,12 @@ kinds, and the text says which:
   default ([11.4](../architecture/cloudflare-convergence-and-serverless-plan.md#114-design-decisions-taken-in-this-plan),
   [11.5](../architecture/cloudflare-convergence-and-serverless-plan.md#115-decisions-open-for-the-owner): work proceeds on the default unless the owner
   says otherwise).
+- **Extrapolated** values are computed from a measured sample, not measured themselves; the text
+  names the sample (the node-loss total of [7.3](#73-recovery-time)).
 - **To be measured** marks a value that no measurement has produced yet; the text names the plan's
   stage that will.
+
+A name or a rule that the plan does not record yet is marked **pending**, with the reason.
 
 Values that are installation configuration rather than code (node policy, alert thresholds, rate
 limits) are labelled as such; the operator reads them from the live installation.
@@ -32,15 +36,15 @@ operator procedures are in the other runbooks ([recovery](recovery.md),
 
 | Topic | State on 2026-10-23 |
 | --- | --- |
-| Runtime | Databases run on two nodes installed from one PGCF image: EU1 (region `eu-dev`) and US1 (region `us-dev`). Each runs one sandboxed systemd PostgreSQL 18 service per database on its own thin LVM volume, a pool of idle sandbox slots that a wake takes instead of building one, and one Rust node agent; there is no Kubernetes. Live acceptance on EU1: Stages 5.1 (lifecycle), 5.2 (sleep and wake), 5.8(b) and 5.8(c) (isolation) passed; Stage 5.4 (crashes) ran on 2026-10-20 with no lost acknowledged commit and one check not met, the agent's restart gap of 36.6 s against 15 s (the start has since been shortened to 5.3 s; the check has not been rerun, [7.1](#71-what-happens-in-each-situation)); Stages 5.3 (cold p95), 5.5 (storage) and 5.6 (density) are open. US1 passed its database acceptance on 2026-10-23. The plan's gates decide what still blocks go-live. |
+| Runtime | Databases run on two nodes installed from one PGCF image: EU1 (region `eu-dev`) and US1 (region `us-dev`). Each runs one sandboxed systemd PostgreSQL 18 service per database on its own thin LVM volume, a pool of idle sandbox slots that a wake takes instead of building one, and one Rust node agent; there is no Kubernetes. Live acceptance on EU1: Stage 5.1 (lifecycle) passed **on the `xs` class** (2 of 8 creates took longer than the 5.1 target of 30.7 s), while the `md` lifecycle and the restore of an `md` database into a smaller class have not run yet: they wait for EU1 to place a database of that size ([2.1](#21-create)); Stages 5.2 (sleep and wake), 5.8(b) and 5.8(c) (isolation) passed; Stage 5.4 (crashes) ran on 2026-10-20 with no lost acknowledged commit and one check not met, the agent's restart gap of 36.6 s against 15 s (the start has since been shortened to 5.3 s; the check has not been rerun, [7.1](#71-what-happens-in-each-situation)); Stages 5.3 (cold p95), 5.5 (storage) and 5.6 (density) are open. US1 passed its database acceptance on 2026-10-23 with one `sm` database. No plan row records a lifecycle run of the `lg` class. The plan's gates decide what still blocks go-live. |
 | First request after a wake | The whole request is one HTTP `/sql` transaction of six statements, sent from a Worker over the public hostname. After about 50 h asleep, 59 samples on 2026-10-23: p50 948 ms, p95 1,583 ms, 26 of 59 at or above 1 s. After 1 h or more asleep, 59 samples on 2026-10-20: p50 1,126 ms, p95 1,814 ms. **The go-live target, a p95 of at most 1 s with 750 ms as the aim, is not met yet** ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)). |
 | Backups | Every database archives its WAL and base backups into the installation's one R2 bucket, which is in the EU jurisdiction, for both regions (cutover 2026-10-23). A new database is ready only after its first base backup is DONE. The four production classes keep a 7-day recovery window ([2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point)). |
-| Redundancy | One node per region, one PostgreSQL instance per database, no replica, no second node in a region. Losing a node stops every database on it until it is restored from R2 into new IDs. Measured on 2026-10-23 for EU1's 167 databases and 23.4 GB of archives: about 2.8 to 3.6 h in all ([7.3](#73-recovery-time), [7.4](#74-eu1-lost)). |
+| Redundancy | One node per region, one PostgreSQL instance per database, no replica, no second node in a region. Losing a node stops every database on it until it is restored from R2 into new IDs. **Extrapolated** on 2026-10-23 for EU1's 167 databases and 23.4 GB of archives from a sample of 8 restores, of which 7 became ready: about 2.8 to 3.6 h in all, if every restore succeeds. The eighth failed `archive_unusable`; the total assumes that defect is fixed, and its fix is not merged ([7.3](#73-recovery-time), [7.4](#74-eu1-lost)). |
 | Capacity numbers | The density test (Stage 5.6, at least 300 databases) and the pool-full and volume-full tests (Stage 5.5) have not run. The numbers in [4](#4-capacity-and-limits-you-must-enforce) are the plan's admission rules and starting values, except where a measurement with a date is named. |
-| New databases | Every database lives on a thin LVM volume of its node, placed by the 80 % rule of [2.1](#21-create). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced. After a burst of awake databases a node stays closed for the length of the placement window (7 days in the code, 3 days decided on 2026-10-23). |
+| New databases | Every database lives on a thin LVM volume of its node, placed by the 80 % rule of [2.1](#21-create). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced. After a burst of awake databases a node stays closed for the length of the placement window: 3 days (owner decision O6 of 2026-10-23; the code on main has it and the installation applies it once the API release is deployed, [2.1](#21-create)). |
 | Alerts | Infrastructure alerts go to the operator's alert webhook and the owner receives them (go-live gate G5 met on 2026-10-20); you receive none from PGCF ([6](#6-alerts-and-operations)). |
 | Your key | Project-scoped key isolation and rotation have not been exercised live (go-live gate G10). |
-| Maintenance | A maintenance cycle (new packages, a new kernel) closes placement on the node, holds wakes with `57P03`, puts every awake database to sleep with the proof and reboots the node if the kernel changed; the first live cycle took 67 s end to end (2026-10-19). From the canary on the EU stack is production (`pgcf-api-dev` and `eu-dev` are only names): reboots need an announced window, and Debian kernel security reboots are pre-approved within 7 days of an advisory, one node at a time. The operator's default window is Tuesday 02:00 to 04:00 UTC, announced through the alert webhook, until the owner names another ([7.1](#71-what-happens-in-each-situation)). |
+| Maintenance | A maintenance cycle (new packages, a new kernel) closes placement on the node, holds wakes with `57P03`, puts every awake database to sleep with the proof and reboots the node if the kernel changed; the first live cycle took 67 s end to end (2026-10-19). From the canary on the EU stack is production (`pgcf-api-dev` and `eu-dev` are only names): reboots need an announced window, and Debian kernel security reboots are pre-approved within 7 days of an advisory, one node at a time. The default window is Tuesday 02:00 to 04:00 UTC (plan default D15, 11.5) until the owner names another; the operator forwards each announcement to you, because the alert webhook reaches only the operator and the owner ([7.1](#71-what-happens-in-each-situation)). |
 
 ## 1. The model
 
@@ -311,14 +315,15 @@ is DONE, so it is never writable before it is restorable. The idle time
   This wait has no timeout of its own (every other operation fails with `operation_timeout` after
   20 minutes without progress); set your own deadline and delete the database to cancel.
 - **Placement window.** The peak that placement counts is the highest 30-minute average of a
-  node's active RAM and of its CPU load within the placement window. The window is 7 days in the
-  code (`PEAK_WINDOW_MS`); the owner decided on 2026-10-23 to set it to 3 days (plan 11.3), which
-  takes effect with the change of that constant. A burst of awake databases raises the peak and
-  closes the node for the databases that no longer fit under 80 % until the peak leaves the window:
-  seeding 59 databases at once put 55 of them awake and the 30-minute average at 73.5 % on
-  2026-10-20, and a new 1 GiB database was then refused as "Waiting for verified regional capacity"
-  for as long as that peak stood ("Placement is closed for a week after a burst", plan 11.2).
-  Databases that are already running are not affected.
+  node's active RAM and of its CPU load within the placement window. The window is 3 days (owner
+  decision O6 of 2026-10-23, plan 11.3; `PEAK_WINDOW_MS` on main). The plan's Open row "Placement is
+  closed for 3 days after a burst" records the change as not deployed to the installation, whose
+  API Worker applies the old window of 7 days until it is. A burst of awake databases raises the
+  peak and closes the node for the databases that no longer fit under 80 % until the peak leaves
+  the window: seeding 59 databases at once put 55 of them awake and the 30-minute average at 73.5 %
+  (peak at 21:36 UTC on 2026-10-19), and a new 1 GiB database was then refused as "Waiting for
+  verified regional capacity" for as long as that peak stood. Databases that are already running
+  are not affected.
 - Errors: `400` for an unknown or disabled class or region, `404` for an unknown project, `409`
   with reason `name_in_use` for a name that a live database of the project already uses.
 - Engine: PostgreSQL 18 (18.6 at the time of writing, unmodified engine, `pgvector` 0.8.7). Which
@@ -369,9 +374,15 @@ pgcf "$PGCF_API/v1/databases/<database-id>/roles/web/connection-uri"
 - `app` is the database owner and not a superuser (the acceptance probe asserts
   `rolsuper = false`). Roles you add are login roles without superuser, `createdb`,
   `createrole` or replication; `bypassrls` only when you ask for it (below). Grant them
-  privileges with SQL as `app`. Role names match `^[a-z][a-z0-9_]{0,62}$` and may not be
-  `postgres`, `pgcf_backup` (the role of the node's base backups), `public` or `none` (PostgreSQL
-  refuses both as role names) or start with `pg_`. There is no API to choose a password.
+  privileges with SQL as `app`. Role names match `^[a-z][a-z0-9_]{0,62}$`. **Reserved today:** the
+  API refuses `postgres`, `streaming_replica` and every name that starts with `pg_` or `cnpg_`
+  (`400`), and it refuses to create or delete `pgcf_maintenance` or to name it in `member_of`.
+  It does **not** refuse `pgcf_backup` (the node's own role for base backups), `public` or `none`
+  (PostgreSQL itself refuses both as role names); do not use them. **Pending, no plan row on this
+  base:** the work W2-C (branch `pr-w2c`, not merged) would refuse `postgres`, `pgcf_backup`,
+  `public`, `none` and `pg_*` and release `streaming_replica`, `cnpg_*` and `pgcf_maintenance`.
+  Until it is released and recorded, a platform that lets its users choose role names must itself
+  refuse all of these names. There is no API to choose a password.
 - Passwords are 43 characters of base64url, server-generated. Only an integrator key can read one,
   and only through the connection URI. `reset-password` replaces it (`password_revision` + 1).
 - Creating, resetting and deleting a role require an `Idempotency-Key` (`400` without one).
@@ -395,7 +406,7 @@ pgcf -X POST "$PGCF_API/v1/databases/<database-id>/roles" -H 'Content-Type: appl
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `valid_until`      | PostgreSQL `VALID UNTIL`: from this time the role cannot log in                                                                                                               | a [timestamp](#20-conventions) in the future when the request executes, no maximum; PostgreSQL applies it at whole seconds, truncated, so `…:05.678Z` expires at `…:05.000Z` and a value whose whole second has already begun is refused with `400` |
 | `connection_limit` | PostgreSQL `CONNECTION LIMIT`: concurrent sessions of the role; one more gets `53300` "too many connections for role"                                                         | 1 to 10,000; omitted means unlimited                                                                                                                                                                                                                |
-| `member_of`        | the role is a member of these roles and inherits their privileges (`INHERIT`; `SET ROLE` to them stays possible, as for any PostgreSQL membership)                            | at most 8 distinct live roles of this database; never `app` or the role itself; otherwise `400`                                                                                                               |
+| `member_of`        | the role is a member of these roles and inherits their privileges (`INHERIT`; `SET ROLE` to them stays possible, as for any PostgreSQL membership)                            | at most 8 distinct live roles of this database; never `app`, the role itself, `pgcf_maintenance` or a reserved name; otherwise `400`                                                                         |
 | `bypass_rls`       | PostgreSQL `BYPASSRLS`: the role ignores row-level security policies, also `FORCE ROW LEVEL SECURITY`; it still needs table privileges. Typical use: an export or backup role | boolean, default `false`                                                                                                                                                                                                                            |
 
 `GET /v1/databases/{id}/roles` returns all four on every role (`null`, `[]`, `false` when not
@@ -444,7 +455,7 @@ pgcf -i -X DELETE "$PGCF_API/v1/databases/<database-id>/roles/report_a1b2c3" \
 - **Repeats.** Another `DELETE` of a role whose removal is still running, or whose operation
   completed for a database that still is not running, returns the same operation, without a new
   generation. After a removal was confirmed the role is `404`.
-- **Refusals.** `400` for the owner `app`; `404` for an unknown role;
+- **Refusals.** `400` for the owner `app` and for `pgcf_maintenance`; `404` for an unknown role;
   `409` for a role that other live roles are `member_of` (`role_has_members`: delete the members
   first). Deleting a database ends a pending removal with `superseded`.
 
@@ -735,6 +746,8 @@ request go-live gate G3 counts: the first request after a sleep may be one HTTP 
 In the 24 h pass 26 of 59 samples were at or above 1 s (39 of 59 in the 1 h pass). From a laptop
 (`pgcf connect` over the public hostname) the first answer had a p50 of 1,027 ms over 10 samples
 after 1 h or more asleep (2026-10-20, "Stage 5.3 cold gate, 1 h stratum, after the race fix").
+The cold gate's databases are 59 `sm`-class databases with a dataset of about 510 MB ("Stage 5.3
+cold gate, first pass of the 1 h stratum on the final code"); the passes above name no other sample.
 
 **The target is not met.** Go-live gate G3 asks for a whole-request p95 of at most 1 s, aiming at
 750 ms (owner, 2026-10-20 evening, plan 11.3), over at least 59 cold samples per stratum from a
@@ -1045,7 +1058,7 @@ What bounds a node, with the kind of each value as in the header.
 | Cap | Value | Kind, date and source |
 | --- | --- | --- |
 | Node size | 6 vCPU, 12 GB RAM (11,967 MiB visible on EU1) and a thin pool of about 289 GiB | measured: US1 reported 11,966 MiB, 6,000 millicores and 289 GiB (2026-10-22, "US1 installed into `us-dev` from the image") |
-| Placement fills a node until its active RAM or CPU load reaches | 80 %, each as the highest 30-minute average within the placement window (7 days in the code, 3 days decided on 2026-10-23) | decided: the owner's rule of 2026-10-17 (plan 11.3, "2026-10-17") |
+| Placement fills a node until its active RAM or CPU load reaches | 80 %, each as the highest 30-minute average of the last 3 days (the placement window) | decided: the owner's rule of 2026-10-17 and its window of 3 days on 2026-10-23 (plan 11.3, "2026-10-17" and "2026-10-23"); the installation applies the 3 days once the API release is deployed ([2.1](#21-create)) |
 | Pool closed for placement at | 80 % of its data or 50 % of its metadata | decided: the 80 % is the owner's number, the 50 % a plan default (plan 4.3) |
 | Sold storage per node | at most 4 times the pool's data (about 1,150 GiB on EU1) | decided: plan default, operator-configurable (plan 11.4, "Logical cap of 4 × pool, operator-configurable") |
 | Volumes per node | 1,000 | measured on 2026-10-17: the largest count tested, `lvcreate` p50 about 270 ms at 1,000 volumes ("Stage 1 Block 1: LVM at scale"); placement closes a node at 1,000 volumes (built 2026-10-20 and in the API deployed on 2026-10-22: "Placement closes a node at 1,000 volumes, and the capacity cron reserves no order while purchases are off"; "Release of main `69d2b245` live on EU1"). It is a technical bound, raised only after a measurement at a higher count, not a sales limit |
@@ -1215,7 +1228,7 @@ disk verdicts for every project at once.
 | --- | --- | --- | --- |
 | Idle sleep | PostgreSQL stops after the sleep proof (every committed transaction is in R2 first); the volume stays mounted; the next connection starts PostgreSQL from it. Measured: asleep 66 s after the last statement at a 60 s idle time (2026-10-23, "Live acceptance on the slot-pool release, part 1") | in R2 and on the volume | reconnect |
 | Manual suspend | refused with `57P03` until resume. Measured: asleep 2.5 s after the request (2026-10-18, "Stage 5.2 sleep and wake on EU1") | as above | `POST /resume` |
-| Node maintenance cycle (new packages, a kernel update) | placement on the node is closed, so creates wait; the node holds new wakes with a bare `57P03` ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)), puts every awake database to sleep with the proof and reboots only if a kernel or core library changed. **Measured:** the first live cycle took 67 s end to end, the node reported its new kernel 56 s after the call and placement was open again after 74 s (2026-10-19, "First live maintenance cycle on EU1"). **Windows (decided):** from the canary on a reboot needs an announced window. Debian kernel security updates follow the owner's standing approval of 2026-10-19 (D10, plan 11.3): a cycle within 7 days of a Debian security advisory, in an announced window, one node at a time; every other reboot also needs the owner's go. **The operator's default window, until the owner names another, is Tuesday 02:00 to 04:00 UTC, announced through the alert webhook.** PGCF has no alert kind for the announcement yet, so the operator sends it; the repository defines no other announcement channel | kept | plan around the window; ask the operator for it |
+| Node maintenance cycle (new packages, a kernel update) | placement on the node is closed, so creates wait; the node holds new wakes with a bare `57P03` ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)), puts every awake database to sleep with the proof and reboots only if a kernel or core library changed. **Measured:** the first live cycle took 67 s end to end, the node reported its new kernel 56 s after the call and placement was open again after 74 s (2026-10-19, "First live maintenance cycle on EU1"). **Windows (decided):** from the canary on a reboot needs an announced window. Debian kernel security updates follow the owner's standing approval of 2026-10-19 (D10, plan 11.3): a cycle within 7 days of a Debian security advisory, in an announced window, one node at a time; every other reboot also needs the owner's go. **The default window is Tuesday 02:00 to 04:00 UTC (plan default D15, 11.5), until the owner names another.** You learn of a window from the operator, who forwards it over the contact channel it names at handover ([7.6](#76-escalation)): the alert webhook reaches only the operator and the owner, PGCF sends integrators no event for a window and has no alert kind for it, and the plan sets no lead time | kept | plan around the window; ask the operator for it |
 | Agent restart (a node release) | running databases keep running: an agent restart never stops a database. New wakes wait for the agent. Measured: the agent was serving 5.3 s after its restart at 167 volumes (2026-10-20, "First release through the normal flow, with an agent change"); a kill -9 of the agent earlier the same day left new connections waiting 36.6 s, before that start was shortened (2026-10-20, "Stage 5.4 results on EU1, runner `s5_chaos.py`") | kept | retry with backoff |
 | Gateway release (a new gateway binary, or a change of the node's route keys) | the gateway on the node is replaced. It closes your idle connections at once with WebSocket close code 1012; a connection in a transaction or running a statement keeps up to 10 s. At that bound a session idle in a transaction is ended with `57P01` and its transaction is rolled back. A session with a statement running is ended with `08007` and **its statement is not stopped**: PostgreSQL finishes it, and the `COMMIT` sent behind it, and notices that the client is gone only when it writes its answer, so the work can commit after the error, up to the statement's run time later (a check made at the error finds nothing yet). An HTTP `/sql` request still running at the bound is answered `08007` in the same way (outcome unknown, not retried). Connections that arrive meanwhile wait for the new gateway, at most those 10 s and its start (and its first table from the node's agent, normally milliseconds, 5 s at most); the one connection the old gateway had accepted at the moment of the signal and not yet read gets `08006`. Designed and tested for that bound; **not yet seen on a node**, so no live outage duration is stated for it ("The gateway drains on a release swap and hands its socket over"). **One time, for the release that brings this behaviour:** the node's agent restarts the gateway before it writes the new unit files, so the first stop is of the previous gateway, which holds every WebSocket for up to 29 s (idle ones too) and keeps its port without accepting for up to 30 s, then resets the connections that waited; a new connection can fail for up to 30 s then, longer than the retry rule, and an HTTP `/sql` request still running at 30 s gets no answer from the gateway (the Edge reports its own `08007`). The restart after the unit files has the new drain but no socket handover (a connection that arrives meanwhile waits in the old process and is reset when it exits, at most 12 s later); the release after that is the first with the handover | a transaction that committed is kept; one idle in a transaction at the bound is rolled back; a statement running at the bound has an unknown outcome and can commit after the error | reconnect on 1012; retry `08006` and `57P01`; after `08007` repeat only an idempotent write, and check a write's effect only after the statement's run time has passed |
 | Node reboot or crash | every awake database stops with the node; when it is back, its agent finds each database that stopped without a proof, starts it through admission, lets it archive and proves its sleep, and a connection wakes it as usual. **Measured, each with writes in flight and no acknowledged commit lost:** a hard power cut (2026-10-18, "Stage 5.4 hard power cut under writes on EU1": 3,040 of 3,040 acknowledged rows present, the node reported again 26.8 s after the start request); a VM restart through the Contabo API (2026-10-20, "Stage 5.4 results on EU1, runner `s5_chaos.py`": the writer was acknowledged again after 84.3 s); a kill -9 of the postmaster (first write again after 7.8 s) and of the gateway (served again after 3.0 s). No outage duration is promised | kept (local volume) | retry with backoff; check `observed_state` |
@@ -1258,14 +1271,19 @@ size and on capacity being available. Per database, measured on EU1 on 2026-10-2
 restore was ready after 50.1 s, a full restore after 44.7 s, `xs`-sized restores after 34.5 to 50.9 s
 and gate-sized ones after 248.7 s and 319.3 s ([2.7](#27-backups-restorable-window-and-restore)).
 
-**A whole node.** The loss of a node was measured without wiping EU1, by restoring a sample of its
-databases and extrapolating to its population ("Live acceptance on the slot-pool release, part 1",
-2026-10-23, G9 restore duration). EU1's 167 databases hold 23.4 GB of archives. A node runs one
-base-backup or restore job at a time, which serialises the restores, so a full node restore takes
-about 2.7 to 3.5 h; with the fence (30 s) and the reinstall of the server (174 to 197 s) the total is
-about 2.8 to 3.6 h, or about 3 h. This is an extrapolation from a sample and not a promise. If the
-server itself is destroyed, ordering a replacement comes first, and the time to order it is not
-measured.
+**A whole node.** The loss of a node has not been run: EU1 was not wiped. The plan extrapolates the
+total from a sample of restores ("Live acceptance on the slot-pool release, part 1", 2026-10-23, G9
+restore duration). **Of the 8 sample restores 7 became ready.** The eighth failed `archive_unusable`
+("tar Unexpected EOF", with the base-backup job at its 256 MiB limit), and its target stayed
+`provisioning` for over 13 minutes ([8](#8-not-available-yet)); its fix is on branch `fx-restore` and
+is not merged. EU1's 167 databases hold 23.4 GB of archives. A node runs one base-backup or restore
+job at a time, which serialises the restores, so a full node restore would take about 2.7 to 3.5 h;
+with the fence (30 s) and the reinstall of the server (174 to 197 s) the total would be about 2.8 to
+3.6 h, or about 3 h. **The figure assumes that every restore succeeds, which the sample did not
+show:** until the `archive_unusable` defect is fixed and shown fixed, some databases of a real node
+loss may not restore within that total, and each stays unrestored until you delete its failed target
+and restore again. It is an extrapolation from a sample and not a promise. If the server itself is
+destroyed, ordering a replacement comes first, and the time to order it is not measured.
 
 ### 7.4 EU1 lost
 
@@ -1289,9 +1307,10 @@ measured.
    IDs was not chosen): update your mapping, connection strings and `wsProxy` hints for each.
 4. Expect the last archived commit, not the last acknowledged one.
 
-The measured total is in [7.3](#73-recovery-time). The runbook with its preconditions is
-go-live gate G9; its restore half was measured on 2026-10-23 and the full drill (marking EU1 lost
-and restoring all its databases) has not been run.
+The extrapolated total, with its sample of 7 successful restores out of 8, is in
+[7.3](#73-recovery-time). The runbook with its preconditions is go-live gate G9; its restore half
+was sampled on 2026-10-23 and the full drill (marking EU1 lost and restoring all its databases) has
+not been run.
 
 ### 7.5 Records to keep
 
@@ -1318,8 +1337,8 @@ the operator supplies it at handover.** Send:
 - A first request after sleep under one second, measured at p95 (go-live gate G3). The best pass so
   far has a p95 of 1,583 ms ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)).
 - A second node in a region and redundancy; a drill that marks a node lost and restores all its
-  databases (the restore time of a node's population is extrapolated from a sample,
-  [7.3](#73-recovery-time)); automatic rebalancing (an operator can move a database under its ID,
+  databases (the restore time of a node's population is extrapolated from a sample of which 7 of 8
+  restores succeeded, [7.3](#73-recovery-time)); automatic rebalancing (an operator can move a database under its ID,
   and a move has not been timed; a restore always creates a new ID).
 - The density, pool-full and volume-full tests ([4.4](#44-capacity-caps)).
 - Alerts for integrators (alerts go to the operator); alert history, acknowledgement and test send.
@@ -1329,6 +1348,8 @@ the operator supplies it at handover.** Send:
 - Infrastructure metrics history and measured CPU and RAM per database.
 - Changing a role after creation (expiry, limit, membership), user-chosen passwords, a grants API,
   per-role settings, renaming a database.
+- The reservation of the role names `pgcf_backup`, `public` and `none` (W2-C, pending: built on a
+  branch, not merged, no plan row on this base, [2.3](#23-roles-connection-uri-and-passwords)).
 - Cancel requests, replication connections, TCP access; in HTTP query mode, `COPY` and
   `authToken`.
 - Budgets, quotas per tenant, compute and storage autoscaling, branching.
@@ -1347,11 +1368,18 @@ part 1") found three. The plan records their fixes when they are live; until the
 - `POST /v1/databases/{id}/roles` with `valid_until` answered `500` after 12.6 s although the role
   had been created. Read the role list before you retry.
 
+A fourth case has no live check: a restore of a backup taken in a class with more `max_connections`
+than the database's class has now (a database that was resized down after its base backup)
+aborted in a test on 2026-10-21 ("Restore into a smaller class, on branch `pr-w1b`"). The fix is in
+the code on main, and the plan records no live run of it (an `md` database restored into `xs` is
+listed as not run in "Live acceptance on the slot-pool release, part 1"); do not rely on such a
+restore until it does.
+
 ## 9. Values for written confirmation (go-live gate G11)
 
 Go-live gate G11 requires this document to state the following and the first integrator's written
-confirmation. The kind column says whether a value is *measured*, *decided* or *to be measured*
-(see the header), with its date. The source column gives the title of the row of the plan's
+confirmation. The kind column says whether a value is *measured*, *extrapolated*, *decided* or *to
+be measured* (see the header), with its date. The source column gives the title of the row of the plan's
 [Done table](../architecture/cloudflare-convergence-and-serverless-plan.md#111-done) unless it says otherwise.
 
 | Item | Value | Kind and date | Source | Where |
@@ -1371,14 +1399,14 @@ confirmation. The kind column says whether a value is *measured*, *decided* or *
 | What a sold memory size means (D3) | A hard ceiling while the database is awake, not a guarantee: under the rule `measured` awake databases are not reserved against each other | decided: plan default D3 (a), not named otherwise by the owner; memory per awake database by size **to be measured** (Stage 5.6) | plan 11.5, D3 | [4.2](#42-awake-databases-what-a-sold-memory-size-means) |
 | Volume-full and pool-full behaviour | A full volume stops that database's writes and the node frees the filesystem's last reserve once; a pool without room refuses wakes, creates and restores with `57P03` `storage`, and a full pool fails writes at once and stops the databases on it, which the node recovers once space is back | design; the live tests are **to be measured** (Stage 5.5). A volume filled in three minutes in a live run on 2026-10-19 | "Storage samples every minute and alert IDs that name the error"; plan 4.3 | [4.3](#43-thin-storage), [7.1](#71-what-happens-in-each-situation) |
 | Connection limits | 12,000 new connections per 60 s per database; 6,000 per 60 s per database, role and source network; 12,000 per 60 s from a service binding; 12,000 admissions per minute per database; 32 waiters per wake; 200 sessions per database through a gateway | Dev values, recorded 2026-10-23; the Dev installation becomes production at the canary | "Dev connection limits recorded (S6-03)" | [3.6](#36-connection-limits) |
-| Outage classes and maintenance windows | Idle sleep, suspend, maintenance cycle (67 s), agent restart (serving after 5.3 s), gateway release, node reboot or crash (the node reported again 26.8 s after a power cut's start request; the writer was acknowledged again 84.3 s after a VM restart), archiving failing, volume full, pool full, node lost, Cloudflare unavailable. Default window: Tuesday 02:00 to 04:00 UTC, announced through the alert webhook, until the owner names another | durations measured 2026-10-18 to 2026-10-20; windows decided (D10, 2026-10-19), the default window is the operator's proposal | "First live maintenance cycle on EU1"; "First release through the normal flow, with an agent change"; "Stage 5.4 results on EU1, runner `s5_chaos.py`"; plan 11.3 | [7.1](#71-what-happens-in-each-situation) |
-| Security reboots | Within 7 days of a Debian security advisory that fixes the kernel, in an announced window, one node at a time; every other reboot also needs the owner's go | decided 2026-10-19 (D10) | plan 11.3 | [7.1](#71-what-happens-in-each-situation) |
+| Outage classes and maintenance windows | Idle sleep, suspend, maintenance cycle (67 s), agent restart (serving after 5.3 s), gateway release, node reboot or crash (the node reported again 26.8 s after a power cut's start request; the writer was acknowledged again 84.3 s after a VM restart), archiving failing, volume full, pool full, node lost, Cloudflare unavailable. Default window: Tuesday 02:00 to 04:00 UTC, which the operator forwards to you (the alert webhook reaches only the operator and the owner), until the owner names another | durations measured 2026-10-18 to 2026-10-20; the need for an announced window decided 2026-10-19 (D10); the default window is a plan default, decided as such (D15, 11.5) | "First live maintenance cycle on EU1"; "First release through the normal flow, with an agent change"; "Stage 5.4 results on EU1, runner `s5_chaos.py`"; plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
+| Security reboots | Within 7 days of a Debian security advisory that fixes the kernel, in an announced window (default Tuesday 02:00 to 04:00 UTC), one node at a time; every other reboot also needs the owner's go | decided 2026-10-19 (D10); window: plan default D15 | plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
 | IDs after restore, move and node loss | Restore: a new ID. Move: the ID is kept. Node loss: new IDs, restored from R2 | restore decided 2026-10-15 (plan 11.3); a move keeps the ID (plan 11.4) and has not been timed (**to be measured**, Stage 5.7); node loss is D4, the plan's default | "Moves keep the ID; automatic rebalancing after go-live" (plan 11.4); plan 11.5, D4 | [1.2](#12-regions), [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) |
-| Losing a node | About 2.8 to 3.6 h for EU1's 167 databases and 23.4 GB: fence 30 s, reinstall 174 to 197 s, restores about 2.7 to 3.5 h | measured 2026-10-23 by restoring a sample and extrapolating; the full drill has not been run | "Live acceptance on the slot-pool release, part 1"; "G9: what is left after the 2026-10-19 loss and reinstall"; "US1 installed into `us-dev` from the image" | [7.3](#73-recovery-time), [7.4](#74-eu1-lost) |
+| Losing a node | About 2.8 to 3.6 h for EU1's 167 databases and 23.4 GB if every restore succeeds: fence 30 s, reinstall 174 to 197 s, restores about 2.7 to 3.5 h. **7 of the 8 sample restores succeeded; the total assumes the `archive_unusable` defect is fixed** (fix on branch `fx-restore`, not merged) | extrapolated 2026-10-23 from a sample of restores; fence and reinstall measured 2026-10-19 and 2026-10-22; the full drill has not been run | "Live acceptance on the slot-pool release, part 1"; "G9: what is left after the 2026-10-19 loss and reinstall"; "US1 installed into `us-dev` from the image" | [7.3](#73-recovery-time), [7.4](#74-eu1-lost) |
 | Capacity caps | Placement fills a node to 80 % of its 30-minute peak of active RAM or CPU; pool closed at 80 % data or 50 % metadata; sold storage at most 4 times the pool; 1,000 volumes; 8 starts at once on EU1; a storm of 40 wakes answered in at most 5.8 s (HTTP) and 7.1 s (WebSocket) with none refused | dated rows in the table of 4.4 are measured (2026-10-17 and 2026-10-20); density and the storage limits are **to be measured** (Stage 5.6 and 5.5) | "Stage 1 Block 1: LVM at scale"; "Stage 5.6 wake storm, first measurement" | [4.4](#44-capacity-caps) |
-| Reserved role names | `postgres`, `pgcf_backup`, `public`, `none` and every name that starts with `pg_` | decided: W2-C and W2-C2 (plan 11.5); in force from the W2-C release, before which `streaming_replica`, `cnpg_*` and `pgcf_maintenance` are also refused | "Role names of the Kubernetes runtime released"; plan 11.5, W2-C and W2-C2 | [2.3](#23-roles-connection-uri-and-passwords) |
+| Reserved role names | **Today:** the API refuses `postgres`, `streaming_replica` and every name that starts with `pg_` or `cnpg_`, and refuses to create or delete `pgcf_maintenance` or to name it in `member_of`; it accepts `pgcf_backup`, `public` and `none`, which must not be used. **Pending:** W2-C would refuse `postgres`, `pgcf_backup`, `public`, `none` and `pg_*` and release the rest | today's list is the contract (code on main); the W2-C list is pending: built on branch `pr-w2c`, not merged, no plan row on this base | `packages/contracts/src/ids-core.ts`; the served OpenAPI, schema `RoleName` | [2.3](#23-roles-connection-uri-and-passwords) |
 | Regions and the archive bucket | Two regions, `eu-dev` (EU1) and `us-dev` (US1), and one R2 archive bucket in the EU jurisdiction for both | measured 2026-10-22 and 2026-10-23 | "US1 installed into `us-dev` from the image"; "US1 database acceptance in `us-dev`"; "G8 one archive bucket: the cutover on Dev, steps 1 to 11" | [1.2](#12-regions) |
-| Placement window | 7 days in the code; 3 days decided | decided 2026-10-23 (plan 11.3) | "Placement is closed for a week after a burst" (plan 11.2); plan 11.3 | [2.1](#21-create) |
+| Placement window | 3 days (the code on main; the installation applies it once the API release is deployed) | decided 2026-10-23 (O6, plan 11.3) | "Placement is closed for 3 days after a burst" (plan 11.2); plan 11.3 | [2.1](#21-create) |
 | Role deletion | Unroutable at once; the removal is confirmed by PostgreSQL; a hibernated database applies it at its next wake | a role delete passed live in Stage 5.1 on 2026-10-23; no plan row records a live run of the hibernated-database case or of a role that owns objects | "Live acceptance on the slot-pool release, part 1" | [2.3](#23-roles-connection-uri-and-passwords) |
 
 The first integrator confirms this table in writing; go-live gate G11 closes with that
@@ -1392,7 +1420,7 @@ Every error body is `{"error": {"code", "message", "request_id", "details"?}}`.
 
 | Status | `error.code`              | When                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Retry                        |
 | ------ | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
-| 400    | `invalid_request`         | validation or unknown field, malformed JSON, body above 64 KiB, wrong `Content-Type`, bad ID, cursor or `Idempotency-Key`, a missing `Idempotency-Key` on a database or role mutation, unknown or disabled class or region, class above the memory maximum, `target_time` in the future, storage shrink, usage range not aligned or over 31 days, a role `valid_until` that is not in the future, a `member_of` entry that is not a live role of the database (or is `app`), deleting `app` | no                           |
+| 400    | `invalid_request`         | validation or unknown field, malformed JSON, body above 64 KiB, wrong `Content-Type`, bad ID, cursor or `Idempotency-Key`, a missing `Idempotency-Key` on a database or role mutation, unknown or disabled class or region, class above the memory maximum, `target_time` in the future, storage shrink, usage range not aligned or over 31 days, a role `valid_until` that is not in the future, a reserved role name (`postgres`, `streaming_replica`, `pg_*`, `cnpg_*`), a `member_of` entry that is not a live role of the database (or is `app` or `pgcf_maintenance`), creating or deleting `pgcf_maintenance`, deleting `app` | no                           |
 | 401    | `unauthorized`            | key missing, malformed, unknown, revoked, or its project deleted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | no                           |
 | 403    | `forbidden`               | integrator key on an admin route                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | no                           |
 | 404    | `not_found`               | unknown ID, an ID of another project, unknown route, a role route of a deleted database                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | no                           |
@@ -1497,8 +1525,8 @@ description of the schema or the operation; the code is authoritative.
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- | ------- |
 | An `integrator` key requires `project_id` and an `admin` key must omit it                                                                                                                             | `ApiKeyCreate`                     | `400`   |
 | `memory_mib` of a size class is a multiple of 256                                                                                                                                                      | `SizeClass`, `SizeClassUpsert`     | `400`   |
-| `postgres`, `pgcf_backup`, `public`, `none` and `pg_*` are not role names                                                                                                                              | `RoleName`, `RoleCreate`           | `400`   |
-| `valid_until` must lie in the future when the request executes (not on a replay); every `member_of` entry is a live role of this database that is neither `app` nor being deleted | `RoleCreate`                       | `400`   |
+| `postgres`, `streaming_replica` and names that start with `pg_` or `cnpg_` are reserved; creating a role also refuses `pgcf_maintenance`, and `app` is the owner                                       | `RoleName`                         | `400`   |
+| `valid_until` must lie in the future when the request executes (not on a replay); every `member_of` entry is a live role of this database that is neither `app`, `pgcf_maintenance` nor being deleted | `createDatabaseRole`, `RoleCreate` | `400`   |
 | A usage request names exactly one scope; both boundaries are aligned to the granularity and at most 31 days apart                                                                                     | `getUsage`                         | `400`   |
 | A request body is JSON of at most 64 KiB with `Content-Type: application/json` whenever there is a body                                                                                               | `info.description`                 | `400`   |
 | Idempotency keys are kept 24 hours per API key; a request that failed is not retained                                                                                                                 | `Idempotency-Key` of each mutation |         |
