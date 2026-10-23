@@ -1613,7 +1613,7 @@
                   },
                   "reason": {
                     "type": "string",
-                    "enum": ["no_room", "no_headroom"]
+                    "enum": ["no_room", "no_headroom", "start_queue"]
                   },
                   "retry_after_seconds": {
                     "type": "integer",
@@ -1699,6 +1699,7 @@
                     "enum": [
                       "no_room",
                       "no_headroom",
+                      "start_queue",
                       "deleted",
                       "suspended",
                       "moving",

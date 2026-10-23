@@ -756,6 +756,46 @@ database_log_stays_in_the_system_journal() {
 	return "$result"
 }
 
+# The release that carries SplitMode=none removes what the split left behind (pgcf-journal.conf,
+# which the agent runs with `systemd-tmpfiles --create --remove`; `--create` alone ignores its `r`
+# lines): the per-uid files by name, archived ones included, and the system journal stays. EU1's 376
+# files took the whole 1 GiB budget of the system journal, and the boot before a reset left no
+# journal for its last 22.5 hours (2026-10-23).
+legacy_journal_files_are_removed() {
+	local uid=299998 old directory archived file result=0
+	old=$(legacy_journal_file "$uid") || {
+		echo "no journal file could be made: the probe proves nothing"
+		return 1
+	}
+	directory=$(dirname "$old")
+	archived=$directory/user-$uid@0005f2c1d3a4b5c6-7d8e9f0a1b2c3d4e.journal
+	install -m 0640 -o root -g systemd-journal /dev/null "$archived" || {
+		rm -f "$old"
+		return 1
+	}
+	systemd-tmpfiles --create /usr/lib/tmpfiles.d/pgcf-journal.conf
+	if [ ! -e "$old" ] || [ ! -e "$archived" ]; then
+		echo "--create alone removed a file: the rules are not the removal's"
+		result=1
+	fi
+	systemd-tmpfiles --create --remove /usr/lib/tmpfiles.d/pgcf-journal.conf || {
+		echo "systemd-tmpfiles refused pgcf-journal.conf"
+		result=1
+	}
+	for file in "$old" "$archived"; do
+		if [ -e "$file" ]; then
+			echo "the file stays: $file"
+			result=1
+		fi
+	done
+	find /var/log/journal /run/log/journal -name 'system.journal' 2>/dev/null | grep -q . || {
+		echo "the system journal is gone"
+		result=1
+	}
+	rm -f "$old" "$archived"
+	[ "$result" = 0 ]
+}
+
 # The journal of this boot shows the agent's own lines (the unit's, not PID 1's lines about it): the
 # agent logs `agent_start_phase` from its first moment, and the checks begin when the system runs.
 journal_has_agent_lines() {
@@ -1169,6 +1209,7 @@ if [ "$phase" = 1 ]; then
 	check database_user_shares_nothing_writable database_user_shares_nothing_writable
 	check database_user_reads_no_journal database_user_reads_no_journal
 	check database_log_stays_in_the_system_journal database_log_stays_in_the_system_journal
+	check legacy_journal_files_are_removed legacy_journal_files_are_removed
 	check database_scratch_space_is_bounded database_scratch_space_is_bounded
 	check database_second_postmaster_is_refused database_second_postmaster_is_refused
 	check slot_isolation slot_isolation

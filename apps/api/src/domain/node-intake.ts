@@ -192,6 +192,7 @@ export async function nodeEvents(
       admitted: number;
       noRoom: number;
       noHeadroom: number;
+      startQueue: number;
       early: number;
       waits: number;
       waitSum: number;
@@ -220,6 +221,7 @@ export async function nodeEvents(
       admitted: 0,
       noRoom: 0,
       noHeadroom: 0,
+      startQueue: 0,
       early: 0,
       waits: 0,
       waitSum: 0,
@@ -230,6 +232,7 @@ export async function nodeEvents(
     else {
       if (event.decision === "admitted") minute.admitted++;
       else if (event.reason === "no_room") minute.noRoom++;
+      else if (event.reason === "start_queue") minute.startQueue++;
       else minute.noHeadroom++;
       if (event.waited_ms > 0) {
         minute.waits++;
@@ -243,12 +246,13 @@ export async function nodeEvents(
       [...minutes].map(([minute, counts]) =>
         db
           .prepare(
-            `INSERT INTO node_minutes(node_id,minute,samples,admitted,refused_no_room,refused_no_headroom,early_sleeps,
-               queue_waits,queue_wait_ms_sum,queue_wait_ms_max)
-             SELECT ?,?,0,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM nodes WHERE id=?)
+            `INSERT INTO node_minutes(node_id,minute,samples,admitted,refused_no_room,refused_no_headroom,refused_start_queue,
+               early_sleeps,queue_waits,queue_wait_ms_sum,queue_wait_ms_max)
+             SELECT ?,?,0,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM nodes WHERE id=?)
              ON CONFLICT(node_id,minute) DO UPDATE SET admitted=admitted+excluded.admitted,
                refused_no_room=refused_no_room+excluded.refused_no_room,
                refused_no_headroom=refused_no_headroom+excluded.refused_no_headroom,
+               refused_start_queue=refused_start_queue+excluded.refused_start_queue,
                early_sleeps=early_sleeps+excluded.early_sleeps,queue_waits=queue_waits+excluded.queue_waits,
                queue_wait_ms_sum=queue_wait_ms_sum+excluded.queue_wait_ms_sum,
                queue_wait_ms_max=MAX(queue_wait_ms_max,excluded.queue_wait_ms_max)`,
@@ -259,6 +263,7 @@ export async function nodeEvents(
             counts.admitted,
             counts.noRoom,
             counts.noHeadroom,
+            counts.startQueue,
             counts.early,
             counts.waits,
             counts.waitSum,

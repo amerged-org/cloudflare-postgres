@@ -323,7 +323,7 @@ const admission = (
 });
 const minutes = (node: string) =>
   env.DB.prepare(
-    "SELECT minute,samples,admitted,refused_no_room,refused_no_headroom,early_sleeps,queue_waits,queue_wait_ms_sum,queue_wait_ms_max FROM node_minutes WHERE node_id=? ORDER BY minute",
+    "SELECT minute,samples,admitted,refused_no_room,refused_no_headroom,refused_start_queue,early_sleeps,queue_waits,queue_wait_ms_sum,queue_wait_ms_max FROM node_minutes WHERE node_id=? ORDER BY minute",
   )
     .bind(node)
     .all<Record<string, number>>()
@@ -351,6 +351,16 @@ describe("the events of a node", () => {
         },
         at + 3000,
       ),
+      admission(
+        "s",
+        {
+          decision: "refused",
+          reason: "start_queue",
+          retry_after_seconds: 5,
+          waited_ms: 10_000,
+        },
+        at + 3500,
+      ),
       {
         type: "early_sleep",
         id: crypto.randomUUID(),
@@ -363,7 +373,7 @@ describe("the events of a node", () => {
     ];
     const response = await post(f, "/node/v1/events", { events });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ accepted: 6, duplicates: 0 });
+    expect(await response.json()).toEqual({ accepted: 7, duplicates: 0 });
     expect(await minutes(f.node)).toEqual([
       {
         minute: at / 60_000 - (at % 60_000) / 60_000,
@@ -371,9 +381,10 @@ describe("the events of a node", () => {
         admitted: 2,
         refused_no_room: 1,
         refused_no_headroom: 1,
+        refused_start_queue: 1,
         early_sleeps: 1,
-        queue_waits: 2,
-        queue_wait_ms_sum: 10_400,
+        queue_waits: 3,
+        queue_wait_ms_sum: 20_400,
         queue_wait_ms_max: 10_000,
       },
       expect.objectContaining({ admitted: 1, queue_waits: 0 }),

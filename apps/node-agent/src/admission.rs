@@ -18,9 +18,10 @@
 //!
 //! A start counts as in flight from its admission until its permit reports it ready or failed
 //! (`Admitter::finish`), or its unit is reported stopped. A start that meets all three rules
-//! begins; otherwise it waits in a FIFO queue for up to `queue_wait_ms` and is then refused
-//! (`Refusal::NoHeadroom`, with the policy's retry hint). The queue is strict: a start behind a
-//! larger one waits, even when it would fit.
+//! begins; otherwise it waits in a FIFO queue for up to `queue_wait_ms` and is then refused, with
+//! the policy's retry hint: `Refusal::NoHeadroom` when the memory rule held it back (or a start
+//! ahead of it), `Refusal::StartQueue` when only the start cap did. The queue is strict: a start
+//! behind a larger one waits, even when it would fit.
 //!
 //! While a start waits for memory, and only if policy enables it (decision D2), the node puts one
 //! idle but awake database to sleep early for each such start (`Admitter::early_sleep`). A start
@@ -118,8 +119,13 @@ pub struct Request {
 pub enum Refusal {
     /// The pool has no room: 57P03 "storage".
     NoRoom,
-    /// The node is at awake capacity and the wait is over: 57P03 "node at awake capacity".
+    /// The node is at awake capacity and the wait is over: 57P03 "node at awake capacity". The
+    /// memory rule held the start back, or a start ahead of it in the queue.
     NoHeadroom,
+    /// The wait is over and the memory was there: the start cap alone kept the start waiting
+    /// (EU1, 2026-10-23: a storm of 40 wakes, 8 starts at once, 17 % of the memory in use):
+    /// 57P03 "node busy starting databases".
+    StartQueue,
 }
 impl Refusal {
     /// The reason the contract names (`ADMISSION_REFUSALS`).
@@ -127,6 +133,7 @@ impl Refusal {
         match self {
             Self::NoRoom => "no_room",
             Self::NoHeadroom => "no_headroom",
+            Self::StartQueue => "start_queue",
         }
     }
     /// The DETAIL of the 57P03 that answers it (`ADMISSION_REFUSAL_DETAILS`).
@@ -134,7 +141,12 @@ impl Refusal {
         match self {
             Self::NoRoom => "storage",
             Self::NoHeadroom => "node at awake capacity",
+            Self::StartQueue => "node busy starting databases",
         }
+    }
+    /// Waiting undoes it, so it carries the policy's retry hint (`refusalRetryHint`).
+    fn retry_hint(self) -> bool {
+        matches!(self, Self::NoHeadroom | Self::StartQueue)
     }
 }
 
@@ -149,7 +161,7 @@ pub struct Admitted {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Refused {
     pub reason: Refusal,
-    /// Only a refusal for awake capacity carries a retry hint, since waiting makes room for it.
+    /// Only a refusal that waiting undoes carries a retry hint: awake capacity and the start cap.
     pub retry_after_seconds: Option<u32>,
     pub waited: Duration,
 }
@@ -384,10 +396,25 @@ impl Admitter {
     fn refusal(&self, reason: Refusal, waited: Duration) -> Refused {
         Refused {
             reason,
-            retry_after_seconds: (reason == Refusal::NoHeadroom)
+            retry_after_seconds: reason
+                .retry_hint()
                 .then_some(self.policy.admission.retry_after_seconds),
             waited,
         }
+    }
+
+    /// The refusal of a start that could not begin in its time, from what held it back: the
+    /// memory rule (`held_by_memory`: its own, or a start ahead of it in the strict queue) is
+    /// awake capacity, and the start cap alone is a full start queue.
+    fn expired(&self, held_by_memory: bool, waited: Duration) -> Refused {
+        self.refusal(
+            if held_by_memory {
+                Refusal::NoHeadroom
+            } else {
+                Refusal::StartQueue
+            },
+            waited,
+        )
     }
 
     /// Asks for a start. `facts` are the node's facts now.
@@ -411,7 +438,12 @@ impl Admitter {
         }
         let wait = Duration::from_millis(self.policy.admission.queue_wait_ms);
         if wait.is_zero() {
-            return Decision::Done(Err(self.refusal(Refusal::NoHeadroom, Duration::ZERO)));
+            let held = !self.memory_fits(facts, request.memory_mib)
+                || self
+                    .queue
+                    .iter()
+                    .any(|waiter| !self.memory_fits(facts, waiter.request.memory_mib));
+            return Decision::Done(Err(self.expired(held, Duration::ZERO)));
         }
         let ticket = Ticket(self.next_ticket);
         self.next_ticket += 1;
@@ -441,7 +473,8 @@ impl Admitter {
         // From the head: begin what fits, refuse what has waited its time, stop at the first start
         // that must keep waiting. A start never overtakes the one before it.
         while let Some(head) = self.queue.front() {
-            let fits = self.fits(facts, head.request.memory_mib);
+            let memory = self.memory_fits(facts, head.request.memory_mib);
+            let fits = memory && self.cap_free();
             if !fits && now < head.deadline {
                 break;
             }
@@ -453,15 +486,19 @@ impl Admitter {
                 self.begin(waiter.request, now);
                 outcomes.push((waiter.ticket, Ok(Admitted { waited })));
             } else {
-                let refused = self.refusal(Refusal::NoHeadroom, waited);
+                let refused = self.expired(!memory, waited);
                 outcomes.push((waiter.ticket, Err(refused)));
             }
         }
-        // A policy with a shorter wait can make a later start expire before the head.
+        // A policy with a shorter wait can make a later start expire before the head. The strict
+        // queue holds a start back for the memory of any start ahead of it as well as its own.
+        let mut ahead_wants_memory = false;
         for waiter in std::mem::take(&mut self.queue) {
+            let memory = self.memory_fits(facts, waiter.request.memory_mib);
+            ahead_wants_memory |= !memory;
             if now >= waiter.deadline {
                 let waited = now.saturating_duration_since(waiter.enqueued);
-                let refused = self.refusal(Refusal::NoHeadroom, waited);
+                let refused = self.expired(ahead_wants_memory, waited);
                 outcomes.push((waiter.ticket, Err(refused)));
             } else {
                 self.queue.push_back(waiter);
@@ -1297,6 +1334,101 @@ mod tests {
         assert_eq!(admitter.snapshot().queued, 0);
     }
 
+    /// What held a start back names its refusal (EU1, 2026-10-23: a storm of 40 wakes on a node at
+    /// 17 % of its memory was refused "node at awake capacity" because the start cap of 8 kept the
+    /// wait past 10 s). The memory rule says `no_headroom`; the cap alone says `start_queue`.
+    #[test]
+    fn a_start_held_back_by_the_start_cap_alone_is_refused_as_a_full_start_queue() {
+        let t0 = Instant::now();
+        let mut admitter = Admitter::new(policy());
+        let plenty = facts(100_000);
+        for n in 0..4 {
+            assert_eq!(
+                admitter.request(t0, &plenty, request(&format!("db{n}"), 256)),
+                admitted(Duration::ZERO)
+            );
+        }
+        let fifth = queue(&mut admitter, t0, &plenty, request("db4", 256));
+        let outcomes = admitter.poll(t0 + secs(10), &plenty);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, fifth);
+        let refused = outcomes[0].1.expect_err("the wait is over");
+        assert_eq!(refused.reason.reason(), "start_queue");
+        assert_eq!(refused.reason.detail(), "node busy starting databases");
+        assert_eq!(
+            (refused.retry_after_seconds, refused.waited),
+            (Some(5), secs(10)),
+            "waiting undoes it, so it carries the policy's retry hint"
+        );
+    }
+
+    #[test]
+    fn a_start_the_memory_rule_holds_back_is_refused_for_awake_capacity_whatever_the_cap_says() {
+        let t0 = Instant::now();
+        let mut admitter = Admitter::new(policy());
+        // The cap is full and the memory is short for the waiting start.
+        for n in 0..4 {
+            admitter.request(t0, &facts(100_000), request(&format!("db{n}"), 256));
+        }
+        let tight = facts(100);
+        let waiting = queue(&mut admitter, t0, &tight, request("db4", 256));
+        let outcomes = admitter.poll(t0 + secs(10), &tight);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, waiting);
+        assert_eq!(
+            outcomes[0].1.expect_err("refused").reason.reason(),
+            "no_headroom"
+        );
+    }
+
+    /// The queue is strict: a start behind one that waits for memory waits for memory too, however
+    /// small it is, and the start cap is not what holds it.
+    #[test]
+    fn a_start_behind_a_start_that_waits_for_memory_is_refused_for_awake_capacity() {
+        let t0 = Instant::now();
+        let mut admitter = Admitter::new(policy());
+        // Memory for 600 + 256 MiB: the large head does not fit, the small start behind it would.
+        let tight = facts(900);
+        queue(&mut admitter, t0, &tight, request("head", 1024));
+        let mut shorter = policy();
+        shorter.admission.queue_wait_ms = 1000;
+        admitter.set_policy(shorter);
+        let small = queue(&mut admitter, t0 + secs(2), &tight, request("small", 256));
+        let outcomes = admitter.poll(t0 + secs(3), &tight);
+        assert_eq!(outcomes.len(), 1, "the head has seven seconds left");
+        assert_eq!(outcomes[0].0, small);
+        assert_eq!(
+            outcomes[0].1.expect_err("refused").reason.reason(),
+            "no_headroom"
+        );
+    }
+
+    #[test]
+    fn a_queue_wait_of_zero_names_the_start_cap_or_the_memory_that_refused() {
+        let t0 = Instant::now();
+        let mut policy = policy();
+        policy.admission.queue_wait_ms = 0;
+        let mut admitter = Admitter::new(policy);
+        for n in 0..4 {
+            assert_eq!(
+                admitter.request(t0, &facts(100_000), request(&format!("db{n}"), 256)),
+                admitted(Duration::ZERO)
+            );
+        }
+        let refused = |decision: Decision| match decision {
+            Decision::Done(Err(refused)) => refused.reason.reason(),
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert_eq!(
+            refused(admitter.request(t0, &facts(100_000), request("cap", 256))),
+            "start_queue"
+        );
+        assert_eq!(
+            refused(admitter.request(t0, &facts(100), request("memory", 256))),
+            "no_headroom"
+        );
+    }
+
     #[test]
     fn a_start_that_fits_at_its_deadline_is_admitted_not_refused() {
         let t0 = Instant::now();
@@ -1960,7 +2092,7 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        let ours = [Refusal::NoRoom, Refusal::NoHeadroom];
+        let ours = [Refusal::NoRoom, Refusal::NoHeadroom, Refusal::StartQueue];
         assert_eq!(ours.map(Refusal::reason), reasons[..]);
         for refusal in ours {
             assert_eq!(

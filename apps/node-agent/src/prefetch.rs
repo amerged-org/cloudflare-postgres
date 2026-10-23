@@ -1,31 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Readahead of the files a database's first request reads (plan 11.2, package F).
+//! Readahead of the files a database's start and first request read (plan 11.2, package F).
 //!
-//! A database that slept for hours has had its pages evicted, and the login and the first
-//! statements read them from the disk one random read at a time (EU1, 2026-10-20, p50 / p95: login
-//! 66 / 133 ms and six statements 208 / 452 ms; with the catalogs read ahead the login took 23 ms,
-//! and with the whole autoprewarm list resident the statements took 66 ms). The agent knows which
-//! files those are before the request does. It asks the kernel to read them ahead with
-//! `posix_fadvise(WILLNEED)`, in two sets:
+//! A database that slept for hours has had its pages evicted, and the start of its PostgreSQL, the
+//! login and the first statements read them from the disk one random read at a time (EU1,
+//! 2026-10-20, p50 / p95: login 66 / 133 ms and six statements 208 / 452 ms; with the catalogs
+//! read ahead the login took 23 ms, and with the whole autoprewarm list resident the statements
+//! took 66 ms). The agent knows which files those are before the request does. It asks the kernel
+//! to read them ahead with `posix_fadvise(WILLNEED)`, in four sets:
 //!
-//! - **`catalog`**: `pg_control`, a window of the WAL at the latest checkpoint, `global/`, and in
-//!   each user database (`base/<oid>`, oid 16384 and up) its `PG_VERSION`, its `pg_filenode.map`
-//!   and the catalogs a login and a first statement read, with their indexes and forks. A mapped
-//!   catalog (`pg_class`, `pg_attribute`, `pg_proc`, `pg_type` and their indexes) that PostgreSQL
-//!   has rewritten (`VACUUM FULL`) lives at the file number the map names, not at its oid. Every
-//!   other catalog is read at its oid: a rewrite of one gives it a file number that only `pg_class`
-//!   records, which the plan does not read, so it drops out of the set and its absent main fork is
-//!   counted in `Report::missing`. About 5 MB, found without starting PostgreSQL.
+//! - **`start`**: what PostgreSQL reads between its exec and its ready, found without starting it:
+//!   the configuration files (`postgresql.conf`, `postgresql.auto.conf`, `pg_hba.conf`,
+//!   `pg_ident.conf`) and `PG_VERSION`; `pg_control`; the WAL at the latest checkpoint record and,
+//!   when it lies earlier (a crash), at the redo point; the last segment of `pg_xact` and of
+//!   `pg_multixact`'s two directories, `pg_stat/pgstat.stat` and `pg_logical/replorigin_checkpoint`,
+//!   which the startup process reads; and `global/`. About 1 MB (a strace of PostgreSQL 18.6 on
+//!   Debian 13 lists them; `pg_internal.init` of `global/` is removed at every start and is not
+//!   read).
+//! - **`catalog`**: in each user database (`base/<oid>`, oid 16384 and up) its `PG_VERSION`, its
+//!   `pg_filenode.map` and the catalogs a login and a first statement read, with their indexes and
+//!   forks. A mapped catalog (`pg_class`, `pg_attribute`, `pg_proc`, `pg_type` and their indexes)
+//!   that PostgreSQL has rewritten (`VACUUM FULL`) lives at the file number the map names, not at
+//!   its oid. Every other catalog is read at its oid: a rewrite of one gives it a file number that
+//!   only `pg_class` records, which the plan does not read, so it drops out of the set and its
+//!   absent main fork is counted in `Report::missing`. About 5 MB, found without starting
+//!   PostgreSQL.
 //! - **`list`**: the blocks of `autoprewarm.blocks`, which PostgreSQL writes at each clean stop,
 //!   merged where they are contiguous and ordered by the fewest listed blocks per relation first
 //!   (catalogs, indexes and small tables before the one big heap), so that a time budget cuts off
 //!   the heap's tail and nothing else.
+//! - **`files`**: whole files that are not in a data directory, the program of PostgreSQL
+//!   (`program`).
 //!
-//! Both are two steps. Building the `Plan` reads the directories and a few small files and opens
+//! Each set is two steps. Building the `Plan` reads the directories and a few small files and opens
 //! each file once to learn its length (blocking: run it in `spawn_blocking`, and before the moment
 //! it matters; it warms the dentries and inodes the issuing needs). `Plan::issue` advises the
 //! kernel in pieces of `PIECE` and stops at a time budget, a byte bound or a cancel; it returns a
-//! `Report` of counts and timings, which is the page cache accounting of a wake. It replaces the
+//! `Report` of counts and timings, which is the page cache accounting of a wake. A piece that the
+//! page cache holds entirely is not advised (its pages are counted first with `cachestat(2)`): a
+//! set that is resident costs one lookup per piece and no read. The issuing replaces the
 //! residency diagnostic that `cache.rs` made, which opened up to 64 files and listed directories
 //! while the wake ran (judge gap 12): the counts now come from the files the issuing advises
 //! anyway, and the wake itself opens and lists nothing to count pages.
@@ -46,12 +58,12 @@
 //! issuing does (a plan that was stopped reports `budget`, `cancelled` or `bounded`).
 use crate::{
     cache,
-    pg_control::{Lsn, parse_control_file},
+    pg_control::{ControlFile, Lsn, parse_control_file},
     sleep::is_segment,
 };
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -219,11 +231,14 @@ pub struct Report {
     /// Files that could not be opened when they were issued (gone, replaced by a link or a pipe,
     /// or below a directory that became a link).
     pub skipped: u64,
-    /// `posix_fadvise` calls made and the bytes they covered.
+    /// The pieces of at most `PIECE` the issuing looked at and the bytes they cover.
     pub pieces: u64,
     pub issued_bytes: u64,
-    /// Of the bytes advised, those that the page cache already held when the piece was issued;
-    /// `None` where the kernel cannot say (before Linux 6.5, or another system).
+    /// The pieces among them that the kernel was asked to read: a piece that the page cache holds
+    /// entirely is not (a pass over a resident set is `advised` 0 and reads nothing).
+    pub advised: u64,
+    /// Of the bytes looked at, those that the page cache already held; `None` where the kernel
+    /// cannot say (before Linux 6.5, or another system).
     pub resident_bytes: Option<u64>,
     /// Building the plan, and the issuing, in microseconds.
     pub plan_us: u64,
@@ -294,6 +309,40 @@ fn read_small(path: &Path, limit: u64) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() as u64 <= limit).then_some(bytes)
+}
+
+/// The WAL a start reads first, as `(segment, spans)` with the spans ascending and merged: a
+/// window of `WAL_WINDOW` at the block of the latest checkpoint record, and, where a crash left
+/// the redo point earlier, a window at the block of that. The redo point of a clean stop is the
+/// record's own; one that is 0 or lies after the record is none.
+fn wal_windows(file: &ControlFile, segment_bytes: u64) -> Vec<(String, Vec<(u64, u64)>)> {
+    let mut positions = vec![file.checkpoint];
+    if file.redo != 0 && file.redo < file.checkpoint {
+        positions.push(file.redo);
+    }
+    let mut windows: Vec<(String, Vec<(u64, u64)>)> = Vec::new();
+    for position in positions {
+        let name = Lsn(position).segment(file.control.timeline, segment_bytes);
+        let from = position % segment_bytes / BLOCK * BLOCK;
+        let span = (from, (from + WAL_WINDOW).min(segment_bytes));
+        match windows.iter_mut().find(|(known, _)| *known == name) {
+            Some((_, spans)) => spans.push(span),
+            None => windows.push((name, vec![span])),
+        }
+    }
+    for (_, spans) in &mut windows {
+        spans.sort_unstable();
+        // Windows that touch or overlap are one.
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for &(from, to) in spans.iter() {
+            match merged.last_mut() {
+                Some((_, end)) if from <= *end => *end = (*end).max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+        *spans = merged;
+    }
+    windows
 }
 
 /// The catalogs that PostgreSQL has moved to a file number of their own, from a database's
@@ -573,7 +622,8 @@ impl<'a> Builder<'a> {
         Added::Planned
     }
 
-    /// `pg_control` and the WAL at the latest checkpoint: what PostgreSQL reads first.
+    /// `pg_control` and the WAL at the latest checkpoint record and redo point: what PostgreSQL
+    /// reads first.
     fn control_and_wal(&mut self) {
         let global = self.directory("global");
         self.add(global, "pg_control", None);
@@ -603,19 +653,53 @@ impl<'a> Builder<'a> {
         let Some(segment_bytes) = segment_bytes else {
             return;
         };
-        let name = Lsn(control.checkpoint).segment(control.control.timeline, segment_bytes);
-        let from = control.checkpoint % segment_bytes / BLOCK * BLOCK;
-        self.add(
-            wal,
-            &name,
-            Some(&[(from, (from + WAL_WINDOW).min(segment_bytes))]),
-        );
+        for (name, spans) in wal_windows(&control, segment_bytes) {
+            self.add(wal, &name, Some(&spans));
+        }
     }
 
-    fn catalog(&mut self) {
+    /// The last segment of an SLRU directory (`pg_xact`, `pg_multixact/offsets`): the one that
+    /// holds the transaction or multixact the start continues from. The names are hexadecimal
+    /// and as long as each other, so the greatest is the last.
+    fn last_segment(&mut self, relative: &str) {
+        let directory = self.directory(relative);
+        let last = self
+            .names(directory)
+            .into_iter()
+            .filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_hexdigit()))
+            .max_by_key(|name| (name.len(), name.clone()));
+        if let Some(last) = last {
+            self.add(directory, &last, None);
+        }
+    }
+
+    /// What PostgreSQL reads between its exec and its ready (a strace of 18.6): the configuration,
+    /// `pg_control` and the WAL at the checkpoint, the SLRU segments, the statistics and the
+    /// replication origins the startup process restores, and `global/`.
+    fn start(&mut self) {
         self.control_and_wal();
         if self.stopped() {
             return;
+        }
+        let root = self.directory("");
+        for name in [
+            "postgresql.conf",
+            "postgresql.auto.conf",
+            "pg_hba.conf",
+            "pg_ident.conf",
+            "PG_VERSION",
+        ] {
+            self.add(root, name, None);
+        }
+        for slru in ["pg_xact", "pg_multixact/offsets", "pg_multixact/members"] {
+            self.last_segment(slru);
+        }
+        for (relative, name) in [
+            ("pg_stat", "pgstat.stat"),
+            ("pg_logical", "replorigin_checkpoint"),
+        ] {
+            let directory = self.directory(relative);
+            self.add(directory, name, None);
         }
         let global = self.directory("global");
         // `pg_control` is planned first. `pg_internal.init` is removed at every start of
@@ -625,6 +709,10 @@ impl<'a> Builder<'a> {
                 self.add(global, &name, None);
             }
         }
+    }
+
+    /// The catalogs of the user databases.
+    fn catalog(&mut self) {
         for oid in self.databases() {
             if self.stopped() {
                 break;
@@ -758,14 +846,58 @@ fn micros(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// The start set of the data directory `data`: nothing, for a directory that is not there or is
+/// a link. About 1 MB. The planning stops at `budget` and at `cancel`, as the issuing does, and
+/// the plan says so (`Report::stop`).
+pub fn start(data: &Path, budget: Duration, cancel: &AtomicBool) -> Plan {
+    let started = Instant::now();
+    let mut builder = Builder::new(data, started, budget, cancel);
+    if cache::is_directory(data) {
+        builder.start();
+    }
+    builder.finish(started)
+}
+
 /// The catalog set of the data directory `data`: nothing, for a directory that is not there or is
-/// a link. About 5 MB for a database with its own small schema. The planning stops at `budget`
-/// and at `cancel`, as the issuing does, and the plan says so (`Report::stop`).
+/// a link. About 5 MB for a database with its own small schema. The planning stops as that of
+/// `start` does.
 pub fn catalog(data: &Path, budget: Duration, cancel: &AtomicBool) -> Plan {
     let started = Instant::now();
     let mut builder = Builder::new(data, started, budget, cancel);
     if cache::is_directory(data) {
         builder.catalog();
+    }
+    builder.finish(started)
+}
+
+/// The files of `paths`, whole, by the file each path leads to (a link is followed once, here; a
+/// file that two paths lead to is planned once). A path that leads to no regular file is counted
+/// in `Report::missing`. The files are not the database user's, so the links of a data directory
+/// are not in question; the planning stops as that of `start` does.
+pub fn files(paths: &[PathBuf], budget: Duration, cancel: &AtomicBool) -> Plan {
+    let started = Instant::now();
+    let mut builder = Builder::new(Path::new("/"), started, budget, cancel);
+    let mut seen = HashSet::new();
+    for path in paths {
+        if builder.stopped() {
+            break;
+        }
+        let real = std::fs::canonicalize(path).ok();
+        let placed = real.as_deref().and_then(|real| {
+            let parent = real.parent()?.strip_prefix("/").ok()?.to_str()?;
+            Some((parent, real.file_name()?.to_str()?))
+        });
+        let Some((parent, name)) = placed else {
+            builder.missing += 1;
+            continue;
+        };
+        if !seen.insert(real.clone()) {
+            continue;
+        }
+        let directory = builder.directory(parent);
+        if builder.add(directory, name, None) == Added::Absent {
+            builder.missing += 1;
+        }
     }
     builder.finish(started)
 }
@@ -815,6 +947,7 @@ impl Plan {
             skipped: 0,
             pieces: 0,
             issued_bytes: 0,
+            advised: 0,
             resident_bytes: Some(0),
             plan_us: self.plan_us,
             issue_us: 0,
@@ -854,14 +987,19 @@ impl Plan {
                     }
                     let piece = (to - at).min(PIECE);
                     let held = kernel.resident(&file, at, piece);
-                    if kernel.advise(&file, at, piece).is_err() {
-                        report.stop = Stop::Failed;
-                        break 'targets;
+                    // A piece the cache holds entirely has nothing to read.
+                    let resident = held.is_some_and(|pages| pages >= piece.div_ceil(page));
+                    if !resident {
+                        if kernel.advise(&file, at, piece).is_err() {
+                            report.stop = Stop::Failed;
+                            break 'targets;
+                        }
+                        report.advised += 1;
                     }
                     report.resident_bytes = report
                         .resident_bytes
                         .zip(held)
-                        .map(|(sum, pages)| sum + pages * page);
+                        .map(|(sum, pages)| sum + (pages * page).min(piece));
                     report.pieces += 1;
                     report.issued_bytes += piece;
                     at += piece;
@@ -877,6 +1015,7 @@ impl Plan {
 mod tests {
     use super::*;
     use crate::{
+        pg_control::Control,
         postgres,
         settings::AGENT_ROLE,
         testpg::{self, Cluster},
@@ -896,6 +1035,9 @@ mod tests {
         cost: Duration,
         /// Pages of a piece that are in the cache already.
         held: Option<u64>,
+        /// Pieces that begin below this offset are in the cache entirely, and the others not at
+        /// all (the kernel can say); it takes the place of `held`.
+        warm_below: Option<u64>,
         /// The flag to raise after that many calls.
         cancel: Option<(usize, Arc<AtomicBool>)>,
     }
@@ -911,8 +1053,12 @@ mod tests {
             }
             Ok(())
         }
-        fn resident(&mut self, _file: &File, _offset: u64, _length: u64) -> Option<u64> {
-            self.held
+        fn resident(&mut self, _file: &File, offset: u64, length: u64) -> Option<u64> {
+            match self.warm_below {
+                Some(below) if offset < below => Some(length.div_ceil(cache::page_size())),
+                Some(_) => Some(0),
+                None => self.held,
+            }
         }
     }
     fn limits(budget: Duration) -> Limits {
@@ -927,6 +1073,15 @@ mod tests {
     /// The plans, with a budget that nothing in a test reaches.
     fn make_catalog(data: &Path) -> Plan {
         catalog(data, Duration::from_secs(600), &no_cancel())
+    }
+    fn make_start(data: &Path) -> Plan {
+        start(data, Duration::from_secs(600), &no_cancel())
+    }
+    /// What the start set and the catalog set name, in this order.
+    fn both(data: &Path) -> Vec<String> {
+        let mut all = names(&make_start(data));
+        all.extend(names(&make_catalog(data)));
+        all
     }
     fn make_list(data: &Path) -> Result<Plan, Unavailable> {
         list(data, Duration::from_secs(600), &no_cancel())
@@ -974,10 +1129,13 @@ mod tests {
         plan.targets
             .iter()
             .map(|t| {
-                (
-                    format!("{}/{}", plan.directories[t.directory].display(), t.name),
-                    t.spans.clone(),
-                )
+                let directory = plan.directories[t.directory].display().to_string();
+                let name = if directory.is_empty() {
+                    t.name.clone()
+                } else {
+                    format!("{directory}/{}", t.name)
+                };
+                (name, t.spans.clone())
             })
             .collect()
     }
@@ -1135,17 +1293,159 @@ mod tests {
         assert_eq!((plan.bytes, plan.missing), (16 * BLOCK, 1));
     }
 
+    /// The window of the WAL that a start reads: at the checkpoint record, and at the redo point
+    /// where a crash would replay from.
     #[test]
-    fn the_catalog_set_takes_control_wal_global_and_the_catalogs_of_user_databases_through_the_map()
-    {
-        let data = data("prefetch-catalog");
+    fn the_wal_a_start_reads_is_the_window_at_the_checkpoint_and_at_the_redo_point() {
+        let file = |checkpoint: u64, redo: u64| ControlFile {
+            control: Control {
+                state: 1,
+                system_identifier: "1".into(),
+                timeline: 1,
+            },
+            checkpoint,
+            redo,
+        };
+        let segment = 16 << 20;
+        let name = |number: u64| format!("00000001{:08X}{:08X}", number / 256, number % 256);
+        let window = WAL_WINDOW;
+        // A clean stop: the redo point is the record's own, and there is one window at its block.
+        assert_eq!(
+            wal_windows(&file(0x0300_5A40, 0x0300_5A40), segment),
+            [(name(3), vec![(0x4000, 0x4000 + window)])]
+        );
+        // A crash in the same segment: a window at each when they are far apart, in the order
+        // of the file, and one window when the second begins inside the first.
+        let far = wal_windows(&file(0x0320_0040, 0x0300_5A40), segment);
+        assert_eq!(
+            far,
+            [(
+                name(3),
+                vec![(0x4000, 0x4000 + window), (0x20_0000, 0x20_0000 + window)]
+            )]
+        );
+        let near = wal_windows(&file(0x0301_0040, 0x0300_5A40), segment);
+        assert_eq!(near, [(name(3), vec![(0x4000, 0x1_0000 + window)])]);
+        // A redo point in the segment before: the checkpoint's segment first, and the window at
+        // the end of the earlier one cut where the segment ends.
+        let before = wal_windows(&file(0x0300_5A40, 0x02FF_F040), segment);
+        assert_eq!(
+            before,
+            [
+                (name(3), vec![(0x4000, 0x4000 + window)]),
+                (name(2), vec![(0xFF_E000, segment)]),
+            ]
+        );
+        // A redo point that is none (0) or lies after the checkpoint is not used.
+        for redo in [0, 0x0300_5A41, 0x0900_0000] {
+            assert_eq!(
+                wal_windows(&file(0x0300_5A40, redo), segment),
+                [(name(3), vec![(0x4000, 0x4000 + window)])],
+                "redo {redo:x}"
+            );
+        }
+        // The timeline is the checkpoint's.
+        let mut later = file(0x0300_5A40, 0x0300_5A40);
+        later.control.timeline = 2;
+        assert_eq!(
+            wal_windows(&later, segment)[0].0,
+            "000000020000000000000003"
+        );
+    }
+
+    #[test]
+    fn the_start_set_takes_what_postgresql_reads_between_its_exec_and_its_ready() {
+        let data = data("prefetch-start");
         // A checkpoint at 0x0300_5A40 of timeline 1, 16 MiB segments: segment 3, offset 0x5A40.
         fs::write(data.join("global/pg_control"), control(0x0300_5A40)).unwrap();
         sparse(data.join("pg_wal/000000010000000000000003"), 16 << 20);
         sparse(data.join("pg_wal/000000010000000000000004"), 16 << 20);
+        for (name, length) in [
+            ("postgresql.conf", 2048),
+            ("postgresql.auto.conf", 88),
+            ("pg_hba.conf", 150),
+            ("pg_ident.conf", 120),
+            ("PG_VERSION", 3),
+            // Written by the start, never read.
+            ("postmaster.opts", 100),
+            ("postmaster.pid", 80),
+        ] {
+            sparse(data.join(name), length);
+        }
+        // The segment that holds the next transaction ID is the last one: 000A is after 0009.
+        for (dir, segments) in [
+            ("pg_xact", &["0000", "0009", "000A"][..]),
+            ("pg_multixact/offsets", &["0000"]),
+            ("pg_multixact/members", &["0000", "0001"]),
+        ] {
+            fs::create_dir_all(data.join(dir)).unwrap();
+            for segment in segments {
+                sparse(data.join(dir).join(segment), 256 << 10);
+            }
+        }
+        fs::create_dir_all(data.join("pg_stat")).unwrap();
+        sparse(data.join("pg_stat/pgstat.stat"), 40_000);
+        fs::create_dir_all(data.join("pg_logical")).unwrap();
+        sparse(data.join("pg_logical/replorigin_checkpoint"), 4);
         sparse(data.join("global/1260"), 8 * BLOCK);
         sparse(data.join("global/pg_filenode.map"), 524);
+        // Removed at every start of PostgreSQL, so a read of it is wasted.
         sparse(data.join("global/pg_internal.init"), 4096);
+        // The catalogs of a user database are the other set's.
+        sparse(data.join("base/16384/1259"), 3 * BLOCK);
+
+        let plan = make_start(&data);
+        assert_eq!(
+            planned(&plan),
+            [
+                ("global/pg_control".to_string(), vec![(0, 296)]),
+                (
+                    "pg_wal/000000010000000000000003".to_string(),
+                    vec![(0x4000, 0x4000 + (256 << 10))]
+                ),
+                ("postgresql.conf".to_string(), vec![(0, 2048)]),
+                ("postgresql.auto.conf".to_string(), vec![(0, 88)]),
+                ("pg_hba.conf".to_string(), vec![(0, 150)]),
+                ("pg_ident.conf".to_string(), vec![(0, 120)]),
+                ("PG_VERSION".to_string(), vec![(0, 3)]),
+                ("pg_xact/000A".to_string(), vec![(0, 256 << 10)]),
+                (
+                    "pg_multixact/offsets/0000".to_string(),
+                    vec![(0, 256 << 10)]
+                ),
+                (
+                    "pg_multixact/members/0001".to_string(),
+                    vec![(0, 256 << 10)]
+                ),
+                ("pg_stat/pgstat.stat".to_string(), vec![(0, 40_000)]),
+                ("pg_logical/replorigin_checkpoint".to_string(), vec![(0, 4)]),
+                ("global/1260".to_string(), vec![(0, 8 * BLOCK)]),
+                ("global/pg_filenode.map".to_string(), vec![(0, 524)]),
+            ]
+        );
+        assert_eq!(plan.missing, 0);
+        // What is not there (no list of statistics after a crash) is no gap to report.
+        let bare = self::data("prefetch-start-bare");
+        fs::write(bare.join("global/pg_control"), control(0x0100_0100)).unwrap();
+        assert_eq!(names(&make_start(&bare)), ["global/pg_control"]);
+        // A directory that is a link is not followed.
+        let outside = testpg::directory("prefetch-start-outside");
+        sparse(outside.join("0000"), 4096);
+        fs::remove_dir_all(data.join("pg_xact")).unwrap();
+        symlink(&outside, data.join("pg_xact")).unwrap();
+        assert!(
+            !names(&make_start(&data))
+                .iter()
+                .any(|name| name.starts_with("pg_xact"))
+        );
+        assert_eq!(make_start(&data.join("missing")).targets.len(), 0);
+    }
+
+    #[test]
+    fn the_catalog_set_takes_the_catalogs_of_user_databases_through_the_map() {
+        let data = data("prefetch-catalog");
+        fs::write(data.join("global/pg_control"), control(0x0300_5A40)).unwrap();
+        sparse(data.join("global/1260"), 8 * BLOCK);
         // pg_class (1259) moved to file number 17000 by a VACUUM FULL; pg_attribute (1249) is not.
         let mut map = vec![0u8; 524];
         map[0..4].copy_from_slice(&MAP_MAGIC.to_le_bytes());
@@ -1177,14 +1477,6 @@ mod tests {
         assert_eq!(
             planned(&plan),
             [
-                ("global/pg_control".to_string(), vec![(0, 296)]),
-                // The window starts at the block of the checkpoint record and is 256 KiB.
-                (
-                    "pg_wal/000000010000000000000003".to_string(),
-                    vec![(0x4000, 0x4000 + (256 << 10))]
-                ),
-                ("global/1260".to_string(), vec![(0, 8 * BLOCK)]),
-                ("global/pg_filenode.map".to_string(), vec![(0, 524)]),
                 ("base/16384/PG_VERSION".to_string(), vec![(0, 3 * BLOCK)]),
                 ("base/16384/pg_filenode.map".to_string(), vec![(0, 524)]),
                 // pg_class through the map; the indexes by their oid; forks that exist.
@@ -1297,6 +1589,107 @@ mod tests {
         assert_eq!((report.stop, report.resident_bytes), (Stop::Done, None));
     }
 
+    /// A pass over pages that the cache holds reads nothing: it counts them and advises no piece.
+    #[test]
+    fn a_piece_the_cache_holds_entirely_is_not_advised() {
+        let data = data("prefetch-resident");
+        sparse(data.join("base/16384/16500"), 10 << 20);
+        let all: Vec<_> = (0..1280).map(|b| (16384, 1663, 16500, 0, b)).collect();
+        dump(&data, &all);
+        let plan = make_list(&data).unwrap();
+        let minute = limits(Duration::from_secs(60));
+        let page = cache::page_size();
+
+        // Every piece resident: 80 pieces looked at, none advised.
+        let mut warm = Model {
+            warm_below: Some(u64::MAX),
+            ..Model::default()
+        };
+        let report = plan.issue_with(minute, &no_cancel(), &mut warm);
+        assert_eq!(
+            (
+                report.stop,
+                report.pieces,
+                report.advised,
+                report.issued_bytes
+            ),
+            (Stop::Done, 80, 0, 10 << 20)
+        );
+        assert_eq!(report.resident_bytes, Some(10 << 20));
+        assert!(warm.calls.is_empty());
+
+        // The first half resident: only the second half is advised, from where it begins.
+        let mut half = Model {
+            warm_below: Some(5 << 20),
+            ..Model::default()
+        };
+        let report = plan.issue_with(minute, &no_cancel(), &mut half);
+        assert_eq!((report.pieces, report.advised), (80, 40));
+        assert_eq!(half.calls.len(), 40);
+        assert_eq!(half.calls[0], (5 << 20, PIECE));
+        assert_eq!(report.resident_bytes, Some(5 << 20));
+
+        // A piece that is one page short of resident is advised, and so is one the kernel cannot
+        // count.
+        let mut short = Model {
+            held: Some(PIECE / page - 1),
+            ..Model::default()
+        };
+        assert_eq!(
+            plan.issue_with(minute, &no_cancel(), &mut short).advised,
+            80
+        );
+        let report = plan.issue_with(minute, &no_cancel(), &mut Model::default());
+        assert_eq!((report.advised, report.resident_bytes), (80, None));
+    }
+
+    /// The program of PostgreSQL is planned by the files themselves: a link leads to the file it
+    /// names, which is planned once.
+    #[test]
+    fn files_are_planned_whole_once_by_the_path_a_link_leads_to_and_the_gaps_are_counted() {
+        let dir = testpg::directory("prefetch-files").canonicalize().unwrap();
+        sparse(dir.join("libreal.so.1.2"), 5 * BLOCK);
+        symlink("libreal.so.1.2", dir.join("libreal.so.1")).unwrap();
+        sparse(dir.join("other"), BLOCK);
+        sparse(dir.join("empty"), 0);
+        fs::create_dir(dir.join("directory")).unwrap();
+        let paths = [
+            dir.join("libreal.so.1"),
+            dir.join("libreal.so.1.2"),
+            dir.join("other"),
+            dir.join("absent"),
+            dir.join("directory"),
+            dir.join("empty"),
+        ];
+        let plan = files(&paths, Duration::from_secs(60), &no_cancel());
+        let relative = dir.strip_prefix("/").unwrap().display().to_string();
+        assert_eq!(
+            planned(&plan),
+            [
+                (format!("{relative}/libreal.so.1.2"), vec![(0, 5 * BLOCK)]),
+                (format!("{relative}/other"), vec![(0, BLOCK)]),
+            ]
+        );
+        // The file that is not there and the directory are gaps; an empty file is not.
+        assert_eq!((plan.bytes, plan.missing), (6 * BLOCK, 2));
+        let report = plan.issue_with(
+            limits(Duration::from_secs(60)),
+            &no_cancel(),
+            &mut Model::default(),
+        );
+        assert_eq!(
+            (report.stop, report.files, report.pieces),
+            (Stop::Done, 2, 2)
+        );
+        // The same budget and cancel as the other plans.
+        let cancel = AtomicBool::new(true);
+        let stopped = files(&paths, Duration::from_secs(60), &cancel);
+        assert_eq!(
+            (stopped.targets.len(), stopped.cut),
+            (0, Some(Stop::Cancelled))
+        );
+    }
+
     /// The data directory is the database user's: a link in place of a directory or a file is not
     /// followed or opened, whether it is there when the plan is made or put there before the
     /// files are opened.
@@ -1318,7 +1711,7 @@ mod tests {
             sparse(outside.join("000000010000000000000001"), 16 << 20);
             fs::remove_dir_all(data.join(place)).unwrap();
             symlink(&outside, data.join(place)).unwrap();
-            assert_eq!(names(&make_catalog(&data)), expected, "{place}");
+            assert_eq!(both(&data), expected, "{place}");
         }
         let data = data("prefetch-link-database");
         let outside = testpg::directory("prefetch-outside");
@@ -1326,7 +1719,7 @@ mod tests {
         sparse(outside.join("16500"), 8192);
         fs::remove_dir_all(data.join("base/16384")).unwrap();
         symlink(&outside, data.join("base/16384")).unwrap();
-        assert_eq!(names(&make_catalog(&data)), Vec::<String>::new());
+        assert_eq!(both(&data), Vec::<String>::new());
         dump(&data, &[(16384, 1663, 16500, 0, 0)]);
         let plan = make_list(&data).unwrap();
         // A line for a database that is a link is dropped: that database is not planned.
@@ -1339,7 +1732,7 @@ mod tests {
         symlink(&real, &linked).unwrap();
         assert_eq!(names(&make_list(&real).unwrap()), ["base/16384/16500"]);
         assert_eq!(make_list(&linked).err(), Some(Unavailable::Missing));
-        assert_eq!(names(&make_catalog(&linked)), Vec::<String>::new());
+        assert_eq!(both(&linked), Vec::<String>::new());
         let other = testpg::directory("prefetch-other").join("list");
         fs::copy(real.join("autoprewarm.blocks"), &other).unwrap();
         fs::remove_file(real.join("autoprewarm.blocks")).unwrap();
@@ -1487,9 +1880,10 @@ mod tests {
         let plan = make_list(&data).unwrap();
         assert_eq!((plan.targets.len(), plan.cut), (2, None));
         assert_eq!(issued(&plan).stop, Stop::Done);
-        // A budget of nothing plans nothing, in the list and in the catalog set.
+        // A budget of nothing plans nothing, in the list and in the start and catalog sets.
         for plan in [
             list(&data, Duration::ZERO, &no_cancel()).unwrap(),
+            start(&data, Duration::ZERO, &no_cancel()),
             catalog(&data, Duration::ZERO, &no_cancel()),
         ] {
             assert_eq!((plan.targets.len(), plan.cut), (0, Some(Stop::Budget)));
@@ -1503,6 +1897,7 @@ mod tests {
         let cancel = AtomicBool::new(true);
         for plan in [
             list(&data, minute, &cancel).unwrap(),
+            start(&data, minute, &cancel),
             catalog(&data, minute, &cancel),
         ] {
             assert_eq!((plan.targets.len(), plan.cut), (0, Some(Stop::Cancelled)));
@@ -1668,9 +2063,6 @@ mod tests {
             }
         }
         assert!(with_content > CATALOGS.len() / 2, "{with_content}");
-        for name in ["pg_control", "pg_filenode.map"] {
-            assert!(planned.contains(&format!("global/{name}")), "{name}");
-        }
         for name in ["PG_VERSION", "pg_filenode.map"] {
             assert!(planned.contains(&format!("{prefix}/{name}")), "{name}");
         }
@@ -1690,30 +2082,61 @@ mod tests {
                 .all(|name| !name.starts_with("base/1/") && !name.starts_with("base/5/"))
         );
 
-        // The WAL window is at the checkpoint that `pg_controldata` reports.
-        let output =
-            std::process::Command::new(real.cluster.layout.postgres_bin.join("pg_controldata"))
-                .arg(&data)
-                .output()
-                .unwrap();
-        let text = String::from_utf8_lossy(&output.stdout).to_string();
-        let value = |key: &str| {
-            text.lines()
-                .find_map(|line| line.strip_prefix(key))
-                .unwrap()
-                .trim()
-                .to_string()
-        };
-        let checkpoint = Lsn::parse(&value("Latest checkpoint location:").to_uppercase()).unwrap();
-        let timeline: u32 = value("Latest checkpoint's TimeLineID:").parse().unwrap();
+        // The start set holds what PostgreSQL opens before it is ready, whichever of these the
+        // clean stop left in the data directory, and the WAL window is at the checkpoint (and the
+        // redo point) that `pg_controldata` reports.
+        let start_plan = make_start(&data);
+        let started = names(&start_plan);
+        for name in [
+            "global/pg_control",
+            "global/pg_filenode.map",
+            "postgresql.conf",
+            "postgresql.auto.conf",
+            "pg_hba.conf",
+            "pg_ident.conf",
+            "PG_VERSION",
+            "pg_xact/0000",
+            "pg_multixact/offsets/0000",
+            "pg_multixact/members/0000",
+            "pg_logical/replorigin_checkpoint",
+        ] {
+            assert!(
+                data.join(name).exists(),
+                "{name} is not in the data directory"
+            );
+            assert!(
+                started.contains(&name.to_string()),
+                "{name} is not planned: {started:?}"
+            );
+        }
+        assert!(
+            !started
+                .iter()
+                .any(|name| name.ends_with("pg_internal.init")),
+            "{started:?}"
+        );
+        assert!(
+            (64 << 10..4 << 20).contains(&start_plan.bytes),
+            "{} bytes",
+            start_plan.bytes
+        );
+        let control = controldata(&real.cluster);
+        let checkpoint = control.checkpoint;
+        assert_eq!(
+            control.redo, control.checkpoint,
+            "a clean stop has no earlier redo point"
+        );
         let segment_bytes = fs::metadata(
             data.join("pg_wal")
-                .join(checkpoint.segment(timeline, 16 << 20)),
+                .join(checkpoint.segment(control.timeline, 16 << 20)),
         )
         .unwrap()
         .len();
-        let wal = format!("pg_wal/{}", checkpoint.segment(timeline, segment_bytes));
-        let window = planned_spans(&plan, &wal);
+        let wal = format!(
+            "pg_wal/{}",
+            checkpoint.segment(control.timeline, segment_bytes)
+        );
+        let window = planned_spans(&start_plan, &wal);
         let from = checkpoint.0 % segment_bytes / BLOCK * BLOCK;
         assert_eq!(window, [(from, (from + WAL_WINDOW).min(segment_bytes))]);
 
@@ -1727,9 +2150,316 @@ mod tests {
         assert_eq!(plan.missing, real.rewritten.len() as u64);
         #[cfg(target_os = "linux")]
         {
-            let report = plan.issue(limits(Duration::from_secs(10)), &no_cancel());
-            assert_eq!((report.stop, report.skipped), (Stop::Done, 0), "{report:?}");
-            assert_eq!(report.issued_bytes, plan.bytes);
+            for plan in [&plan, &start_plan] {
+                let report = plan.issue(limits(Duration::from_secs(10)), &no_cancel());
+                assert_eq!((report.stop, report.skipped), (Stop::Done, 0), "{report:?}");
+                assert_eq!(report.issued_bytes, plan.bytes);
+            }
+        }
+    }
+
+    /// The files of the directories `dirs` that are read (`read(2)`, `pread(2)`) while `during`
+    /// runs, as inotify reports them: `IN_ACCESS` on a directory names the file read below it.
+    /// Relative to `base`.
+    #[cfg(target_os = "linux")]
+    fn read_while(base: &Path, dirs: &[PathBuf], during: impl FnOnce()) -> Vec<String> {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        // SAFETY: plain calls with valid arguments; the descriptor is closed below.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "inotify_init1: {}", io::Error::last_os_error());
+        let mut watched = HashMap::new();
+        for dir in dirs.iter().filter(|dir| dir.is_dir()) {
+            let path = CString::new(dir.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `path` is a NUL-terminated string that lives through the call.
+            let wd = unsafe { libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_ACCESS) };
+            assert!(wd >= 0, "inotify_add_watch: {}", io::Error::last_os_error());
+            watched.insert(wd, dir.clone());
+        }
+        during();
+        let mut read = Vec::new();
+        let mut buffer = vec![0u8; 1 << 16];
+        loop {
+            // SAFETY: the buffer is writable for its length.
+            let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if n <= 0 {
+                break;
+            }
+            let mut at = 0;
+            while at < n as usize {
+                let word = |from: usize| {
+                    u32::from_ne_bytes(buffer[at + from..at + from + 4].try_into().unwrap())
+                };
+                let wd = word(0) as i32;
+                let length = word(12) as usize;
+                let name = &buffer[at + 16..at + 16 + length];
+                let name = String::from_utf8_lossy(
+                    &name[..name.iter().position(|b| *b == 0).unwrap_or(length)],
+                );
+                if let Some(dir) = watched.get(&wd) {
+                    let path = dir.join(name.as_ref());
+                    read.push(path.strip_prefix(base).unwrap().display().to_string());
+                }
+                at += 16 + length;
+            }
+        }
+        // SAFETY: closing the descriptor opened above.
+        unsafe { libc::close(fd) };
+        read.sort();
+        read.dedup();
+        read
+    }
+
+    /// The start set names the files a real postmaster reads between its exec and its ready.
+    /// inotify reports every read of the directories PostgreSQL's start uses; each file read there
+    /// is in the start set, except the few that are not data (the lock file, which the start
+    /// reads to check for a postmaster, and the hot list, which is the other set's).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_start_set_names_every_file_a_real_postmaster_reads_before_ready() {
+        let Some(real) = real("prefetch-real-start").await else {
+            return;
+        };
+        let (cluster, data) = (&real.cluster, real.cluster.data());
+        let directories: Vec<PathBuf> = [
+            "",
+            "global",
+            "pg_wal",
+            "pg_xact",
+            "pg_multixact/offsets",
+            "pg_multixact/members",
+            "pg_stat",
+            "pg_logical",
+            "pg_commit_ts",
+            "pg_subtrans",
+            "pg_serial",
+            "pg_twophase",
+        ]
+        .iter()
+        .map(|dir| data.join(dir))
+        .collect();
+        let planned = names(&make_start(&data));
+        // A directory listed is no file to read ahead (`base`, `pg_notify`, `pg_tblspc`).
+        let read: Vec<String> = read_while(&data, &directories, || cluster.start())
+            .into_iter()
+            .filter(|name| !data.join(name).is_dir())
+            .collect();
+        // The lock file, which the start reads to check for another postmaster, and the hot list,
+        // which the autoprewarm worker reads once the database is ready and is the other set's.
+        let allowed = ["postmaster.pid", "autoprewarm.blocks"];
+        for name in &read {
+            assert!(
+                planned.contains(name) || allowed.contains(&name.as_str()),
+                "{name} is read by the start and is not in the start set: {planned:?}"
+            );
+        }
+        assert!(read.len() >= 5, "{read:?}");
+    }
+
+    /// Tells the kernel to drop the pages of every file below `directory` (`POSIX_FADV_DONTNEED`,
+    /// as the prefetch lab did before each cold request) and returns the pages the cache held
+    /// before and after, or `None` where the kernel cannot count. Dirty pages are written first,
+    /// since a dirty page is not dropped.
+    #[cfg(target_os = "linux")]
+    fn drop_cache(directory: &Path) -> Option<(u64, u64)> {
+        use std::os::fd::AsRawFd;
+        fn files(directory: &Path, found: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => files(&entry.path(), found),
+                    Ok(kind) if kind.is_file() => found.push(entry.path()),
+                    _ => {}
+                }
+            }
+        }
+        let mut all = Vec::new();
+        files(directory, &mut all);
+        // SAFETY: a plain call without arguments to memory.
+        unsafe { libc::sync() };
+        let (mut before, mut after) = (0u64, 0u64);
+        for path in &all {
+            let Ok(file) = File::open(path) else { continue };
+            before += cache::cachestat_range(&file, 0, 0).ok()?;
+            // SAFETY: advice for an open descriptor; length 0 is to the end of the file.
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            after += cache::cachestat_range(&file, 0, 0).ok()?;
+        }
+        Some((before, after))
+    }
+
+    /// A start that reads the start set and the catalogs ahead reaches ready no later than a start
+    /// that does not, at the median of 20 starts of each, every start on a data directory whose
+    /// pages the kernel was told to drop first, the two arms interleaved (the order swapping each
+    /// round). The reading is what the agent's hook does, in a thread of its own that starts with
+    /// the postmaster and that nothing waits for: the worst case of the agent's overlap, whose
+    /// bind (13 ms at p50 on EU1) gives the reading a head start. The disk of this test is the test
+    /// machine's, and the live pass on EU1's disk is the real test (plan 11.2): this one shows that
+    /// the reading costs a start nothing on a disk where the pages are really gone, and it says
+    /// where the file system cannot drop them (tmpfs, overlayfs).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_start_with_the_sets_read_ahead_is_ready_no_later_at_the_median() {
+        let Some(real) = real("prefetch-ab").await else {
+            return;
+        };
+        let (cluster, data) = (&real.cluster, real.cluster.data());
+        // The stopped cluster's pages are in the cache, and the kernel drops them: a file system
+        // that reports none or keeps what it is told to drop shows nothing of a disk.
+        let held = match drop_cache(&data) {
+            Some((before, after)) if before > 0 && after * 2 < before => before,
+            other => {
+                eprintln!(
+                    "skipped: this file system does not drop the pages it is told to drop ({other:?})"
+                );
+                return;
+            }
+        };
+        let never = no_cancel();
+        let budget = Duration::from_millis(50);
+        let (mut without, mut with) = (Vec::new(), Vec::new());
+        let mut reads = 0;
+        for round in 0..20 {
+            // One of each, the order swapping from round to round.
+            let arms = if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            };
+            for read_ahead in arms {
+                // Whatever the last start read is dropped again: little is held afterwards.
+                assert!(drop_cache(&data).is_some_and(|(_, after)| after * 2 < held));
+                let started = std::thread::scope(|scope| {
+                    let reading = read_ahead.then(|| {
+                        scope.spawn(|| {
+                            let mut advised = 0;
+                            for plan in
+                                [start(&data, budget, &never), catalog(&data, budget, &never)]
+                            {
+                                let limits = Limits {
+                                    budget,
+                                    max_bytes: 12 << 20,
+                                };
+                                advised += plan.issue(limits, &never).advised;
+                            }
+                            advised
+                        })
+                    });
+                    let started = cluster.start_timed();
+                    reads += reading.map_or(0, |reading| reading.join().unwrap());
+                    started
+                });
+                if read_ahead { &mut with } else { &mut without }.push(started);
+                cluster.stop();
+            }
+        }
+        let median = |times: &mut Vec<Duration>| {
+            times.sort();
+            (times[times.len() / 2], times[times.len() * 19 / 20])
+        };
+        let (a, b) = (median(&mut without), median(&mut with));
+        eprintln!(
+            "start to ready, 20 starts of each, pages dropped before each: without {:.1} / {:.1} ms, \
+             with the start set and the catalogs read ahead {:.1} / {:.1} ms (p50 / p95), {reads} pieces advised",
+            a.0.as_secs_f64() * 1e3,
+            a.1.as_secs_f64() * 1e3,
+            b.0.as_secs_f64() * 1e3,
+            b.1.as_secs_f64() * 1e3,
+        );
+        assert!(reads > 20 * 40, "the reading did not read: {reads} pieces");
+        // The acceptance of the live pass: the median grows by at most 10 ms.
+        assert!(
+            b.0 <= a.0 + Duration::from_millis(10),
+            "with {:?}, without {:?}",
+            b.0,
+            a.0
+        );
+    }
+
+    /// What `pg_controldata` says of a stopped cluster's latest checkpoint.
+    struct Controldata {
+        checkpoint: Lsn,
+        redo: Lsn,
+        timeline: u32,
+    }
+    fn controldata(cluster: &Cluster) -> Controldata {
+        let output = std::process::Command::new(cluster.layout.postgres_bin.join("pg_controldata"))
+            .arg(cluster.data())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        let value = |key: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let lsn = |key: &str| Lsn::parse(&value(key).to_uppercase()).unwrap();
+        Controldata {
+            checkpoint: lsn("Latest checkpoint location:"),
+            redo: lsn("Latest checkpoint's REDO location:"),
+            timeline: value("Latest checkpoint's TimeLineID:").parse().unwrap(),
+        }
+    }
+
+    /// A cluster that crashed after an online checkpoint replays from the redo point, which is
+    /// before the checkpoint record: the control file and `pg_controldata` say the same, and the
+    /// windows cover both positions. How far the redo point lies before the record depends on the
+    /// WAL written while the checkpoint ran, which a test cannot choose; the windows of positions
+    /// that are far apart are the pure test's.
+    #[tokio::test]
+    async fn the_wal_a_crashed_cluster_replays_from_is_named_by_pg_controldata() {
+        let Some(cluster) = Cluster::create("prefetch-crash") else {
+            return;
+        };
+        cluster.start();
+        let agent = cluster.agent().await;
+        agent
+            .batch("CREATE TABLE t AS SELECT g FROM generate_series(1, 20000) g")
+            .await
+            .unwrap();
+        agent.batch_long("CHECKPOINT").await.unwrap();
+        agent
+            .batch("INSERT INTO t SELECT g FROM generate_series(1, 20000) g")
+            .await
+            .unwrap();
+        drop(agent);
+        cluster.kill();
+        let control = controldata(&cluster);
+        assert!(
+            control.redo < control.checkpoint,
+            "an online checkpoint's redo precedes its record"
+        );
+        let file = parse_control_file(&fs::read(cluster.data().join("global/pg_control")).unwrap())
+            .unwrap();
+        assert_eq!(
+            (file.checkpoint, file.redo),
+            (control.checkpoint.0, control.redo.0)
+        );
+        assert_eq!(file.control.timeline, control.timeline);
+        let wal = cluster.data().join("pg_wal");
+        let segment_bytes =
+            fs::metadata(wal.join(control.checkpoint.segment(control.timeline, 16 << 20)))
+                .unwrap()
+                .len();
+        let windows = wal_windows(&file, segment_bytes);
+        for position in [control.checkpoint, control.redo] {
+            let name = position.segment(control.timeline, segment_bytes);
+            let from = position.0 % segment_bytes / BLOCK * BLOCK;
+            assert!(
+                windows.iter().any(|(known, spans)| *known == name
+                    && spans
+                        .iter()
+                        .any(|(start, end)| *start <= from && from < *end)),
+                "{position} is in no window: {windows:?}"
+            );
+        }
+        // The plan reads them, as it does a start that is no crash.
+        let planned = names(&make_start(&cluster.data()));
+        for (name, _) in &windows {
+            assert!(
+                planned.contains(&format!("pg_wal/{name}")),
+                "{name}: {planned:?}"
+            );
         }
     }
 

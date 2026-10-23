@@ -279,7 +279,8 @@ Everything in `mkosi.extra` is one or the other, and the build stops at a file t
    agent's own binary changed, the agent that runs after its restart writes them. It holds the
    signed list to its own rules just before it writes (a list its rules do not allow is refused for
    its files only, the binaries are installed all the same), runs `systemd-sysusers` and
-   `systemd-tmpfiles --create` on the files that say so (`sysusers`, `tmpfiles`), reads systemd's
+   `systemd-tmpfiles --create --remove` on the files that say so (`sysusers`, `tmpfiles`; `--create`
+   alone ignores the `r` lines that remove), reads systemd's
    units again once, and then restarts what changed (the gateway, cloudflared, ssh, journald,
    systemd-sysctl; the agent's own last). The agent's own unit is first written to
    `/run/systemd/system`, which systemd reads before `/usr/lib/systemd/system` and which a boot
@@ -466,7 +467,16 @@ package from creating a default cluster.
   `SplitMode=none` and removes the files at the source: journald makes no new per-uid file (lab,
   systemd 257.13: without the file `user-301000.journal` appears with the first line a slot logs,
   readable by uid 301000 and not by an unrelated uid; with it the line is in the system journal). The files
-  made before stay until journald vacuums them by age, and the unit does not see them. The boot test
+  made before stay until journald vacuums them by age (the vacuum removes archived files only, and these
+  were still active files: 376 of them took the whole 1 GiB budget of the system journal on EU1
+  until the operator rotated and vacuumed by size, and the system journal of the boot before a
+  reset ended 22.5 hours early), and the unit does not see them.
+  [pgcf-journal.conf](mkosi.extra/usr/lib/tmpfiles.d/pgcf-journal.conf) removes them by name, in the
+  persistent and the volatile journal (`r /var/log/journal/*/user-*.journal`, the `~` and the
+  `/run/log/journal` forms; `system.journal` and `system@*.journal` match none), when a release that
+  carries it is applied (`systemd-tmpfiles --create --remove`) and at every boot, and the boot test
+  makes a legacy file and an archived one, requires `--create` alone to leave them and `--remove`
+  to take them, and the system journal to stay. The boot test
   makes a user of its own with the last uid of the agent's database range (299,999; the scratch
   database's user is a system account, which journald never splits), has it log a line, requires the
   line in a `system.journal` file and no `user-*.journal` file in either directory, removes the user,
@@ -690,8 +700,17 @@ after it has unmounted, the configuration it writes, `pg_control` and `postmaste
 before inside the namespace; the database units and the backup jobs mount their volumes themselves
 (`MountImages=`).
 
-- The namespace ends with the agent. An agent restart (a release, a crash) ends every mount it made
-  and drops every device link. The agent mounts a database's volume when it decides on the
+- The namespace is held by `pgcf-mounts.service`, not by the agent (found live, 2026-10-23: the
+  agent's `kill -9` took 14 s to end the process with 312 volumes mounted, because the kernel
+  unmounts a dying process's namespace volume by volume). The agent starts that transient unit
+  (`systemd-run`, `PrivateMounts=yes`, `Type=notify`, running `pgcf-agent hold`) when the node has
+  none and joins its namespace with `setns(2)` before it starts a thread, so this unit file's
+  `PrivateMounts=yes` is the namespace of an agent that could not join. An agent restart (a
+  release, a crash, a kill) leaves every mount where it was (lab: the kill ends the process in
+  11 ms, the next agent joins in 12 ms), keeps the page cache of the sleeping databases and drops
+  every device link, which the agent makes again for a volume it finds attached. Where the agent
+  could not join (`mount_holder_unavailable`), the namespace ends with the agent as before: its
+  restart ends every mount it made. The agent mounts a database's volume when it decides on the
   database (`Core::reconcile`), after it has read the database's unit and its volume: the
   databases that run first, then the others, 16 at a time, each mount waiting for the disk beside
   the others. It serves the gateway as soon as it has decided on the databases that run (they
@@ -701,11 +720,11 @@ before inside the namespace; the database units and the backup jobs mount their 
   `activating`) stays counted by admission, with its memory, until the decision on its database ends
   it: the unit's answer is read from its `postmaster.pid` through the agent's mount, so it is not
   read, and not taken for a failure, before the mount is made. The databases that run are not touched: a unit has its own mount,
-  which does not depend on the agent's. A restart also ends the page cache of the volumes of
-  sleeping databases (their last mount is gone), so the first wake after it reads from disk: the
-  plan measured about 300 ms more on a cold first request.
-- The agent's exit unmounts its volumes 16 at a time (`Storage::unmount_all`) before the process
-  ends. A process that exits leaves its mount namespace, and the kernel unmounts what the
+  which does not depend on the agent's. A restart that did not join the holder's namespace also
+  ends the page cache of the volumes of sleeping databases (their last mount is gone), so the
+  first wake after it reads from disk: the plan measured about 300 ms more on a cold first request.
+- The exit of an agent that did not join the holder's namespace unmounts its volumes 16 at a time
+  (`Storage::unmount_all`) before the process ends; the holder does the same when it is stopped. A process that exits leaves its mount namespace, and the kernel unmounts what the
   namespace holds one after the other, each as slow as the disk's flushes; the process is not gone
   until it has, and systemd starts the next agent after it (EU1: 14 s to stop with 301 volumes).
   A mount that is busy stays for the kernel.
@@ -713,11 +732,14 @@ before inside the namespace; the database units and the backup jobs mount their 
   to EU1's mount time: 300 volumes, stop and start to the first served wake 76 s before the change
   and 6 s after it. On EU1 (167 volumes) it is measured in the plan (11.1, the rollout of
   `2f9901b3`); the events `agent_start_phase` of one restart (`process_start`, `storage_open`,
-  `device_links`, `restore_runtime`, `link_started`, `first_page`, `units_read`, `credentials`
-  (the archive credentials of the databases and the node's own, read at the same time), `apply`,
-  `settled`, `gateway_table`, `service_started`, with `link_hello` and `first_wake_served` beside
-  them, and `reconcile_first_pass` with the number and the summed time of the runs of `lvs`, the
-  mounts and the unit reads) say where its time went.
+  `device_links`, `restore_runtime`, `linked` (how long the link and the first page outlasted the
+  storage: both are asked for while it opens), `slots_adopted`, `units_read`, `apply`, `settled`,
+  `gateway_table`, `service_started`, with `link_started`, `link_hello`, `first_page`, `credentials`
+  (the archive credentials of the databases and the node's own, read at the same time after the
+  first page is applied) and `first_wake_served` beside them, read by `at_ms`, and
+  `reconcile_first_pass` with the number and the summed time of the runs of `lvs`, the mounts and
+  the unit reads) say where its time went. systemd starts the agent 100 ms after it ended
+  (`RestartSec=100ms`), and a start that failed waits five seconds in the agent first.
 - What the agent decides never rests on its own mount table alone, because a unit or a job mounts
   the volume in a namespace of its own, and the agent's own mounts end with its restart: whether a
   unit may start is the link (`attached`); which generation a running unit serves is its own
@@ -857,8 +879,8 @@ token or the route keyring changed.
   a target alone and removes a path that an earlier list named and this one drops, whether the
   agent wrote it or the image brought it (it keeps `agent/host-files.json` with the paths it owns
   and what is left to tell systemd, saved before the first write, and restarts the unit that a
-  dropped file applied to). Then the runs of `systemd-sysusers` and `systemd-tmpfiles --create` on
-  the files that say so, then one `daemon-reload`, then the restarts in name order, the
+  dropped file applied to). Then the runs of `systemd-sysusers` and `systemd-tmpfiles --create
+  --remove` on the files that say so, then one `daemon-reload`, then the restarts in name order, the
   agent's own last, each taken out of the record when done; a restart that fails does not keep the
   others from theirs, and what failed is tried again after a growing wait. A reload and restarts
   that a boot has made moot are dropped with the boot id. The agent's own unit is written to

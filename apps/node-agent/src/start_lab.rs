@@ -180,50 +180,88 @@ fn control_of(lab: &Lab, n: usize) -> Vec<u8> {
 struct Agent {
     service: Arc<Service<Node>>,
     gateway: FakeGateway,
-    _cloud: Cloud,
-    _base: crate::link::test_server::TempDir,
+    _cloudflare: Arc<Cloudflare>,
     began: Instant,
 }
 
-/// Starts the agent as `main` does, up to the link, and then the service; the gateway connects as
-/// soon as the socket is there. Returns when the service has started.
-async fn start_agent(lab: &Lab, node: &Arc<Node>, began: Instant) -> Agent {
-    let credential_delay = Duration::from_millis(number("PGCF_LAB_CREDENTIAL_MS", 0) as u64);
-    let cloud = Cloud::start().await;
-    cloud.with(|inner| {
-        inner.databases = (0..lab.volumes).map(entry_json).collect();
-        for n in 0..lab.volumes {
-            let db = entry_json(n);
-            inner.credential_paths.insert(
-                format!("crd_{n:020}"),
-                db["archive"]["path"].as_str().unwrap().to_string(),
-            );
-        }
-        inner.credential_delay = credential_delay;
-        // The release is not this test's: the page names none.
-        inner.release = Some(Value::Null);
-    });
-    let base = tempdir();
-    cloud.seed(&base);
+/// The double of Cloudflare: the lab's databases on its page and the times it takes to answer.
+struct Cloudflare {
+    cloud: Cloud,
+    base: crate::link::test_server::TempDir,
+}
+impl Cloudflare {
+    async fn start(lab: &Lab) -> Self {
+        let credential_delay = Duration::from_millis(number("PGCF_LAB_CREDENTIAL_MS", 0) as u64);
+        let cloud = Cloud::start().await;
+        cloud.with(|inner| {
+            inner.databases = (0..lab.volumes).map(entry_json).collect();
+            for n in 0..lab.volumes {
+                let db = entry_json(n);
+                inner.credential_paths.insert(
+                    format!("crd_{n:020}"),
+                    db["archive"]["path"].as_str().unwrap().to_string(),
+                );
+            }
+            inner.credential_delay = credential_delay;
+            inner.node_credentials_delay =
+                Duration::from_millis(number("PGCF_LAB_NODE_CREDENTIALS_MS", 0) as u64);
+            inner.page_delay = Duration::from_millis(number("PGCF_LAB_PAGE_MS", 0) as u64);
+            // The release is not this test's: the page names none.
+            inner.release = Some(Value::Null);
+        });
+        let base = tempdir();
+        cloud.seed(&base);
+        Self { cloud, base }
+    }
+}
+
+/// The link and the first page, as `main` asks for them: while the storage opens.
+async fn linked(
+    node: Arc<Node>,
+    cloudflare: Arc<Cloudflare>,
+) -> (
+    crate::link::Link,
+    crate::link::LinkEvents,
+    crate::link::Desired,
+) {
     let (link, events) = crate::link::Link::start(
         LinkConfig {
-            paths: Paths::new(&base),
+            paths: Paths::new(&cloudflare.base),
             image_version: "25".into(),
             agent_version: "0.1.0".into(),
             release_id: None,
-            os: os_report(&**node).await.unwrap(),
+            os: os_report(&*node).await.unwrap(),
             timing: LinkTiming::default(),
         },
-        Transport::new(cloud.roots()).unwrap(),
+        Transport::new(cloudflare.cloud.roots()).unwrap(),
     )
     .await
     .unwrap();
-    timing::phase("link_started");
+    timing::phase_once("link_started");
+    let page = Service::<Node>::first_page(&link).await;
+    (link, events, page)
+}
+
+/// Starts the service on a link and its first page, and the gateway that connects as soon as the
+/// socket is there. Returns when the service has started.
+async fn start_service(
+    lab: &Lab,
+    node: &Arc<Node>,
+    cloudflare: Arc<Cloudflare>,
+    linked: (
+        crate::link::Link,
+        crate::link::LinkEvents,
+        crate::link::Desired,
+    ),
+    began: Instant,
+) -> Agent {
+    let (link, events, page) = linked;
     std::fs::create_dir_all(lab.layout.agent_run()).unwrap();
-    let starting = tokio::spawn(Service::start(
+    let starting = tokio::spawn(Service::start_with_page(
         node.clone(),
         link,
         events,
+        page,
         ServiceConfig {
             intervals: Intervals::default(),
             timing: Timing::default(),
@@ -237,10 +275,18 @@ async fn start_agent(lab: &Lab, node: &Arc<Node>, began: Instant) -> Agent {
     Agent {
         service,
         gateway,
-        _cloud: cloud,
-        _base: base,
+        _cloudflare: cloudflare,
         began,
     }
+}
+
+/// Starts the agent as `main` does, up to the link, and then the service. The link and the first
+/// page are asked for before the storage opens in `main`; here they follow it (`prepare` makes the
+/// node and is not timed).
+async fn start_agent(lab: &Lab, node: &Arc<Node>, began: Instant) -> Agent {
+    let cloudflare = Arc::new(Cloudflare::start(lab).await);
+    let linked = linked(node.clone(), cloudflare.clone()).await;
+    start_service(lab, node, cloudflare, linked, began).await
 }
 
 impl Agent {
@@ -260,7 +306,9 @@ impl Agent {
             queued_at_ms: u64::try_from(crate::agent::now_ms()).unwrap(),
         };
         // The gateway delivers a wake again after 3 s while the agent answers `wake_in_progress`,
-        // which is no result.
+        // which is no result. A database the last agent left without a clean stop is proven again
+        // by the agent's recovery, which takes a moment.
+        let mut unproven = 0;
         loop {
             let seen = self.gateway.received().len();
             self.gateway.send_wake(ticket.clone()).await;
@@ -283,6 +331,13 @@ impl Agent {
                     Some(result) if result.reason.as_deref() == Some("wake_in_progress") => {
                         tokio::time::sleep(Duration::from_secs(3).saturating_sub(asked.elapsed()))
                             .await;
+                        break;
+                    }
+                    Some(result)
+                        if result.reason.as_deref() == Some("unproven") && unproven < 120 =>
+                    {
+                        unproven += 1;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                         break;
                     }
                     Some(result) => {
@@ -368,22 +423,34 @@ async fn start() {
     };
     let began = Instant::now();
     timing::phase("process_start");
+    // As `main` has it: Cloudflare is asked while the storage opens.
+    let cloudflare = Arc::new(Cloudflare::start(&lab).await);
     let node = Arc::new(
-        Node::connect(lab.layout.clone(), lab.config.clone(), slots::POOL)
+        Node::connect_unopened(lab.layout.clone(), lab.config.clone(), slots::POOL)
             .await
             .unwrap(),
     );
+    let linking = tokio::spawn(linked(node.clone(), cloudflare.clone()));
+    node.open_storage().await.unwrap();
     timing::phase("storage_open");
     node.reset_device_links().await.unwrap();
     timing::phase("device_links");
     restore_runtime(&*node).await;
     timing::phase("restore_runtime");
-    let mut agent = start_agent(&lab, &node, began).await;
+    let linked = linking.await.unwrap();
+    timing::phase("linked");
+    let mut agent = start_service(&lab, &node, cloudflare, linked, began).await;
     let started = agent.since();
     // The gateway asks for a sleeping database with a PostgreSQL; it is served while the agent
     // decides on the rest.
     let probe = lab.awake + number("PGCF_LAB_PROBE", 0) % lab.asleep;
     let woken = agent.wake(probe).await;
+    // `PGCF_LAB_WAKE_MORE`: more databases run when the agent is killed.
+    for more in 1..=number("PGCF_LAB_WAKE_MORE", 0) {
+        agent
+            .wake(lab.awake + (probe - lab.awake + more) % lab.asleep)
+            .await;
+    }
     let table = agent
         .gateway
         .received()
@@ -422,18 +489,27 @@ async fn start() {
             eprintln!("lab: phase {event}");
         }
     }
+    // `PGCF_LAB_KILL`: the agent is killed here (`kill -9`) and the next `start` of the same
+    // mount namespace, which another process holds, is the agent that systemd starts after it.
+    if number("PGCF_LAB_KILL", 0) != 0 {
+        eprintln!("lab: waiting to be killed");
+        std::future::pending::<()>().await;
+    }
     // The probe goes back to sleep for the next run: stopped, and its record made of what it left.
     agent.service.stop();
     node.stop(&database_id(probe)).await.unwrap();
     let control = control_of(&lab, probe);
     save_state(&lab, probe, &control);
-    // The agent exits: its mounts go before the process does, as `main` has it.
-    let releasing = Instant::now();
-    node.release_mounts().await;
-    eprintln!(
-        "lab: the mounts were released in {} ms",
-        releasing.elapsed().as_millis()
-    );
+    // The agent exits: its mounts go before the process does, as `main` has it, unless another
+    // process holds the namespace (`PGCF_LAB_HELD`, as `pgcf-mounts.service` does).
+    if number("PGCF_LAB_HELD", 0) == 0 {
+        let releasing = Instant::now();
+        node.release_mounts().await;
+        eprintln!(
+            "lab: the mounts were released in {} ms",
+            releasing.elapsed().as_millis()
+        );
+    }
     eprintln!(
         "lab: finished at {} ms, epoch {}",
         began.elapsed().as_millis(),
