@@ -146,6 +146,22 @@ const status = async (operation: string) =>
     .first())!;
 const ordersOf = (node: string) => openNodeOrders(env.DB, node);
 
+it("rejects a same-node move before changing database authority or creating work", async () => {
+  const f = await ready(),
+    before = await f.row(),
+    page = await pageOf(f.node);
+  await expect(start(f, f.node)).rejects.toMatchObject({
+    code: "invalid_request",
+    message: "A move requires a different node in the database's region",
+  });
+  expect(await f.row()).toEqual(before);
+  expect(await listDatabaseMoves(env.DB, f.id)).toEqual([]);
+  expect(await ordersOf(f.node)).toEqual([]);
+  expect((await moveTargets(env.DB, f.node, Date.now())).size).toBe(0);
+  expect((await pageOf(f.node)).databases).toEqual(page.databases);
+  expect((await actorFor(f.id).admit(f.id, "app")).ok).toBe(true);
+});
+
 it("moves on what the source reports to the node API, and tells the nodes to pull", async () => {
   const f = await ready();
   const other = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
@@ -337,16 +353,17 @@ it("refuses a target that is not open for placement or has no room for the secon
     code: "conflict",
     details: { reason: "node_capacity" },
   });
-  // On its own node the move needs a second volume: 398 GiB of the 400 the pool may sell are sold,
+  // Nominal capacity also applies: 398 GiB of the 400 the target pool may sell are sold,
   // and the database brings 5 more.
-  await seedSamples(f.node, [
+  const sold = await addNode(f.region);
+  await seedSamples(sold, [
     {
       at: Date.now(),
       totalBytes: 8192 * MIB,
       pool: { ...OPEN_POOL, nominal: 398 * GIB },
     },
   ]);
-  await expect(start(f, f.node)).rejects.toMatchObject({
+  await expect(start(f, sold)).rejects.toMatchObject({
     code: "conflict",
     details: { reason: "node_capacity" },
   });
@@ -906,22 +923,6 @@ it("leaves the database with its source when the target cannot build, retires wh
   });
 });
 
-it("cannot tell the node of a failed same-node move to retire its staged volume without retiring the source's", async () => {
-  const f = await ready(),
-    move = await restoring(f, f.node);
-  await reportTarget(
-    f,
-    move,
-    { state: "error", error: "storage_full" },
-    f.node,
-  );
-  expect(await status(move.operation)).toMatchObject({
-    status: "failed",
-    failure: "storage_full",
-  });
-  expect(await ordersOf(f.node)).toEqual([]);
-});
-
 it("fails a move whose database changed after the stage, and the database stays where it is", async () => {
   const f = await ready(),
     move = await restoring(f);
@@ -1014,42 +1015,6 @@ it("ends a restoring move when either node is lost, and the lost node's page sta
     if (lost === "target") expect(await ordersOf(f.node)).toEqual([]);
     await cleanup();
   }
-});
-
-it("moves between two volumes of the same node, whose page then serves the staged generation and retires the old", async () => {
-  const f = await ready(),
-    move = await restoring(f, f.node),
-    row = await f.row();
-  expect(row).toMatchObject({ node_id: f.node, storage_generation: 1 });
-  const orders = await ordersOf(f.node);
-  expect(orders).toEqual([expect.objectContaining({ type: "move" })]);
-  const staged = (await moveTargets(env.DB, f.node, Date.now())).get(f.id)!;
-  // The page serves the staged generation in place of the entry of the database, with the move order.
-  const page = await pageOf(f.node);
-  expect(page.databases).toEqual([
-    expect.objectContaining({
-      id: f.id,
-      generation: staged.generation,
-      operation: staged.operation,
-      storage_generation: 2,
-      archive: staged.archive,
-      origin: staged.origin,
-    }),
-  ]);
-  expect(page.orders).toEqual(orders);
-  await reportTarget(f, move, { state: "ready" }, f.node);
-  expect(await status(move.operation)).toMatchObject({ status: "done" });
-  expect(await f.row()).toMatchObject({
-    node_id: f.node,
-    storage_generation: 2,
-  });
-  expect(await ordersOf(f.node)).toEqual([
-    expect.objectContaining({
-      type: "superseded",
-      storage_generation: 1,
-      remove_volume: true,
-    }),
-  ]);
 });
 
 it("never lowers a storage generation or serves one an order retired", async () => {

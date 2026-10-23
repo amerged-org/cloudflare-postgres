@@ -51,7 +51,7 @@ function register(
 
 const MoveRequest = z.strictObject({
   target_node_id: NodeId.describe(
-    "The node that serves the database next. It may be the node the database is on: the move then goes from one volume to another.",
+    "A different node in the database's region that serves the database next. Same-node moves are refused before creating work.",
   ),
 });
 const DatabaseMove = z

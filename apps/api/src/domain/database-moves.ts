@@ -32,7 +32,7 @@ import { parseBackupInfo } from "./restore-catalog.ts";
 import { isConstraintError } from "./rows.ts";
 
 /**
- * A move (ULTRA plan 9.5): one database changes node, or volume on the same node, and keeps its
+ * A move (ULTRA plan 9.5): one database changes node and keeps its
  * ID. D1 stays the authority at every step, and the node only ever reports. Until the target is
  * ready the database stays what D1 says it is, served by the source from its storage generation;
  * a move that fails leaves it there.
@@ -58,9 +58,9 @@ import { isConstraintError } from "./rows.ts";
  * A move that fails while proving or restoring leaves everything as it was and ends the `move`
  * order, so the source serves again. So does any change D1 makes to the database after the move
  * staged its generation (a resize, a suspend, a wake claim): the target's work is then moot. A
- * target that is another node is told to retire and remove the storage generation it staged; on
- * the same node that cannot be said without retiring the source's own, so the staged volume
- * stays for the operator.
+ * target is told to retire and remove the storage generation it staged. Same-node moves are
+ * refused before creating work: retiring a staged generation there would retire the source's
+ * generation too, and the agent cannot safely restore the source's earlier entry after failure.
  */
 export type MoveStatus = "proving" | "restoring" | "done" | "failed";
 export interface DatabaseMove {
@@ -128,8 +128,8 @@ const liveNodeSql = `n.lost_at IS NULL AND NOT EXISTS(SELECT 1 FROM node_losses 
  * The guard of a write that places the database `d` on the node `target`, or null when it may not
  * be placed there now (ULTRA plan 4.8): by the rules that create and resize apply, the node is
  * online, open for new databases, with an open pool and room for the database's memory and
- * storage as a database of its own resources, which on the database's own node is the second
- * volume of the move. The guard holds only while nothing else was placed on the node meanwhile.
+ * storage as a database of its own resources. The guard holds only while nothing else was
+ * placed on the node meanwhile.
  */
 async function targetOpen(
   db: D1Database,
@@ -176,8 +176,7 @@ async function targetFits(
 }
 
 /**
- * Starts the move of a database to `targetNodeId`, which may be its own node: a move from one
- * volume to another is how the first node is tested. The request is answered by the existing
+ * Starts the move of a database to a different node in its region. The request is answered by the existing
  * move when the same one is already running.
  */
 export async function startDatabaseMove(
@@ -199,6 +198,11 @@ export async function startDatabaseMove(
     throw new ApiError("conflict", "Database is deleted", {
       reason: "database_deleted",
     });
+  if (row.node_id === targetNodeId)
+    throw new ApiError(
+      "invalid_request",
+      "A move requires a different node in the database's region",
+    );
   const sameOrRefuse = (active: DatabaseMove | null): DatabaseMove => {
     if (active?.target_node_id === targetNodeId) return active;
     throw new ApiError("conflict", "Another move of this database is running", {
@@ -292,7 +296,7 @@ export async function startDatabaseMove(
 /**
  * The entry a move target's page carries for a database it restores: the staged generation, not
  * the one D1 serves. `operation` is the move, which made the staged generation. The page lists
- * this entry in place of any other entry for the database, also on the source's own node; once
+ * this entry in place of any other entry for the database; once
  * the move is done the database row says the same and the entry is gone. The credentials read
  * the source archive and write the staged one.
  */
