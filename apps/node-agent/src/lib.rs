@@ -20,6 +20,7 @@ pub mod notify;
 pub mod pg_control;
 pub mod postgres;
 pub mod prefetch;
+pub mod program;
 pub mod proof;
 pub mod release;
 pub mod roles;

@@ -22,7 +22,7 @@ pub(crate) mod report;
 pub(crate) mod testing;
 
 pub use entry::{Desired, Entry, Origin, Policy, Source};
-pub use readahead::{PREFETCH, Prefetch};
+pub use readahead::{PREFETCH, Prefetch, Start};
 
 use crate::{
     admission::{Admission, Admitter, Facts, Permit, Running},
@@ -92,6 +92,10 @@ pub struct Timing {
     /// that time otherwise, so with the default boost of 5 s the event is read inside the burst and
     /// counts no throttling, and at 0 it counts the quota's.
     pub detail: Duration,
+    /// How often the agent keeps PostgreSQL's program in the page cache (`readahead`): a pass
+    /// that finds nothing lost counts the pages of 37 MB and reads nothing, and the pages the
+    /// kernel drops under memory pressure are read back within this time.
+    pub program_every: Duration,
 }
 impl Default for Timing {
     fn default() -> Self {
@@ -109,6 +113,7 @@ impl Default for Timing {
             host_files_retry_maximum: Duration::from_secs(300),
             settle: Duration::from_secs(10),
             detail: Duration::from_secs(2),
+            program_every: Duration::from_secs(60),
         }
     }
 }
@@ -332,6 +337,8 @@ pub struct Core<M: Machine> {
     pub(crate) fences: Fences,
     pub(crate) timing: Timing,
     pub(crate) prefetch: Prefetch,
+    /// What the readings remember: the program found, the passes, the starts counted for the A/B.
+    pub(crate) readahead: readahead::Readahead,
     pub(crate) policy: Arc<RwLock<Policy>>,
     /// A maintenance order is open: new wakes are held with 57P03 (plan 9.3).
     pub(crate) maintenance: AtomicBool,
@@ -407,6 +414,7 @@ impl<M: Machine> Core<M> {
             fences: parts.fences,
             timing: parts.timing,
             prefetch: parts.prefetch,
+            readahead: readahead::Readahead::new(),
             policy,
             maintenance: AtomicBool::new(false),
             taken: Mutex::new(std::collections::HashSet::new()),

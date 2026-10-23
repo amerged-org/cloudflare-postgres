@@ -152,6 +152,7 @@ pub(crate) fn timing() -> Timing {
         host_files_retry_maximum: Duration::from_millis(2000),
         settle: Duration::from_secs(10),
         detail: Duration::from_millis(100),
+        program_every: Duration::from_secs(60),
     }
 }
 

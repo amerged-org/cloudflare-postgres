@@ -34,7 +34,9 @@ use super::{
 use crate::{
     layout::Layout,
     machine::{Account, initdb_arguments},
-    postgres, settings,
+    postgres, prefetch,
+    program::Program,
+    settings,
     storage::{CommandRunner, Config, Output, Storage, VolumeId},
 };
 use std::{
@@ -552,6 +554,90 @@ async fn a_database_runs_in_a_pooled_slot_with_its_limits_set_before_the_order()
     assert!(pool.stop(&database.id).await.unwrap());
     assert_eq!(show(&unit, "ActiveState"), "inactive");
     assert_eq!(pool.snapshot(), slots::Snapshot::default());
+}
+
+/// The program the agent keeps in the page cache (`program`) is what a postmaster of the image
+/// maps: every ELF file in its address space is in the set, ICU's data library is the one file
+/// left out for its size, the closure finds every library, every system file the set names is in
+/// the image, and a second pass over what the first read finds it resident and advises nothing.
+/// The image's PostgreSQL is Debian 13's, where the strace of the set was made.
+#[tokio::test]
+#[ignore = "needs systemd as PID 1, root, PostgreSQL 18 and the node image's units (lab)"]
+async fn the_program_the_agent_keeps_in_the_page_cache_is_what_a_postmaster_of_the_image_maps() {
+    let (lab, database) = Lab::new("p").await;
+    let pool = &lab.pool;
+    pool.refill(1).await.unwrap();
+    let bound = pool.bind(&database.id, &database.bind(512)).await.unwrap();
+    let started = pool.exec(&bound).await.unwrap();
+
+    let layout = Layout::default();
+    let program = Program::find(
+        &layout.postgres_bin.join("postgres"),
+        &layout.postgres_lib,
+        settings::PRELOAD_LIBRARIES,
+    );
+    let kept: std::collections::HashSet<_> = program.files().iter().cloned().collect();
+    let maps = fs::read_to_string(format!("/proc/{}/maps", started.main_pid)).unwrap();
+    let mut mapped: Vec<PathBuf> = maps
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .filter(|path| path.starts_with('/') && !path.starts_with("/dev/"))
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .filter(|path| path.is_file() && !path.starts_with(database.data()))
+        .collect();
+    mapped.sort();
+    mapped.dedup();
+    let mut data_files = 0;
+    for path in &mapped {
+        if fs::metadata(path).unwrap().len() > (16 << 20) {
+            data_files += 1;
+        } else {
+            assert!(
+                kept.contains(path),
+                "{} is mapped by the postmaster and is not in the program",
+                path.display()
+            );
+        }
+    }
+    assert_eq!(program.data_files(), data_files, "{mapped:?}");
+    assert_eq!(program.unresolved(), 0, "{:?}", program.files());
+
+    // Every file the set names is in the image: the plan counts none missing.
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let limits = prefetch::Limits {
+        budget: Duration::from_secs(30),
+        max_bytes: u64::MAX,
+    };
+    let plan = program.plan(Duration::from_secs(30), &cancel);
+    let first = plan.issue(limits, &cancel);
+    assert_eq!((first.missing, first.skipped), (0, 0), "{first:?}");
+    assert!(first.files >= 36, "{first:?}");
+    // The postmaster ran, so the pages are resident and the second pass reads nothing: where the
+    // file system reports its pages (a container's overlayfs reports none).
+    let second = program
+        .plan(Duration::from_secs(30), &cancel)
+        .issue(limits, &cancel);
+    println!(
+        "slot_lab program: {} files, {} bytes, first pass advised {} of {} pieces, second pass {} advised ({} bytes resident)",
+        second.files,
+        second.planned_bytes,
+        first.advised,
+        first.pieces,
+        second.advised,
+        second.resident_bytes.unwrap_or(0)
+    );
+    if second.resident_bytes.is_none_or(|bytes| bytes == 0) {
+        println!("slot_lab program: this file system does not report the pages of its files");
+    } else {
+        assert_eq!(second.advised, 0, "{second:?}");
+        assert_eq!(
+            second.resident_bytes,
+            Some(second.issued_bytes),
+            "{second:?}"
+        );
+    }
+
+    assert!(pool.stop(&database.id).await.unwrap());
 }
 
 /// Exactly one writer. Two slots that see one data directory as their own are kept from running

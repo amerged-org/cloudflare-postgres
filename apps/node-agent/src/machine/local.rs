@@ -300,6 +300,7 @@ impl Local {
         let layout = Layout {
             state: root.join("s"),
             run: root.join("r"),
+            postgres_lib: testpg::lib_directory(&bin),
             postgres_bin: bin,
             host_root: root.join("h"),
             ..Layout::default()

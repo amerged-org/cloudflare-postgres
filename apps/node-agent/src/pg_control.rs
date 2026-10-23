@@ -71,22 +71,31 @@ impl std::fmt::Display for Lsn {
 }
 
 /// `pg_control` with the position of its latest checkpoint, which is where the shutdown
-/// checkpoint of a clean stop is.
+/// checkpoint of a clean stop is, and the position recovery would start reading from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlFile {
     pub control: Control,
     /// `checkPoint`: the location of the latest checkpoint record.
     pub checkpoint: u64,
+    /// `checkPointCopy.redo`: where the WAL replay of a crash starts. It is the checkpoint
+    /// record's own position after a clean stop, and an earlier one after a crash.
+    pub redo: u64,
 }
 /// The offset of `checkPoint` in PostgreSQL 18's `ControlFileData`.
 const CHECKPOINT_OFFSET: usize = 32;
+/// The offset of `checkPointCopy.redo`, the first member of `CheckPoint`, which follows `checkPoint`.
+const REDO_OFFSET: usize = 40;
 pub fn parse_control_file(bytes: &[u8]) -> Result<ControlFile, &'static str> {
     let control = parse_control(bytes)?;
-    let mut checkpoint = [0u8; 8];
-    checkpoint.copy_from_slice(&bytes[CHECKPOINT_OFFSET..CHECKPOINT_OFFSET + 8]);
+    let position = |offset: usize| {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bytes[offset..offset + 8]);
+        u64::from_le_bytes(word)
+    };
     Ok(ControlFile {
         control,
-        checkpoint: u64::from_le_bytes(checkpoint),
+        checkpoint: position(CHECKPOINT_OFFSET),
+        redo: position(REDO_OFFSET),
     })
 }
 
@@ -252,6 +261,21 @@ mod tests {
             parse_control(&control(1800, 1, 1, 40)),
             Err("control_unreadable")
         );
+    }
+
+    /// The checkpoint record and the redo point are the two 64-bit words that follow the state and
+    /// the time (`ControlFileData.checkPoint`, then `checkPointCopy.redo`).
+    #[test]
+    fn the_checkpoint_and_the_redo_position_are_read_at_their_own_offsets() {
+        let mut bytes = control(1800, 1, 1, 296);
+        bytes[CHECKPOINT_OFFSET..CHECKPOINT_OFFSET + 8]
+            .copy_from_slice(&0x0000_0003_0200_5A40u64.to_le_bytes());
+        bytes[REDO_OFFSET..REDO_OFFSET + 8]
+            .copy_from_slice(&0x0000_0003_01FF_0000u64.to_le_bytes());
+        let file = parse_control_file(&bytes).unwrap();
+        assert_eq!((file.checkpoint, file.redo), (0x3_0200_5A40, 0x3_01FF_0000));
+        // The timeline that follows them is the checkpoint's own.
+        assert_eq!(file.control.timeline, 1);
     }
 
     #[test]

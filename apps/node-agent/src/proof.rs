@@ -279,6 +279,7 @@ pub fn wake_check(record: Option<&ProvenSleepRecord>, volume: &Path) -> Result<(
     let ControlFile {
         control,
         checkpoint,
+        ..
     } = parse_control_file(&bytes).map_err(|error| match error {
         "control_version" => WakeRefusal::ControlVersion,
         _ => WakeRefusal::Unproven,

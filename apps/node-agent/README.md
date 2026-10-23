@@ -58,7 +58,7 @@ exit so that systemd starts the new one.
 | Fencing                    | `fence.rs`                                                                                                                                             |
 | Gateway channel            | `gateway.rs`: the writer table, the wakes, quiesce, close, status and activity                                                                         |
 | Metrics and diagnostics    | `usage.rs`, `sample.rs`, `events.rs`, `diagnostics/`                                                                                       |
-| Cold page cache            | `prefetch.rs`: readahead of the catalog set and the autoprewarm list with its own accounting; `cache.rs`: how files of the data directory are opened and counted |
+| Cold page cache            | `prefetch.rs`: readahead of the start set, the catalog set, the autoprewarm list and whole files with its own accounting; `program.rs`: the files of PostgreSQL's program; `cache.rs`: how files of the data directory are opened and counted |
 | Updates                    | `update.rs`, `release.rs`                                                                                                                              |
 | The loops                  | `service.rs`: what feeds the core and what it feeds                                                                                                    |
 
@@ -331,28 +331,52 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   background after the next start, where it competes with the first queries for the disk. Two of
   the worker slots are its leader and its worker; the sleep guard does not count its worker as a
   session.
-- **Readahead** (`prefetch.rs`, called from `agent/readahead.rs`). Before a request the agent
-  asks the kernel to read a sleeping database's hot files ahead with `posix_fadvise(WILLNEED)`:
-  the catalog set (`pg_control`, 256 KiB of WAL at the latest checkpoint, `global/`, and in each
-  user database its `PG_VERSION`, `pg_filenode.map` and the login's catalogs with their indexes
-  and forks; about 5 MB) and the autoprewarm list (blocks merged where contiguous, the relations
-  with the fewest listed blocks first, system databases left out). The mapped catalogs
-  (`pg_class`, `pg_attribute`, `pg_proc`, `pg_type` and their indexes) are found through the map
-  where `VACUUM FULL` moved them; the others are read at their OID, so a rewrite of one drops it
-  from the set, and the report's `missing` counts it. A plan is built first (blocking:
-  directories, `pg_control`, the maps and the list are read, each file is opened once for its
-  length), then issued in pieces of at most 128 KiB, because the kernel reads only the first
-  `read_ahead_kb` of a range per call. The data directory is the database user's, so a plan reads
-  only the real directories of `base/` (at most 32 databases) whatever the list names, stops after
-  512 files of a list that are not there, and stops at a budget and a cancel as the issuing does.
-  Issuing stops at a time budget, a byte bound or a cancel and returns the counts, the bytes the
-  cache already held and the timings; they go to an event (`prefetch`: set, hook, why it ended and
-  the counts), which takes the place of the residency diagnostic that `cache.rs` made while a wake
-  ran (deleted). `pg_internal.init` is left out: PostgreSQL removes it at every start. Two hooks,
-  and a constant of the build (`readahead::PREFETCH`, not a policy of the node) says which run: the
-  hot list from ready with a budget of 150 ms (shipped), and the catalogs at the bind (code, off
-  until the interleaved A/B on the pooled path). `settings::AUTOPREWARM` is the build's other
-  switch, for the A/B arm without PostgreSQL's own autoprewarm.
+- **Readahead** (`prefetch.rs` and `program.rs`, called from `agent/readahead.rs`). The agent
+  asks the kernel to read ahead with `posix_fadvise(WILLNEED)` the files a cold start and request
+  read, in four sets of a sleeping database and the program of PostgreSQL:
+  - the **start set**: what PostgreSQL reads between its exec and its ready (the configuration
+    and `PG_VERSION`; `pg_control`; 256 KiB of WAL at the latest checkpoint record and, after a
+    crash, at the redo point that `pg_control` holds; the last segment of `pg_xact` and of
+    `pg_multixact`'s two directories; `pg_stat/pgstat.stat`; `pg_logical/replorigin_checkpoint`;
+    `global/`; about 1 MB). `pg_internal.init` is left out: PostgreSQL removes it at every start;
+  - the **catalog set**: in each user database its `PG_VERSION`, `pg_filenode.map` and the
+    login's catalogs with their indexes and forks; about 5 MB. The mapped catalogs (`pg_class`,
+    `pg_attribute`, `pg_proc`, `pg_type` and their indexes) are found through the map where
+    `VACUUM FULL` moved them; the others are read at their OID, so a rewrite of one drops it from
+    the set, and the report's `missing` counts it;
+  - the **hot list**: the autoprewarm list (blocks merged where contiguous, the relations with
+    the fewest listed blocks first, system databases left out);
+  - the **program** (`program.rs`): the `postgres` binary, the libraries it links (found from the
+    `DT_NEEDED` entries of the binary and of each library, on the loader's default path), the
+    extension libraries of `settings::PRELOAD_LIBRARIES`, and the system files a postmaster
+    opens at its start (the time zone abbreviations, the C.UTF-8 locale, OpenSSL's configuration);
+    ICU's 32 MB data library, of which a postmaster touches 72 KiB, is left out because it is
+    data.
+
+  A plan is built first (blocking: directories, `pg_control`, the maps and the list are read,
+  each file is opened once for its length), then issued in pieces of at most 128 KiB, because the
+  kernel reads only the first `read_ahead_kb` of a range per call. A piece that `cachestat(2)`
+  shows the cache holds entirely is not advised, so a pass over a resident set reads nothing. The
+  data directory is the database user's, so a plan reads only the real directories of `base/` (at
+  most 32 databases) whatever the list names, stops after 512 files of a list that are not there,
+  and stops at a budget and a cancel as the issuing does. Issuing stops at a time budget, a byte
+  bound or a cancel and returns the counts, the bytes the cache already held and the timings; they
+  go to an event (`prefetch`: set, hook, why it ended and the counts; `program_warm` for the
+  program), which takes the place of the residency diagnostic that `cache.rs` made while a wake
+  ran (deleted).
+
+  Three hooks, and one constant of the build (`agent::PREFETCH`, not a policy of the node, so the
+  A/B needs a release and no API change) says which run:
+  - the **program**, from the pool's refill: one pass at the first refill after the agent starts
+    and then one every `Timing::program_every` (60 s), never while a start is in flight or waits,
+    and a start that begins ends the pass that runs (shipped);
+  - the **start set and the catalogs at the bind**, from the start's permit, in a task the order
+    does not wait for, for at most 50 ms (code, off until the interleaved A/B on the pooled path:
+    `Start::Alternate` reads for every second start and says which in a `prefetch_arm` event);
+  - the **hot list** from ready, with a budget of 150 ms (shipped).
+
+  `settings::AUTOPREWARM` is the build's other switch, for the A/B arm without PostgreSQL's own
+  autoprewarm.
 - **Login.** The node's root reaches the cluster's superuser `postgres` by peer authentication
   through `pg_ident.conf`; the backup role `pgcf_backup` is reached by the database's own Linux user
   the same way; every other role logs in over the socket with SCRAM-SHA-256. Replication connections

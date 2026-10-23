@@ -1308,10 +1308,12 @@ impl<M: Machine> Service<M> {
 
     /// The pool of idle slots: kept at `start_concurrency` while no start is in flight or waits,
     /// when the pool was used, and now and then for what no start told it (a slot that ended, a
-    /// quiet node that began with an empty pool).
+    /// quiet node that began with an empty pool). PostgreSQL's program is kept in the page cache
+    /// at the same turns, at its own interval (`Core::warm_program`).
     async fn slots(&self) {
         loop {
             self.core.refill_pass().await;
+            self.core.warm_program().await;
             tokio::select! {
                 () = self.core.refill.notified() => {}
                 () = tokio::time::sleep(SLOTS_EVERY) => {}
