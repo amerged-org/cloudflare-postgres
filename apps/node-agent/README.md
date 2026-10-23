@@ -422,14 +422,29 @@ plan 9.3, "Changing the page"; it is written there once.
   move target replays through the segment named in the source's proven-sleep record before it may
   promote.
 - **A build that fails** (a create, a restore, a point-in-time restore or a move target, with any
-  of the errors above) is abandoned once: the unit stops, the volume goes, the user goes with the
-  database's last volume, and the database stays in `error` with that error until it is deleted.
-  It is not begun again in this run, however often the page still names it (`View::abandoned_build`,
-  keyed by the build's archive path): the API fails the operation on the report, and refuses a
-  `ready` report for a failed restore. The API's page stops naming a restore whose operation
-  failed, so that an agent that restarted does not begin it again either. A build that was refused
-  before it began (the previous storage generation is still held) wrote nothing and is tried at
-  the next pull. A create that a restart interrupted, with no failure reported, still resumes.
+  of the errors above) is abandoned once: the unit stops, the generation's volume goes, the user
+  goes with the database's last volume, and the node's files of that generation go (its state and
+  upload logs; a build that failed before it wrote anything of its own, because the credential of
+  its archive had not arrived, leaves the files of the generation the database is served from).
+  It is not begun again in this run, however often the page still names it
+  (`View::abandoned_build`, keyed by the build's archive path). What follows depends on the build:
+  - A create, a restore or a point-in-time restore: the API fails the operation on the report,
+    refuses a `ready` report for a failed restore, and stops naming the build (no `origin`) once
+    its operation failed, a create as well as a restore. The database stays in `error` until it is
+    deleted; the code of that error is the build's in this run, and `volume_missing` after the
+    agent restarted (every rollout of the fleet restarts it), because it finds nothing of the
+    database on its disk and its page names no origin. Nothing is started either way. A create or
+    a restore that a restart interrupted before any failure was reported still resumes, since the
+    page still names it.
+  - A move target on another node: the API ends the move (`failMove`), the source serves again, and
+    the target retires the staged generation through the superseded order. The database is not
+    left in `error` for the customer to delete.
+  - A move target on the node of its source: the page returns to the source's entry, whose
+    generation is below the staged one that the agent holds, and the agent never lowers a
+    generation (`Core::accept`). In this run the staged entry stays in `error` and the source is not
+    served; its volume and its archive are untouched (plan 11.2).
+  A build that was refused before it began (the previous storage generation is still held) wrote
+  nothing and is tried at the next pull.
 
 ## Backups
 

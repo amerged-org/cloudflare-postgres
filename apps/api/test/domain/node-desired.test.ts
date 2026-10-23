@@ -455,6 +455,28 @@ describe("the desired page of a node", () => {
     expect((await entry(f, db.id))!.origin).toBeUndefined();
   });
 
+  it("stops asking for a create whose operation failed, so that an agent that restarted does not build it again", async () => {
+    const f = await fixture();
+    const db = await served(f);
+    expect((await entry(f, db.id))!.origin).toEqual({ kind: "create" });
+    // The node reports the build failed and abandons it (volume, user and state gone): the API
+    // fails the operation on that report. The page keeps the database and names no origin, or
+    // every agent restart, and every rollout of the fleet restarts the agent, would build it
+    // again, to a ready the failed operation never takes.
+    expect(
+      (await report(f, db.id, 1, "error", { error: "build_failed" })).status,
+    ).toBe(200);
+    const operation = await env.DB.prepare(
+      "SELECT status,error_code FROM operations WHERE id=?",
+    )
+      .bind(db.operation)
+      .first<{ status: string; error_code: string }>();
+    expect(operation).toEqual({ status: "failed", error_code: "build_failed" });
+    const page = await entry(f, db.id);
+    expect(page).toBeDefined();
+    expect(page!.origin).toBeUndefined();
+  });
+
   it("keeps the operation of the generation that asked: a role change names none of its own", async () => {
     const f = await fixture();
     const db = await served(f);

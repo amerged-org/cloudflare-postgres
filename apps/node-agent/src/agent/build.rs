@@ -450,9 +450,12 @@ impl<M: Machine> Core<M> {
     /// A build that began and failed is abandoned (`abandon_build`) and not begun again in this
     /// run: the page names the build until the API has ended its operation, and a build that
     /// began again could end ready on the node while the API, which failed the operation, refuses
-    /// that report. The database stays in its error until it is deleted. A build that was refused
-    /// before it began (the previous generation is still held) is no failed build: nothing was
-    /// written, and the next pull tries it again.
+    /// that report. The database stays in its error until it is deleted, or retired by the order
+    /// that ends a move. Once the operation of a restore or a create has failed the page names no
+    /// origin, so an agent that restarted finds nothing of the database and reports
+    /// `volume_missing`; it builds nothing. A build that was refused before it began (the previous
+    /// generation is still held) is no failed build: nothing was written, and the next pull tries
+    /// it again.
     pub(crate) async fn build(
         self: &Arc<Self>,
         db: &Arc<Db>,
@@ -486,20 +489,39 @@ impl<M: Machine> Core<M> {
                     "event": "build_failed", "database_id": db.id,
                     "operation": entry.operation, "error": error,
                 }));
-                if released {
+                let forgotten = if released {
                     self.abandon_build(entry).await;
-                    self.files(&db.id).remove().ok();
-                }
+                    self.forget_state(&db.id, entry.storage_generation)
+                } else {
+                    false
+                };
                 self.set(db, |view| {
                     view.phase = Phase::Error;
                     view.error = Some(error);
                     if released {
                         view.abandoned_build = Some(entry.archive_path.clone());
+                    }
+                    if forgotten {
                         view.state = None;
                     }
                 });
                 Err(error)
             }
+        }
+    }
+
+    /// Removes the node's files of a database (its state and the upload logs) when they are those
+    /// of the storage generation that was built. A build that failed before it wrote its own
+    /// (no credential for its archive had arrived, so `begin_state` never ran) finds the files of
+    /// the generation the database is served from: a move target on the node of its source. They
+    /// are the source's proof and stay. `true` when they were removed.
+    fn forget_state(&self, id: &str, storage_generation: u64) -> bool {
+        let files = self.files(id);
+        match files.load() {
+            Ok(Some(state)) if state.storage_generation == storage_generation => {
+                files.remove().is_ok()
+            }
+            _ => false,
         }
     }
 

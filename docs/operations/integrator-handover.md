@@ -528,8 +528,15 @@ the source without reconciling them. A stale ID fails with `28P01` ([A.4](#a4-sq
 The restore is ready when its operation is `succeeded`: recovery has promoted the database onto a
 later timeline, its roles are reset and the first base backup of the new timeline is DONE. Compare
 your markers before cutover. A restore whose operation ends `failed` (for example `no_recovery_point`
-or `archive_unusable` after the `202`) is not tried again: its target stays in `error` and holds
-nothing on the node. Delete the target and request the restore again with a new `Idempotency-Key`.
+or `archive_unusable` after the `202`) is not tried again by the node: it abandons the build, and
+the target stays in `error` and holds nothing on the node. Its error code can change to
+`volume_missing` after the node's agent restarts, because the node has nothing of the target and
+the API names no source for a failed restore. Delete the target and request the restore again with
+a new `Idempotency-Key`. One failure is not covered: a restore that runs longer than 20 minutes is
+failed by the operation timeout (`operation_timeout`) while the node goes on building it. That
+build can end ready on the node and archive WAL while the API keeps the target `provisioning` with
+the operation `failed` (the plan's 11.2 lists it as open). Treat that target the same way: delete
+it and request the restore again.
 
 | `409` reason         | Meaning                                                                                                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |

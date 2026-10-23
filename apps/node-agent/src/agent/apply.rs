@@ -2801,6 +2801,55 @@ mod tests {
         pulled_again_stays_failed(&rig, &id, &db, "build_failed").await;
     }
 
+    /// The agent restarts after a create failed. The page the API sends now keeps the database and
+    /// names no origin (it stopped asking for a create whose operation failed): the agent has
+    /// nothing of it, reports `volume_missing` and starts nothing. Found by review: the page named
+    /// the create until the database was ready, and every restart (every rollout of the fleet
+    /// restarts the agent) built the failed create again, to a ready under the failed operation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_that_failed_is_not_built_by_the_agent_that_restarted() {
+        let Some(rig) = Rig::new("create-failed-restart").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.fixture.set("backup-fail", "");
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "the create to fail", || handle.phase() == Phase::Error).await;
+        assert_eq!(handle.view().error, Some("build_failed"));
+        rig.fixture.clear("backup-fail");
+
+        let rig = rig.restart().await;
+        let starts = || {
+            rig.machine
+                .calls()
+                .iter()
+                .filter(|call| **call == format!("start {id}"))
+                .count()
+        };
+        let before = starts();
+        let mut kept = db.clone();
+        kept.as_object_mut().unwrap().remove("origin");
+        rig.deliver(db["archive"]["path"].as_str().unwrap(), "read_write");
+        rig.core.apply(&Rig::page(vec![kept], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the decision", || handle.view().adopted).await;
+        for _ in 0..15 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(handle.phase(), Phase::Error);
+        }
+        assert_eq!(handle.view().error, Some("volume_missing"));
+        assert_eq!(starts(), before, "nothing is started");
+        let observation = rig.observation(&id);
+        assert_eq!(
+            (&observation["state"], &observation["error"]),
+            (&json!("error"), &json!("volume_missing"))
+        );
+        assert!(!rig.machine.running(&id));
+        assert!(rig.machine.volumes().is_empty());
+    }
+
     /// A source that was resized up after its backup and down again before the restore has a
     /// parameter change in its WAL above both the backup's settings and the class's. PostgreSQL
     /// pauses that recovery ("recovery has paused") and its postmaster still reports ready, so
@@ -2971,6 +3020,47 @@ mod tests {
                 .any(|(volume, _)| volume.generation() == 1)
         );
         assert!(rig.machine.has_account(&id), "{:?}", rig.machine.calls());
+    }
+
+    /// A move target on the node of its source whose build fails before it writes anything of its
+    /// own (the credential of its archive has not arrived, so there is no store): the state and the
+    /// upload log on the disk are the source's generation's, and stay, with the source's user and
+    /// volume. They are what an agent that restarts decides on (adopted asleep from the proof);
+    /// the abandoned build must not take them with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_move_target_that_fails_before_it_begins_leaves_the_state_of_the_source() {
+        let Some(rig) = Rig::new("move-unbegun").await else {
+            return;
+        };
+        let (mut db, id, source_state) = source(&rig).await;
+        let old_path = db["archive"]["path"].as_str().unwrap().to_string();
+        rig.deliver(&old_path, "read_only");
+        // The credential of the target's archive path is not delivered.
+        let new_path = format!("s3://pgcf-eu/eu-dev/{id}/g2-op_hhhhhhhhhhhhhhhhhhhh");
+        db["storage_generation"] = json!(2);
+        db["generation"] = json!(7);
+        db["operation"] = json!("op_hhhhhhhhhhhhhhhhhhhh");
+        db["archive"]["path"] = json!(new_path);
+        db["origin"] = json!({"kind": "move", "source": {
+            "database_id": id, "path": old_path, "backup_id": source_state.backup.clone().unwrap().backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"},
+            "end": source_state.record.clone().unwrap()}});
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db], vec![])).await;
+        eventually(60, "the build to fail", || handle.phase() == Phase::Error).await;
+        assert_eq!(handle.view().error, Some("archive_unusable"));
+
+        let files = rig.core.files(&id);
+        assert_eq!(files.load().unwrap(), Some(source_state.clone()));
+        assert!(files.directory().join("uploads-g1.log").exists());
+        assert_eq!(handle.state(), Some(source_state));
+        assert!(rig.machine.has_account(&id));
+        assert!(
+            rig.machine
+                .volumes()
+                .iter()
+                .any(|(volume, _)| volume.generation() == 1)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

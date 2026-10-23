@@ -42,10 +42,16 @@ recovers the same customer EU1.
    switch back to an older source without reconciling those writes.
 
 A restore whose operation ends `failed` is not tried again by the node. It abandons the build once
-(the unit stops, the volume and the user go) and the target stays in `error` with that error until
-it is deleted. Delete the target and submit the restore again with a new `Idempotency-Key`; a
-failure that is not the source's (a `tar` that ended early while the archive was read: 1 of 9
-restores on 2026-10-23) passed at the second request, the one time it was seen.
+(the unit stops, the volume and the user go) and the target stays in `error` until it is deleted;
+the error is the build's, and it can read `volume_missing` after the node's agent restarts, because
+the node has nothing of the target and the page names no source for a failed restore. Delete the
+target and submit the restore again with a new `Idempotency-Key`; a failure that is not the
+source's (a `tar` that ended early while the archive was read: 1 of 9 restores on 2026-10-23)
+passed at the second request, the one time it was seen. One case is open (the plan's 11.2): a
+restore that runs longer than 20 minutes is failed by the operation timeout while the node goes on
+building it. That build ends ready on the node and archives WAL, and the API keeps the target
+`provisioning` with the operation `failed`. It is not abandoned. Delete that target as well, and
+submit the restore again.
 
 A deleted source can be restored within its configured retention window. Keep its encrypted
 credentials and the corresponding `CREDENTIAL_KEYS` key IDs until that window ends. Expired
