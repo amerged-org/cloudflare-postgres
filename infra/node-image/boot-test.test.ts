@@ -47,3 +47,23 @@ test("all the credentials of the boot test fit the SMBIOS space QEMU gives them"
   // Each string takes its bytes and its NUL, so the runner's guard counts what the table holds.
   assert.equal(smbiosSize(["ab", "c"]), 5);
 });
+
+test("the journal probe logs as a user it makes itself, with a uid of the agent's database range", () => {
+  const script = readFileSync(new URL("./boot-test/guest.sh", import.meta.url), "utf8");
+  const users = readFileSync(new URL("../../apps/node-agent/src/units/users.rs", import.meta.url), "utf8");
+  const first = Number(users.match(/pub const FIRST_UID: u32 = ([\d_]+);/)?.[1]?.replaceAll("_", ""));
+  const count = Number(users.match(/pub const UID_COUNT: u32 = ([\d_]+);/)?.[1]?.replaceAll("_", ""));
+  assert.ok(first > 65_535 && count > 0, "the agent's range was not found in units/users.rs");
+  const uid = Number(script.match(/^journal_probe_uid=(\d+)$/m)?.[1]);
+  // journald splits a uid from 65536 up to the container range at 524288 and keeps the system uids,
+  // systemd's dynamic range and nobody in the system journal whatever SplitMode is: a uid of the
+  // agent's range is split, so a line that stays in the system journal came from the configuration.
+  assert.ok(uid >= first && uid < first + count, `the probe's uid ${uid} is outside ${first}-${first + count - 1}`);
+  assert.ok(uid > 65_535 && uid < 524_288);
+  // The scratch database's user is a system account (uid 987 in CI), which journald never splits.
+  const probe = script.slice(script.indexOf("database_log_stays_in_the_system_journal() {"));
+  const body = probe.slice(0, probe.indexOf("\n}\n"));
+  assert.doesNotMatch(body, /\/proc\/\$pid|MainPID|pgcf-pg@/, "the probe must not take its uid from the scratch database");
+  assert.match(body, /useradd -u "?\$uid"?/);
+  assert.match(body, /userdel /);
+});
