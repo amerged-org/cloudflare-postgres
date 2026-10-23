@@ -21,7 +21,9 @@ policy, and reports each decision (plan 1.6, 5.2):
   reservations of the awake and starting databases plus _m_ and the overhead stay within the awake
   budget), and fewer than `start_concurrency` starts are in flight. Otherwise the start waits in a
   strict FIFO queue for `queue_wait_ms` and is then refused with `57P03` and the policy's retry
-  hint. systemd never restarts a database by itself, so no start bypasses these rules.
+  hint: DETAIL "node at awake capacity" (`no_headroom`) when the memory rule held it back, or a
+  start ahead of it, and DETAIL "node busy starting databases" (`start_queue`) when the start cap
+  alone did. systemd never restarts a database by itself, so no start bypasses these rules.
 - **Early sleep.** Only if the policy enables it, and only while a start waits for memory, the node
   puts one idle but awake database to sleep per waiting start, with the normal sleep proof.
 - **Recovery starts.** A database that stopped without a proof is started through admission and
@@ -75,9 +77,15 @@ every flow updates in small steps.
 
 PostgreSQL runs in a slot, the unit `pgcf-slot@<n>.service`, as the slot's own user
 (`pgcf-slot-<n>`, uid 300000 + _n_). The agent builds slots before a wake, for no database, and
-keeps as many idle as `start_concurrency` while no start is in flight or waits (`agent/power.rs`,
-`refill_pass`; a build costs about 80 ms of CPU, which a wake must not wait for, and a fence or a
-maintenance order stops the idle ones). An idle slot runs the supervisor (`pgcf-archive slot <n>`),
+keeps four idle for each start that may run at once (`IDLE_PER_START`, so 32 on EU1 at 8 starts)
+while no start is in flight or waits (`agent/power.rs`, `refill_pass`). The pool must hold what a
+storm takes, because it is refilled only on a quiet node: a storm of 40 wakes found 8 idle slots
+and built the other 32 inside the wakes, 1 to 4 s each (EU1, 2026-10-23). An idle slot holds about
+0.6 MiB (live, with 309 volumes mounted), so the 32 cost about 20 MiB. A pool that a storm emptied
+is built `BUILDS_AT_ONCE` (4) slots at a time; the refills decide one at a time in the pool's turn
+(`Pool::refill`), so together they build no more than the target and make each user once. A build
+costs about 80 ms of CPU, which a wake must not wait for, and runs at the idle CPU weight from its
+first moment; a fence or a maintenance order stops the idle slots. An idle slot runs the supervisor (`pgcf-archive slot <n>`),
 which takes one order, from root. Every start takes one path: the admission permit, then
 
 1. **Take or build** (`slots::Pool::bind`): an idle slot, or a new one built inside the permit, so
@@ -392,11 +400,18 @@ plan 9.3, "Changing the page"; it is written there once.
   apply it at once, and a base backup that begins inside the burst applies it first), reads the hot
   list ahead and reports the phases of the wake as events; about 2 s later a `wake_detail` event adds
   the slot's origin and what the bind and the order took, the split of the start, the CPU quota's
-  throttling and the steal time. A wake it already serves is answered `wake_in_progress`, which is
+  throttling and the steal time. A ticket that is ahead of the agent's page (a connection right
+  after an idle sleep brings the generation the sleep made, and the page follows in 1 to 7 s) makes
+  the agent pull that database's page at once and hold the wake for it, up to `page_wait` (8 s)
+  after the gateway queued the wake (`Service::catch_up`, asked again every second): the checks
+  then run against the page it has, so a ticket the page does not order is refused `desired_stale`
+  as before, after the wait. A wake it already serves is answered `wake_in_progress`, which is
   no result. A start that fails writes a `unit_start_failed` event with the class of the error and
   answers `release_failed`; a slot that is awake or cannot be read at that point is stopped without a
   proof and recovered, so no database stays `starting`.
-- **Sleep.** After the database's idle time the agent runs the sleep proof (plan 7.9): the gateway
+- **Sleep.** After the database's idle time, `start_concurrency` databases at a time (the idle pass
+  looks at every database each five seconds, and a sleep that waits for the archive holds up none
+  of the others), the agent runs the sleep proof (plan 7.9): the gateway
   quiesces and closes idle sessions, the guard refuses while a session is busy or a transaction is
   prepared (`power_busy`), a checkpoint and a WAL switch close the last segment, the upload log must
   hold it and every segment before it, and only then the postmaster stops with a fast shutdown.

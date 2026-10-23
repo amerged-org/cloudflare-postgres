@@ -448,6 +448,10 @@ pub struct Pool<H: Host> {
     host: H,
     range: Range<u32>,
     table: Mutex<Table>,
+    /// One refill decides at a time: it counts the slots that are idle or being built, makes the
+    /// user of a number if none is free, and takes its number, before the next one counts. The
+    /// builds themselves run at once.
+    turn: tokio::sync::Mutex<()>,
 }
 
 impl<H: Host> Pool<H> {
@@ -461,6 +465,7 @@ impl<H: Host> Pool<H> {
             host,
             range,
             table: Mutex::new(table),
+            turn: tokio::sync::Mutex::new(()),
         }
     }
     pub fn host(&self) -> &H {
@@ -795,24 +800,32 @@ impl<H: Host> Pool<H> {
     /// where none that is free has one (a node that never made a slot, or one whose free numbers
     /// all failed on a process left in their cgroups), the refill makes the next user first. A
     /// user that cannot be made does not stop it from building on a failed number, which may work
-    /// by now; it says why only where no number is left.
+    /// by now; it says why only where no number is left. Refills may run at once: each decides in
+    /// its own turn (the count, the user, the number) and then builds, so together they build no
+    /// more than `target` and make each user once.
     pub async fn refill(&self, target: usize) -> Result<Option<u32>, Error> {
         self.sweep().await;
-        let counted = self.snapshot();
-        if counted.idle + counted.spawning >= target {
-            return Ok(None);
-        }
-        let fresh = self.table().fresh_number(&self.range).is_some();
-        let made = if fresh {
-            Ok(None)
-        } else {
-            self.make_user().await
-        };
-        let reserved = self.table().reserve(&self.range, None);
-        let slot = match (reserved, made) {
-            (Ok(slot), _) => slot,
-            (Err(Error::NoSlot), Err(error)) => return Err(error),
-            (Err(error), _) => return Err(error),
+        let slot = {
+            // Refills may run at once (the agent builds several slots at a time after a storm):
+            // each counts and takes its number in its own turn, so that together they build no
+            // more than `target`, and a user is made once however many of them wait for it.
+            let _turn = self.turn.lock().await;
+            let counted = self.snapshot();
+            if counted.idle + counted.spawning >= target {
+                return Ok(None);
+            }
+            let fresh = self.table().fresh_number(&self.range).is_some();
+            let made = if fresh {
+                Ok(None)
+            } else {
+                self.make_user_in_turn().await
+            };
+            let reserved = self.table().reserve(&self.range, None);
+            match (reserved, made) {
+                (Ok(slot), _) => slot,
+                (Err(Error::NoSlot), Err(error)) => return Err(error),
+                (Err(error), _) => return Err(error),
+            }
         };
         let spawned = self.build(slot, None).await?;
         self.set_state(slot, State::Idle);
@@ -840,6 +853,12 @@ impl<H: Host> Pool<H> {
     /// keeps its number out of every later build and of this call, and ends this pass with the
     /// error.
     pub async fn make_user(&self) -> Result<Option<u32>, Error> {
+        let _turn = self.turn.lock().await;
+        self.make_user_in_turn().await
+    }
+
+    /// `make_user` for a caller that holds the turn.
+    async fn make_user_in_turn(&self) -> Result<Option<u32>, Error> {
         let slot = {
             let table = self.table();
             self.range
@@ -1362,6 +1381,10 @@ mod tests {
         no_user: BTreeSet<u32>,
         /// A start waits here for a permit, as a unit's job takes its time.
         start_gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// Making a user waits here for a permit, as `useradd` takes its time.
+        user_gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// Every user the pool asked for, in order.
+        ensured: Vec<u32>,
     }
     #[derive(Clone)]
     struct SimUnit {
@@ -1470,7 +1493,12 @@ mod tests {
             self.state().users.clone()
         }
         async fn ensure_user(&self, slot: u32) -> Result<(), Error> {
+            let gate = self.state().user_gate.clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
             let mut state = self.state();
+            state.ensured.push(slot);
             if state.no_user.contains(&slot) {
                 return Err(refused("useradd"));
             }
@@ -2233,6 +2261,48 @@ mod tests {
         sim.die(1);
         assert_eq!(pool.refill(2).await.unwrap(), Some(2));
         assert_eq!(pool.snapshot().idle, 2);
+    }
+
+    /// Refills that run at once decide one at a time: each counts the slots that are idle or being
+    /// built and takes its number in the same turn, so that eight of them for a target of three
+    /// build three, and a user is made once however many wait for it (EU1, 2026-10-23: the pool
+    /// refills in parallel after a storm).
+    #[tokio::test]
+    async fn refills_at_once_never_build_past_the_target_nor_make_a_user_twice() {
+        let sim = Sim::fresh();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        sim.state().user_gate = Some(gate.clone());
+        let pool = Arc::new(pool(&sim));
+        let refills: Vec<_> = (0..8)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.refill(3).await })
+            })
+            .collect();
+        // Every refill waits for the first user; none has built anything.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        gate.add_permits(64);
+        let mut built = Vec::new();
+        for refill in refills {
+            if let Some(slot) = refill.await.unwrap().unwrap() {
+                built.push(slot);
+            }
+        }
+        built.sort_unstable();
+        assert_eq!(built, [0, 1, 2], "three slots for a target of three");
+        assert_eq!(
+            pool.snapshot(),
+            Snapshot {
+                idle: 3,
+                spawning: 0,
+                held: 0
+            }
+        );
+        assert_eq!(
+            sim.state().ensured,
+            [0, 1, 2],
+            "each user was made once, and none for a refill past the target"
+        );
     }
 
     // 8. Fence and maintenance.

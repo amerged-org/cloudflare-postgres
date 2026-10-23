@@ -35,6 +35,28 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Idle slots the pool keeps for each start that may run at once (`start_concurrency` of the node's
+/// policy), so that a storm of wakes finds a slot for most of its wakes instead of building one
+/// inside each (EU1, 2026-10-23: 8 idle slots met a storm of 40 wakes, the other 32 were built at 1
+/// to 4 s each on a saturated CPU). The pool is refilled only while the node is quiet, so it must
+/// hold what a storm takes before the next quiet moment. The cost is memory: an idle slot holds
+/// about 0.6 MiB (`memory.current` of 610 to 623 KiB with its namespaces, peak 2.6 to 2.9 MiB
+/// while it is built; measured live with 309 volumes mounted), so the 32 slots of EU1's 8 starts
+/// at once are about 20 MiB, 0.2 % of the awake-database budget, and 64 starts at once, the
+/// contract's largest, about 150 MiB. No node-policy field: the start cap is the operator's
+/// measure of what the node starts at once.
+pub(crate) const IDLE_PER_START: usize = 4;
+
+/// Slots the refill builds at once while the pool is short. A build is about 80 ms of CPU, spent at
+/// the idle weight, and the refill runs only on a quiet node, so a few at a time empty the shortfall
+/// of a storm in a few builds' time instead of one build's time for each slot.
+pub(crate) const BUILDS_AT_ONCE: usize = 4;
+
+/// The idle slots the pool keeps for `start_concurrency` starts at once.
+pub(crate) fn idle_target(start_concurrency: usize) -> usize {
+    start_concurrency.saturating_mul(IDLE_PER_START)
+}
+
 /// What a start is for, in the admission event and the wake's phases.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StartAs<'a> {
@@ -138,6 +160,19 @@ fn ticket_matches(request: &WakeRequest, entry: &Entry, claimed: bool) -> Result
         return Err(Stale::Role);
     }
     Ok(())
+}
+
+/// Whether the ticket is ahead of the entry of the page: the page lacks a generation or a route
+/// revision the ticket names, so the page has to catch up and the ticket may be fine. The ticket is
+/// ahead when it is more than the next generation, when its route revision is above the entry's
+/// (the claim of the ticket's own wake and every other mutation raise it), or when the entry is a
+/// manual suspension and the ticket is above its generation (D1 moved on with a resume). A ticket
+/// of the entry's own generation or below, or of a lower route revision, is stale for good: no page
+/// makes it right, and waiting would only hold its client.
+pub(crate) fn ticket_ahead(request: &WakeRequest, entry: &Entry) -> bool {
+    request.generation > entry.generation.saturating_add(1)
+        || request.route_revision > entry.route_revision
+        || (entry.desired == Desired::Suspended && request.generation > entry.generation)
 }
 
 /// Whole milliseconds, rounded up: a step of 1 took at most a millisecond.
@@ -260,6 +295,14 @@ impl<M: Machine> Core<M> {
     /// The database's volume, of the storage generation the page serves.
     pub(crate) fn volume_id(entry: &Entry) -> Option<VolumeId> {
         VolumeId::new(&entry.id, entry.storage_generation).ok()
+    }
+
+    /// Whether the node holds a page entry of the wake's database that the ticket is ahead of
+    /// (`ticket_ahead`): a pull of the page is what the wake waits for.
+    pub(crate) fn page_behind(&self, request: &WakeRequest) -> bool {
+        self.find(&request.database)
+            .and_then(|db| db.view().entry.clone())
+            .is_some_and(|entry| ticket_ahead(request, &entry))
     }
 
     /// Starts PostgreSQL for `entry` through admission and waits for it to accept connections, up
@@ -425,10 +468,10 @@ impl<M: Machine> Core<M> {
     }
 
     /// One pass of the pool's refill (`slots`): while the node takes no start and waits for none,
-    /// one idle slot at a time up to `start_concurrency`, and then the users of the numbers that
-    /// have none, one at a time, to the end of the pool's range, so that a storm of wakes never
-    /// finds a number without its user (a wake makes none). A fenced node and one in maintenance
-    /// have no idle slots.
+    /// idle slots up to `idle_target`, `BUILDS_AT_ONCE` at a time while the pool is short, and then
+    /// the users of the numbers that have none, one at a time, to the end of the pool's range, so
+    /// that a storm of wakes never finds a number without its user (a wake makes none). A fenced
+    /// node and one in maintenance have no idle slots.
     pub async fn refill_pass(self: &Arc<Self>) {
         loop {
             if self.fences.fenced() || self.maintenance.load(Ordering::Relaxed) {
@@ -437,14 +480,23 @@ impl<M: Machine> Core<M> {
             }
             // The build costs the node about 80 ms of CPU, which a wake must not wait for: it is
             // made only when no start is in flight or waits. So is a user, which locks the node's
-            // account files for about 75 ms.
+            // account files for about 75 ms. The slot itself runs at the idle CPU weight from its
+            // first moment (`limits::idle`), so what a build costs yields to a database that wakes
+            // meanwhile.
             if !self.admission.quiet().await {
                 return;
             }
-            let target = self.policy().admission.admission.start_concurrency;
-            // A build that fails ends no pass: the user of the next number is still to be made,
-            // which is what lets the next build leave the number that failed.
-            if let Ok(Some(_)) = self.machine.refill_slot(target).await {
+            let target = idle_target(self.policy().admission.admission.start_concurrency);
+            let held = self.machine.slots();
+            let missing = target.saturating_sub(held.idle + held.spawning);
+            // A pool a storm emptied is built several slots at a time. A build that fails ends no
+            // pass: the user of the next number is still to be made, which is what lets the next
+            // build leave the number that failed.
+            let built = futures_util::future::join_all(
+                (0..missing.min(BUILDS_AT_ONCE)).map(|_| self.machine.refill_slot(target)),
+            )
+            .await;
+            if built.iter().any(|slot| matches!(slot, Ok(Some(_)))) {
                 continue;
             }
             match self.machine.make_slot_user().await {
@@ -1263,50 +1315,63 @@ impl<M: Machine> Core<M> {
     }
 
     /// Puts to sleep the awake databases that nobody used for their idle time (plan 3.2), and
-    /// tells admission when each was last used, which early sleep picks from.
+    /// tells admission when each was last used, which early sleep picks from. The databases are
+    /// looked at `start_concurrency` at a time, and each sleep is the whole proof of plan 7.9
+    /// (EU1, 2026-10-23: one at a time, a sleep takes 2 to 3 s, so after a storm the awake count
+    /// drained at about 0.4 a second, and one sleep that waited for the archive held up all the
+    /// others). Every database has its own flow lock, so two sleeps never meet on a database; the
+    /// archive jobs keep their own limits (`Jobs`), and a sleep that waits for them holds its
+    /// place and no more.
     pub async fn idle_pass(self: &Arc<Self>) {
-        for db in self.all() {
-            let (entry, since, backup, put_off) = {
-                let view = db.view();
-                if view.phase != Phase::Ready {
-                    continue;
-                }
-                (
-                    view.entry.clone(),
-                    view.awake_since_ms,
-                    view.state.as_ref().and_then(|state| state.backup.clone()),
-                    view.backup_put_off_ms,
-                )
-            };
-            let Some(entry) = entry else { continue };
-            // An always-warm database takes its backup while it serves. So does one that was put
-            // off for the longest: the idle sleep that would take it does not come while the
-            // database is used.
-            if (entry.sleep_after_seconds.is_none() || put_off_for_the_longest(put_off, now_ms()))
-                && super::build::backup_due(backup.as_ref(), None, now_ms())
-            {
-                self.spawn_served_backup(&db);
+        use futures_util::StreamExt;
+        let at_once = self.policy().admission.admission.start_concurrency.max(1);
+        futures_util::stream::iter(self.all())
+            .for_each_concurrent(at_once, |db| self.idle_check(db))
+            .await;
+    }
+
+    /// One database's turn of the idle pass.
+    async fn idle_check(self: &Arc<Self>, db: Arc<Db>) {
+        let (entry, since, backup, put_off) = {
+            let view = db.view();
+            if view.phase != Phase::Ready {
+                return;
             }
-            // Without the gateway there is no way to know that nobody uses the database.
-            let Some(activity) = self.gateway.activity(&db.id).await else {
-                continue;
-            };
-            let now = now_ms();
-            let last = activity
-                .last_activity_ms
-                .unwrap_or(0)
-                .max(since.unwrap_or(now))
-                .min(now);
-            let age = Duration::from_millis(u64::try_from(now - last).unwrap_or(0));
-            self.admission
-                .activity(&db.id, tokio::time::Instant::now() - age);
-            let Some(idle) = entry.sleep_after_seconds else {
-                continue;
-            };
-            let busy = activity.busy_connections > 0 || activity.pending_dials > 0;
-            if !busy && age >= Duration::from_secs(idle) && entry.desired == Desired::Running {
-                self.sleep(&db, Why::Idle).await;
-            }
+            (
+                view.entry.clone(),
+                view.awake_since_ms,
+                view.state.as_ref().and_then(|state| state.backup.clone()),
+                view.backup_put_off_ms,
+            )
+        };
+        let Some(entry) = entry else { return };
+        // An always-warm database takes its backup while it serves. So does one that was put
+        // off for the longest: the idle sleep that would take it does not come while the
+        // database is used.
+        if (entry.sleep_after_seconds.is_none() || put_off_for_the_longest(put_off, now_ms()))
+            && super::build::backup_due(backup.as_ref(), None, now_ms())
+        {
+            self.spawn_served_backup(&db);
+        }
+        // Without the gateway there is no way to know that nobody uses the database.
+        let Some(activity) = self.gateway.activity(&db.id).await else {
+            return;
+        };
+        let now = now_ms();
+        let last = activity
+            .last_activity_ms
+            .unwrap_or(0)
+            .max(since.unwrap_or(now))
+            .min(now);
+        let age = Duration::from_millis(u64::try_from(now - last).unwrap_or(0));
+        self.admission
+            .activity(&db.id, tokio::time::Instant::now() - age);
+        let Some(idle) = entry.sleep_after_seconds else {
+            return;
+        };
+        let busy = activity.busy_connections > 0 || activity.pending_dials > 0;
+        if !busy && age >= Duration::from_secs(idle) && entry.desired == Desired::Running {
+            self.sleep(&db, Why::Idle).await;
         }
     }
 
@@ -1563,6 +1628,59 @@ mod tests {
             role_revision_hash: entry.role_hash(),
             queued_at_ms: 0,
         }
+    }
+
+    /// A ticket is ahead of the page when the page is what must catch up (a generation or a route
+    /// revision the node lacks), and only then: a ticket the page has passed is stale for good.
+    #[test]
+    fn a_ticket_is_ahead_of_the_page_only_when_the_page_lacks_what_the_ticket_names() {
+        let mut page = Entry::parse(&crate::agent::testing::new_entry_json()).unwrap();
+        page.route_revision = 5;
+        let (g, r, wake) = (
+            page.generation,
+            page.route_revision,
+            "op_wwwwwwwwwwwwwwwwwwww",
+        );
+        let ahead = |entry: &Entry, generation: u64, route: u64| {
+            ticket_ahead(&ticket_for(entry, generation, wake, route), entry)
+        };
+        assert!(
+            !ahead(&page, g + 1, r),
+            "the next generation at the entry's route is a wake the page orders"
+        );
+        assert!(
+            ahead(&page, g + 2, r),
+            "a sleep or a resume made a generation the page lacks"
+        );
+        assert!(ahead(&page, g + 7, r));
+        assert!(
+            ahead(&page, g + 1, r + 1),
+            "the route revision the claims and mutations raise is above the page's"
+        );
+        assert!(!ahead(&page, g, r), "the entry's own generation");
+        assert!(!ahead(&page, g - 1, r), "a generation the page has passed");
+        assert!(
+            !ahead(&page, g + 1, r - 1),
+            "a route revision the page has passed: the ticket is the stale one"
+        );
+        // After the claim the page holds the ticket's generation: only a route above it is ahead.
+        let claimed = Entry {
+            generation: g + 1,
+            route_revision: r + 1,
+            ..page.clone()
+        };
+        assert!(!ahead(&claimed, g + 1, r + 1));
+        assert!(ahead(&claimed, g + 1, r + 2));
+        // The page holds a manual suspension: D1 resumed it, and the page has not caught up.
+        let suspended = Entry {
+            desired: Desired::Suspended,
+            ..page.clone()
+        };
+        assert!(ahead(&suspended, g + 1, r));
+        assert!(
+            !ahead(&suspended, g, r),
+            "a connection to the suspended database"
+        );
     }
 
     #[test]
@@ -3578,12 +3696,12 @@ mod tests {
         rig.core.refill_pass().await;
         assert_eq!(
             rig.machine.slots().idle,
-            4,
-            "start_concurrency of the policy"
+            idle_target(4),
+            "IDLE_PER_START for each of the policy's starts at once"
         );
         let result = rig.core.wake(&ticket).await;
         assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");
-        assert_eq!(rig.machine.slots().idle, 3);
+        assert_eq!(rig.machine.slots().idle, idle_target(4) - 1);
         eventually(10, "the detail of the hit", || {
             detail_events(&db.id).len() == 2
         })
@@ -3646,8 +3764,8 @@ mod tests {
     }
 
     /// The refill builds nothing while a start is in flight or waits, nor on a node that is fenced
-    /// or in maintenance, and builds one slot at a time up to `start_concurrency` when the node is
-    /// quiet.
+    /// or in maintenance, and builds up to `idle_target(start_concurrency)` idle slots when the
+    /// node is quiet.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_refill_pauses_while_a_start_is_in_flight_and_while_the_node_is_fenced_or_in_maintenance()
      {
@@ -3673,11 +3791,15 @@ mod tests {
         assert_eq!(rig.machine.slots().idle, 0, "a start is in flight");
         assert_eq!(waking.await.unwrap().outcome, WakeOutcome::Started);
 
-        // Quiet: two idle slots, as many as the starts at once.
+        // Quiet: the idle slots of two starts at once.
         rig.core.refill_pass().await;
-        assert_eq!(rig.machine.slots().idle, 2);
+        assert_eq!(rig.machine.slots().idle, idle_target(2));
         rig.core.refill_pass().await;
-        assert_eq!(rig.machine.slots().idle, 2, "no more than the target");
+        assert_eq!(
+            rig.machine.slots().idle,
+            idle_target(2),
+            "no more than the target"
+        );
 
         // In maintenance the idle slots stop and none is built.
         rig.core.maintenance.store(true, Ordering::Relaxed);
@@ -3685,7 +3807,7 @@ mod tests {
         assert_eq!(rig.machine.slots().idle, 0);
         rig.core.maintenance.store(false, Ordering::Relaxed);
         rig.core.refill_pass().await;
-        assert_eq!(rig.machine.slots().idle, 2);
+        assert_eq!(rig.machine.slots().idle, idle_target(2));
         // A fence stops them too, and the node builds none while it stands.
         rig.core.fences.fence("op_ffffffffffffffffffff").unwrap();
         rig.core.refill_pass().await;
@@ -3725,7 +3847,7 @@ mod tests {
 
         // Quiet: the idle slots first, then every number of the range has its user.
         rig.core.refill_pass().await;
-        assert_eq!(rig.machine.slots().idle, 2);
+        assert_eq!(rig.machine.slots().idle, idle_target(2));
         assert_eq!(
             rig.machine.slot_users(),
             crate::units::slots::POOL.len(),
@@ -3751,11 +3873,97 @@ mod tests {
         rig.machine.stray_slot(0);
 
         rig.core.refill_pass().await;
-        assert_eq!(rig.machine.slots().idle, 1, "built on the next number");
+        assert_eq!(
+            rig.machine.slots().idle,
+            idle_target(1),
+            "built on the next numbers"
+        );
         assert_eq!(
             rig.machine.slot_users(),
             crate::units::slots::POOL.len(),
             "and the quiet pass went on to the users of the whole range"
+        );
+    }
+
+    /// The pool is deep enough for a storm and refills in parallel (EU1, 2026-10-23: a storm of 40
+    /// wakes found 8 idle slots, built the other 32 inside the wakes at 1 to 4 s each on a busy
+    /// CPU): `IDLE_PER_START` idle slots for each start that may run at once, and when the pool is
+    /// short, `BUILDS_AT_ONCE` builds at a time, each user made once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_refill_builds_several_slots_at_once_up_to_four_idle_slots_for_each_start() {
+        let Some(rig) = Rig::new("refill-parallel").await else {
+            return;
+        };
+        rig.core
+            .set_policy(crate::agent::testing::policy_with_start_concurrency(Some(
+                2,
+            )));
+        rig.machine.drain_idle_slots().await;
+        // A node just installed: the user of number 0 exists, and the others are made as the
+        // builds need them.
+        rig.machine.limit_slot_users(1).await;
+        rig.machine.delay_slot_builds(Duration::from_millis(100));
+
+        rig.core.refill_pass().await;
+        assert_eq!((IDLE_PER_START, BUILDS_AT_ONCE), (4, 4));
+        assert_eq!(rig.machine.slots().idle, 2 * IDLE_PER_START);
+        assert_eq!(
+            rig.machine.slot_builds_at_once(),
+            BUILDS_AT_ONCE,
+            "an empty pool is built several slots at a time"
+        );
+        let made = rig.machine.user_calls();
+        let distinct: std::collections::BTreeSet<_> = made.iter().collect();
+        assert_eq!(made.len(), distinct.len(), "a user is made once: {made:?}");
+    }
+
+    /// Idle databases sleep `start_concurrency` at a time (EU1, 2026-10-23: one at a time, about
+    /// 0.4 a second, so that the awake count took up to 7 minutes to drain after a storm), and each
+    /// sleep is the whole proof: the record is written, the unit is stopped, the database is asleep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_databases_sleep_start_concurrency_at_a_time_each_with_its_whole_proof() {
+        let Some(rig) = Rig::new("idle-parallel").await else {
+            return;
+        };
+        rig.core
+            .set_policy(crate::agent::testing::policy_with_start_concurrency(Some(
+                2,
+            )));
+        let gateway = rig.connect_gateway().await;
+        // Three databases that are awake and unused for longer than their idle time. One database
+        // awake at a time while they are made: the test machine tells the callers of the archive
+        // socket apart only when a single database holds a slot.
+        let mut awake = Vec::new();
+        for _ in 0..3 {
+            let (entry, db) = rig.create().await;
+            assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+            awake.push((entry, db));
+        }
+        for (entry, _) in &awake {
+            let woken = rig.core.wake(&Rig::ticket(entry)).await;
+            assert_eq!(woken.outcome, WakeOutcome::Started, "{woken:?}");
+        }
+        gateway.sessions.lock().unwrap().last_activity_ms = Some(now_ms() - 61_000);
+        for (_, db) in &awake {
+            db.view().awake_since_ms = Some(now_ms() - 120_000);
+        }
+
+        // The first two stops wait for each other: they are under way at the same time or the
+        // test fails after the wait.
+        rig.machine.meet_in_stops(2);
+        rig.core.idle_pass().await;
+        for (entry, db) in &awake {
+            assert_eq!(db.phase(), Phase::Asleep, "{}", entry.id);
+            assert!(!rig.machine.running(&entry.id));
+            assert!(
+                db.state().unwrap().record.is_some(),
+                "the proven-sleep record is written"
+            );
+        }
+        assert_eq!(
+            rig.machine.stops_at_once(),
+            2,
+            "two at a time, as many as the starts at once"
         );
     }
 

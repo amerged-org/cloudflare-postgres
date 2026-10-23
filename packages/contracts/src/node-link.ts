@@ -1581,8 +1581,8 @@ export const NodeEvent = z.discriminatedUnion("type", [
       start: z.enum(ADMISSION_STARTS),
       decision: z.enum(["admitted", "refused"]),
       /**
-       * Exactly a refusal names its reason, and exactly the refusal of awake capacity the retry
-       * hint its client got (`refusalRetryHint`).
+       * Exactly a refusal names its reason, and exactly the refusals that waiting undoes (awake
+       * capacity, the start cap) the retry hint its client got (`refusalRetryHint`).
        */
       reason: z.enum(ADMISSION_REFUSALS).optional(),
       retry_after_seconds: z.number().int().min(1).max(300).optional(),
@@ -1603,7 +1603,8 @@ export const NodeEvent = z.discriminatedUnion("type", [
         ctx.addIssue({
           code: "custom",
           path: ["retry_after_seconds"],
-          message: "Exactly the refusal of awake capacity carries a retry hint",
+          message:
+            "Exactly the refusals that waiting undoes carry a retry hint",
         });
     }),
   /** An idle-but-awake database put to sleep early for a waiting wake (D2). */

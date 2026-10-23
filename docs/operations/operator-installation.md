@@ -1269,6 +1269,15 @@ read 2 s after the release, carries `nr_throttled` and `throttled_usec` since th
 none inside a burst of 2 s or more, the quota's throttling at `0` (the A/B in the plan, 11.2,
 compares the two).
 
+`start_concurrency` also sets how many things the node does at once besides starts. It keeps four
+idle slots for each start (32 at 8; an idle slot holds about 0.6 MiB, so 32 are about 20 MiB inside
+the awake budget, and the contract's largest value, 64, about 150 MiB), builds four of them at a
+time when a storm emptied the pool, and puts that many idle databases to sleep at a time; each sleep
+keeps its whole proof, and the uploads of the sleeps still wait for the `backup` limits above (plan
+4.7, 5.10). A wake that waits for a free start longer than `queue_wait_ms` while memory is available
+is refused `57P03` with DETAIL "node busy starting databases", and one that waits for memory with
+DETAIL "node at awake capacity" (plan 4.6); both count towards the capacity alert.
+
 The starting values come from plan sections 4.3 to 4.6 and 7.5 and stay estimates until Stage 5
 measures the node; the memory budget is the visible RAM minus the system, the mounted volumes, the
 backup jobs and the page-cache floor (plan 4.5). `awake_budget_mib` is also the memory limit of

@@ -41,6 +41,8 @@ export interface SampleSeed {
   volumes?: number;
   /** Wakes the node refused for awake capacity in this sample's minute. */
   refusals?: number;
+  /** Wakes the node refused because the start cap kept them waiting, in this sample's minute. */
+  startQueueRefusals?: number;
 }
 export const NODE_BYTES = 10 * GIB;
 
@@ -120,8 +122,8 @@ export function sampleStatements(
         `INSERT OR REPLACE INTO node_minutes(node_id,minute,samples,memory_total_bytes,memory_used_bytes_sum,memory_used_bytes_max,
           cpu_cores,cpu_busy_millicores_sum,cpu_busy_millicores_max,no_room_samples,
           pool_data_total_bytes,pool_data_used_bytes,pool_metadata_total_bytes,pool_metadata_used_bytes,pool_nominal_bytes,
-          refused_no_headroom)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          refused_no_headroom,refused_start_queue)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).bind(
         nodeId,
         minute,
@@ -139,6 +141,7 @@ export function sampleStatements(
         pool?.metadataUsed ?? null,
         pool?.nominal ?? null,
         group.reduce((sum, seed) => sum + (seed.refusals ?? 0), 0),
+        group.reduce((sum, seed) => sum + (seed.startQueueRefusals ?? 0), 0),
       ),
     );
   }

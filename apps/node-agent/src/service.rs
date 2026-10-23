@@ -25,7 +25,7 @@ use crate::{
 use pgcf_native_protocol::wake::WakeRequest;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -159,6 +159,9 @@ pub struct Service<M: Machine> {
     verdict: Mutex<Option<(update::Release, Result<(), update::ReleaseRefusal>)>>,
     /// The probes an administrator asked for that the agent has answered or is running (SEC-09).
     probes: probe::Answered,
+    /// The databases whose page a wake waits for (`catch_up`), which `wanted_pulls` pulls together.
+    wanted: Mutex<BTreeSet<String>>,
+    wanted_signal: Notify,
     /// A release is being installed.
     updating: AtomicBool,
     /// The release that was installed runs another agent: the agent restarts to run it.
@@ -170,6 +173,11 @@ pub struct Service<M: Machine> {
 
 /// How often the pool of idle slots is looked at when no start told it to.
 const SLOTS_EVERY: Duration = Duration::from_secs(5);
+
+/// How often a wake that waits for its page asks for it again, and how often it looks whether it
+/// came.
+const PAGE_RETRY: Duration = Duration::from_secs(1);
+const PAGE_POLL: Duration = Duration::from_millis(10);
 
 /// The identifiers of the archive credentials an entry of the page needs: its own, and the one
 /// that reads the archive it is built from.
@@ -271,6 +279,8 @@ impl<M: Machine> Service<M> {
             release_key: config.release_key,
             verdict: Mutex::new(None),
             probes: probe::Answered::load(layout.agent().join("probes-done")),
+            wanted: Mutex::new(BTreeSet::new()),
+            wanted_signal: Notify::new(),
             updating: AtomicBool::new(false),
             restart: Notify::new(),
             superseded: AtomicBool::new(false),
@@ -328,6 +338,8 @@ impl<M: Machine> Service<M> {
 
         let s = service.clone();
         service.spawn(async move { s.follow(&mut events).await });
+        let s = service.clone();
+        service.spawn(async move { s.wanted_pulls().await });
         let s = service.clone();
         service.spawn(async move { s.maintenance().await });
         let s = service.clone();
@@ -540,6 +552,66 @@ impl<M: Machine> Service<M> {
                 LinkEvent::Fenced => {}
             }
         }
+    }
+
+    /// The pulls the wakes ask for (`catch_up`): the databases that wait for their page are pulled
+    /// together, one request for up to 40 of them (more are pulled whole), and a pull that is under
+    /// way does not hold the next one's databases back from being collected. A pull of its own,
+    /// beside the link's hints and the whole page every minute: a wake does not wait for a hint
+    /// that has not come, and a slow pull holds up no other.
+    async fn wanted_pulls(self: &Arc<Self>) {
+        loop {
+            self.wanted_signal.notified().await;
+            let ids: Vec<String> =
+                std::mem::take(&mut *self.wanted.lock().unwrap_or_else(PoisonError::into_inner))
+                    .into_iter()
+                    .collect();
+            if !ids.is_empty() {
+                self.pull(Some(&ids)).await;
+            }
+        }
+    }
+
+    /// A wake whose ticket is ahead of the node's page (`Core::page_behind`): the page is pulled at
+    /// once, and the wake waits for it up to `Timing::page_wait` after the gateway queued it. EU1,
+    /// 2026-10-23: a connection right after an idle sleep brings the generation the sleep made,
+    /// the node has not pulled it, and 16.7 % of 1,000 cycle wakes were refused `desired_stale`
+    /// for 1 to 7 s, for 32.6 s with the link to the API down. Nothing else changes: when the wait
+    /// ends, the wake meets the same checks against the page it has, and a ticket the page does not
+    /// order is refused as before. The pull is asked for again every second while the page is
+    /// behind, as one that failed would otherwise cost the whole wait.
+    async fn catch_up(self: &Arc<Self>, request: &WakeRequest) {
+        if !self.core.page_behind(request) {
+            return;
+        }
+        let queued = Duration::from_millis(
+            u64::try_from(crate::agent::now_ms())
+                .unwrap_or(0)
+                .saturating_sub(request.queued_at_ms),
+        );
+        let deadline = Instant::now() + self.core.timing.page_wait.saturating_sub(queued);
+        let mut ask = Instant::now();
+        loop {
+            if Instant::now() >= ask {
+                self.want_page(&request.database);
+                ask = Instant::now() + PAGE_RETRY;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(PAGE_POLL).await;
+            if !self.core.page_behind(request) {
+                return;
+            }
+        }
+    }
+
+    fn want_page(&self, database: &str) {
+        self.wanted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(database.to_string());
+        self.wanted_signal.notify_one();
     }
 
     /// The whole page again at an interval: a message the link lost is made up for.
@@ -1108,11 +1180,14 @@ impl<M: Machine> Service<M> {
             let service = self.clone();
             tokio::spawn(async move {
                 // A database the page does not name yet: it is pulled once, as the page may be
-                // ahead of the node.
+                // ahead of the node. One it names, at a generation or a route the ticket is
+                // ahead of, is pulled at once, and the wake waits for the page.
                 if service.core.find(&request.database).is_none() {
                     service
                         .pull(Some(std::slice::from_ref(&request.database)))
                         .await;
+                } else {
+                    service.catch_up(&request).await;
                 }
                 let result = service.core.wake(&request).await;
                 // `wake_in_progress` is no answer: the gateway asks again.
@@ -1943,6 +2018,159 @@ mod tests {
             undecided(&service) == 0
         })
         .await;
+        service.stop();
+    }
+
+    /// A connection right after an idle sleep brings a ticket of the generation the sleep made,
+    /// and the node's page is behind it (EU1, 2026-10-23: 16.7 % of 1,000 cycle wakes were refused
+    /// `desired_stale`, for 1 to 7 s, and for 32.6 s with the link to the API down). The node pulls
+    /// the page of the database at once and the wake waits for it, up to the wait: a ticket the
+    /// page then matches is admitted, one it still does not match is refused as before, and none is
+    /// admitted that the page does not order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_ahead_of_the_page_pulls_it_at_once_and_waits_for_it_within_a_bound() {
+        let Some((machine, _fixture, _root)) =
+            site("wake-ahead", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let (link, events) = Link::start(
+            LinkConfig {
+                paths: crate::link::Paths::new(&base),
+                image_version: "25".into(),
+                agent_version: "0.1.0".into(),
+                release_id: None,
+                os: crate::machine::os_report(&*machine).await.unwrap(),
+                timing: LinkTiming {
+                    interval: Duration::from_millis(300),
+                    ..LinkTiming::default()
+                },
+            },
+            Transport::new(cloud.roots()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut db = new_entry_json();
+        let id = db["id"].as_str().unwrap().to_string();
+        let credential = db["archive"]["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        cloud.with(|inner| {
+            inner.databases = vec![db.clone()];
+            inner.credential_paths.insert(credential, path);
+        });
+        let service = Service::start(
+            machine.clone(),
+            link,
+            events,
+            ServiceConfig {
+                intervals: quick(),
+                timing: crate::agent::Timing {
+                    page_wait: Duration::from_millis(1500),
+                    ..timing()
+                },
+                gateway: None,
+                release_key: test_release_key(),
+            },
+        )
+        .await
+        .unwrap();
+        eventually(90, "the cloud to be told the database is ready", || {
+            observed(&cloud, &id, "ready")
+        })
+        .await;
+        let mut gateway = FakeGateway::connect(&machine.layout().gateway_socket()).await;
+        let node = service
+            .core()
+            .find(&id)
+            .unwrap()
+            .view()
+            .entry
+            .clone()
+            .unwrap();
+        // D1 moved on by one generation, with a route revision more, and no hint has reached the
+        // node: its page is behind. The ticket is the next generation of what D1 has.
+        db.as_object_mut().unwrap().remove("origin");
+        db["generation"] = (node.generation + 1).into();
+        db["operation"] = "op_dddddddddddddddddddd".into();
+        db["route_revision"] = (node.route_revision + 1).into();
+        cloud.with(|inner| inner.databases = vec![db.clone()]);
+        let ahead = crate::agent::Entry::parse(&db).unwrap();
+        let answered = |gateway: &FakeGateway, operation: &str| {
+            gateway
+                .received()
+                .into_iter()
+                .filter_map(|message| match message {
+                    ToGateway::WakeResult { result } if result.operation == operation => {
+                        Some(result)
+                    }
+                    _ => None,
+                })
+                .next_back()
+        };
+
+        // A ticket the page can match: the node pulls the database's page, and the wake is admitted
+        // well inside the wait.
+        let began = Instant::now();
+        let mut ticket = Rig::ticket(&ahead);
+        ticket.operation = "op_wwwwwwwwwwwwwwwwwwww".into();
+        gateway.send_wake(ticket.clone()).await;
+        eventually(30, "the wake to be answered", || {
+            answered(&gateway, &ticket.operation).is_some()
+        })
+        .await;
+        let result = answered(&gateway, &ticket.operation).unwrap();
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (Outcome::Started, None),
+            "{result:?}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(
+            service
+                .core()
+                .find(&id)
+                .unwrap()
+                .view()
+                .entry
+                .as_ref()
+                .unwrap()
+                .generation,
+            ahead.generation,
+            "the page was pulled"
+        );
+
+        // A ticket the page, once pulled, still does not match: the wake waits for the page up to
+        // the wait and is refused as it was.
+        let mut beyond = Rig::ticket(&ahead);
+        beyond.generation += 1;
+        beyond.operation = "op_xxxxxxxxxxxxxxxxxxxx".into();
+        let began = Instant::now();
+        gateway.send_wake(beyond.clone()).await;
+        eventually(30, "the wake beyond the page to be answered", || {
+            answered(&gateway, &beyond.operation).is_some()
+        })
+        .await;
+        let result = answered(&gateway, &beyond.operation).unwrap();
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (Outcome::Refused, Some("desired_stale")),
+            "{result:?}"
+        );
+        assert!(
+            began.elapsed() >= Duration::from_millis(1400),
+            "it waited for the page: {:?}",
+            began.elapsed()
+        );
         service.stop();
     }
 

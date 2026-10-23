@@ -879,6 +879,77 @@ async fn eight_idle_slots_cost_less_than_the_idle_ceiling_each() {
     );
 }
 
+/// The refill builds several slots at once on a real systemd (the agent does after a storm, four at
+/// a time): the refills decide one at a time in the pool's turn, so sixteen of them for a target of
+/// sixteen build sixteen, each on its own number with its own user and unit, and the memory the
+/// units hold is what sixteen slots built one after another hold. The time of both and the memory
+/// the units hold are printed: the cost of a deep pool (plan 4.5, 5.6).
+#[tokio::test]
+#[ignore = "needs systemd as PID 1, root, PostgreSQL 18 and the node image's units (lab)"]
+async fn sixteen_slots_built_four_at_a_time_are_all_idle_and_cost_what_sixteen_built_one_by_one_cost()
+ {
+    let (lab, _database) = Lab::new("i").await;
+    let pool = &lab.pool;
+    let slice = Path::new("/sys/fs/cgroup/pgcf.slice");
+    let held_mib = || -> f64 {
+        POOL.map(|slot| {
+            fs::read_to_string(slice.join(slot_unit(slot)).join("memory.current"))
+                .ok()
+                .and_then(|text| text.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+        })
+        .sum::<f64>()
+            / (1024.0 * 1024.0)
+    };
+
+    // One after the other, as the refill built them until now.
+    let began = Instant::now();
+    for _ in 0..16 {
+        assert!(pool.refill(16).await.unwrap().is_some());
+    }
+    let one_by_one = began.elapsed();
+    assert_eq!(pool.snapshot().idle, 16);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let sequential_held = held_mib();
+    assert_eq!(pool.drain_idle().await, 16);
+
+    // Four at a time, and a refill past the target builds nothing.
+    let began = Instant::now();
+    for _ in 0..4 {
+        let built = futures_util::future::join_all((0..4).map(|_| pool.refill(16))).await;
+        assert!(
+            built.iter().all(|slot| matches!(slot, Ok(Some(_)))),
+            "{built:?}"
+        );
+    }
+    let at_once = began.elapsed();
+    assert_eq!(pool.snapshot().idle, 16);
+    assert_eq!(pool.refill(16).await.unwrap(), None, "past the target");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let parallel_held = held_mib();
+    let active = POOL
+        .filter(|slot| show(&slot_unit(*slot), "ActiveState") == "active")
+        .count();
+    assert_eq!(active, 16, "sixteen distinct units run the supervisor");
+    println!(
+        "slot_lab sixteen slots: one by one {:.0} ms, four at a time {:.0} ms; held by the units {:.1} / {:.1} MiB",
+        one_by_one.as_secs_f64() * 1000.0,
+        at_once.as_secs_f64() * 1000.0,
+        sequential_held,
+        parallel_held,
+    );
+    // The ceiling of the unit file holds each with room to spare, and the way they were built
+    // changes what they hold by no more than their own noise.
+    assert!(
+        parallel_held / 16.0 < 28.0,
+        "{parallel_held} MiB for sixteen"
+    );
+    assert!(
+        (parallel_held - sequential_held).abs() < 8.0,
+        "{parallel_held} against {sequential_held} MiB"
+    );
+}
+
 /// An agent that dies loses its table and nothing else: the slots run on, and the next agent reads
 /// them back from the kernel. After a boot there is nothing to read: the units are gone with
 /// `/run`, the users stay.

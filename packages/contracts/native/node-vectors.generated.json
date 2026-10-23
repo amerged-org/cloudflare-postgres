@@ -16736,6 +16736,20 @@
             "reason": "no_room",
             "waited_ms": 10000,
             "memory_mib": 256
+          },
+          {
+            "type": "admission",
+            "id": "22222222-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "start": "wake",
+            "decision": "refused",
+            "reason": "start_queue",
+            "retry_after_seconds": 5,
+            "waited_ms": 10000,
+            "memory_mib": 256
           }
         ]
       }
@@ -17087,6 +17101,30 @@
             "start": "wake",
             "decision": "refused",
             "reason": "no_headroom",
+            "waited_ms": 10000,
+            "memory_mib": 256
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeEventReport",
+      "name": "start-queue-without-retry-hint",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "events": [
+          {
+            "type": "admission",
+            "id": "aaaaaaaa-1111-4111-8111-111111111111",
+            "at": "2026-10-17T12:00:00.000Z",
+            "database": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "start": "wake",
+            "decision": "refused",
+            "reason": "start_queue",
             "waited_ms": 10000,
             "memory_mib": 256
           }

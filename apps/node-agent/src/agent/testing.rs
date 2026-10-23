@@ -146,6 +146,7 @@ pub(crate) fn timing() -> Timing {
         recovery_retry: Duration::from_millis(100),
         recovery_retry_maximum: Duration::from_millis(400),
         adopt_wait: Duration::from_secs(5),
+        page_wait: Duration::from_secs(2),
         report_retry: Duration::from_millis(10),
         report_retry_maximum: Duration::from_millis(40),
         host_files_retry: Duration::from_millis(500),

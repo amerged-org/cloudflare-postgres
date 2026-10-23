@@ -1675,6 +1675,8 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
             reason: "no_room",
             retry_after_seconds: undefined,
           },
+          // The start cap alone held the start back: waiting undoes it, so it has the hint.
+          { ...admission, id: eventId("2"), reason: "start_queue" },
         ],
       },
       true,
@@ -1743,6 +1745,20 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     [
       "refused-without-retry-hint",
       { events: [{ ...admission, retry_after_seconds: undefined }] },
+      false,
+      true,
+    ],
+    [
+      "start-queue-without-retry-hint",
+      {
+        events: [
+          {
+            ...admission,
+            reason: "start_queue",
+            retry_after_seconds: undefined,
+          },
+        ],
+      },
       false,
       true,
     ],

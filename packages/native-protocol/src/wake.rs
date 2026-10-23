@@ -31,9 +31,10 @@ pub const MAX_HELD_PER_DATABASE: usize = 32;
 pub const MAX_HELD_TOTAL: usize = 512;
 /// Every reason the node agent's wake result may name (`WAKE_REASONS` of
 /// `packages/contracts/src/node-local.ts`).
-pub const REASONS: [&str; 19] = [
+pub const REASONS: [&str; 20] = [
     "no_room",
     "no_headroom",
+    "start_queue",
     "deleted",
     "suspended",
     "moving",
@@ -55,8 +56,9 @@ pub const REASONS: [&str; 19] = [
 /// The one reason that is not an answer (`WAKE_AGAIN_REASON` of the contract): the agent already
 /// serves the wake, so the held connections keep waiting and the ticket is delivered again.
 pub const AGAIN_REASON: &str = "wake_in_progress";
-/// The one refusal that waiting can undo, and so the only one with a retry hint.
-pub const RETRY_REASON: &str = "no_headroom";
+/// The refusals that waiting can undo, and so the only ones with a retry hint: the wait for awake
+/// capacity and the wait for the start cap (`refusalRetryHint` of the contract).
+pub const RETRY_REASONS: [&str; 2] = ["no_headroom", "start_queue"];
 /// The longest retry hint, in seconds.
 pub const RETRY_AFTER_MAX_SECONDS: u32 = 300;
 /// The DETAIL of the 57P03 that answers a refused wake (`ADMISSION_REFUSAL_DETAILS` of the
@@ -65,12 +67,14 @@ pub fn refusal_detail(reason: &str) -> Option<&'static str> {
     match reason {
         "no_room" => Some("storage"),
         "no_headroom" => Some("node at awake capacity"),
+        "start_queue" => Some("node busy starting databases"),
         _ => None,
     }
 }
 /// The HINT of that 57P03: `retry after <n> s` for the refusal that carries a retry hint.
 pub fn refusal_hint(reason: &str, retry_after_seconds: Option<u32>) -> Option<String> {
-    (reason == RETRY_REASON)
+    RETRY_REASONS
+        .contains(&reason)
         .then_some(retry_after_seconds)
         .flatten()
         .map(|seconds| format!("retry after {seconds} s"))
@@ -300,7 +304,7 @@ pub struct WakeResult {
     pub outcome: Outcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// The HINT of the 57P03, exactly with `no_headroom` (`RETRY_REASON`).
+    /// The HINT of the 57P03, exactly with the reasons of `RETRY_REASONS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -321,8 +325,8 @@ impl WakeResult {
             None => (None, None),
         }
     }
-    /// `started`, or `refused` with a reason of `REASONS`. Exactly the refusal that waiting can
-    /// undo carries the retry hint.
+    /// `started`, or `refused` with a reason of `REASONS`. Exactly the refusals that waiting can
+    /// undo carry the retry hint.
     pub fn valid(&self) -> bool {
         valid_pattern("database", &self.database)
             && valid_pattern("operation", &self.operation)
@@ -330,7 +334,7 @@ impl WakeResult {
             && match (&self.outcome, &self.reason, self.retry_after_seconds) {
                 (Outcome::Started, None, None) => true,
                 (Outcome::Refused, Some(reason), seconds) if REASONS.contains(&reason.as_str()) => {
-                    (reason == RETRY_REASON) == seconds.is_some()
+                    RETRY_REASONS.contains(&reason.as_str()) == seconds.is_some()
                         && seconds.is_none_or(|s| (1..=RETRY_AFTER_MAX_SECONDS).contains(&s))
                 }
                 _ => false,
@@ -362,19 +366,22 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_answers_are_started_or_refused_and_only_no_headroom_carries_the_hint() {
+    fn the_agents_answers_are_started_or_refused_and_only_the_refusals_that_waiting_undoes_carry_the_hint()
+     {
         let valid = |r: WakeResult| r.valid();
         assert!(valid(result(Outcome::Started, None, None)));
         assert!(!valid(result(Outcome::Started, Some("no_room"), None)));
         assert!(!valid(result(Outcome::Started, None, Some(5))));
         for reason in REASONS {
-            let hint = (reason == RETRY_REASON).then_some(5);
+            let hint = (reason == "no_headroom" || reason == "start_queue").then_some(5);
             assert!(
                 valid(result(Outcome::Refused, Some(reason), hint)),
                 "{reason}"
             );
         }
+        assert!(REASONS.contains(&"start_queue"));
         assert!(!valid(result(Outcome::Refused, Some("no_headroom"), None)));
+        assert!(!valid(result(Outcome::Refused, Some("start_queue"), None)));
         assert!(!valid(result(Outcome::Refused, Some("no_room"), Some(5))));
         assert!(!valid(result(
             Outcome::Refused,
@@ -385,6 +392,11 @@ mod tests {
             Outcome::Refused,
             Some("no_headroom"),
             Some(RETRY_AFTER_MAX_SECONDS + 1)
+        )));
+        assert!(!valid(result(
+            Outcome::Refused,
+            Some("start_queue"),
+            Some(0)
         )));
         assert!(!valid(result(
             Outcome::Refused,

@@ -97,6 +97,12 @@ impl Slot {
     }
 }
 
+/// Stops that wait for each other (`Local::meet_in_stops`).
+struct StopMeeting {
+    count: usize,
+    met: bool,
+}
+
 #[derive(Default)]
 struct State {
     /// The units of their own that run on the machine: only what a test started.
@@ -141,6 +147,19 @@ struct State {
     purge_fails: bool,
     /// How long the next start takes before the postmaster begins.
     start_delay: Option<Duration>,
+    /// How long a slot's unit takes to start (the supervisor's, not PostgreSQL's), how many such
+    /// starts were under way at once at the most, and how many are now.
+    slot_build_delay: Option<Duration>,
+    slot_builds: usize,
+    slot_builds_at_once: usize,
+    /// The stops that meet: the first waits until `count` stops are under way at once, so that a
+    /// test shows two sleeps overlapping without depending on how long either takes. The most
+    /// stops under way at once, and how many are now.
+    stop_meeting: Option<StopMeeting>,
+    stops: usize,
+    stops_at_once: usize,
+    /// Every `ensure_user` the pool made, in order.
+    user_calls: Vec<u32>,
     /// LVM, or systemd, cannot be read: what they hold is not known.
     volumes_unreadable: bool,
     /// The next this many questions of `has_volume`, or of `unit`, fail as an unreadable LVM or
@@ -619,6 +638,27 @@ impl Local {
     pub fn delay_next_start(&self, delay: Duration) {
         self.state().start_delay = Some(delay);
     }
+    /// Every slot's unit takes this long to start, as systemd's job does.
+    pub fn delay_slot_builds(&self, delay: Duration) {
+        self.state().slot_build_delay = Some(delay);
+    }
+    /// The most slot units that were being started at once.
+    pub fn slot_builds_at_once(&self) -> usize {
+        self.state().slot_builds_at_once
+    }
+    /// The next stops meet: the first waits (for at most 5 s) until `count` stops are under way at
+    /// once, and then they all go on.
+    pub fn meet_in_stops(&self, count: usize) {
+        self.state().stop_meeting = Some(StopMeeting { count, met: false });
+    }
+    /// The most stops that were under way at once.
+    pub fn stops_at_once(&self) -> usize {
+        self.state().stops_at_once
+    }
+    /// Every slot user the pool asked for, in order.
+    pub fn user_calls(&self) -> Vec<u32> {
+        self.state().user_calls.clone()
+    }
     pub fn fail_next_start(&self) {
         self.state().start_fails = true;
     }
@@ -783,6 +823,41 @@ impl Drop for Shared {
         if let Some(root) = self.layout.state.parent() {
             let _ = fs::remove_dir_all(root);
         }
+    }
+}
+
+impl Local {
+    /// The stop of a database's unit, in its slot or as a unit of its own: the postmaster is asked
+    /// to shut down fast and waited for.
+    async fn stop_unit(&self, database: &str) -> Result<(), units::Error> {
+        {
+            let mut state = self.state();
+            state.calls.push(format!("stop {database}"));
+            state.quotas.insert(database.to_string(), None);
+        }
+        if self.pool.stop(database).await? {
+            return Ok(());
+        }
+        let child = self
+            .state()
+            .legacy
+            .get_mut(database)
+            .and_then(|unit| unit.child.take());
+        if let Some(mut child) = child {
+            let _ = Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status();
+            let started = Instant::now();
+            while child.try_wait().ok().flatten().is_none() {
+                if started.elapsed() > Duration::from_secs(30) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1203,32 +1278,31 @@ impl Machine for Local {
     async fn stop(&self, database: &str) -> Result<(), units::Error> {
         {
             let mut state = self.state();
-            state.calls.push(format!("stop {database}"));
-            state.quotas.insert(database.to_string(), None);
+            state.stops += 1;
+            state.stops_at_once = state.stops_at_once.max(state.stops);
         }
-        if self.pool.stop(database).await? {
-            return Ok(());
-        }
-        let child = self
-            .state()
-            .legacy
-            .get_mut(database)
-            .and_then(|unit| unit.child.take());
-        if let Some(mut child) = child {
-            let _ = Command::new("kill")
-                .args(["-INT", &child.id().to_string()])
-                .status();
-            let started = Instant::now();
-            while child.try_wait().ok().flatten().is_none() {
-                if started.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let waiting = {
+                let mut state = self.state();
+                let count = state.stops;
+                match &mut state.stop_meeting {
+                    Some(meeting) if meeting.met || count >= meeting.count => {
+                        meeting.met = true;
+                        false
+                    }
+                    Some(_) => true,
+                    None => false,
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            if !waiting || Instant::now() >= deadline {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        Ok(())
+        let stopped = self.stop_unit(database).await;
+        self.state().stops -= 1;
+        stopped
     }
     async fn set_limits(&self, database: &str, limits: &Limits) -> Result<(), units::Error> {
         self.pool.set(database, &limits.properties()).await?;
@@ -1861,6 +1935,39 @@ fn unit_assert(slot: u32) -> units::Error {
     }
 }
 
+impl LocalHost {
+    /// The unit's process, which waits for the order and stands for the supervisor.
+    fn spawn_supervisor(&self, slot: u32) -> Result<Spawned, units::Error> {
+        if self.0.state().stray_slots.contains(&slot) {
+            return Err(units::Error::StrayProcesses);
+        }
+        let child = Command::new("sleep")
+            .arg("3600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(units::Error::Io)?;
+        let mut state = self.0.state();
+        let unit = state.slots.entry(slot).or_insert_with(Slot::new);
+        unit.invocations += 1;
+        // An RFC 4122 UUID (variant 8) that names the slot and the start.
+        let invocation = format!("00000000-0000-4000-8{slot:03x}-{:012x}", unit.invocations);
+        let main_pid = child.id();
+        unit.child = Some(child);
+        unit.crashed = false;
+        unit.postgres = false;
+        unit.mounted = None;
+        unit.lock = None;
+        unit.invocation_id = Some(invocation.clone());
+        Ok(Spawned {
+            main_pid,
+            invocation_id: invocation,
+            requested_us: None,
+        })
+    }
+}
+
 impl Host for LocalHost {
     async fn unit(&self, slot: u32) -> Result<SlotUnit, units::Error> {
         let mut state = self.0.state();
@@ -1913,7 +2020,9 @@ impl Host for LocalHost {
     }
 
     async fn ensure_user(&self, slot: u32) -> Result<(), units::Error> {
-        self.0.state().slot_users.insert(slot);
+        let mut state = self.0.state();
+        state.user_calls.push(slot);
+        state.slot_users.insert(slot);
         Ok(())
     }
 
@@ -1926,33 +2035,18 @@ impl Host for LocalHost {
 
     /// The unit starts with a process that waits, which stands for the supervisor.
     async fn start(&self, slot: u32) -> Result<Spawned, units::Error> {
-        if self.0.state().stray_slots.contains(&slot) {
-            return Err(units::Error::StrayProcesses);
+        let delay = {
+            let mut state = self.0.state();
+            state.slot_builds += 1;
+            state.slot_builds_at_once = state.slot_builds_at_once.max(state.slot_builds);
+            state.slot_build_delay
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
-        let child = Command::new("sleep")
-            .arg("3600")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(units::Error::Io)?;
-        let mut state = self.0.state();
-        let unit = state.slots.entry(slot).or_insert_with(Slot::new);
-        unit.invocations += 1;
-        // An RFC 4122 UUID (variant 8) that names the slot and the start.
-        let invocation = format!("00000000-0000-4000-8{slot:03x}-{:012x}", unit.invocations);
-        let main_pid = child.id();
-        unit.child = Some(child);
-        unit.crashed = false;
-        unit.postgres = false;
-        unit.mounted = None;
-        unit.lock = None;
-        unit.invocation_id = Some(invocation.clone());
-        Ok(Spawned {
-            main_pid,
-            invocation_id: invocation,
-            requested_us: None,
-        })
+        let spawned = self.spawn_supervisor(slot);
+        self.0.state().slot_builds -= 1;
+        spawned
     }
 
     async fn stop(&self, slot: u32) -> Result<(), units::Error> {
