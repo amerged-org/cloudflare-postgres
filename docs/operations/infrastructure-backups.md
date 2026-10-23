@@ -34,7 +34,12 @@ minute and `cron.watchdog_checked_at` must follow. The watchdog is armed by the 
 run after the deploy, so a cron that never runs again after it is not reported. Rolling the
 Worker back below this release first needs
 `DELETE FROM infrastructure_alerts WHERE kind IN ('database_archive_failing','database_base_backup_stale','thin_storage_blocked','control_cron_stalled','control_cron_step_failing')`,
-because the earlier release's health route does not parse those kinds.
+because the earlier release's health route does not parse those kinds. Migration
+`0082_drop_dead_capacity_fields.sql` is not undone by rolling the Worker back either: an older
+Worker reads columns and a table it dropped. A rollback below it needs the forward migration of
+[Rolling back below migration 0082](#rolling-back-below-migration-0082) before the older Worker is
+deployed and its two usage statements again as a second migration right after the older Worker is
+live; the export taken before the migration is not a substitute for it.
 
 Use the administrator API, replacing every placeholder with this installation's
 actual values:
@@ -64,6 +69,164 @@ capability. Changing only the alert sender or recipient never does: the update c
 every valid pending or running run to the new revision in the same transaction, and a
 run the cron creates while the update is in flight takes the revision in the statement
 that inserts it.
+
+## Rolling back below migration 0082
+
+Migration `0082_drop_dead_capacity_fields.sql` removes the node RAM window, fields of the capacity
+policy and of the size classes, and the three `reserved_*` usage keys. A Worker of an earlier release
+that runs over the migrated database fails: its SQL names the dropped columns and the dropped
+`node_memory_samples` table, and its strict usage contract requires the three keys that the migration
+removed from every hourly usage row and every lifecycle resource snapshot. `GET /v1/usage` answers 500
+for a range that covers a stored hour, and the rollup reads a snapshot without them as a gap.
+
+**A rollback below `0082` is a forward migration, and without it is unsupported.** Restoring the D1
+export taken before `0082` is not a rollback of the migration: it replaces the control database with
+its state at the time of the export and loses every control-plane write since. That includes the
+databases created since (D1 forgets them and the Edge stops routing them, while their volumes stay on
+the node), deletions (the databases come back), resizes, storage generations (they move backwards
+under the fencing invariants), API keys, approvals, enrollments and usage. It needs the owner's
+explicit go, and switching the Worker bindings to a restored database is the separate,
+explicitly authorized step of [recovery](recovery.md#control-plane).
+
+The forward migration adds back what `0082` dropped, with the definitions of migrations `0018`,
+`0024`, `0038` and `0041`. The columns held only dead data with no producer, so the restored values
+are the old defaults (none, `reserved`, `0`) and the older Worker reads them as it did before. The
+usage keys need a second run, because the newer Worker keeps writing the newer shape until the older
+Worker is live. The order is:
+
+1. Save the three blocks below as one migration file in `apps/api/migrations`, numbered after the
+   highest migration the installation has applied, and apply it with `wrangler d1 migrations apply`,
+   which runs it as one transaction.
+2. Deploy the older Worker straight after: it fails without this migration.
+3. Right after the older Worker is live, apply the usage block and the lifecycle block again,
+   unchanged, as a second migration file numbered after the first. Both statements select only the
+   rows that lack the keys, so the second run leaves every row the first one repaired as it is.
+
+Between the first migration and the deploy, the newer Worker writes rows that the first migration has
+already passed. Its rollup stores hourly usage rows without the three `reserved_*` metrics, including
+for the hours it finalizes, and every wake and every sleep stores a lifecycle snapshot of
+`memory_mib` and `cpu_millicores` only. The older Worker's strict usage contract refuses both. For
+any range that covers such an hour `GET /v1/usage` answers 500 and keeps answering it, because a
+final hour is never recomputed. Its rollup reads such a snapshot as a `resource_snapshot` gap, so
+`memory_mib_seconds` and `cpu_millicore_seconds` of that database are null until its next lifecycle
+event, and are lost for good once those hours finalize. The second migration gives those rows the
+keys, which is what makes the older Worker work again.
+
+A short window remains: from the moment the older Worker is live until the second migration has run.
+In it `GET /v1/usage` still answers 500 for a range that covers a newer-shape hour, and an hour that
+finalizes in it (two hours after the hour ends) while its resource snapshot is still the newer shape
+keeps null `memory_mib_seconds` and `cpu_millicore_seconds` for good. An hour that is still open is
+computed again from the repaired snapshots. Keep the second migration file ready before the deploy
+and apply it without a pause.
+
+The newer Worker that runs between steps 1 and 2 writes statements that name none of the restored
+columns and reads the restored usage shape. It fails one route family while
+`size_classes.cpu_request_millicores` exists: it parses a whole size class row with a strict schema
+that does not know the column, so `GET /v1/size-classes` and `PUT /v1/size-classes/{id}` (after it
+stored the class) answer 500 until the older Worker runs.
+
+```sql
+-- The dropped columns and the empty RAM sample table, as 0018, 0024, 0038 and 0041 created them.
+ALTER TABLE node_region_policies ADD COLUMN ram_expansion_threshold_ppm INTEGER
+  CHECK(ram_expansion_threshold_ppm IS NULL OR
+    (typeof(ram_expansion_threshold_ppm)='integer' AND ram_expansion_threshold_ppm BETWEEN 1 AND 1000000));
+ALTER TABLE node_region_policies ADD COLUMN ram_warning_threshold_ppm INTEGER
+  CHECK(ram_warning_threshold_ppm IS NULL OR
+    (typeof(ram_warning_threshold_ppm)='integer' AND ram_warning_threshold_ppm BETWEEN 1 AND 1000000));
+ALTER TABLE node_region_policies ADD COLUMN placement_mode TEXT NOT NULL DEFAULT 'reserved'
+  CHECK(placement_mode IN('reserved','actual_ram'));
+ALTER TABLE node_region_policies ADD COLUMN postgres_memory_request_mib INTEGER
+  CHECK(postgres_memory_request_mib>0);
+ALTER TABLE nodes ADD COLUMN memory_window_observed_at TEXT;
+ALTER TABLE nodes ADD COLUMN memory_window_valid INTEGER NOT NULL DEFAULT 0
+  CHECK(memory_window_valid IN(0,1));
+ALTER TABLE nodes ADD COLUMN memory_utilization_ppm INTEGER
+  CHECK(memory_utilization_ppm BETWEEN 0 AND 1000000);
+ALTER TABLE nodes ADD COLUMN memory_expansion_triggered_at TEXT;
+ALTER TABLE size_classes ADD COLUMN cpu_request_millicores INTEGER
+  CHECK(cpu_request_millicores IS NULL OR
+    (typeof(cpu_request_millicores)='integer' AND cpu_request_millicores>0
+      AND cpu_request_millicores<=cpu_millicores));
+CREATE TABLE node_memory_samples(
+  node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  node_uid TEXT NOT NULL,
+  minute INTEGER NOT NULL,
+  observed_at TEXT NOT NULL,
+  working_set_bytes INTEGER CHECK(working_set_bytes>=0),
+  capacity_memory_bytes INTEGER CHECK(capacity_memory_bytes>0),
+  available_bytes INTEGER CHECK(available_bytes>=0),
+  memory_pressure INTEGER CHECK(memory_pressure IN(0,1)),
+  capacity_cpu_millicores INTEGER
+    CHECK(capacity_cpu_millicores IS NULL OR
+      (typeof(capacity_cpu_millicores)='integer' AND capacity_cpu_millicores>0)),
+  cpu_usage_nano_cores INTEGER
+    CHECK(cpu_usage_nano_cores IS NULL OR
+      (typeof(cpu_usage_nano_cores)='integer' AND cpu_usage_nano_cores>=0 AND capacity_cpu_millicores IS NOT NULL)),
+  PRIMARY KEY(node_id,node_uid,minute),
+  CHECK(working_set_bytes IS NULL OR working_set_bytes<=capacity_memory_bytes),
+  CHECK(available_bytes IS NULL OR available_bytes<=capacity_memory_bytes)
+);
+```
+
+```sql
+-- Every hourly usage row has the three reserved_* metrics again, unknown (null) and listed in gaps as
+-- the rollup lists a metric it could not measure. A row that has them is not touched.
+UPDATE usage_hourly
+SET metrics=json_set(metrics,'$.reserved_memory_mib_seconds',json('null'),
+    '$.reserved_cpu_millicore_seconds',json('null'),'$.reserved_storage_byte_seconds',json('null')),
+  gaps=(SELECT json_group_array(value) FROM (SELECT value FROM json_each(usage_hourly.gaps)
+    UNION SELECT 'reserved_cpu_millicore_seconds' UNION SELECT 'reserved_memory_mib_seconds'
+    UNION SELECT 'reserved_storage_byte_seconds' ORDER BY value))
+WHERE json_type(metrics,'$.reserved_memory_mib_seconds') IS NULL;
+```
+
+```sql
+-- Every lifecycle resource snapshot has its three fields again. The limits stand in for the reserved
+-- figures, which the older release wrote equal to them; the allocated storage is unknown (null).
+-- The immutability trigger is dropped for the update and created again, unchanged.
+DROP TRIGGER lifecycle_events_immutable;
+UPDATE lifecycle_events
+SET resource_snapshot=json_set(resource_snapshot,
+  '$.reserved_memory_mib',json_extract(resource_snapshot,'$.memory_mib'),
+  '$.reserved_cpu_millicores',json_extract(resource_snapshot,'$.cpu_millicores'),
+  '$.storage_allocated_bytes',json('null'))
+WHERE json_type(resource_snapshot,'$.reserved_memory_mib') IS NULL
+  AND json_type(resource_snapshot,'$.memory_mib')='integer'
+  AND json_type(resource_snapshot,'$.cpu_millicores')='integer';
+CREATE TRIGGER lifecycle_events_immutable BEFORE UPDATE ON lifecycle_events
+BEGIN SELECT RAISE(ABORT, 'lifecycle events are immutable'); END;
+```
+
+On an installation with many hourly rows or lifecycle events, run each of the two `UPDATE`
+statements once for each first letter of the database ID, as `0082` does: add
+`AND database_id>='a' AND database_id<'b'` to its `WHERE`, then the same for `'b'` and `'c'` up to
+`'y'` and `'z'`, and `AND database_id>='z'` alone for the last, all inside the same migration, in the
+second file as in the first.
+
+What the migrations do not restore, and why the older Worker works once the second one has run:
+
+- **Approval hashes.** The hashes that `0082` cleared stay cleared, and the older Worker reads the
+  restored threshold as none, so a standing profile with a trigger no longer matches its stored hash.
+  Both only fail safe: an order waits for `POST /v1/nodes/additions/{id}/approve` until
+  `PUT /v1/regions/{id}/capacity-policy` stores the profile again through the older Worker (which
+  demands `ram_expansion_threshold_ppm` there when autoscaling, purchases and an `order` are all set).
+- **The alert kind `regional_ram_warning`.** Its CHECK stays narrowed and its rows stay deleted. The
+  older Worker raises it only for a non-null `ram_warning_threshold_ppm` and a measured window, and
+  the restored threshold is none and the restored table empty.
+- **Reserved usage figures.** They stay unknown for every hour and snapshot written before the
+  second migration, those of the newer Worker included; the older Worker meters new hours from the
+  limits as before.
+
+To roll forward again, deploy the newer Worker and then run the statement below; the size-class
+routes answer 500 as above until it has run. It drops the one restored column that the newer Worker's
+strict parse refuses. The other restored columns and the table stay unread, and the newer Worker reads
+the restored usage shape as it reads the shape the older Worker wrote after `0082`. The statement
+discards the CPU request the older Worker may have stored, a value no placement or admission code
+reads.
+
+```sql
+ALTER TABLE size_classes DROP COLUMN cpu_request_millicores;
+```
 
 ## Capture and acceptance
 
@@ -113,16 +276,47 @@ proof in the ULTRA plan; targeted tests alone are not live backup acceptance.
 
 While the provider's export job runs, the control database stops answering requests. Cloudflare
 documents the unavailability and states no duration. The exporter sends no D1 request of its own
-meanwhile, and no running database needs D1 to keep writing. **How long D1 stops is not
+meanwhile, and no running database needs D1 to keep writing. **How long D1 itself stops is not
 established.** ULTRA plan 9.10 states about 4 s, tagged as measured on EU1, which the plan's legend
 defines as the retired Kubernetes runtime; the plan does not say how it was taken. The earlier
 sampling of that runtime (usage posts of the regional agent, one per 15 s) showed gaps of 37 to 72 s
 in four of six nightly runs, a stall of at least 37 s in three of them and none in two, and so
-contradicts it. Nothing on the node runtime has measured the length yet, and gate G6 does not ask
-for it: record the stall of a nightly run in the plan when one is measured. A wake admits from the
-DatabaseActor's own state and commits its claim to D1 after the answer, so it is not expected to
-wait for the export. That is not yet observed: go-live gate G6 needs a night with an awake database
-under writes and one wake during the export that shows no failed wake.
+contradicts it. On the node runtime the export of the window test below ran 6.1 s from start to
+completion; that is the length of the job and not a measurement of the stall inside it, which no
+test has timed. A wake through a wake ticket admits from the DatabaseActor's own state and commits
+its claim to D1 after the answer, so by design it does not wait for the export. A wake on the
+`ensure_awake` path does: the actor has no snapshot that says whether the database is wakeable, or
+its snapshot shows it neither ready to serve nor an idle sleeper (resuming, being created,
+restarting at a generation the controller has not reported), and then the actor reads D1 before it
+answers, unless its snapshot already admits the connection, and its claim reads D1 under the
+actor's gate. Such a wake can wait for the export. The `path` of the `actor_admit` log line names
+which path answered a connection (`snapshot`, `ticket`, `ensure_awake` or `refused`). The
+window test below found no failed wake; its record has 37 wakes but 32 ticket claims and does not
+say how the other five were admitted, and whether a wake that fell inside the export was slower than
+the others was not measured.
+
+**Window test (go-live gate G6), passed 2026-10-22.** The test does not wait for the nightly run: a
+private operator tool starts the same raw D1 export of the control database that the nightly backup
+makes (`output_format: polling`, the nightly dump options; no Workflow, no backup row, and the signed
+URL is never read), and the traffic around it runs from 60 s before to 120 s after its start. On
+2026-10-22 (12:30:25.9 UTC, export completed in 6.1 s):
+
+- one new `xs` test database took one committed `INSERT` a second: 181 acknowledged, 181 found
+  afterwards, 0 lost, 0 refused, the slowest write 1,767 ms;
+- 37 sleeping small test databases, never the databases of the cold-path measurement, were woken one
+  every 5 s with one HTTP `/sql` request each under the integrators' retry rule: 37 answered, 0 failed,
+  0 retries, WAKE plus request p50 750 ms and p95 1,486 ms. The record has no maximum and no time of
+  each wake against the 6.1 s of the export. At one wake every 5 s, one or two of the 37 fell inside
+  the export, and those may be among the samples above p95;
+- the API Worker's logs in the window: 32 ticket claims, the longest actor gate held 3.3 s (the limit
+  is 30 s), no `admission_refused`. A gate of 3.3 s fits a D1 commit that the export stalled; the
+  logs do not say whether it was one.
+
+The test database and its temporary key were removed afterwards. The pass rule is no failed wake
+after the integrators' 1/2/4/8 s retry rule and no actor gate held above 30 s; the test meets it, and
+it does not show that a wake inside the export is as fast as any other. Together with the
+[restore drill](#restore-drill) of 2026-10-21 this meets gate G6; the full record is in the ULTRA
+plan (11.1).
 
 ## Optional email or webhook delivery
 
@@ -147,7 +341,10 @@ policy region each minute:
 - Storage is the fuller of the thin pool's data and metadata in the node's newest sample.
 
 The email subject is `PGCF infrastructure: <kind> (<region>)` and its body is the
-event JSON, including `node_ids`, `threshold_ppm` and the highest `utilization_ppm`.
+event JSON, including `node_ids`, `threshold_ppm` and the highest `utilization_ppm`. The JSON also
+carries `regional_ram_utilization_ppm`, always `null` since the regional RAM window was removed
+(migration `0082`); it stays so that a receiver that reads it keeps working, and a receiver may
+ignore it.
 A node crossing during an active episode adds no message only while a listed node
 still exceeds; otherwise it replaces the episode with a new event. The episode clears
 only when every listed node is fresh and below the threshold, or lost.
@@ -358,6 +555,16 @@ complete artifact (go-live gate G6 of the
 [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md)), after any change of
 the keyring or of the envelope code, and before relying on the backup in a recovery.
 
+**Last drill: passed on the artifact of day 2026-10-21** (the nightly run completed at 00:00:25 UTC;
+43,708,855 plaintext bytes, key version `dev1`; drilled at 00:03 and again at 00:05 UTC with the same
+result). The object was downloaded from R2, decrypted and authenticated against its receipt, and
+imported into a new scratch D1 in 24 chunks (the largest 5,000 statements or 2,097,085 bytes; the
+largest single statement 49,223 bytes): 55 tables, 82,761 queries and 310,008 rows written, every
+chunk accepted the first time. `PRAGMA foreign_key_check` returned no row; `d1_migrations` (81) and
+`databases` (846) equal the live control database, `regions` 2 and `nodes` 5. The scratch database
+was deleted by its ID. The window half of gate G6 is the
+[window test](#the-d1-export-window) of 2026-10-22; the full record is in the ULTRA plan (11.1).
+
 The tool is `scripts/operations/restore-infrastructure-backup.ts` (Node, no packages beyond the
 repository's). It does not share code with the Worker: it reads the layout documented under
 [offline recovery custody](#offline-recovery-custody), so a restore needs nothing of the Worker.
@@ -520,11 +727,11 @@ wrangler on `PATH`), which is logged in or has `CLOUDFLARE_API_TOKEN` and
    power cut, cannot clean up: delete `$TMPDIR/pgcf-restore-*` (for `import`) or `<output>.partial`
    (for `decrypt`) by hand.
 
-   **Unverified until the first drill:** that D1 accepts a file that opens with the dump's `PRAGMA
-   defer_foreign_keys=TRUE;` and takes chunks of the default size (2 MiB, 5,000 statements). The
-   first chunk is the schema, so a refusal of the pragma shows at chunk 1; a reset shows at the
-   first chunk of rows. The chunks do not depend on how D1 groups a file into transactions: every
-   table's rows come after the rows of the tables it references.
+   **Verified by the drill of 2026-10-21:** D1 accepts a file that opens with the dump's `PRAGMA
+   defer_foreign_keys=TRUE;` and takes chunks of the default size (2 MiB, 5,000 statements): all 24
+   chunks of the artifact of that day were accepted the first time, so neither the pragma at chunk 1
+   nor the first chunk of rows was refused or reset. The chunks do not depend on how D1 groups a file
+   into transactions: every table's rows come after the rows of the tables it references.
 
 6. **Check the scratch database** against the live one. The tool has run `PRAGMA foreign_key_check`
    (it printed `foreign_key_check: no violations`). `d1_migrations` and `regions` must match the
