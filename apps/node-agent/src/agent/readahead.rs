@@ -36,9 +36,10 @@
 //!   the prefetch lab of 2026-10-20 (arm I): the statements took about 10 ms less at p50.
 //!
 //! **The switch.** `PREFETCH` below is the one line that says what a build runs; the A/B is a
-//! release that changes it, and the node's page carries no setting for it. The program is on in the
-//! default build, the sets at the bind are off until the interleaved A/B on the pooled path, and
-//! the hot list is on.
+//! release that changes it, and the node's page carries no setting for it. The program and the hot
+//! list are on, and the release ships `Start::Alternate` for the sets at the bind: it is the live
+//! interleaved A/B on the pooled path (at least 18 starts per arm, on the 24 h and 1 h strata), and
+//! the decision after it is a release with `Start::On` or `Start::Off`.
 //!
 //! Every reading says what it did in an event (`prefetch`, `program_warm`): its set and hook, why
 //! it ended, and the counts and times of `prefetch::Report`; a list that is not there or not
@@ -80,12 +81,12 @@ pub enum Start {
     Alternate,
 }
 
-/// What this build runs: the program kept warm, nothing at the bind until the A/B, the hot list.
-/// The A/B is a release with `start: Start::Alternate`; the decision after it is a release with
-/// `Start::On` or `Start::Off`.
+/// What this build runs: the program kept warm, the sets at the bind on every second start (the
+/// live A/B), the hot list. The decision after the A/B is a release with `start: Start::On` or
+/// `Start::Off`.
 pub const PREFETCH: Prefetch = Prefetch {
     program: true,
-    start: Start::Off,
+    start: Start::Alternate,
     hot_list: true,
 };
 
@@ -409,16 +410,16 @@ mod tests {
             .collect()
     }
 
-    /// The variant of a build names the hooks it runs, and the build ships the measured ones: the
-    /// program kept warm and the hot list from ready. The start set and the catalogs at the bind
-    /// are code that a variant turns on, after the interleaved A/B of the module's documentation.
+    /// The variant of a build names the hooks it runs, and the build ships the measured ones, the
+    /// program kept warm and the hot list from ready, and the sets at the bind for every second
+    /// start: the live A/B of the module's documentation.
     #[test]
-    fn the_build_ships_the_program_and_the_hot_list_and_not_the_sets_at_the_bind() {
+    fn the_build_ships_the_program_and_the_hot_list_and_alternates_the_sets_at_the_bind() {
         assert_eq!(
             PREFETCH,
             Prefetch {
                 program: true,
-                start: Start::Off,
+                start: Start::Alternate,
                 hot_list: true
             }
         );
@@ -512,11 +513,16 @@ mod tests {
     }
 
     /// A wake reads the hot list ahead from the moment it has released the database, off its path,
-    /// and says what it did; nothing is read at the bind in the variant a build ships.
+    /// and says what it did; nothing is read at the bind in a variant without the sets (the build
+    /// ships `Start::Alternate`, tested below).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_wake_reads_the_hot_list_ahead_from_ready_and_the_sets_only_when_the_variant_says_so()
     {
-        let Some(rig) = Rig::with_timing("readahead-default", timing()).await else {
+        let variant = Prefetch {
+            start: Start::Off,
+            ..PREFETCH
+        };
+        let Some(rig) = Rig::with_prefetch("readahead-default", variant).await else {
             return;
         };
         let (entry, db) = rig.create().await;

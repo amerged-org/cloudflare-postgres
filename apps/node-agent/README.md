@@ -454,8 +454,9 @@ all three (`settings.rs`); a restored database's files are the source's and are 
     and then one every `Timing::program_every` (60 s), never while a start is in flight or waits,
     and a start that begins ends the pass that runs (shipped);
   - the **start set and the catalogs at the bind**, from the start's permit, in a task the order
-    does not wait for, for at most 50 ms (code, off until the interleaved A/B on the pooled path:
-    `Start::Alternate` reads for every second start and says which in a `prefetch_arm` event);
+    does not wait for, for at most 50 ms (shipped as `Start::Alternate` for the live interleaved
+    A/B on the pooled path: it reads for every second start and says which in a `prefetch_arm`
+    event; the release after the A/B sets `Start::On` or `Start::Off`);
   - the **hot list** from ready, with a budget of 150 ms (shipped).
 
   `settings::AUTOPREWARM` is the build's other switch, for the A/B arm without PostgreSQL's own
