@@ -17,6 +17,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(crate) mod replacement;
+
 const VERSION: u8 = 1;
 const STATE_FILE: &str = "state.json";
 

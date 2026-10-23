@@ -1037,7 +1037,7 @@ impl Machine for Local {
             return Err(storage::Error::Busy);
         }
         state.volumes.remove(id);
-        state.attached.remove(id);
+        let was_attached = state.attached.remove(id);
         let others = state
             .volumes
             .keys()
@@ -1049,6 +1049,8 @@ impl Machine for Local {
             .volume(&format!("{}.g{}", id.database(), id.generation()));
         let target = if aside.exists() {
             aside
+        } else if was_attached {
+            self.layout.volume(id.database())
         } else if others {
             return Ok(());
         } else {

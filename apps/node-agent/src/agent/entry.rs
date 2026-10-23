@@ -40,6 +40,11 @@ pub enum Origin {
     /// This database's previous storage generation, to the end of its WAL: `end` is the record
     /// that proved the source's sleep.
     Move(Source, End),
+    /// A PITR into this database's connection identity. The original generation and its full
+    /// proven-sleep record are retained locally until promotion and explicit cleanup.
+    Replace(Source, u64, crate::state::ProvenSleepRecord),
+    /// Forward rollback, explicit even if the initial journal never reached disk.
+    ReplaceRollback(Source, u64, crate::state::ProvenSleepRecord, u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +96,17 @@ impl Entry {
             Some(origin) => Some(match origin["kind"].as_str()? {
                 "create" => Origin::Create,
                 "restore" => Origin::Restore(source(&origin["source"])?),
+                "replace" => Origin::Replace(
+                    source(&origin["source"])?,
+                    number(&origin["previous"], "storage_generation")?,
+                    serde_json::from_value(origin["previous"]["end"].clone()).ok()?,
+                ),
+                "replace_rollback" => Origin::ReplaceRollback(
+                    source(&origin["source"])?,
+                    number(&origin["previous"], "storage_generation")?,
+                    serde_json::from_value(origin["previous"]["end"].clone()).ok()?,
+                    number(origin, "replacement_generation")?,
+                ),
                 "move" => {
                     let end = &origin["source"]["end"];
                     Origin::Move(
@@ -140,6 +156,12 @@ impl Entry {
     pub fn volume_bytes(&self) -> u64 {
         self.storage_gib << 30
     }
+    pub(crate) fn replaces_storage(&self) -> bool {
+        matches!(
+            self.origin,
+            Some(Origin::Replace(..) | Origin::ReplaceRollback(..))
+        )
+    }
     /// `role_revision_hash` of the roles the database holds (plan 5.3): what a wake ticket carries.
     pub fn role_hash(&self) -> String {
         wake::role_revision_hash(self.roles.iter().filter_map(|role| match role {
@@ -187,6 +209,26 @@ mod tests {
     use super::*;
     use crate::link::test_server::{database, vector};
     use serde_json::json;
+
+    #[test]
+    fn an_in_place_restore_reads_the_previous_proof_and_keeps_the_database_identity() {
+        let mut db = database("dbbbbbbbbbbbbbbbbbbb");
+        db["storage_generation"] = json!(2);
+        db["origin"] = json!({"kind":"replace", "source": {
+            "database_id":"dbbbbbbbbbbbbbbbbbbb",
+            "path":"s3://pgcf-eu/eu-dev/dbbbbbbbbbbbbbbbbbbb/g1-op_aaaaaaaaaaaaaaaaaaaa",
+            "backup_id":"20261017T225342", "target_time":"2026-10-17T22:53:45.664Z",
+            "credential":{"id":"crd_rrrrrrrrrrrrrrrrrrrr"}
+        }, "previous": {"storage_generation":1, "end": {
+            "system_identifier":"7431215993172011234", "timeline":1,
+            "checkpoint_lsn":"0/1A2B3C48", "last_archived_segment":"000000010000000000000003",
+            "proven_at":"2026-10-18T10:11:12.345Z"
+        }}});
+        let entry = Entry::parse(&db).expect("an in-place restore is a known origin");
+        assert_eq!(entry.id, "dbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(entry.storage_generation, 2);
+        assert_eq!(entry.roles.len(), 3);
+    }
 
     #[test]
     fn the_example_entry_of_the_contract_is_read() {
