@@ -599,14 +599,18 @@ it("does not stage a move whose source archive lacks what the proof names, and e
 it("waits for an archive it cannot read instead of ending the move", async () => {
   const f = await ready(),
     move = await start(f);
-  await env.DB.prepare("UPDATE regions SET backup_bucket=? WHERE id=?")
-    .bind("unbound-bucket", f.region)
+  const path = (await f.row()).archive_path;
+  await env.DB.prepare("UPDATE databases SET archive_path=? WHERE id=?")
+    .bind(
+      path.replace(`s3://${env.ARCHIVE_BUCKET_NAME}/`, "s3://unbound-bucket/"),
+      f.id,
+    )
     .run();
   await proven(f, move.operation);
   expect(await status(move.operation)).toMatchObject({ status: "proving" });
   expect(await ordersOf(f.node)).toHaveLength(1);
-  await env.DB.prepare("UPDATE regions SET backup_bucket=? WHERE id=?")
-    .bind(env.ARCHIVE_BUCKET_NAME, f.region)
+  await env.DB.prepare("UPDATE databases SET archive_path=? WHERE id=?")
+    .bind(path, f.id)
     .run();
   await proven(f, move.operation);
   expect(await status(move.operation)).toMatchObject({ status: "restoring" });

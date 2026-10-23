@@ -213,13 +213,9 @@ it("refuses a restore into another region, whose nodes cannot read the source's 
   const f = await archived(),
     targetNode = newNodeId(),
     targetKey = await nodeKeyPair(),
-    now = new Date().toISOString(),
-    bucket = "pgcf-api-us-test";
-  // The other region has a bucket and a node that reports and could take the database.
+    now = new Date().toISOString();
+  // The other region has a node that reports and could take the database.
   await env.DB.batch([
-    env.DB.prepare(
-      "UPDATE regions SET backup_bucket=?,backup_endpoint_url=? WHERE id=?",
-    ).bind(bucket, "https://target.r2.cloudflarestorage.com", f.foreign),
     env.DB.prepare(
       "INSERT INTO nodes(id,region_id,hostname,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,public_key,enrolled_at) VALUES(?,?,?,1,1,4096,2000,30,128,100,?,?,?,?,?,?)",
     ).bind(
@@ -235,12 +231,6 @@ it("refuses a restore into another region, whose nodes cannot read the source's 
     ),
   ]);
   await reports(targetNode);
-  const mapping = {
-    ARCHIVE_BINDINGS: JSON.stringify({
-      [f.region]: { binding: "ARCHIVE", bucket: env.ARCHIVE_BUCKET_NAME },
-      [f.foreign]: { binding: "ARCHIVE_US", bucket },
-    }),
-  };
   const count = async () =>
     (await env.DB.prepare("SELECT COUNT(*) n FROM databases").first<number>(
       "n",
@@ -252,11 +242,11 @@ it("refuses a restore into another region, whose nodes cannot read the source's 
   // A node reads only archives of its own region, so the restore could never build there.
   expect(
     await refusal(
-      await overridden(
+      await request(
         `/v1/databases/${f.id}/restore`,
         f.integrator,
+        "POST",
         { mode: "full", name: "cross-region-restored", region_id: f.foreign },
-        mapping,
         "cross-region-restore",
       ),
     ),
@@ -270,11 +260,11 @@ it("refuses a restore into another region, whose nodes cannot read the source's 
   // The source's own region stays the place to restore into.
   expect(
     (
-      await overridden(
+      await request(
         `/v1/databases/${f.id}/restore`,
         f.integrator,
+        "POST",
         { mode: "full", name: "same-region-restored", region_id: f.region },
-        mapping,
         "same-region-restore",
       )
     ).status,
@@ -596,6 +586,62 @@ it("expiry cleanup deletes only the owned prefix and releases retained credentia
       .bind(f.id)
       .first(),
   ).toEqual({ id: f.id });
+});
+
+it("expiry cleanup leaves an archive that names another bucket alone and still purges the one after them", async () => {
+  // Two expired archives sort before the third and name a bucket this Worker does not have, as the
+  // old US archives do after the single-bucket change. They are neither claimed nor allowed to
+  // fill the batch of two that a run takes.
+  const foreign = [await archived(), await archived()],
+    owned = await archived();
+  for (const f of [...foreign, owned]) {
+    expect(
+      (await request(`/v1/databases/${f.id}`, f.integrator, "DELETE")).status,
+    ).toBe(202);
+    expect(await verdicts(await report(f, f.id, 2, "deleted"))).toEqual([
+      "accept",
+    ]);
+  }
+  const expiry = await env.DB.prepare(
+    "SELECT expires_at FROM retained_archives WHERE source_database_id=?",
+  )
+    .bind(owned.id)
+    .first<{ expires_at: string }>();
+  const now = Date.parse(expiry!.expires_at);
+  for (const [index, f] of foreign.entries())
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE databases SET archive_path=replace(archive_path,?,'s3://another-bucket/') WHERE id=?",
+      ).bind(`s3://${env.ARCHIVE_BUCKET_NAME}/`, f.id),
+      env.DB.prepare(
+        "UPDATE retained_archives SET archive_path=replace(archive_path,?,'s3://another-bucket/'),expires_at=? WHERE source_database_id=?",
+      ).bind(
+        `s3://${env.ARCHIVE_BUCKET_NAME}/`,
+        new Date(now - 1000 * (index + 2)).toISOString(),
+        f.id,
+      ),
+    ]);
+  expect((await cleanupRetainedArchives(env, now)).objects).toBe(3);
+  expect(await cleanupRetainedArchives(env, now)).toEqual({
+    purged: 1,
+    objects: 0,
+  });
+  expect(
+    (
+      await env.DB.prepare(
+        "SELECT cleanup_claim FROM retained_archives WHERE source_database_id IN(?,?)",
+      )
+        .bind(foreign[0]!.id, foreign[1]!.id)
+        .all()
+    ).results,
+  ).toEqual([{ cleanup_claim: null }, { cleanup_claim: null }]);
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) count FROM retained_archives WHERE source_database_id=?",
+    )
+      .bind(owned.id)
+      .first(),
+  ).toEqual({ count: 0 });
 });
 
 it("refuses a known WAL gap instead of promoting at the first missing segment", async () => {

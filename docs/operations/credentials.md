@@ -198,10 +198,13 @@ A node holds no secret of the image. Its credentials come from the install and f
   (`R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`): one archive prefix of one
   database generation, no delete right, 7 days, renewed after a third of that. Nodes never hold the
   parent key or a bucket-wide key. To replace the parent key, create the new R2 API token (object
-  read and write on the archive buckets), set both Worker secrets and deploy; credentials delivered
+  read and write on the archive bucket), set both Worker secrets and deploy; credentials delivered
   afterwards are signed with the new key. Delete the old token only after the credentials it signed
-  have expired, 7 days after the deploy: deleting it earlier ends the credentials the nodes hold,
-  and archiving fails until they read new ones (`database_archive_failing`).
+  have expired, 7 days after the deploy, or after a forced refresh that every node has read and a
+  base backup, a WAL archive and a restore read on the new key
+  ([the bucket move](operator-installation.md#moving-to-another-archive-bucket), step 11): deleting it
+  earlier ends the credentials the nodes hold, and archiving fails until they read new ones
+  (`database_archive_failing`).
 
 ## Provider and account credentials
 

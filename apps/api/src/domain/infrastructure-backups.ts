@@ -12,7 +12,7 @@ import {
 } from "@pgcf/contracts/infrastructure-backups";
 import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
-import { regionArchive } from "./archive-bindings.ts";
+import { archiveBucket } from "./archive-bucket.ts";
 import {
   encryptSource,
   measureSource,
@@ -143,14 +143,13 @@ export async function configureInfrastructureBackups(
   ]);
   return readInfrastructureBackupConfig(env.DB);
 }
+/** The installation's archive bucket, once the region the artifact is recorded under exists. */
 export async function backupArchive(env: Env, regionId: string) {
-  const region = await env.DB.prepare(
-    "SELECT id,backup_bucket FROM regions WHERE id=?",
-  )
+  const region = await env.DB.prepare("SELECT id FROM regions WHERE id=?")
     .bind(regionId)
-    .first<{ id: string; backup_bucket: string }>();
+    .first<{ id: string }>();
   if (!region) throw new ApiError("not_found", "Backup region not found");
-  return regionArchive(env, region).bucket;
+  return archiveBucket(env).bucket;
 }
 export async function readInfrastructureBackupRun(db: D1Database, id: string) {
   const row = await db

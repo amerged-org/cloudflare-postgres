@@ -54,7 +54,7 @@ const heartbeat = () =>
   }>();
 const admissionRecovery =
   "SELECT kind,scope_id,mutation_id FROM admission_scope_fences";
-const retainedArchives = "SELECT a.*,r.backup_bucket FROM retained_archives a";
+const retainedArchives = "SELECT a.* FROM retained_archives a";
 
 it("records a heartbeat of every run and lists the steps it attempted", async () => {
   const at = Date.now(),

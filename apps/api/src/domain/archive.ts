@@ -4,7 +4,7 @@ import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import { databaseForRequest } from "./rows.ts";
 import type { DatabaseRow } from "./rows.ts";
-import { regionArchive } from "./archive-bindings.ts";
+import { archiveBucket } from "./archive-bucket.ts";
 import { readRestoreCatalog } from "./restore-catalog.ts";
 import { retainedArchiveRestorable } from "./retained-archives.ts";
 
@@ -13,22 +13,19 @@ export function validatedArchivePrefix(
     DatabaseRow,
     "id" | "region_id" | "archive_path" | "storage_generation"
   >,
-  region: { backup_bucket: string } | null,
   boundBucket: string,
 ): string {
   const path = ARCHIVE_DESTINATION_PATTERN.exec(row.archive_path);
   if (
-    !region ||
     !path ||
-    path[1] !== region.backup_bucket ||
+    path[1] !== boundBucket ||
     path[2] !== row.region_id ||
     path[3] !== row.id ||
-    Number(path[4]) !== (row.storage_generation ?? 1) ||
-    boundBucket !== region.backup_bucket
+    Number(path[4]) !== (row.storage_generation ?? 1)
   )
     throw new ApiError(
       "internal",
-      "The region archive bucket is not bound to this installation",
+      "The archive bucket is not bound to this installation",
     );
   return `${row.region_id}/${row.id}/${row.archive_path.slice(row.archive_path.lastIndexOf("/") + 1)}/database/`;
 }
@@ -38,16 +35,8 @@ export async function archiveSummary(
   id: string,
 ): Promise<Response> {
   const row = await databaseForRequest(c, id, true);
-  const region = await c.env.DB.prepare(
-    "SELECT backup_bucket FROM regions WHERE id=?",
-  )
-    .bind(row.region_id)
-    .first<{ backup_bucket: string }>();
-  const selected = regionArchive(c.env, {
-    id: row.region_id,
-    backup_bucket: region?.backup_bucket ?? "",
-  });
-  const prefix = validatedArchivePrefix(row, region, selected.bucketName);
+  const selected = archiveBucket(c.env);
+  const prefix = validatedArchivePrefix(row, selected.bucketName);
   let baseBackups = 0,
     walCount = 0,
     bytes = 0;
@@ -124,16 +113,8 @@ export async function backupCatalog(
     if (!retainedArchiveRestorable(retained, row, new Date().toISOString()))
       return c.json(unknown);
   }
-  const region = await c.env.DB.prepare(
-    "SELECT backup_bucket FROM regions WHERE id=?",
-  )
-    .bind(row.region_id)
-    .first<{ backup_bucket: string }>();
-  const selected = regionArchive(c.env, {
-    id: row.region_id,
-    backup_bucket: region?.backup_bucket ?? "",
-  });
-  const prefix = validatedArchivePrefix(row, region, selected.bucketName);
+  const selected = archiveBucket(c.env);
+  const prefix = validatedArchivePrefix(row, selected.bucketName);
   let catalog;
   try {
     catalog = await readRestoreCatalog(selected.bucket, prefix);

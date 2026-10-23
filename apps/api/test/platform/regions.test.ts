@@ -18,8 +18,6 @@ function input() {
     provider: "contabo",
     provider_region: "test",
     gateway_url: `https://${["gateway", "invalid"].join(".")}/pg`,
-    backup_bucket: "b-" + crypto.randomUUID(),
-    backup_endpoint_url: `https://${["archive", "invalid"].join(".")}`,
   };
 }
 const count = (id: string) =>
@@ -56,6 +54,34 @@ it("region creation answers the region, replays it for the same key and holds no
   const text = await (await request("/v1/regions", state.admin)).text();
   expect(text).not.toContain("agent_key");
   expect(text).not.toContain("route_keyring");
+});
+it("a region names no bucket and no endpoint: every region archives into the installation's one bucket at its one endpoint", async () => {
+  const state = await fixture(),
+    body = input();
+  for (const named of [
+    { backup_bucket: env.ARCHIVE_BUCKET_NAME },
+    { backup_endpoint_url: env.ARCHIVE_ENDPOINT_URL },
+  ]) {
+    const refused = await request("/v1/regions", state.admin, "POST", {
+      ...body,
+      ...named,
+    });
+    expect(refused.status).toBe(400);
+    expect(await count(body.id)).toBe(0);
+  }
+  const created = await request("/v1/regions", state.admin, "POST", body);
+  expect(created.status).toBe(201);
+  const region = await created.json();
+  for (const column of ["backup_bucket", "backup_endpoint_url"]) {
+    expect(region).not.toHaveProperty(column);
+    expect(
+      Object.keys(
+        (await env.DB.prepare("SELECT * FROM regions WHERE id=?")
+          .bind(body.id)
+          .first())!,
+      ),
+    ).not.toContain(column);
+  }
 });
 it("concurrent matching region creations create one region", async () => {
   const state = await fixture(),

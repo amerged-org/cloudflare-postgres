@@ -42,15 +42,9 @@ const gatewayOf = (node: string) =>
     .bind(node)
     .first<{ gateway_url: string | null }>()
     .then((row) => row?.gateway_url);
-async function accountRegion(region: string) {
-  await env.DB.prepare("UPDATE regions SET backup_endpoint_url=? WHERE id=?")
-    .bind(`https://${ACCOUNT}.r2.cloudflarestorage.com`, region)
-    .run();
-}
 
 it("hands a node the route keyring derived for it, the token of its Tunnel and the revision D1 holds", async () => {
   const f = await fixture(0);
-  await accountRegion(f.region);
   const api = cloudflare();
   vi.stubGlobal("fetch", api.fetcher);
   const response = await nodeRequest(f, CREDENTIALS, { bindings: configured });
@@ -83,7 +77,6 @@ it("hands a node the route keyring derived for it, the token of its Tunnel and t
 
 it("makes the shell hostname of a node only while NODE_SHELL_HOSTNAME is exactly the string true, and removes it when it is not", async () => {
   const f = await fixture(0);
-  await accountRegion(f.region);
   const api = cloudflare();
   vi.stubGlobal("fetch", api.fetcher);
   const hostnames = () => api.records.map((record) => record.name);
@@ -107,7 +100,6 @@ it("makes the shell hostname of a node only while NODE_SHELL_HOSTNAME is exactly
 
 it("carries the CA key of the operator shell only while NODE_SHELL_HOSTNAME is true and the key is exactly one valid ssh-ed25519 line", async () => {
   const f = await fixture(0);
-  await accountRegion(f.region);
   vi.stubGlobal("fetch", cloudflare().fetcher);
   const ask = async (
     shell: string | undefined,
@@ -153,7 +145,6 @@ const shellStateOf = (node: string) =>
 
 it("names a revision that matches its own shell state, so that a Worker version the page has not caught up with cannot leave a node with a key D1 says is gone", async () => {
   const f = await fixture(0);
-  await accountRegion(f.region);
   vi.stubGlobal("fetch", cloudflare().fetcher);
   const ask = async (bindings: Record<string, string | undefined>) => {
     const response = await nodeRequest(f, CREDENTIALS, {
@@ -194,7 +185,6 @@ it("names a revision that matches its own shell state, so that a Worker version 
 it("raises the revision once for a changed route keyring, and the page and the read name the same one whichever sees the change first; a changed Tunnel token raises nothing", async () => {
   const f = await fixture(0);
   await setNodePolicy(f);
-  await accountRegion(f.region);
   const api = cloudflare();
   let token = TUNNEL_TOKEN;
   // The double hands out one token; the Tunnel's token is read through a path of its own.
@@ -255,12 +245,26 @@ it("raises the revision once for a changed route keyring, and the page and the r
 
 it("answers a node whose Tunnel cannot be made with a failure, and writes no gateway", async () => {
   const f = await fixture(0);
-  // No Cloudflare configuration at all, then an account the region's endpoint does not name.
+  // No Cloudflare configuration at all, then an archive endpoint that names no account (the
+  // account of the Tunnels is the one that holds the archive bucket).
   expect((await nodeRequest(f, CREDENTIALS)).status).toBe(500);
   expect(
-    (await nodeRequest(f, CREDENTIALS, { bindings: configured })).status,
+    (
+      await nodeRequest(f, CREDENTIALS, {
+        bindings: {
+          ...configured,
+          ARCHIVE_ENDPOINT_URL: `https://${["archive", "invalid"].join(".")}`,
+        },
+      })
+    ).status,
   ).toBe(500);
-  await accountRegion(f.region);
+  expect(
+    (
+      await nodeRequest(f, CREDENTIALS, {
+        bindings: { ...configured, ARCHIVE_ENDPOINT_URL: "" },
+      })
+    ).status,
+  ).toBe(500);
   vi.stubGlobal("fetch", async () =>
     Response.json({ success: false, errors: [] }, { status: 500 }),
   );
@@ -270,9 +274,36 @@ it("answers a node whose Tunnel cannot be made with a failure, and writes no gat
   expect(await gatewayOf(f.node)).toBeNull();
 });
 
+it("makes the Tunnel in the account that holds the archive bucket, whatever the node's region", async () => {
+  const f = await fixture(0);
+  const api = cloudflare();
+  vi.stubGlobal("fetch", api.fetcher);
+  const other = `https://${ACCOUNT.replace(/.$/, "0")}.eu.r2.cloudflarestorage.com`;
+  expect(other).not.toContain(`${ACCOUNT}.`);
+  // An archive endpoint of another account looks for the Tunnel there, where the double has none.
+  const elsewhere = await nodeRequest(f, CREDENTIALS, {
+    bindings: { ...configured, ARCHIVE_ENDPOINT_URL: other },
+  });
+  expect(elsewhere.status).toBe(500);
+  expect(api.calls.length).toBeGreaterThan(0);
+  expect(api.calls.every((call) => !call.url.includes(ACCOUNT))).toBe(true);
+  expect(await gatewayOf(f.node)).toBeNull();
+  // The installation's own endpoint finds it, with the same node and region.
+  expect(
+    (
+      await nodeRequest(f, CREDENTIALS, {
+        bindings: {
+          ...configured,
+          ARCHIVE_ENDPOINT_URL: env.ARCHIVE_ENDPOINT_URL,
+        },
+      })
+    ).status,
+  ).toBe(200);
+  expect(api.calls.some((call) => call.url.includes(ACCOUNT))).toBe(true);
+});
+
 it("gives nothing to a node declared lost", async () => {
   const f = await fixture(0);
-  await accountRegion(f.region);
   const api = cloudflare();
   vi.stubGlobal("fetch", api.fetcher);
   await env.DB.prepare(

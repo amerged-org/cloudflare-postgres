@@ -19,7 +19,6 @@
       "bucket_name": "pgcf-api-test",
       "jurisdiction": "eu",
     },
-    { "binding": "ARCHIVE_US", "bucket_name": "pgcf-api-us-test" },
   ],
   "vars": {
     "CONTABO_NODE_FIREWALL_ID": "<CONTABO_NODE_FIREWALL_ID>",
@@ -27,6 +26,7 @@
     "CONTABO_ORDER_SSH_KEY_IDS": "<CONTABO_ORDER_SSH_KEY_IDS_JSON>",
     "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>",
     "ARCHIVE_BUCKET_NAME": "pgcf-api-test",
+    "ARCHIVE_ENDPOINT_URL": "https://0123456789abcdef0123456789abcdef.eu.r2.cloudflarestorage.com",
     // The keep-warm is off: a warmer's alarm would visit actors, and read D1, in the middle of
     // another test. The tests of the keep-warm arm it with an interval of their own.
     "DATABASE_ACTOR_WARM_INTERVAL_MS": "0",

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Env } from "../env.ts";
 import { validatedArchivePrefix } from "./archive.ts";
-import { regionArchive } from "./archive-bindings.ts";
+import { archiveBucket } from "./archive-bucket.ts";
 interface ExpiredArchive {
   source_database_id: string;
   region_id: string;
@@ -10,7 +10,6 @@ interface ExpiredArchive {
   deleted_at: string;
   expires_at: string;
   cleanup_claim: string | null;
-  backup_bucket: string;
 }
 /**
  * Whether the archive of a deleted database can still be restored from: inside its recovery
@@ -40,11 +39,15 @@ export async function cleanupRetainedArchives(
   now = Date.now(),
 ): Promise<{ purged: number; objects: number }> {
   const timestamp = new Date(now).toISOString();
+  // An archive that names another bucket is out of this Worker's reach: its objects cannot be
+  // listed or deleted here, so it is never selected, which would otherwise fill the batch of two
+  // and fail every run before the archives after it.
+  const named = `s3://${archiveBucket(env).bucketName}/`;
   const rows = await env.DB.prepare(
-    `SELECT a.*,r.backup_bucket FROM retained_archives a JOIN databases d ON d.id=a.source_database_id JOIN regions r ON r.id=a.region_id
-   WHERE a.expires_at<=? AND d.desired_state='deleted' AND d.observed_state='deleted' AND d.deleted_at=a.deleted_at AND d.archive_path=a.archive_path AND d.storage_generation=a.storage_generation AND ${idle} ORDER BY a.expires_at,a.source_database_id LIMIT 2`,
+    `SELECT a.* FROM retained_archives a JOIN databases d ON d.id=a.source_database_id
+   WHERE a.expires_at<=? AND substr(a.archive_path,1,length(?))=? AND d.desired_state='deleted' AND d.observed_state='deleted' AND d.deleted_at=a.deleted_at AND d.archive_path=a.archive_path AND d.storage_generation=a.storage_generation AND ${idle} ORDER BY a.expires_at,a.source_database_id LIMIT 2`,
   )
-    .bind(timestamp)
+    .bind(timestamp, named, named)
     .all<ExpiredArchive>();
   let purged = 0,
     objects = 0;
@@ -57,10 +60,7 @@ export async function cleanupRetainedArchives(
       .bind(claim, row.source_database_id, timestamp, row.cleanup_claim)
       .run();
     if (claimed.meta.changes !== 1) continue;
-    const selected = regionArchive(env, {
-      id: row.region_id,
-      backup_bucket: row.backup_bucket,
-    });
+    const selected = archiveBucket(env);
     const prefix = validatedArchivePrefix(
       {
         id: row.source_database_id,
@@ -68,7 +68,6 @@ export async function cleanupRetainedArchives(
         archive_path: row.archive_path,
         storage_generation: row.storage_generation,
       },
-      row,
       selected.bucketName,
     );
     const listed = await selected.bucket.list({ prefix, limit: 128 });

@@ -28,9 +28,10 @@ recovers the same customer EU1.
 3. Save the returned target ID and operation ID. Repeating the same request and key returns the
    same target; a transport failure does not justify issuing a new key or replaying SQL writes.
 4. Poll the operation. The source stays unchanged. The target uses new storage and its own
-   archive path in the source's region, in the same bucket and endpoint; its configuration
-   revision is independent of its storage generation. Source backup/WAL selection reads that
-   region's catalog, including when the source has been deleted.
+   archive path in the source's region, in the installation's archive bucket (the same endpoint
+   for every region); its configuration revision is independent of its storage generation. Source
+   backup/WAL selection reads the source's archive path and catalog, including when the source
+   has been deleted.
 5. Ready means the node promoted the restored database onto a later timeline than the backup's,
    with the backup's system identifier, reset its roles and took the first base backup of the new
    timeline into the target's own archive, which counts only when it is DONE (plan 7.8). Authenticate

@@ -33,6 +33,7 @@ import {
   placementNodes,
 } from "./placement.ts";
 import { syncDatabaseActor } from "./database-actor-sync.ts";
+import { archiveBucket } from "./archive-bucket.ts";
 import { runNodeCapacity } from "./node-capacity.ts";
 import { stoppedSleeperSql } from "./startup-admission.ts";
 import {
@@ -83,7 +84,6 @@ export async function databaseOperationResponse(
 export interface DatabaseInsertSnapshot {
   body: DatabaseCreate;
   size: SizeRow;
-  region: RegionRow;
   /** The database's own resources; omitted takes the size class's. */
   resources?: ResourceOverrides;
   /** The node the database is placed on; null waits for verified regional capacity. */
@@ -117,7 +117,7 @@ export function databaseInsertStatement(
       .prepare(
         `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,status_message,created_at,updated_at,own_memory_mib,own_cpu_millicores,own_storage_gib)
       SELECT ?,p.id,r.id,NULL,?,s.id,?,'running',1,?,'Waiting for verified regional capacity',?,?,?,?,?
-      FROM projects p JOIN regions r ON r.id=? AND r.backup_bucket=? JOIN size_classes s ON s.id=? AND s.enabled=1
+      FROM projects p JOIN regions r ON r.id=? JOIN size_classes s ON s.id=? AND s.enabled=1
       WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=?
       AND ${admissionScopesOpenSql("p.id", "r.id", "NULL")}
       AND s.max_connections=? AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?
@@ -132,7 +132,6 @@ export function databaseInsertStatement(
         snapshot.now,
         ...ownValues,
         snapshot.body.region_id,
-        snapshot.region.backup_bucket,
         snapshot.body.size_class_id,
         snapshot.body.project_id,
         ...sizeValues,
@@ -149,7 +148,7 @@ export function databaseInsertStatement(
     .prepare(
       `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,created_at,updated_at,placed_at,own_memory_mib,own_cpu_millicores,own_storage_gib)
             SELECT ?,p.id,n.region_id,n.id,?,s.id,?,'running',1,?,?,?,?,?,?,? FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
-            JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id AND r.backup_bucket=?
+            JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id
             WHERE n.region_id=? AND ${guard.sql}
             AND ${admissionScopesOpenSql("p.id", "r.id", "n.id")}
             AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=? AND s.max_connections=?
@@ -166,7 +165,6 @@ export function databaseInsertStatement(
       ...ownValues,
       snapshot.body.project_id,
       snapshot.body.size_class_id,
-      snapshot.region.backup_bucket,
       snapshot.body.region_id,
       ...guard.bindings,
       ...sizeValues,
@@ -196,9 +194,7 @@ export async function createDatabase(
       )
         .bind(body.size_class_id)
         .first<SizeRow>();
-      const region = await c.env.DB.prepare(
-        "SELECT id,backup_bucket,backup_endpoint_url FROM regions WHERE id=?",
-      )
+      const region = await c.env.DB.prepare("SELECT id FROM regions WHERE id=?")
         .bind(body.region_id)
         .first<RegionRow>();
       if (!project) throw new ApiError("not_found", "Project not found");
@@ -207,7 +203,8 @@ export async function createDatabase(
           "invalid_request",
           "Size class or region unavailable",
         );
-      const own = overridesOfCreate(body.resources),
+      const { bucketName } = archiveBucket(c.env),
+        own = overridesOfCreate(body.resources),
         effective = effectiveResources(size, own);
       assertResourcesAllowed(
         effective,
@@ -233,7 +230,7 @@ export async function createDatabase(
                   decidedAt,
                 );
         const archive = archiveDestinationPath(
-          region.backup_bucket,
+          bucketName,
           region.id,
           id,
           1,
@@ -249,7 +246,6 @@ export async function createDatabase(
             databaseInsertStatement(c.env.DB, {
               body,
               size,
-              region,
               resources: own,
               nodeId: node?.id ?? null,
               pendingMemoryMib: node?.pending_memory_mib,

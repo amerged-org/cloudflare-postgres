@@ -3,7 +3,7 @@ import { DatabaseId, Timestamp } from "@pgcf/contracts";
 import { USAGE_HOUR_MS } from "@pgcf/contracts/usage";
 import { rollupUsageHour } from "./usage-rollup.ts";
 import { measureBackupUsage } from "./backup-usage.ts";
-import type { ArchiveEnvironment } from "./archive-bindings.ts";
+import type { ArchiveEnvironment } from "./archive-bucket.ts";
 
 export const USAGE_CRON_PAGE_LIMIT = 24;
 export const USAGE_CRON_STATEMENT_LIMIT = 600;

@@ -523,21 +523,18 @@ describe("bounded usage cron", () => {
       ).results,
     ).toEqual(before.results);
   });
-  it("wires the exact regional R2 backup bytes through the bounded usage cron and hourly row", async () => {
+  it("wires the exact R2 backup bytes through the bounded usage cron and hourly row", async () => {
     const f = await cohort(),
       id = f.ids[0]!,
       now = Date.now(),
       current = Math.floor(now / USAGE_HOUR_MS) * USAGE_HOUR_MS;
     const archivePath = archiveDestinationPath(
-      "pgcf-api-us-test",
+      env.ARCHIVE_BUCKET_NAME,
       f.region,
       id,
       1,
       newOperationId(),
     );
-    await env.DB.prepare("UPDATE regions SET backup_bucket=? WHERE id=?")
-      .bind("pgcf-api-us-test", f.region)
-      .run();
     await env.DB.prepare(
       "UPDATE databases SET archive_path=?,created_at=? WHERE id=?",
     )
@@ -545,15 +542,9 @@ describe("bounded usage cron", () => {
       .run();
     const prefix = `${f.region}/${id}/${archivePath.slice(archivePath.lastIndexOf("/") + 1)}/database/`,
       key = `${prefix}fixture`;
-    await env.ARCHIVE_US.put(key, new Uint8Array(37));
-    await env.ARCHIVE.put(key, new Uint8Array(99));
+    await env.ARCHIVE.put(key, new Uint8Array(37));
     try {
-      const result = await runUsageCron(env.DB, Date.now(), {
-        ...env,
-        ARCHIVE_BINDINGS: JSON.stringify({
-          [f.region]: { binding: "ARCHIVE_US", bucket: "pgcf-api-us-test" },
-        }),
-      });
+      const result = await runUsageCron(env.DB, Date.now(), env);
       expect(result.backupMeasured).toBe(1);
       expect(result.backupUnavailable).toBe(0);
       expect(result.statements).toBeLessThanOrEqual(USAGE_CRON_STATEMENT_LIMIT);
@@ -561,7 +552,6 @@ describe("bounded usage cron", () => {
       expect(JSON.parse(saved[0]!.metrics).backup_bytes_max).toBe(37);
     } finally {
       await env.ARCHIVE.delete(key);
-      await env.ARCHIVE_US.delete(key);
     }
   });
 });
@@ -577,15 +567,12 @@ describe("backup measurement of a deleted database", () => {
       current = Math.floor(now / USAGE_HOUR_MS) * USAGE_HOUR_MS,
       removed = deletedAt(current),
       archivePath = archiveDestinationPath(
-        "pgcf-api-us-test",
+        env.ARCHIVE_BUCKET_NAME,
         f.region,
         id,
         1,
         newOperationId(),
       );
-    await env.DB.prepare("UPDATE regions SET backup_bucket=? WHERE id=?")
-      .bind("pgcf-api-us-test", f.region)
-      .run();
     await env.DB.batch([
       env.DB.prepare(
         "UPDATE databases SET archive_path=?,created_at=? WHERE id=?",
@@ -602,23 +589,17 @@ describe("backup measurement of a deleted database", () => {
     ]);
     const prefix = `${f.region}/${id}/${archivePath.slice(archivePath.lastIndexOf("/") + 1)}/database/`,
       key = `${prefix}fixture`;
-    await env.ARCHIVE_US.put(key, new Uint8Array(37));
-    const archive = {
-      ...env,
-      ARCHIVE_BINDINGS: JSON.stringify({
-        [f.region]: { binding: "ARCHIVE_US", bucket: "pgcf-api-us-test" },
-      }),
-    };
-    let result = await runUsageCron(env.DB, now, archive);
+    await env.ARCHIVE.put(key, new Uint8Array(37));
+    let result = await runUsageCron(env.DB, now, env);
     for (let visit = 1; visit < visits; visit++) {
-      const again = await runUsageCron(env.DB, now, archive);
+      const again = await runUsageCron(env.DB, now, env);
       result = {
         ...again,
         backupMeasured: result.backupMeasured + again.backupMeasured,
         backupUnavailable: result.backupUnavailable + again.backupUnavailable,
       };
     }
-    await env.ARCHIVE_US.delete(key);
+    await env.ARCHIVE.delete(key);
     const backups = (await env.DB.prepare(
       "SELECT count(*) n FROM usage_samples WHERE database_id=? AND source='backup'",
     )

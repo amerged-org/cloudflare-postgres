@@ -67,17 +67,20 @@ async function preLifecycle() {
     // A table that today's schema no longer has keeps its empty history.
     if (current.size === 0) continue;
     // Today's tables lost columns that the genuine pre-0008 schema requires: the regional agent
-    // key goes with the node link, so the history gets a placeholder in its place. A node's
-    // hostname was the Kubernetes node name.
+    // key goes with the node link and the archive bucket and its endpoint with the one bucket of the
+    // installation, so the history gets a placeholder in their place. A node's hostname was the
+    // Kubernetes node name.
     const renamed: Record<string, string> = { k8s_node_name: "hostname" };
+    const placeholders: Record<string, string> = {
+      agent_key_hash: "lower(hex(randomblob(32)))",
+      backup_bucket: "'history-bucket'",
+      backup_endpoint_url: "'https://history.invalid'",
+    };
     const columns = (await names(table.name)).filter(
-      (name) =>
-        current.has(name) || name in renamed || name === "agent_key_hash",
+      (name) => current.has(name) || name in renamed || name in placeholders,
     );
     const values = columns.map((name) =>
-      current.has(name)
-        ? name
-        : (renamed[name] ?? "lower(hex(randomblob(32)))"),
+      current.has(name) ? name : (renamed[name] ?? placeholders[name]!),
     );
     // Lifecycle/sample inserts may already have created their revision row.
     await env.DB.prepare(

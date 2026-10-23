@@ -57,9 +57,6 @@ export type Env = Cloudflare.Env & {
   INFRASTRUCTURE_ALERT_WEBHOOK?: Fetcher;
   INFRASTRUCTURE_ALERT_WEBHOOK_URL?: string;
   INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN?: string;
-  ARCHIVE_BINDINGS?: string;
-  ARCHIVE_EU?: R2Bucket;
-  ARCHIVE_US?: R2Bucket;
   /**
    * The Contabo firewall every node sits behind: active, no inbound rule that accepts, created
    * once by the operator (docs/operations/operator-installation.md). AddNode assigns an instance
