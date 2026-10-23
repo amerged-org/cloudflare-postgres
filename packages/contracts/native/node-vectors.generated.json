@@ -18815,6 +18815,48 @@
     },
     {
       "schema": "AgentLinkMessage",
+      "name": "hello-with-in-place-restore",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "type": "hello",
+        "protocol": 1,
+        "agent_version": "0.1.0",
+        "release_id": "release-25",
+        "os": {
+          "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+          "booted_at": "2026-10-17T12:00:00.000Z",
+          "kernel_release": "6.12.111+deb13-amd64",
+          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "host_files_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "capabilities": ["restore_in_place_v1"]
+      }
+    },
+    {
+      "schema": "AgentLinkMessage",
+      "name": "hello-with-unknown-capability",
+      "valid": false,
+      "node_valid": false,
+      "refinement": false,
+      "value": {
+        "type": "hello",
+        "protocol": 1,
+        "agent_version": "0.1.0",
+        "release_id": "release-25",
+        "os": {
+          "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+          "booted_at": "2026-10-17T12:00:00.000Z",
+          "kernel_release": "6.12.111+deb13-amd64",
+          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "host_files_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "capabilities": ["restore_in_place_v2"]
+      }
+    },
+    {
+      "schema": "AgentLinkMessage",
       "name": "sample",
       "valid": true,
       "node_valid": true,

@@ -2296,6 +2296,11 @@
                 "host_files_sha256"
               ],
               "additionalProperties": false
+            },
+            "capabilities": {
+              "maxItems": 1,
+              "type": "array",
+              "items": { "type": "string", "const": "restore_in_place_v1" }
             }
           },
           "required": ["type", "protocol", "agent_version", "release_id", "os"],

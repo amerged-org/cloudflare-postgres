@@ -1909,6 +1909,8 @@ export const AgentLinkMessage = z.discriminatedUnion("type", [
     agent_version: z.string().min(1).max(64),
     release_id: FleetReleaseId.nullable(),
     os: NodeOs,
+    /** Authoritative capabilities of this binary/connection, accepted before new agents send them. */
+    capabilities: z.array(z.literal("restore_in_place_v1")).max(1).optional(),
   }),
   z.strictObject({ type: z.literal("sample"), sample: NodeSample }),
 ]);

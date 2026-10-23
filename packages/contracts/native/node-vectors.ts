@@ -2016,6 +2016,16 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
   AgentLinkMessage: [
     ["hello", hello, true],
+    [
+      "hello-with-in-place-restore",
+      { ...hello, capabilities: ["restore_in_place_v1"] },
+      true,
+    ],
+    [
+      "hello-with-unknown-capability",
+      { ...hello, capabilities: ["restore_in_place_v2"] },
+      false,
+    ],
     ["sample", { type: "sample", sample }, true],
     ["other-protocol", { ...hello, protocol: 2, release_id: null }, false],
     ["hello-without-os", { ...hello, os: undefined }, false],
