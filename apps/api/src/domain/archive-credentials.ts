@@ -52,7 +52,9 @@ const iso = (ms: number) => new Date(ms).toISOString();
  * to it, and a target loses the right when the move ends without it.
  */
 const stagedSql = `EXISTS(SELECT 1 FROM database_moves m WHERE m.database_id=d.id AND m.status='restoring'
-    AND m.target_node_id=n.id AND m.target_archive_path=?)`;
+    AND m.target_node_id=n.id AND m.target_archive_path=?) OR EXISTS(SELECT 1 FROM database_replacements p
+    WHERE p.database_id=d.id AND p.node_id=n.id AND ((p.phase='restoring' AND p.target_archive_path=?)
+      OR (p.phase='rolling_back' AND p.rollback_archive_path=?)))`;
 const guardSql = `n.id=? AND n.region_id=? AND n.lost_at IS NULL
   AND NOT EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=n.id)
   AND (?='read_only' OR (d.node_id=n.id AND d.archive_path=?) OR ${stagedSql})`;
@@ -61,6 +63,8 @@ function guardBindings(scope: ArchiveCredentialScope, region: string) {
     scope.nodeId,
     region,
     scope.access,
+    scope.archivePath,
+    scope.archivePath,
     scope.archivePath,
     scope.archivePath,
   ];
@@ -249,7 +253,10 @@ export async function deliverArchiveCredential(
       d.node_id database_node_id,d.archive_path database_archive_path,
       CASE WHEN n.lost_at IS NOT NULL OR EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=n.id) THEN 1 ELSE 0 END lost,
       CASE WHEN EXISTS(SELECT 1 FROM database_moves m WHERE m.database_id=c.database_id AND m.status='restoring'
-        AND m.target_node_id=c.node_id AND m.target_archive_path=c.archive_path) THEN 1 ELSE 0 END staged
+        AND m.target_node_id=c.node_id AND m.target_archive_path=c.archive_path)
+        OR EXISTS(SELECT 1 FROM database_replacements p WHERE p.database_id=c.database_id AND p.node_id=c.node_id
+          AND ((p.phase='restoring' AND p.target_archive_path=c.archive_path)
+            OR (p.phase='rolling_back' AND p.rollback_archive_path=c.archive_path))) THEN 1 ELSE 0 END staged
       FROM archive_credentials c JOIN nodes n ON n.id=c.node_id
       JOIN databases d ON d.id=c.database_id WHERE c.id=? AND c.node_id=?`,
   )

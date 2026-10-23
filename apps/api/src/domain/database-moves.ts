@@ -194,6 +194,17 @@ export async function startDatabaseMove(
     .bind(databaseId)
     .first<StartRow>();
   if (!row) throw new ApiError("not_found", "Database not found");
+  if (
+    await db
+      .prepare(
+        "SELECT 1 FROM database_replacements WHERE database_id=? AND phase IN('proving','restoring','rolling_back')",
+      )
+      .bind(databaseId)
+      .first()
+  )
+    throw new ApiError("conflict", "An in-place restore holds this database", {
+      reason: "mutation_in_progress",
+    });
   if (row.deleted_at !== null || row.desired_state === "deleted")
     throw new ApiError("conflict", "Database is deleted", {
       reason: "database_deleted",
@@ -256,6 +267,7 @@ export async function startDatabaseMove(
           `INSERT INTO database_moves(operation,database_id,project_id,region_id,source_node_id,target_node_id,source_storage_generation,source_archive_path,status,created_at,updated_at)
           SELECT ?,d.id,d.project_id,d.region_id,d.node_id,?,d.storage_generation,d.archive_path,'proving',?,?
           FROM databases d WHERE d.id=? AND d.generation=? AND d.storage_generation=? AND d.node_id=? AND d.deleted_at IS NULL
+          AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase IN('proving','restoring','rolling_back'))
           AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=d.node_id AND ${liveNodeSql}) AND ${open.sql}`,
         )
         .bind(
@@ -475,7 +487,7 @@ interface DatabaseState {
  * with its data, and the WAL is archived from the backup's first segment through the last one of
  * the proof. A fault of R2 or of the binding is thrown, not answered.
  */
-async function sourceArchiveHolds(
+export async function sourceArchiveHolds(
   env: Env,
   database: DatabaseState,
   observed: NodeDatabaseObservation,

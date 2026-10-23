@@ -115,6 +115,16 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Restore a database from its archive",
     "project",
   ),
+  "POST /v1/databases/{id}/restore-in-place": route(
+    "restoreDatabaseInPlace",
+    "Restore a database while retaining its connection identity",
+    "project",
+  ),
+  "GET /v1/databases/{id}/restores/in-place": route(
+    "listDatabaseReplacements",
+    "List in-place restore history and prior-state retention",
+    "project",
+  ),
   "POST /v1/databases/{id}/suspend": route(
     "suspendDatabase",
     "Suspend a database",

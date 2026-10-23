@@ -2,6 +2,7 @@
 import { parseArchivePath } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
+import { expireReplacementArchives } from "./database-replacements.ts";
 import { purgeArchiveCredentials } from "./archive-credentials.ts";
 import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
@@ -221,6 +222,7 @@ export async function enforceBackupRetention(
       LEFT JOIN backup_retention_runs c ON c.database_id=d.id AND c.archive_path=d.archive_path
       LEFT JOIN database_recovery_points p ON p.database_id=d.id AND p.storage_generation=d.storage_generation
       WHERE d.node_id IS NOT NULL AND d.deleted_at IS NULL AND d.desired_state<>'deleted'
+      AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase IN('proving','restoring','rolling_back'))
       AND NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id
         WHERE x.source_database_id=d.id AND x.verified_at IS NULL AND o.status IN('pending','running'))
       AND (c.checked_at IS NULL OR c.checked_at<? OR d.backup_last_completed_at>c.checked_at
@@ -292,19 +294,35 @@ export async function expireSupersededArchives(
     await env.DB.prepare(
       `${due("done", "source_archive_path", "source_archive_deleted_at", "source")}
       UNION ALL ${due("failed", "target_archive_path", "target_archive_deleted_at", "target")}
+      UNION ALL SELECT p.operation,p.region_id,p.source_archive_path archive_path,d.archive_path current_path,p.completed_at,'replacement' side
+      FROM database_replacements p JOIN databases d ON d.id=p.database_id
+      WHERE p.phase IN('succeeded','failed') AND p.retained_until<=?
+        AND ((p.source_archive_deleted_at IS NULL AND p.source_archive_path<>d.archive_path)
+          OR (p.phase='failed' AND p.target_archive_deleted_at IS NULL AND p.target_archive_path<>d.archive_path)
+          OR (p.rollback_archive_deleted_at IS NULL AND p.rollback_archive_path<>d.archive_path))
       ORDER BY completed_at,operation LIMIT 2`,
     )
-      .bind(at, named, named, at, named, named)
+      .bind(at, named, named, at, named, named, at)
       .all<{
         operation: string;
         region_id: string;
         archive_path: string;
         current_path: string;
-        side: "source" | "target";
+        side: "source" | "target" | "replacement";
       }>()
   ).results;
   const result = { archives: 0, objects: 0 };
+  let replacementsChecked = false;
   for (const row of rows) {
+    if (row.side === "replacement") {
+      if (!replacementsChecked) {
+        const expired = await expireReplacementArchives(env, now, limit);
+        result.archives += expired.archives;
+        result.objects += expired.objects;
+        replacementsChecked = true;
+      }
+      continue;
+    }
     const selected = archiveBucket(env);
     const path = parseArchivePath(row.archive_path);
     if (!path || path.bucket !== selected.bucketName) continue;

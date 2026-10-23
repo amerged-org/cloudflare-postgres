@@ -45,6 +45,7 @@ export const DatabaseAdmissionSnapshot = z
      * takes the authoritative wake path.
      */
     wakeable: z.boolean().optional(),
+    replacement_active: z.boolean().optional(),
     region: DatabaseRegionRoute,
     /** The node of the database, whose key signs the routes to it. */
     node: NodeId.nullable(),

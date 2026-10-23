@@ -61,12 +61,30 @@ export async function withIdempotency(
   c: ApiContext,
   handlers: IdempotencyHandlers,
 ): Promise<Response> {
+  const execute = async (lease: IdempotencyLease) => {
+    const id = c.req.param("id");
+    if (
+      id &&
+      c.req.path.startsWith("/v1/databases/") &&
+      (await c.env.DB.prepare(
+        "SELECT 1 FROM database_replacements WHERE database_id=? AND phase IN('proving','restoring','rolling_back')",
+      )
+        .bind(id)
+        .first())
+    )
+      throw new ApiError(
+        "conflict",
+        "An in-place restore holds this database",
+        { reason: "mutation_in_progress" },
+      );
+    return handlers.execute(lease);
+  };
   const auth = await getAuth(c);
   const key = c.req.header(IDEMPOTENCY_KEY_HEADER);
   if (key === undefined) {
     if (requiredIdempotentPublicRoutes.has(routeKey(c)))
       throw new ApiError("invalid_request", "Idempotency-Key is required");
-    return handlers.execute({
+    return execute({
       completeStatement: () => c.env.DB.prepare("SELECT 1"),
     });
   }
@@ -130,7 +148,7 @@ export async function withIdempotency(
     },
   };
   try {
-    const response = await handlers.execute(lease);
+    const response = await execute(lease);
     const result = await read();
     if (result?.state !== "completed")
       throw new Error("Mutation did not complete its idempotency reservation");
