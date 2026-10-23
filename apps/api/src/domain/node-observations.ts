@@ -149,7 +149,7 @@ class Statements {
    * The operations of the kinds that end with this report. A resize ends only when the filesystem
    * has the storage it asked for: `storageBytes`, the size the node reports, is at least the
    * database's effective storage less the gap at the end of its volume. A report that tells no size
-   * (an agent of an earlier release) ends it with the state, as before.
+   * cannot prove a resize and leaves it running until a current agent observes the filesystem.
    */
   succeed(
     kinds: readonly string[],
@@ -165,7 +165,7 @@ class Statements {
              AND kind IN(SELECT value FROM json_each(?)) ${id ? "AND id=?" : ""}
              AND NOT EXISTS(SELECT 1 FROM operations newer WHERE newer.database_id=operations.database_id
                AND newer.kind=operations.kind AND newer.kind='database.resize' AND newer.generation>operations.generation)
-             AND (kind<>'database.resize' OR ?=0 OR ?>=(SELECT r.storage_gib FROM database_resources r
+             AND (kind<>'database.resize' OR ?>=(SELECT r.storage_gib FROM database_resources r
                WHERE r.database_id=operations.database_id)*1073741824-?)
              AND ${applied.sql}`,
         )
@@ -177,7 +177,6 @@ class Statements {
           this.generation,
           JSON.stringify(kinds),
           ...(id ? [id] : []),
-          Number(storageBytes !== undefined),
           storageBytes ?? 0,
           FILESYSTEM_END_GAP_BYTES,
           ...applied.bindings,

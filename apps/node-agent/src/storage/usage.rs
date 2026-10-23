@@ -14,15 +14,13 @@ pub enum Alert {
     Critical,
 }
 
-/// `statvfs` of what the tenant can use of a mounted volume, as the agent reads it every 60 s
-/// (`host::tenant_usage`): the tenant's limit is the size, its files are the use.
+/// `statvfs` of the mounted filesystem, read every 60 seconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FsUsage {
     pub total_bytes: u64,
     /// Total minus free, as `df` counts it.
     pub used_bytes: u64,
-    /// Free space the tenant can still take: the room its limit leaves (`quota::limits`), or the
-    /// filesystem's own on a volume that has no limit.
+    /// Free space available to PostgreSQL.
     pub available_bytes: u64,
     pub inodes_total: u64,
     pub inodes_used: u64,

@@ -453,13 +453,6 @@ impl Machine for Node {
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750))
     }
 
-    async fn project_data(&self, database: &str) -> io::Result<()> {
-        let data = self.layout.data(database);
-        tokio::task::spawn_blocking(move || storage::project_data(&data))
-            .await
-            .map_err(io::Error::other)?
-    }
-
     async fn initdb(&self, account: &Account, data: &Path) -> io::Result<()> {
         let output = tokio::process::Command::new(self.layout.postgres_bin.join("initdb"))
             .args(initdb_arguments(data, Some(LOCALE)))

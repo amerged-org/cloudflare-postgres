@@ -271,34 +271,10 @@ scratch_filesystem_gap() {
 		echo "filesystem $filesystem of a volume of $bytes"
 		return 1
 	}
-}
-
-# The filesystem has no reserved group descriptors (an online grow asks the 8 MiB journal for 6
-# credits at any size, not 1,030) and has the project quota of the tenant's share, whose kernel
-# module the volume's mount loaded (plan 4.3).
-scratch_filesystem_format() {
-	local id features
-	id=$(scratch_id)
+	local features
 	features=$(dumpe2fs -h "/dev/mapper/pgcf-db_${id}_g1" 2>/dev/null | sed -n 's/^Filesystem features: *//p')
-	for wanted in meta_bg quota project; do
-		case " $features " in
-		*" $wanted "*) ;;
-		*)
-			echo "filesystem features: $features"
-			return 1
-			;;
-		esac
-	done
-	case " $features " in
-	*" resize_inode "*)
-		echo "filesystem features: $features"
-		return 1
-		;;
-	esac
-	grep -q '^quota_v2 ' /proc/modules || {
-		echo "quota_v2 is not loaded"
-		return 1
-	}
+	[[ " $features " == *" meta_bg "* && " $features " != *" resize_inode "* && " $features " != *" project "* ]]
+
 }
 
 scratch_id() {
@@ -1229,7 +1205,6 @@ check socket_directory socket_directory
 check no_volume_in_pid_1_namespace no_volume_in_pid_1_namespace
 if [ "$phase" = 1 ]; then
 	check scratch_filesystem_gap scratch_filesystem_gap
-	check scratch_filesystem_format scratch_filesystem_format
 	check database_unit_device_allow database_unit_device_allow
 	check slot_unit_device_allow slot_unit_device_allow
 	check database_unit_needs_the_link database_unit_needs_the_link

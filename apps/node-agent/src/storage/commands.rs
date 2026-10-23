@@ -235,8 +235,7 @@ fn fs_size(volume_bytes: u64) -> String {
 ///   `meta_bg` the descriptors of a group are beside the group, nothing is reserved, and a grow
 ///   asks for 6 credits at any size, up to the 64 TiB that the API accepts (lab, `plan` 11.1).
 /// - `-m 0`: no root-only reserve. PostgreSQL does not run as root, so it never had the use of it,
-///   and the WAL's room is the project quota's (`quota`).
-/// - `-O quota,project` and `quotatype=prjquota`: the project quota, and its inode.
+///   recovery after a full volume is by growing it.
 pub fn mkfs(config: &Config, id: &VolumeId, volume_bytes: u64) -> Vec<String> {
     words([
         "mkfs.ext4",
@@ -249,9 +248,9 @@ pub fn mkfs(config: &Config, id: &VolumeId, volume_bytes: u64) -> Vec<String> {
         "-m",
         "0",
         "-O",
-        "^resize_inode,meta_bg,quota,project",
+        "^resize_inode,meta_bg",
         "-E",
-        "lazy_itable_init=0,lazy_journal_init=0,quotatype=prjquota",
+        "lazy_itable_init=0,lazy_journal_init=0",
         &device(config, id),
         &fs_size(volume_bytes),
     ])
@@ -262,6 +261,10 @@ pub fn resize_fs(config: &Config, id: &VolumeId, volume_bytes: u64) -> Vec<Strin
 }
 pub fn fsck(config: &Config, id: &VolumeId) -> Vec<String> {
     words(["e2fsck", "-p", &device(config, id)])
+}
+/// An offline grow must check the filesystem even when its clean flag is set.
+pub fn check_before_grow(config: &Config, id: &VolumeId) -> Vec<String> {
+    words(["e2fsck", "-p", "-f", &device(config, id)])
 }
 /// Sets the filesystem's `needs_recovery` flag so that `e2fsck -p` replays the journal. After a
 /// full pool the journal can hold committed transactions while the flag is clear, because the
@@ -418,8 +421,8 @@ mod tests {
         assert_eq!(
             line(mkfs(&config, &id(), 1 << 30)),
             format!(
-                "mkfs.ext4 -F -q -J size=8 -i 65536 -m 0 -O ^resize_inode,meta_bg,quota,project \
-                 -E lazy_itable_init=0,lazy_journal_init=0,quotatype=prjquota {device} 1044480K"
+                "mkfs.ext4 -F -q -J size=8 -i 65536 -m 0 -O ^resize_inode,meta_bg \
+                 -E lazy_itable_init=0,lazy_journal_init=0 {device} 1044480K"
             )
         );
         assert_eq!(

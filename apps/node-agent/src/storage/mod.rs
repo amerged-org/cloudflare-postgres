@@ -26,7 +26,6 @@ mod listing;
 mod lvm;
 mod mountinfo;
 mod pool;
-mod quota;
 #[cfg(target_os = "linux")]
 mod store;
 mod usage;
@@ -38,14 +37,6 @@ pub use ids::VolumeId;
 pub use pool::{NoRoom, Policy, PoolMode, PoolSample};
 #[cfg(target_os = "linux")]
 pub use store::Storage;
-
-/// Puts the files of a data directory's `base` and `global` in the tenant's project, so that the
-/// volume's limits apply to them (`quota`). After `initdb` and after a restore has fetched the
-/// files, before PostgreSQL starts on them.
-#[cfg(target_os = "linux")]
-pub fn project_data(data: &std::path::Path) -> std::io::Result<()> {
-    host::mark_project(data, quota::PROJECT_ID)
-}
 pub use usage::{Alert, FsUsage, Inventory, MountInfo, Removal, VolumeInfo};
 
 /// What `Storage::open` did to get the group active besides the plain `vgchange`: nothing, on

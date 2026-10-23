@@ -1164,7 +1164,7 @@ export const NodeDatabaseObservation = z
      * it is at least the storage that the resize asked for less `FILESYSTEM_END_GAP_BYTES`; a
      * growth the kernel refused leaves the filesystem as it was, and the resize stays open until
      * the node's next try has grown it, or the API fails it. A node that does not send it (an
-     * agent that was released before this property) ends the resize with the state, as before.
+     * agent that was released before this property) cannot prove the resize, which stays open.
      */
     storage_bytes: Positive.optional(),
     proven_sleep: ProvenSleepRecord.nullable(),

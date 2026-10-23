@@ -815,12 +815,7 @@ token or the route keyring changed.
 - Every filesystem is made and grown with an explicit size that ends 4 MiB (`FS_END_GAP_BYTES`, one
   extent) before the end of its volume: `mkfs.ext4 … <volume size - 4 MiB>K` and `resize2fs
   <device> <new size - 4 MiB>K`; systemd never grows it, and a call that finds the filesystem at
-  the size or above leaves it (its superblock's block count), because resize2fs refuses to shrink
-  one for ever. The format is `-O ^resize_inode,meta_bg,quota,project` with `-m 0` (plan 4.3,
-  Appendix C): no reserved group descriptors, so an online grow asks the 8 MiB journal for 6
-  credits at any size (with them it asked for 1,030 and failed with -28 from 5.4 GiB), and a
-  project quota for the tenant's share, which the mount enforces (`prjquota`) and the agent
-  sets with `quotactl`. The first mount of such a volume loads the kernel module `quota_v2`.
+  the size or above leaves it (`dumpe2fs -h`), because resize2fs refuses to shrink one for ever.
   The units and the jobs mount a volume through systemd's image dissection, whose libblkid
   probers read the end of the device as root and refuse a device that carries a RAID or ZFS
   signature there. The farthest end-of-device probe of libblkid 2.41 is `promise_raid`'s, 3087

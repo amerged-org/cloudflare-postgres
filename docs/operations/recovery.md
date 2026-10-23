@@ -358,27 +358,20 @@ created at full size at first boot and does not grow.
   again and wakes the database through admission; PostgreSQL runs crash recovery from its durable
   WAL, and every acknowledged commit survives. A volume it cannot repair (`e2fsck` refuses) needs an
   operator. Running writers are never stopped for storage.
-- **A full volume.** A tenant can fill its own share of the volume with bytes or with inodes
-  (many relations or partitions). The share is a project quota on the data directory's `base` and
-  `global` (plan 4.3): the volume less the room the WAL keeps, 55 to 68 percent of it. At its
-  limit the tenant's inserts and creates fail with `Disk quota exceeded` as errors of the
-  statement and the database goes on serving; `DELETE`, `DROP` and the checkpoint work, a crash
-  recovery finishes by itself, and `VACUUM` and `TRUNCATE` need a few KiB that a `DROP` or a
-  resize gives. The agent reports each volume's space and inodes of the share every 60 seconds, and
-  `database_volume_warning` (80 %) and `database_volume_critical` (90 %) fire. Raise the size with
-  `PUT /v1/databases/{id}/resources` (storage only grows, online) or have the integrator free
-  space. WAL that piles up during an R2 outage is outside the share and can fill the volume; then
-  PostgreSQL stops on the failed WAL write and a resize is the way out. Nothing extends a volume
-  by itself.
-- **A resize that did not grow the filesystem.** The resize operation stays `running` while the
-  filesystem is smaller than the storage; the node reports the size its filesystem has with
-  `ready` and `asleep`, and tries the growth again with every decision of the database. After 20
-  minutes the operation fails with `filesystem_not_grown`, and while the filesystem is smaller
-  than the storage `database_volume_critical` names the database. The `resize_refused` events of
-  the node (Workers Logs, the `class` names the refusal) say why. A volume made before the
-  change that made the filesystem without reserved group descriptors (an 8 GiB or larger volume
-  of the older format cannot add a flex group online: the kernel logs `JBD2: resize2fs wants too
-  many credits`, `resize2fs` fails with -28) is recreated or restored, not repaired.
+- **A full volume.** A tenant can exhaust its volume's bytes or inodes, including WAL retained
+  during an R2 outage. Space and inode warnings fire at 80 % and critical alerts at 90 %. The
+  supported recovery is an explicit storage increase through `PUT /v1/databases/{id}/resources`
+  or a larger size class. New filesystems have no root-only reserve or project quota; arbitrary
+  `DELETE`, `VACUUM` and `TRUNCATE` at full are not guaranteed. The node applies the grow before
+  attempting PostgreSQL recovery, preserves the unproven state, then archives and proves recovery
+  before admitting clients. The operation succeeds only after the measured filesystem reaches
+  the requested volume size less its 4 MiB end gap. Missing or undersized observations cannot
+  complete it; a 20-minute timeout reports `filesystem_not_grown` while reconciliation continues.
+  The earlier ext4 layout needs an offline grow: a running writer first completes the normal
+  sleep proof, and the agent verifies that no unit or job still holds the filesystem before
+  `e2fsck -p -f` and `resize2fs`. Failed checks leave the volume suspect for recovery. Never force
+  an unmount, reformat an existing volume, or replay an uncertain application write. Nothing
+  extends a volume without an explicit request.
 
 Thin physical allocation metrics stay null until a real measurement exists; neither a logical
 quota nor zero stands in for an unknown measurement. The agent's full-pool and full-volume recovery

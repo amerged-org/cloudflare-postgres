@@ -169,14 +169,6 @@ pub const PRELOAD_LIBRARIES: &[&str] = &["pg_prewarm"];
 /// the readahead of the hot list reads the last one there is.
 pub const AUTOPREWARM: bool = true;
 
-/// `max_wal_size` of a database whose volume has `volume_bytes`: a quarter of the volume, and never
-/// below the 64 MiB that keeps checkpoints from running back to back on a tiny volume. The volume's
-/// project quota leaves this much room, and more, outside the tenant's share
-/// (`storage::quota::limits`).
-pub fn max_wal_bytes(volume_bytes: u64) -> u64 {
-    (volume_bytes / 4 / MIB).max(64) * MIB
-}
-
 /// `postgresql.conf`. `None` for a setting that cannot be written as it is.
 ///
 /// Every database runs autoprewarm: PostgreSQL's `pg_prewarm` library, loaded at start, writes the
@@ -196,7 +188,9 @@ pub fn postgresql_conf(settings: &Settings) -> Option<String> {
         None => "archive_mode = off\n".to_string(),
     };
     let tuning = tuning(settings.memory_mib);
-    let max_wal_mib = max_wal_bytes(settings.volume_bytes) / MIB;
+    // A quarter of the volume, and never below the 64 MiB that keeps checkpoints from running
+    // back to back on a tiny volume.
+    let max_wal_mib = (settings.volume_bytes / 4 / MIB).max(64);
     let mut conf = format!(
         "# Written by pgcf-agent for every start of the database. Do not edit.\n\
          listen_addresses = ''\n\
@@ -382,17 +376,6 @@ mod tests {
             assert!(!large.contains(absent), "{absent}");
         }
         assert!(large.contains("max_wal_size = 25600MB"));
-    }
-
-    /// `max_wal_size` is a quarter of the volume and never below 64 MiB; the volume's quota keeps
-    /// that much room for the WAL outside the tenant's share (`storage::quota`).
-    #[test]
-    fn the_wal_may_take_a_quarter_of_the_volume_and_at_least_64_mib() {
-        assert_eq!(max_wal_bytes(1 << 30), 256 * MIB);
-        assert_eq!(max_wal_bytes(2 << 30), 512 * MIB);
-        assert_eq!(max_wal_bytes(100 << 30), 25_600 * MIB);
-        assert_eq!(max_wal_bytes(64 * MIB), 64 * MIB);
-        assert_eq!(max_wal_bytes(0), 64 * MIB);
     }
 
     /// The whole file of a 256 MiB and of a 1 GiB class, as PostgreSQL 18 reads it. The small

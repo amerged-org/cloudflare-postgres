@@ -17,7 +17,7 @@ use std::{
     slice,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -1890,26 +1890,7 @@ fn a_volume_that_a_unit_or_a_job_still_has_open_is_busy_and_goes_when_it_lets_go
     assert!(lab.lv(&a).is_none());
 }
 
-// ---------- the tenant's share of a volume, and growing a volume under a running PostgreSQL ----------
-
-/// What the kernel says of the project's use of a volume: the limited directory's `statvfs`.
-fn share(lab: &Lab, id: &VolumeId) -> FsUsage {
-    host::tenant_usage(&lab.dir_of(id)).unwrap()
-}
-
-/// The limits that the agent must have set on the volume of `id`, from what its filesystem has.
-fn wanted_limits(lab: &Lab, id: &VolumeId) -> quota::Limits {
-    let whole = host::fs_usage(&lab.dir_of(id)).unwrap();
-    quota::limits(
-        whole.total_bytes,
-        whole.inodes_total,
-        lab.lv(id).unwrap().size_bytes,
-    )
-}
-
-fn limits_of(lab: &Lab, id: &VolumeId) -> quota::Limits {
-    host::quota_limits(&commands::device(lab.config(), id), quota::PROJECT_ID).unwrap()
-}
+// ---------- growth and recovery with a real tenant PostgreSQL ----------
 
 /// A tenant's PostgreSQL on the volume of a lab: `initdb` as the tenant's user, the files of
 /// `base` and `global` in the project as the agent puts them, the agent's `postgresql.conf` for
@@ -1940,8 +1921,6 @@ impl TenantPg {
             "initdb: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        // What the agent does after `initdb`, and before PostgreSQL writes to the files.
-        crate::storage::project_data(&data).unwrap();
         let volume_bytes = lab.lv(id).unwrap().size_bytes;
         let conf = crate::settings::postgresql_conf(&crate::settings::Settings {
             socket_directory: &socket,
@@ -2045,20 +2024,6 @@ impl TenantPg {
         }
     }
 
-    /// The bytes the WAL segments take on the volume.
-    fn wal_bytes(&self) -> u64 {
-        fs::read_dir(self.data.join("pg_wal"))
-            .map(|files| {
-                files
-                    .flatten()
-                    .filter_map(|file| file.metadata().ok())
-                    .filter(|metadata| metadata.is_file())
-                    .map(|metadata| metadata.len())
-                    .sum()
-            })
-            .unwrap_or(0)
-    }
-
     /// Inserts rows of `row_bytes` in batches of about 10 MB until a statement fails: the number
     /// of rows that were acknowledged, and the error that ended it. The table has a primary key
     /// when `indexed`.
@@ -2100,137 +2065,12 @@ fn tenant(command: &mut Command) -> &mut Command {
         .current_dir("/")
 }
 
-/// A volume's tenant gets its share and no more, and what is left outside the share is for the
-/// WAL: the project's `statvfs` is the tenant's view, the limits follow the volume, and they are
-/// there after the volume was unmounted and attached again.
+/// An older filesystem with resize_inode and an 8 MiB journal grows safely offline.
 #[test]
-fn the_tenant_stops_at_its_share_of_the_volume_while_the_wal_has_room_and_the_share_follows_growth()
-{
-    let lab = Lab::open(2048);
-    let a = id(ID, 1);
-    lab.create(&a, 1024);
-    let device = commands::device(lab.config(), &a);
-    assert!(host::read_superblock(&device).unwrap().project_quota());
-    // The mount enforces the limits of the project.
-    let mount_line = lab
-        .mount_table()
-        .lines()
-        .find(|line| line.contains(&format!("/{ID} ")))
-        .map(String::from)
-        .unwrap();
-    assert!(mount_line.contains("prjquota"), "{mount_line}");
-    assert_eq!(limits_of(&lab, &a), wanted_limits(&lab, &a));
-
-    // What PostgreSQL's directories are, and what the agent does after `initdb`.
-    let data = lab.dir_of(&a).join("data");
-    for directory in ["base", "global", "pg_wal", "pg_xact"] {
-        fs::create_dir_all(data.join(directory)).unwrap();
-    }
-    sh(
-        "chown",
-        &["-R", &TENANT.to_string(), data.to_str().unwrap()],
-    );
-    fs::write(data.join("base").join("existing"), vec![7u8; 1 << 20]).unwrap();
-    chown(
-        data.join("base").join("existing"),
-        Some(TENANT),
-        Some(TENANT),
-    )
-    .unwrap();
-    crate::storage::project_data(&data).unwrap();
-
-    // The tenant's view of the volume is its share: the size is the limit, the use is the files
-    // of `base`, and the files outside it are not counted.
-    let view = share(&lab, &a);
-    let limits = limits_of(&lab, &a);
-    assert_eq!(view.total_bytes, limits.blocks * quota::BLOCK_UNIT);
-    assert!(
-        view.used_bytes >= 1 << 20 && view.used_bytes < 2 << 20,
-        "{view:?}"
-    );
-    let whole = host::fs_usage(&lab.dir_of(&a)).unwrap();
-    assert!(
-        view.total_bytes < whole.total_bytes * 8 / 10,
-        "{view:?} {whole:?}"
-    );
-
-    // The tenant fills `base` and stops at its limit; nothing but `base` and `global` is limited.
-    let fill = |dir: &str, name: &str, kib: u64| {
-        let path = data.join(dir).join(name);
-        let status = Command::new("setpriv")
-            .args([
-                &format!("--reuid={TENANT}"),
-                &format!("--regid={TENANT}"),
-                "--clear-groups",
-                "dd",
-                "if=/dev/zero",
-                &format!("of={}", path.display()),
-                "bs=64k",
-                &format!("count={}", kib / 64),
-                "conv=fsync",
-            ])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        status.success()
-    };
-    assert!(!fill("base", "fill", 4 << 20), "the limit stops the tenant");
-    let full = share(&lab, &a);
-    assert_eq!(full.space_percent(), 100, "{full:?}");
-    assert_eq!(full.space_alert(), Some(Alert::Critical));
-    assert!(full.used_bytes + 64 * 1024 >= full.total_bytes);
-    // The volume as a whole has room, and `pg_wal`, `pg_xact` and the rest are not limited.
-    let outside = host::fs_usage(&lab.dir_of(&a)).unwrap();
-    assert!(outside.available_bytes >= 200 << 20, "{outside:?}");
-    assert!(fill("pg_wal", "segment", 64 << 10));
-    assert!(fill("pg_xact", "0000", 256));
-    // The volume report is the tenant's view, and it is valid.
-    let mounted = lab.volume(&a).mount.unwrap();
-    assert_eq!(mounted.usage.total_bytes, full.total_bytes);
-
-    // The limits are in the filesystem: an attach again, with the agent's mount gone, finds them.
-    lab.storage.unmount_volume(&a).unwrap();
-    lab.storage.mount_volume(&a).unwrap();
-    assert_eq!(limits_of(&lab, &a), limits);
-    assert!(
-        lab.mount_table()
-            .lines()
-            .any(|line| line.contains(&format!("/{ID} ")) && line.contains("prjquota"))
-    );
-    // A growth raises the share with the filesystem, and the tenant can write again.
-    lab.storage.grow_volume(&a, 2048 << 20).unwrap();
-    let grown = limits_of(&lab, &a);
-    assert_eq!(grown, wanted_limits(&lab, &a));
-    assert!(grown.blocks > limits.blocks * 3 / 2 && grown.inodes > limits.inodes);
-    assert!(fill("base", "more", 512 << 10));
-    // Called again with the size it has, the growth changes nothing; limits set by hand to
-    // something else are put back by the next attach or growth.
-    host::set_quota_limits(
-        &commands::device(lab.config(), &a),
-        quota::PROJECT_ID,
-        quota::Limits {
-            blocks: 1000,
-            inodes: 10,
-        },
-    )
-    .unwrap();
-    lab.storage.grow_volume(&a, 2048 << 20).unwrap();
-    assert_eq!(limits_of(&lab, &a), wanted_limits(&lab, &a));
-}
-
-/// A volume that an earlier release made has no project quota and its superblock says so: it is
-/// mounted without the option (which the kernel would refuse), has no limits, and reports the
-/// volume as a whole. Its filesystem has the reserved group descriptor blocks that
-/// `mke2fs` leaves for 1,024 times the size: from 5.4 GiB a grow that adds a flex group asks the
-/// 8 MiB journal for more credits than it has, `resize2fs` fails and the filesystem keeps its
-/// size, and the agent says so (the volume is larger than its filesystem, and the error is the
-/// command's) instead of ending as if it had grown.
-#[test]
-fn a_volume_of_an_earlier_release_has_no_share_and_a_failed_growth_is_an_error() {
+fn an_older_filesystem_grows_offline_without_losing_data() {
     let lab = Lab::open_with(3072, |config| config.logical_cap_factor = 64);
     let a = id(ID, 1);
     let size = 8u64 << 30;
-    // What `create_volume` did before: the earlier mkfs line, with the reserved descriptors.
     lab.run(commands::volume_create(lab.config(), &a, size));
     lab.run(
         [
@@ -2256,48 +2096,39 @@ fn a_volume_of_an_earlier_release_has_no_share_and_a_failed_growth_is_an_error()
         slice::from_ref(&a),
         FS_TAG,
     ));
-    // The commands above ran beside the storage, which must read its list again.
     lab.storage.changed_elsewhere();
     lab.storage.mount_volume(&a).unwrap();
-    assert!(lab.mounted(&a));
-    let device = commands::device(lab.config(), &a);
-    assert!(!host::read_superblock(&device).unwrap().project_quota());
     assert!(
-        !lab.mount_table()
-            .lines()
-            .any(|line| line.contains(&format!("/{ID} ")) && line.contains("prjquota"))
+        !host::read_superblock(&commands::device(lab.config(), &a))
+            .unwrap()
+            .online_grow()
     );
-    assert!(host::quota_limits(&device, quota::PROJECT_ID).is_err());
-    // The tenant's view is the filesystem as a whole.
-    let before = filesystem_bytes(&lab, &a);
-    let view = lab.volume(&a).mount.unwrap().usage;
-    assert_eq!(view, host::fs_usage(&lab.dir_of(&a)).unwrap());
-
-    let result = lab.storage.grow_volume(&a, 9 << 30);
-    assert!(
-        matches!(&result, Err(Error::Command { program, .. }) if program == "resize2fs"),
-        "{result:?}"
+    fs::write(lab.dir_of(&a).join("acknowledged"), b"committed data").unwrap();
+    let holder = lab.unit_holding(&a);
+    assert!(matches!(
+        lab.storage.grow_volume(&a, 9 << 30),
+        Err(Error::OfflineGrowRequired)
+    ));
+    assert_eq!(lab.lv(&a).unwrap().size_bytes, size);
+    assert!(lab.linked_to_the_mounted_volume(&a));
+    drop(holder);
+    lab.storage.grow_volume(&a, 9 << 30).unwrap();
+    assert_eq!(
+        filesystem_bytes(&lab, &a),
+        (9 << 30) - commands::FS_END_GAP_BYTES
     );
-    // The volume has the size and the filesystem does not: the kernel fills the last group it has
-    // (up to 128 MiB) before it asks for the credits it does not have, and stops there. The
-    // superblock says so, which is what the agent reports.
-    assert_eq!(lab.lv(&a).unwrap().size_bytes, 9 << 30);
-    let stopped = filesystem_bytes(&lab, &a);
-    assert!(
-        stopped >= before && stopped - before <= 128 << 20,
-        "{stopped} {before}"
+    assert_eq!(
+        fs::read(lab.dir_of(&a).join("acknowledged")).unwrap(),
+        b"committed data"
     );
-    assert!(stopped < commands::fs_target_kib(9 << 30) * 1024);
-    assert_eq!(lab.storage.filesystem_bytes(&a).unwrap(), stopped);
-    // The same growth once more is the same error, and nothing is half done.
-    assert!(lab.storage.grow_volume(&a, 9 << 30).is_err());
-    assert_eq!(filesystem_bytes(&lab, &a), stopped);
+    assert!(lab.linked_to_the_mounted_volume(&a));
+    lab.storage.grow_volume(&a, 9 << 30).unwrap();
 }
 
 /// A volume made as the agent makes it grows online under a running PostgreSQL, from the least the
 /// API creates to a terabyte in one call, and in steps from the class size, at every size: the
 /// filesystem has the size at each end, `resize2fs` is never refused, the database keeps taking
-/// writes, and the share follows.
+/// writes.
 #[test]
 fn a_volume_grows_online_under_a_running_postgresql_in_one_call_and_in_steps() {
     // The sold storage of the lab is far over its pool: the logical cap is lifted.
@@ -2324,7 +2155,6 @@ fn a_volume_grows_online_under_a_running_postgresql_in_one_call_and_in_steps() {
     let tib = 1u64 << 40;
     lab.storage.grow_volume(&one_call, tib).unwrap();
     assert_eq!(filesystem_bytes(&lab, &one_call), tib - gap);
-    assert_eq!(limits_of(&lab, &one_call), wanted_limits(&lab, &one_call));
     write(&pg, 20_000);
     assert_eq!(pg.sql("SELECT count(*) FROM written").unwrap(), "40000");
     // The checkpoint and a restart work on the grown filesystem.
@@ -2352,7 +2182,6 @@ fn a_volume_grows_online_under_a_running_postgresql_in_one_call_and_in_steps() {
             (next << 30) - gap,
             "{next} GiB"
         );
-        assert_eq!(limits_of(&lab, &steps), wanted_limits(&lab, &steps));
         size_gib = next;
     }
     assert_eq!(size_gib, 1024);
@@ -2379,213 +2208,55 @@ fn a_volume_grows_online_under_a_running_postgresql_in_one_call_and_in_steps() {
     }
 }
 
-/// Samples the WAL's size on the volume until dropped; the largest size it saw.
-struct WalPeak {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    peak: Arc<std::sync::atomic::AtomicU64>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-impl WalPeak {
-    fn watch(pg: &TenantPg) -> WalPeak {
-        let (stop, peak) = (
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Arc::new(AtomicU64::new(0)),
-        );
-        let dir = pg.data.join("pg_wal");
-        let thread = {
-            let (stop, peak) = (stop.clone(), peak.clone());
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let bytes: u64 = fs::read_dir(&dir)
-                        .map(|files| {
-                            files
-                                .flatten()
-                                .filter_map(|file| file.metadata().ok())
-                                .map(|metadata| metadata.len())
-                                .sum()
-                        })
-                        .unwrap_or(0);
-                    peak.fetch_max(bytes, Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            })
-        };
-        WalPeak {
-            stop,
-            peak,
-            thread: Some(thread),
-        }
-    }
-    fn end(mut self) -> u64 {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        self.peak.load(Ordering::Relaxed)
-    }
-}
-
-/// A tenant that fills its share of the volume gets "Disk quota exceeded" and the database goes on
-/// serving: the acknowledged rows are all there, the deletes, the drops and a crash at the limit
-/// need the WAL and the checkpoint, which have their room, and none of them panics the server.
-/// Numbers of the lab (kernel 6.8, PostgreSQL 18.6) go to the output.
-fn a_tenant_fills_its_share_and_cleans_up(lab: &Lab, id: &VolumeId) {
-    let volume_bytes = lab.lv(id).unwrap().size_bytes;
-    let mut pg = TenantPg::new(lab, id);
-    let name = format!("{} GiB", volume_bytes >> 30);
-
-    // Bytes: the tenant's inserts stop at the limit, with the error of the statement.
-    pg.sql("CREATE TABLE scratch AS SELECT g, repeat('s', 1000) FROM generate_series(1, 30000) g")
-        .unwrap();
-    let (rows, error) = pg.fill("t", 2000, true);
-    assert!(error.contains("Disk quota exceeded"), "{name}: {error}");
-    assert!(rows > 0);
-    assert_eq!(pg.sql("SELECT count(*) FROM t").unwrap(), rows.to_string());
-    let view = share(lab, id);
-    assert_eq!(view.space_alert(), Some(Alert::Critical), "{view:?}");
-    let outside = host::fs_usage(&lab.dir_of(id)).unwrap();
-    eprintln!(
-        "{name}: stopped at {} MiB of {} MiB ({} rows), wal {} MiB, {} MiB of the volume free",
-        view.used_bytes >> 20,
-        view.total_bytes >> 20,
-        rows,
-        pg.wal_bytes() >> 20,
-        outside.available_bytes >> 20,
-    );
-    assert!(outside.available_bytes > 0);
-    assert_eq!(pg.sql("SELECT count(*) FROM t WHERE id = 1").unwrap(), "1");
-
-    // The delete needs the WAL, and the checkpoint behind it the room that the WAL has.
-    let watch = WalPeak::watch(&pg);
-    pg.sql("DELETE FROM t").unwrap();
-    let peak = watch.end();
-    eprintln!(
-        "{name}: DELETE of every row ok, wal peaked at {} MiB (max_wal_size {} MiB), {} MiB of the volume free",
-        peak >> 20,
-        crate::settings::max_wal_bytes(volume_bytes) >> 20,
-        host::fs_usage(&lab.dir_of(id)).unwrap().available_bytes >> 20,
-    );
-    assert_eq!(pg.sql("SELECT count(*) FROM t").unwrap(), "0");
-    assert_eq!(pg.sql("SELECT 1").unwrap(), "1");
-    // A VACUUM makes the first page of the table's visibility map, 8 KiB of a new file, and there
-    // is none left to take: the statement fails and nothing else does.
-    let vacuum = pg.sql("VACUUM t");
-    eprintln!("{name}: VACUUM at the limit: {vacuum:?}");
-    assert_eq!(pg.sql("SELECT 1").unwrap(), "1");
-    // A drop gives the room back at once (the bytes of a relation's files go with the statement,
-    // the inode of its first file with the next checkpoint), and the VACUUM runs and returns
-    // the table's pages to the tenant's share.
-    pg.sql("DROP TABLE scratch").unwrap();
-    pg.sql("VACUUM t").unwrap();
-    assert!(share(lab, id).used_bytes < view.used_bytes / 2);
-    eprintln!(
-        "{name}: after DROP of a small table VACUUM ok, share at {} MiB",
-        share(lab, id).used_bytes >> 20
-    );
-
-    // Refilled to the limit: TRUNCATE of the table with an index needs the new index's first page,
-    // 8 KiB of a new file, and fails like the VACUUM; of a table with no index it does not.
-    let (again, error) = pg.fill("t", 2000, true);
-    assert!(error.contains("Disk quota exceeded"), "{name}: {error}");
-    assert_eq!(pg.sql("SELECT count(*) FROM t").unwrap(), again.to_string());
-    let truncate = pg.sql("TRUNCATE t");
-    eprintln!(
-        "{name}: TRUNCATE of the indexed table at the limit: {truncate:?}; wal {} MiB, {} MiB of the volume free",
-        pg.wal_bytes() >> 20,
-        host::fs_usage(&lab.dir_of(id)).unwrap().available_bytes >> 20,
-    );
-    pg.sql("DROP TABLE t").unwrap();
-    let (plain, error) = pg.fill("plain", 2000, false);
-    assert!(error.contains("Disk quota exceeded"), "{name}: {error}");
-    assert_eq!(
-        pg.sql("SELECT count(*) FROM plain").unwrap(),
-        plain.to_string()
-    );
-    let truncate = pg.sql("TRUNCATE plain");
-    eprintln!("{name}: TRUNCATE of a table with no index at the limit: {truncate:?}");
-    assert_eq!(pg.sql("SELECT 1").unwrap(), "1");
-    pg.sql("DROP TABLE plain").unwrap();
-    pg.sql("CREATE TABLE after_drop AS SELECT g FROM generate_series(1, 1000) g")
-        .unwrap();
-    assert_eq!(pg.sql("SELECT count(*) FROM after_drop").unwrap(), "1000");
-    assert!(share(lab, id).used_bytes < view.used_bytes / 4);
-
-    // A crash at the limit: the server recovers by itself, with every acknowledged row.
-    let (rows, error) = pg.fill("c", 2000, true);
-    assert!(error.contains("Disk quota exceeded"), "{name}: {error}");
-    let deleting = {
-        let socket = pg.socket.clone();
-        let bin = pg.bin.clone();
-        std::thread::spawn(move || {
-            let mut psql = Command::new(bin.join("psql"));
-            psql.arg("-h")
-                .arg(socket)
-                .args(["-U", "postgres", "-X", "-q", "-d", "postgres"])
-                // One implicit transaction that does not end before the crash.
-                .args(["-c", "DELETE FROM c WHERE id % 2 = 0; SELECT pg_sleep(120)"]);
-            let _ = tenant(&mut psql).output();
-        })
-    };
-    std::thread::sleep(Duration::from_secs(2));
+/// No quota reservation: a full tenant filesystem recovers by the explicitly requested grow.
+#[test]
+fn a_full_postgres_volume_recovers_by_growth_with_acknowledged_rows_intact() {
+    let lab = Lab::open(2048);
+    let a = id(ID, 1);
+    lab.create(&a, 256);
+    let mut pg = TenantPg::new(&lab, &a);
+    let (rows, error) = pg.fill("acknowledged", 2000, true);
+    assert!(rows > 0, "{error}");
+    let full = lab.volume(&a).mount.unwrap().usage;
+    assert!(full.space_percent() >= 90, "{full:?}: {error}");
+    assert_eq!(full.space_alert(), Some(Alert::Critical));
     pg.crash();
-    let _ = deleting.join();
+    lab.storage.grow_volume(&a, 512 << 20).unwrap();
     pg.start();
-    assert_eq!(pg.sql("SELECT count(*) FROM c").unwrap(), rows.to_string());
-    assert!(pg.log().contains("automatic recovery in progress"));
-    pg.sql("DROP TABLE c").unwrap();
-
-    // Inodes: tables until the project has no inode left, then the drops give them back (the
-    // files of dropped relations are removed by the next checkpoint).
-    let mut made = 0u64;
-    let error = loop {
-        match pg.sql(
-            "DO $$ BEGIN FOR i IN 1..500 LOOP EXECUTE format('CREATE TABLE ti_%s_%s(i int)', \
-             (SELECT count(*) FROM pg_class), i); END LOOP; END $$",
-        ) {
-            Ok(_) => made += 500,
-            Err(error) => break error,
-        }
-    };
-    assert!(error.contains("Disk quota exceeded"), "{name}: {error}");
-    let inodes = share(lab, id);
-    eprintln!(
-        "{name}: {made} tables until the inode limit, {} of {} inodes",
-        inodes.inodes_used, inodes.inodes_total
+    assert_eq!(
+        pg.sql(&format!(
+            "SELECT count(*) FROM acknowledged WHERE id <= {rows}"
+        ))
+        .unwrap(),
+        rows.to_string()
     );
-    assert_eq!(inodes.inode_alert(), Some(Alert::Critical));
-    assert_eq!(pg.sql("SELECT count(*) FROM after_drop").unwrap(), "1000");
-    pg.sql(
-        "DO $$ DECLARE r record; BEGIN FOR r IN SELECT relname FROM pg_class \
-         WHERE relname LIKE 'ti\\_%' LIMIT 400 LOOP EXECUTE format('DROP TABLE %I', r.relname); \
-         END LOOP; END $$",
-    )
-    .unwrap();
-    pg.sql("CHECKPOINT").unwrap();
-    pg.sql("CREATE TABLE after_inodes(i int)").unwrap();
-    assert!(share(lab, id).inodes_used + 300 < inodes.inodes_used);
-
-    assert!(!pg.log().contains("PANIC"), "{name}:\n{}", pg.log());
-    pg.stop();
+    pg.sql("INSERT INTO acknowledged(v) VALUES ('after grow'); CHECKPOINT")
+        .unwrap();
+    assert!(!pg.log().contains("PANIC"), "{}", pg.log());
 }
 
 #[test]
-fn a_tenant_who_fills_its_share_of_a_volume_can_clean_up_and_the_database_never_panics() {
-    let lab = Lab::open_with(8192, |config| config.logical_cap_factor = 64);
-    for gib in [1u64, 2, 5] {
-        let volume = id(ID, gib);
-        lab.storage
-            .create_volume(&volume, gib << 30, &policy())
-            .unwrap();
-        chown(lab.dir_of(&volume), Some(TENANT), Some(TENANT)).unwrap();
-        a_tenant_fills_its_share_and_cleans_up(&lab, &volume);
-        lab.storage.unmount_volume(&volume).unwrap();
-        lab.storage
-            .remove_volume(
-                &volume,
-                Removal::DatabaseDeleted {
-                    storage_generation: gib,
-                },
-            )
-            .unwrap();
+fn inode_exhaustion_is_observed_and_growth_adds_usable_inodes() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 128);
+    let directory = lab.dir_of(&a).join("inodes");
+    fs::create_dir(&directory).unwrap();
+    let mut count = 0u64;
+    loop {
+        match fs::File::create(directory.join(count.to_string())) {
+            Ok(_) => count += 1,
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                break;
+            }
+        }
     }
+    let full = lab.volume(&a).mount.unwrap().usage;
+    assert_eq!(full.inode_alert(), Some(Alert::Critical));
+    assert_eq!(full.inodes_used, full.inodes_total);
+    lab.storage.grow_volume(&a, 256 << 20).unwrap();
+    let grown = lab.volume(&a).mount.unwrap().usage;
+    assert!(grown.inodes_total > full.inodes_total);
+    fs::File::create(directory.join("after-grow")).unwrap();
 }

@@ -14,7 +14,6 @@ use super::{
     lvm::{self, GroupStep, LogicalVolume, PoolStep},
     mountinfo::{self, Mount},
     pool::{self, parse_pool, parse_thin_mapped},
-    quota,
     usage::{Inventory, MountInfo, Removal, VolumeInfo},
 };
 use std::{
@@ -428,6 +427,8 @@ impl<R: CommandRunner> Storage<R> {
     /// Reads the pool now and keeps the reading for `room`. A read that fails leaves no reading,
     /// so `room` answers `Unobserved` rather than the last healthy sample.
     fn read_pool(&self) -> Result<PoolSample, Error> {
+        // A delayed status/table command cannot make old facts appear newly observed.
+        let observed = Instant::now();
         let sample = self.run(commands::dm_status_pool()).and_then(|status| {
             let table = self.run(commands::dm_table_pool())?;
             parse_pool(
@@ -435,7 +436,7 @@ impl<R: CommandRunner> Storage<R> {
                 &self.config.pool,
                 &status.stdout,
                 &table.stdout,
-                Instant::now(),
+                observed,
             )
         });
         *self.latest.lock().unwrap_or_else(PoisonError::into_inner) = sample.as_ref().ok().cloned();
@@ -520,7 +521,7 @@ impl<R: CommandRunner> Storage<R> {
                 .ok_or(Error::Unexpected("a volume that is not active"))?;
             let mount = match self.mount_of(&id, &mounts) {
                 Some(mount) => Some(MountInfo {
-                    usage: host::tenant_usage(&mount.mount_point)?,
+                    usage: host::fs_usage(&mount.mount_point)?,
                 }),
                 None => None,
             };
@@ -747,7 +748,6 @@ impl<R: CommandRunner> Storage<R> {
             return if suspect {
                 self.drop_link(id)
             } else {
-                self.ensure_quota(id)?;
                 self.install_link(id)
             };
         }
@@ -769,38 +769,13 @@ impl<R: CommandRunner> Storage<R> {
         crate::timing::MOUNT.add(began.elapsed());
         mounted?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-        self.ensure_quota(id)?;
         // Last: the link is the unit's permission to start, and exists only for what is mounted.
         self.install_link(id)
     }
 
-    /// Mounts the volume's own filesystem at its directory, with its project quota enforced when it
-    /// has one (a filesystem of an earlier release has none).
+    /// Mounts only this volume, with no tenant quota or reduced-capacity share.
     fn mount_own(&self, id: &VolumeId) -> Result<(), Error> {
-        let device = commands::device(&self.config, id);
-        let quota = host::read_superblock(&device)?.project_quota();
-        host::mount_ext4(&device, &self.mount_dir(id), quota)?;
-        Ok(())
-    }
-
-    /// Sets the limits of the tenant's share of the volume (`quota::limits`) from the filesystem it
-    /// has now and the size the device has, unless they are set: at every attach, so that an agent
-    /// that restarts, a boot and a crash between a growth and its limits all end with the right
-    /// ones, and after every growth. A filesystem without a project quota has no share to limit.
-    fn ensure_quota(&self, id: &VolumeId) -> Result<(), Error> {
-        let device = commands::device(&self.config, id);
-        if !host::read_superblock(&device)?.project_quota() {
-            return Ok(());
-        }
-        let whole = host::fs_usage(&self.mount_dir(id))?;
-        let wanted = quota::limits(
-            whole.total_bytes,
-            whole.inodes_total,
-            host::device_bytes(&device)?,
-        );
-        if host::quota_limits(&device, quota::PROJECT_ID)? != wanted {
-            host::set_quota_limits(&device, quota::PROJECT_ID, wanted)?;
-        }
+        host::mount_ext4(&commands::device(&self.config, id), &self.mount_dir(id))?;
         Ok(())
     }
 
@@ -817,11 +792,11 @@ impl<R: CommandRunner> Storage<R> {
         Ok(lv)
     }
 
-    /// Grows the volume and its filesystem online (plan 3.5: storage never shrinks). The logical
+    /// Grows the volume and its filesystem (plan 3.5: storage never shrinks). The logical
     /// cap holds; a sleeping database's volume is mounted first, as `resize2fs` needs it, and a
     /// suspect volume is repaired before it grows. It ends well only when the filesystem has the
-    /// size: `resize2fs` that ends 0 and leaves the filesystem as it was is an error, and the
-    /// tenant's limits follow the size that the filesystem has then.
+    /// size: `resize2fs` that ends 0 and leaves the filesystem as it was is an error. Legacy
+    /// geometry grows offline, after every mount holder is gone; it is never reformatted.
     pub fn grow_volume(&self, id: &VolumeId, size_bytes: u64) -> Result<(), Error> {
         check_size(size_bytes)?;
         let guard = self.lock();
@@ -842,21 +817,49 @@ impl<R: CommandRunner> Storage<R> {
         if size_bytes > current {
             self.within_cap(&sample, &lvs, size_bytes - current)?;
         }
-        self.attach(id, false, &lvs)?;
+        let target = commands::fs_target_kib(size_bytes) * 1024;
+        let geometry = host::read_superblock(&commands::device(&self.config, id))?;
+        if geometry.bytes() >= target {
+            return self.attach(id, false, &lvs);
+        }
+        let offline = !geometry.online_grow();
+        if offline {
+            // The kernel checks all mount namespaces, including pooled units and backup jobs.
+            // A busy detach restores the agent's mount; restore the start link too.
+            if let Err(error) = self.detach(id) {
+                self.restore_link(id);
+                return Err(match error {
+                    Error::Busy => Error::OfflineGrowRequired,
+                    other => other,
+                });
+            }
+            // Interrupted or failed offline work must be checked before a subsequent mount.
+            self.run(commands::volumes_add_tag(
+                &self.config,
+                slice::from_ref(id),
+                SUSPECT_TAG,
+            ))?;
+            let check = self
+                .runner
+                .run(&commands::check_before_grow(&self.config, id))?;
+            if !matches!(check.code, 0 | 1) {
+                return Err(Error::Fsck(check.code));
+            }
+        } else {
+            self.attach(id, false, &lvs)?;
+        }
         if size_bytes > current {
             self.run(commands::volume_extend(&self.config, id, size_bytes))?;
         }
-        // A filesystem that already has the size, or more (a volume made before the gap existed
-        // fills it; a call that follows a crash after `resize2fs`), is left as it is: asked for
-        // less, resize2fs refuses to shrink it, for ever.
-        let target = commands::fs_target_kib(size_bytes) * 1024;
+        self.run(commands::resize_fs(&self.config, id, size_bytes))?;
         if self.filesystem_bytes(id)? < target {
-            self.run(commands::resize_fs(&self.config, id, size_bytes))?;
-            if self.filesystem_bytes(id)? < target {
-                return Err(Error::Unexpected("the filesystem did not grow"));
-            }
+            return Err(Error::Unexpected("the filesystem did not grow"));
         }
-        self.ensure_quota(id)
+        if offline {
+            self.run(commands::volume_delete_tag(&self.config, id, SUSPECT_TAG))?;
+            self.attach(id, false, &lvs)?;
+        }
+        Ok(())
     }
 
     /// The size of the volume's filesystem, from its superblock: what `resize2fs` made it.
@@ -1287,6 +1290,35 @@ mod tests {
         storage.runner.0.store(true, Ordering::Relaxed);
         assert!(matches!(storage.poll_pool(), Err(Error::Command { .. })));
         assert_eq!(storage.room(&policy), Err(NoRoom::Unobserved));
+    }
+
+    /// A command that finishes late must not make its earlier status look newly observed.
+    #[test]
+    fn a_slow_pool_read_keeps_the_age_of_its_facts() {
+        struct Delayed(Mutex<Option<Instant>>);
+        impl CommandRunner for Delayed {
+            fn run(&self, command: &[String]) -> io::Result<Output> {
+                if command.get(1).map(String::as_str) == Some("status") {
+                    *self.0.lock().unwrap() = Some(Instant::now());
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Recorded(AtomicBool::new(false)).run(command)
+            }
+        }
+        let storage = Storage::new(Delayed(Mutex::new(None)), Config::default());
+        let sample = storage.poll_pool().unwrap();
+        let began = storage.runner.0.lock().unwrap().unwrap();
+        assert!(
+            sample.observed <= began,
+            "completion time cannot be the sample time"
+        );
+        assert_eq!(
+            storage.room(&Policy {
+                sample_max_age: Duration::from_millis(5),
+                ..policy()
+            }),
+            Err(NoRoom::Stale)
+        );
     }
 
     fn policy() -> Policy {

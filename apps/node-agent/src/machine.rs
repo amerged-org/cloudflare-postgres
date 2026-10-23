@@ -311,11 +311,6 @@ pub trait Machine: Send + Sync + 'static {
     /// `/run/pgcf/<id>`: owned by the database's user, readable by the gateway's group, mode 0750.
     /// It is gone after a boot, so the agent makes it for every database when it starts.
     fn prepare_socket_directory(&self, database: &str, account: &Account) -> io::Result<()>;
-    /// Puts the files of the database's `base` and `global` in the volume's project quota, so that
-    /// the tenant's data has the limit of its share (`storage::quota`). After `initdb` and after a
-    /// restore fetched the files, before PostgreSQL runs on them. It visits every file of the two
-    /// directories, so a restored database of many files takes seconds: off the executor.
-    fn project_data(&self, database: &str) -> impl Future<Output = io::Result<()>> + Send;
     /// Runs `initdb` as the database's user into `data`.
     fn initdb(
         &self,

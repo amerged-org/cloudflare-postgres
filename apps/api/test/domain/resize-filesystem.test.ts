@@ -101,11 +101,13 @@ describe("a resize ends when the filesystem has the storage", () => {
     ).toBe(filesystemOf(6));
   });
 
-  it("ends with the state when the node tells no size, as every agent did before it did", async () => {
+  it("keeps a resize running when a report contains no filesystem size", async () => {
     const { f, id, operation } = await growing(6);
-    expect((await report(f, id, 2)).status).toBe(200);
+    expect(
+      (await report(f, id, 2, "ready", { storage_bytes: undefined })).status,
+    ).toBe(200);
     expect(await operationOf(operation)).toMatchObject({
-      status: "succeeded",
+      status: "running",
     });
     expect(
       await env.DB.prepare(
@@ -113,7 +115,7 @@ describe("a resize ends when the filesystem has the storage", () => {
       )
         .bind(id)
         .first("observed_storage_bytes"),
-    ).toBeNull();
+    ).toBe(filesystemOf(5));
   });
 
   it("ends the resize of a database that sleeps with the filesystem too", async () => {

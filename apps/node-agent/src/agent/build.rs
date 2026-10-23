@@ -617,8 +617,10 @@ impl<M: Machine> Core<M> {
         Ok(resumed)
     }
 
-    /// Creates the user, the volume and its directories: the same for every origin.
-    async fn provision(&self, entry: &Entry) -> Result<(Account, VolumeId), &'static str> {
+    /// Creates the user, the volume and its directories: the same for every origin. The size of
+    /// the new filesystem is read into the view (`read_filesystem`), so that the observation of
+    /// the database that this build ends with tells it.
+    async fn provision(&self, db: &Db, entry: &Entry) -> Result<(Account, VolumeId), &'static str> {
         let id = &entry.id;
         let volume = Self::volume_id(entry).ok_or_else(|| build_failed!())?;
         let account = self
@@ -635,6 +637,9 @@ impl<M: Machine> Core<M> {
             )
             .await
             .map_err(|error| volume_error(&error))?;
+        self.read_filesystem(db, &volume)
+            .await
+            .map_err(|_| build_failed!())?;
         self.machine
             .prepare_socket_directory(id, &account)
             .map_err(|_| build_failed!())?;
@@ -651,7 +656,7 @@ impl<M: Machine> Core<M> {
             .store(&entry.archive_path, Access::ReadWrite)
             .ok_or("archive_unusable")?;
         let _ = self.begin_state(db, entry)?;
-        let (account, volume) = self.provision(entry).await?;
+        let (account, volume) = self.provision(db, entry).await?;
         let job_database = self.job_database(&volume, &account.name);
         // The archive path is the database's own and must hold nothing but backups of the cluster
         // on this volume: a generation never writes into an archive that holds something else
@@ -689,12 +694,6 @@ impl<M: Machine> Core<M> {
                 .await
                 .map_err(|_| build_failed!())?;
         }
-        // Every time, so that a build that stopped between `initdb` and here is finished: the
-        // tenant's data is limited to its share before PostgreSQL writes to it.
-        self.machine
-            .project_data(id)
-            .await
-            .map_err(|_| build_failed!())?;
         let config = self
             .write_configuration(entry, &account)
             .map_err(|_| build_failed!())?;
@@ -775,7 +774,7 @@ impl<M: Machine> Core<M> {
             .store(&source.path, Access::ReadOnly)
             .ok_or("archive_unusable")?;
         let resumed = self.begin_state(db, entry)?;
-        let (account, volume) = self.provision(entry).await?;
+        let (account, volume) = self.provision(db, entry).await?;
         // The agent that began this build went away with the units it started (a release restarts
         // it): the PostgreSQL of the recovery may run on the data directory that the restore
         // empties and fetches again (`Restorer::begin_afresh`), and it is stopped first. The
@@ -905,13 +904,7 @@ impl<M: Machine> Rebuild<M> {
 }
 impl<M: Machine> Host for Rebuild<M> {
     async fn start(&self) -> Result<(), Failed> {
-        // The restored files are the source's: the agent's own replace them before the start, and
-        // the restored data is put in the volume's project quota like a new database's.
-        self.core
-            .machine
-            .project_data(&self.entry.id)
-            .await
-            .map_err(|_| Failed)?;
+        // The restored files are the source's: replace the configuration before the start.
         self.core
             .write_configuration(&self.entry, &self.account)
             .map_err(|_| Failed)?;
@@ -1119,18 +1112,6 @@ mod tests {
         assert!(rig.machine.has_account(&entry.id));
         assert_eq!(rig.machine.volumes().len(), 1);
         assert!(layout.data(&entry.id).join("PG_VERSION").exists());
-        // The data of the tenant is put in the volume's project quota once, after `initdb` and
-        // before PostgreSQL starts on it.
-        let calls = rig.machine.calls();
-        let at = |call: &str| {
-            calls
-                .iter()
-                .position(|c| *c == format!("{call} {}", entry.id))
-        };
-        assert!(
-            at("project").is_some() && at("project") < at("start"),
-            "{calls:?}"
-        );
         let conf = std::fs::read_to_string(layout.data(&entry.id).join("postgresql.conf")).unwrap();
         assert!(conf.contains("max_connections = 25") && conf.contains("archive_mode = on"));
         assert!(rig.machine.running(&entry.id));

@@ -120,6 +120,7 @@ struct State {
     /// `grow_volume` extends the volume and then fails, as `resize2fs` does when the kernel
     /// refuses the grow (-28): the filesystem keeps its size.
     growth_refused: bool,
+    offline_growth: bool,
     /// The volumes the agent has mounted in its mount namespace, each with its link for the
     /// database's unit: what the agent's restart ends. A unit that runs keeps its own mount.
     attached: BTreeSet<VolumeId>,
@@ -637,8 +638,12 @@ impl Local {
             .map(|(id, size)| (id.clone(), *size))
             .collect()
     }
-    /// The next growths of a volume end as `resize2fs` ends when the kernel refuses them: the
-    /// volume has the new size, the filesystem keeps its own.
+    /// A legacy filesystem cannot grow while a unit or a job holds it.
+    pub fn set_offline_growth(&self, offline: bool) {
+        self.state().offline_growth = offline;
+    }
+
+    /// The device grows but the filesystem keeps its size, as after resize2fs fails.
     pub fn set_growth_refused(&self, refused: bool) {
         self.state().growth_refused = refused;
     }
@@ -1041,7 +1046,12 @@ impl Machine for Local {
         }
     }
     async fn grow_volume(&self, id: &VolumeId, size_bytes: u64) -> Result<(), storage::Error> {
+        let held = self.held(id);
         let mut state = self.state();
+        if state.offline_growth && held {
+            return Err(storage::Error::OfflineGrowRequired);
+        }
+        state.calls.push(format!("grow {}", id.database()));
         let current = *state.volumes.get(id).ok_or(storage::Error::Missing)?;
         if size_bytes < current {
             return Err(storage::Error::Shrink);
@@ -1212,11 +1222,6 @@ impl Machine for Local {
             .mode(0o750)
             .create(&directory)?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o750))
-    }
-
-    async fn project_data(&self, database: &str) -> io::Result<()> {
-        self.state().calls.push(format!("project {database}"));
-        Ok(())
     }
 
     async fn initdb(&self, _account: &Account, data: &Path) -> io::Result<()> {

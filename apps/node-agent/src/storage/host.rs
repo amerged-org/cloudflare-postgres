@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The kernel side of a volume: mounting it with the new mount API, unmounting, `statvfs`, and
 //! the mount table and ext4's error counter.
-use super::{
-    FsUsage,
-    quota::{self, Limits},
-};
+use super::FsUsage;
 use std::{
     ffi::CString,
     fs, io,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{ffi::OsStrExt, fs::FileExt, fs::OpenOptionsExt},
+        unix::{ffi::OsStrExt, fs::FileExt},
     },
     path::{Path, PathBuf},
 };
@@ -18,7 +15,6 @@ use std::{
 // linux/mount.h
 const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
 const FSOPEN_CLOEXEC: libc::c_uint = 0x1;
-const FSCONFIG_SET_FLAG: libc::c_uint = 0;
 const FSCONFIG_SET_STRING: libc::c_uint = 1;
 const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
 const FSMOUNT_CLOEXEC: libc::c_uint = 0x1;
@@ -57,8 +53,8 @@ fn text(value: &str) -> io::Result<CString> {
     CString::new(value).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
-/// A detached mount of `fstype`, with `source` when given and each of `flags` set (`prjquota`).
-pub(crate) fn detached(fstype: &str, source: Option<&str>, flags: &[&str]) -> io::Result<OwnedFd> {
+/// A detached mount of `fstype`, with `source` when given.
+pub(crate) fn detached(fstype: &str, source: Option<&str>) -> io::Result<OwnedFd> {
     let fstype = text(fstype)?;
     // SAFETY: plain syscalls with valid NUL-terminated strings; results are checked.
     let context =
@@ -72,19 +68,6 @@ pub(crate) fn detached(fstype: &str, source: Option<&str>, flags: &[&str]) -> io
                 FSCONFIG_SET_STRING,
                 key.as_ptr(),
                 value.as_ptr(),
-                0,
-            )
-        })?;
-    }
-    for flag in flags {
-        let key = text(flag)?;
-        ok(unsafe {
-            libc::syscall(
-                libc::SYS_fsconfig,
-                context.as_raw_fd(),
-                FSCONFIG_SET_FLAG,
-                key.as_ptr(),
-                std::ptr::null::<libc::c_void>(),
                 0,
             )
         })?;
@@ -132,12 +115,8 @@ fn attach(mount: OwnedFd, target: &Path) -> io::Result<()> {
 /// Mounts the ext4 on `device` at `target`: fsopen, fsconfig and fsmount as the attach path
 /// does, then move_mount to the volume's directory. The mount is nosuid, nodev, noexec and
 /// noatime, and has no `discard` (plan Appendix C): space returns to the pool through `fstrim`.
-/// A filesystem with a project quota (`Superblock::project_quota`) is mounted with its limits
-/// enforced (`prjquota`); a superblock that is already mounted anywhere keeps the options of its
-/// first mount, which is why the agent mounts before any unit does.
-pub fn mount_ext4(device: &str, target: &Path, project_quota: bool) -> io::Result<()> {
-    let flags: &[&str] = if project_quota { &["prjquota"] } else { &[] };
-    attach(detached("ext4", Some(device), flags)?, target)
+pub fn mount_ext4(device: &str, target: &Path) -> io::Result<()> {
+    attach(detached("ext4", Some(device))?, target)
 }
 
 /// Unmounts without force and without lazy detach: a filesystem that something holds stays.
@@ -255,23 +234,12 @@ pub fn fs_usage(path: &Path) -> io::Result<FsUsage> {
     ))
 }
 
-/// `statvfs` of what the tenant can use of the mounted volume: the project's view of the data
-/// directory when the volume has a project quota, where the size is the limit and the use is the
-/// project's (`ext4_statfs_project`), else of the volume as a whole. A mount that has no data
-/// directory yet is read at its root.
-pub fn tenant_usage(mount_point: &Path) -> io::Result<FsUsage> {
-    match fs_usage(&mount_point.join("data").join(quota::DIRECTORIES[0])) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs_usage(mount_point),
-        other => other,
-    }
-}
-
 /// The fields of ext4's superblock that the agent reads (`struct ext4_super_block`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Superblock {
     pub block_count: u64,
     pub block_size: u64,
-    pub ro_compat: u32,
+    pub incompat: u32,
 }
 
 impl Superblock {
@@ -280,9 +248,7 @@ impl Superblock {
     const OFFSET: u64 = 1024;
     const MAGIC: u16 = 0xef53;
     const INCOMPAT_64BIT: u32 = 0x80;
-    /// `EXT4_FEATURE_RO_COMPAT_QUOTA` and `_PROJECT`.
-    const RO_COMPAT_QUOTA: u32 = 0x100;
-    const RO_COMPAT_PROJECT: u32 = 0x2000;
+    const INCOMPAT_META_BG: u32 = 0x10;
 
     /// The superblock in its first 1,024 bytes; `None` when they are none of ext4's.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
@@ -304,7 +270,7 @@ impl Superblock {
         Some(Self {
             block_count: high | u64::from(word(0x04)?),
             block_size: 1024 << block_shift,
-            ro_compat: word(0x64)?,
+            incompat: word(0x60)?,
         })
     }
 
@@ -314,10 +280,9 @@ impl Superblock {
         self.block_count.saturating_mul(self.block_size)
     }
 
-    /// Whether the filesystem has a project quota that the agent can set limits on.
-    pub fn project_quota(&self) -> bool {
-        self.ro_compat & (Self::RO_COMPAT_QUOTA | Self::RO_COMPAT_PROJECT)
-            == (Self::RO_COMPAT_QUOTA | Self::RO_COMPAT_PROJECT)
+    /// The grow-safe layout introduced after the legacy 8 MiB journal exhausted its credits.
+    pub fn online_grow(&self) -> bool {
+        self.incompat & Self::INCOMPAT_META_BG != 0
     }
 }
 
@@ -328,138 +293,6 @@ pub fn read_superblock(device: &str) -> io::Result<Superblock> {
     fs::File::open(device)?.read_exact_at(&mut bytes, Superblock::OFFSET)?;
     Superblock::parse(&bytes)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not an ext4 superblock"))
-}
-
-/// The size of the block device at `path`: a thin volume's nominal size.
-pub fn device_bytes(path: &str) -> io::Result<u64> {
-    use std::io::{Seek, SeekFrom};
-    fs::File::open(path)?.seek(SeekFrom::End(0))
-}
-
-// linux/quota.h and linux/fs.h
-const Q_GETQUOTA: u32 = 0x80_0007;
-const Q_SETQUOTA: u32 = 0x80_0008;
-const PRJQUOTA: u32 = 2;
-const QIF_BLIMITS: u32 = 1;
-const QIF_ILIMITS: u32 = 4;
-const FS_XFLAG_PROJINHERIT: u32 = 0x200;
-/// `_IOR('X', 31, struct fsxattr)` and `_IOW('X', 32, struct fsxattr)`: the same on x86-64 and arm64.
-const FS_IOC_FSGETXATTR: libc::c_ulong = 0x801c_581f;
-const FS_IOC_FSSETXATTR: libc::c_ulong = 0x401c_5820;
-
-/// `struct fsxattr` of `linux/fs.h`.
-#[repr(C)]
-#[derive(Default)]
-struct FsxAttr {
-    xflags: u32,
-    extsize: u32,
-    nextents: u32,
-    projid: u32,
-    cowextsize: u32,
-    pad: [u8; 8],
-}
-
-/// `QCMD(command, PRJQUOTA)`.
-fn project_command(command: u32) -> libc::c_int {
-    ((command << 8) | PRJQUOTA) as libc::c_int
-}
-
-/// The limits of project `project` on the filesystem of `device`, mounted anywhere: the call finds
-/// the filesystem by its device, in no mount namespace.
-pub fn quota_limits(device: &str, project: u32) -> io::Result<Limits> {
-    let special = text(device)?;
-    // SAFETY: dqblk is plain data; zero is a valid value for the kernel to overwrite.
-    let mut block: libc::dqblk = unsafe { std::mem::zeroed() };
-    // SAFETY: `special` is NUL-terminated and `block` is the structure the command fills in.
-    let result = unsafe {
-        libc::quotactl(
-            project_command(Q_GETQUOTA),
-            special.as_ptr(),
-            project as libc::c_int,
-            std::ptr::from_mut(&mut block).cast(),
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(Limits {
-        blocks: block.dqb_bhardlimit,
-        inodes: block.dqb_ihardlimit,
-    })
-}
-
-/// Sets the hard limits of project `project` (and no soft limit, which would block at its grace's
-/// end whatever the hard limit is).
-pub fn set_quota_limits(device: &str, project: u32, limits: Limits) -> io::Result<()> {
-    let special = text(device)?;
-    // SAFETY: dqblk is plain data; zero is a valid value, and the fields set below are the ones
-    // `dqb_valid` names.
-    let mut block: libc::dqblk = unsafe { std::mem::zeroed() };
-    block.dqb_bhardlimit = limits.blocks;
-    block.dqb_ihardlimit = limits.inodes;
-    block.dqb_valid = QIF_BLIMITS | QIF_ILIMITS;
-    // SAFETY: `special` is NUL-terminated and `block` is the structure the command reads.
-    let result = unsafe {
-        libc::quotactl(
-            project_command(Q_SETQUOTA),
-            special.as_ptr(),
-            project as libc::c_int,
-            std::ptr::from_mut(&mut block).cast(),
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Puts the data directory's `base` and `global`, with everything in them, in project `project`:
-/// each directory also passes the project on to what is made in it later, which is how a
-/// running PostgreSQL's new relations, forks and temporary files get into it. The tree is read
-/// with no symlink followed and no file other than directories and regular files touched, for a
-/// restored data directory is the tenant's. Called with no PostgreSQL running on the tree: after
-/// `initdb`, and after a restore has fetched the files.
-pub fn mark_project(data: &Path, project: u32) -> io::Result<()> {
-    for directory in quota::DIRECTORIES {
-        mark_tree(&data.join(directory), project)?;
-    }
-    Ok(())
-}
-
-fn mark_tree(path: &Path, project: u32) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
-        mark_inode(path, project, true)?;
-        for entry in fs::read_dir(path)? {
-            mark_tree(&entry?.path(), project)?;
-        }
-    } else if metadata.is_file() {
-        mark_inode(path, project, false)?;
-    }
-    Ok(())
-}
-
-fn mark_inode(path: &Path, project: u32, directory: bool) -> io::Result<()> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    let mut attributes = FsxAttr::default();
-    // SAFETY: the descriptor is open and `attributes` is the structure the ioctl fills in.
-    if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FSGETXATTR as _, &mut attributes) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    attributes.projid = project;
-    if directory {
-        attributes.xflags |= FS_XFLAG_PROJINHERIT;
-    } else {
-        attributes.xflags &= !FS_XFLAG_PROJINHERIT;
-    }
-    // SAFETY: the descriptor is open and `attributes` is the structure the ioctl reads.
-    if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FSSETXATTR as _, &attributes) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 pub fn mount_table() -> io::Result<String> {
@@ -488,23 +321,19 @@ pub fn ext4_errors(minor: u32) -> io::Result<u64> {
 mod tests {
     use super::*;
 
-    /// A superblock as `mkfs` makes it, 60 MiB of 1 KiB blocks with the project quota (captured
+    /// A captured ext4 superblock, 60 MiB of 1 KiB blocks with `meta_bg` (captured
     /// from the lab, e2fsprogs 1.47.2): `dumpe2fs -h` said 61,440 blocks of 1,024 bytes.
     #[test]
-    fn a_real_superblock_tells_the_size_of_its_filesystem_and_its_project_quota() {
+    fn a_real_superblock_tells_the_size_of_its_filesystem_and_its_grow_geometry() {
         let bytes = include_bytes!("fixtures/ext4-superblock.bin");
         let superblock = Superblock::parse(bytes).unwrap();
         assert_eq!(superblock.block_count, 61_440);
         assert_eq!(superblock.block_size, 1024);
         assert_eq!(superblock.bytes(), 60 << 20);
-        assert!(superblock.project_quota());
-        // A filesystem of an earlier release has neither feature; one of them alone is not enough.
+        assert!(superblock.online_grow());
         let mut older = *bytes;
-        older[0x64..0x68].copy_from_slice(&0x0000_0463u32.to_le_bytes());
-        assert!(!Superblock::parse(&older).unwrap().project_quota());
-        let mut quota_only = *bytes;
-        quota_only[0x64..0x68].copy_from_slice(&0x0000_0563u32.to_le_bytes());
-        assert!(!Superblock::parse(&quota_only).unwrap().project_quota());
+        older[0x60..0x64].copy_from_slice(&0x0000_02c2u32.to_le_bytes());
+        assert!(!Superblock::parse(&older).unwrap().online_grow());
         // The high half of the block count counts with the `64bit` feature only.
         let mut large = *bytes;
         large[0x150..0x154].copy_from_slice(&3u32.to_le_bytes());
@@ -520,23 +349,6 @@ mod tests {
         let mut huge = *bytes;
         huge[0x18..0x1c].copy_from_slice(&40u32.to_le_bytes());
         assert_eq!(Superblock::parse(&huge), None);
-    }
-
-    /// The calls into the kernel are the ABI, so a wrong number does something else without an
-    /// error: `linux/quota.h` and `linux/fs.h`, and the sizes of the two structures they move.
-    #[test]
-    fn the_quota_calls_and_the_attribute_ioctls_are_the_kernels() {
-        assert_eq!(project_command(Q_GETQUOTA) as u32, 0x8000_0702);
-        assert_eq!(project_command(Q_SETQUOTA) as u32, 0x8000_0802);
-        assert_eq!(std::mem::size_of::<FsxAttr>(), 28);
-        assert_eq!(std::mem::size_of::<libc::dqblk>(), 72);
-        let ioctl = |direction: u64, number: u64| {
-            (direction << 30) | (28 << 16) | (u64::from(b'X') << 8) | number
-        };
-        assert_eq!(FS_IOC_FSGETXATTR, ioctl(2, 31));
-        assert_eq!(FS_IOC_FSSETXATTR, ioctl(1, 32));
-        assert_eq!(FS_XFLAG_PROJINHERIT, 0x200);
-        assert_eq!((QIF_BLIMITS, QIF_ILIMITS), (1, 4));
     }
 
     /// The kernel's `MOUNT_ATTR_*` values (`linux/mount.h`, uapi): the constants above are the
@@ -561,7 +373,7 @@ mod tests {
     fn the_kernel_lists_a_mounted_volume_as_nosuid_nodev_noexec_and_noatime() {
         let target = std::env::temp_dir().join(format!("pgcf-host-{}", std::process::id()));
         std::fs::create_dir_all(&target).unwrap();
-        let mount = match detached("tmpfs", None, &[]) {
+        let mount = match detached("tmpfs", None) {
             Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
                 eprintln!("skipped: no CAP_SYS_ADMIN");
                 return;
