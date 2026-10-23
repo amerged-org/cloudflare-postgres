@@ -33,6 +33,8 @@ pub(crate) struct Facts<'a> {
     pub superseded: bool,
     /// A sleep the page asked for was refused for this generation.
     pub refused: bool,
+    /// The build the entry names failed in this run and was abandoned (`View::abandoned_build`).
+    pub abandoned: bool,
 }
 
 /// What is to be done with an entry.
@@ -85,6 +87,8 @@ pub(crate) fn plan(f: &Facts) -> Step {
         None if !f.volume => Step::Fail("volume_missing"),
         None if f.unit_awake => Step::AdoptRunning,
         None => Step::AdoptAsleep,
+        // A build that failed is not begun again, whatever the page still says of it.
+        Some(_) if build && f.abandoned => Step::Nothing,
         Some(_) if build => Step::Build,
         Some(Phase::Ready) if entry.desired == Desired::Suspended && !f.refused => Step::Suspend,
         Some(_) => Step::Nothing,
@@ -391,6 +395,7 @@ impl<M: Machine> Core<M> {
                 fenced: self.fences.fenced(),
                 superseded: self.fences.blocks(&db.id, entry.storage_generation),
                 refused: view.refusal.is_some(),
+                abandoned: view.abandoned_build.as_deref() == Some(entry.archive_path.as_str()),
             })
         };
         if !matches!(step, Step::AdoptRunning | Step::AdoptAsleep) {
@@ -691,7 +696,7 @@ impl<M: Machine> Core<M> {
     /// Stops the unit of a database by its name, out of admission's awake set and off the archive
     /// socket's table; the node needs no record of the database for it. `false` when the unit may
     /// still run.
-    async fn stop_unit(&self, database: &str) -> bool {
+    pub(super) async fn stop_unit(&self, database: &str) -> bool {
         let stopped = self.machine.stop(database).await.is_ok();
         self.admission.stopped(database);
         self.table.remove(database);
@@ -1010,6 +1015,7 @@ mod tests {
             fenced: false,
             superseded: false,
             refused: false,
+            abandoned: false,
         })
     }
 
@@ -1047,6 +1053,27 @@ mod tests {
                 false
             ),
             Step::Build
+        );
+        // A build that failed and was abandoned is not begun again, however often the page names
+        // it; the same entry is built if it was not abandoned (a refused release), and a
+        // generation that is built needs none either way.
+        let abandoned = |entry: &Entry, phase, state: Option<&DatabaseState>| {
+            plan(&Facts {
+                entry,
+                phase,
+                state,
+                volume: false,
+                unit_awake: false,
+                fenced: false,
+                superseded: false,
+                refused: false,
+                abandoned: true,
+            })
+        };
+        assert_eq!(abandoned(&create, Some(Phase::Error), None), Step::Nothing);
+        assert_eq!(
+            abandoned(&create, Some(Phase::Error), Some(&state(false, 1))),
+            Step::Nothing
         );
         assert_eq!(
             decide(&create, Some(Phase::Asleep), Some(&built), true, false),
@@ -1100,7 +1127,8 @@ mod tests {
                 unit_awake: true,
                 fenced: false,
                 superseded: false,
-                refused: true
+                refused: true,
+                abandoned: false,
             }),
             Step::Nothing
         );
@@ -1128,6 +1156,7 @@ mod tests {
                 fenced,
                 superseded,
                 refused: false,
+                abandoned: false,
             };
             assert_eq!(plan(&facts(Some(Phase::Ready))), Step::Retire);
             assert_eq!(plan(&facts(Some(Phase::Retired))), Step::Nothing);
@@ -2679,6 +2708,390 @@ mod tests {
         assert_eq!(own.timeline, 2);
     }
 
+    /// The pulls that still list a build that failed do not begin it again: the API's page names
+    /// the build until it has ended the operation, and an agent that has just reported the failure
+    /// pulls before it knows that. The database stays in its error with nothing of it on the node.
+    async fn pulled_again_stays_failed(rig: &Rig, id: &str, entry: &Value, error: &'static str) {
+        let handle = rig.core.db(id);
+        let starts = || {
+            rig.machine
+                .calls()
+                .iter()
+                .filter(|call| **call == format!("start {id}"))
+                .count()
+        };
+        let before = starts();
+        for _ in 0..3 {
+            rig.core
+                .apply(&Rig::page(vec![entry.clone()], vec![]))
+                .await;
+            for _ in 0..15 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert_eq!(
+                    handle.phase(),
+                    Phase::Error,
+                    "a build that failed is not begun again"
+                );
+            }
+        }
+        assert_eq!(starts(), before);
+        assert_eq!(handle.view().error, Some(error));
+        let observation = rig.observation(id);
+        assert_eq!(
+            (&observation["state"], &observation["error"]),
+            (&json!("error"), &json!(error))
+        );
+        // Abandoned: the unit is stopped, the volume and the user are gone, and so is the state.
+        assert!(!rig.machine.running(id));
+        assert!(!rig.machine.has_account(id));
+        assert!(
+            rig.machine
+                .volumes()
+                .iter()
+                .all(|(volume, _)| volume.database() != id)
+        );
+        assert_eq!(rig.core.files(id).load().unwrap(), None);
+    }
+
+    /// A restore that failed on a transient error of the archive: the node rebuilt it on the next
+    /// pull, the build succeeded, and the API (which had failed the operation) never took the
+    /// database as ready (found live, 2026-10-23, `tar` ending early).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restore_that_failed_is_not_rebuilt_by_the_pull_that_still_lists_it() {
+        let Some(rig) = Rig::new("restore-failed").await else {
+            return;
+        };
+        let (source_json, source_id, source_state) = source(&rig).await;
+        let backup = source_state.backup.clone().unwrap();
+        let source_path = source_json["archive"]["path"].as_str().unwrap().to_string();
+        rig.deliver(&source_path, "read_only");
+
+        let mut restored = rig.entry_json();
+        let id = id_of(&restored);
+        restored["origin"] = json!({"kind": "restore", "source": {
+            "database_id": source_id, "path": source_path, "backup_id": backup.backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"}}});
+        let handle = rig.core.db(&id);
+        rig.fixture.set("restore-fail", "");
+        rig.core
+            .apply(&Rig::page(vec![restored.clone()], vec![]))
+            .await;
+        eventually(60, "the restore to fail", || handle.phase() == Phase::Error).await;
+        assert_eq!(handle.view().error, Some("archive_unusable"));
+        // The archive answers again: the pull that lists the restore still does not build it.
+        rig.fixture.clear("restore-fail");
+        pulled_again_stays_failed(&rig, &id, &restored, "archive_unusable").await;
+    }
+
+    /// Every release restarts the agent, and the units of the databases and of the jobs run on.
+    /// A restore that the agent was building is begun again by the one that comes after, with
+    /// its state file, the data directory of the generation it was building and the PostgreSQL
+    /// of the first run still there: it is built again, to the end, over an emptied directory
+    /// and not over the postmaster that held the old one (found by review: barman refuses a
+    /// destination that holds anything, and the restore failed with `archive_unusable`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restore_the_agent_was_building_when_it_restarted_is_built_again_to_the_end() {
+        let Some(rig) = Rig::new("restore-restart").await else {
+            return;
+        };
+        let (source_json, source_id, source_state) = source(&rig).await;
+        let backup = source_state.backup.clone().unwrap();
+        let source_path = source_json["archive"]["path"].as_str().unwrap().to_string();
+        rig.deliver(&source_path, "read_only");
+
+        let mut restored = rig.entry_json();
+        let id = id_of(&restored);
+        let own_path = restored["archive"]["path"].as_str().unwrap().to_string();
+        restored["origin"] = json!({"kind": "restore", "source": {
+            "database_id": source_id, "path": source_path, "backup_id": backup.backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"}}});
+        let entry = rig.entry_for(&restored);
+        let handle = rig.core.db(&id);
+        rig.core
+            .apply(&Rig::page(vec![restored.clone()], vec![]))
+            .await;
+        eventually(120, "the restore", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+        let first = handle.view().writer.clone().unwrap().pid;
+        // The agent went away before the first base backup, and PostgreSQL of the first run goes
+        // on: the state says what it said after the build began, and the database's own archive
+        // holds no backup.
+        rig.core
+            .files(&id)
+            .save(&crate::state::DatabaseState::new(entry.storage_generation))
+            .unwrap();
+        std::fs::remove_dir_all(rig.fixture.store_directory().join(format!(
+            "objects/{}/database/base",
+            own_path.strip_prefix("s3://").unwrap()
+        )))
+        .unwrap();
+        let rig = rig.restart().await;
+        rig.deliver(&source_path, "read_only");
+        rig.deliver(&own_path, "read_write");
+        let handle = rig.core.db(&id);
+        rig.core
+            .apply(&Rig::page(vec![restored.clone()], vec![]))
+            .await;
+        eventually(120, "the restore, begun again", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+
+        // The source's data, under a postmaster of the second run.
+        let data = tenant(&rig, &id).await;
+        let rows = data.query("SELECT count(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 4000);
+        assert_ne!(handle.view().writer.clone().unwrap().pid, first);
+        let state = handle.state().unwrap();
+        assert!(state.built && state.record.is_none());
+        assert_eq!(state.backup.unwrap().timeline, 2);
+        assert_eq!(rig.observation(&id)["state"], "ready");
+    }
+
+    /// The agent restarts after the first base backup of a restore is DONE in the database's own
+    /// archive and before the state says built (in a batch the listing that follows the backup
+    /// waits for the node's one big-job slot behind the other restores, so a rollout often finds
+    /// a restore there). The build that is begun again finishes over that backup: no second fetch
+    /// into a directory barman refuses, no second backup, no failed operation (found by review,
+    /// the restore was refused `prefix_not_empty`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restore_the_agent_restarted_after_its_first_base_backup_is_finished_over_that_backup()
+     {
+        let Some(rig) = Rig::new("restore-restart-backup").await else {
+            return;
+        };
+        let (source_json, source_id, source_state) = source(&rig).await;
+        let backup = source_state.backup.clone().unwrap();
+        let source_path = source_json["archive"]["path"].as_str().unwrap().to_string();
+        rig.deliver(&source_path, "read_only");
+
+        let mut restored = rig.entry_json();
+        let id = id_of(&restored);
+        let own_path = restored["archive"]["path"].as_str().unwrap().to_string();
+        restored["origin"] = json!({"kind": "restore", "source": {
+            "database_id": source_id, "path": source_path, "backup_id": backup.backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"}}});
+        let entry = rig.entry_for(&restored);
+        let handle = rig.core.db(&id);
+        rig.core
+            .apply(&Rig::page(vec![restored.clone()], vec![]))
+            .await;
+        eventually(120, "the restore", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+        let first = handle.view().writer.clone().unwrap().pid;
+        let own = handle.state().unwrap().backup.unwrap();
+        // The agent went away with the first base backup DONE and the state not yet saying built.
+        rig.core
+            .files(&id)
+            .save(&crate::state::DatabaseState::new(entry.storage_generation))
+            .unwrap();
+        let rig = rig.restart().await;
+        rig.deliver(&source_path, "read_only");
+        rig.deliver(&own_path, "read_write");
+        let handle = rig.core.db(&id);
+        rig.core
+            .apply(&Rig::page(vec![restored.clone()], vec![]))
+            .await;
+        eventually(120, "the restore, begun again", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+
+        // The database of the first run, under a postmaster of the second, and its first backup.
+        let data = tenant(&rig, &id).await;
+        let rows = data.query("SELECT count(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 4000);
+        assert_ne!(handle.view().writer.clone().unwrap().pid, first);
+        let state = handle.state().unwrap();
+        assert!(state.built && state.record.is_none());
+        let kept = state.backup.unwrap();
+        assert_eq!(
+            (kept.backup_id.as_str(), kept.timeline),
+            (own.backup_id.as_str(), 2)
+        );
+        let backups = std::fs::read_dir(rig.fixture.store_directory().join(format!(
+            "objects/{}/database/base",
+            own_path.strip_prefix("s3://").unwrap()
+        )))
+        .unwrap()
+        .count();
+        assert_eq!(backups, 1, "no second base backup");
+        assert_eq!(rig.observation(&id)["state"], "ready");
+    }
+
+    /// The first pull of an agent that has just started reads the archive credentials and resumes
+    /// every create and restore the last agent left, and a credential whose read failed once is
+    /// read again by the next pull (found live: `credential_not_delivered` on the first attempt
+    /// after a deploy). A build that never began for want of it says nothing and is begun by the
+    /// pull that brings the credential, and not failed for good by the one that did not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_build_without_its_archive_credential_says_nothing_and_begins_when_it_arrives() {
+        let Some(rig) = Rig::new("credential-late").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "the create", || handle.phase() == Phase::Ready).await;
+        // The agent restarts while the create is not built: a state file that says so, a cluster
+        // on the volume, and no credential yet.
+        rig.machine.stop(&id).await.unwrap();
+        rig.core
+            .files(&id)
+            .save(&crate::state::DatabaseState::new(1))
+            .unwrap();
+        let rig = rig.restart().await;
+        let handle = rig.core.db(&id);
+        let starts = || {
+            rig.machine
+                .calls()
+                .iter()
+                .filter(|call| **call == format!("start {id}"))
+                .count()
+        };
+        let before = starts();
+        for _ in 0..3 {
+            rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+            eventually(30, "the decision", || {
+                let view = handle.view();
+                view.adopted && view.reconcile == crate::agent::Reconcile::Idle
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Nothing is reported and nothing is begun or abandoned.
+            assert_eq!(rig.core.pending_observation(&id), None);
+            assert_ne!(handle.phase(), Phase::Error);
+            assert_eq!(handle.view().abandoned_build, None);
+            assert_eq!(starts(), before);
+        }
+        // The pull that brings the credential begins it.
+        rig.deliver(&path, "read_write");
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "the create", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+        assert_eq!(rig.observation(&id)["state"], "ready");
+    }
+
+    /// A credential that does not come is not waited for for ever: a restore whose source's
+    /// credential is missing fails with `archive_unusable` at the first pull after the wait, as it
+    /// did at the first, and is abandoned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_build_whose_credential_never_arrives_fails_after_the_wait() {
+        let timing = crate::agent::Timing {
+            credential_wait: std::time::Duration::from_millis(600),
+            ..crate::agent::testing::timing()
+        };
+        let Some(rig) = Rig::with_timing("credential-never", timing).await else {
+            return;
+        };
+        let mut restored = rig.entry_json();
+        let id = id_of(&restored);
+        restored["origin"] = json!({"kind": "restore", "source": {
+            "database_id": "zyxwvutsrqponmlkjihg",
+            "path": "s3://pgcf-eu/eu-dev/zyxwvutsrqponmlkjihg/g1-op_bbbbbbbbbbbbbbbbbbbb",
+            "backup_id": "20261017T225342",
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"}}});
+        let handle = rig.core.db(&id);
+        let page = || Rig::page(vec![restored.clone()], vec![]);
+        rig.core.apply(&page()).await;
+        eventually(30, "the decision", || {
+            let view = handle.view();
+            view.adopted && view.reconcile == crate::agent::Reconcile::Idle
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(rig.core.pending_observation(&id), None);
+        assert_ne!(handle.phase(), Phase::Error);
+        // The pull after the wait gives up.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        rig.core.apply(&page()).await;
+        eventually(30, "the build to fail", || handle.phase() == Phase::Error).await;
+        assert_eq!(handle.view().error, Some("archive_unusable"));
+        assert_eq!(rig.observation(&id)["error"], "archive_unusable");
+        assert!(rig.machine.volumes().is_empty());
+        assert!(!rig.machine.has_account(&id));
+    }
+
+    /// A create that failed after its unit was up (the first base backup): the unit is stopped and
+    /// the volume goes, and the pulls that still list the create do not begin it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_that_failed_is_abandoned_and_not_begun_again() {
+        let Some(rig) = Rig::new("create-failed").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.fixture.set("backup-fail", "");
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "the create to fail", || handle.phase() == Phase::Error).await;
+        assert_eq!(handle.view().error, Some("build_failed"));
+        rig.fixture.clear("backup-fail");
+        pulled_again_stays_failed(&rig, &id, &db, "build_failed").await;
+    }
+
+    /// The agent restarts after a create failed. The page the API sends now keeps the database and
+    /// names no origin (it stopped asking for a create whose operation failed): the agent has
+    /// nothing of it, reports `volume_missing` and starts nothing. Found by review: the page named
+    /// the create until the database was ready, and every restart (every rollout of the fleet
+    /// restarts the agent) built the failed create again, to a ready under the failed operation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_that_failed_is_not_built_by_the_agent_that_restarted() {
+        let Some(rig) = Rig::new("create-failed-restart").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.fixture.set("backup-fail", "");
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "the create to fail", || handle.phase() == Phase::Error).await;
+        assert_eq!(handle.view().error, Some("build_failed"));
+        rig.fixture.clear("backup-fail");
+
+        let rig = rig.restart().await;
+        let starts = || {
+            rig.machine
+                .calls()
+                .iter()
+                .filter(|call| **call == format!("start {id}"))
+                .count()
+        };
+        let before = starts();
+        let mut kept = db.clone();
+        kept.as_object_mut().unwrap().remove("origin");
+        rig.deliver(db["archive"]["path"].as_str().unwrap(), "read_write");
+        rig.core.apply(&Rig::page(vec![kept], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the decision", || handle.view().adopted).await;
+        for _ in 0..15 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(handle.phase(), Phase::Error);
+        }
+        assert_eq!(handle.view().error, Some("volume_missing"));
+        assert_eq!(starts(), before, "nothing is started");
+        let observation = rig.observation(&id);
+        assert_eq!(
+            (&observation["state"], &observation["error"]),
+            (&json!("error"), &json!("volume_missing"))
+        );
+        assert!(!rig.machine.running(&id));
+        assert!(rig.machine.volumes().is_empty());
+    }
+
     /// A source that was resized up after its backup and down again before the restore has a
     /// parameter change in its WAL above both the backup's settings and the class's. PostgreSQL
     /// pauses that recovery ("recovery has paused") and its postmaster still reports ready, so
@@ -2755,6 +3168,9 @@ mod tests {
                 .iter()
                 .all(|(volume, _)| volume.database() != id)
         );
+        // And it stays so: the node rebuilt this restore 11 times in 5 minutes, one on each pull
+        // that still listed it (found live, 2026-10-23).
+        pulled_again_stays_failed(&rig, &id, &restored, "no_recovery_point").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2846,6 +3262,52 @@ mod tests {
                 .any(|(volume, _)| volume.generation() == 1)
         );
         assert!(rig.machine.has_account(&id), "{:?}", rig.machine.calls());
+    }
+
+    /// A move target on the node of its source whose build fails before it writes anything of its
+    /// own (the credential of its archive has not arrived, so there is no store): the state and the
+    /// upload log on the disk are the source's generation's, and stay, with the source's user and
+    /// volume. They are what an agent that restarts decides on (adopted asleep from the proof);
+    /// the abandoned build must not take them with it. The build fails once the wait for the
+    /// credential (`Timing::credential_wait`) is over, here none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_move_target_that_fails_before_it_begins_leaves_the_state_of_the_source() {
+        let timing = crate::agent::Timing {
+            credential_wait: std::time::Duration::ZERO,
+            ..crate::agent::testing::timing()
+        };
+        let Some(rig) = Rig::with_timing("move-unbegun", timing).await else {
+            return;
+        };
+        let (mut db, id, source_state) = source(&rig).await;
+        let old_path = db["archive"]["path"].as_str().unwrap().to_string();
+        rig.deliver(&old_path, "read_only");
+        // The credential of the target's archive path is not delivered.
+        let new_path = format!("s3://pgcf-eu/eu-dev/{id}/g2-op_hhhhhhhhhhhhhhhhhhhh");
+        db["storage_generation"] = json!(2);
+        db["generation"] = json!(7);
+        db["operation"] = json!("op_hhhhhhhhhhhhhhhhhhhh");
+        db["archive"]["path"] = json!(new_path);
+        db["origin"] = json!({"kind": "move", "source": {
+            "database_id": id, "path": old_path, "backup_id": source_state.backup.clone().unwrap().backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"},
+            "end": source_state.record.clone().unwrap()}});
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db], vec![])).await;
+        eventually(60, "the build to fail", || handle.phase() == Phase::Error).await;
+        assert_eq!(handle.view().error, Some("archive_unusable"));
+
+        let files = rig.core.files(&id);
+        assert_eq!(files.load().unwrap(), Some(source_state.clone()));
+        assert!(files.directory().join("uploads-g1.log").exists());
+        assert_eq!(handle.state(), Some(source_state));
+        assert!(rig.machine.has_account(&id));
+        assert!(
+            rig.machine
+                .volumes()
+                .iter()
+                .any(|(volume, _)| volume.generation() == 1)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

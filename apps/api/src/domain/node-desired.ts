@@ -53,6 +53,10 @@ interface DatabaseRow {
   backup_id: string | null;
   target_time: string | null;
   restore_verified_at: string | null;
+  /** The status of the operation of a restore target's restore. */
+  restore_status: string | null;
+  /** 1 when the database's `database.create` operation failed. */
+  create_failed: number;
 }
 
 /** The operation of a fence, the same every time the node reads it. */
@@ -242,11 +246,13 @@ export async function nodeDesiredPage(
           'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'bypass_rls',r.bypass_rls))
           FROM roles r WHERE r.database_id=d.id) roles_json,
        EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
+       EXISTS(SELECT 1 FROM operations co WHERE co.database_id=d.id AND co.kind='database.create' AND co.status='failed') create_failed,
        x.source_database_id,x.source_archive_path,x.backup_id,x.target_time,
-       x.verified_at restore_verified_at
+       x.verified_at restore_verified_at,ro.status restore_status
      FROM databases d JOIN size_classes s ON s.id=d.size_class_id JOIN database_resources dr ON dr.database_id=d.id
      LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id
      LEFT JOIN database_restores x ON x.target_database_id=d.id
+     LEFT JOIN operations ro ON ro.id=x.operation_id AND ro.kind='database.restore'
      WHERE d.region_id=? AND d.desired_state IN('running','suspended','deleted')
        AND ((d.node_id=? AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL)
            AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation))
@@ -276,7 +282,8 @@ export async function nodeDesiredPage(
           : [
               { archivePath: row.archive_path, access: "read_write" as const },
               ...(row.source_archive_path !== null &&
-              row.restore_verified_at === null
+              row.restore_verified_at === null &&
+              row.restore_status !== "failed"
                 ? [
                     {
                       archivePath: row.source_archive_path,
@@ -296,8 +303,15 @@ export async function nodeDesiredPage(
         row.source_archive_path === null
           ? undefined
           : issued.get(`read_only|${row.source_archive_path}`);
+    // A build whose operation failed is not asked for again, a restore or a create: the node
+    // abandoned the target when it reported the failure (volume, user and state gone), and an
+    // agent that restarted since, which every rollout of the fleet does, would build it again. For
+    // a restore the API refuses the ready that follows (`applyObservation`); a create would end
+    // ready under the operation that failed.
     const restoring =
-      row.source_database_id !== null && row.restore_verified_at === null;
+      row.source_database_id !== null &&
+      row.restore_verified_at === null &&
+      row.restore_status !== "failed";
     if (
       move === undefined &&
       (credential === undefined || (restoring && source === undefined))
@@ -317,7 +331,9 @@ export async function nodeDesiredPage(
                 credential: source!,
               },
             }
-          : row.source_database_id === null && row.ever_ready === 0
+          : row.source_database_id === null &&
+              row.ever_ready === 0 &&
+              row.create_failed === 0
             ? { kind: "create" as const }
             : undefined;
     databases.push({

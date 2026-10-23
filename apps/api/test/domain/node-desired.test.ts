@@ -455,6 +455,28 @@ describe("the desired page of a node", () => {
     expect((await entry(f, db.id))!.origin).toBeUndefined();
   });
 
+  it("stops asking for a create whose operation failed, so that an agent that restarted does not build it again", async () => {
+    const f = await fixture();
+    const db = await served(f);
+    expect((await entry(f, db.id))!.origin).toEqual({ kind: "create" });
+    // The node reports the build failed and abandons it (volume, user and state gone): the API
+    // fails the operation on that report. The page keeps the database and names no origin, or
+    // every agent restart, and every rollout of the fleet restarts the agent, would build it
+    // again, to a ready the failed operation never takes.
+    expect(
+      (await report(f, db.id, 1, "error", { error: "build_failed" })).status,
+    ).toBe(200);
+    const operation = await env.DB.prepare(
+      "SELECT status,error_code FROM operations WHERE id=?",
+    )
+      .bind(db.operation)
+      .first<{ status: string; error_code: string }>();
+    expect(operation).toEqual({ status: "failed", error_code: "build_failed" });
+    const page = await entry(f, db.id);
+    expect(page).toBeDefined();
+    expect(page!.origin).toBeUndefined();
+  });
+
   it("keeps the operation of the generation that asked: a role change names none of its own", async () => {
     const f = await fixture();
     const db = await served(f);
@@ -828,6 +850,46 @@ describe("a restore on the page", () => {
       .bind(now, target.id)
       .run();
     expect((await entry(f, target.id))!.origin).toBeUndefined();
+  });
+
+  it("stops naming a restore whose operation failed, and issues no source credential for it", async () => {
+    const f = await fixture();
+    const source = await served(f, "source");
+    const target = await served(f, "target");
+    const operation = newOperationId(),
+      now = new Date().toISOString();
+    const sourcePath = (await env.DB.prepare(
+      "SELECT archive_path FROM databases WHERE id=?",
+    )
+      .bind(source.id)
+      .first<string>("archive_path"))!;
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO operations(id,kind,status,error_code,error_message,project_id,database_id,generation,created_at,updated_at,completed_at) SELECT ?,'database.restore','failed','no_recovery_point','The recovery paused',project_id,id,1,?,?,? FROM databases WHERE id=?",
+      ).bind(operation, now, now, now, target.id),
+      env.DB.prepare(
+        "INSERT INTO database_restores(target_database_id,operation_id,source_database_id,source_archive_path,source_storage_generation,backup_id,created_at) VALUES(?,?,?,?,1,?,?)",
+      ).bind(
+        target.id,
+        operation,
+        source.id,
+        sourcePath,
+        "20261017T110000",
+        now,
+      ),
+    ]);
+    // The node reported the failure and abandoned the target: the page keeps the database (it is
+    // to be deleted or kept as it is) and does not ask for the build again.
+    const page = await entry(f, target.id);
+    expect(page).toBeDefined();
+    expect(page!.origin).toBeUndefined();
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) n FROM archive_credentials WHERE archive_path=? AND access='read_only'",
+      )
+        .bind(sourcePath)
+        .first<number>("n"),
+    ).toBe(0);
   });
 
   it("leaves out a restore whose source archive lies in another region, which this node holds no credential for", async () => {

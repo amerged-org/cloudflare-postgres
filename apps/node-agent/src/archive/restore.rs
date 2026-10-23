@@ -24,9 +24,15 @@
 //! backup role of the restored cluster is the source's, and the first backup uses it as it is.
 //! A step that fails fails the operation with the node contract's error, and the database is
 //! abandoned (`Host::abandon`: stopped, its volume and user deleted).
+//!
+//! A build that an agent restart cut off is begun again (`Order::resumed`). If the earlier run had
+//! not taken its first base backup, its files go and steps 2 to 5 run over an empty directory. If
+//! the first backup is DONE in the database's own archive and is the one of the cluster on the
+//! volume, the build only starts the promoted database again, checks who it is and takes the
+//! backup for the one it has (`Restorer::begin_again`).
 use super::{
     facts::{self, Backup},
-    job::{Database, Job, Jobs, Outcome, Store},
+    job::{Database, Job, Jobs, Kind, Outcome, Store},
     recovery::{self, Restored},
     server::{Recovery, Registration, Table, log_failed_job, unix_seconds},
     upload_log::UploadLog,
@@ -88,6 +94,18 @@ pub struct Order<'a> {
     pub upload_log: &'a UploadLog,
     /// The operation's id: it names the spool.
     pub operation: &'a str,
+    /// The build was begun before and cut off by a restart of the agent: what the earlier run
+    /// left is not trusted (`Restorer::begin_again`).
+    pub resumed: bool,
+}
+
+/// What a build that is begun again goes on with (`Restorer::begin_again`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resume {
+    /// The earlier run's files are gone: the backup is fetched and recovered as for a new build.
+    Afresh,
+    /// The earlier run's database is promoted and its first base backup is DONE: both stay.
+    Finish,
 }
 
 /// The node's table, jobs and credentials, which the executor works with.
@@ -138,36 +156,9 @@ impl Restorer<'_> {
         let segment_bytes = backup.segment_bytes.ok_or("archive_unusable")?;
         phase(order, "listed", &mut lap);
 
-        // 2. Its files, into the new database's data directory.
-        let restore = Job::restore(order.source, order.backup_id, &database.data_directory());
-        self.barman(order, order.source, restore, "restore")
-            .await
-            .map_err(|_| "archive_unusable")?;
-        phase(order, "base_fetched", &mut lap);
-
-        // 3. The recovery settings, and the database known to the archive socket as recovering.
-        // The backup's control file has the settings of the database it came from.
-        let source = proof::read_control(&database.volume)
-            .ok()
-            .and_then(|bytes| pg_control::parse_capacity(&bytes).ok())
-            .ok_or("archive_unusable")?;
-        let capacity = class.at_least(source);
-        if !capacity.fits(order.memory_mib) {
-            crate::timing::emit_event(json!({
-                "event": "restore_capacity_refused", "database_id": database.id,
-                "memory_mib": order.memory_mib,
-                "max_connections": capacity.max_connections,
-                "max_worker_processes": capacity.max_worker_processes,
-                "max_wal_senders": capacity.max_wal_senders,
-                "max_prepared_transactions": capacity.max_prepared_transactions,
-                "max_locks_per_transaction": capacity.max_locks_per_transaction,
-            }));
-            return Err("build_failed");
-        }
-        let settings = recovery::settings(self.fetch_command, order.target_time, &capacity)
-            .ok_or("build_failed")?;
-        recovery::prepare(&database.data_directory(), &settings, order.uid, order.gid)
-            .map_err(|_| "build_failed")?;
+        // 2. Its files, into the new database's data directory, unless the earlier run of this
+        // build got further than that.
+        let finishing = order.resumed && self.begin_again(order).await? == Resume::Finish;
         let spool = recovery::spool_directory(&database.volume, order.operation);
         let registration = |recovery| Registration {
             database: database.clone(),
@@ -175,12 +166,51 @@ impl Restorer<'_> {
             recovery,
             upload_log: order.upload_log.clone(),
         };
-        self.table.set(registration(Some(Recovery {
-            source: order.source.clone(),
-            spool: spool.clone(),
-            required_through: order.end.map(|end| end.last_segment.clone()),
-            segment_bytes,
-        })));
+        let capacity = if finishing {
+            // The database is the promoted one of the earlier run, with its first backup DONE.
+            // It archives to its own store, and the host starts it on its class's own settings.
+            recovery::finish(&database.data_directory(), &spool).map_err(|_| "build_failed")?;
+            self.table.set(registration(None));
+            class
+        } else {
+            let restore = Job::restore(order.source, order.backup_id, &database.data_directory());
+            self.barman(order, order.source, restore, "restore")
+                .await
+                .map_err(|_| "archive_unusable")?;
+            phase(order, "base_fetched", &mut lap);
+
+            // 3. The recovery settings, and the database known to the archive socket as
+            // recovering. The backup's control file has the settings of the database it came
+            // from.
+            let source = proof::read_control(&database.volume)
+                .ok()
+                .and_then(|bytes| pg_control::parse_capacity(&bytes).ok())
+                .ok_or("archive_unusable")?;
+            let capacity = class.at_least(source);
+            if !capacity.fits(order.memory_mib) {
+                crate::timing::emit_event(json!({
+                    "event": "restore_capacity_refused", "database_id": database.id,
+                    "memory_mib": order.memory_mib,
+                    "max_connections": capacity.max_connections,
+                    "max_worker_processes": capacity.max_worker_processes,
+                    "max_wal_senders": capacity.max_wal_senders,
+                    "max_prepared_transactions": capacity.max_prepared_transactions,
+                    "max_locks_per_transaction": capacity.max_locks_per_transaction,
+                }));
+                return Err("build_failed");
+            }
+            let settings = recovery::settings(self.fetch_command, order.target_time, &capacity)
+                .ok_or("build_failed")?;
+            recovery::prepare(&database.data_directory(), &settings, order.uid, order.gid)
+                .map_err(|_| "build_failed")?;
+            self.table.set(registration(Some(Recovery {
+                source: order.source.clone(),
+                spool: spool.clone(),
+                required_through: order.end.map(|end| end.last_segment.clone()),
+                segment_bytes,
+            })));
+            capacity
+        };
 
         // 4. Recovery to the end of the archive or the target, and the check of who promoted.
         host.start().await.map_err(|_| "start_failed")?;
@@ -193,19 +223,22 @@ impl Restorer<'_> {
         recovery::verify_restored(backup, end, &restored)?;
 
         // 5. Recovery is over. The settings and the spool go before the backup, which would
-        // otherwise carry them; the database now archives to its own store.
-        self.table.set(registration(None));
-        recovery::finish(&database.data_directory(), &spool).map_err(|_| "build_failed")?;
-        // The database runs on the settings its recovery needed. It runs on its class's before it
-        // counts as ready, and its first base backup records those.
-        if capacity != class {
-            host.restart().await.map_err(|_| "start_failed")?;
-            phase(order, "restarted", &mut lap);
+        // otherwise carry them; the database now archives to its own store. The first base
+        // backup of a build that finishes is the earlier run's.
+        if !finishing {
+            self.table.set(registration(None));
+            recovery::finish(&database.data_directory(), &spool).map_err(|_| "build_failed")?;
+            // The database runs on the settings its recovery needed. It runs on its class's
+            // before it counts as ready, and its first base backup records those.
+            if capacity != class {
+                host.restart().await.map_err(|_| "start_failed")?;
+                phase(order, "restarted", &mut lap);
+            }
+            let first = Job::base_backup(order.store, database);
+            self.barman(order, order.store, first, "backup")
+                .await
+                .map_err(|_| "build_failed")?;
         }
-        let first = Job::base_backup(order.store, database);
-        self.barman(order, order.store, first, "backup")
-            .await
-            .map_err(|_| "build_failed")?;
         let listing = self
             .barman(
                 order,
@@ -226,6 +259,69 @@ impl Restorer<'_> {
             .ok_or("build_failed")?;
         phase(order, "first_backup", &mut lap);
         Ok(newest)
+    }
+
+    /// What a build that is begun again does before it fetches. The agent that began it went
+    /// away (a release restarts it), and what it started stays: the unit of its fetch, which
+    /// `barman-cloud-restore` would share the destination with and which refuses a destination
+    /// that holds anything, and the files it wrote. The generation is the build's own and no
+    /// client has been near it, so the fetch is stopped and the data directory and the spool go,
+    /// as `build_create` makes a half made cluster again.
+    ///
+    /// Nothing is touched when the database's own archive already holds a DONE backup: the earlier
+    /// run got that far, and the WAL this run archives next would replace the earlier run's under
+    /// it. If that backup is of the cluster on the volume (its system identifier and its timeline
+    /// are the control file's), the cluster is the promoted database of the earlier run and the
+    /// build finishes over both (`Resume::Finish`), as `build_create` goes on over its own
+    /// backup; the backup would otherwise be a long stretch of a batch, since its listing waits
+    /// for the node's one big-job slot behind the other restores, and a rollout in it would fail
+    /// the restore. Any other DONE backup refuses the build with `prefix_not_empty`. A backup the
+    /// earlier run began and did not finish (barman uploads its `backup.info` as `STARTED` when it
+    /// begins) is no backup of anything and stays where it is.
+    async fn begin_again(&self, order: &Order<'_>) -> Result<Resume, &'static str> {
+        let database = order.database;
+        self.jobs
+            .stop_earlier(&database.id, Kind::Restore)
+            .await
+            .map_err(|_| "build_failed")?;
+        let listing = self
+            .barman(
+                order,
+                order.store,
+                Job::backup_list(order.store),
+                "backup-list",
+            )
+            .await
+            .map_err(|_| "archive_unusable")?;
+        let backups = facts::parse_backup_list(&listing.stdout).map_err(|_| "archive_unusable")?;
+        if backups.iter().any(|backup| backup.status == "DONE") {
+            let cluster = proof::read_control(&database.volume)
+                .ok()
+                .and_then(|bytes| pg_control::parse_control(&bytes).ok());
+            let ours = cluster.is_some_and(|cluster| {
+                facts::newest_done(&backups).is_some_and(|backup| {
+                    backup.system_identifier == cluster.system_identifier
+                        && backup.timeline == cluster.timeline
+                })
+            });
+            return if ours {
+                Ok(Resume::Finish)
+            } else {
+                Err("prefix_not_empty")
+            };
+        }
+        for directory in [
+            database.data_directory(),
+            recovery::spool_directory(&database.volume, order.operation),
+        ] {
+            match std::fs::remove_dir_all(directory) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err("build_failed");
+                }
+                _ => {}
+            }
+        }
+        Ok(Resume::Afresh)
     }
 
     /// Runs a barman job of the new database against `store`, to its end; `Failed` for any reason
@@ -310,6 +406,47 @@ mod tests {
         }
     }
 
+    /// A host whose database has been promoted already, as the one of a build that is begun again
+    /// after the earlier run took its first base backup: it records what was asked of it.
+    struct Promoted {
+        system_identifier: &'static str,
+        timeline: u32,
+        started: AtomicBool,
+        restarted: AtomicBool,
+        abandoned: AtomicBool,
+    }
+    impl Promoted {
+        fn on(system_identifier: &'static str, timeline: u32) -> Self {
+            Self {
+                system_identifier,
+                timeline,
+                started: AtomicBool::new(false),
+                restarted: AtomicBool::new(false),
+                abandoned: AtomicBool::new(false),
+            }
+        }
+    }
+    impl Host for Promoted {
+        async fn start(&self) -> Result<(), Failed> {
+            self.started.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn promoted(&self) -> Result<Restored, Failed> {
+            Ok(Restored {
+                in_recovery: false,
+                system_identifier: self.system_identifier.into(),
+                timeline: self.timeline,
+            })
+        }
+        async fn restart(&self) -> Result<(), Failed> {
+            self.restarted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn abandon(&self) {
+            self.abandoned.store(true, Ordering::SeqCst);
+        }
+    }
+
     fn entry(status: &str, segment_size: Option<u64>) -> String {
         let size = segment_size.map_or(String::new(), |size| {
             format!(r#","xlog_segment_size":{size}"#)
@@ -327,6 +464,37 @@ mod tests {
         backup_id: &str,
         target_time: Option<&str>,
     ) -> (Result<Backup, &'static str>, Unreached, std::path::PathBuf) {
+        restore_again(node, name, backup_id, target_time, false).await
+    }
+
+    /// The same, of a build that was begun before (`resumed`) or not.
+    async fn restore_again(
+        node: &Node,
+        name: &str,
+        backup_id: &str,
+        target_time: Option<&str>,
+        resumed: bool,
+    ) -> (Result<Backup, &'static str>, Unreached, std::path::PathBuf) {
+        restore_with(
+            node,
+            name,
+            backup_id,
+            target_time,
+            resumed,
+            Unreached::default(),
+        )
+        .await
+    }
+
+    /// The same, over a host of the test's own.
+    async fn restore_with<H: Host>(
+        node: &Node,
+        name: &str,
+        backup_id: &str,
+        target_time: Option<&str>,
+        resumed: bool,
+        host: H,
+    ) -> (Result<Backup, &'static str>, H, std::path::PathBuf) {
         use std::os::unix::fs::MetadataExt;
         let volume = node.root.join(name);
         // The user and group the agent hands the recovery files to: the test's own.
@@ -351,8 +519,8 @@ mod tests {
             store: &new_store,
             upload_log: &log,
             operation: "op_dddddddddddddddddddd",
+            resumed,
         };
-        let host = Unreached::default();
         let restorer = Restorer {
             table: &node.table,
             jobs: &node.jobs,
@@ -404,6 +572,165 @@ mod tests {
                 .store_directory()
                 .join("objects/pgcf-eu/eu-dev/abcdefghijklmnopqrst/g2-op_dddddddddddddddddddd")
                 .exists()
+        );
+    }
+
+    /// The agent that began the build went away with the unit of its fetch still running (a unit
+    /// outlives the agent, and every rollout restarts the agent) and part of the destination
+    /// written. barman refuses a destination that holds anything, so the build that is begun
+    /// again must stop the earlier fetch and empty the directory of the generation it builds,
+    /// which no client has seen, before it fetches.
+    #[tokio::test]
+    async fn a_restore_begun_again_stops_the_fetch_of_the_earlier_run_and_fetches_into_an_empty_directory()
+     {
+        let node = Node::start("restore-again", AGENT_BOUND).await;
+        let files = backup_files("restore-again-files", Some(&Capacity::of_class(256, 20)));
+        node.fixture.put_backup(
+            SOURCE,
+            BACKUP,
+            &entry("DONE", Some(SEGMENT_BYTES)),
+            Some(&files),
+        );
+        // The earlier run: a fetch that wrote part of the data directory and is still under way.
+        let volume = node.root.join("again");
+        let earlier = database(&volume);
+        node.fixture.set("restore-slow", "30");
+        let run = tokio::spawn({
+            let (jobs, credentials) = (node.jobs.clone(), node.credentials.clone());
+            let earlier = earlier.clone();
+            async move {
+                let source = store(SOURCE, Access::ReadOnly);
+                let credential = credentials.get(&source.scope, unix_seconds()).unwrap();
+                let job = Job::restore(&source, BACKUP, &earlier.data_directory());
+                jobs.run(&earlier, &job, &credential, None).await
+            }
+        });
+        for _ in 0..200 {
+            if volume.join("data/PARTIAL").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(volume.join("data/PARTIAL").exists());
+        // The agent went away: its client dies, and the unit goes on.
+        run.abort();
+        let _ = run.await;
+        assert_eq!(node.fixture.running_units().len(), 1);
+        node.fixture.clear("restore-slow");
+
+        let (result, host, volume) = restore_again(&node, "again", BACKUP, None, true).await;
+        // The fetch ran to its end and the build went on to the start of the database, which the
+        // host here does not give.
+        assert_eq!(result.unwrap_err(), "start_failed");
+        assert!(host.started.load(Ordering::SeqCst));
+        assert!(node.fixture.running_units().is_empty());
+        assert!(!volume.join("data/PARTIAL").exists());
+        assert_eq!(
+            std::fs::read_to_string(volume.join("data/PG_VERSION")).unwrap(),
+            "18\n"
+        );
+    }
+
+    /// A build that is begun again may not go on over a first base backup that the earlier run
+    /// finished in the database's own archive: the WAL it archives next replaces the earlier
+    /// run's, and the backup would not fit it. One the earlier run did not finish is no reason.
+    #[tokio::test]
+    async fn a_restore_begun_again_is_refused_when_its_own_archive_holds_a_finished_backup() {
+        let node = Node::start("restore-again-archive", AGENT_BOUND).await;
+        let files = backup_files(
+            "restore-again-archive-files",
+            Some(&Capacity::of_class(256, 20)),
+        );
+        node.fixture.put_backup(
+            SOURCE,
+            BACKUP,
+            &entry("DONE", Some(SEGMENT_BYTES)),
+            Some(&files),
+        );
+        let own = "s3://pgcf-eu/eu-dev/abcdefghijklmnopqrst/g2-op_dddddddddddddddddddd";
+        // The earlier run began a first backup and did not finish it: the build goes on.
+        node.fixture.put_backup(
+            own,
+            "20261017T225900",
+            &entry("STARTED", Some(SEGMENT_BYTES)),
+            None,
+        );
+        let (result, host, _) = restore_again(&node, "again-started", BACKUP, None, true).await;
+        assert_eq!(result.unwrap_err(), "start_failed");
+        assert!(host.started.load(Ordering::SeqCst));
+        // One it finished: the build is refused.
+        node.fixture.put_backup(
+            own,
+            "20261017T230000",
+            &entry("DONE", Some(SEGMENT_BYTES)),
+            None,
+        );
+        let (result, host, volume) =
+            restore_again(&node, "again-archive", BACKUP, None, true).await;
+        assert_eq!(result.unwrap_err(), "prefix_not_empty");
+        assert!(!host.started.load(Ordering::SeqCst));
+        assert!(host.abandoned.load(Ordering::SeqCst));
+        // Nothing was fetched.
+        assert!(!volume.join("data").exists());
+    }
+
+    /// The agent restarts after the first base backup of a restore is DONE in the database's own
+    /// archive and before the build is recorded as built: in a batch that is a long stretch, since
+    /// the listing that follows the backup waits for the node's one big-job slot behind the other
+    /// restores. The database is the promoted one on the volume and its backup is DONE: the build
+    /// that is begun again finishes over them. It does not fetch again (barman refuses a directory
+    /// that holds anything), take another backup (the WAL it would archive replaces the earlier
+    /// run's under the first) or fail the operation.
+    #[tokio::test]
+    async fn a_restore_begun_again_after_its_first_backup_was_done_finishes_over_that_backup() {
+        const SYSTEM: &str = "7431215993172011234";
+        let node = Node::start("restore-finish", AGENT_BOUND).await;
+        let class = Capacity::of_class(256, 20);
+        let files = backup_files("restore-finish-files", Some(&class));
+        let listed = |id: &str, timeline: u32| {
+            format!(
+                r#"{{"backup_id":"{id}","status":"DONE","timeline":{timeline},"systemid":"{SYSTEM}","end_wal":"000000010000000000000003","end_time_iso":"2026-10-17T22:53:45+00:00","xlog_segment_size":{SEGMENT_BYTES}}}"#
+            )
+        };
+        node.fixture
+            .put_backup(SOURCE, BACKUP, &listed(BACKUP, 1), Some(&files));
+        let own = "s3://pgcf-eu/eu-dev/abcdefghijklmnopqrst/g2-op_dddddddddddddddddddd";
+        node.fixture
+            .put_backup(own, "20261017T230000", &listed("20261017T230000", 2), None);
+        // What the earlier run left on the volume: the promoted database, on timeline 2.
+        let data = node.root.join("finish/data");
+        std::fs::create_dir_all(data.join("global")).unwrap();
+        let mut control = crate::pg_control::control_file(&class);
+        control[48..52].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(data.join("global/pg_control"), control).unwrap();
+        std::fs::write(data.join("PG_VERSION"), "18\n").unwrap();
+        std::fs::write(data.join("rows"), "the earlier run's data").unwrap();
+        // Another base backup or another fetch would fail and leave a note.
+        let noted = node.root.join("noted");
+        for command in ["barman-cloud-backup", "barman-cloud-restore"] {
+            node.fixture.install(
+                command,
+                format!(
+                    "#!/bin/sh\necho {command} >> '{}'\nexit 1\n",
+                    noted.display()
+                ),
+            );
+        }
+
+        let (result, host, _) =
+            restore_with(&node, "finish", BACKUP, None, true, Promoted::on(SYSTEM, 2)).await;
+        let backup = result.unwrap();
+        assert_eq!(
+            (backup.backup_id.as_str(), backup.timeline),
+            ("20261017T230000", 2)
+        );
+        assert!(host.started.load(Ordering::SeqCst));
+        assert!(!host.restarted.load(Ordering::SeqCst));
+        assert!(!host.abandoned.load(Ordering::SeqCst));
+        assert!(!noted.exists(), "{:?}", std::fs::read_to_string(&noted));
+        assert_eq!(
+            std::fs::read_to_string(data.join("rows")).unwrap(),
+            "the earlier run's data"
         );
     }
 

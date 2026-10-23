@@ -446,12 +446,32 @@ impl<M: Machine> Core<M> {
 
     /// Builds the storage generation `entry.origin` names. Ready follows only the first base
     /// backup. The error is the node contract's.
+    ///
+    /// A build that began and failed is abandoned (`abandon_build`) and not begun again in this
+    /// run: the page names the build until the API has ended its operation, and a build that
+    /// began again could end ready on the node while the API, which failed the operation, refuses
+    /// that report. The database stays in its error until it is deleted, or retired by the order
+    /// that ends a move. Once the operation of a restore or a create has failed the page names no
+    /// origin, so an agent that restarted finds nothing of the database and reports
+    /// `volume_missing`; it builds nothing. A build that was refused before it began (the previous
+    /// generation is still held) is no failed build: nothing was written, and the next pull tries
+    /// it again.
+    ///
+    /// A build whose archive credential, its own or its source's, was not delivered at this pull
+    /// has not begun either: it says nothing and the next pull tries it again
+    /// (`credential_wait`), `Err("credential_not_delivered")`, which is no error of the contract.
+    /// The pull that begins or resumes a build is also the one that reads the credentials, and
+    /// the first one after a start reads every credential of the node; a read that failed once is
+    /// made again.
     pub(crate) async fn build(
         self: &Arc<Self>,
         db: &Arc<Db>,
         entry: &Entry,
     ) -> Result<(), &'static str> {
         let origin = entry.origin.clone().ok_or_else(|| build_failed!())?;
+        if self.waits_for_credential(db, entry, &origin) {
+            return Err("credential_not_delivered");
+        }
         self.set(db, |view| {
             view.phase = Phase::Building;
             view.error = None;
@@ -460,7 +480,8 @@ impl<M: Machine> Core<M> {
         });
         // Before anything is written: the record of the generation that is released stays what
         // it is until it has been, so that a build that was refused is released again.
-        let built = if !self.release_previous_generation(entry).await {
+        let released = self.release_previous_generation(entry).await;
+        let built = if !released {
             Err("build_failed")
         } else {
             match origin {
@@ -478,26 +499,122 @@ impl<M: Machine> Core<M> {
                     "event": "build_failed", "database_id": db.id,
                     "operation": entry.operation, "error": error,
                 }));
+                let forgotten = if released {
+                    self.abandon_build(entry).await;
+                    self.forget_state(&db.id, entry.storage_generation)
+                } else {
+                    false
+                };
                 self.set(db, |view| {
                     view.phase = Phase::Error;
                     view.error = Some(error);
+                    if released {
+                        view.abandoned_build = Some(entry.archive_path.clone());
+                    }
+                    if forgotten {
+                        view.state = None;
+                    }
                 });
                 Err(error)
             }
         }
     }
 
-    /// The state file of a build that begins: a new generation, or the one a crash left behind.
-    fn begin_state(&self, db: &Db, entry: &Entry) -> Result<(), &'static str> {
+    /// Whether the build waits for an archive credential (its own, or its source's) that has not
+    /// been delivered, and has not waited for it for `Timing::credential_wait` yet. Past that wait
+    /// the build is begun, and fails with `archive_unusable` like any build without its archive.
+    fn waits_for_credential(&self, db: &Db, entry: &Entry, origin: &Origin) -> bool {
+        let delivered = self.store(&entry.archive_path, Access::ReadWrite).is_some()
+            && match origin {
+                Origin::Create => true,
+                Origin::Restore(source) | Origin::Move(source, _) => {
+                    self.store(&source.path, Access::ReadOnly).is_some()
+                }
+            };
+        let now = super::now_ms();
+        let wait = i64::try_from(self.timing.credential_wait.as_millis()).unwrap_or(i64::MAX);
+        let mut view = db.view();
+        if delivered {
+            view.credential_missing_since_ms = None;
+            return false;
+        }
+        let first = view.credential_missing_since_ms.is_none();
+        let since = *view.credential_missing_since_ms.get_or_insert(now);
+        let waits = now - since < wait;
+        // The wait is over: the build begins and fails, and the next build starts its own wait.
+        if !waits {
+            view.credential_missing_since_ms = None;
+        }
+        drop(view);
+        if first {
+            crate::timing::emit_event(serde_json::json!({
+                "event": "build_waits_for_credential", "database_id": db.id,
+                "operation": entry.operation, "waits": waits,
+            }));
+        }
+        waits
+    }
+
+    /// Removes the node's files of a database (its state and the upload logs) when they are those
+    /// of the storage generation that was built. A build that failed before it wrote its own
+    /// (no credential for its archive had arrived, so `begin_state` never ran) finds the files of
+    /// the generation the database is served from: a move target on the node of its source. They
+    /// are the source's proof and stay. `true` when they were removed.
+    fn forget_state(&self, id: &str, storage_generation: u64) -> bool {
+        let files = self.files(id);
+        match files.load() {
+            Ok(Some(state)) if state.storage_generation == storage_generation => {
+                files.remove().is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    /// Stops the unit of a build that failed and deletes its volume, and its user with the
+    /// database's last volume. A move on the node of its source leaves the source's volume, whose
+    /// files the user owns: the user, and its uid, go only with the database's last volume. The
+    /// restore executor has abandoned its own build already (`Host::abandon`); doing it again
+    /// finds nothing.
+    async fn abandon_build(&self, entry: &Entry) {
+        let _ = self.machine.stop(&entry.id).await;
+        self.admission.stopped(&entry.id);
+        self.table.remove(&entry.id);
+        if let Some(volume) = Self::volume_id(entry) {
+            let _ = self
+                .machine
+                .remove_volume(
+                    &volume,
+                    Removal::DatabaseDeleted {
+                        storage_generation: entry.storage_generation,
+                    },
+                )
+                .await;
+        }
+        let others = self.machine.inventory().await.map(|inventory| {
+            inventory
+                .volumes
+                .iter()
+                .any(|volume| volume.id.database() == entry.id)
+        });
+        if matches!(others, Ok(false)) {
+            let _ = std::fs::remove_dir_all(self.layout().socket_directory(&entry.id));
+            let _ = self.machine.remove_account(&entry.id).await;
+        }
+    }
+
+    /// The state file of a build that begins: a new generation, or the one a crash or a restart of
+    /// the agent left behind. `true` for the latter: the build was begun before, and what it left
+    /// on the node is not trusted.
+    fn begin_state(&self, db: &Db, entry: &Entry) -> Result<bool, &'static str> {
         let held = self.files(&db.id).load().map_err(|_| build_failed!())?;
-        let state = held
-            .filter(|state| state.storage_generation == entry.storage_generation)
-            .unwrap_or_else(|| DatabaseState::new(entry.storage_generation));
+        let held = held.filter(|state| state.storage_generation == entry.storage_generation);
+        let resumed = held.is_some();
+        let state = held.unwrap_or_else(|| DatabaseState::new(entry.storage_generation));
         self.files(&db.id)
             .save(&state)
             .map_err(|_| build_failed!())?;
         self.set(db, |view| view.state = Some(state));
-        Ok(())
+        Ok(resumed)
     }
 
     /// Creates the user, the volume and its directories: the same for every origin.
@@ -533,7 +650,7 @@ impl<M: Machine> Core<M> {
         let store = self
             .store(&entry.archive_path, Access::ReadWrite)
             .ok_or("archive_unusable")?;
-        self.begin_state(db, entry)?;
+        let _ = self.begin_state(db, entry)?;
         let (account, volume) = self.provision(entry).await?;
         let job_database = self.job_database(&volume, &account.name);
         // The archive path is the database's own and must hold nothing but backups of the cluster
@@ -651,8 +768,15 @@ impl<M: Machine> Core<M> {
         let from = self
             .store(&source.path, Access::ReadOnly)
             .ok_or("archive_unusable")?;
-        self.begin_state(db, entry)?;
+        let resumed = self.begin_state(db, entry)?;
         let (account, volume) = self.provision(entry).await?;
+        // The agent that began this build went away with the units it started (a release restarts
+        // it): the PostgreSQL of the recovery may run on the data directory that the restore
+        // empties and fetches again (`Restorer::begin_afresh`), and it is stopped first. The
+        // previous generation is released (`build`), so a unit of this database is this build's.
+        if resumed && !self.stop_unit(&entry.id).await {
+            return Err("build_failed");
+        }
         // The restore writes the generation it builds: its device, whatever the database's link
         // names.
         let job_database = self.job_database(&volume, &account.name);
@@ -685,15 +809,10 @@ impl<M: Machine> Core<M> {
             store: &store,
             upload_log: &upload_log,
             operation: &entry.operation,
+            resumed,
         };
-        let backup = match restorer.run(&order, &host).await {
-            Ok(backup) => backup,
-            Err(error) => {
-                // The executor abandoned the build: stopped, volume and user gone.
-                self.files(id).remove().ok();
-                return Err(error);
-            }
-        };
+        // A failure is the executor's abandoned build: stopped, volume and user gone (`build`).
+        let backup = restorer.run(&order, &host).await?;
         let completed = backup
             .completed_at_ms
             .map(facts::timestamp)
@@ -832,15 +951,33 @@ impl<M: Machine> Host for Rebuild<M> {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        // The database is the new database's before its first backup: its name, its roles.
+        // The database is the new database's before its first backup: its name, its roles. A
+        // build that finishes over the promoted database of the earlier run (`Resume::Finish`)
+        // finds the name changed already; one that finds neither name has no tenant database.
         if self.source_database != self.entry.id {
-            session
-                .batch(&format!(
-                    "ALTER DATABASE \"{}\" RENAME TO \"{}\"",
-                    self.source_database, self.entry.id
-                ))
+            let names = vec![self.source_database.clone(), self.entry.id.clone()];
+            let found: Vec<String> = session
+                .query(
+                    "SELECT datname::text FROM pg_catalog.pg_database WHERE datname::text = ANY($1)",
+                    &[&names],
+                )
                 .await
+                .map_err(|_| Failed)?
+                .iter()
+                .map(|row| row.try_get::<_, String>(0))
+                .collect::<Result<_, _>>()
                 .map_err(|_| Failed)?;
+            if found.contains(&self.source_database) {
+                session
+                    .batch(&format!(
+                        "ALTER DATABASE \"{}\" RENAME TO \"{}\"",
+                        self.source_database, self.entry.id
+                    ))
+                    .await
+                    .map_err(|_| Failed)?;
+            } else if !found.contains(&self.entry.id) {
+                return Err(Failed);
+            }
         }
         let applied = roles::apply(&session, &self.entry.roles, &Default::default(), true)
             .await
@@ -860,32 +997,7 @@ impl<M: Machine> Host for Rebuild<M> {
     }
 
     async fn abandon(&self) {
-        let core = &self.core;
-        let _ = core.machine.stop(&self.entry.id).await;
-        core.admission.stopped(&self.entry.id);
-        if let Some(volume) = Core::<M>::volume_id(&self.entry) {
-            let _ = core
-                .machine
-                .remove_volume(
-                    &volume,
-                    Removal::DatabaseDeleted {
-                        storage_generation: self.entry.storage_generation,
-                    },
-                )
-                .await;
-        }
-        // A move on the node of its source leaves the source's volume, whose files the user owns:
-        // the user, and its uid, go only with the database's last volume.
-        let others = core.machine.inventory().await.map(|inventory| {
-            inventory
-                .volumes
-                .iter()
-                .any(|volume| volume.id.database() == self.entry.id)
-        });
-        if matches!(others, Ok(false)) {
-            let _ = std::fs::remove_dir_all(core.layout().socket_directory(&self.entry.id));
-            let _ = core.machine.remove_account(&self.entry.id).await;
-        }
+        self.core.abandon_build(&self.entry).await;
     }
 }
 
@@ -1155,14 +1267,10 @@ mod tests {
         let _flow = db.lock.lock().await;
         assert_eq!(rig.core.build(&db, &entry).await, Err("prefix_not_empty"));
         assert_eq!(rig.observation(&entry.id)["error"], "prefix_not_empty");
-        // Nothing of the cluster or the archive was touched.
-        assert!(
-            rig.core
-                .layout()
-                .data(&entry.id)
-                .join("PG_VERSION")
-                .exists()
-        );
+        // Nothing of the archive was touched; the build is abandoned, and the cluster that was
+        // never ready goes with its volume.
+        assert!(rig.machine.volumes().is_empty());
+        assert!(!rig.machine.running(&entry.id));
         assert!(backup_files(&rig, &entry, &first.backup_id).exists());
         assert_eq!(
             std::fs::read_to_string(backup_files(&rig, &entry, "20261017T225342")).unwrap(),
@@ -1188,6 +1296,7 @@ mod tests {
         assert_eq!(rig.observation(&entry.id)["error"], "storage_full");
         assert_eq!(rig.observation(&entry.id)["state"], "error");
         assert!(!rig.machine.running(&entry.id));
+        assert!(!rig.machine.has_account(&entry.id));
         rig.machine.set_no_room(false);
 
         // An archive path that holds a backup is not a new database's.
@@ -1210,19 +1319,16 @@ mod tests {
                 .exists()
         );
 
-        // A start that fails is a failed build, and a build is tried again from where it stopped.
+        // A start that fails is a failed build: abandoned, with nothing of it left on the node
+        // (the build of the used archive above left none either), and not begun again by the next
+        // pull (`a_create_that_failed_is_abandoned_and_not_begun_again`).
         let entry = rig.entry();
         let db = rig.core.db(&entry.id);
         rig.core.accept(&db, entry.clone());
         rig.machine.fail_next_start();
         assert_eq!(rig.core.build(&db, &entry).await, Err("start_failed"));
         assert_eq!(rig.observation(&entry.id)["error"], "start_failed");
-        rig.core.build(&db, &entry).await.unwrap();
-        assert_eq!(rig.observation(&entry.id)["state"], "ready");
-        assert_eq!(
-            rig.machine.volumes().len(),
-            2,
-            "one volume per database, not per attempt"
-        );
+        assert!(rig.machine.volumes().is_empty());
+        assert!(!rig.machine.has_account(&entry.id));
     }
 }

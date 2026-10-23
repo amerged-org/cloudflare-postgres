@@ -43,6 +43,7 @@ impl Fixture {
         let root = directory(name);
         let store = root.join("store");
         fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("units")).unwrap();
         fs::create_dir_all(&store).unwrap();
         let store = store.display();
         // systemd-run: the unit's command with the unit's environment file, as `systemd-run --wait
@@ -53,11 +54,12 @@ impl Fixture {
         script(
             &root.join("bin/systemd-run"),
             r#"#!/bin/sh
-env_file=; runtime=; quiet=
+env_file=; runtime=; quiet=; unit=
 while [ $# -gt 0 ]; do
   case "$1" in
     --) shift; break ;;
     --quiet) quiet=1 ;;
+    --unit=*) unit=${1#--unit=} ;;
     -p) shift; case "$1" in
       EnvironmentFile=*) env_file=${1#EnvironmentFile=} ;;
       RuntimeMaxSec=*) runtime=${1#RuntimeMaxSec=} ;;
@@ -72,6 +74,9 @@ ended="$env_file.ended"
 # terminal, which dash does not have here).
 perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' "$@" &
 command=$!
+# systemd knows the unit by its name while it runs, and a client that went away does not end it.
+units=$(dirname "$0")/../units
+[ -z "$unit" ] || echo "$command" > "$units/$unit.service"
 if [ -n "$runtime" ]; then
   # The unit's own timer: it outlives this client if the client is killed.
   (
@@ -82,6 +87,7 @@ if [ -n "$runtime" ]; then
 fi
 wait $command
 status=$?
+[ -z "$unit" ] || rm -f "$units/$unit.service"
 if [ -f "$ended" ]; then result=timeout; status=1
 elif [ $status -eq 0 ]; then result=success
 else result=exit-code; fi
@@ -93,6 +99,38 @@ if [ -z "$quiet" ]; then
   echo "Memory peak: 1.7M (swap: 0B)" >&2
 fi
 exit $status
+"#
+            .into(),
+        );
+        // systemctl: the units systemd-run started that still run, listed by pattern and stopped
+        // by name (the command and what it started are one process group, as in a cgroup that is
+        // killed whole). A unit whose processes are gone is not loaded any more (`--collect`).
+        script(
+            &root.join("bin/systemctl"),
+            r#"#!/bin/sh
+units=$(dirname "$0")/../units
+alive() { perl -e 'exit(kill(0, -$ARGV[0]) ? 0 : 1)' "$1"; }
+case "$1" in
+  list-units)
+    pattern=
+    for argument in "$@"; do case "$argument" in -*|list-units) ;; *) pattern=$argument ;; esac; done
+    for file in "$units"/*.service; do
+      [ -f "$file" ] || continue
+      if ! alive "$(cat "$file")"; then rm -f "$file"; continue; fi
+      unit=$(basename "$file")
+      case "$unit" in $pattern) echo "$unit loaded active running fixture" ;; esac
+    done ;;
+  stop)
+    file="$units/$2"
+    [ -f "$file" ] || { echo "Unit $2 not loaded." >&2; exit 5; }
+    group=$(cat "$file")
+    perl -e 'kill "TERM", -$ARGV[0]' "$group" 2>/dev/null
+    left=50
+    while alive "$group" && [ $left -gt 0 ]; do sleep 0.1; left=$((left - 1)); done
+    perl -e 'kill "KILL", -$ARGV[0]' "$group" 2>/dev/null
+    rm -f "$file" ;;
+  *) exit 1 ;;
+esac
 "#
             .into(),
         );
@@ -153,6 +191,7 @@ if [ -f "$STORE/restore-fail" ]; then echo 'simulated R2 outage' >&2; exit 4; fi
 src="$STORE/objects/${{dest#s3://}}/$server/base/$id/data"
 if [ ! -d "$src" ]; then echo "Backup $id for server $server does not exist" >&2; exit 1; fi
 if [ -n "$(ls -A "$target" 2>/dev/null)" ]; then echo "$target is not empty" >&2; exit 2; fi
+if [ -f "$STORE/restore-slow" ]; then mkdir -p "$target" && echo partial > "$target/PARTIAL"; sleep "$(cat "$STORE/restore-slow")"; fi
 mkdir -p "$target" && cp -R "$src/." "$target/" && chmod 700 "$target"
 "#
             ),
@@ -207,12 +246,31 @@ printf ']}}\n'
         self.root.join("store").join(file)
     }
     /// Switches a behaviour of the commands on (`fail`, `fetch-fail`, `backup-fail`) or sets it
-    /// (`delay` of the WAL commands and `backup-delay` of the base backup, in seconds).
+    /// (`delay` of the WAL commands, `backup-delay` of the base backup and `restore-slow` of the
+    /// restore, which leaves a file in its destination and then takes that many seconds).
     pub fn set(&self, flag: &str, value: &str) {
         fs::write(self.store(flag), value).unwrap();
     }
     pub fn clear(&self, flag: &str) {
         let _ = fs::remove_file(self.store(flag));
+    }
+    /// The units `systemd-run` started whose processes still run, by name.
+    pub fn running_units(&self) -> Vec<String> {
+        let mut units: Vec<String> = fs::read_dir(self.root.join("units"))
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let group = fs::read_to_string(entry.path()).ok()?;
+                Command::new("perl")
+                    .args(["-e", "exit(kill(0, -$ARGV[0]) ? 0 : 1)", group.trim()])
+                    .status()
+                    .ok()?
+                    .success()
+                    .then(|| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        units.sort();
+        units
     }
     /// The object an upload to `destination` leaves for `name`.
     pub fn object(&self, destination: &str, name: &str) -> PathBuf {

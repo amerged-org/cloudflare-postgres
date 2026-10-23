@@ -399,6 +399,7 @@ async fn restore(
         store: &own,
         upload_log: &log,
         operation: OPERATION,
+        resumed: false,
     };
     let host = ClusterHost {
         pg,
