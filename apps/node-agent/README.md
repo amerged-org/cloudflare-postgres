@@ -124,6 +124,18 @@ One database has one flow at a time (a create, a wake, a sleep, a recovery or a 
 before the next begins). What the gateway and the observations read is the database's view, which
 every flow updates in small steps.
 
+**Filesystem growth.** New volumes use `meta_bg` without `resize_inode`, so their 8 MiB journal
+can grow online without the reserved-descriptor credit exhaustion of the earlier layout. Every
+filesystem leaves 4 MiB at the end of its volume for signature isolation. Existing filesystems
+are never reformatted: the earlier layout grows offline after all holders release it, with
+`e2fsck -p -f` before `resize2fs`. A warm database uses the existing quiesce/archive/stop proof;
+a busy database defers growth. A crashed database stays unproven while the agent applies an
+explicitly requested grow before PostgreSQL recovery, then archives and proves it normally.
+An interrupted offline grow is tagged suspect and checked before remounting. Every ready or
+asleep observation carries the measured filesystem size; no size means no resize completion.
+No tenant project quota is installed. Full-volume recovery is by growing the volume, without a
+guarantee that arbitrary SQL cleanup can run with no available space.
+
 **The pool after a reset that was not clean** (`Storage::open`, `activate_group`). A hard power-off
 left one leaked data block in the pool's metadata on EU1 (2026-10-23): `thin_check -q` found it
 (exit 64), `vgchange --activate y` ended with 5, the agent crash-looped 798 times and every
@@ -726,7 +738,10 @@ Tests that need the kernel are `#[ignore]`d. CI runs them from
 alone (the mount API, for example).
 The lab tests need a Debian 13 host with systemd as PID 1, root, LVM and the image's units
 (`units/lab.rs`, `machine/node.rs`), or a privileged container with loop devices for
-`storage/lab_tests.rs`, which is built only with `RUSTFLAGS='--cfg pgcf_storage_lab'`.
+`storage/lab_tests.rs`, which is built only with `RUSTFLAGS='--cfg pgcf_storage_lab'`. Besides root,
+LVM and loop devices, it needs PostgreSQL 18 (`PGCF_TEST_POSTGRES_BINDIR`) and a user with uid
+1234 and a passwd entry. These tests exercise growth under real writes, full-volume recovery by
+growth, inode exhaustion, and legacy offline growth while another namespace holds the volume.
 `units/idmap_lab.rs` runs the idmapped handoff of a database's volume and socket directory into
 a systemd sandbox (`units/idmap.rs`); it is built only with `RUSTFLAGS='--cfg pgcf_idmap_lab'` and
 runs as root on a systemd host inside `systemd-run --wait --pipe -p PrivateMounts=yes`, the mount

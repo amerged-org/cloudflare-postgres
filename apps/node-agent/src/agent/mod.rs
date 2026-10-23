@@ -205,6 +205,10 @@ pub(crate) struct View {
     /// The roles the API deleted: gone, and refused.
     pub roles_removed: Vec<String>,
     pub roles_blocked: Vec<String>,
+    /// The size of the volume's filesystem in bytes, as its superblock says (`Core::resize`). The
+    /// observation tells it, so that a resize ends when the filesystem has the size and not when
+    /// the volume has.
+    pub storage_bytes: Option<u64>,
     /// A recovery runs or waits for its retry.
     pub recovering: bool,
     /// Since when the unit runs: the usage meter's, and the first minute after which a due base
@@ -252,6 +256,7 @@ impl View {
             state: None,
             roles_removed: Vec::new(),
             roles_blocked: Vec::new(),
+            storage_bytes: None,
             recovering: false,
             awake_since_ms: None,
             backup_failed_ms: None,

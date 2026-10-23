@@ -456,32 +456,57 @@ impl<M: Machine> Core<M> {
     /// database is decided on from the files below its mount point. A volume that cannot be
     /// attached is a fact to decide on (a volume that needs a repair has no `pg_control` to
     /// show); a volume list that cannot be read is not, and `false` says that nothing is decided.
+    ///
+    /// The size of the volume's filesystem is read here (`read_filesystem`), once for every
+    /// database that the agent decides on after it began: what the observation of a ready or
+    /// sleeping database tells (`View::storage_bytes`) is known before the first one is queued, so
+    /// that the resize that is open in Cloudflare is never ended by an observation that says
+    /// nothing of the filesystem. A filesystem that cannot be read is not a fact either.
     async fn attach(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) -> bool {
         let Some(volume) = Self::volume_id(entry) else {
             return true;
         };
-        if self.machine.attached(&volume) {
-            return true;
-        }
-        match self
-            .machine
-            .mount_volumes(std::slice::from_ref(&volume))
-            .await
-        {
-            Ok(failures) => {
-                for (volume, error) in failures {
-                    crate::timing::emit_event(json!({
-                        "event": "mount_failed", "database_id": volume.database(),
-                        "class": crate::diagnostics::error_code(&error.into()),
-                    }));
+        if !self.machine.attached(&volume) {
+            match self
+                .machine
+                .mount_volumes(std::slice::from_ref(&volume))
+                .await
+            {
+                Ok(failures) => {
+                    for (volume, error) in failures {
+                        crate::timing::emit_event(json!({
+                            "event": "mount_failed", "database_id": volume.database(),
+                            "class": crate::diagnostics::error_code(&error.into()),
+                        }));
+                    }
                 }
-                true
+                Err(error) => {
+                    Self::unread(db, "volume", error.into());
+                    return false;
+                }
             }
+        }
+        match self.read_filesystem(db, &volume).await {
+            Ok(()) => true,
             Err(error) => {
-                Self::unread(db, "volume", error.into());
+                Self::unread(db, "filesystem", error.into());
                 false
             }
         }
+    }
+
+    /// Reads the size of the volume's filesystem from its superblock into the view, where the
+    /// observation takes it from. A change of it is a change of the observation.
+    pub(crate) async fn read_filesystem(
+        &self,
+        db: &Db,
+        volume: &crate::storage::VolumeId,
+    ) -> Result<(), crate::storage::Error> {
+        let bytes = self.machine.filesystem_bytes(volume).await?;
+        if db.view().storage_bytes != Some(bytes) {
+            self.set(db, |view| view.storage_bytes = Some(bytes));
+        }
+        Ok(())
     }
 
     /// The unit runs, as the agent found it at its start: it is released to the gateway as ready,
@@ -573,7 +598,11 @@ impl<M: Machine> Core<M> {
 
     /// The database sizes of the entry are the unit's limits and the volume's: set again when
     /// they changed, running or asleep, and the admission knows it. A change of the settings is
-    /// written at the next start.
+    /// written at the next start. The observation carries the size that the filesystem has
+    /// (`View::storage_bytes`), read after the growth: Cloudflare ends a resize when the filesystem
+    /// has the size and not when the volume has, so a growth that failed (the kernel's -28, a pool
+    /// that took no writes) leaves the resize open, and it is tried again with every decision of
+    /// the database.
     pub(crate) async fn resize(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
         let current = Resources {
             memory_mib: entry.memory_mib,
@@ -585,26 +614,53 @@ impl<M: Machine> Core<M> {
             .state
             .as_ref()
             .and_then(|state| state.resources.clone());
-        if held.as_ref() != Some(&current) {
+        let changed = held.as_ref() != Some(&current);
+        let growing = db.view().storage_bytes.is_some_and(|bytes| {
+            bytes
+                < entry
+                    .volume_bytes()
+                    .saturating_sub(crate::storage::FS_END_GAP_BYTES)
+        });
+        if changed || growing {
             let mut applied = self.apply_limits(entry).await.is_ok();
-            if let (Some(held), Some(volume)) = (&held, Self::volume_id(entry))
-                && held.storage_gib < current.storage_gib
-                && let Err(error) = self
+            if let Some(volume) = Self::volume_id(entry)
+                && (growing
+                    || held
+                        .as_ref()
+                        .is_some_and(|held| held.storage_gib < current.storage_gib))
+            {
+                let mut result = self
                     .machine
                     .grow_volume(&volume, entry.volume_bytes())
-                    .await
-            {
-                applied = false;
-                crate::timing::emit_event(json!({
-                    "event": "resize_refused", "database_id": db.id,
-                    "class": crate::diagnostics::error_code(&error.into()),
-                }));
+                    .await;
+                if matches!(result, Err(crate::storage::Error::OfflineGrowRequired))
+                    && db.phase() == Phase::Ready
+                    && self.sleep_locked(db, Why::Order).await == Slept::Proven
+                {
+                    // Only the established quiesce/archive/stop proof may stop a warm writer.
+                    // A busy writer or archive leaves the operation pending for a later pass.
+                    result = self
+                        .machine
+                        .grow_volume(&volume, entry.volume_bytes())
+                        .await;
+                }
+                if let Err(error) = result {
+                    applied = false;
+                    crate::timing::emit_event(json!({
+                        "event": "resize_refused", "database_id": db.id,
+                        "class": crate::diagnostics::error_code(&error.into()),
+                    }));
+                }
             }
             if applied {
                 let _ = self.save_state(db, |state| state.resources = Some(current.clone()));
             }
             self.admission.resized(&db.id, entry.memory_mib);
-            self.set(db, |_| {});
+        }
+        if let Some(volume) = Self::volume_id(entry) {
+            // The size it has now; one that cannot be read leaves the size as it was (the volume
+            // is the same), and the next decision reads it again.
+            let _ = self.read_filesystem(db, &volume).await;
         }
     }
 
@@ -1548,6 +1604,247 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Started, "{:?}", result.reason);
         let limits = rig.machine.limits(&id).unwrap();
         assert_eq!((limits.memory_mib, limits.cpu_millicores), (512, 500));
+    }
+
+    /// A resize ends in Cloudflare when the filesystem has the size, so the observation of a
+    /// ready or sleeping database tells the size the filesystem has (its superblock's), also
+    /// after a growth, and a growth that the kernel refused leaves the old size in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_observation_tells_the_size_of_the_filesystem_and_a_refused_growth_leaves_it_as_it_is()
+     {
+        let Some(rig) = Rig::new("resize-fs").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        let (volume, created) = rig.machine.volumes()[0].clone();
+        let gap = crate::storage::FS_END_GAP_BYTES;
+        eventually(30, "the observation to tell the filesystem", || {
+            handle.view().storage_bytes == Some(created - gap)
+        })
+        .await;
+        assert_eq!(rig.observation(&id)["storage_bytes"], created - gap);
+
+        // The kernel refuses the growth: the volume has the size and the filesystem keeps its
+        // own, the page's size is not kept as applied, and the observation says so.
+        rig.machine.set_growth_refused(true);
+        next(&mut db, 6);
+        db["resources"] = json!({"memory_mib": 512, "cpu_millicores": 500, "storage_gib": 2});
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(30, "the volume to be grown", || {
+            rig.machine.volumes()[0].1 == 2 << 30
+        })
+        .await;
+        eventually(30, "the observation of the new generation", || {
+            rig.core
+                .pending_observation(&id)
+                .is_some_and(|observation| observation["generation"] == 6)
+        })
+        .await;
+        assert_eq!(rig.observation(&id)["storage_bytes"], created - gap);
+        assert_eq!(rig.machine.filesystem(&volume), Some(created - gap));
+        assert_ne!(
+            handle
+                .state()
+                .and_then(|state| state.resources)
+                .map(|resources| resources.storage_gib),
+            Some(2),
+            "a growth that failed is not kept as done"
+        );
+
+        // The next decision tries again, and the observation follows the filesystem.
+        rig.machine.set_growth_refused(false);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(30, "the filesystem to grow", || {
+            handle.view().storage_bytes == Some((2 << 30) - gap)
+        })
+        .await;
+        assert_eq!(rig.observation(&id)["storage_bytes"], (2u64 << 30) - gap);
+        assert_eq!(rig.machine.filesystem(&volume), Some((2 << 30) - gap));
+    }
+
+    /// The agent restarts while a growth is open: the size that the filesystem has is the first
+    /// thing it says of the database that it decides on, also of the one that sleeps (its state
+    /// file holds a proof, and says `asleep` before anything is decided), and also while the
+    /// volume is attached: a ready or sleeping database that tells no size is read by Cloudflare
+    /// as one of an agent that never tells it, and the resize that is open ends with the state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_agent_that_restarts_during_a_growth_says_the_size_of_the_filesystem_first() {
+        let Some(rig) = Rig::new("resize-restart").await else {
+            return;
+        };
+        let (rig, mut db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        let (volume, created) = rig.machine.volumes()[0].clone();
+        let old = created - crate::storage::FS_END_GAP_BYTES;
+        // The page grows the sleeping database, the kernel refuses the growth, and the agent
+        // cannot attach the volume yet.
+        rig.machine.set_growth_refused(true);
+        rig.machine.hold_mounts();
+        next(&mut db, 6);
+        db["resources"] = json!({"memory_mib": 256, "cpu_millicores": 250, "storage_gib": 2});
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the state file to be read", || {
+            handle.view().state.is_some()
+        })
+        .await;
+        // The state file has a proof and the entry is the page's, so the database would say
+        // `asleep`: without a size it says nothing.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(handle.view().storage_bytes, None);
+        assert!(
+            rig.core
+                .pending_observation(&id)
+                .is_none_or(|observation| observation["state"] == "unproven"
+                    || observation.get("storage_bytes").is_some()),
+            "{:?}",
+            rig.core.pending_observation(&id)
+        );
+        rig.machine.release_mounts();
+        eventually(
+            30,
+            "the database to be decided on and the growth refused",
+            || handle.view().adopted && rig.machine.volumes()[0].1 == 2 << 30,
+        )
+        .await;
+        let observation = rig.observed(&id, "asleep").await;
+        assert_eq!(observation["generation"], 6);
+        assert_eq!(observation["storage_bytes"], old);
+        assert_eq!(rig.machine.filesystem(&volume), Some(old));
+    }
+
+    /// A database that crashed, an agent that restarted, the recovery that proved its sleep and the
+    /// wake after it: every ready and asleep it says has the size the filesystem has, the one a
+    /// growth that failed left (the API ends a resize by it), and not one without.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_crash_a_restart_the_recovery_and_a_wake_never_say_ready_or_asleep_without_the_size()
+    {
+        let Some(rig) = Rig::new("resize-crash").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let (id, path) = (
+            id_of(&db),
+            db["archive"]["path"].as_str().unwrap().to_string(),
+        );
+        let _ = rig.create_from(&db).await;
+        db.as_object_mut().unwrap().remove("origin");
+        let (volume, created) = rig.machine.volumes()[0].clone();
+        let old = created - crate::storage::FS_END_GAP_BYTES;
+
+        // A growth the kernel refused, at generation 6, and then the crash of the database.
+        rig.machine.set_growth_refused(true);
+        next(&mut db, 6);
+        db["resources"] = json!({"memory_mib": 256, "cpu_millicores": 250, "storage_gib": 2});
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(30, "the volume to be grown", || {
+            rig.machine.volumes()[0].1 == 2 << 30
+        })
+        .await;
+        rig.machine.crash(&id);
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        // Whatever the agent queues for the database while this goes on.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let watch = tokio::spawn({
+            let (core, id, seen) = (rig.core.clone(), id.clone(), seen.clone());
+            async move {
+                loop {
+                    if let Some(observation) = core.pending_observation(&id)
+                        && matches!(observation["state"].as_str(), Some("ready" | "asleep"))
+                        && observation.get("storage_bytes").is_none()
+                    {
+                        seen.lock().unwrap().push(observation);
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(60, "the recovery to prove the sleep", || {
+            handle.phase() == Phase::Asleep
+                && handle.state().as_ref().is_some_and(|s| s.record.is_some())
+        })
+        .await;
+        let asleep = rig.observed(&id, "asleep").await;
+        assert_eq!(asleep["generation"], 6);
+        assert_eq!(asleep["storage_bytes"], old);
+        let mut ticket = Rig::ticket(&rig.entry_for(&db));
+        ticket.operation = "op_rrrrrrrrrrrrrrrrrrrr".into();
+        assert_eq!(rig.core.wake(&ticket).await.outcome, Outcome::Started);
+        let ready = rig.observed(&id, "ready").await;
+        assert_eq!(ready["storage_bytes"], old);
+        assert_eq!(rig.machine.filesystem(&volume), Some(old));
+        watch.abort();
+        // Never one without, at any moment the watch looked.
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_growth_stops_a_warm_database_only_with_its_sleep_proof() {
+        let Some(rig) = Rig::new("resize-legacy").await else {
+            return;
+        };
+        let mut entry = rig.entry_json();
+        let (_, db) = rig.create_from(&entry).await;
+        let id = id_of(&entry);
+        rig.machine.set_offline_growth(true);
+        next(&mut entry, 6);
+        entry["resources"]["storage_gib"] = 2.into();
+        rig.core.apply(&Rig::page(vec![entry], vec![])).await;
+        eventually(60, "legacy filesystem to grow", || {
+            db.view().storage_bytes == Some((2 << 30) - crate::storage::FS_END_GAP_BYTES)
+        })
+        .await;
+        assert_eq!(db.phase(), Phase::Asleep);
+        assert!(db.state().unwrap().record.is_some());
+        let calls = rig.machine.calls();
+        let stop = calls.iter().rposition(|call| call == &format!("stop {id}"));
+        let grow = calls.iter().rposition(|call| call == &format!("grow {id}"));
+        assert!(stop.is_some() && stop < grow, "{calls:?}");
+    }
+
+    /// A grow requested after a crash must happen before PostgreSQL recovery; otherwise a full
+    /// filesystem cannot run recovery to reach the phase in which resize used to be applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_requested_grow_precedes_recovery_of_an_unproven_database() {
+        let Some(rig) = Rig::new("resize-unproven").await else {
+            return;
+        };
+        let mut entry = rig.entry_json();
+        let _ = rig.create_from(&entry).await;
+        let id = id_of(&entry);
+        let path = entry["archive"]["path"].as_str().unwrap().to_string();
+        rig.machine.crash(&id);
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        let calls_before = rig.machine.calls().len();
+        next(&mut entry, 6);
+        entry["resources"]["storage_gib"] = 2.into();
+        rig.core.apply(&Rig::page(vec![entry], vec![])).await;
+        let db = rig.core.db(&id);
+        eventually(60, "recovery to prove sleep", || {
+            db.phase() == Phase::Asleep && db.state().is_some_and(|state| state.record.is_some())
+        })
+        .await;
+        let calls = rig.machine.calls();
+        let calls = &calls[calls_before..];
+        let grow = calls.iter().position(|call| call == &format!("grow {id}"));
+        let start = calls.iter().position(|call| call == &format!("start {id}"));
+        assert!(grow.is_some() && grow < start, "{calls:?}");
+        assert_eq!(
+            db.view().storage_bytes,
+            Some((2 << 30) - crate::storage::FS_END_GAP_BYTES)
+        );
     }
 
     /// The next generation of a page entry: the same database, moved on by the API.
@@ -2669,7 +2966,6 @@ mod tests {
         })
         .await;
         assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
-
         // The data of the source, in a database of the new name, under the page's roles.
         let data = tenant(&rig, &id).await;
         let rows = data.query("SELECT count(*) FROM t", &[]).await.unwrap();

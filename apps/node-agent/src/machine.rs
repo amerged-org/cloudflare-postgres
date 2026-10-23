@@ -270,6 +270,12 @@ pub trait Machine: Send + Sync + 'static {
         id: &VolumeId,
         size_bytes: u64,
     ) -> impl Future<Output = Result<(), storage::Error>> + Send;
+    /// The size of the volume's filesystem in bytes, as its superblock says: what a growth made it,
+    /// and not what the volume has.
+    fn filesystem_bytes(
+        &self,
+        id: &VolumeId,
+    ) -> impl Future<Output = Result<u64, storage::Error>> + Send;
     fn remove_volume(
         &self,
         id: &VolumeId,

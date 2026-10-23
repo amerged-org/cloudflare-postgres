@@ -372,6 +372,12 @@ impl Machine for Node {
             .await
     }
 
+    async fn filesystem_bytes(&self, id: &VolumeId) -> Result<u64, storage::Error> {
+        let id = id.clone();
+        self.storage(move |storage| storage.filesystem_bytes(&id))
+            .await
+    }
+
     async fn remove_volume(&self, id: &VolumeId, removal: Removal) -> Result<(), storage::Error> {
         let id = id.clone();
         self.storage(move |storage| match storage.remove_volume(&id, removal) {

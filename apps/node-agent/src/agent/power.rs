@@ -1229,6 +1229,27 @@ impl<M: Machine> Core<M> {
                 _ => return Recovered::Retry,
             }
         }
+        // A full filesystem may not be able to run PostgreSQL's crash recovery. Honor a
+        // requested grow before trying it, without inventing a sleep proof: the database stays
+        // unproven until the recovery below archives and proves it. Stop and verify the writer
+        // first; storage also refuses an offline grow while any namespace still holds it.
+        if self.read_filesystem(db, &volume).await.is_err() {
+            return Recovered::Retry;
+        }
+        let required = entry
+            .volume_bytes()
+            .saturating_sub(crate::storage::FS_END_GAP_BYTES);
+        if db
+            .view()
+            .storage_bytes
+            .is_some_and(|bytes| bytes < required)
+        {
+            if self.machine.stop(&db.id).await.is_err() {
+                return Recovered::Retry;
+            }
+            self.admission.stopped(&db.id);
+            self.resize(db, &entry).await;
+        }
         if self.refresh_configuration(db, &entry).await.is_err() {
             return Recovered::Retry;
         }

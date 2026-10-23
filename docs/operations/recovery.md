@@ -366,14 +366,20 @@ created at full size at first boot and does not grow.
   wake that comes first repairs its volume and starts, so no wake is refused for the tag. A volume
   the repair is refused (`e2fsck` refuses, a job holds it) goes through the recovery above at its
   next wake.
-- **A full volume.** A tenant can fill its own volume by reaching its size, by using up its inodes
-  or by keeping WAL during an R2 outage. The agent reports each volume's space and inodes every 60
-  seconds, and `database_volume_warning` (80 %) and `database_volume_critical` (90 %) fire. Raise the
-  size with `PUT /v1/databases/{id}/resources` (storage only grows) or have the integrator free
-  space. When a volume is full PostgreSQL stops on the failed WAL write, and crash recovery itself
-  must write: the agent frees the filesystem's 1 % root-only reserve once so that recovery can
-  finish and the integrator can delete data or resize; a database that still cannot start needs its
-  size raised. Nothing extends a volume by itself.
+- **A full volume.** A tenant can exhaust its volume's bytes or inodes, including WAL retained
+  during an R2 outage. Space and inode warnings fire at 80 % and critical alerts at 90 %. The
+  supported recovery is an explicit storage increase through `PUT /v1/databases/{id}/resources`
+  or a larger size class. New filesystems have no root-only reserve or project quota; arbitrary
+  `DELETE`, `VACUUM` and `TRUNCATE` at full are not guaranteed. The node applies the grow before
+  attempting PostgreSQL recovery, preserves the unproven state, then archives and proves recovery
+  before admitting clients. The operation succeeds only after the measured filesystem reaches
+  the requested volume size less its 4 MiB end gap. Missing or undersized observations cannot
+  complete it; a 20-minute timeout reports `filesystem_not_grown` while reconciliation continues.
+  The earlier ext4 layout needs an offline grow: a running writer first completes the normal
+  sleep proof, and the agent verifies that no unit or job still holds the filesystem before
+  `e2fsck -p -f` and `resize2fs`. Failed checks leave the volume suspect for recovery. Never force
+  an unmount, reformat an existing volume, or replay an uncertain application write. Nothing
+  extends a volume without an explicit request.
 
 - **A delete that does not finish.** The node reports a database `deleted` only when its unit,
   its volumes, its user and its files are gone. A step that fails is a `node_event` line in

@@ -1146,6 +1146,14 @@ export const NODE_DATABASE_STATES = [
   "error",
   "deleted",
 ] as const;
+/**
+ * What the filesystem of a volume leaves unused at the end of its volume (`FS_END_GAP_BYTES` of the
+ * node agent, which a test holds equal): a volume of N bytes holds a filesystem of N less this
+ * many bytes, so that the data of a database never forms a signature where libblkid looks for one
+ * (plan 4.3).
+ */
+export const FILESYSTEM_END_GAP_BYTES = 4 * 1024 * 1024;
+
 export const NODE_DATABASE_ERRORS = [
   "storage_full",
   "prefix_not_empty",
@@ -1176,6 +1184,15 @@ export const NodeDatabaseObservation = z
      */
     instance: z.uuid().optional(),
     error: z.enum(NODE_DATABASE_ERRORS).optional(),
+    /**
+     * The size of the database's filesystem in bytes, as its superblock says (its block count
+     * times its block size), sent with `ready` and `asleep`. A resize of the database ends when
+     * it is at least the storage that the resize asked for less `FILESYSTEM_END_GAP_BYTES`; a
+     * growth the kernel refused leaves the filesystem as it was, and the resize stays open until
+     * the node's next try has grown it, or the API fails it. A node that does not send it (an
+     * agent that was released before this property) cannot prove the resize, which stays open.
+     */
+    storage_bytes: Positive.optional(),
     proven_sleep: ProvenSleepRecord.nullable(),
     /**
      * A sleep this generation asked for was refused; the database stays awake and wakeable. The

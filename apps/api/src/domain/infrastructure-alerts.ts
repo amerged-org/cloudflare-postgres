@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   bytesToHex,
+  FILESYSTEM_END_GAP_BYTES,
   INFRA_ALERT_ACTIONS,
   InfraAlert,
   InfraAlertStatus,
@@ -754,9 +755,12 @@ function collectSubjects(rows: readonly SubjectRow[]): RegionSubjects {
   const subjects: RegionSubjects = new Map();
   for (const row of rows) {
     const entry = subjects.get(row.kind) ?? { failing: [], unresolved: 0 };
-    if (row.state === "failing")
-      entry.failing.push({ id: row.subject, detail: row.detail });
-    else entry.unresolved++;
+    if (row.state === "failing") {
+      // A kind that two reads judge (a volume that is full and a filesystem that did not grow)
+      // names a subject once.
+      if (!entry.failing.some((subject) => subject.id === row.subject))
+        entry.failing.push({ id: row.subject, detail: row.detail });
+    } else entry.unresolved++;
     subjects.set(row.kind, entry);
   }
   return subjects;
@@ -813,7 +817,13 @@ async function readNodeSubjects(
           AND (SELECT COALESCE(SUM(refused_no_headroom+refused_start_queue),0) FROM node_minutes WHERE node_id=n.id AND minute>p.refused_since)>=${CAPACITY_REFUSAL_COUNT}
         ORDER BY n.id LIMIT 64)
       UNION ALL ${volume("database_volume_warning", `(${measured} AND ${reached(VOLUME_WARNING_PERCENT)} AND NOT ${reached(VOLUME_CRITICAL_PERCENT)})`)}
-      UNION ALL ${volume("database_volume_critical", `(${measured} AND ${reached(VOLUME_CRITICAL_PERCENT)})`)}`,
+      UNION ALL ${volume("database_volume_critical", `(${measured} AND ${reached(VOLUME_CRITICAL_PERCENT)})`)}
+      UNION ALL SELECT * FROM (SELECT 'database_volume_critical' kind,'failing' state,d.id subject,NULL detail
+        FROM databases d JOIN database_resources r ON r.database_id=d.id,p
+        WHERE d.region_id=p.region AND d.deleted_at IS NULL AND d.node_id IS NOT NULL
+          AND d.observed_generation=d.generation AND d.observed_storage_bytes IS NOT NULL
+          AND d.observed_storage_bytes<r.storage_gib*1073741824-${FILESYSTEM_END_GAP_BYTES}
+        ORDER BY d.id LIMIT 64)`,
     )
     .bind(
       regionId,

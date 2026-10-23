@@ -508,7 +508,14 @@ its memory and CPU are admitted by its node then, while its storage growth must 
   memory and CPU; growth of its storage is sold from now on and is refused with the same `503` on
   the same storage test.
 - Storage may only grow; shrinking is `400` ("Storage shrink is not supported"). Growth through the
-  API is **not yet verified live**.
+  API is **not yet verified live** on the final production candidate. An operation succeeds only
+  after the node reports the measured filesystem at the requested size less its 4 MiB isolation
+  gap. A missing or smaller size keeps it running; after 20 minutes it fails with
+  `filesystem_not_grown`, while the node continues reconciliation. Existing filesystems with the
+  earlier layout require a clean stop before offline growth; active transactions or unavailable
+  archiving can defer that stop. Full-volume and inode-exhaustion recovery is by explicit growth,
+  which also applies before crash recovery. No tenant project quota is imposed and arbitrary SQL
+  cleanup at zero available space is not guaranteed.
 - The operator can roll a new revision of a resource profile out to every database assigned to
   it; that changes your database's `size_class_id` (a hibernated one at its next wake). Read it
   with `GET /v1/databases/{id}/resource-profile`.

@@ -54,6 +54,8 @@ export interface DatabaseRow extends DatabaseHealthSource {
   archive_path: string;
   archiving_health: "ok" | "failing" | "unknown";
   archiving_health_since: string | null;
+  /** The size of the database's filesystem as its node last told it; null until it has. */
+  observed_storage_bytes?: number | null;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;

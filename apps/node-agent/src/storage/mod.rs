@@ -37,7 +37,7 @@ pub use ids::VolumeId;
 pub use pool::{NoRoom, Policy, PoolMode, PoolSample};
 #[cfg(target_os = "linux")]
 pub use store::Storage;
-pub use usage::{Alert, FsUsage, Inventory, MountInfo, Removal, ReserveAction, VolumeInfo};
+pub use usage::{Alert, FsUsage, Inventory, MountInfo, Removal, VolumeInfo};
 
 /// What `Storage::open` did to get the group active besides the plain `vgchange`: nothing, on
 /// every start but the one after a reset that was not clean. The agent reports each (the events

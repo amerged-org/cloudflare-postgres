@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import {
   DatabaseWithOperation,
   INFRA_ALERT_ACTIONS,
+  FILESYSTEM_END_GAP_BYTES,
   InfraAlert,
   type InfraAlertKind,
 } from "@pgcf/contracts";
@@ -736,6 +737,62 @@ it("warns at 80 % and 90 % of a volume's space or inodes, once for each level", 
   expect(hook.events).toHaveLength(2);
   await volume(f, id, now + 4000, { used: GIB }).run();
   await runInfrastructureHealthAlerts(hook.env, now + 4000, hook.fetcher);
+  expect(await status(f, "database_volume_critical")).toMatchObject({
+    active: false,
+  });
+});
+
+it("raises the loud volume alert for a filesystem that is smaller than the storage, and ends it when the filesystem has grown", async () => {
+  const f = await fixture(),
+    hook = receiver(),
+    id = await placed(f, "unresized"),
+    now = Date.now();
+  // The class has 5 GiB: its filesystem is that less the gap at the end of the volume.
+  const fits = 5 * GIB - FILESYSTEM_END_GAP_BYTES;
+  const reported = (bytes: number | null, generation?: number) =>
+    env.DB.prepare(
+      `UPDATE databases SET observed_storage_bytes=?,observed_generation=COALESCE(?,observed_generation) WHERE id=?`,
+    )
+      .bind(bytes, generation ?? null, id)
+      .run();
+  const critical = () =>
+    hook.events.filter((event) => event.kind === "database_volume_critical");
+  // The node has reported the database at its generation.
+  await env.DB.prepare(
+    "UPDATE databases SET observed_generation=generation WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  await reported(fits);
+  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+  expect(critical()).toEqual([]);
+  // A node that has not told its size (an agent of an earlier release) is not judged.
+  await reported(null);
+  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
+  expect(critical()).toEqual([]);
+  // A resize left the filesystem at 2 GiB under a volume of 5.
+  await reported(2 * GIB);
+  await runInfrastructureHealthAlerts(hook.env, now + 2000, hook.fetcher);
+  expect(critical()).toMatchObject([{ database_ids: [id] }]);
+  // Nothing new while it stays there.
+  await runInfrastructureHealthAlerts(hook.env, now + 3000, hook.fetcher);
+  expect(critical()).toHaveLength(1);
+  // A resize that the node has not reported yet is not judged by the figure of the generation before.
+  await env.DB.prepare("UPDATE databases SET observed_generation=0 WHERE id=?")
+    .bind(id)
+    .run();
+  await runInfrastructureHealthAlerts(hook.env, now + 4000, hook.fetcher);
+  expect(await status(f, "database_volume_critical")).toMatchObject({
+    active: false,
+  });
+  await reported(2 * GIB, 1);
+  await runInfrastructureHealthAlerts(hook.env, now + 5000, hook.fetcher);
+  expect(await status(f, "database_volume_critical")).toMatchObject({
+    active: true,
+  });
+  // The node's next try grew it.
+  await reported(fits);
+  await runInfrastructureHealthAlerts(hook.env, now + 6000, hook.fetcher);
   expect(await status(f, "database_volume_critical")).toMatchObject({
     active: false,
   });

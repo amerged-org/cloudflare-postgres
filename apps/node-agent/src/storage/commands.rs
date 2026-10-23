@@ -19,8 +19,6 @@ pub const LV_FIELDS: &str =
 /// The tag that marks a volume whose ext4 was made: a create that stopped before it may format
 /// again, one that passed it never does.
 pub const FS_TAG: &str = "pgcf.fs";
-/// The tag of a volume whose filesystem has no root-only reserve (plan 4.3, full volume).
-pub const RESERVE_FREED_TAG: &str = "pgcf.reserve0";
 /// The tag of a volume that was mounted while the pool took no writes (plan 4.3, full pool): it
 /// stays until the volume is repaired, so a restart of the agent or of the node keeps it.
 pub const SUSPECT_TAG: &str = "pgcf.suspect";
@@ -225,24 +223,19 @@ pub fn fs_target_kib(volume_bytes: u64) -> u64 {
 fn fs_size(volume_bytes: u64) -> String {
     format!("{}K", fs_target_kib(volume_bytes))
 }
-/// The filesystem's superblock, which tells how big it is.
-pub fn fs_header(config: &Config, id: &VolumeId) -> Vec<String> {
-    words(["dumpe2fs", "-h", &device(config, id)])
-}
-/// The size of the filesystem in KiB from `dumpe2fs -h`: its block count times its block size.
-pub fn parse_fs_kib(header: &str) -> Option<u64> {
-    let field = |name: &str| -> Option<u64> {
-        header
-            .lines()
-            .find_map(|line| line.strip_prefix(name))?
-            .trim()
-            .parse()
-            .ok()
-    };
-    Some(field("Block count:")? * field("Block size:")? / 1024)
-}
 /// The filesystem is made with an explicit size that ends `FS_END_GAP_BYTES` before the end of
 /// the volume, never the whole device.
+///
+/// - `-J size=8`: an 8 MiB journal (the pool pays for every block `mkfs` writes).
+/// - `-O ^resize_inode,meta_bg`: no reserved group descriptor blocks. `mke2fs` reserves them for
+///   1,024 times the size: 255 for 2 GiB, 639 for 5 GiB and 1,024 from 8 GiB. An online grow
+///   that adds a flex group asks the journal for 6 credits and one for each reserved block, and
+///   the 8 MiB journal allows 678 on kernel 6.12 (508 on 6.8): a filesystem from 5.4 GiB failed
+///   with -28 and stayed as it was (US1 2026-10-23: 25 GiB to 50 GiB asked for 1,030). With
+///   `meta_bg` the descriptors of a group are beside the group, nothing is reserved, and a grow
+///   asks for 6 credits at any size, up to the 64 TiB that the API accepts (lab, `plan` 11.1).
+/// - `-m 0`: no root-only reserve. PostgreSQL does not run as root, so it never had the use of it,
+///   recovery after a full volume is by growing it.
 pub fn mkfs(config: &Config, id: &VolumeId, volume_bytes: u64) -> Vec<String> {
     words([
         "mkfs.ext4",
@@ -253,7 +246,9 @@ pub fn mkfs(config: &Config, id: &VolumeId, volume_bytes: u64) -> Vec<String> {
         "-i",
         "65536",
         "-m",
-        "1",
+        "0",
+        "-O",
+        "^resize_inode,meta_bg",
         "-E",
         "lazy_itable_init=0,lazy_journal_init=0",
         &device(config, id),
@@ -266,6 +261,10 @@ pub fn resize_fs(config: &Config, id: &VolumeId, volume_bytes: u64) -> Vec<Strin
 }
 pub fn fsck(config: &Config, id: &VolumeId) -> Vec<String> {
     words(["e2fsck", "-p", &device(config, id)])
+}
+/// An offline grow must check the filesystem even when its clean flag is set.
+pub fn check_before_grow(config: &Config, id: &VolumeId) -> Vec<String> {
+    words(["e2fsck", "-p", "-f", &device(config, id)])
 }
 /// Sets the filesystem's `needs_recovery` flag so that `e2fsck -p` replays the journal. After a
 /// full pool the journal can hold committed transactions while the flag is clear, because the
@@ -280,9 +279,6 @@ pub fn replay_journal(config: &Config, id: &VolumeId) -> Vec<String> {
         "feature needs_recovery",
         &device(config, id),
     ])
-}
-pub fn reserve(config: &Config, id: &VolumeId, percent: u8) -> Vec<String> {
-    words(["tune2fs", "-m", &percent.to_string(), &device(config, id)])
 }
 pub fn trim(config: &Config, id: &VolumeId) -> Vec<String> {
     words([
@@ -402,8 +398,8 @@ mod tests {
              pgcf/db_k1l2m3n4o5p6q7r8s9t0_g1"
         );
         assert_eq!(
-            line(volume_delete_tag(&config, &id(), RESERVE_FREED_TAG)),
-            "lvchange --quiet --deltag pgcf.reserve0 pgcf/db_a1b2c3d4e5f6g7h8i9j0_g3"
+            line(volume_delete_tag(&config, &id(), SUSPECT_TAG)),
+            "lvchange --quiet --deltag pgcf.suspect pgcf/db_a1b2c3d4e5f6g7h8i9j0_g3"
         );
         assert_eq!(
             line(volume_extend(&config, &id(), 2 << 30)),
@@ -425,7 +421,8 @@ mod tests {
         assert_eq!(
             line(mkfs(&config, &id(), 1 << 30)),
             format!(
-                "mkfs.ext4 -F -q -J size=8 -i 65536 -m 1 -E lazy_itable_init=0,lazy_journal_init=0 {device} 1044480K"
+                "mkfs.ext4 -F -q -J size=8 -i 65536 -m 0 -O ^resize_inode,meta_bg \
+                 -E lazy_itable_init=0,lazy_journal_init=0 {device} 1044480K"
             )
         );
         assert_eq!(
@@ -438,31 +435,17 @@ mod tests {
             format!("debugfs -w -R feature needs_recovery {device}")
         );
         assert_eq!(
-            line(reserve(&config, &id(), 0)),
-            format!("tune2fs -m 0 {device}")
-        );
-        assert_eq!(
             line(trim(&config, &id())),
             "fstrim /var/lib/pgcf/db/a1b2c3d4e5f6g7h8i9j0"
         );
     }
 
-    /// What `dumpe2fs -h` of e2fsprogs 1.47.2 printed for a filesystem made as `mkfs` makes it, 60
-    /// MiB of 1 KiB blocks.
+    /// The target is what the commands are given, for a volume of any size.
     #[test]
-    fn the_size_of_a_filesystem_is_its_block_count_times_its_block_size() {
-        let header = include_str!("fixtures/dumpe2fs-header.txt");
-        assert_eq!(parse_fs_kib(header), Some(61440));
-        assert_eq!(parse_fs_kib(""), None);
-        assert_eq!(parse_fs_kib("Block count:   12\n"), None);
-        assert_eq!(parse_fs_kib("Block count: x\nBlock size: 4096\n"), None);
-        assert_eq!(
-            line(fs_header(&Config::default(), &id())),
-            "dumpe2fs -h /dev/mapper/pgcf-db_a1b2c3d4e5f6g7h8i9j0_g3"
-        );
-        // The target is what the commands are given, for a volume of any size.
+    fn the_filesystem_ends_one_gap_before_its_volume() {
         assert_eq!(fs_target_kib(1 << 30), 1_044_480);
         assert_eq!(fs_size(1 << 30), "1044480K");
+        assert_eq!(FS_END_GAP_BYTES, 4 << 20);
     }
 
     /// What libblkid 2.41, which systemd 257's image dissection runs over the device as root, reads
@@ -527,12 +510,10 @@ mod tests {
             dm_status_pool(),
             dm_table_pool(),
             dm_status_thin(),
-            fs_header(&config, &id),
             mkfs(&config, &id, 1 << 30),
             resize_fs(&config, &id, 2 << 30),
             fsck(&config, &id),
             replay_journal(&config, &id),
-            reserve(&config, &id, 0),
             trim(&config, &id),
             vec![],
         ] {

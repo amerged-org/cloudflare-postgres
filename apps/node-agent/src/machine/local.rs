@@ -97,6 +97,11 @@ impl Slot {
     }
 }
 
+/// What `mkfs` and `resize2fs` give a volume of `volume_bytes`: it ends one gap before the volume.
+fn filesystem_of(volume_bytes: u64) -> u64 {
+    volume_bytes.saturating_sub(storage::FS_END_GAP_BYTES)
+}
+
 /// Stops that wait for each other (`Local::meet_in_stops`).
 struct StopMeeting {
     count: usize,
@@ -109,6 +114,13 @@ struct State {
     legacy: HashMap<String, Unit>,
     slots: BTreeMap<u32, Slot>,
     volumes: BTreeMap<VolumeId, u64>,
+    /// The size of each volume's filesystem, which a growth sets after the volume's own: the node's
+    /// `resize2fs`.
+    filesystems: BTreeMap<VolumeId, u64>,
+    /// `grow_volume` extends the volume and then fails, as `resize2fs` does when the kernel
+    /// refuses the grow (-28): the filesystem keeps its size.
+    growth_refused: bool,
+    offline_growth: bool,
     /// The volumes the agent has mounted in its mount namespace, each with its link for the
     /// database's unit: what the agent's restart ends. A unit that runs keeps its own mount.
     attached: BTreeSet<VolumeId>,
@@ -638,6 +650,19 @@ impl Local {
             .map(|(id, size)| (id.clone(), *size))
             .collect()
     }
+    /// A legacy filesystem cannot grow while a unit or a job holds it.
+    pub fn set_offline_growth(&self, offline: bool) {
+        self.state().offline_growth = offline;
+    }
+
+    /// The device grows but the filesystem keeps its size, as after resize2fs fails.
+    pub fn set_growth_refused(&self, refused: bool) {
+        self.state().growth_refused = refused;
+    }
+    /// The size of the filesystem on the volume.
+    pub fn filesystem(&self, id: &VolumeId) -> Option<u64> {
+        self.state().filesystems.get(id).copied()
+    }
     pub fn set_no_room(&self, no_room: bool) {
         self.state().no_room = no_room;
     }
@@ -973,6 +998,9 @@ impl Machine for Local {
         }
         fs::create_dir_all(&live)?;
         state.volumes.insert(id.clone(), size_bytes);
+        state
+            .filesystems
+            .insert(id.clone(), filesystem_of(size_bytes));
         state.attached.insert(id.clone());
         Ok(())
     }
@@ -1066,15 +1094,36 @@ impl Machine for Local {
         }
     }
     async fn grow_volume(&self, id: &VolumeId, size_bytes: u64) -> Result<(), storage::Error> {
+        let held = self.held(id);
         let mut state = self.state();
-        match state.volumes.get_mut(id) {
-            None => Err(storage::Error::Missing),
-            Some(size) if size_bytes < *size => Err(storage::Error::Shrink),
-            Some(size) => {
-                *size = size_bytes;
-                Ok(())
-            }
+        if state.offline_growth && held {
+            return Err(storage::Error::OfflineGrowRequired);
         }
+        state.calls.push(format!("grow {}", id.database()));
+        let current = *state.volumes.get(id).ok_or(storage::Error::Missing)?;
+        if size_bytes < current {
+            return Err(storage::Error::Shrink);
+        }
+        state.volumes.insert(id.clone(), size_bytes);
+        if state.growth_refused {
+            return Err(storage::Error::Command {
+                program: "resize2fs".into(),
+                code: 1,
+                stderr: "No space left on device while checking for on-line resizing support"
+                    .into(),
+            });
+        }
+        state
+            .filesystems
+            .insert(id.clone(), filesystem_of(size_bytes));
+        Ok(())
+    }
+    async fn filesystem_bytes(&self, id: &VolumeId) -> Result<u64, storage::Error> {
+        self.state()
+            .filesystems
+            .get(id)
+            .copied()
+            .ok_or(storage::Error::Missing)
     }
     async fn remove_volume(&self, id: &VolumeId, _removal: Removal) -> Result<(), storage::Error> {
         let held = self.held(id);
@@ -1089,6 +1138,7 @@ impl Machine for Local {
             return Err(storage::Error::Busy);
         }
         state.volumes.remove(id);
+        state.filesystems.remove(id);
         state.attached.remove(id);
         let others = state
             .volumes
@@ -1162,7 +1212,6 @@ impl Machine for Local {
                 size_bytes: *size,
                 pool_used_bytes: 150 << 20,
                 formatted: true,
-                reserve_released: false,
                 suspect: false,
                 fs_errors: false,
                 mount: state.attached.contains(id).then_some(MountInfo {

@@ -15,6 +15,7 @@ import {
   NodeBootReport,
   NodeCredentials,
   NodeDatabaseObservation,
+  FILESYSTEM_END_GAP_BYTES,
   NodeDesiredPage,
   NodeDiagnostic,
   NodeDesiredQuery,
@@ -673,6 +674,23 @@ describe("what a node reports", () => {
           orders: [{ operation: `op_${"s".repeat(20)}`, ...result }],
         }).success,
       ).toBe(valid);
+  });
+
+  it("tells the size of the filesystem as a count of bytes, and does not have to", () => {
+    const report = (extra: Record<string, unknown>) =>
+      NodeObservationReport.safeParse({
+        observed_at: now,
+        databases: [{ ...observation, ...extra }],
+        orders: [],
+      }).success;
+    expect(report({})).toBe(true);
+    expect(
+      report({ storage_bytes: 2 * 1024 ** 3 - FILESYSTEM_END_GAP_BYTES }),
+    ).toBe(true);
+    for (const broken of [0, -1, 1.5, "2147483648", null])
+      expect(report({ storage_bytes: broken })).toBe(false);
+    // The gap is 4 MiB: the agent's `FS_END_GAP_BYTES` is held equal to it by a test of its own.
+    expect(FILESYSTEM_END_GAP_BYTES).toBe(4194304);
   });
 
   it("names the unit's instance exactly while the database is ready", () => {

@@ -6,6 +6,7 @@ import {
 } from "cloudflare:test";
 import {
   ErrorBody,
+  FILESYSTEM_END_GAP_BYTES,
   NodeDesiredPage,
   RELEASE_FILES,
   bytesToHex,
@@ -465,16 +466,21 @@ export async function observationOf(
   extra: Record<string, unknown> = {},
 ) {
   const row = await env.DB.prepare(
-    "SELECT storage_generation FROM databases WHERE id=?",
+    "SELECT d.storage_generation,r.storage_gib FROM databases d JOIN database_resources r ON r.database_id=d.id WHERE d.id=?",
   )
     .bind(id)
-    .first<{ storage_generation: number }>();
+    .first<{ storage_generation: number; storage_gib: number }>();
   const now = new Date().toISOString();
   return {
     id,
     generation,
     operation: await operationOf(id, generation),
     storage_generation: row?.storage_generation ?? 1,
+    ...((state === "ready" || state === "asleep") && row
+      ? {
+          storage_bytes: row.storage_gib * 1024 ** 3 - FILESYSTEM_END_GAP_BYTES,
+        }
+      : {}),
     state,
     ...(state === "ready" ? { instance: instanceOf(id) } : {}),
     proven_sleep:

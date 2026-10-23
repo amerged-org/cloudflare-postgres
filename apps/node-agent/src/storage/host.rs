@@ -4,10 +4,10 @@
 use super::FsUsage;
 use std::{
     ffi::CString,
-    io,
+    fs, io,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::ffi::OsStrExt,
+        unix::{ffi::OsStrExt, fs::FileExt},
     },
     path::{Path, PathBuf},
 };
@@ -234,6 +234,67 @@ pub fn fs_usage(path: &Path) -> io::Result<FsUsage> {
     ))
 }
 
+/// The fields of ext4's superblock that the agent reads (`struct ext4_super_block`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Superblock {
+    pub block_count: u64,
+    pub block_size: u64,
+    pub incompat: u32,
+}
+
+impl Superblock {
+    const SIZE: usize = 1024;
+    /// Where the superblock is on a device: 1,024 bytes from its start.
+    const OFFSET: u64 = 1024;
+    const MAGIC: u16 = 0xef53;
+    const INCOMPAT_64BIT: u32 = 0x80;
+    const INCOMPAT_META_BG: u32 = 0x10;
+
+    /// The superblock in its first 1,024 bytes; `None` when they are none of ext4's.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let bytes = bytes.get(..Self::SIZE)?;
+        let word = |at: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+        };
+        let magic = u16::from_le_bytes(bytes.get(0x38..0x3a)?.try_into().ok()?);
+        if magic != Self::MAGIC {
+            return None;
+        }
+        let high = if word(0x60)? & Self::INCOMPAT_64BIT != 0 {
+            u64::from(word(0x150)?) << 32
+        } else {
+            0
+        };
+        let block_shift = word(0x18)?;
+        (block_shift <= 6).then_some(())?;
+        Some(Self {
+            block_count: high | u64::from(word(0x04)?),
+            block_size: 1024 << block_shift,
+            incompat: word(0x60)?,
+        })
+    }
+
+    /// What the filesystem has: its block count times its block size, which is what `resize2fs`
+    /// sets and what the volume's size bounds.
+    pub fn bytes(&self) -> u64 {
+        self.block_count.saturating_mul(self.block_size)
+    }
+
+    /// The grow-safe layout introduced after the legacy 8 MiB journal exhausted its credits.
+    pub fn online_grow(&self) -> bool {
+        self.incompat & Self::INCOMPAT_META_BG != 0
+    }
+}
+
+/// The superblock of the filesystem on `device`, mounted or not: a read of the device sees the
+/// kernel's own copy of it, as `dumpe2fs` does.
+pub fn read_superblock(device: &str) -> io::Result<Superblock> {
+    let mut bytes = [0u8; Superblock::SIZE];
+    fs::File::open(device)?.read_exact_at(&mut bytes, Superblock::OFFSET)?;
+    Superblock::parse(&bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not an ext4 superblock"))
+}
+
 pub fn mount_table() -> io::Result<String> {
     std::fs::read_to_string("/proc/self/mountinfo")
 }
@@ -259,6 +320,36 @@ pub fn ext4_errors(minor: u32) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A captured ext4 superblock, 60 MiB of 1 KiB blocks with `meta_bg` (captured
+    /// from the lab, e2fsprogs 1.47.2): `dumpe2fs -h` said 61,440 blocks of 1,024 bytes.
+    #[test]
+    fn a_real_superblock_tells_the_size_of_its_filesystem_and_its_grow_geometry() {
+        let bytes = include_bytes!("fixtures/ext4-superblock.bin");
+        let superblock = Superblock::parse(bytes).unwrap();
+        assert_eq!(superblock.block_count, 61_440);
+        assert_eq!(superblock.block_size, 1024);
+        assert_eq!(superblock.bytes(), 60 << 20);
+        assert!(superblock.online_grow());
+        let mut older = *bytes;
+        older[0x60..0x64].copy_from_slice(&0x0000_02c2u32.to_le_bytes());
+        assert!(!Superblock::parse(&older).unwrap().online_grow());
+        // The high half of the block count counts with the `64bit` feature only.
+        let mut large = *bytes;
+        large[0x150..0x154].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            Superblock::parse(&large).unwrap().block_count,
+            (3 << 32) | 61_440
+        );
+        large[0x60..0x64].copy_from_slice(&0x0000_0002u32.to_le_bytes());
+        assert_eq!(Superblock::parse(&large).unwrap().block_count, 61_440);
+        // Anything else is no superblock.
+        assert_eq!(Superblock::parse(&[0; 1024]), None);
+        assert_eq!(Superblock::parse(&bytes[..1000]), None);
+        let mut huge = *bytes;
+        huge[0x18..0x1c].copy_from_slice(&40u32.to_le_bytes());
+        assert_eq!(Superblock::parse(&huge), None);
+    }
 
     /// The kernel's `MOUNT_ATTR_*` values (`linux/mount.h`, uapi): the constants above are the
     /// ABI, so a wrong one mounts with other attributes without any error.

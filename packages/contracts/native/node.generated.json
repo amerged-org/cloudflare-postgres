@@ -1171,6 +1171,11 @@
                   "start_failed"
                 ]
               },
+              "storage_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
               "proven_sleep": {
                 "anyOf": [
                   {
@@ -2490,6 +2495,7 @@
     "NODE_DESIRED_PAGE_LIMIT_MAX": 200,
     "NODE_REPORT_EVENTS_MAX": 64,
     "NODE_REPORT_EVENT_FIELDS_MAX": 24,
+    "FILESYSTEM_END_GAP_BYTES": 4194304,
     "NODE_BOOT_REPORT_ENTRIES_MAX": 1000,
     "NODE_BOOT_REPORT_MESSAGE_MAX_BYTES": 2048,
     "NODE_BOOT_REPORT_MAX_BYTES": 1048576,

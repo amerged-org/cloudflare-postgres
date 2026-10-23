@@ -45,6 +45,8 @@ pub enum Error {
     NeedsRepair,
     /// Something still holds the filesystem.
     Busy,
+    /// This legacy filesystem needs an offline grow, but a writer or job still holds it.
+    OfflineGrowRequired,
     /// Storage only grows (plan 3.5).
     Shrink,
     /// `e2fsck -p` could not repair the filesystem.
@@ -79,6 +81,9 @@ impl fmt::Display for Error {
             }
             Error::NeedsRepair => write!(f, "the volume may have lost writes and needs repair"),
             Error::Busy => write!(f, "the filesystem is busy"),
+            Error::OfflineGrowRequired => {
+                write!(f, "legacy filesystem grow needs a stopped writer")
+            }
             Error::Shrink => write!(f, "a volume never shrinks"),
             Error::Fsck(code) => write!(f, "e2fsck could not repair the filesystem ({code})"),
         }

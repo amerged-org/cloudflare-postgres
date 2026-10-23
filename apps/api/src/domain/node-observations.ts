@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   DatabaseRuntime,
+  FILESYSTEM_END_GAP_BYTES,
   NodeObservationReport,
   newOperationId,
   observationVerdict,
@@ -144,8 +145,17 @@ class Statements {
         ),
     );
   }
-  /** The operations of the kinds that end with this report. */
-  succeed(kinds: readonly string[], id?: string | null): void {
+  /**
+   * The operations of the kinds that end with this report. A resize ends only when the filesystem
+   * has the storage it asked for: `storageBytes`, the size the node reports, is at least the
+   * database's effective storage less the gap at the end of its volume. A report that tells no size
+   * cannot prove a resize and leaves it running until a current agent observes the filesystem.
+   */
+  succeed(
+    kinds: readonly string[],
+    id?: string | null,
+    storageBytes?: number,
+  ): void {
     const applied = this.applied();
     this.list.push(
       this.db
@@ -155,6 +165,8 @@ class Statements {
              AND kind IN(SELECT value FROM json_each(?)) ${id ? "AND id=?" : ""}
              AND NOT EXISTS(SELECT 1 FROM operations newer WHERE newer.database_id=operations.database_id
                AND newer.kind=operations.kind AND newer.kind='database.resize' AND newer.generation>operations.generation)
+             AND (kind<>'database.resize' OR ?>=(SELECT r.storage_gib FROM database_resources r
+               WHERE r.database_id=operations.database_id)*1073741824-?)
              AND ${applied.sql}`,
         )
         .bind(
@@ -165,6 +177,32 @@ class Statements {
           this.generation,
           JSON.stringify(kinds),
           ...(id ? [id] : []),
+          storageBytes ?? 0,
+          FILESYSTEM_END_GAP_BYTES,
+          ...applied.bindings,
+        ),
+    );
+  }
+  /**
+   * A resize the report did not end, because the filesystem is smaller than the storage it asked
+   * for, is running from now on; its clock is the first such report, which later ones do not
+   * restart, so that the operation timeout fails it for the filesystem that did not grow
+   * (`filesystem_not_grown`).
+   */
+  resizeRunning(): void {
+    const applied = this.applied();
+    this.list.push(
+      this.db
+        .prepare(
+          `UPDATE operations SET status='running',updated_at=?
+           WHERE database_id=? AND project_id=? AND generation<=? AND status='pending'
+             AND kind='database.resize' AND ${applied.sql}`,
+        )
+        .bind(
+          this.now,
+          this.row.id,
+          this.row.project_id,
+          this.generation,
           ...applied.bindings,
         ),
     );
@@ -404,6 +442,8 @@ function holds(
     (observation.state !== "asleep" ||
       (row.proven_sleep_json === JSON.stringify(observation.proven_sleep) &&
         (row.desired_state !== "suspended" || row.slept === 1))) &&
+    (observation.storage_bytes === undefined ||
+      row.observed_storage_bytes === observation.storage_bytes) &&
     row.status_message === columns.message &&
     row.archiving_health === columns.health &&
     row.archiving_health_since === columns.since &&
@@ -549,7 +589,8 @@ async function applyObservation(
              runtime_json=CASE WHEN ?='ready' THEN ? ELSE NULL END,
              proven_sleep_json=CASE WHEN ?='asleep' THEN ? ELSE proven_sleep_json END,
              status_message=?,archiving_health=?,archiving_health_since=?,
-             backup_observed_at=?,backup_health=?,backup_last_completed_at=?,updated_at=?
+             backup_observed_at=?,backup_health=?,backup_last_completed_at=?,
+             observed_storage_bytes=COALESCE(?,observed_storage_bytes),updated_at=?
            WHERE id=? AND node_id=? AND generation=? AND updated_at=? AND desired_state=? AND observed_state=?
              AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=databases.node_id AND n.lost_at IS NULL)
              AND (${guard?.sql ?? "1=1"})`,
@@ -569,6 +610,7 @@ async function applyObservation(
           columns.backup_observed_at,
           columns.backup_health,
           columns.backup_last_completed_at,
+          observation.storage_bytes ?? null,
           now,
           row.id,
           node.id,
@@ -588,7 +630,12 @@ async function applyObservation(
           [restoring ? "database.restore" : "database.create"],
           null,
         );
-        statements.succeed(["database.resize"], null);
+        statements.succeed(
+          ["database.resize"],
+          null,
+          observation.storage_bytes,
+        );
+        statements.resizeRunning();
         statements.succeed(
           ["database.resume", "database.wake"],
           row.power_operation,
@@ -610,7 +657,12 @@ async function applyObservation(
             ["database.suspend", "database.hibernate"],
             row.power_operation,
           );
-          statements.succeed(["database.resize"], null);
+          statements.succeed(
+            ["database.resize"],
+            null,
+            observation.storage_bytes,
+          );
+          statements.resizeRunning();
           statements.sleepEndsRoleRemovals();
         }
         break;
