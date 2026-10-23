@@ -361,6 +361,31 @@ export async function rawRequest(
   return response;
 }
 /**
+ * The real DatabaseActor namespace whose publication of the snapshot, the last step of a
+ * publish, stalls for `stallMs` and then fails as the platform does when it loses the connection
+ * (found live, 2026-10-23: a role create answered 500 after 12.6 s, "Network connection lost.",
+ * and the role existed). The seed and the barrier before a commit are the real ones.
+ */
+export function lostConnection(stallMs: number): Env["DATABASE_ACTOR"] {
+  return {
+    idFromName: (name: string) => env.DATABASE_ACTOR.idFromName(name),
+    get: (
+      id: DurableObjectId,
+      options?: DurableObjectNamespaceGetDurableObjectOptions,
+    ) =>
+      new Proxy(env.DATABASE_ACTOR.get(id, options), {
+        get(target, property) {
+          if (property !== "publishAdmissionSnapshot")
+            return Reflect.get(target, property);
+          return async () => {
+            await new Promise((resolve) => setTimeout(resolve, stallMs));
+            throw new Error("Network connection lost.");
+          };
+        },
+      }),
+  } as unknown as Env["DATABASE_ACTOR"];
+}
+/**
  * A request signed with the node's key (plan 8): its method, its path with the query and the
  * bytes of its body are what the signature covers.
  */

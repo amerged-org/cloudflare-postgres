@@ -6,7 +6,9 @@ import {
   fixture,
   cleanupFixtures,
   desiredPage,
+  lostConnection,
   nodeKeyPair,
+  rawRequest,
   refusal,
   request,
   report,
@@ -90,6 +92,34 @@ it("creates and restores a database in a region whose node release is assigned",
     { name: "after-release", mode: "full" },
   );
   expect(restored.status).toBe(202);
+});
+it("answers the replay of a restore with its operation although the publication of the target's Actor fails", async () => {
+  const f = await archived(),
+    key = crypto.randomUUID(),
+    send = (actors?: Env["DATABASE_ACTOR"]) =>
+      rawRequest(
+        `/v1/databases/${f.id}/restore`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${f.integrator}`,
+            "Content-Type": "application/json",
+            "Idempotency-Key": key,
+          },
+          body: JSON.stringify({ name: "replayed", mode: "full" }),
+        },
+        undefined,
+        actors ? { DATABASE_ACTOR: actors } : {},
+      );
+  const first = await send();
+  expect(first.status).toBe(202);
+  const operation = ((await first.json()) as { operation: { id: string } })
+    .operation.id;
+  const replay = await send(lostConnection(0));
+  expect(replay.status).toBe(202);
+  expect(
+    ((await replay.json()) as { operation: { id: string } }).operation.id,
+  ).toBe(operation);
 });
 it("keeps a fresh restore target denied and refuses restore creation while its project scope is fenced", async () => {
   const f = await archived();
@@ -468,24 +498,21 @@ it("completed reservation survives a lost response and replay creates neither cr
   const f = await archived(),
     body = { mode: "full", name: "lost-response" },
     path = `/v1/databases/${f.id}/restore`;
-  const actor = {
-    idFromName: (id: string) => env.DATABASE_ACTOR.idFromName(id),
-    get: () => ({
-      seed: async () => {
-        throw new Error("response_ack_lost");
-      },
-    }),
-  } as unknown as Env["DATABASE_ACTOR"];
+  // The reservation's batch commits and its reply is lost.
+  const db = new Proxy(env.DB, {
+    get(actual, property) {
+      if (property === "batch")
+        return async (statements: D1PreparedStatement[]) => {
+          await actual.batch(statements);
+          throw new Error("reply lost after actual restore commit");
+        };
+      const value = Reflect.get(actual, property, actual);
+      return typeof value === "function" ? value.bind(actual) : value;
+    },
+  });
   expect(
-    (
-      await overridden(
-        path,
-        f.integrator,
-        body,
-        { DATABASE_ACTOR: actor },
-        "lost-response",
-      )
-    ).status,
+    (await overridden(path, f.integrator, body, { DB: db }, "lost-response"))
+      .status,
   ).toBe(500);
   const count = await env.DB.prepare(
     "SELECT COUNT(*) count FROM database_restores WHERE source_database_id=?",

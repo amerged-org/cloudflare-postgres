@@ -14,6 +14,7 @@ import { ApiError } from "../api-error.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
 import type { ApiContext, Env } from "../env.ts";
 import {
+  publishForAnswer,
   withAdmissionMutation,
   type AdmissionSqlGuard,
 } from "./admission-mutations.ts";
@@ -32,7 +33,6 @@ import {
   placementGuard,
   placementNodes,
 } from "./placement.ts";
-import { syncDatabaseActor } from "./database-actor-sync.ts";
 import { archiveBucket } from "./archive-bucket.ts";
 import { runNodeCapacity } from "./node-capacity.ts";
 import { stoppedSleeperSql } from "./startup-admission.ts";
@@ -74,7 +74,7 @@ export async function databaseOperationResponse(
 ): Promise<Response> {
   const operation = await operationForRequest(c, operationId);
   const database = await databaseForRequest(c, operation.database_id, true);
-  await syncDatabaseActor(c, database.id);
+  await publishForAnswer(c, database.id);
   c.header("Location", `/v1/operations/${operation.id}`);
   return Response.json(
     { database: databaseView(database), operation: operationView(operation) },

@@ -18,6 +18,7 @@ import { hintDatabases } from "./node-hints.ts";
 import { applyLifecycleObservations } from "./lifecycle-observations.ts";
 import { USAGE_SNAPSHOT_SQL } from "./resources.ts";
 import {
+  ADMISSION_PUBLISH_ANSWER_MS,
   withAdmissionMutation,
   type AdmissionMutation,
 } from "./admission-mutations.ts";
@@ -28,8 +29,6 @@ import {
 import type { NodeCaller } from "./node-auth.ts";
 import type { DatabaseRow } from "./rows.ts";
 
-/** How long a report waits for its admission publish (about 0.1 s) before it is answered. */
-const ADMISSION_PUBLISH_ANSWER_MS = 1000;
 /** How long a report of a wake the Actor claimed waits for D1 to commit the claim. */
 const CLAIM_WAIT_MS = 3000;
 /** How often a failed wake's recovery reads the row again when another writer won its compare-and-set. */
