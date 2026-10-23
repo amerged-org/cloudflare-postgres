@@ -211,9 +211,7 @@ describe("route token v6", () => {
       "a-b",
       "a\0b",
       "postgres",
-      "streaming_replica",
       "pg_read_all_data",
-      "cnpg_pooler_pgbouncer",
       1,
       null,
     ]) {

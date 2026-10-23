@@ -666,7 +666,14 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(schemas.ApiKeyCreate!.description).toMatch(
       /integrator.*project_id/s,
     );
-    expect(schemas.RoleName!.description).toMatch(/pgcf_maintenance/);
+    expect(schemas.RoleName!.description).toMatch(/postgres/);
+    expect(schemas.RoleName!.description).toMatch(/pg_/);
+    expect(schemas.RoleName!.description).toMatch(/pgcf_backup/);
+    expect(schemas.RoleName!.description).toMatch(/public/);
+    expect(schemas.RoleName!.description).toMatch(/none/);
+    expect(schemas.RoleName!.description).not.toMatch(
+      /cnpg_|streaming_replica|pgcf_maintenance/,
+    );
     expect(schemas.SizeClass!.description).toMatch(/multiple of 256/);
     expect(schemas.SizeClassUpsert!.description).toMatch(/multiple of 256/);
     const usage = operation(doc, "/v1/usage", "get");

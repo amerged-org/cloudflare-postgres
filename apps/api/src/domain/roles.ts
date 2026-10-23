@@ -8,7 +8,6 @@ import {
   roleExpiryInstant,
   type RoleCreate,
 } from "@pgcf/contracts";
-import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 import { ApiError } from "../api-error.ts";
 import { keyring } from "../crypto/keyring.ts";
 import type { ApiContext } from "../env.ts";
@@ -280,11 +279,6 @@ export async function deleteRole(
   const db = await databaseForRequest(c, id);
   if (name === OWNER_ROLE_NAME)
     throw new ApiError("invalid_request", "The owner role cannot be deleted");
-  if (name === MAINTENANCE_ROLE)
-    throw new ApiError(
-      "invalid_request",
-      "Role name is reserved for internal maintenance",
-    );
   return withIdempotency(c, {
     replay: (operation, status) =>
       databaseOperationResponse(c, operation, status),

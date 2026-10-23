@@ -88,6 +88,34 @@ describe("role attributes", () => {
     });
   });
 
+  it("takes the role names of the Kubernetes runtime as ordinary roles, in the list, the page and as membership targets", async () => {
+    const f = await fixture(),
+      id = await database(f);
+    for (const name of ["cnpg_app", "streaming_replica"])
+      expect((await createRole(f, id, { name })).status, name).toBe(201);
+    const member = await createRole(f, id, {
+      name: "pgcf_maintenance",
+      member_of: ["cnpg_app", "streaming_replica"],
+    });
+    expect(member.status).toBe(201);
+    expect(Role.parse(await member.json())).toMatchObject({
+      name: "pgcf_maintenance",
+      owner: false,
+      member_of: ["cnpg_app", "streaming_replica"],
+    });
+    expect((await listRoles(f, id)).map((role) => role.name)).toEqual([
+      "app",
+      "cnpg_app",
+      "pgcf_maintenance",
+      "streaming_replica",
+    ]);
+    expect(
+      ((await desiredRoles(f, id)) as { name: string }[]).map(
+        (role) => role.name,
+      ),
+    ).toEqual(["app", "cnpg_app", "pgcf_maintenance", "streaming_replica"]);
+  });
+
   it("sends the attributes to the node only for the role that has them", async () => {
     const f = await fixture(),
       id = await database(f);
@@ -125,7 +153,7 @@ describe("role attributes", () => {
     ]);
   });
 
-  it("refuses an expiry that is not in the future, unknown memberships, the owner as a target and the internal role as a name", async () => {
+  it("refuses an expiry that is not in the future, unknown memberships, the owner as a target and the names a customer role cannot take", async () => {
     const f = await fixture(),
       id = await database(f);
     for (const body of [
@@ -139,10 +167,17 @@ describe("role attributes", () => {
       },
       { name: "alone", member_of: ["nobody"] },
       { name: "boss", member_of: ["app"] },
-      { name: "boss", member_of: ["pgcf_maintenance"] },
       { name: "boss", member_of: ["pg_read_all_data"] },
       { name: "limit", connection_limit: 0 },
-      { name: "pgcf_maintenance" },
+      { name: "boss", member_of: ["pgcf_backup"] },
+      { name: "postgres" },
+      { name: "pg_monitor" },
+      { name: "pgcf_backup" },
+      // PostgreSQL refuses `CREATE ROLE public` and `none`: such a role would be registered, fail at
+      // the node and stop its database from waking.
+      { name: "public" },
+      { name: "none" },
+      { name: "boss", member_of: ["public"] },
     ]) {
       const response = await createRole(f, id, body);
       expect(response.status, JSON.stringify(body)).toBe(400);

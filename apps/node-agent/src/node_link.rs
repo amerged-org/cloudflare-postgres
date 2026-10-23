@@ -401,7 +401,7 @@ fn roles_valid(db: &Value) -> bool {
         let Some(name) = role["name"].as_str() else {
             return false;
         };
-        if !names.insert(name) || reserved_role(name) || name == text("MAINTENANCE_ROLE") {
+        if !names.insert(name) || reserved_role(name) {
             return false;
         }
         if role.get("state").is_some() {
@@ -545,6 +545,29 @@ mod tests {
             if schema == "NodeDesiredPage" {
                 assert_eq!(desired_page_valid(value), valid, "{schema}/{name}");
             }
+        }
+    }
+    /// The roles the node creates for itself are names a customer role must never take: a page that
+    /// named one would be applied with `ALTER ROLE` to the role barman logs in as. PostgreSQL
+    /// refuses `public` and `none` itself: a page that named one would fail the role step at every
+    /// start of its database.
+    #[test]
+    fn the_roles_the_node_creates_for_itself_and_postgresql_refuses_are_reserved() {
+        use crate::settings::{AGENT_ROLE, BACKUP_ROLE};
+        for name in [AGENT_ROLE, BACKUP_ROLE, "public", "none"] {
+            assert!(reserved_role(name), "{name}");
+        }
+        // The names of the Kubernetes runtime are ordinary roles, and a near miss is not reserved.
+        for name in [
+            "cnpg_app",
+            "streaming_replica",
+            "pgcf_maintenance",
+            "pgcf_backups",
+            "public_reader",
+            "nonesuch",
+            "current_user",
+        ] {
+            assert!(!reserved_role(name), "{name}");
         }
     }
     #[test]

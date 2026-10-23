@@ -64,3 +64,34 @@ pub fn valid_role(value: &str) -> bool {
             .iter()
             .any(|v| value.starts_with(v.as_str().expect("generated prefix")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::valid_role;
+
+    #[test]
+    fn the_gateway_refuses_the_reserved_roles_and_nothing_else() {
+        for name in [
+            "postgres",
+            "pg_monitor",
+            "pgcf_backup",
+            "public",
+            "none",
+            "App",
+            "",
+        ] {
+            assert!(!valid_role(name), "{name}");
+        }
+        for name in [
+            "app",
+            "cnpg_app",
+            "streaming_replica",
+            "pgcf_maintenance",
+            "pgcf_backups",
+            "public_reader",
+            "nonesuch",
+        ] {
+            assert!(valid_role(name), "{name}");
+        }
+    }
+}
