@@ -567,7 +567,7 @@ it("announces a volume that fails after another one did", async () => {
 it("announces a delete its node has not finished after ten minutes and ends the episode once the database and its volumes are gone", async () => {
   // F2 of the live run on US1: two databases the API called deleted kept their 80 GiB volumes and
   // their users, and nothing told the operator. A delete that the node does not finish within ten
-  // minutes (the integrator's operation is failed at twenty) is an alert, whether the node never
+  // minutes (the integrator's operation remains open until confirmed) is an alert, whether the node never
   // reported the database deleted or reported it deleted and still names a volume of it.
   const f = await fixture(),
     hook = receiver(),

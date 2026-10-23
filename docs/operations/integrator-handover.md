@@ -314,8 +314,9 @@ is DONE, so it is never writable before it is restorable. The idle time
 - **No capacity.** If no node qualifies, the call still returns `202`: `node_id` is `null`,
   `observed_state` is `pending` and `status_message` is `Waiting for verified regional capacity`.
   A minute cron places it when a node qualifies.
-  This wait has no timeout of its own (every other operation fails with `operation_timeout` after
-  20 minutes without a report); set your own deadline and delete the database to cancel.
+  This wait has no timeout of its own; set your own deadline and delete the database to cancel.
+  Accepted deletions also have no timeout ([2.6](#26-delete)); other regional operations fail with
+  `operation_timeout` after 20 minutes without a report.
 - **Placement window.** The peak that placement counts is the highest 30-minute average of a
   node's active RAM and of its CPU load within the placement window. The window is 3 days (owner
   decision O6 of 2026-10-23, plan 11.3; `PEAK_WINDOW_MS` on main). The plan's Open row "Placement is
@@ -521,6 +522,13 @@ the slot-pool release, part 1"). The name is free at once. The backup archive is
 (the API does not return that date). Role credentials and attributes are retained with it; a role
 awaiting its removal is not. A project can be deleted only after all its databases have finished
 deleting. Retained archives are removed by a cron after expiry.
+
+An accepted deletion cannot be cancelled. Its operation stays `pending` or `running` until the
+node confirms that PostgreSQL, its owned volumes, its account and its local files are gone; only
+then does it succeed. It does not fail merely because cleanup takes more than 20 minutes. The
+agent retries failed cleanup steps and `database_delete_incomplete` alerts the operator after ten
+minutes without completed cleanup. Repeating `DELETE` returns the same operation. A client may
+stop polling at its own deadline, but that does not cancel deletion or prove cleanup complete.
 
 A `409 conflict` from `DELETE` deletes nothing. Reason `mutation_in_progress` means another change
 to the same database holds it at that moment: a wake, an idle sleep or its compensation, a move or a
@@ -1530,7 +1538,7 @@ there is.
 | `error.code`                                                    | Meaning                                                                                                                                                                                           |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `superseded`                                                    | a newer intent (resize, delete or power change) replaced it; not a platform fault                                                                                                                 |
-| `operation_timeout`                                             | no report for 20 minutes: 20 minutes after the operation was placed, or after the node's last report that a create or restore is `building`, which each pull of the page repeats ("Regional operation exceeded 20 minutes"); or a create or restore still building 24 hours after its placement ("Build exceeded 24 hours after its placement") |
+| `operation_timeout`                                             | except for accepted `database.delete`: no report for 20 minutes after placement or the node's last repeated `building` report ("Regional operation exceeded 20 minutes"); or a create or restore still building 24 hours after placement ("Build exceeded 24 hours after its placement") |
 | `power_busy`, `power_archive`, `power_unknown`, `power_timeout` | a suspend or hibernation was refused or timed out; the database returned to running                                                                                                               |
 | `role_not_droppable`                                            | `database.role.delete`: the role owns objects or holds privileges, so PostgreSQL cannot drop it; it stays unable to log in until they are removed ([2.3](#23-roles-connection-uri-and-passwords)) |
 

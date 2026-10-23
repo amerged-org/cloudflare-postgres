@@ -379,8 +379,9 @@ created at full size at first boot and does not grow.
   Workers Logs, `delete_incomplete`, with the `step` (`unit`, `inventory`, `volume`,
   `socket_directory`, `account`, `state`), its `class` and the `seconds` the delete has been
   failing, and is tried again after 1 s, doubling to 30 s, for as long as it takes. The delete
-  operation ends `operation_timeout` after 20 minutes while the database stays deleted and the
-  agent goes on; the operator is told earlier: `database_delete_incomplete` fires when a database
+  operation stays `pending` or `running` until the node confirms cleanup; an accepted deletion
+  cannot be cancelled and has no operation timeout. The operator is told independently:
+  `database_delete_incomplete` fires when a database
   deleted more than 10 minutes ago is still on its node's page (not reported `deleted`, or a volume
   of it still reported by the node, which is also what an agent that did not run the whole delete
   leaves) and ends when the node has reported it `deleted` and names no volume of it. A node marked

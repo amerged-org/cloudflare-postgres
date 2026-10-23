@@ -352,7 +352,9 @@ impl<M: Machine> Core<M> {
         let Some(entry) = db.view().entry.clone() else {
             return;
         };
-        if db.view().state.is_none() {
+        // Deletion is authorized by the page and volume identity, not by a local sleep proof.
+        // A damaged state file must block starts, but must not strand an explicitly deleted DB.
+        if entry.desired != Desired::Deleted && db.view().state.is_none() {
             match self.files(&db.id).load() {
                 Ok(state) => self.set(db, |view| view.state = state),
                 // A state that was read and cannot be trusted is not taken for a new database.
@@ -3644,6 +3646,34 @@ mod tests {
             "{:?}",
             events_of(&id, "delete_incomplete")
         );
+        assert!(rig.machine.volumes().is_empty());
+        assert!(!rig.machine.has_account(&id));
+        assert_eq!(rig.core.files(&id).load().unwrap(), None);
+        assert_eq!(rig.observation(&id)["state"], "deleted");
+    }
+
+    /// Deletion is authorized by the desired page and the volume's identity. A broken sleep
+    /// proof must refuse a wake, but cannot prevent the owner from deleting the database.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_authorized_delete_cleans_up_after_a_restart_with_corrupt_local_state() {
+        let Some(rig) = Rig::new("delete-corrupt").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        rig.create_from(&db).await;
+        let rig = rig.restart().await;
+        std::fs::write(
+            rig.core.files(&id).directory().join("state.json"),
+            "{not a state",
+        )
+        .unwrap();
+        let deleted = deletion(&db, 2);
+        let handle = rig.core.db(&id);
+        handle.view().entry = Some(rig.entry_for(&deleted));
+        rig.core.reconcile(&handle, &mut None).await;
+        assert_eq!(handle.phase(), Phase::Deleted);
+        assert!(!rig.machine.running(&id));
         assert!(rig.machine.volumes().is_empty());
         assert!(!rig.machine.has_account(&id));
         assert_eq!(rig.core.files(&id).load().unwrap(), None);

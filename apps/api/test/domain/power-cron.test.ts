@@ -79,6 +79,54 @@ it("compensates timed-out quiescence before failing the operation without invent
   ).toBe(3);
 });
 
+it("keeps an accepted deletion pending until cleanup is confirmed, even after the operation deadline", async () => {
+  const f = await fixture();
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  const id = created.database.id;
+  await report(f, id, 1);
+  const removed = DatabaseWithOperation.parse(
+    await (await request(`/v1/databases/${id}`, f.integrator, "DELETE")).json(),
+  );
+  const stale = new Date(Date.now() - 25 * 3_600_000).toISOString();
+  await env.DB.prepare(
+    "UPDATE operations SET created_at=?,updated_at=? WHERE id=?",
+  )
+    .bind(stale, stale, removed.operation.id)
+    .run();
+  const operation = () =>
+    env.DB.prepare(
+      "SELECT status,error_code,completed_at FROM operations WHERE id=?",
+    )
+      .bind(removed.operation.id)
+      .first();
+  expect((await runCron(env)).failed).toBe(0);
+  expect(await operation()).toEqual({
+    status: "pending",
+    error_code: null,
+    completed_at: null,
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT desired_state,observed_state FROM databases WHERE id=?",
+    )
+      .bind(id)
+      .first(),
+  ).toEqual({ desired_state: "deleted", observed_state: "ready" });
+
+  // Retrying the intent returns the same operation; only the node's completed cleanup ends it.
+  const retry = DatabaseWithOperation.parse(
+    await (await request(`/v1/databases/${id}`, f.integrator, "DELETE")).json(),
+  );
+  expect(retry.operation.id).toBe(removed.operation.id);
+  expect(retry.operation.status).toBe("pending");
+  expect((await report(f, id, 2, "deleted")).status).toBe(200);
+  expect(await operation()).toMatchObject({
+    status: "succeeded",
+    error_code: null,
+    completed_at: expect.any(String),
+  });
+});
+
 it("uses the current power revision after a role configuration change", async () => {
   const f = await suspended();
   expect(

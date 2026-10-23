@@ -668,8 +668,8 @@ type RegionSubjects = Map<
 /**
  * A database deleted this long ago that its node still has not finished (it is still on the node's
  * desired page, `nodeDesiredPage`: not reported deleted, or a volume of it still reported) is an
- * alert. The agent tries again every 30 s at most; the integrator's delete operation ends
- * `operation_timeout` at 20 minutes, which this precedes.
+ * alert. The agent tries again every 30 s at most; the integrator's delete operation remains
+ * open until cleanup is confirmed, so this alert makes missing progress visible independently.
  */
 const DELETE_INCOMPLETE_ALERT_MS = 600_000;
 
