@@ -648,6 +648,7 @@ export class DatabaseActor extends DurableObject<Env> {
     user: unknown,
     options?: { deadline?: number; waiterId?: string },
   ): Promise<DatabaseWakeAdmission> {
+    const started = Date.now();
     const trace: AdmissionTrace = { path: "refused", reused: null };
     const result = await this.#admitWake(databaseId, user, options, trace);
     if (!result.ok) this.refused("admit_wake", databaseId, result.sqlstate);
@@ -659,6 +660,9 @@ export class DatabaseActor extends DurableObject<Env> {
         waiter_id: options?.waiterId ?? null,
         path: trace.path,
         reused: trace.reused,
+        // Time in this handler, excluding delivery/queueing before entry and transport afterwards.
+        // Compare with the Edge's admit_ms using waiter_id/cid; this alone is not the RPC duration.
+        handler_ms: Date.now() - started,
         // 0 when this very call built the instance; a node report or another call may have built it.
         instance_age_ms: Date.now() - this.constructedAt,
         isolate_actors: isolateActors,

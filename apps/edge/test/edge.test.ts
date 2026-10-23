@@ -535,11 +535,17 @@ describe("native edge admission with real Workers D1 and route-token modules", (
 
   it("actor RPC errors fail closed without leaking exception text or contacting Gateway", async () => {
     const canary = crypto.randomUUID();
+    const failure = Object.assign(new Error(canary, { cause: canary }), {
+      name: canary,
+      retryable: true,
+      overloaded: false,
+      remote: true,
+    });
     const actor = {
       idFromName: (name: string) => testEnv.DATABASE_ACTOR.idFromName(name),
       get: () => ({
         admitWake: async (): Promise<DatabaseWakeAdmission> => {
-          throw new Error(canary);
+          throw failure;
         },
         cancelWakeWaiter: async () => false,
       }),
@@ -553,6 +559,14 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       canary,
     );
     expect(JSON.stringify(logs.mock.calls)).not.toContain(canary);
+    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string)).toMatchObject({
+      event: "conn_admission",
+      outcome: "08006",
+      admit_error: "rpc_exception",
+      admit_retryable: true,
+      admit_overloaded: false,
+      admit_remote: true,
+    });
   });
   it("returns the unopened gateway WebSocket directly without accepting or relaying it", async () => {
     let upstream: WebSocket | null = null;
