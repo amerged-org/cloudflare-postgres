@@ -177,15 +177,15 @@ which stays inside one jurisdiction's endpoint). The old bucket is only read, ex
 mirror and cleanup below, until the owner says it may go. The move needs the owner's costed go for the new bucket;
 the plan puts it after the acceptance tests and before the go-live gates.
 
-What moves, and what does not. The move copies what a database that is not deleted needs: its archive
-(the `archive_path` in D1), the node image releases (`node-images/`) and the infrastructure exports
-(`infrastructure/v1/`). It does not wait for a retention window to end. The archives of deleted databases,
-which stay restorable for their `backup_retention_days`, and the source archives of finished moves are not
-copied unless the owner wants them restorable from the new bucket (their prefixes then join the list of
-step 3): the expired and still-retained archives of test databases stay in the old bucket and go with it.
-The rewrite of step 6 still points their rows at the new bucket. Nothing is under those prefixes, so a
-restore from such an archive fails, and the Worker's purge (`cleanupRetainedArchives`) lists the empty
-prefix and deletes the row when its retention ends. Keys of any other layout, such as the legacy keys of
+What moves. Copy and verify **every archive still required by the installation**, not only archives
+of live databases: unexpired deleted-database recovery windows, active restore/move readers,
+unexpired superseded move archives, and active or retained in-place replacement history all count.
+Deletion of a database does not waive its promised recovery window, including for test databases.
+Include `node-images/` and `infrastructure/v1/` as before. Step 3 defines the current required set;
+expired, cleaned tombstones alone do not keep an archive required forever. No required immutable retained/source prefix may
+be pointed at the new bucket before its objects have been copied and verified there. Ongoing WAL
+writes still require the existing final-delta, maintenance and credential barriers below. An empty
+prefix at the destination is a gap, not a successful migration or a reason to purge its metadata. Keys of any other layout, such as the legacy keys of
 an earlier runtime, stay as well unless the owner decides otherwise.
 
 Why the order matters. A node archives into the path of the page entry it holds, with the credential
@@ -214,7 +214,12 @@ the file of the first run stays as it was. A pass that finds no key writes no fi
 means that the pass found nothing, not that nobody read it; a file that exists holds every key of its own
 pass, which a name used twice would not.
 
-1. Make `0084` the only pending migration before anything is deployed. `wrangler d1 migrations
+1. Check the deployed schema first. The `0084` ordering in this paragraph applies only to the
+   original single-bucket conversion; skip that conversion when `0084` is already applied. Do not
+   apply unrelated pending migrations as part of a bucket move. The inventory below includes
+   `database_replacements` from `0088`; on a pre-`0088` installation omit only its CTE and UNION arm,
+   after confirming that the table is absent. For the original conversion, make `0084` the only
+   pending migration before anything is deployed. `wrangler d1 migrations
    apply` (and a deploy script's `--migrate`, which runs it before the deploy) takes every pending
    file, and `0082` and `0084` need opposite orders: `0082` (the dead capacity fields, D-1 of the plan)
    goes first, with a fresh daily D1 export in place and its Worker straight after it, while `0084`
@@ -230,9 +235,9 @@ pass, which a name used twice would not.
    SELECT count(*) FROM databases WHERE deleted_at IS NULL
      AND substr(archive_path,1,length('s3://<old>/'))<>'s3://<old>/';
    ```
-   It must answer 0: step 3's list takes only the databases that name `<old>`, so a database that
-   names a third bucket would be left out of the copy, and every archive operation of the Worker
-   refuses its path. Then deploy the Worker with `ARCHIVE_ENDPOINT_URL` set to
+   It must answer 0. Also run step 3's complete `required_paths` inventory without its bucket filter:
+   every required path must name `<old>`. A foreign-bucket retained archive or reader is a blocker
+   too; reconcile it before proceeding, rather than silently omit it from the copy. Then deploy the Worker with `ARCHIVE_ENDPOINT_URL` set to
    the endpoint of the bucket (the old bucket's, which is the new bucket's too), the single
    `ARCHIVE` binding and `ARCHIVE_BUCKET_NAME` still naming the old bucket, and the `ARCHIVE_US`
    binding and the `ARCHIVE_BINDINGS` variable gone from the private configuration (the Worker reads
@@ -260,13 +265,66 @@ pass, which a name used twice would not.
    of them. Archiving then fails (`database_archive_failing`) and no database can sleep until the
    rewrite of step 6 has given every path a new credential id and the nodes have read it. A rollback
    signs for the old bucket with these tokens too.
-3. Copy what a database that is not deleted needs while everything runs, in rounds, and repeat
-   until a round copies only what changed. A round starts with the list of prefixes, made
-   read-only into a new file of the cutover's directory (`"$D/prefixes-<round>.txt"`, 0600), and copies each line:
+3. Warm-copy the complete required archive set in rounds. At each round, capture one UTC
+   `<T_INVENTORY>` in the same millisecond ISO format D1 uses. Materialize the following read-only
+   inventory into a new 0600 prefix file (`"$D/prefixes-<round>.txt"`); use a fresh timestamp/list
+   each round. The same `required_paths` CTE is the reference check in steps 6, 10 and rollback:
    ```sql
-   SELECT substr(archive_path,length('s3://<old>/')+1) FROM databases
-     WHERE deleted_at IS NULL AND substr(archive_path,1,length('s3://<old>/'))='s3://<old>/';
+   WITH clock(at) AS (VALUES('<T_INVENTORY>')),
+   move_paths(archive_path,deleted_at,keep_until,active) AS (
+     SELECT m.source_archive_path,m.source_archive_deleted_at,
+       strftime('%Y-%m-%dT%H:%M:%fZ',m.completed_at,'+'||s.backup_retention_days||' days'),
+       m.status IN('proving','restoring')
+     FROM database_moves m JOIN databases d ON d.id=m.database_id
+       JOIN size_classes s ON s.id=d.size_class_id
+     WHERE m.status IN('proving','restoring','done')
+     UNION ALL
+     SELECT m.target_archive_path,m.target_archive_deleted_at,
+       strftime('%Y-%m-%dT%H:%M:%fZ',m.completed_at,'+'||s.backup_retention_days||' days'),
+       m.status IN('proving','restoring')
+     FROM database_moves m JOIN databases d ON d.id=m.database_id
+       JOIN size_classes s ON s.id=d.size_class_id
+     WHERE m.status IN('proving','restoring','failed')
+   ), replacement_paths(archive_path,deleted_at,cleanup_claim,keep_until,active) AS (
+     SELECT source_archive_path,source_archive_deleted_at,source_cleanup_claim,retained_until,
+       phase IN('proving','restoring','rolling_back') FROM database_replacements
+     UNION ALL
+     SELECT target_archive_path,target_archive_deleted_at,target_cleanup_claim,retained_until,
+       phase IN('proving','restoring','rolling_back') FROM database_replacements
+     UNION ALL
+     SELECT rollback_archive_path,rollback_archive_deleted_at,rollback_cleanup_claim,retained_until,
+       phase IN('proving','restoring','rolling_back') FROM database_replacements
+   ), required_paths(archive_path) AS (
+     SELECT archive_path FROM databases WHERE deleted_at IS NULL
+     UNION
+     SELECT a.archive_path FROM retained_archives a JOIN databases d ON d.id=a.source_database_id
+     WHERE a.expires_at>(SELECT at FROM clock) AND a.cleanup_claim IS NULL
+       AND d.deleted_at=a.deleted_at AND d.archive_path=a.archive_path
+       AND d.storage_generation=a.storage_generation
+     UNION
+     SELECT x.source_archive_path FROM database_restores x JOIN operations o ON o.id=x.operation_id
+     WHERE x.verified_at IS NULL AND o.status IN('pending','running')
+     UNION
+     SELECT archive_path FROM move_paths WHERE archive_path IS NOT NULL
+       AND (active OR (deleted_at IS NULL AND keep_until>(SELECT at FROM clock)))
+     UNION
+     SELECT archive_path FROM replacement_paths WHERE archive_path IS NOT NULL
+       AND (active OR (deleted_at IS NULL AND cleanup_claim IS NULL AND keep_until>(SELECT at FROM clock)))
+   )
+   SELECT DISTINCT substr(archive_path,length('s3://<old>/')+1)||'/' AS prefix
+   FROM required_paths WHERE substr(archive_path,1,length('s3://<old>/'))='s3://<old>/'
+   ORDER BY prefix;
    ```
+   These predicates follow `retainedArchiveRestorable`, active `database_restores` readers,
+   `expireSupersededArchives` and `expireReplacementArchives`. An active reader protects its source
+   even after the ordinary retention deadline. A required path whose cleanup claim/deletion marker
+   conflicts with that reader is an inconsistency: stop and reconcile, never copy a partially purged
+   archive as complete. For each prefix, retain the owning reference, expiry/claim state and full
+   object inventory alongside the verification; do not infer presence from a prefix's name.
+   An archive empty in both buckets needs separate lifecycle evidence. A create or restore that
+   failed before its first DONE backup and was never published writable has no recoverable archive
+   to migrate; record that original failure, not a successful copy. A missing source without that
+   evidence remains unresolved. Do not infer either case from a null backup timestamp alone.
    The copy and the compare take one `--prefix` a call, so run each once for every line of the list
    (`<region>/<database>/g<generation>-<operation>/`) and once each for `node-images/` and
    `infrastructure/v1/`. `copy` lists the destination under the same prefix as the source and
@@ -290,8 +348,9 @@ pass, which a name used twice would not.
    created in between has its first base backup and its WAL in no per-prefix copy and older than
    every later `--since`, and it has no restorable base backup in the new bucket until its next
    one. The passes by time take no prefix: they copy whatever was written since, and a deleted
-   database writes nothing, so they bring none of the left-behind archives along, and they catch
-   a database created after the last round's list was made.
+   database writes nothing, so those passes cannot repair a retained archive omitted from the
+   prefix list. They supplement the full required-prefix copy and catch new writes; they never
+   replace the inventory or final full-prefix verification.
    A key counts as copied when its size and ETag, or its size and a LastModified not older
    than the source's, match, because R2 may recompute a multipart ETag on a copy. Compare sizes and
    ETags of every key of the list, the bodies of the ones whose ETag differs, and the stored sha256
@@ -299,8 +358,15 @@ pass, which a name used twice would not.
    only when it asks with `x-amz-checksum-mode`). An object whose checksum the copy lost is uploaded
    again with `register-node-image.ts` run with `PGCF_R2_BUCKET` set to the new bucket: until step
    5 the variable names the old one, where the script finds the object complete and sends nothing.
-4. Rehearse the rewrite below on a D1 export. Check that no create, restore, move or base backup is in flight
-   and that every node runs its region's release.
+4. Rehearse the rewrite and inventory on a current D1 export. Check that no create, restore, move,
+   in-place replacement or base backup is in flight and that every node runs its region's release.
+   Rebuild the required-prefix inventory, finish its copies and verify each immutable retained/source
+   prefix in full before step 6 (no `--since` filter). Repeat the reference/expiry/cleanup-claim checks
+   immediately before rewriting: new required prefixes must be copied first; a reader, changed claim
+   or partial purge stops the rewrite until reconciled. Save the verified prefix/object inventory.
+   These reads are not a lock against concurrent requests or garbage collection. If the inventories
+   do not remain consistent, stop and repeat the existing copy/verification barriers; do not claim
+   an atomic cutover or discard a still-promised recovery window to make the check pass.
 5. Deploy the Worker with `ARCHIVE` bound to the new bucket and `ARCHIVE_BUCKET_NAME` set to it. Note
    the time (T_B) immediately before the deploy starts and after the last warm copy has ended: every
    copy predates it, and everything a database or the Worker writes into the new bucket postdates it
@@ -308,23 +374,37 @@ pass, which a name used twice would not.
    new bucket). From here the Worker deletes (retention, expiry) in the new bucket only. Until step 6
    ends, the minute cron's retention step reports failed every minute: it throws for each database row
    that still names the old bucket and applies no retention window meanwhile. That alert is expected
-   and must stop after step 6. Point the release registration (`PGCF_R2_BUCKET` of
+   and must stop after step 6; this configuration mismatch is not a cleanup or reader lock. Point the release registration (`PGCF_R2_BUCKET` of
    `register-node-image.ts`) at the new bucket too: it uploads into that bucket and the Worker reads
    the bound one.
 6. Rewrite the stored paths from a 0600 file in a 0700 directory (`wrangler d1 execute <database>
    --remote --file <file>`), and delete the file. Every statement touches only rows that still name
-   the old bucket, so the file is run again after a partial failure:
+   the old bucket. Before running it, compare every required path against step 4's verified set;
+   no required immutable prefix may be missing and no reader or cleanup claim may have changed.
+   Check step 4's no-in-flight condition again. After a partial failure, repeat these checks and the
+   affected copy/verification before repeating the file; the final WAL delta remains steps 7–10:
    ```sql
    UPDATE databases SET archive_path='s3://<new>/'||substr(archive_path,length('s3://<old>/')+1)
      WHERE substr(archive_path,1,length('s3://<old>/'))='s3://<old>/';
    ```
    The same for `retained_archives.archive_path`, `database_restores.source_archive_path`,
    `backup_retention_runs.archive_path` and, when a move row exists, `database_moves.source_archive_path`
-   and `target_archive_path` (the trigger `database_moves_monotonic` refuses that change: drop it
-   and create it again, text for text, from migration `0065` around the statements). The credential
-   rows stay: a credential is found by node, path and access, so the new paths make every page name a
+   and `target_archive_path`. Include all three `database_replacements` paths from `0088`:
+   `source_archive_path`, `target_archive_path`, `rollback_archive_path`. The triggers
+   `database_moves_monotonic` (`0065`) and `database_replacements_monotonic` (`0088`) refuse these
+   immutable-path changes: in the same rehearsed rewrite, drop only these triggers, rewrite
+   the paths, then recreate their exact definitions. Do not leave a trigger absent after an error;
+   read back both definitions and run `PRAGMA foreign_key_check` before continuing. Keep
+   every generation, phase, retention deadline, cleanup claim and deletion marker unchanged.
+   Historical expired rows may be normalized too, but their paths alone create no copy obligation
+   and must never be treated as proof of a recoverable archive. The credential rows stay: a credential
+   is found by node, path and access, so the new paths make every page name a
    new credential, and the old rows record when the old credentials expire. Note the time the file
-   ended (T_REWRITE).
+   ended (T_REWRITE). Re-run `required_paths` against `<new>`: every result must match a verified
+   prefix; none may still name `<old>` or a third bucket. Compare the saved reference set, not only
+   live database rows. Check active-reader counts again, including
+   `database_restores` joined to pending/running operations, moves in `proving`/`restoring` and
+   replacements in `proving`/`restoring`/`rolling_back`.
 7. Run the maintenance cycle (`POST /v1/nodes/{id}/maintenance`) on every node that holds a database
    and wait until it is `done`. The node answers new wakes with `57P03`, puts every awake database to
    sleep with the proof and reopens placement; by then it has read the new credentials and accepted
@@ -352,7 +432,8 @@ pass, which a name used twice would not.
    optional here: step 7's cycle archived the final WAL of every awake database into the new bucket
    only, and a database created after the deploy exists only there, so without it the copy refuses
    and copies nothing. Then compare: `verify --from <old> --to <new> --since <next_since>` (the same
-   time; without `--since` it would report every left-behind archive as missing). Then delete from the
+   time), and repeat the full verification of every required prefix from step 4. A time-filtered
+   compare alone cannot find an omitted old base backup or retained archive. Then delete from the
    new bucket the copies of what the old bucket's retention deleted before step 5 (written there at or
    before T_B, absent in the old bucket), or a deleted database's data outlives its recovery window:
    `prune --from <old> --to <new> --before <T_B>` is the dry run (it prints the count and the first
@@ -363,12 +444,17 @@ pass, which a name used twice would not.
    and its step 4 cleaned the old bucket: it also deletes every key that the first attempt wrote into
    the new bucket before the new T_B and that the old bucket lacks, the WAL that only the new bucket
    holds, and it keeps in the new bucket every archive that the old bucket still holds, which the
-   warm copy of the second attempt brings back from there.
+   warm copy of the second attempt brings back from there. Before any prune, recheck the required
+   references and the per-object retention decision: a missing old-bucket object is not by itself
+   proof that the new copy is disposable. A required anchor backup or WAL segment is never pruned.
 9. Accept on the new bucket: wake a database, write, let it sleep (its WAL appears under the same
    prefix in the new bucket and the old bucket gets no new key), take a base backup, restore to a point
    in time, `HEAD` and `GET` a release file through `/node/v1/releases/<release>/<file>` (it reads the
    bound bucket; registering a known release again does not) and wait for the next infrastructure
-   backup.
+   backup. Also restore one still-retained deleted database from the new bucket and verify its
+   markers/digest, without changing its deletion or expiry. Where retained in-place history exists,
+   exercise its supported `source_operation_id` restore too. Use owned acceptance sources; do not
+   restore arbitrary customer data merely to test the move.
 10. Repeat the copy and the check for new keys in the old bucket after an hour, a day and after the
     last credential for the old bucket has expired (`max(expires_at)` of the rows that name it, at
     most seven days). Each pass is `copy --since <next_since> --allow-extra-destination-keys
@@ -394,34 +480,29 @@ pass, which a name used twice would not.
     --to <new> --since <T_REWRITE> --sample-heads 0 --missing-file "$D/missing-<pass>.txt"`: every key the old bucket received since step 6's file ended, compared with
     the new bucket whatever the chain skipped (the keys of a pass are in its own file, and a pass that finds none writes none). In the passes of an hour and a day it finds nothing
     missing (the new bucket's retention cannot have acted on keys that young). After the last
-    credential has expired a missing key is no gap only if no row names its prefix (below) or if it is
-    older than the `backup_retention_days` of its database's size class (the line shows `modified=`:
-    retention may have deleted it); any other is a gap, copied with `copy --since <T_REWRITE> --prefix
+    credential has expired, classify a missing key against the required-prefix check below and
+    the actual retention decision. Object age alone is not proof: the oldest surviving DONE backup
+    may be the anchor of a cold database or the source of a retained recovery point. A key removed
+    by verified retention is not a gap; an unexplained missing required key is a gap, copied with `copy --since <T_REWRITE> --prefix
     <its prefix> --allow-extra-destination-keys` (a live prefix always needs the flag: the new bucket
     holds that database's WAL from after the switch, which the old bucket lacks), after which the check
     runs again (under a `<pass>` of its own, such as `10-1b`). A pass that copies a key is real, not noise (`"$D/copied-<pass>.txt"` holds all of them): check
-    that the key's prefix is still named by a row that the Worker has not purged yet. No row of
-    `databases` or `database_moves` is ever deleted: the purge of a retained archive deletes only its
-    `retained_archives` row and the deleted database keeps its `archive_path` (`deleted_at` set), and
-    the expiry of a superseded archive only sets `source_archive_deleted_at` or
-    `target_archive_deleted_at`. So the prefix counts while a database that is not deleted is on it,
-    while a `retained_archives` row names it, while the source of a done move or the staged target of a
-    failed move is not marked deleted, and while it is the target of a move in flight. As a read-only
-    query, where `<bucket>` is the bucket whose name the rows carry (the
-    new bucket after step 6; the old one after the rollback's step 2) and `<prefix>` is
-    `<region>/<database>/g<generation>-<operation>`, a row answers when the prefix is named:
+    that the key's prefix is still required, using step 3's complete `required_paths` CTE with a
+    fresh `<T_INVENTORY>`. Replace its final SELECT with the following membership check, where
+    `<bucket>` is the bucket currently named by D1 (`<new>` after step 6, `<old>` after rollback):
     ```sql
-    SELECT 1 FROM databases WHERE archive_path='s3://<bucket>/<prefix>' AND deleted_at IS NULL
-    UNION ALL SELECT 1 FROM retained_archives WHERE archive_path='s3://<bucket>/<prefix>'
-    UNION ALL SELECT 1 FROM database_moves WHERE
-      (status='done' AND source_archive_path='s3://<bucket>/<prefix>' AND source_archive_deleted_at IS NULL)
-      OR (status='restoring' AND target_archive_path='s3://<bucket>/<prefix>')
-      OR (status='failed' AND target_archive_path='s3://<bucket>/<prefix>' AND target_archive_deleted_at IS NULL)
+    SELECT 1 FROM required_paths WHERE archive_path='s3://<bucket>/<prefix>' LIMIT 1;
     ```
-    A prefix that nothing of this names came back from a purge or an expiry and is no
-    gap; the owner deletes it from the new bucket. For a real gap, find the node whose credential read
-    failed (usually a parent key that lacks the new bucket) and wake its databases again. The last
-    pass is the one after the last credential for the old bucket has expired. Step 11 ends that wait
+    Do not protect a prefix solely because an expired database/move/replacement tombstone names it.
+    Conversely, a restore reader or active replacement still protects its source after an expiry.
+    No matching required reference makes a prefix eligible for investigation, not immediate deletion:
+    confirm completed cleanup/expiry and no new reader/claim change immediately before an authorized
+    prune, and repeat the inventory after it. An unexpired retained reference with no destination
+    objects is always a gap. Re-copy and verify it by full prefix, even if every object predates
+    T_REWRITE; never resolve the gap by deleting its D1 row or waiting out its recovery window.
+    Keep the separately proven never-writable, empty-source cases of step 3 distinct from such gaps.
+    For continuing old-bucket writes, fix the failed credential refresh and repeat the barrier.
+    The last pass is the one after the last credential for the old bucket has expired. Step 11 ends that wait
     at once: the access key of a temporary credential is the parent key's, so revoking the earlier
     parent keys (step 2's) ends every credential signed with them, and the last pass then runs after
     the revocation.
@@ -473,8 +554,13 @@ pass, which a name used twice would not.
        fails to archive belongs to a node that never read a credential after T_KEY: delete the
        credential rows of its databases again (as in 2) and wait for its next pull; restarting
        `pgcf-agent` makes it read every credential again. Then delete the token of the copy.
-12. Only when step 11 is done, step 10's last pass ended without a failure and its check shows no gap,
-    and with the owner's word, delete the old bucket.
+12. Delete the old bucket only with the owner's word, after step 11 and a fresh full required-prefix
+    audit (not only the time-filtered last pass). Every live, retained and active-reader reference
+    with a recoverable archive must have it complete and verified in the new bucket; no required base/WAL object may exist
+    only in the old one. Reconcile expiry/cleanup changes since the copy, confirm no old credential
+    or writer remains, and retain any separately required operator-custody material. A missing
+    retained archive blocks retirement even when all live databases work. Keep the old bucket and
+    repair the gap; expiration is not a substitute for delivering the promised recovery window.
 
 What can be rolled back, step by step. The rollback is the procedure under "If a step fails" below;
 it returns the installation to the old bucket. It needs three things at once: a parent token that
@@ -532,6 +618,12 @@ until step 11.4 revokes the earlier parent tokens, every rollback is the same wh
 because nothing records whether a node switched and a check that no credential names the new bucket
 races the nodes' pulls every 60 seconds (after the revocation nothing signs for the old bucket and
 only fixing forward is left):
+
+Before rollback step 1, repeat step 4's no-in-flight and fresh reference/expiry/claim checks.
+Verify the required immutable retained/source prefixes in the old bucket before their references
+point back to it; mirror any missing prefix under the rollback authority below, including retained
+deleted archives and replacement history. A changed reader/claim or incomplete mirror stops the
+rewrite. Keep the existing reverse-delta, credential and maintenance barriers for continuing writes.
 
 1. Redeploy the old configuration (`ARCHIVE` and `ARCHIVE_BUCKET_NAME` name the old bucket;
    `ARCHIVE_ENDPOINT_URL` stays). When step 11.1 has run, set `R2_PARENT_ACCESS_KEY_ID` and

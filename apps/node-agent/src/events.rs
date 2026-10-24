@@ -133,9 +133,18 @@ impl Events {
         let at = facts::timestamp(crate::agent::now_ms());
         if let Some(event) = sanitize(line, &at) {
             #[cfg(test)]
-            SEEN.lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(event.clone());
+            {
+                SEEN.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(event.clone());
+                let _ = CAPTURE.try_with(|capture| {
+                    capture
+                        .0
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(event.clone());
+                });
+            }
             self.ring().push(event);
             self.arrived.notify_one();
         }
@@ -182,6 +191,29 @@ static SEEN: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 #[cfg(test)]
 pub(crate) fn seen() -> Vec<Value> {
     SEEN.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// Events emitted while a test polls its own operation. Unrelated tasks, including tasks spawned
+/// inside the scope, do not inherit this capture; the normal report ring still receives them all.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct Capture(std::sync::Arc<Mutex<Vec<Value>>>);
+#[cfg(test)]
+tokio::task_local! {
+    static CAPTURE: Capture;
+}
+#[cfg(test)]
+impl Capture {
+    pub(crate) async fn scope<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        CAPTURE.scope(self.clone(), future).await
+    }
+
+    pub(crate) fn seen(&self) -> Vec<Value> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Keeps `line`, a line of the agent's log, for the next report, as far as the contract allows.
@@ -394,6 +426,42 @@ mod tests {
         );
         assert!(!ring.allow_alone(early, every));
         assert!(ring.allow_alone(start + every, every));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_test_capture_keeps_only_its_scope_while_the_report_keeps_every_event() {
+        let events = Arc::new(Events::new(Duration::ZERO));
+        let capture = Capture::default();
+        capture
+            .scope(async {
+                events.record(&json!({"event": "own_before"}));
+                let other = events.clone();
+                tokio::spawn(async move { other.record(&json!({"event": "unrelated"})) })
+                    .await
+                    .unwrap();
+                events.record(&json!({"event": "own_after"}));
+            })
+            .await;
+        events.record(&json!({"event": "outside"}));
+        assert_eq!(
+            capture
+                .seen()
+                .iter()
+                .map(|event| event["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["own_before", "own_after"]
+        );
+        let mut report = json!({});
+        events.attach(&mut report, false);
+        assert_eq!(
+            report["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["own_before", "unrelated", "own_after", "outside"]
+        );
     }
 
     #[tokio::test(start_paused = true)]

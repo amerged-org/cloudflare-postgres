@@ -217,18 +217,19 @@ it("runs the SQL of the bucket-move runbook on the migrated schema and selects w
   credential("b", "read_write", before, "2026-10-29T09:00:00.000Z");
   credential("f", "read_only", after, later);
 
-  // Step 3: the archives of the databases that are not deleted and name the old bucket, and no other.
-  expect(
+  // Step 3 is the complete required-archive inventory, not a live-database-only SELECT.
+  const inventory = (at = T) =>
+    runbookSql("WITH clock(at)", { "<old>": OLD, "<T_INVENTORY>": at });
+  const prefix = (letter: string) =>
+    `eu-test/${id(letter)}/g1-${operation(letter)}/`;
+  const selectedPrefixes = () =>
     db
-      .prepare(runbookSql("SELECT substr(archive_path", { "<old>": OLD }))
+      .prepare(inventory())
       .all()
-      .map((row) => Object.values(row)[0])
-      .sort(),
-  ).toEqual(
-    ["a", "b", "c", "d", "f"].map(
-      (letter) => `eu-test/${id(letter)}/g1-${operation(letter)}`,
-    ),
-  );
+      .map((row) => row.prefix)
+      .sort();
+  const expectedPrefixes = new Set(["a", "b", "c", "d", "f"].map(prefix));
+  expect(selectedPrefixes()).toEqual([...expectedPrefixes].sort());
 
   // Step 1: the live databases that name another bucket than the one the Worker will use. g is the only
   // one: step 3's list above leaves it out, so the check is what tells the operator before the deploy.
@@ -266,6 +267,253 @@ it("runs the SQL of the bucket-move runbook on the migrated schema and selects w
       .all()
       .map((row) => row.id),
   ).toEqual([`crd_${"a".repeat(20)}`, `crd_${"f".repeat(20)}`]);
+
+  // The following fixtures use real tables with every FK and CHECK still enabled. Archived
+  // generations use distinct paths, so a live database's current path cannot hide a missing arm.
+  const cases: { name: string; path: string; required: boolean }[] = [];
+  const expectPath = (name: string, path: string, required: boolean) => {
+    cases.push({ name, path, required });
+    if (required) expectedPrefixes.add(path.slice(`s3://${OLD}/`.length) + "/");
+  };
+  const deleted = (letter: string) => {
+    database(letter, OLD, "deleted", {
+      observed_state: "deleted",
+      observed_generation: 1,
+      deleted_at: NOW,
+    });
+    return `s3://${OLD}/${prefix(letter).slice(0, -1)}`;
+  };
+  const retained = (
+    letter: string,
+    expires: string,
+    claim: string | null = null,
+    generation = 1,
+  ) => {
+    const path = deleted(letter);
+    run(
+      `INSERT INTO retained_archives(source_database_id,project_id,region_id,archive_path,
+       storage_generation,roles_json,deleted_at,expires_at,cleanup_claim)
+       VALUES(?,?,'eu-test',?,?,'[]',?,?,?)`,
+      id(letter),
+      project,
+      path,
+      generation,
+      NOW,
+      expires,
+      claim,
+    );
+    return path;
+  };
+  const unexpired = retained("h", later);
+  expectPath("unexpired deleted database", unexpired, true);
+  const expired = retained("i", before);
+  expectPath("expired retained tombstone", expired, false);
+  expectPath("expiry is exclusive", retained("j", T), false);
+  expectPath(
+    "claimed archive is not offered as restorable",
+    retained("k", later, "00000000-0000-4000-8000-000000000001"),
+    false,
+  );
+  expectPath(
+    "retained generation must match",
+    retained("l", later, null, 2),
+    false,
+  );
+  expectPath("cleaned deleted-database tombstone", deleted("m"), false);
+  const readAfterExpiry = retained("n", before);
+  expectPath(
+    "expired archive with active restore reader",
+    readAfterExpiry,
+    true,
+  );
+
+  let serial = 1;
+  const nextOperation = () => `op_${(serial++).toString(36).padStart(20, "0")}`;
+  const op = (databaseId: string, kind: string, status: string) => {
+    const value = nextOperation();
+    run(
+      `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at)
+       VALUES(?,?,?,?,?,1,?,?,?)`,
+      value,
+      kind,
+      status,
+      project,
+      databaseId,
+      NOW,
+      NOW,
+      ["pending", "running"].includes(status) ? null : NOW,
+    );
+    return value;
+  };
+  const reader = (
+    letter: string,
+    sourcePath: string,
+    status: string,
+    verified: string | null,
+  ) => {
+    database(letter, OLD, "running");
+    expectedPrefixes.add(prefix(letter));
+    run(
+      `INSERT INTO database_restores(target_database_id,operation_id,source_database_id,
+       source_archive_path,source_storage_generation,backup_id,verified_at,created_at)
+       VALUES(?,?,?,?,1,'20261019T090000',?,?)`,
+      id(letter),
+      op(id(letter), "database.restore", status),
+      sourcePath.split("/")[4]!,
+      sourcePath,
+      verified,
+      NOW,
+    );
+  };
+  reader("o", readAfterExpiry, "running", null);
+  reader("p", expired, "succeeded", T);
+  reader("q", expired, "failed", null);
+  reader("r", expired, "running", T);
+  // All three terminal/verified readers above must leave the expired source unprotected.
+  const archive = (key: string, generation = 1, letter = "a") =>
+    `s3://${OLD}/eu-test/${id(letter)}/g${generation}-${key}`;
+  const move = (
+    status: string,
+    completed: string | null,
+    sourceDeleted: string | null = null,
+  ) => {
+    // Move operations live in database_moves, not the public operations table.
+    const key = nextOperation();
+    const source = archive(key),
+      target = archive(key, 2);
+    run(
+      `INSERT INTO database_moves(operation,database_id,project_id,region_id,source_node_id,target_node_id,
+       source_storage_generation,source_archive_path,status,target_generation,target_storage_generation,
+       target_archive_path,backup_id,proven_sleep_json,failure,source_archive_deleted_at,created_at,updated_at,completed_at)
+       VALUES(?,?,?,'eu-test',?,?,1,?,?,2,2,?,'20261019T090000','{}',?,?,?, ?,?)`,
+      key,
+      id("a"),
+      project,
+      node,
+      node,
+      source,
+      status,
+      target,
+      status === "failed" ? "start_failed" : null,
+      sourceDeleted,
+      NOW,
+      NOW,
+      completed,
+    );
+    return { source, target };
+  };
+  const activeMove = move("restoring", null);
+  expectPath("active move source", activeMove.source, true);
+  expectPath("active move target", activeMove.target, true);
+  expectPath("retained completed move source", move("done", NOW).source, true);
+  expectPath(
+    "expired completed move source",
+    move("done", "2026-10-01T00:00:00.000Z").source,
+    false,
+  );
+  expectPath(
+    "cleaned completed move source",
+    move("done", NOW, T).source,
+    false,
+  );
+  expectPath("retained failed move target", move("failed", NOW).target, true);
+
+  const replacement = (
+    phase: string,
+    retainedUntil: string | null,
+    cleaned = false,
+    claimed = false,
+  ) => {
+    const active = phase === "rolling_back";
+    const key = op(id("b"), "database.restore", active ? "running" : phase);
+    const source = archive(key, 1, "b"),
+      target = archive(key, 2, "b");
+    const rollback = phase === "succeeded" ? null : archive(key, 3, "b");
+    const claim = claimed ? "00000000-0000-4000-8000-000000000002" : null;
+    const columns = {
+      operation: key,
+      database_id: id("b"),
+      node_id: node,
+      project_id: project,
+      region_id: "eu-test",
+      phase,
+      source_generation: 1,
+      source_storage_generation: 1,
+      source_archive_path: source,
+      requested_backup_id: "20261019T090000",
+      target_time: NOW,
+      target_generation: 2,
+      target_storage_generation: 2,
+      target_archive_path: target,
+      rollback_generation: rollback ? 3 : null,
+      rollback_storage_generation: rollback ? 3 : null,
+      rollback_archive_path: rollback,
+      failure: phase === "succeeded" ? null : "start_failed",
+      created_at: NOW,
+      updated_at: NOW,
+      completed_at: active ? null : NOW,
+      retained_until: retainedUntil,
+      source_cleanup_claim: claim,
+      target_cleanup_claim: claim,
+      rollback_cleanup_claim: claim,
+      source_archive_deleted_at: cleaned ? T : null,
+      target_archive_deleted_at: cleaned ? T : null,
+      rollback_archive_deleted_at: cleaned ? T : null,
+    };
+    run(
+      `INSERT INTO database_replacements(${Object.keys(columns).join(",")}) VALUES(${Object.keys(
+        columns,
+      )
+        .map(() => "?")
+        .join(",")})`,
+      ...Object.values(columns),
+    );
+    return { source, target, rollback };
+  };
+  for (const [name, paths, required] of [
+    ["active replacement", replacement("rolling_back", null), true],
+    ["retained replacement", replacement("failed", later), true],
+    ["cleaned replacement", replacement("failed", later, true), false],
+    ["claimed replacement", replacement("failed", later, false, true), false],
+  ] as const)
+    for (const [side, path] of Object.entries(paths))
+      if (path !== null) expectPath(`${name} ${side}`, path, required);
+  const expiredReplacement = replacement("failed", before);
+  expectPath("expired replacement target", expiredReplacement.target, false);
+  expectPath(
+    "expired replacement rollback",
+    expiredReplacement.rollback!,
+    false,
+  );
+  reader("s", expiredReplacement.source, "pending", null);
+  expectPath(
+    "expired replacement source with pending reader",
+    expiredReplacement.source,
+    true,
+  );
+  const succeeded = replacement("succeeded", later);
+  expectPath("retained successful replacement source", succeeded.source, true);
+  expectPath("retained successful replacement target", succeeded.target, true);
+
+  expect(selectedPrefixes()).toEqual([...expectedPrefixes].sort());
+  // Step 10 reuses this exact CTE with the documented membership SELECT; it must classify every
+  // case the same way as the copy inventory, not retain all tombstone paths forever.
+  const sql = inventory();
+  const select = sql.lastIndexOf("SELECT DISTINCT substr(archive_path");
+  expect(select).toBeGreaterThan(0);
+  for (const { name, path, required } of cases) {
+    const membership =
+      sql.slice(0, select) +
+      runbookSql("SELECT 1 FROM required_paths", {
+        "<bucket>": OLD,
+        "<prefix>": path.slice(`s3://${OLD}/`.length),
+      });
+    expect(db.prepare(membership).all().length, name).toBe(required ? 1 : 0);
+  }
+  expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+  expect(db.prepare("PRAGMA integrity_check").get()).toEqual({
+    integrity_check: "ok",
+  });
 });
 
 it("takes the archive endpoint from the Worker's variable, with no SQL that edits a region's", () => {
@@ -305,8 +553,8 @@ it("takes the archive endpoint from the Worker's variable, with no SQL that edit
 });
 
 it("makes the prefix list again for the last warm round, so a database created after it is inside the window of the passes by time", () => {
-  const steps = MOVE.slice(MOVE.indexOf("\n3. Copy"), MOVE.indexOf("\n4. "));
-  const text = steps.replace(/\s+/g, " ");
+  const text = FORWARD.get(3)!;
+  expect(text).toMatch(/^3\. Warm-copy/);
   // The last round makes its own list at its start and starts copying within an hour of it.
   expect(text).toMatch(/last round.{0,100}makes its own list at its start/);
   expect(text).toMatch(/within an hour of making the list/);
