@@ -14,6 +14,115 @@ async fn tenant(rig: &Rig, id: &str) -> postgres::Session {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_waits_for_source_read_only_and_unexpired_target_write_credentials() {
+    let Some(rig) = Rig::new("replace-credential-arrival").await else {
+        return;
+    };
+    let (source, source_state, point) = source(&rig).await;
+    let target = replace(&rig, &source, &source_state, &point);
+    let id = target["id"].as_str().unwrap();
+    let source_path = source["archive"]["path"].as_str().unwrap();
+    let target_path = target["archive"]["path"].as_str().unwrap();
+    // replace() delivers both credentials eagerly. Restart clears that cache while retaining
+    // the real source volume, backup and proven sleep, as a fresh desired pull would find them.
+    let rig = rig.restart().await;
+    rig.deliver(source_path, "read_write");
+    rig.deliver(target_path, "read_write");
+    let handle = rig.core.db(id);
+    rig.core
+        .apply(&Rig::page(vec![target.clone()], vec![]))
+        .await;
+    eventually(
+        30,
+        "the replacement to wait for its source credential",
+        || {
+            let view = handle.view();
+            view.adopted && !view.queued && view.reconcile == super::Reconcile::Idle
+        },
+    )
+    .await;
+    assert_ne!(handle.phase(), Phase::Error, "{:?}", handle.view().error);
+    assert!(handle.view().credential_missing_since_ms.is_some());
+    assert!(
+        !rig.machine
+            .has_volume(&VolumeId::new(id, 2).unwrap())
+            .await
+            .unwrap(),
+        "source write access is not the restore job's read-only credential"
+    );
+
+    // An endpoint and a held but expired target credential are not usable write access.
+    rig.core.credentials.hold(
+        crate::credentials::Scope::for_archive(target_path, crate::credentials::Access::ReadWrite)
+            .unwrap(),
+        crate::credentials::Credential::delivered(
+            "fixturekeyid1234",
+            &crate::testpg::password(3),
+            "fixturetoken1234567",
+            0,
+        )
+        .unwrap(),
+    );
+    rig.deliver(source_path, "read_only");
+    eventually(
+        30,
+        "the replacement to wait for a fresh target credential",
+        || {
+            let view = handle.view();
+            view.adopted && !view.queued && view.reconcile == super::Reconcile::Idle
+        },
+    )
+    .await;
+    assert_ne!(handle.phase(), Phase::Error, "{:?}", handle.view().error);
+    assert!(handle.view().credential_missing_since_ms.is_some());
+    assert!(
+        !rig.machine
+            .has_volume(&VolumeId::new(id, 2).unwrap())
+            .await
+            .unwrap(),
+        "an expired write credential must not begin the replacement"
+    );
+
+    // Delivery alone must resume the waiting build; no second desired page is needed.
+    rig.deliver(target_path, "read_write");
+    eventually(120, "the replacement after both credentials arrive", || {
+        matches!(handle.phase(), Phase::Ready | Phase::Error)
+    })
+    .await;
+    assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+    assert!(handle.view().credential_missing_since_ms.is_none());
+    let restored = handle.state().unwrap();
+    assert!(restored.built && restored.backup.is_some());
+    assert_eq!(restored.storage_generation, 2);
+    let session = tenant(&rig, id).await;
+    assert_eq!(
+        session
+            .query("SELECT count(*) FROM replacement_marker", &[])
+            .await
+            .unwrap()[0]
+            .get::<_, i64>(0),
+        1
+    );
+    drop(session);
+    assert!(
+        rig.machine
+            .has_volume(&VolumeId::new(id, 1).unwrap())
+            .await
+            .unwrap(),
+        "the proven source remains until explicit cleanup"
+    );
+    assert_eq!(
+        rig.core
+            .files(id)
+            .load_replacement()
+            .unwrap()
+            .unwrap()
+            .source,
+        source_state
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unreachable_pitr_point_is_not_retried_as_a_temporary_fetch_failure() {
     let Some(rig) = Rig::new("replace-unreachable-point").await else {
         return;
