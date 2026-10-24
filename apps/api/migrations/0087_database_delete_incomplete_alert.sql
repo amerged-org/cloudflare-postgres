@@ -5,8 +5,8 @@
 -- and the files after it. When the node cannot (a full filesystem that makes PostgreSQL's shutdown
 -- checkpoint PANIC, a unit that no signal ends, a user the system cannot lock), the volume stays and
 -- so does its space in the thin pool. The agent says every step that fails and tries again; this kind
--- tells the operator when a delete has not finished ten minutes after the request, ten minutes
--- being below the 20 minutes after which the integrator's delete operation ends `operation_timeout`.
+-- tells the operator when a delete has not finished ten minutes after the request. An accepted
+-- delete is excluded from the generic operation timeout and stays pending until cleanup is proven.
 --
 -- SQLite cannot widen a CHECK in place, so the table is built again as 0082 did and every episode is
 -- copied unchanged. Nothing references `infrastructure_alerts`.
