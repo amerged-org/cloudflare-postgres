@@ -3,7 +3,8 @@
 //! restored the file, and 1 only when the agent answered that the archive does not hold it, which
 //! is how PostgreSQL learns where the archived WAL ends. Every other outcome (no agent, no answer
 //! in time, a failed download) exits 255: PostgreSQL then aborts the recovery instead of ending
-//! it early at the last file it got, and the agent retries the operation.
+//! it early at the last file it got. The agent may retry an unpublished restore after a fetch
+//! timeout, within its fixed attempt limit; other failures never mean the archive ended.
 use pgcf_archive::{CLIENT_BOUND, Reply, Request, exchange, socket, valid_destination, valid_name};
 use std::process::ExitCode;
 

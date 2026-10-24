@@ -606,6 +606,14 @@ plan 9.3, "Changing the page"; it is written there once.
   backup waits for the one big-job slot behind the other restores); any other DONE backup refuses
   the build with `prefix_not_empty`. A backup the earlier run began and did not finish (`STARTED`)
   is no reason.
+  A timed-out WAL download gives the unpublished restore one further attempt, after stopping that
+  target's previous fetch jobs. Two timed-out attempts end as `archive_unusable`; other unavailable
+  archive failures do not become `no_recovery_point`. Each recovery registration holds its own fetch
+  result, so an earlier attempt cannot change a later one's classification. Missing WAL within a
+  proven source chain is `archive_unusable` without retry. A normal archive end and an unreachable
+  PITR target retain their existing behavior. The ordinary operation's existing no-progress and
+  absolute deadlines still apply; rollback of an in-place restore retains its separate
+  source-preserving recovery behavior.
 - **In-place PITR.** Nodes advertise `restore_in_place_v1` in their authenticated hello and repeat it
   in samples for diagnostics. The explicit `replace`
   origin keeps the database ID, socket, Linux account and current roles, but builds a newer storage

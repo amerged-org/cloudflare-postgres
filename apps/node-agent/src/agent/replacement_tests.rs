@@ -13,6 +13,58 @@ async fn tenant(rig: &Rig, id: &str) -> postgres::Session {
         .unwrap()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_pitr_point_is_not_retried_as_a_temporary_fetch_failure() {
+    let Some(rig) = Rig::new("replace-unreachable-point").await else {
+        return;
+    };
+    let (source, state, _) = source(&rig).await;
+    // The proof is written after the last commit. There is no later transaction in the archive
+    // that could make PostgreSQL reach this deliberately unreachable recovery target.
+    let target = replace(
+        &rig,
+        &source,
+        &state,
+        &state.record.as_ref().unwrap().proven_at,
+    );
+    let id = target["id"].as_str().unwrap();
+    let handle = rig.core.db(id);
+    rig.core
+        .apply(&Rig::page(vec![target.clone()], vec![]))
+        .await;
+    eventually(90, "the unreachable point to fail", || {
+        handle.phase() == Phase::Error
+    })
+    .await;
+    assert!(
+        matches!(
+            handle.view().error,
+            Some("no_recovery_point" | "start_failed")
+        ),
+        "{:?}",
+        handle.view().error
+    );
+    assert_eq!(
+        std::fs::read_to_string(rig.fixture.store_directory().join("restore-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    let retained = rig.core.files(id).load_replacement().unwrap().unwrap();
+    assert_eq!(retained.source, state);
+    assert!(
+        retained.attempt.failed,
+        "the API can proceed to forward rollback"
+    );
+    assert!(
+        rig.machine
+            .has_volume(&VolumeId::new(id, 1).unwrap())
+            .await
+            .unwrap()
+    );
+}
+
 async fn source(rig: &Rig) -> (Value, DatabaseState, String) {
     let mut db = rig.entry_json();
     let (entry, handle) = rig.create_from(&db).await;

@@ -2947,6 +2947,106 @@ mod tests {
         source_in_class(rig, 256, 25).await
     }
 
+    /// A live US restore hit the full WAL-fetch bound on an existing, valid archived segment.
+    /// That download failure is retried before the still-unpublished restore is failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wal_fetch_timeout_retries_the_unpublished_restore_and_keeps_its_source() {
+        let Some(rig) = Rig::new("restore-fetch-retry").await else {
+            return;
+        };
+        let (source_json, source_id, source_state) = source(&rig).await;
+        rig.deliver(
+            source_json["archive"]["path"].as_str().unwrap(),
+            "read_only",
+        );
+        rig.fixture.set("fetch-timeout-count", "1");
+        rig.fixture.set(
+            "fetch-timeout-name",
+            &source_state.record.as_ref().unwrap().last_archived_segment,
+        );
+        let mut target = rig.entry_json();
+        let id = id_of(&target);
+        target["origin"] = json!({"kind":"restore", "source":{
+            "database_id":source_id,"path":source_json["archive"]["path"],
+            "backup_id":source_state.backup.as_ref().unwrap().backup_id,
+            "credential":{"id":"crd_rrrrrrrrrrrrrrrrrrrr","expires_at":"2099-01-01T00:00:00.000Z"}}});
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![target], vec![])).await;
+        eventually(90, "the restore after one timed-out download", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+        assert_eq!(
+            std::fs::read_to_string(rig.fixture.store_directory().join("restore-attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        let data = tenant(&rig, &id).await;
+        assert_eq!(
+            data.query("SELECT count(*) FROM t", &[]).await.unwrap()[0].get::<_, i64>(0),
+            4000
+        );
+        assert!(handle.state().unwrap().built && handle.state().unwrap().backup.is_some());
+        assert_eq!(rig.core.db(&source_id).state(), Some(source_state));
+        assert_eq!(rig.core.db(&source_id).phase(), Phase::Asleep);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_wal_fetch_timeouts_are_bounded_and_are_not_a_missing_recovery_point() {
+        let Some(rig) = Rig::new("restore-fetch-bounded").await else {
+            return;
+        };
+        let (source_json, source_id, source_state) = source(&rig).await;
+        rig.deliver(
+            source_json["archive"]["path"].as_str().unwrap(),
+            "read_only",
+        );
+        rig.fixture.set("fetch-timeout-count", "100");
+        rig.fixture.set("fetch-timeout-leaves-unit", "1");
+        rig.fixture.set(
+            "fetch-timeout-name",
+            &source_state.record.as_ref().unwrap().last_archived_segment,
+        );
+        let mut target = rig.entry_json();
+        let id = id_of(&target);
+        target["origin"] = json!({"kind":"restore", "source":{
+            "database_id":source_id,"path":source_json["archive"]["path"],
+            "backup_id":source_state.backup.as_ref().unwrap().backup_id,
+            "credential":{"id":"crd_rrrrrrrrrrrrrrrrrrrr","expires_at":"2099-01-01T00:00:00.000Z"}}});
+        let handle = rig.core.db(&id);
+        rig.core
+            .apply(&Rig::page(vec![target.clone()], vec![]))
+            .await;
+        eventually(90, "the bounded archive failure", || {
+            handle.phase() == Phase::Error
+        })
+        .await;
+        assert_eq!(handle.view().error, Some("archive_unusable"));
+        pulled_again_stays_failed(&rig, &id, &target, "archive_unusable").await;
+        assert_eq!(
+            std::fs::read_to_string(rig.fixture.store_directory().join("restore-attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        let remaining = rig.fixture.running_units();
+        // The regression must also clean its fixture process if the assertion below fails.
+        rig.core
+            .jobs
+            .stop_earlier(&id, crate::archive::job::Kind::WalFetch)
+            .await
+            .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "timed-out fetch still holds its unit: {remaining:?}"
+        );
+        assert_eq!(rig.core.db(&source_id).state(), Some(source_state));
+    }
+
     /// The same, of a class of `memory_mib` and `max_connections`.
     async fn source_in_class(
         rig: &Rig,

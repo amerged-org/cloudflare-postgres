@@ -13,7 +13,7 @@ use crate::{
         facts,
         job::{Job, Store},
         recovery::Restored,
-        restore::{End, Failed, Host, Order, Restorer},
+        restore::{End, Failed, Host, Order, RECOVERY_FETCH_TIMEOUT, Restorer},
         server::{log_failed_job, unix_seconds},
     },
     credentials::Access,
@@ -51,6 +51,10 @@ macro_rules! build_failed {
 
 /// The tasks one database's unit may have (`TasksMax=` of the unit template).
 const TASKS_MAX: u64 = 64;
+/// One additional attempt after a proven WAL-fetch timeout; other recovery failures are not
+/// retried. The database remains unpublished until its first DONE backup, and the existing API
+/// operation deadlines still apply. A restarted agent resumes an interrupted build as before.
+const RECOVERY_ATTEMPTS: u32 = 2;
 /// How old the newest base backup of a database that runs may grow (plan 7.6).
 const BACKUP_MAX_AGE_MS: i64 = 24 * 3_600_000;
 /// How long a base backup that failed waits before it is tried again.
@@ -497,27 +501,52 @@ impl<M: Machine> Core<M> {
             // The target's ready report can cut over without a stale source move hold.
             self.set(db, |view| view.moving = None);
         }
-        let built = if !released {
-            Err("build_failed")
-        } else {
-            match origin {
-                Origin::Create => self.build_create(db, entry).await,
-                Origin::Restore(source) => self.build_restored(db, entry, &source, None).await,
-                Origin::Replace(source, _, _) => {
-                    self.build_restored(db, entry, &source, None).await
+        let mut attempt = 1;
+        let built = loop {
+            let result = if !released {
+                Err("build_failed")
+            } else {
+                match origin.clone() {
+                    Origin::Create => self.build_create(db, entry).await,
+                    Origin::Restore(source) => self.build_restored(db, entry, &source, None).await,
+                    Origin::Replace(source, _, _) => {
+                        self.build_restored(db, entry, &source, None).await
+                    }
+                    Origin::Move(source, end) => {
+                        self.build_restored(db, entry, &source, Some(end)).await
+                    }
+                    Origin::ReplaceRollback(source, _, record, _) => {
+                        let end = End {
+                            system_identifier: record.system_identifier,
+                            timeline: record.timeline,
+                            last_segment: record.last_archived_segment,
+                        };
+                        self.build_restored(db, entry, &source, Some(end)).await
+                    }
                 }
-                Origin::Move(source, end) => {
-                    self.build_restored(db, entry, &source, Some(end)).await
-                }
-                Origin::ReplaceRollback(source, _, record, _) => {
-                    let end = End {
-                        system_identifier: record.system_identifier,
-                        timeline: record.timeline,
-                        last_segment: record.last_archived_segment,
-                    };
-                    self.build_restored(db, entry, &source, Some(end)).await
-                }
+            };
+            if result != Err(RECOVERY_FETCH_TIMEOUT) {
+                break result;
             }
+            // A client timeout does not prove the transient systemd job ended. Stop only this
+            // target's prior fetch jobs before rebuilding or finally abandoning its files.
+            if self
+                .jobs
+                .stop_earlier(&entry.id, crate::archive::job::Kind::WalFetch)
+                .await
+                .is_err()
+            {
+                break Err("archive_unusable");
+            }
+            if attempt == RECOVERY_ATTEMPTS {
+                break Err("archive_unusable");
+            }
+            attempt += 1;
+            crate::timing::log_line(serde_json::json!({
+                "event":"restore_fetch_retry", "database_id":entry.id,
+                "operation":entry.operation, "attempt":attempt, "attempt_limit":RECOVERY_ATTEMPTS,
+            }));
+            tokio::time::sleep(self.timing.recovery_retry).await;
         };
         match built {
             Ok(()) => Ok(()),

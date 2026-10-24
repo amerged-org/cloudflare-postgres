@@ -34,7 +34,9 @@ use super::{
     facts::{self, Backup},
     job::{Database, Job, Jobs, Kind, Outcome, Store},
     recovery::{self, Restored},
-    server::{Recovery, Registration, Table, log_failed_job, unix_seconds},
+    server::{
+        FetchFailure, FetchStatus, Recovery, Registration, Table, log_failed_job, unix_seconds,
+    },
     upload_log::UploadLog,
 };
 use crate::{credentials::Credentials, pg_control, proof, settings::Capacity};
@@ -44,6 +46,18 @@ use std::{future::Future, time::Instant};
 /// What a step of the host did not do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Failed;
+
+/// Internal, never reported as an API error. The controller gives a timed-out recovery fetch
+/// one further attempt before reporting `archive_unusable`.
+pub(crate) const RECOVERY_FETCH_TIMEOUT: &str = "recovery_fetch_timeout";
+
+fn recovery_error(fetch: &FetchStatus, fallback: &'static str) -> &'static str {
+    match fetch.failure() {
+        Some(FetchFailure::TimedOut) => RECOVERY_FETCH_TIMEOUT,
+        Some(FetchFailure::Unavailable) => "archive_unusable",
+        None => fallback,
+    }
+}
 
 /// What the executor needs from the modules that own the database's unit and connection.
 pub trait Host {
@@ -166,12 +180,11 @@ impl Restorer<'_> {
             recovery,
             upload_log: order.upload_log.clone(),
         };
-        let capacity = if finishing {
+        let (capacity, fetch_status) = if finishing {
             // The database is the promoted one of the earlier run, with its first backup DONE.
             // It archives to its own store, and the host starts it on its class's own settings.
             recovery::finish(&database.data_directory(), &spool).map_err(|_| "build_failed")?;
-            self.table.set(registration(None));
-            class
+            (class, self.table.set(registration(None)))
         } else {
             let restore = Job::restore(order.source, order.backup_id, &database.data_directory());
             self.barman(order, order.source, restore, "restore")
@@ -203,19 +216,24 @@ impl Restorer<'_> {
                 .ok_or("build_failed")?;
             recovery::prepare(&database.data_directory(), &settings, order.uid, order.gid)
                 .map_err(|_| "build_failed")?;
-            self.table.set(registration(Some(Recovery {
+            let status = self.table.set(registration(Some(Recovery {
                 source: order.source.clone(),
                 spool: spool.clone(),
                 required_through: order.end.map(|end| end.last_segment.clone()),
                 segment_bytes,
             })));
-            capacity
+            (capacity, status)
         };
 
         // 4. Recovery to the end of the archive or the target, and the check of who promoted.
-        host.start().await.map_err(|_| "start_failed")?;
+        host.start()
+            .await
+            .map_err(|_| recovery_error(&fetch_status, "start_failed"))?;
         phase(order, "recovery_started", &mut lap);
-        let restored = host.promoted().await.map_err(|_| "no_recovery_point")?;
+        let restored = host
+            .promoted()
+            .await
+            .map_err(|_| recovery_error(&fetch_status, "no_recovery_point"))?;
         phase(order, "promoted", &mut lap);
         let end = order
             .end
