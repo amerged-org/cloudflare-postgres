@@ -4220,7 +4220,10 @@ mod tests {
         );
         assert!(!rig.machine.has_account(&leaked_id));
         assert!(rig.machine.has_account(&kept_id));
-        assert_eq!(rig.observation(&leaked_id)["state"], "deleted");
+        assert_eq!(
+            rig.observed(&leaked_id, "deleted").await["state"],
+            "deleted"
+        );
         // A page that does not name a database, and one that names it running, remove nothing.
         rig.core.apply(&Rig::page(vec![kept_page], vec![])).await;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
