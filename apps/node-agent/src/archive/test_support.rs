@@ -54,7 +54,7 @@ impl Fixture {
         script(
             &root.join("bin/systemd-run"),
             r#"#!/bin/sh
-env_file=; runtime=; quiet=; unit=
+env_file=; runtime=; quiet=; unit=; selected_timeout=
 while [ $# -gt 0 ]; do
   case "$1" in
     --) shift; break ;;
@@ -70,12 +70,27 @@ done
 [ -n "$quiet" ] || echo "Running as unit: fixture.service; invocation ID: 0" >&2
 if [ -n "$env_file" ]; then set -a; . "$env_file"; set +a; fi
 ended="$env_file.ended"
+units=$(dirname "$0")/../units
+# A selected recovery fetch can hit its real unit timeout once (or repeatedly), while the
+# source object remains intact. The agent still gets systemd's timeout result, not an exit-code
+# approximation. Other jobs and normal archive-end probes retain their configured bounds.
+timeouts="$units/../store/fetch-timeout-count"
+selected="$units/../store/fetch-timeout-name"
+if [ "${1##*/}" = barman-cloud-wal-restore ] && [ -f "$timeouts" ] && [ -f "$selected" ]; then
+  left=$(cat "$timeouts"); wanted=$(cat "$selected"); matched=
+  for argument in "$@"; do [ "$argument" != "$wanted" ] || matched=1; done
+  if [ "$left" -gt 0 ] && [ -n "$matched" ]; then
+    echo "$((left - 1))" > "$timeouts"
+    runtime=1
+    selected_timeout=1
+    set -- sh -c 'sleep 5; exec "$@"' delayed-fetch "$@"
+  fi
+fi
 # The unit's processes are one group, as in a cgroup that is killed whole (perl: `set -m` needs a
 # terminal, which dash does not have here).
 perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' "$@" &
 command=$!
 # systemd knows the unit by its name while it runs, and a client that went away does not end it.
-units=$(dirname "$0")/../units
 [ -z "$unit" ] || echo "$command" > "$units/$unit.service"
 if [ -n "$runtime" ]; then
   # The unit's own timer: it outlives this client if the client is killed.
@@ -87,7 +102,14 @@ if [ -n "$runtime" ]; then
 fi
 wait $command
 status=$?
-[ -z "$unit" ] || rm -f "$units/$unit.service"
+if [ -n "$selected_timeout" ] && [ -f "$units/../store/fetch-timeout-leaves-unit" ]; then
+  # Model the unit that can outlive a timed-out systemd-run client. Keep a real process group
+  # under this job's unit name, so cleanup must stop it even after the final recovery attempt.
+  perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' sleep 60 </dev/null >/dev/null 2>&1 &
+  echo "$!" > "$units/$unit.service"
+else
+  [ -z "$unit" ] || rm -f "$units/$unit.service"
+fi
 if [ -f "$ended" ]; then result=timeout; status=1
 elif [ $status -eq 0 ]; then result=success
 else result=exit-code; fi
@@ -187,6 +209,7 @@ STORE='{store}'
 {CREDENTIAL_CHECK}
 while [ $# -gt 0 ]; do case "$1" in --endpoint-url) shift ;; *) break ;; esac; shift; done
 dest=$1; server=$2; id=$3; target=$4
+echo "$dest" >> "$STORE/restore-attempts"
 if [ -f "$STORE/restore-fail" ]; then echo 'simulated R2 outage' >&2; exit 4; fi
 src="$STORE/objects/${{dest#s3://}}/$server/base/$id/data"
 if [ ! -d "$src" ]; then echo "Backup $id for server $server does not exist" >&2; exit 1; fi

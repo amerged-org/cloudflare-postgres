@@ -97,6 +97,11 @@ impl Slot {
     }
 }
 
+/// What `mkfs` and `resize2fs` give a volume of `volume_bytes`: it ends one gap before the volume.
+fn filesystem_of(volume_bytes: u64) -> u64 {
+    volume_bytes.saturating_sub(storage::FS_END_GAP_BYTES)
+}
+
 /// Stops that wait for each other (`Local::meet_in_stops`).
 struct StopMeeting {
     count: usize,
@@ -109,6 +114,13 @@ struct State {
     legacy: HashMap<String, Unit>,
     slots: BTreeMap<u32, Slot>,
     volumes: BTreeMap<VolumeId, u64>,
+    /// The size of each volume's filesystem, which a growth sets after the volume's own: the node's
+    /// `resize2fs`.
+    filesystems: BTreeMap<VolumeId, u64>,
+    /// `grow_volume` extends the volume and then fails, as `resize2fs` does when the kernel
+    /// refuses the grow (-28): the filesystem keeps its size.
+    growth_refused: bool,
+    offline_growth: bool,
     /// The volumes the agent has mounted in its mount namespace, each with its link for the
     /// database's unit: what the agent's restart ends. A unit that runs keeps its own mount.
     attached: BTreeSet<VolumeId>,
@@ -141,6 +153,14 @@ struct State {
     /// The order fails once after PostgreSQL is up, as the real one can (EU1, 2026-10-20): the
     /// slot runs on.
     start_fails_after_up: bool,
+    /// The next this many stops of a slot's unit fail as a stop job that does not end, and leave
+    /// the process running.
+    stop_fails: u32,
+    /// The next this many removals of a volume fail as lvm2 does for a volume that is in use.
+    remove_volume_fails: u32,
+    /// The next this many removals of a user fail as `userdel` does when it cannot take the lock
+    /// of `/etc/passwd`.
+    remove_account_fails: u32,
     /// `reboot` fails once, and the node keeps running.
     reboot_fails: bool,
     /// `purge_packages` fails once, as dpkg does for a package that others depend on.
@@ -166,8 +186,11 @@ struct State {
     /// systemd does, and the questions asked: what a reconciliation that retries costs.
     volume_reads_fail: u32,
     unit_reads_fail: u32,
+    pool_sample_gate: Option<Arc<tokio::sync::Semaphore>>,
+    pool_reads: u64,
+    pool_unobserved: bool,
     volume_reads: u64,
-    unit_reads: u64,
+    unit_reads: BTreeMap<String, u64>,
     /// The databases whose unit reads wait for `release_unit_reads`: a systemd that is slow to
     /// answer about them.
     held_units: BTreeSet<String>,
@@ -176,6 +199,10 @@ struct State {
     wait_reads_fail: u32,
     /// Every volume must be repaired before its database starts again.
     needs_repair: bool,
+    /// The volumes a pool without writes tagged, each until a repair clears it.
+    suspects: BTreeSet<VolumeId>,
+    /// A repair of a volume takes this long, as an `e2fsck` does.
+    repair_delay: Option<Duration>,
     units_unreadable: bool,
     /// The `archive_command` of a database, where it is not the layout's.
     archive_commands: HashMap<String, String>,
@@ -526,8 +553,9 @@ impl Local {
     }
     /// Whether `database` has a postmaster running, in a slot or as a unit of its own.
     pub fn running(&self, database: &str) -> bool {
+        let slot = self.pool.slot_of(database);
         let mut state = self.state();
-        if let Some(slot) = self.pool.slot_of(database) {
+        if let Some(slot) = slot {
             return state
                 .slots
                 .get_mut(&slot)
@@ -542,11 +570,11 @@ impl Local {
     /// Whether the postmaster of `database` has written `ready` to its `postmaster.pid`, which the
     /// kernel shows to whoever reads the volume, mounted by the agent or not.
     pub fn postmaster_ready(&self, database: &str) -> bool {
+        let Some(slot) = self.pool.slot_of(database) else {
+            return false;
+        };
         let pid = {
             let mut state = self.state();
-            let Some(slot) = self.pool.slot_of(database) else {
-                return false;
-            };
             let unit = state.slots.get_mut(&slot);
             unit.and_then(|unit| {
                 (unit.postgres && unit.alive())
@@ -558,8 +586,9 @@ impl Local {
     }
     /// SIGKILL: a crash the units do not report.
     pub fn crash(&self, database: &str) {
+        let slot = self.pool.slot_of(database);
         let mut state = self.state();
-        let child = match self.pool.slot_of(database) {
+        let child = match slot {
             Some(slot) => state.slots.get_mut(&slot).and_then(|unit| {
                 unit.lock = None;
                 unit.child.take().inspect(|_| unit.crashed = true)
@@ -626,6 +655,29 @@ impl Local {
             .map(|(id, size)| (id.clone(), *size))
             .collect()
     }
+    /// A legacy filesystem cannot grow while a unit or a job holds it.
+    pub fn set_offline_growth(&self, offline: bool) {
+        self.state().offline_growth = offline;
+    }
+
+    /// The device grows but the filesystem keeps its size, as after resize2fs fails.
+    pub fn set_growth_refused(&self, refused: bool) {
+        self.state().growth_refused = refused;
+    }
+    /// The size of the filesystem on the volume.
+    pub fn filesystem(&self, id: &VolumeId) -> Option<u64> {
+        self.state().filesystems.get(id).copied()
+    }
+    pub fn hold_pool_samples(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut state = self.state();
+        state.pool_sample_gate = Some(gate.clone());
+        state.pool_unobserved = true;
+        gate
+    }
+    pub fn pool_reads(&self) -> u64 {
+        self.state().pool_reads
+    }
     pub fn set_no_room(&self, no_room: bool) {
         self.state().no_room = no_room;
     }
@@ -683,6 +735,34 @@ impl Local {
     pub fn set_needs_repair(&self, needs_repair: bool) {
         self.state().needs_repair = needs_repair;
     }
+    /// The pool took no writes while this volume was mounted: it is tagged suspect, and stays so
+    /// until a repair clears it.
+    pub fn mark_suspect(&self, id: &VolumeId) {
+        self.state().suspects.insert(id.clone());
+    }
+    /// Whether the volume is tagged suspect.
+    pub fn is_suspect(&self, id: &VolumeId) -> bool {
+        let state = self.state();
+        state.needs_repair || state.suspects.contains(id)
+    }
+    /// Every repair of a volume takes `delay` from now on.
+    pub fn slow_repairs(&self, delay: Duration) {
+        self.state().repair_delay = Some(delay);
+    }
+    /// The next `count` clean stops of a database's unit fail and leave its process running; the
+    /// kill ends it.
+    pub fn fail_stops(&self, count: u32) {
+        self.state().stop_fails = count;
+    }
+    /// The next `count` removals of a volume fail, as lvm2 does for a volume that is in use.
+    pub fn fail_volume_removals(&self, count: u32) {
+        self.state().remove_volume_fails = count;
+    }
+    /// The next `count` removals of a user fail, as `userdel` does without the lock of
+    /// `/etc/passwd`.
+    pub fn fail_account_removals(&self, count: u32) {
+        self.state().remove_account_fails = count;
+    }
     pub fn set_units_unreadable(&self, unreadable: bool) {
         self.state().units_unreadable = unreadable;
     }
@@ -716,7 +796,10 @@ impl Local {
     /// How often `has_volume` was asked, and how often `unit` was.
     pub fn reads(&self) -> (u64, u64) {
         let state = self.state();
-        (state.volume_reads, state.unit_reads)
+        (state.volume_reads, state.unit_reads.values().sum())
+    }
+    pub fn unit_reads_by_database(&self) -> BTreeMap<String, u64> {
+        self.state().unit_reads.clone()
     }
     /// A unit that exists and is stopped, as one is after a stop or a boot.
     pub fn add_stopped_unit(&self, database: &str) {
@@ -886,7 +969,15 @@ impl Machine for Local {
         })
     }
     async fn remove_account(&self, database: &str) -> io::Result<()> {
-        self.state().accounts.retain(|a| a != database);
+        let mut state = self.state();
+        state.calls.push(format!("remove account {database}"));
+        if state.remove_account_fails > 0 {
+            state.remove_account_fails -= 1;
+            return Err(io::Error::other(
+                "userdel ended with exit status: 1: cannot lock /etc/passwd",
+            ));
+        }
+        state.accounts.retain(|a| a != database);
         Ok(())
     }
 
@@ -925,6 +1016,9 @@ impl Machine for Local {
         }
         fs::create_dir_all(&live)?;
         state.volumes.insert(id.clone(), size_bytes);
+        state
+            .filesystems
+            .insert(id.clone(), filesystem_of(size_bytes));
         state.attached.insert(id.clone());
         Ok(())
     }
@@ -1018,15 +1112,36 @@ impl Machine for Local {
         }
     }
     async fn grow_volume(&self, id: &VolumeId, size_bytes: u64) -> Result<(), storage::Error> {
+        let held = self.held(id);
         let mut state = self.state();
-        match state.volumes.get_mut(id) {
-            None => Err(storage::Error::Missing),
-            Some(size) if size_bytes < *size => Err(storage::Error::Shrink),
-            Some(size) => {
-                *size = size_bytes;
-                Ok(())
-            }
+        if state.offline_growth && held {
+            return Err(storage::Error::OfflineGrowRequired);
         }
+        state.calls.push(format!("grow {}", id.database()));
+        let current = *state.volumes.get(id).ok_or(storage::Error::Missing)?;
+        if size_bytes < current {
+            return Err(storage::Error::Shrink);
+        }
+        state.volumes.insert(id.clone(), size_bytes);
+        if state.growth_refused {
+            return Err(storage::Error::Command {
+                program: "resize2fs".into(),
+                code: 1,
+                stderr: "No space left on device while checking for on-line resizing support"
+                    .into(),
+            });
+        }
+        state
+            .filesystems
+            .insert(id.clone(), filesystem_of(size_bytes));
+        Ok(())
+    }
+    async fn filesystem_bytes(&self, id: &VolumeId) -> Result<u64, storage::Error> {
+        self.state()
+            .filesystems
+            .get(id)
+            .copied()
+            .ok_or(storage::Error::Missing)
     }
     async fn remove_volume(&self, id: &VolumeId, _removal: Removal) -> Result<(), storage::Error> {
         let held = self.held(id);
@@ -1036,8 +1151,13 @@ impl Machine for Local {
         if held {
             return Err(storage::Error::Busy);
         }
+        if state.remove_volume_fails > 0 {
+            state.remove_volume_fails -= 1;
+            return Err(storage::Error::Busy);
+        }
         state.volumes.remove(id);
-        state.attached.remove(id);
+        state.filesystems.remove(id);
+        let was_attached = state.attached.remove(id);
         let others = state
             .volumes
             .keys()
@@ -1049,6 +1169,8 @@ impl Machine for Local {
             .volume(&format!("{}.g{}", id.database(), id.generation()));
         let target = if aside.exists() {
             aside
+        } else if was_attached {
+            self.layout.volume(id.database())
         } else if others {
             return Ok(());
         } else {
@@ -1063,21 +1185,41 @@ impl Machine for Local {
         self.state().calls.push(format!("trim {}", id.database()));
         Ok(())
     }
-    async fn needs_repair(&self, _id: &VolumeId) -> Result<bool, storage::Error> {
-        Ok(self.state().needs_repair)
+    async fn needs_repair(&self, id: &VolumeId) -> Result<bool, storage::Error> {
+        Ok(self.is_suspect(id))
+    }
+    async fn suspect_volumes(&self) -> Result<Vec<VolumeId>, storage::Error> {
+        let state = self.state();
+        Ok(if state.needs_repair {
+            state.volumes.keys().cloned().collect()
+        } else {
+            state.suspects.iter().cloned().collect()
+        })
     }
     async fn recover_volume(
         &self,
         id: &VolumeId,
         _policy: &storage::Policy,
     ) -> Result<(), storage::Error> {
-        self.state()
-            .calls
-            .push(format!("recover {}", id.database()));
-        // The repair detaches the volume first, which a holder refuses.
+        let (delay, no_room) = {
+            let mut state = self.state();
+            state.calls.push(format!("recover {}", id.database()));
+            (state.repair_delay, state.no_room)
+        };
+        // The repair detaches the volume first, which a holder refuses, and writes, which a pool
+        // without room does not take.
         if self.held(id) {
             return Err(storage::Error::Busy);
         }
+        if no_room {
+            return Err(storage::Error::NoRoom(NoRoom::Reserve));
+        }
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let mut state = self.state();
+        state.needs_repair = false;
+        state.suspects.remove(id);
         Ok(())
     }
     async fn inventory(&self) -> Result<Inventory, storage::Error> {
@@ -1090,7 +1232,6 @@ impl Machine for Local {
                 size_bytes: *size,
                 pool_used_bytes: 150 << 20,
                 formatted: true,
-                reserve_released: false,
                 suspect: false,
                 fs_errors: false,
                 mount: state.attached.contains(id).then_some(MountInfo {
@@ -1110,6 +1251,15 @@ impl Machine for Local {
         })
     }
     async fn poll_pool(&self) -> Result<PoolSample, storage::Error> {
+        let gate = {
+            let mut state = self.state();
+            state.pool_reads += 1;
+            state.pool_sample_gate.clone()
+        };
+        if let Some(gate) = gate {
+            let _permit = gate.acquire().await.unwrap();
+        }
+        self.state().pool_unobserved = false;
         Ok(PoolSample {
             observed: Instant::now(),
             data_total_bytes: 100 << 30,
@@ -1121,7 +1271,10 @@ impl Machine for Local {
         })
     }
     fn room(&self, _policy: &storage::Policy) -> Result<(), NoRoom> {
-        if self.state().no_room {
+        let state = self.state();
+        if state.pool_unobserved {
+            Err(NoRoom::Unobserved)
+        } else if state.no_room {
             Err(NoRoom::Reserve)
         } else {
             Ok(())
@@ -1195,7 +1348,7 @@ impl Machine for Local {
     async fn unit(&self, database: &str) -> Result<UnitState, units::Error> {
         let held = {
             let mut state = self.state();
-            state.unit_reads += 1;
+            *state.unit_reads.entry(database.to_string()).or_default() += 1;
             state.held_units.contains(database)
         };
         if held {
@@ -1305,6 +1458,22 @@ impl Machine for Local {
         self.state().stops -= 1;
         stopped
     }
+    async fn kill(&self, database: &str) -> Result<(), units::Error> {
+        self.state().calls.push(format!("kill {database}"));
+        if self.pool.kill(database).await? {
+            return Ok(());
+        }
+        let child = self
+            .state()
+            .legacy
+            .get_mut(database)
+            .and_then(|unit| unit.child.take());
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Ok(())
+    }
     async fn set_limits(&self, database: &str, limits: &Limits) -> Result<(), units::Error> {
         self.pool.set(database, &limits.properties()).await?;
         Ok(())
@@ -1348,14 +1517,19 @@ impl Machine for Local {
     /// database a slot holds, if there is exactly one.
     fn caller(&self, _uid: u32, pid: u32) -> Option<String> {
         let databases = self.pool.databases();
+        // Never hold the machine's state while asking the pool: a pool sweep holds its table
+        // while it reads the machine's process state through `Host::alive`.
+        let slots: Vec<_> = databases
+            .iter()
+            .filter_map(|database| self.pool.slot_of(database).map(|slot| (database, slot)))
+            .collect();
         let postmasters: Vec<(String, u32)> = {
             let state = self.state();
-            databases
+            slots
                 .iter()
-                .filter_map(|database| {
-                    let slot = self.pool.slot_of(database)?;
-                    let main = state.slots.get(&slot)?.child.as_ref()?.id();
-                    Some((database.clone(), main))
+                .filter_map(|(database, slot)| {
+                    let main = state.slots.get(slot)?.child.as_ref()?.id();
+                    Some(((*database).clone(), main))
                 })
                 .collect()
         };
@@ -2053,6 +2227,13 @@ impl Host for LocalHost {
     async fn stop(&self, slot: u32) -> Result<(), units::Error> {
         let (child, database) = {
             let mut state = self.0.state();
+            if state.stop_fails > 0 && state.slots.contains_key(&slot) {
+                state.stop_fails -= 1;
+                return Err(units::Error::Job {
+                    unit: slots::slot_unit(slot),
+                    result: "timeout".into(),
+                });
+            }
             let Some(unit) = state.slots.get_mut(&slot) else {
                 return Ok(());
             };
@@ -2083,6 +2264,36 @@ impl Host for LocalHost {
             if let Some(database) = database {
                 self.0.release_shared_memory(&database);
             }
+        }
+        Ok(())
+    }
+
+    /// SIGKILL to the process of the unit: it ends at once and the unit is `failed`.
+    async fn kill(&self, slot: u32) -> Result<(), units::Error> {
+        let (child, database) = {
+            let mut state = self.0.state();
+            let Some(unit) = state.slots.get_mut(&slot) else {
+                return Ok(());
+            };
+            let database = unit.mounted.take().map(|(database, _)| database);
+            unit.postgres = false;
+            unit.lock = None;
+            unit.crashed = unit.child.is_some();
+            (unit.child.take(), database)
+        };
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(database) = database {
+                self.0.release_shared_memory(&database);
+            }
+        }
+        Ok(())
+    }
+
+    async fn reset(&self, slot: u32) -> Result<(), units::Error> {
+        if let Some(unit) = self.0.state().slots.get_mut(&slot) {
+            unit.crashed = false;
         }
         Ok(())
     }

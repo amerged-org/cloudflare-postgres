@@ -24,7 +24,10 @@ import {
   type IdempotencyLease,
 } from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
-import { latestAgentSampleSql } from "./operational-health.ts";
+import {
+  latestAgentSampleSql,
+  latestFilesystemSampleSql,
+} from "./operational-health.ts";
 import { keyring } from "../crypto/keyring.ts";
 import {
   choosePlacement,
@@ -348,7 +351,7 @@ export async function listDatabases(c: ApiContext): Promise<Response> {
     bindings.push(query.observed_state);
   }
   const result = await c.env.DB.prepare(
-    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")} FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${latestFilesystemSampleSql("d")} filesystem_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")} FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
   )
     .bind(...bindings, ...cursor.bindings, pagination.limit + 1)
     .all<DatabaseRow>();

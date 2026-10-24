@@ -14,6 +14,7 @@ import {
   infrastructureAlertStatus,
   runInfrastructureHealthAlerts,
 } from "../../src/domain/infrastructure-alerts.ts";
+import { evaluateAlerts } from "../../src/cron-watchdog.ts";
 import { cleanupFixtures, fixture, nodeRequest } from "./fixtures.ts";
 
 afterEach(async () => {
@@ -468,6 +469,47 @@ it("still judges nodes when the database reads fail and keeps the unread kinds a
   expect(logged).toHaveBeenCalled();
 });
 
+it("keeps a failing read of the pool-closed kind from holding back the database kinds", async () => {
+  const f = await fixture(),
+    now = Date.now(),
+    hook = receiver();
+  await database(
+    f,
+    "archive",
+    awake(now, {
+      archiving_health: "failing",
+      archiving_health_since: ago(now, HOUR),
+    }),
+  );
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  // The read of the smallest class on offer is the pool-closed kind's own; only it fails.
+  const broken = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          if (sql.startsWith("SELECT * FROM size_classes WHERE enabled=1"))
+            throw new Error("injected_class_read_failure");
+          return target.prepare(sql);
+        };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  await expect(
+    runInfrastructureHealthAlerts(
+      { ...hook.env, DB: broken },
+      now,
+      hook.fetcher,
+    ),
+  ).rejects.toThrow("injected_class_read_failure");
+  // The database kind was judged and raised; the pool-closed kind is unknown and starts nothing.
+  expect(await status(f, "database_archive_failing")).toMatchObject({
+    active: true,
+  });
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+  expect(logged).toHaveBeenCalled();
+});
+
 it("still judges every region's nodes and databases when the backup health read fails", async () => {
   const f = await fixture(),
     now = Date.now(),
@@ -608,6 +650,78 @@ it("warns of a volume that crosses 80 % between two quarter-hour marks, from the
     database_ids: [id],
     action: INFRA_ALERT_ACTIONS.database_volume_warning,
   });
+});
+
+it("raises database_volume_critical at the first evaluation after a volume report crosses 90 %, for bytes and for inodes, and logs the episode it opened", async () => {
+  const f = await fixture(),
+    hook = receiver(),
+    bytes = await database(f, "full-bytes", awake(Date.now(), {})),
+    inodes = await database(f, "full-inodes", awake(Date.now(), {})),
+    total = 5 * 1024 ** 3,
+    logged = vi.spyOn(console, "log").mockImplementation(() => {});
+  const reported = Date.now() - 30_000,
+    volume = (database: string, usedBytes: number, usedInodes: number) => ({
+      database,
+      storage_generation: 1,
+      mounted: true,
+      size_bytes: total,
+      pool_used_bytes: 0,
+      filesystem: {
+        total_bytes: total,
+        used_bytes: usedBytes,
+        inodes_total: 327_680,
+        inodes_used: usedInodes,
+      },
+    });
+  // One report of the node: the first volume is 91 % full in bytes, the second in inodes.
+  expect(
+    (
+      await nodeRequest(f, "/node/v1/volumes", {
+        method: "POST",
+        body: {
+          observed_at: new Date(reported).toISOString(),
+          volumes: [
+            volume(bytes, Math.floor(total * 0.91), 1500),
+            volume(inodes, Math.floor(total * 0.1), 298_000),
+          ],
+        },
+      })
+    ).status,
+  ).toBe(200);
+  const evaluatedAt = Date.now();
+  expect(
+    (await evaluateAlerts(hook.env, evaluatedAt, hook.fetcher)).failed,
+  ).toEqual([]);
+  const episode = await status(f, "database_volume_critical"),
+    stored = await env.DB.prepare(
+      "SELECT MIN(observed_at) observed_at FROM node_volumes WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first<{ observed_at: string }>();
+  expect(episode).toMatchObject({ active: true });
+  // From the report's time in D1 to the start of the episode: one evaluation, not a quarter hour.
+  expect(
+    Date.parse(episode!.occurred_at!) - Date.parse(stored!.observed_at),
+  ).toBeLessThanOrEqual(120_000);
+  expect(await status(f, "database_volume_warning")).toBeUndefined();
+  expect(
+    hook.events
+      .filter((value) => value.event.kind === "database_volume_critical")
+      .map((value) => [...(value.event.database_ids ?? [])].sort()),
+  ).toEqual([[bytes, inodes].sort()]);
+  // The evaluation says which episode it opened, so that a delay can be attributed to its run.
+  const opened = logged.mock.calls
+    .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+    .filter((line) => line.event === "alert_episode_opened");
+  expect(opened).toEqual([
+    {
+      event: "alert_episode_opened",
+      region_id: f.region,
+      kind: "database_volume_critical",
+      event_id: episode!.event_id,
+      occurred_at: episode!.occurred_at,
+    },
+  ]);
 });
 
 /** The stored row of a kind, as the delivery reads it. */

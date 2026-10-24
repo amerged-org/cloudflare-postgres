@@ -246,7 +246,7 @@ export async function enrollNode(
     throw refuse("token", "unauthorized");
   const now = new Date().toISOString();
   // The right token presented in vain, by another key or too late, raises an alert (plan 8): the
-  // refusal is recorded for the minute cron to judge.
+  // refusal is recorded for the CronWatchdog alarm's alert evaluation to judge.
   const refuseInVain = async (
     reason: "repeat" | "expired",
     code: "unauthorized" | "conflict",

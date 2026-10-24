@@ -12,7 +12,7 @@ import {
   newApiKey,
   newApiKeyId,
 } from "@pgcf/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanupFixtures, fixture, request } from "../domain/fixtures.ts";
 
 const DAY = 86_400_000;
@@ -390,6 +390,120 @@ describe("the audit log", () => {
     });
     expect(created.status).toBe(201);
     expect(await count("audit_events")).toBe(rowsBefore + 1);
+  });
+
+  /**
+   * A database whose inserts into the audit log fail as D1 does when a request is lost
+   * ("Network connection lost" after about 12 s, 2026-10-23 16:03:35): `plan` says, for the attempt
+   * with that number, whether the insert fails before it reaches D1, after D1 committed it, or not.
+   */
+  function faultyAudit(plan: (attempt: number) => "before" | "after" | "ok") {
+    let attempts = 0;
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (sql: string) => {
+            const statement = target.prepare(sql);
+            if (!sql.startsWith("INSERT INTO audit_events")) return statement;
+            return {
+              bind: (...values: unknown[]) => {
+                const bound = statement.bind(...values);
+                return {
+                  run: async () => {
+                    const mode = plan(++attempts);
+                    if (mode === "before")
+                      throw new Error("D1_ERROR: Network connection lost.");
+                    const result = await bound.run();
+                    if (mode === "after")
+                      throw new Error("D1_ERROR: Network connection lost.");
+                    return result;
+                  },
+                };
+              },
+            } as unknown as D1PreparedStatement;
+          };
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    return { bindings: { DB: db }, attempts: () => attempts };
+  }
+
+  it("writes its audit row again after a transient D1 fault, and the change runs once", async () => {
+    const f = await fixture();
+    await env.DB.prepare("DELETE FROM audit_events").run();
+    const fault = faultyAudit((attempt) => (attempt === 1 ? "before" : "ok"));
+    const created = await request(
+      "/v1/projects",
+      f.admin,
+      "POST",
+      { name: "acct-retried" },
+      undefined,
+      undefined,
+      fault.bindings,
+    );
+    expect(created.status).toBe(201);
+    expect(fault.attempts()).toBe(2);
+    expect(await count("projects WHERE name='acct-retried'")).toBe(1);
+    const rows = await rowsOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ route: "/v1/projects", status: 201 });
+  });
+
+  it("keeps one audit row when the first insert committed and only its answer was lost", async () => {
+    const f = await fixture();
+    await env.DB.prepare("DELETE FROM audit_events").run();
+    const fault = faultyAudit((attempt) => (attempt === 1 ? "after" : "ok"));
+    const created = await request(
+      "/v1/projects",
+      f.admin,
+      "POST",
+      { name: "acct-committed" },
+      undefined,
+      undefined,
+      fault.bindings,
+    );
+    expect(created.status).toBe(201);
+    expect(fault.attempts()).toBe(2);
+    expect(await count("projects WHERE name='acct-committed'")).toBe(1);
+    const rows = await rowsOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ route: "/v1/projects", status: 201 });
+  });
+
+  it("still fails closed, after bounded attempts, when D1 refuses every audit insert, and logs the D1 error", async () => {
+    const f = await fixture();
+    await env.DB.prepare("DELETE FROM audit_events").run();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const fault = faultyAudit(() => "before");
+      const refused = await request(
+        "/v1/projects",
+        f.admin,
+        "POST",
+        { name: "acct-refused" },
+        undefined,
+        undefined,
+        fault.bindings,
+      );
+      expect(refused.status).toBe(500);
+      expect(await code(refused)).toBe("internal");
+      expect(fault.attempts()).toBe(3);
+      expect(await count("projects WHERE name='acct-refused'")).toBe(0);
+      expect(await count("audit_events")).toBe(0);
+      const lines = logged.mock.calls
+        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+        .filter((line) => line.event === "audit_write_failed");
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({
+        phase: "before_change",
+        error_code: "d1_error",
+        attempts: 3,
+        message: "D1_ERROR: Network connection lost.",
+      });
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   it("does not claim an outcome it could not record, and does not undo the change", async () => {

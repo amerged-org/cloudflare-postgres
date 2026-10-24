@@ -2,6 +2,8 @@
 import { env } from "cloudflare:workers";
 import {
   DatabaseWithOperation,
+  INFRA_ALERT_ACTIONS,
+  FILESYSTEM_END_GAP_BYTES,
   InfraAlert,
   type InfraAlertKind,
 } from "@pgcf/contracts";
@@ -17,8 +19,15 @@ import {
 } from "../../src/domain/node-state.ts";
 import { addNode, cleanupFixtures, fixture } from "./fixtures.ts";
 import {
+  choosePlacement,
+  placementNodes,
+  type PlacementNeed,
+} from "../../src/domain/placement.ts";
+import { closedPools } from "../../src/domain/placement-closed.ts";
+import {
   forgetSamples,
   GIB,
+  MIB,
   OPEN_POOL,
   seedSamples,
   steady,
@@ -34,6 +43,12 @@ afterEach(async () => {
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 const MINUTE = 60_000;
+/** What the fixture's class asks of a node. */
+const SMALLEST: PlacementNeed = {
+  memory_mib: 512,
+  cpu_millicores: 500,
+  storage_gib: 5,
+};
 const WEBHOOK = {
   INFRASTRUCTURE_ALERT_WEBHOOK_URL: "https://receiver.invalid/events",
   INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN: "test-alert-receiver-token",
@@ -324,6 +339,228 @@ it("alarms a pool that placement has closed, by its data, its metadata or the lo
   }
 });
 
+/** An enabled size class of the given storage, smaller than the fixture's; removed by the caller. */
+async function offerClass(id: string, storageGib: number, enabled = true) {
+  const at = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
+    VALUES (?,256,250,?,50,NULL,60,7,?,?,?)`,
+  )
+    .bind(id, storageGib, Number(enabled), at, at)
+    .run();
+}
+
+it("closes the pool for the smallest class on offer: 4 GiB below the logical cap is closed for a class of 5 GiB, and a class of 1 GiB opens it again", async () => {
+  const f = await fixture(0),
+    hook = receiver(),
+    smaller = "s" + crypto.randomUUID().replaceAll("-", "").slice(0, 8),
+    now = Date.now();
+  const closed = () =>
+    hook.events.filter((event) => event.kind === "regional_node_pool_closed");
+  try {
+    // A pool of 100 GiB sells 400 GiB. The smallest class on offer is the fixture's 5 GiB: 395 GiB
+    // sold leave room for exactly one, 396 GiB do not, though the pool is below its cap.
+    await seedSamples(f.node, [
+      { at: now, pool: pool({ nominal: 395 * GIB }) },
+    ]);
+    await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+    expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+    await seedSamples(f.node, [
+      { at: now + 1000, pool: pool({ nominal: 396 * GIB }) },
+    ]);
+    await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
+    expect(closed()).toHaveLength(1);
+    expect(closed()[0]).toMatchObject({ node_ids: [f.node] });
+    // A class of 1 GiB goes on offer: it fits, so the region is open again.
+    await offerClass(smaller, 1);
+    await runInfrastructureHealthAlerts(hook.env, now + 2000, hook.fetcher);
+    expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+      active: false,
+    });
+    // A disabled class is not on offer: the pool is closed for the 5 GiB class again.
+    await env.DB.prepare("UPDATE size_classes SET enabled=0 WHERE id=?")
+      .bind(smaller)
+      .run();
+    await runInfrastructureHealthAlerts(hook.env, now + 3000, hook.fetcher);
+    expect(closed()).toHaveLength(2);
+    expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+      active: true,
+    });
+  } finally {
+    await env.DB.prepare("DELETE FROM size_classes WHERE id=?")
+      .bind(smaller)
+      .run();
+  }
+});
+
+it("closes the pool of a node that takes no new databases once the smallest class no longer fits under the logical cap: the pool judges it, not the load", async () => {
+  const f = await fixture(0),
+    hook = receiver(),
+    now = Date.now();
+  // Placement is switched off on the node, so no RAM or CPU judgement reaches it: only the pool
+  // can call it closed, and it must judge the cap with the storage of the class on offer.
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_enabled=0 WHERE id=?",
+  )
+    .bind(f.node)
+    .run();
+  const closed = () =>
+    hook.events.filter((event) => event.kind === "regional_node_pool_closed");
+  // 395 GiB of the 400 GiB sold: the 5 GiB class still fits.
+  await seedSamples(f.node, [{ at: now, pool: pool({ nominal: 395 * GIB }) }]);
+  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+  // 396 GiB: 4 GiB are left, the pool is below its cap and the smallest class does not fit.
+  await seedSamples(f.node, [
+    { at: now + 1000, pool: pool({ nominal: 396 * GIB }) },
+  ]);
+  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
+  expect(closed()).toHaveLength(1);
+  expect(closed()[0]).toMatchObject({ node_ids: [f.node] });
+});
+
+it("calls a region closed for the pool only when no node can take the smallest class: one node at the logical cap beside an open node is no episode, and both at it are one that lists both", async () => {
+  const f = await fixture(0),
+    second = await addNode(f.region, 0),
+    hook = receiver(),
+    at = Date.now();
+  const closed = () =>
+    hook.events.filter((event) => event.kind === "regional_node_pool_closed");
+  // The pools of 100 GiB sell 400 GiB. The first has 396 GiB sold: the 5 GiB class does not fit
+  // under its cap. The second is open, at 10 % RAM, and placement chooses it.
+  const sold = pool({ nominal: 396 * GIB });
+  await seedSamples(f.node, steady(at, 40, { ramPpm: 100_000, pool: sold }));
+  await seedSamples(second, steady(at, 40, { ramPpm: 100_000 }));
+  const nodes = await placementNodes(env.DB, f.region, at);
+  expect(choosePlacement(nodes, SMALLEST, at)?.id).toBe(second);
+  expect(await closedPools(env.DB, f.region, at)).toEqual([]);
+  await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+  expect(closed()).toEqual([]);
+  // The second reaches the cap as well: no node takes the class, the region is closed and the
+  // episode names both nodes.
+  await seedSamples(second, [{ at: at + MINUTE, pool: sold }]);
+  await runInfrastructureHealthAlerts(hook.env, at + MINUTE, hook.fetcher);
+  expect(closed()).toHaveLength(1);
+  expect(closed()[0]?.node_ids?.slice().sort()).toEqual(
+    [f.node, second].sort(),
+  );
+  expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+    active: true,
+  });
+  // A database is deleted on the first: the class fits there again, and the episode ends with
+  // the second node still at the cap.
+  await seedSamples(f.node, [{ at: at + 2 * MINUTE, pool: pool({}) }]);
+  await runInfrastructureHealthAlerts(hook.env, at + 2 * MINUTE, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+    active: false,
+  });
+  expect(closed()).toHaveLength(1);
+});
+
+it("keeps the episode of a region whose open node is out of RAM while another is at the logical cap, and ends it when either node takes the class", async () => {
+  const f = await fixture(0),
+    second = await addNode(f.region, 0),
+    hook = receiver(),
+    at = Date.now();
+  const closed = () =>
+    hook.events.filter((event) => event.kind === "regional_node_pool_closed");
+  // The first node is at the cap; the second has a pool with room and 90 % RAM: nothing fits.
+  await seedSamples(
+    f.node,
+    steady(at, 40, { ramPpm: 100_000, pool: pool({ nominal: 396 * GIB }) }),
+  );
+  await seedSamples(second, steady(at, 40, { ramPpm: 900_000 }));
+  await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
+  expect(closed()).toHaveLength(1);
+  expect(closed()[0]?.node_ids?.slice().sort()).toEqual(
+    [f.node, second].sort(),
+  );
+  // The second one's RAM falls to 50 % over the window: it takes the class, the episode ends.
+  await forgetSamples(second);
+  await seedSamples(second, steady(at + 5 * MINUTE, 40, { ramPpm: 500_000 }));
+  await runInfrastructureHealthAlerts(hook.env, at + 5 * MINUTE, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+    active: false,
+  });
+});
+
+it("closes the region when its only node has no RAM or CPU left for the smallest class, and opens it when the node has", async () => {
+  const f = await fixture(0),
+    hook = receiver(),
+    at = Date.now();
+  const closed = () =>
+    hook.events.filter((event) => event.kind === "regional_node_pool_closed");
+  // Half an hour at 81 % active RAM: the 30-minute average is over the 80 % placement allows.
+  await seedSamples(f.node, steady(at, 40, { ramPpm: 810_000 }));
+  await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
+  expect(closed()).toHaveLength(1);
+  expect(closed()[0]).toMatchObject({ node_ids: [f.node] });
+  // The same node with its RAM at 50 % over the whole window takes a database again.
+  await forgetSamples(f.node);
+  await seedSamples(f.node, steady(at + 5 * MINUTE, 40, { ramPpm: 500_000 }));
+  await runInfrastructureHealthAlerts(hook.env, at + 5 * MINUTE, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+    active: false,
+  });
+  // The CPU is the same: 81 % busy over all cores.
+  await forgetSamples(f.node);
+  await seedSamples(f.node, steady(at + 10 * MINUTE, 40, { cpuPpm: 810_000 }));
+  await runInfrastructureHealthAlerts(hook.env, at + 10 * MINUTE, hook.fetcher);
+  expect(closed()).toHaveLength(2);
+  expect(closed()[1]).toMatchObject({ node_ids: [f.node] });
+});
+
+it("leaves the region open while another node takes the smallest class, and says nothing of a node whose load is not known yet", async () => {
+  const f = await fixture(0),
+    second = await addNode(f.region, 0),
+    hook = receiver(),
+    at = Date.now();
+  // The first node is full of RAM; the second has the room: databases still have a place.
+  await seedSamples(f.node, steady(at, 40, { ramPpm: 900_000 }));
+  await seedSamples(second, steady(at, 40, { ramPpm: 100_000 }));
+  await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+  // The second node is new: a few seconds of samples are no 30-minute average, so nothing is known
+  // of it, and the region is not called closed on what is not known.
+  await forgetSamples(second);
+  await seedSamples(second, [{ at: at + 1000 }]);
+  await runInfrastructureHealthAlerts(hook.env, at + 1000, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+});
+
+it("does not call a region closed for the databases a burst of creates placed since the node's newest sample", async () => {
+  const f = await fixture(0),
+    hook = receiver(),
+    at = Date.now();
+  // An idle node of 4 GiB, 40 minutes of samples; the smallest class asks 512 MiB.
+  await seedSamples(f.node, steady(at, 40, { totalBytes: 4096 * MIB }));
+  for (let index = 0; index < 6; index++)
+    expect((await f.create(`burst-${index}`)).status).toBe(202);
+  // Six databases of 512 MiB that no sample counts yet: 75 % of the node as far as placement is
+  // concerned, so a seventh waits for the next sample, while the measured load is 0.
+  const node = (await placementNodes(env.DB, f.region, Date.now())).find(
+    (value) => value.id === f.node,
+  )!;
+  expect(node.pending_memory_mib).toBe(6 * 512);
+  expect(choosePlacement([node], SMALLEST, Date.now())).toBeNull();
+  await runInfrastructureHealthAlerts(hook.env, Date.now(), hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+});
+
+it("does not call a region closed for a node that went quiet: that is the stale alarm's", async () => {
+  const f = await fixture(0),
+    hook = receiver(),
+    at = Date.now();
+  // Its last sample is ten minutes old and showed a full node: nothing is known of it now.
+  await seedSamples(f.node, steady(at - 10 * MINUTE, 40, { ramPpm: 900_000 }));
+  await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+  expect(hook.events.map((event) => event.kind)).toEqual([
+    "regional_node_stale",
+  ]);
+});
+
 it("counts the storage a node has not finished against the logical cap of the alarm", async () => {
   const f = await fixture(0),
     hook = receiver(),
@@ -505,6 +742,62 @@ it("warns at 80 % and 90 % of a volume's space or inodes, once for each level", 
   });
 });
 
+it("raises the loud volume alert for a filesystem that is smaller than the storage, and ends it when the filesystem has grown", async () => {
+  const f = await fixture(),
+    hook = receiver(),
+    id = await placed(f, "unresized"),
+    now = Date.now();
+  // The class has 5 GiB: its filesystem is that less the gap at the end of the volume.
+  const fits = 5 * GIB - FILESYSTEM_END_GAP_BYTES;
+  const reported = (bytes: number | null, generation?: number) =>
+    env.DB.prepare(
+      `UPDATE databases SET observed_storage_bytes=?,observed_generation=COALESCE(?,observed_generation) WHERE id=?`,
+    )
+      .bind(bytes, generation ?? null, id)
+      .run();
+  const critical = () =>
+    hook.events.filter((event) => event.kind === "database_volume_critical");
+  // The node has reported the database at its generation.
+  await env.DB.prepare(
+    "UPDATE databases SET observed_generation=generation WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  await reported(fits);
+  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+  expect(critical()).toEqual([]);
+  // A node that has not told its size (an agent of an earlier release) is not judged.
+  await reported(null);
+  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
+  expect(critical()).toEqual([]);
+  // A resize left the filesystem at 2 GiB under a volume of 5.
+  await reported(2 * GIB);
+  await runInfrastructureHealthAlerts(hook.env, now + 2000, hook.fetcher);
+  expect(critical()).toMatchObject([{ database_ids: [id] }]);
+  // Nothing new while it stays there.
+  await runInfrastructureHealthAlerts(hook.env, now + 3000, hook.fetcher);
+  expect(critical()).toHaveLength(1);
+  // A resize that the node has not reported yet is not judged by the figure of the generation before.
+  await env.DB.prepare("UPDATE databases SET observed_generation=0 WHERE id=?")
+    .bind(id)
+    .run();
+  await runInfrastructureHealthAlerts(hook.env, now + 4000, hook.fetcher);
+  expect(await status(f, "database_volume_critical")).toMatchObject({
+    active: false,
+  });
+  await reported(2 * GIB, 1);
+  await runInfrastructureHealthAlerts(hook.env, now + 5000, hook.fetcher);
+  expect(await status(f, "database_volume_critical")).toMatchObject({
+    active: true,
+  });
+  // The node's next try grew it.
+  await reported(fits);
+  await runInfrastructureHealthAlerts(hook.env, now + 6000, hook.fetcher);
+  expect(await status(f, "database_volume_critical")).toMatchObject({
+    active: false,
+  });
+});
+
 it("keeps a volume episode while its report is stale or its volume unmounted, and ignores old generations and deleted databases", async () => {
   const f = await fixture(),
     hook = receiver(),
@@ -561,6 +854,110 @@ it("announces a volume that fails after another one did", async () => {
   expect(new Set(hook.events[1]!.database_ids)).toEqual(
     new Set([first, second]),
   );
+});
+
+it("announces a delete its node has not finished after ten minutes and ends the episode once the database and its volumes are gone", async () => {
+  // F2 of the live run on US1: two databases the API called deleted kept their 80 GiB volumes and
+  // their users, and nothing told the operator. A delete that the node does not finish within ten
+  // minutes (the integrator's operation remains open until confirmed) is an alert, whether the node never
+  // reported the database deleted or reported it deleted and still names a volume of it.
+  const f = await fixture(),
+    hook = receiver(),
+    id = await placed(f, "leaking"),
+    now = Date.now(),
+    deleted = new Date(now).toISOString(),
+    // The node's samples go stale in these ten minutes and raise the Thin storage kind: not asked here.
+    raised = () =>
+      hook.events.filter(
+        (event) => event.kind === "database_delete_incomplete",
+      );
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='deleted',generation=generation+1,deleted_at=?,updated_at=? WHERE id=?",
+  )
+    .bind(deleted, deleted, id)
+    .run();
+  // Inside the bound the node is still at work.
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 10 * MINUTE - 1000,
+    hook.fetcher,
+  );
+  expect(await status(f, "database_delete_incomplete")).toBeUndefined();
+  // The node never reported the delete: the alert names the database and tells the operator what to read.
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 10 * MINUTE + 1000,
+    hook.fetcher,
+  );
+  expect(raised()).toMatchObject([
+    {
+      kind: "database_delete_incomplete",
+      database_ids: [id],
+      action: INFRA_ALERT_ACTIONS.database_delete_incomplete,
+    },
+  ]);
+  // Nothing new while it stays there.
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 11 * MINUTE,
+    hook.fetcher,
+  );
+  expect(raised()).toHaveLength(1);
+  // The node reports it deleted (an agent that stopped at the first error, or a report that was
+  // sent while a volume remained) and its volume report still names a volume of it: kept.
+  await volume(f, id, now + 11 * MINUTE, { used: GIB }).run();
+  await env.DB.prepare(
+    "UPDATE databases SET observed_state='deleted',observed_generation=generation WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 12 * MINUTE,
+    hook.fetcher,
+  );
+  expect(await status(f, "database_delete_incomplete")).toMatchObject({
+    active: true,
+  });
+  // The volume report no longer names a volume of it: all of it is gone.
+  await env.DB.prepare("DELETE FROM node_volumes WHERE database_id=?")
+    .bind(id)
+    .run();
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 13 * MINUTE,
+    hook.fetcher,
+  );
+  expect(await status(f, "database_delete_incomplete")).toMatchObject({
+    active: false,
+  });
+  expect(raised()).toHaveLength(1);
+});
+
+it("does not announce a delete on a node that is marked lost: nothing there can finish it", async () => {
+  const f = await fixture(),
+    hook = receiver(),
+    id = await placed(f, "on-a-lost-node"),
+    now = Date.now(),
+    deleted = new Date(now).toISOString();
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='deleted',generation=generation+1,deleted_at=?,updated_at=? WHERE id=?",
+  )
+    .bind(deleted, deleted, id)
+    .run();
+  const uid = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
+    .bind(f.node)
+    .first<string>("node_uid");
+  await markNodeLost(env.DB, f.node, {
+    expected_node_uid: uid!,
+    reason: "confirmed provider loss",
+  });
+  await runInfrastructureHealthAlerts(
+    hook.env,
+    now + 30 * MINUTE,
+    hook.fetcher,
+  );
+  expect(await status(f, "database_delete_incomplete")).toBeUndefined();
 });
 
 it("cannot arm or clear a node warning from a superseded concurrent read", async () => {

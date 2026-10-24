@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   bytesToHex,
+  FILESYSTEM_END_GAP_BYTES,
   INFRA_ALERT_ACTIONS,
   InfraAlert,
   InfraAlertStatus,
@@ -18,7 +19,6 @@ import {
 import {
   AVERAGE_MINIMUM_SPAN_SECONDS,
   AVERAGE_WINDOW_SECONDS,
-  closedPools,
   LATEST_SAMPLES_SQL,
   minuteOf,
   NODE_OBSERVATION_MAX_AGE_MS,
@@ -28,6 +28,7 @@ import {
   cronErrorCode,
   readCronHealth,
 } from "./cron-health.ts";
+import { closedPools } from "./placement-closed.ts";
 import { purgeNodeDiagnostics } from "./node-diagnostics.ts";
 import type { Env } from "../env.ts";
 import { regionalNodeCountSql } from "./node-capacity-count.ts";
@@ -271,6 +272,23 @@ function callback(
   }
 }
 
+/**
+ * One line for each episode an evaluation opens (or opens again): with the `alert_evaluation` line
+ * of the same invocation it says which run raised an alarm and when, so that a late alert can be
+ * attributed to the node's report, the evaluation or the delivery.
+ */
+function logEpisodeOpened(event: InfraAlert): void {
+  console.log(
+    JSON.stringify({
+      event: "alert_episode_opened",
+      region_id: event.region_id,
+      kind: event.kind,
+      event_id: event.event_id,
+      occurred_at: event.occurred_at,
+    }),
+  );
+}
+
 /** At-least-once authenticated callback: the receiver must durably deduplicate event_id and payload. */
 export async function runInfrastructureAlerts(
   env: Env,
@@ -343,7 +361,7 @@ export async function runInfrastructureAlerts(
       action: INFRA_ALERT_ACTIONS[kind],
       ...detail,
     });
-    await env.DB.prepare(
+    const written = await env.DB.prepare(
       `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)
       SELECT ?,?,1,?,? WHERE ${snapshot.sql} ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,
         payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0${
@@ -359,6 +377,7 @@ export async function runInfrastructureAlerts(
         ...(takeover?.bindings ?? []),
       )
       .run();
+    if (written.meta.changes > 0) logEpisodeOpened(event);
   }
   const pending = await env.DB.prepare(
     "SELECT * FROM infrastructure_alerts WHERE region_id=? AND active=1 AND delivered_at IS NULL ORDER BY kind",
@@ -614,7 +633,7 @@ async function reconcileEpisode(
     ...observation.detail,
   });
   // Arms a cleared episode, or replaces exactly the one this evaluation read.
-  await env.DB.prepare(
+  const written = await env.DB.prepare(
     `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES(?,?,1,?,?) ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0 OR (infrastructure_alerts.event_id=? AND infrastructure_alerts.payload=?)`,
   )
     .bind(
@@ -626,6 +645,7 @@ async function reconcileEpisode(
       current?.payload ?? null,
     )
     .run();
+  if (written.meta.changes > 0) logEpisodeOpened(event);
   return true;
 }
 
@@ -666,6 +686,14 @@ type RegionSubjects = Map<
   { failing: Subject[]; unresolved: number }
 >;
 /**
+ * A database deleted this long ago that its node still has not finished (it is still on the node's
+ * desired page, `nodeDesiredPage`: not reported deleted, or a volume of it still reported) is an
+ * alert. The agent tries again every 30 s at most; the integrator's delete operation remains
+ * open until cleanup is confirmed, so this alert makes missing progress visible independently.
+ */
+const DELETE_INCOMPLETE_ALERT_MS = 600_000;
+
+/**
  * One statement reads every database and Thin storage condition of a region. `failing` rows are
  * the subjects that hold the condition now; `unresolved` rows are the subjects a still active
  * episode names that are not yet known to be fine, so an unknown measurement keeps the episode.
@@ -685,7 +713,7 @@ async function readRegionSubjects(
       AND ${baseline}>=p.backup_before)`;
   const result = await db
     .prepare(
-      `WITH p AS (SELECT ? region,? fresh,? backup_before)
+      `WITH p AS (SELECT ? region,? fresh,? backup_before,? delete_before)
       SELECT * FROM (SELECT 'database_archive_failing' kind,
           CASE WHEN d.observed_state='ready' AND d.observed_power='awake' AND d.archiving_health='failing' THEN 'failing' ELSE 'unresolved' END state,
           d.id subject,NULL detail
@@ -703,7 +731,13 @@ async function readRegionSubjects(
             OR (d.id IN(SELECT n.value FROM infrastructure_alerts a,json_each(a.payload,'$.database_ids') n
               WHERE a.region_id=d.region_id AND a.kind='database_base_backup_stale' AND a.active=1)
               AND NOT ${backupGood}))
-        ORDER BY state,${baseline},d.id LIMIT 64)`,
+        ORDER BY state,${baseline},d.id LIMIT 64)
+      UNION ALL SELECT * FROM (SELECT 'database_delete_incomplete','failing',d.id,NULL
+        FROM databases d JOIN nodes n ON n.id=d.node_id AND n.lost_at IS NULL,p
+        WHERE d.region_id=p.region AND d.desired_state='deleted' AND d.deleted_at<p.delete_before
+          AND (d.observed_state<>'deleted' OR d.observed_generation<>d.generation
+            OR EXISTS(SELECT 1 FROM node_volumes v WHERE v.node_id=d.node_id AND v.database_id=d.id))
+        ORDER BY d.deleted_at,d.id LIMIT 64)`,
     )
     .bind(
       regionId,
@@ -711,6 +745,7 @@ async function readRegionSubjects(
       // anti-entropy period, not once in each minute.
       new Date(now - NODE_DATABASE_STALE_MS).toISOString(),
       new Date(now - BASE_BACKUP_MAX_AGE_MS).toISOString(),
+      new Date(now - DELETE_INCOMPLETE_ALERT_MS).toISOString(),
     )
     .all<SubjectRow>();
   return collectSubjects(result.results);
@@ -720,9 +755,12 @@ function collectSubjects(rows: readonly SubjectRow[]): RegionSubjects {
   const subjects: RegionSubjects = new Map();
   for (const row of rows) {
     const entry = subjects.get(row.kind) ?? { failing: [], unresolved: 0 };
-    if (row.state === "failing")
-      entry.failing.push({ id: row.subject, detail: row.detail });
-    else entry.unresolved++;
+    if (row.state === "failing") {
+      // A kind that two reads judge (a volume that is full and a filesystem that did not grow)
+      // names a subject once.
+      if (!entry.failing.some((subject) => subject.id === row.subject))
+        entry.failing.push({ id: row.subject, detail: row.detail });
+    } else entry.unresolved++;
     subjects.set(row.kind, entry);
   }
   return subjects;
@@ -779,7 +817,13 @@ async function readNodeSubjects(
           AND (SELECT COALESCE(SUM(refused_no_headroom+refused_start_queue),0) FROM node_minutes WHERE node_id=n.id AND minute>p.refused_since)>=${CAPACITY_REFUSAL_COUNT}
         ORDER BY n.id LIMIT 64)
       UNION ALL ${volume("database_volume_warning", `(${measured} AND ${reached(VOLUME_WARNING_PERCENT)} AND NOT ${reached(VOLUME_CRITICAL_PERCENT)})`)}
-      UNION ALL ${volume("database_volume_critical", `(${measured} AND ${reached(VOLUME_CRITICAL_PERCENT)})`)}`,
+      UNION ALL ${volume("database_volume_critical", `(${measured} AND ${reached(VOLUME_CRITICAL_PERCENT)})`)}
+      UNION ALL SELECT * FROM (SELECT 'database_volume_critical' kind,'failing' state,d.id subject,NULL detail
+        FROM databases d JOIN database_resources r ON r.database_id=d.id,p
+        WHERE d.region_id=p.region AND d.deleted_at IS NULL AND d.node_id IS NOT NULL
+          AND d.observed_generation=d.generation AND d.observed_storage_bytes IS NOT NULL
+          AND d.observed_storage_bytes<r.storage_gib*1073741824-${FILESYSTEM_END_GAP_BYTES}
+        ORDER BY d.id LIMIT 64)`,
     )
     .bind(
       regionId,
@@ -817,6 +861,7 @@ const HEALTH_KINDS = [
   "database_archive_failing",
   "database_base_backup_stale",
   "thin_storage_blocked",
+  "database_delete_incomplete",
   "regional_node_capacity_refusals",
   "regional_node_pool_closed",
   "database_volume_warning",
@@ -918,7 +963,7 @@ async function regionHealthAlerts(
       ...(await readRegionSubjects(env.DB, regionId, now)),
       ...(await readNodeSubjects(env.DB, regionId, now)),
     ]);
-    closed = await closedPools(env.DB, regionId);
+    closed = await closedPools(env.DB, regionId, now);
   } catch (error) {
     readFailure = { error };
   }
@@ -981,6 +1026,12 @@ async function regionHealthAlerts(
           node_id: subject.id,
           error_code: subject.detail,
         })),
+      })),
+    ],
+    [
+      "database_delete_incomplete",
+      subjectOf("database_delete_incomplete", (failing) => ({
+        database_ids: failing.map((subject) => subject.id),
       })),
     ],
     [
@@ -1176,8 +1227,9 @@ const CRON_KINDS = [
 
 /**
  * Judges the minute cron's heartbeat and raises its alarms in every region. It never runs inside
- * the cron: the CronWatchdog Durable Object alarm calls it, so a cron that is stopped, hanging or
- * failing is reported by a clock the cron does not own.
+ * the cron: the CronWatchdog Durable Object alarm calls it (`evaluateAlerts`, which also stamps
+ * `watchdog_checked_at`), so a cron that is stopped, hanging or failing is reported by a clock the
+ * cron does not own.
  */
 export async function runCronWatchdog(
   env: Env,
@@ -1187,11 +1239,6 @@ export async function runCronWatchdog(
   const health = await readCronHealth(env.DB, now);
   // Until the cron has recorded a run there is nothing to judge.
   if (health.status === "unknown") return;
-  await env.DB.prepare(
-    "UPDATE cron_heartbeat SET watchdog_checked_at=? WHERE singleton=1",
-  )
-    .bind(new Date(now).toISOString())
-    .run();
   const detail: EventDetail = {
     cron: {
       last_started_at: health.last_started_at,

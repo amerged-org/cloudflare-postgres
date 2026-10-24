@@ -415,6 +415,113 @@ describe("the desired page of a node", () => {
     expect(deleted.archive.credential.id).not.toBe(written.id);
   });
 
+  it("keeps a deleted database on the page until its node has deleted it and no longer reports a volume of it", async () => {
+    const f = await fixture();
+    const db = await served(f);
+    const GIB = 1024 ** 3;
+    const volumes = async (list: { database: string }[]) =>
+      expect(
+        (
+          await nodeRequest(f, "/node/v1/volumes", {
+            method: "POST",
+            body: {
+              observed_at: new Date().toISOString(),
+              volumes: list.map(({ database }) => ({
+                database,
+                storage_generation: 1,
+                mounted: true,
+                size_bytes: GIB,
+                pool_used_bytes: 100 * 1024 ** 2,
+                filesystem: {
+                  total_bytes: GIB,
+                  used_bytes: 100 * 1024 ** 2,
+                  inodes_total: 65_536,
+                  inodes_used: 1500,
+                },
+              })),
+            },
+          })
+        ).status,
+      ).toBe(200);
+    expect(
+      (await request(`/v1/databases/${db.id}`, f.integrator, "DELETE")).status,
+    ).toBe(202);
+    const generation = (await env.DB.prepare(
+      "SELECT generation FROM databases WHERE id=?",
+    )
+      .bind(db.id)
+      .first<number>("generation"))!;
+    // The node says it deleted the database, but its volume report still names the volume: the
+    // delete did not finish (a volume that would not go), so the page keeps asking for it.
+    await volumes([{ database: db.id }]);
+    expect((await report(f, db.id, generation, "deleted")).status).toBe(200);
+    expect((await entry(f, db.id))?.desired_state).toBe("deleted");
+    // The next report no longer names the volume: the deletion is done everywhere.
+    await volumes([]);
+    expect(await entry(f, db.id)).toBeUndefined();
+  });
+
+  it("names a database again that was deleted and dropped from the page when its node still reports a volume of it, and no other volume", async () => {
+    const f = await fixture();
+    const db = await served(f, "gone");
+    const kept = await served(f, "kept");
+    const volume = (database: string) => ({
+      database,
+      storage_generation: 1,
+      mounted: true,
+      size_bytes: 1024 ** 3,
+      pool_used_bytes: 100 * 1024 ** 2,
+      filesystem: {
+        total_bytes: 1024 ** 3,
+        used_bytes: 100 * 1024 ** 2,
+        inodes_total: 65_536,
+        inodes_used: 1500,
+      },
+    });
+    expect(
+      (await request(`/v1/databases/${db.id}`, f.integrator, "DELETE")).status,
+    ).toBe(202);
+    const generation = (await env.DB.prepare(
+      "SELECT generation FROM databases WHERE id=?",
+    )
+      .bind(db.id)
+      .first<number>("generation"))!;
+    // The API has the deletion done and the page has dropped the database.
+    expect((await report(f, db.id, generation, "deleted")).status).toBe(200);
+    expect(await entry(f, db.id)).toBeUndefined();
+    // Later the node's volume report shows a volume of the deleted database, a volume of a
+    // database that exists and a volume of none the API knows: the page names the deleted one
+    // again, for the node to delete what is left, and no other.
+    expect(
+      (
+        await nodeRequest(f, "/node/v1/volumes", {
+          method: "POST",
+          body: {
+            observed_at: new Date().toISOString(),
+            volumes: [
+              volume(db.id),
+              volume(kept.id),
+              volume("zzzzzzzzzzzzzzzzzzzz"),
+            ],
+          },
+        })
+      ).status,
+    ).toBe(200);
+    const page = await pull(f);
+    expect(
+      page.databases.map((database) => [
+        database.id,
+        database.desired_state,
+        database.storage_generation,
+      ]),
+    ).toEqual(
+      [
+        [db.id, "deleted", 1],
+        [kept.id, "running", 1],
+      ].sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    );
+  });
+
   it("reads the credentials of a whole page in one query and writes the missing ones together", async () => {
     const f = await fixture();
     for (const name of ["one", "two", "three"]) await served(f, name);

@@ -4,6 +4,7 @@ import { NodeMarkLost, type NodeLoss } from "@pgcf/contracts/nodes";
 import type { Env } from "../env.ts";
 import { withAdmissionMutation } from "./admission-mutations.ts";
 import { failMovesOfLostNode } from "./database-moves.ts";
+import { failReplacementsOfLostNode } from "./database-replacements.ts";
 import { fenceActionsFromEnv } from "./fence-actions.ts";
 import { archiveEndpoint } from "./archive-bucket.ts";
 import { hintNode } from "./node-hints.ts";
@@ -90,13 +91,17 @@ export async function declareNodeLost(
   // The other node of a move that ended pulls its page: an order ended there, or a staged volume goes.
   const others = await failMovesOfLostNode(env.DB, nodeId, at);
   await Promise.allSettled(others.map((node) => hintNode(env, node)));
-  if (node.lost_at !== null) return markNodeLost(env.DB, nodeId, request);
-  return withAdmissionMutation(
-    env,
-    [],
-    (mutation) => markNodeLost(env.DB, nodeId, request, mutation),
-    { kind: "node", id: nodeId },
-  );
+  const loss =
+    node.lost_at !== null
+      ? await markNodeLost(env.DB, nodeId, request)
+      : await withAdmissionMutation(
+          env,
+          [],
+          (mutation) => markNodeLost(env.DB, nodeId, request, mutation),
+          { kind: "node", id: nodeId },
+        );
+  await failReplacementsOfLostNode(env, nodeId, at);
+  return loss;
 }
 
 export interface NodeLossStatus {

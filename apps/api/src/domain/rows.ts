@@ -13,6 +13,7 @@ import { assertProjectAccess, getAuth } from "../middleware/auth.ts";
 import {
   databaseHealthOf,
   latestAgentSampleSql,
+  latestFilesystemSampleSql,
   type DatabaseHealthSource,
 } from "./operational-health.ts";
 import type { Page } from "../platform/pagination.ts";
@@ -53,6 +54,8 @@ export interface DatabaseRow extends DatabaseHealthSource {
   archive_path: string;
   archiving_health: "ok" | "failing" | "unknown";
   archiving_health_since: string | null;
+  /** The size of the database's filesystem as its node last told it; null until it has. */
+  observed_storage_bytes?: number | null;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
@@ -194,7 +197,7 @@ export async function databaseForRequest(
 ): Promise<DatabaseRow> {
   await getAuth(c);
   const row = await c.env.DB.prepare(
-    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")} FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${latestFilesystemSampleSql("d")} filesystem_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")} FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
   )
     .bind(id)
     .first<DatabaseRow>();

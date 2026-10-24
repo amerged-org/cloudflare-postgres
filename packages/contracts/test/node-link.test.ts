@@ -15,6 +15,7 @@ import {
   NodeBootReport,
   NodeCredentials,
   NodeDatabaseObservation,
+  FILESYSTEM_END_GAP_BYTES,
   NodeDesiredPage,
   NodeDiagnostic,
   NodeDesiredQuery,
@@ -332,6 +333,64 @@ describe("the per-node desired page", () => {
       ).toBe(valid);
   });
 
+  it("replaces only the same database's proven prior generation with an explicit PITR target", () => {
+    const replacement = {
+      ...database,
+      storage_generation: 2,
+      archive: {
+        path: `s3://pgcf-eu/eu-dev/${id}/g2-${operation}`,
+        credential,
+      },
+      origin: {
+        kind: "replace",
+        source: {
+          database_id: id,
+          path: database.archive.path,
+          backup_id: "20261017T110000",
+          target_time: "2026-10-17T11:30:00.000Z",
+          credential,
+        },
+        previous: { storage_generation: 1, end: proof },
+      },
+    };
+    const valid = (entry: unknown) =>
+      NodeDesiredPage.safeParse({ ...page, databases: [entry] }).success;
+    expect(valid(replacement)).toBe(true);
+    expect(
+      valid({
+        ...replacement,
+        origin: { ...replacement.origin, previous: undefined },
+      }),
+    ).toBe(false);
+    expect(
+      valid({
+        ...replacement,
+        origin: {
+          ...replacement.origin,
+          previous: { storage_generation: 2, end: proof },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      valid({
+        ...replacement,
+        origin: {
+          ...replacement.origin,
+          source: { ...replacement.origin.source, target_time: undefined },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      valid({
+        ...replacement,
+        origin: {
+          ...replacement.origin,
+          source: { ...replacement.origin.source, database_id: "x".repeat(20) },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("proves a move's end with the source's proven-sleep record, and a restore has none", () => {
     // The target can check that replay reached every committed transaction only against the
     // record that proved the source's sleep (plan 7.9, 9.5).
@@ -615,6 +674,23 @@ describe("what a node reports", () => {
           orders: [{ operation: `op_${"s".repeat(20)}`, ...result }],
         }).success,
       ).toBe(valid);
+  });
+
+  it("tells the size of the filesystem as a count of bytes, and does not have to", () => {
+    const report = (extra: Record<string, unknown>) =>
+      NodeObservationReport.safeParse({
+        observed_at: now,
+        databases: [{ ...observation, ...extra }],
+        orders: [],
+      }).success;
+    expect(report({})).toBe(true);
+    expect(
+      report({ storage_bytes: 2 * 1024 ** 3 - FILESYSTEM_END_GAP_BYTES }),
+    ).toBe(true);
+    for (const broken of [0, -1, 1.5, "2147483648", null])
+      expect(report({ storage_bytes: broken })).toBe(false);
+    // The gap is 4 MiB: the agent's `FS_END_GAP_BYTES` is held equal to it by a test of its own.
+    expect(FILESYSTEM_END_GAP_BYTES).toBe(4194304);
   });
 
   it("names the unit's instance exactly while the database is ready", () => {

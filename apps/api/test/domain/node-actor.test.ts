@@ -6,7 +6,7 @@ import {
   runInDurableObject,
 } from "cloudflare:test";
 import { NodeSample, newDatabaseId } from "@pgcf/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   foldSample,
   NODE_HEADER,
@@ -365,6 +365,74 @@ describe("the samples of a node", () => {
       admitted: 0,
     });
     socket.close(1000);
+  });
+
+  it("keeps a node open when its first minute prunes old rows at the hour boundary", async () => {
+    const f = await fixture(0);
+    const socket = await connect(f);
+    // A controlled next-hour timestamp exercises the hourly DELETE on every run. The alarm
+    // stays in the future on the real clock, so only runDurableObjectAlarm may flush this minute.
+    const hour = (Math.floor(Date.now() / (60 * MINUTE)) + 1) * 60 * MINUTE;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(hour + 5_000);
+    let again: WebSocket | undefined;
+    try {
+      await env.DB.prepare(
+        "INSERT INTO node_minutes(node_id,minute,samples) VALUES(?,?,1)",
+      )
+        .bind(f.node, hour / MINUTE - 9 * 24 * 60)
+        .run();
+      const take = (at: number) =>
+        runInDurableObject(actor(f.node), async (instance, state) => {
+          await instance.webSocketMessage(
+            state.getWebSockets("agent")[0]!,
+            sampleMessage(at),
+          );
+          return state.storage.sql
+            .exec<{ open: number }>(
+              "SELECT open FROM node_link WHERE singleton=1",
+            )
+            .one().open;
+        });
+      expect(await take(hour + 3_000)).toBe(1);
+      expect(
+        await env.DB.prepare("SELECT ready FROM nodes WHERE id=?")
+          .bind(f.node)
+          .first("ready"),
+      ).toBe(1);
+      // The expired row was pruned, but its DELETE result did not replace the ready result.
+      expect(await minutes(f.node)).toMatchObject([
+        { minute: hour / MINUTE, samples: 1 },
+      ]);
+      expect(await take(hour + 4_000)).toBe(1);
+      expect((await minutes(f.node))[0]!.samples).toBe(1);
+      const observed = (
+        column: "last_observed_at" | "os_previous_observed_at",
+      ) =>
+        env.DB.prepare(`SELECT ${column} value FROM nodes WHERE id=?`)
+          .bind(f.node)
+          .first<string>("value");
+      expect(await observed("last_observed_at")).toBe(
+        new Date(hour + 3_000).toISOString(),
+      );
+      expect((await heldLink(f.node)).sample?.observed_at).toBe(
+        new Date(hour + 4_000).toISOString(),
+      );
+      // A new boot must retain the actor's newer sample before that minute has been flushed.
+      again = await connect(f, false);
+      const welcomed = next(again);
+      again.send(hello(null, nodeOs({ boot_id: crypto.randomUUID() })));
+      await welcomed;
+      expect(await observed("os_previous_observed_at")).toBe(
+        new Date(hour + 4_000).toISOString(),
+      );
+      expect(await runDurableObjectAlarm(actor(f.node))).toBe(true);
+      expect((await minutes(f.node))[0]!.samples).toBe(2);
+      expect(await runDurableObjectAlarm(actor(f.node))).toBe(false);
+    } finally {
+      clock.mockRestore();
+      socket.close(1000);
+      again?.close(1000);
+    }
   });
 
   it("writes the last minute when its alarm rings, and not twice", async () => {

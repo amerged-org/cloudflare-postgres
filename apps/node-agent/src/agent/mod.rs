@@ -17,6 +17,11 @@ mod power;
 mod readahead;
 #[cfg(test)]
 mod real_gateway;
+pub(crate) mod remove;
+mod repair;
+mod replacement;
+#[cfg(test)]
+mod replacement_tests;
 pub(crate) mod report;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -203,6 +208,10 @@ pub(crate) struct View {
     /// The roles the API deleted: gone, and refused.
     pub roles_removed: Vec<String>,
     pub roles_blocked: Vec<String>,
+    /// The size of the volume's filesystem in bytes, as its superblock says (`Core::resize`). The
+    /// observation tells it, so that a resize ends when the filesystem has the size and not when
+    /// the volume has.
+    pub storage_bytes: Option<u64>,
     /// A recovery runs or waits for its retry.
     pub recovering: bool,
     /// Since when the unit runs: the usage meter's, and the first minute after which a due base
@@ -222,6 +231,10 @@ pub(crate) struct View {
     pub queued: bool,
     /// The reconciliation of the entry: one runs, and runs again when the entry changed meanwhile.
     pub reconcile: Reconcile,
+    /// Since when the delete of the database has not been completed (`Core::delete`).
+    pub delete_failing_since_ms: Option<i64>,
+    /// When the repair of the sleeping database's volume last failed (`Core::repair_asleep`).
+    pub repair_failed_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,6 +259,7 @@ impl View {
             state: None,
             roles_removed: Vec::new(),
             roles_blocked: Vec::new(),
+            storage_bytes: None,
             recovering: false,
             awake_since_ms: None,
             backup_failed_ms: None,
@@ -254,6 +268,8 @@ impl View {
             retrying: false,
             queued: false,
             reconcile: Reconcile::Idle,
+            delete_failing_since_ms: None,
+            repair_failed_ms: None,
         }
     }
 }
@@ -390,6 +406,8 @@ pub struct Core<M: Machine> {
     pub(crate) changed: Notify,
     /// A start took a slot or ended: the pool may want another idle one (`refill_pass`).
     pub(crate) refill: Notify,
+    /// A pass repairs the volumes of the sleeping databases (`repair_sleeping`).
+    repairing: AtomicBool,
     /// The maintenance orders whose databases all sleep with their proofs: the packages and the
     /// check follow, which the service does, since it reaches the files.
     slept: Mutex<Vec<String>>,
@@ -459,6 +477,7 @@ impl<M: Machine> Core<M> {
             meter: Meter::load(layout.agent().join("usage.json")),
             changed: Notify::new(),
             refill: Notify::new(),
+            repairing: AtomicBool::new(false),
             slept: Mutex::new(Vec::new()),
             slept_signal: Notify::new(),
         });
@@ -721,18 +740,24 @@ impl<M: Machine> Core<M> {
     /// it knows: an entry below it is stale and `false`; one at it with another operation wins;
     /// a wake claim the page has caught up with is done.
     pub(crate) fn accept(&self, db: &Db, entry: Entry) -> bool {
-        let known = db
-            .view()
-            .entry
-            .as_ref()
-            .map(|known| (known.generation, known.operation.clone()));
-        if known
-            .as_ref()
-            .is_some_and(|(generation, _)| entry.generation < *generation)
-        {
+        let known = db.view().entry.as_ref().map(|known| {
+            (
+                known.generation,
+                known.operation.clone(),
+                known.storage_generation,
+            )
+        });
+        if known.as_ref().is_some_and(|(generation, _, storage)| {
+            entry.generation < *generation || entry.storage_generation < *storage
+        }) {
             return false;
         }
-        let changed = known.as_ref() != Some(&(entry.generation, entry.operation.clone()));
+        let changed = known.as_ref()
+            != Some(&(
+                entry.generation,
+                entry.operation.clone(),
+                entry.storage_generation,
+            ));
         self.set(db, |view| {
             if let Some(claim) = &view.claim
                 && (entry.generation > claim.generation

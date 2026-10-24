@@ -56,8 +56,10 @@ to name.
 
 A change is written to the log **before** it runs, and its status is added when the answer is
 known. This order is deliberate: a change cannot be taken back, so a row written afterwards could
-be lost with the change already made. If the row cannot be written, the request is not run and
-answers `500` (log line `audit_write_failed`); the retry is safe. If only the status cannot be
+be lost with the change already made. A failed insert is retried up to three attempts with the same
+event ID; a lost response after D1 committed the row cannot create a duplicate. If all attempts
+fail, the request is not run and answers `500` (log line `audit_write_failed`); the retry is safe.
+If only the status cannot be
 written, the answer stands and the event keeps `status: null`, which says the outcome is unknown
 (also after a Worker that stopped mid-request), never that it succeeded. A refused key is
 refused whatever the log says. Look for `null` statuses after an incident.
@@ -135,8 +137,8 @@ restart ends every open client session: the gateway stops accepting (its socket 
 connection that arrives meanwhile waits for the next gateway), closes the idle sessions at once,
 gives a busy one 10 seconds, and clients reconnect. The socket handover does not cover
 `cloudflared`: while it registers with Cloudflare again, the Edge cannot reach the node and a new
-connection fails. **How long that gap lasts has not been measured.** The owner's go and, from the
-canary on, an announced window apply to each step.
+connection fails. **How long that gap lasts has not been measured.** The owner's go and, from
+production acceptance onward, an announced window apply to each step.
 
 **What is not known.** No route reports which key IDs a node's gateway holds. D1 holds the revision
 it has for the node (`nodes.credentials_revision`), and the node's newest sample

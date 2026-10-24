@@ -77,10 +77,14 @@ link and the first page, which need the node's boot and packages and nothing of 
 time as** the storage opening (`Node::connect_unopened`, `Node::open_storage`; a node that is set up
 asks lvm2 for `pvs`, `vgs` and `lvs` at once and activates nothing when the pool and every volume
 are active, which is what an agent that restarts finds); the device links and the runtime
-(`restore_runtime`); the slots and units read back from the kernel; the first page applied (the
+(`restore_runtime`); the slots and units read back from the kernel, with up to 16 independent
+slot checks and idle-limit restorations at once; the first page applied (the
 fences, the generations, the decisions on the databases that ran, which come first); and the
 gateway served once those are decided (`Core::settled`). A wake is never served before the first
-page, the fences and the generations are known. **The credentials are not on that path.** The
+page, the fences and the generations are known. The first thin-pool sample runs beside slot
+adoption and completes before admission starts. A sample that fails or exceeds one second leaves
+capacity unknown and starts refused until a later sample succeeds; it never prevents the service
+from coming up indefinitely. **The credentials are not on that path.** The
 archive credentials (one read each, 32 at a time, those of the databases that ran first) and the
 node's own (the Tunnel and the route keyring) are read after the first page is applied, in the
 background (`Service::pull_page`): a database that ran is registered with the archive socket when
@@ -89,7 +93,10 @@ its credential arrives (`Core::deliver`), a build waits for its own up to `Timin
 the first reads its credentials before it is applied, as before. The phases `agent_start_phase` names: `storage_open`, `device_links`,
 `restore_runtime`, `linked` (how long the link outlasted the storage), `slots_adopted`,
 `units_read`, `apply`, `settled`, `gateway_table`, `service_started`, and beside the row (read by
-`at_ms`) `link_started`, `link_hello`, `first_page`, `credentials` and `first_wake_served`. A start
+`at_ms`) `link_started`, `link_hello`, `first_page`, `initial_pool_sample`, `credentials` and
+`first_wake_served`. The last phase requires a successful `started` wake, never a refusal; it
+measures agent-side readiness. The client measures successful first SQL and the complete cold
+request separately. A start
 that fails (the pool will not activate, `vgchange_exit_5`) says `agent_failed` and waits five
 seconds before it ends (`pause_after_failed_start`), so that the 100 ms restart does not run the
 failing commands ten times a second; a stop ends the wait. systemd's `RestartSteps=` is not used:
@@ -104,7 +111,7 @@ kill for as long as the node lives.
 | Admission                  | `admission.rs`                                                                                                                                         |
 | Storage                    | `storage/`: the volume group and thin pool, one thin volume with its ext4 per database, the samples, the room rule, full-pool and full-volume recovery |
 | Units and slots            | `units/`: the pool of slots (`slots.rs`), the node's systemd and kernel for it (`system.rs`), the idmapped handoff (`idmap.rs`), limits as unit properties, the Linux users; the units of their own an earlier agent started |
-| Database lifecycle         | `agent/`: `apply.rs` (the page becomes action), `build.rs` (create, restore, move target, resize, delete), `power.rs` (wake, sleep, recovery)          |
+| Database lifecycle         | `agent/`: `apply.rs` (the page becomes action, and the delete), `remove.rs` (the machine's part of a delete), `build.rs` (create, restore, move target), `power.rs` (wake, sleep, recovery), `repair.rs` (the volumes of sleeping databases after a pool without writes) |
 | Sleep proof and its record | `proof.rs`, `sleep.rs`, `pg_control.rs`, `state.rs`                                                                                                    |
 | Roles                      | `roles.rs`, `scram.rs`: PostgreSQL holds exactly the roles of the page, with verifiers, never passwords                                                |
 | Backups                    | `archive/`: the archive socket, the barman-cloud jobs, restore and PITR recovery, the upload log                                                       |
@@ -123,6 +130,18 @@ PostgreSQL 18.
 One database has one flow at a time (a create, a wake, a sleep, a recovery or a delete finishes
 before the next begins). What the gateway and the observations read is the database's view, which
 every flow updates in small steps.
+
+**Filesystem growth.** New volumes use `meta_bg` without `resize_inode`, so their 8 MiB journal
+can grow online without the reserved-descriptor credit exhaustion of the earlier layout. Every
+filesystem leaves 4 MiB at the end of its volume for signature isolation. Existing filesystems
+are never reformatted: the earlier layout grows offline after all holders release it, with
+`e2fsck -p -f` before `resize2fs`. A warm database uses the existing quiesce/archive/stop proof;
+a busy database defers growth. A crashed database stays unproven while the agent applies an
+explicitly requested grow before PostgreSQL recovery, then archives and proves it normally.
+An interrupted offline grow is tagged suspect and checked before remounting. Every ready or
+asleep observation carries the measured filesystem size; no size means no resize completion.
+No tenant project quota is installed. Full-volume recovery is by growing the volume, without a
+guarantee that arbitrary SQL cleanup can run with no available space.
 
 **The pool after a reset that was not clean** (`Storage::open`, `activate_group`). A hard power-off
 left one leaked data block in the pool's metadata on EU1 (2026-10-23): `thin_check -q` found it
@@ -399,12 +418,48 @@ all three (`settings.rs`); a restored database's files are the source's and are 
   _m_/16 and at least 16 MB. For 256 MiB that is 32, 192, 2 and 16 MB; for 1 GiB, 128, 768, 4 and
   64 MB. `shared_buffers` stays small because shared memory cannot be reclaimed without swap; the
   page cache does the caching. `huge_pages` and `jit` are off.
+- **ANALYZE and autovacuum** are bounded by the memory for the table's own columns, and not for
+  the values of an index expression. `ANALYZE` keeps a sample of 300 × `default_statistics_target`
+  rows, each as it lies on its page: up to 8,200 bytes for rows that are never toasted
+  (`STORAGE PLAIN`; a row of ordinary columns is cut to 2 KB) and 9,260 with the expanded copy of one
+  compressed value (`settings.rs`, checked against PostgreSQL 18 by a test). PostgreSQL's default of
+  100 is 30,000 rows, 265 MiB at the widest rows: more than a 256 MiB database has.
+  `autovacuum_max_workers` is 1 up to 512 MiB, 2 up to 1 GiB and 3 above, and
+  `default_statistics_target` is the largest multiple of ten, from 10 to 100, at which the samples
+  of every autovacuum worker and of one manual `ANALYZE`, all at the widest rows, take at most half
+  of the memory: 20 for 256 MiB, 40 for 512 MiB, 60 for 1 GiB, 90 for 2 GiB and 100 from 2,304 MiB.
+  A vacuum's dead-item store is `maintenance_work_mem` (_m_/16), which is smaller than a sample's
+  share. What a tenant can still change: its session's or role's or database's
+  `default_statistics_target`, a column's target (`ALTER TABLE ... SET STATISTICS`, up to 10,000) and
+  its session's `maintenance_work_mem`. Each raises the sample, or the vacuum's store, in proportion;
+  past the class's bound the database is throttled at the unit's soft limit (every session of it, not
+  only the ANALYZE) and, at the ceiling, a backend is killed and the database runs crash recovery.
+  The workers and `autovacuum_work_mem` are the postmaster's, which the tenant's roles cannot set.
+  A lower target gives a column fewer most-common values and histogram buckets (20 for 256 MiB),
+  which planner estimates for skewed columns of large tables can show.
+  **Index and statistics expressions are not bounded by any class setting.** While the sample lives,
+  `ANALYZE` also copies the value of every index expression for every sampled row
+  (`compute_index_stats` in `analyze.c`; `CREATE STATISTICS` expressions do the same in
+  `compute_expr_stats`), one index or statistics object at a time, and the width of such a value is
+  whatever the expression makes it, not the row's. A full-text index on
+  `to_tsvector('simple', body)` over documents of 22 KB holds a tsvector of 26 KB for each sampled
+  row: 152 MiB for the 6,000 rows of a 256 MiB database (measured on the real unit, plan 4.4), where
+  the model above says 53 MiB; at the class's target a table with enough rows holds 455 MiB in 1 GiB,
+  682 MiB in 2 GiB and 758 MiB in 4 GiB (rows × width, not measured at those sizes). One such
+  `ANALYZE` fits every class (xs: 204 MiB of 230 MiB that the unit cannot give back), but the
+  autovacuum worker and a session at once do not fit xs: the unit stalled for memory about 30 % of
+  the time and the two had not ended after 700 s. A tenant ends it with `ALTER INDEX ... ALTER COLUMN
+  1 SET STATISTICS 0` (the expression gets no new statistics, +0 MiB) or with a stored generated
+  column that the index is on instead of the expression (+1 MiB); plan 4.4 and the integrator
+  handover give the cost of each. A `CREATE STATISTICS` object over expressions holds the same, and
+  `ALTER STATISTICS ... SET STATISTICS 0` skips it (read in `extended_stats.c`, not measured).
 - **From the size class:** `max_connections` and `archive_timeout`. `archive_mode` is on with
   `/usr/libexec/pgcf/pgcf-archive %p`, `wal_level` is `replica`, `wal_init_zero` is off,
   `wal_recycle` on, `min_wal_size` 32 MB, `max_wal_size` a quarter of the volume (at least 64 MiB),
   and crash recovery syncs the filesystem once (`recovery_init_sync_method = syncfs`).
-- **Small databases** (512 MiB and below) run one autovacuum worker out of two slots, one I/O
-  worker, no parallel query or maintenance workers, four background worker slots and no replication.
+- **Small databases** (512 MiB and below) run two autovacuum worker slots (one worker, above),
+  one I/O worker, no parallel query or maintenance workers, four background worker slots and no
+  replication.
   A restore runs with the larger of the backup's and the class's values during its recovery,
   because a recovery checks `max_connections`, the process, sender, prepared transaction and lock
   settings against its source's, and restarts onto the class's own afterwards.
@@ -551,7 +606,32 @@ plan 9.3, "Changing the page"; it is written there once.
   backup waits for the one big-job slot behind the other restores); any other DONE backup refuses
   the build with `prefix_not_empty`. A backup the earlier run began and did not finish (`STARTED`)
   is no reason.
-- **A build that fails** (a create, a restore, a point-in-time restore or a move target, with any
+  A timed-out WAL download gives the unpublished restore one further attempt, after stopping that
+  target's previous fetch jobs. Two timed-out attempts end as `archive_unusable`; other unavailable
+  archive failures do not become `no_recovery_point`. Each recovery registration holds its own fetch
+  result, so an earlier attempt cannot change a later one's classification. Missing WAL within a
+  proven source chain is `archive_unusable` without retry. A normal archive end and an unreachable
+  PITR target retain their existing behavior. The ordinary operation's existing no-progress and
+  absolute deadlines still apply; rollback of an in-place restore retains its separate
+  source-preserving recovery behavior.
+- **In-place PITR.** Nodes advertise `restore_in_place_v1` in their authenticated hello and repeat it
+  in samples for diagnostics. The explicit `replace`
+  origin keeps the database ID, socket, Linux account and current roles, but builds a newer storage
+  generation. Before replacing `state.json`, `agent/replacement.rs` verifies the original's exact
+  proven sleep and stopped writer, then durably saves its state and archive identity in the private
+  `replacement.json`. A replay must match that journal even when the target is already built.
+  Failed targets never discard the source's journal or upload log. The explicit `replace_rollback`
+  origin replays the source's proven archive end into another, higher generation under the same
+  operation; it can recreate a missing journal only from the retained, matching original state.
+  An interrupted failure's staged writer is stopped before its volume is detached. Explicit rollback
+  durably names and removes that unpublished target before allocating the next one, retaining the
+  original source; it does not require space for three generations. Rollback retries
+  with the existing recovery backoff through an R2 outage, keeping admission closed and the original
+  volume intact. The source move hold clears only after journal persistence and exclusive release.
+  A later operation waits for an earlier source cleanup without failing or overwriting its journal.
+  An explicit superseded cleanup removes retained volumes and then the journal only after the newer
+  generation has its first DONE backup. Local cleanup never deletes the retained R2 archive lineage.
+- **An ordinary build that fails** (a create, a restore, a point-in-time restore or a move target, with any
   of the errors above) is abandoned once: the unit stops, the generation's volume goes, the user
   goes with the database's last volume, and the node's files of that generation go (its state and
   upload logs; a build that failed before it wrote anything of its own, because the credential of
@@ -690,7 +770,10 @@ Tests that need the kernel are `#[ignore]`d. CI runs them from
 alone (the mount API, for example).
 The lab tests need a Debian 13 host with systemd as PID 1, root, LVM and the image's units
 (`units/lab.rs`, `machine/node.rs`), or a privileged container with loop devices for
-`storage/lab_tests.rs`, which is built only with `RUSTFLAGS='--cfg pgcf_storage_lab'`.
+`storage/lab_tests.rs`, which is built only with `RUSTFLAGS='--cfg pgcf_storage_lab'`. Besides root,
+LVM and loop devices, it needs PostgreSQL 18 (`PGCF_TEST_POSTGRES_BINDIR`) and a user with uid
+1234 and a passwd entry. These tests exercise growth under real writes, full-volume recovery by
+growth, inode exhaustion, and legacy offline growth while another namespace holds the volume.
 `units/idmap_lab.rs` runs the idmapped handoff of a database's volume and socket directory into
 a systemd sandbox (`units/idmap.rs`); it is built only with `RUSTFLAGS='--cfg pgcf_idmap_lab'` and
 runs as root on a systemd host inside `systemd-run --wait --pipe -p PrivateMounts=yes`, the mount
@@ -707,6 +790,14 @@ with the image's `pgcf-slot@.service`, `pgcf.slice`, the supervisor at
 directory, as in the image: the kernel names the process's file by its real path, and the agent
 knows the supervisor by the file the link leads to now) and PostgreSQL 18, inside `systemd-run --wait --pipe -p
 PrivateMounts=yes <test binary> --ignored --test-threads=1 units::slot_lab` (its header says how).
+`units/slot_lab/analyze.rs` is part of it: a database of each class of the catalog (256 MiB to 4 GiB) in
+a pooled slot with the class's limits and its own `postgresql.conf`, tables of 100,000 rows of 8 KB that
+are never toasted, of 2 KB, and of the widest row an `ANALYZE` keeps, and a manual `ANALYZE`, a `VACUUM`,
+the autovacuum worker and as many `ANALYZE` at once as the class has workers plus one beside connections,
+each read from the unit's cgroup every 10 ms (peak memory, the ceiling, kills, stalls). Three tables of
+6,000 documents of 22 KB show what the model does not cover: a full-text index on an expression
+(+152 MiB in every class), the same with the statistics of its column off (+0) and a stored generated
+column (+1). It needs 8 GiB of disk and runs with the filter `units::slot_lab::analyze`.
 `start_lab.rs` is the agent's start on a node with 300 databases, on the same real parts and with a
 disk that is slow to flush (its header says how to run it); the numbers it gave are in the plan
 (11.1, "Agent start and stop at 300 databases").

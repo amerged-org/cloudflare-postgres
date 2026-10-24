@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! How full a database's volume is (plan 4.3, "A full single volume"): the alert levels, and when
-//! the filesystem's root-only reserve is freed and given back.
+//! How full a database's volume is (plan 4.3, "A full single volume"): the alert levels.
 use super::VolumeId;
 use serde_json::{Value, json};
 
@@ -8,9 +7,6 @@ use serde_json::{Value, json};
 pub const WARNING_PERCENT: u64 = 80;
 /// A volume at this share raises the critical alert.
 pub const CRITICAL_PERCENT: u64 = 90;
-/// A database whose unit failed a write with less than this left for users has run out: one WAL
-/// segment is the least that crash recovery and the next checkpoint need.
-pub const WAL_SEGMENT_BYTES: u64 = 16 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Alert {
@@ -18,27 +14,16 @@ pub enum Alert {
     Critical,
 }
 
-/// `statvfs` of a mounted volume, as the agent reads it every 60 s.
+/// `statvfs` of the mounted filesystem, read every 60 seconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FsUsage {
     pub total_bytes: u64,
     /// Total minus free, as `df` counts it.
     pub used_bytes: u64,
-    /// Free space a user other than root can still take.
+    /// Free space available to PostgreSQL.
     pub available_bytes: u64,
     pub inodes_total: u64,
     pub inodes_used: u64,
-}
-
-/// What to do with the 1 % root-only reserve of ext4 (`tune2fs -m`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReserveAction {
-    Keep,
-    /// The database stopped on a failed write and the tenant has no space left: let PostgreSQL's
-    /// crash recovery and the tenant's deletes run.
-    Release,
-    /// Use dropped, or the volume grew: back to 1 %.
-    Restore,
 }
 
 impl FsUsage {
@@ -74,20 +59,6 @@ impl FsUsage {
     pub fn inode_alert(&self) -> Option<Alert> {
         alert(self.inode_percent())
     }
-    /// `released` is whether the reserve was freed earlier (the volume carries a tag for it, as
-    /// the filesystem cannot tell its root-only reserve from the share ext4 keeps for itself).
-    /// `write_failed` is whether the database's unit ended on its own after a failed write. The
-    /// reserve is freed once both that and the lack of space hold (plan 4.3): a tenant who is
-    /// still running would spend it, and crash recovery after it would have none.
-    pub fn reserve_action(&self, released: bool, write_failed: bool) -> ReserveAction {
-        if write_failed && self.available_bytes < WAL_SEGMENT_BYTES {
-            ReserveAction::Release
-        } else if released && self.space_percent() < WARNING_PERCENT {
-            ReserveAction::Restore
-        } else {
-            ReserveAction::Keep
-        }
-    }
 }
 
 fn percent(used: u64, of: u64) -> u64 {
@@ -114,7 +85,6 @@ pub struct VolumeInfo {
     pub pool_used_bytes: u64,
     /// Its ext4 was made.
     pub formatted: bool,
-    pub reserve_released: bool,
     /// The pool took no writes while the volume was mounted: it may have lost some (the volume
     /// carries a tag for it). Only `recover_volume` mounts it again.
     pub suspect: bool,
@@ -212,7 +182,7 @@ mod tests {
     use super::*;
 
     /// A 128 MiB volume with 1 KiB blocks, as `stat -f` showed it after a non-root user filled it
-    /// (1 block left for users), and after `tune2fs -m 0` (1,311 blocks).
+    /// (1 block left for users).
     fn full() -> FsUsage {
         FsUsage::from_blocks(1024, 120_787, 3_932, 1, 2_048, 2_035)
     }
@@ -266,56 +236,6 @@ mod tests {
     }
 
     #[test]
-    fn the_reserve_is_freed_once_the_database_failed_a_write_and_the_tenant_has_no_space() {
-        assert_eq!(full().reserve_action(false, true), ReserveAction::Release);
-        // Releasing again is harmless; it covers a stop between the tag and the tune2fs.
-        assert_eq!(full().reserve_action(true, true), ReserveAction::Release);
-        // A database that still runs would spend the reserve, and crash recovery would find none.
-        assert_eq!(full().reserve_action(false, false), ReserveAction::Keep);
-        // 500 MiB of a 100 GiB volume are still available: the share reads 100 %, the tenant
-        // can still write, and a stop for another reason does not free the reserve.
-        let nearly = FsUsage {
-            total_bytes: 100 << 30,
-            used_bytes: (99 << 30) - (500 << 20),
-            available_bytes: 500 << 20,
-            inodes_total: 1000,
-            inodes_used: 10,
-        };
-        assert_eq!(nearly.space_percent(), 100);
-        assert_eq!(nearly.reserve_action(false, true), ReserveAction::Keep);
-        // Less than a WAL segment is left: the tenant has run out.
-        let spent = FsUsage {
-            available_bytes: WAL_SEGMENT_BYTES - 1,
-            ..nearly
-        };
-        assert_eq!(spent.reserve_action(false, true), ReserveAction::Release);
-        // Freed, and still almost full: keep it freed.
-        let released = FsUsage::from_blocks(1024, 120_787, 3_932, 1_311, 2_048, 2_035);
-        assert_eq!(released.reserve_action(true, false), ReserveAction::Keep);
-        // Use dropped below the warning level (a delete, or a resize): back to 1 %.
-        assert_eq!(
-            usage(790, 210, 0).reserve_action(true, false),
-            ReserveAction::Restore
-        );
-        assert_eq!(
-            usage(800, 200, 0).reserve_action(true, false),
-            ReserveAction::Keep
-        );
-        // Never freed: nothing to give back.
-        assert_eq!(
-            usage(100, 900, 0).reserve_action(false, false),
-            ReserveAction::Keep
-        );
-        // Out of inodes is not helped by the reserve.
-        let no_inodes = FsUsage {
-            available_bytes: 1 << 30,
-            inodes_used: 1000,
-            ..nearly
-        };
-        assert_eq!(no_inodes.reserve_action(false, true), ReserveAction::Keep);
-    }
-
-    #[test]
     fn a_volume_needs_repair_when_the_pool_failed_under_it_or_ext4_recorded_an_error() {
         let id = VolumeId::new("a1b2c3d4e5f6g7h8i9j0", 1).unwrap();
         let volume = |suspect: bool, fs_errors: bool, mounted: bool| VolumeInfo {
@@ -323,7 +243,6 @@ mod tests {
             size_bytes: 128 << 20,
             pool_used_bytes: 0,
             formatted: true,
-            reserve_released: false,
             suspect,
             fs_errors,
             mount: mounted.then(|| MountInfo { usage: full() }),
@@ -347,7 +266,6 @@ mod tests {
             size_bytes: 128 << 20,
             pool_used_bytes: 9_699_328,
             formatted: true,
-            reserve_released: false,
             suspect: false,
             fs_errors: false,
             mount: Some(MountInfo { usage: full() }),

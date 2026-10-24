@@ -8,6 +8,8 @@ import {
   DatabaseIdleTime,
   DatabaseResize,
   DatabaseRestore,
+  DatabaseRestoreInPlace,
+  DatabaseReplacementHistory,
   DatabaseRestored,
   DatabaseId,
   DatabaseListQuery,
@@ -26,6 +28,10 @@ import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { restoreDatabase } from "../domain/restore.ts";
+import {
+  startDatabaseReplacement,
+  replacementHistory,
+} from "../domain/database-replacements.ts";
 import { archiveSummary, backupCatalog } from "../domain/archive.ts";
 import {
   createDatabase,
@@ -268,6 +274,35 @@ export function registerDomain(app: ApiApp): void {
         DatabaseId.parse(c.req.param("id")),
         DatabaseRestore.parse(await c.req.json()),
       ),
+  );
+  register(
+    app,
+    {
+      method: "post",
+      path: "/v1/databases/{id}/restore-in-place",
+      security,
+      tags: ["Backups"],
+      request: { headers, params, body: body(DatabaseRestoreInPlace) },
+      responses: responses(DatabaseWithOperation, 202),
+    },
+    async (c) =>
+      startDatabaseReplacement(
+        c,
+        DatabaseId.parse(c.req.param("id")),
+        DatabaseRestoreInPlace.parse(await c.req.json()),
+      ),
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/databases/{id}/restores/in-place",
+      security,
+      tags: ["Backups"],
+      request: { params },
+      responses: responses(listEnvelope(DatabaseReplacementHistory)),
+    },
+    (c) => replacementHistory(c, DatabaseId.parse(c.req.param("id"))),
   );
   for (const action of ["suspend", "resume"] as const)
     register(

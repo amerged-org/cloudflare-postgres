@@ -12,10 +12,6 @@ import { runBackupRetention } from "./domain/backup-retention.ts";
 import { runNodeFencingCron } from "./domain/node-loss.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
 import { runInfrastructureBackupCron } from "./domain/infrastructure-backups.ts";
-import {
-  runCapacityAlertsCron,
-  runInfrastructureHealthAlerts,
-} from "./domain/infrastructure-alerts.ts";
 import { runNodeCapacityCron } from "./domain/node-capacity.ts";
 import { runResourceProfileRollouts } from "./domain/resource-profiles.ts";
 import {
@@ -23,13 +19,28 @@ import {
   cronErrorCode,
   cronErrorMessage,
   finishCronRun,
+  runWithin,
   type CronStep,
   type CronStepFailure,
 } from "./domain/cron-health.ts";
 import { armCronWatchdog } from "./cron-watchdog.ts";
 
-/** Time one run may spend sending alert notifications; the rest wait for the next minute. */
-export const ALERT_DELIVERY_BUDGET_MS = 20_000;
+/**
+ * How long one step may take before the run leaves it behind. It is a guarantee, not an answer to
+ * a hung step that was seen: Cloudflare's invocation analytics (sampled; rows with
+ * `requestDurationP50` 0 and at least 5 subrequests, see docs/operations/infrastructure-backups.md)
+ * list 351 runs between 11:00 and 18:15 UTC on 2026-10-23, and the longest took 340 s in all
+ * (median 97 s, because the platform ran them in Asia-Pacific and US colos while D1 is in WEUR);
+ * the five `cron_step_failed` lines that could be matched to their run came 3 to 157 s after it
+ * began, and none of those runs lasted longer than 169 s. Without a bound a step that does hang
+ * would hold back every step after it. Only 4 of those 351 runs took longer than 240 s (249, 262,
+ * 277 and 340 s), so a step meets the bound only when it is nearly all of a slow run, and the
+ * bound is below the 300 s after which the stall alarm fires. The step is counted as failed
+ * (`step_timeout`) and the next one starts; what the step left unfinished is picked up by the
+ * next minute's run, as after any failure. `step_ms` in the `cron_completed` line is what shows
+ * whether a step comes near it.
+ */
+export const CRON_STEP_TIMEOUT_MS = 240_000;
 
 /**
  * How long after its placement a create or a restore may still be building. A node reports
@@ -71,33 +82,39 @@ const noUsage: UsageCronResult = {
 };
 
 /**
- * One minute of control-plane work. Every step runs in its own failure boundary: a step that throws
- * is logged (`cron_step_failed`), counted in the heartbeat and reported in the result, and the steps
- * after it still run. The heartbeat records when a run started and when it attempted every step; the
- * CronWatchdog alarm reads it independently of this cron.
+ * One minute of control-plane work. Every step runs in its own failure boundary: a step that throws,
+ * or does not answer within `stepTimeoutMs`, is logged (`cron_step_failed`), counted in the
+ * heartbeat and reported in the result, and the steps after it still run. The heartbeat records
+ * when a run started and when it attempted every step; the CronWatchdog alarm reads it
+ * independently of this cron. The alerts are not a step: the same alarm evaluates them every
+ * minute (`evaluateAlerts`), so that neither a slow step nor a run that does not start holds them
+ * back. `step_ms` is the time each step took, in the order they ran.
  */
 export async function runCron(
   env: Env,
   now = Date.now(),
-  deliveryBudgetMs = ALERT_DELIVERY_BUDGET_MS,
+  stepTimeoutMs = CRON_STEP_TIMEOUT_MS,
 ): Promise<{
   failed: number;
   purged: number;
   hinted: number;
   usage: UsageCronResult;
   step_failures: CronStepFailure[];
+  step_ms: Partial<Record<CronStep, number>>;
 }> {
   const timestamp = new Date(now).toISOString(),
     cutoff = new Date(now - 20 * 60_000).toISOString(),
     buildCeiling = new Date(now - BUILD_CEILING_MS).toISOString(),
-    step_failures: CronStepFailure[] = [];
+    step_failures: CronStepFailure[] = [],
+    step_ms: Partial<Record<CronStep, number>> = {};
   const attempt = async <T>(
     step: CronStep,
     fallback: T,
     run: () => Promise<T>,
   ): Promise<T> => {
+    const began = Date.now();
     try {
-      return await run();
+      return await runWithin(stepTimeoutMs, "step_timeout", run);
     } catch (error) {
       const error_code = cronErrorCode(error);
       step_failures.push({ step, error_code });
@@ -108,15 +125,20 @@ export async function runCron(
           step,
           error_code,
           message: cronErrorMessage(error),
+          ms: Date.now() - began,
         }),
       );
       return fallback;
+    } finally {
+      step_ms[step] = Date.now() - began;
     }
   };
-  // The heartbeat is bookkeeping: a fault there must never stop the work it describes.
+  // The heartbeat is bookkeeping: a fault or lost response must never stop the work it describes.
   let previous: Awaited<ReturnType<typeof beginCronRun>> | null = null;
   try {
-    previous = await beginCronRun(env.DB, now);
+    previous = await runWithin(stepTimeoutMs, "cron_heartbeat_timeout", () =>
+      beginCronRun(env.DB, now),
+    );
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -128,17 +150,7 @@ export async function runCron(
   }
   await armCronWatchdog(env);
 
-  // Alerting needs only D1 and a bounded send, so it runs first and a slow or failing step below
-  // cannot starve it; the daily backup dispatch follows, ahead of the steps that call out. Alerting
-  // in turn may not hold the steps after it back: once the budget is spent a notification stays
-  // unclaimed and the next minute's run sends it.
-  const deliverBefore = Date.now() + deliveryBudgetMs;
-  await attempt("health_alerts", undefined, () =>
-    runInfrastructureHealthAlerts(env, now, fetch, deliverBefore),
-  );
-  await attempt("capacity_alerts", undefined, () =>
-    runCapacityAlertsCron(env, now, fetch, deliverBefore),
-  );
+  // The daily backup dispatch leads, ahead of the steps that call out to other systems.
   await attempt("infrastructure_backup_dispatch", undefined, () =>
     runInfrastructureBackupCron(env, now),
   );
@@ -221,13 +233,21 @@ export async function runCron(
   // build waits for the node's one big-job slot behind others; `Statements.running`). A node
   // that reports `building` for ever (the task of the build ended, a call of it hangs) keeps that
   // clock young, so a create or a restore also ends at a ceiling after its placement.
+  // An accepted delete cannot be undone: the node continues removing its resources until done.
+  // Keep its operation open until that confirmation, rather than claim failure and delete later.
+  // The independent database_delete_incomplete alert reports a stalled cleanup after ten minutes.
   const expired = await attempt("operation_timeouts", 0, async () => {
+    // A resize that the node reported and that is still running has a filesystem that did not
+    // reach the storage it asked for (`Statements.resizeRunning`): its own code says so.
     const result = await env.DB.prepare(
-      `UPDATE operations SET status='failed',error_code='operation_timeout',
-      error_message=CASE WHEN updated_at<? THEN 'Regional operation exceeded 20 minutes' ELSE 'Build exceeded 24 hours after its placement' END,
-      updated_at=?,completed_at=? WHERE status IN('pending','running') AND (updated_at<?
+      `UPDATE operations SET status='failed',
+      error_code=CASE WHEN kind='database.resize' AND status='running' THEN 'filesystem_not_grown' ELSE 'operation_timeout' END,
+      error_message=CASE WHEN kind='database.resize' AND status='running' THEN 'The filesystem did not reach the requested storage within 20 minutes; the node tries again'
+        WHEN updated_at<? THEN 'Regional operation exceeded 20 minutes' ELSE 'Build exceeded 24 hours after its placement' END,
+      updated_at=?,completed_at=? WHERE status IN('pending','running') AND kind<>'database.delete' AND (updated_at<?
         OR (kind IN('database.create','database.restore') AND EXISTS(SELECT 1 FROM databases b WHERE b.id=operations.database_id AND b.node_id IS NOT NULL AND b.placed_at<?)))
       AND NOT EXISTS(SELECT 1 FROM databases u WHERE u.id=operations.database_id AND u.node_id IS NULL AND u.desired_state='running' AND u.deleted_at IS NULL AND operations.kind IN('database.create','database.restore'))
+      AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.operation=operations.id AND rp.phase IN('proving','restoring','rolling_back'))
       AND NOT EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
         WHERE d.power_operation=operations.id AND d.id=operations.database_id AND d.project_id=operations.project_id
         AND d.deleted_at IS NULL AND operations.generation<=d.generation
@@ -341,11 +361,13 @@ export async function runCron(
 
   if (previous !== null)
     try {
-      await finishCronRun(
-        env.DB,
-        previous,
-        step_failures,
-        Math.max(now, Date.now()),
+      await runWithin(stepTimeoutMs, "cron_heartbeat_timeout", () =>
+        finishCronRun(
+          env.DB,
+          previous,
+          step_failures,
+          Math.max(now, Date.now()),
+        ),
       );
     } catch (error) {
       console.error(
@@ -362,5 +384,6 @@ export async function runCron(
     hinted,
     usage,
     step_failures,
+    step_ms,
   };
 }

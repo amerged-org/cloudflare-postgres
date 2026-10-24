@@ -169,6 +169,7 @@ impl Link {
             "protocol": constant("NODE_PROTOCOL_VERSION"),
             "agent_version": config.agent_version,
             "release_id": config.release_id,
+            "capabilities": ["restore_in_place_v1"],
             "os": config.os,
         });
         if !schema_valid("AgentLinkMessage", &hello) {
@@ -591,7 +592,10 @@ mod tests {
         let (link, mut events) = start(&cloud, &base).await;
         assert_eq!(next(&mut events).await, Some(LinkEvent::Desired(None)));
         let hellos = || cloud.with(|inner| inner.hellos.clone());
-        assert_eq!(hellos(), [vector("AgentLinkMessage", "hello")]);
+        assert_eq!(
+            hellos(),
+            [vector("AgentLinkMessage", "hello-with-in-place-restore")]
+        );
         // The packages changed in a maintenance cycle: the next hello says so, on a new link.
         let mut installed = os();
         installed["packages_sha256"] = "b".repeat(64).into();

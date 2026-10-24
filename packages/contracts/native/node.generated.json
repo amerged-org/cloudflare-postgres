@@ -989,6 +989,176 @@
                       }
                     },
                     "required": ["kind", "source"]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": { "type": "string", "const": "replace" },
+                      "source": {
+                        "type": "object",
+                        "properties": {
+                          "database_id": { "$ref": "#/$defs/DatabaseId" },
+                          "path": {
+                            "type": "string",
+                            "pattern": "^s3:\\/\\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\\/([a-z][a-z0-9-]{1,30}[a-z0-9])\\/([a-z][a-z0-9]{19})\\/g([1-9][0-9]{0,15})-(op_[a-z0-9]{20})$"
+                          },
+                          "backup_id": {
+                            "type": "string",
+                            "pattern": "^[0-9]{8}T[0-9]{6}$"
+                          },
+                          "target_time": { "$ref": "#/$defs/Timestamp" },
+                          "credential": {
+                            "type": "object",
+                            "properties": {
+                              "id": {
+                                "type": "string",
+                                "pattern": "^crd_[a-z0-9]{20}$"
+                              },
+                              "expires_at": { "$ref": "#/$defs/Timestamp" }
+                            },
+                            "required": ["id", "expires_at"]
+                          }
+                        },
+                        "required": [
+                          "database_id",
+                          "path",
+                          "backup_id",
+                          "target_time",
+                          "credential"
+                        ]
+                      },
+                      "previous": {
+                        "type": "object",
+                        "properties": {
+                          "storage_generation": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 9007199254740991
+                          },
+                          "end": {
+                            "type": "object",
+                            "properties": {
+                              "system_identifier": {
+                                "type": "string",
+                                "pattern": "^[1-9][0-9]{0,19}$"
+                              },
+                              "timeline": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 4294967295
+                              },
+                              "checkpoint_lsn": {
+                                "type": "string",
+                                "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+                              },
+                              "last_archived_segment": {
+                                "type": "string",
+                                "pattern": "^[0-9A-F]{24}$"
+                              },
+                              "proven_at": { "$ref": "#/$defs/Timestamp" }
+                            },
+                            "required": [
+                              "system_identifier",
+                              "timeline",
+                              "checkpoint_lsn",
+                              "last_archived_segment",
+                              "proven_at"
+                            ]
+                          }
+                        },
+                        "required": ["storage_generation", "end"]
+                      }
+                    },
+                    "required": ["kind", "source", "previous"]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": { "type": "string", "const": "replace_rollback" },
+                      "source": {
+                        "type": "object",
+                        "properties": {
+                          "database_id": { "$ref": "#/$defs/DatabaseId" },
+                          "path": {
+                            "type": "string",
+                            "pattern": "^s3:\\/\\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\\/([a-z][a-z0-9-]{1,30}[a-z0-9])\\/([a-z][a-z0-9]{19})\\/g([1-9][0-9]{0,15})-(op_[a-z0-9]{20})$"
+                          },
+                          "backup_id": {
+                            "type": "string",
+                            "pattern": "^[0-9]{8}T[0-9]{6}$"
+                          },
+                          "credential": {
+                            "type": "object",
+                            "properties": {
+                              "id": {
+                                "type": "string",
+                                "pattern": "^crd_[a-z0-9]{20}$"
+                              },
+                              "expires_at": { "$ref": "#/$defs/Timestamp" }
+                            },
+                            "required": ["id", "expires_at"]
+                          }
+                        },
+                        "required": [
+                          "database_id",
+                          "path",
+                          "backup_id",
+                          "credential"
+                        ]
+                      },
+                      "previous": {
+                        "type": "object",
+                        "properties": {
+                          "storage_generation": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 9007199254740991
+                          },
+                          "end": {
+                            "type": "object",
+                            "properties": {
+                              "system_identifier": {
+                                "type": "string",
+                                "pattern": "^[1-9][0-9]{0,19}$"
+                              },
+                              "timeline": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 4294967295
+                              },
+                              "checkpoint_lsn": {
+                                "type": "string",
+                                "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+                              },
+                              "last_archived_segment": {
+                                "type": "string",
+                                "pattern": "^[0-9A-F]{24}$"
+                              },
+                              "proven_at": { "$ref": "#/$defs/Timestamp" }
+                            },
+                            "required": [
+                              "system_identifier",
+                              "timeline",
+                              "checkpoint_lsn",
+                              "last_archived_segment",
+                              "proven_at"
+                            ]
+                          }
+                        },
+                        "required": ["storage_generation", "end"]
+                      },
+                      "replacement_generation": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 9007199254740991
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "source",
+                      "previous",
+                      "replacement_generation"
+                    ]
                   }
                 ]
               }
@@ -1089,6 +1259,11 @@
                   "build_failed",
                   "start_failed"
                 ]
+              },
+              "storage_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
               },
               "proven_sleep": {
                 "anyOf": [
@@ -1448,6 +1623,11 @@
             { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
             { "type": "null" }
           ]
+        },
+        "capabilities": {
+          "maxItems": 1,
+          "type": "array",
+          "items": { "type": "string", "const": "restore_in_place_v1" }
         }
       },
       "required": [
@@ -2116,6 +2296,11 @@
                 "host_files_sha256"
               ],
               "additionalProperties": false
+            },
+            "capabilities": {
+              "maxItems": 1,
+              "type": "array",
+              "items": { "type": "string", "const": "restore_in_place_v1" }
             }
           },
           "required": ["type", "protocol", "agent_version", "release_id", "os"],
@@ -2282,6 +2467,11 @@
                     },
                     { "type": "null" }
                   ]
+                },
+                "capabilities": {
+                  "maxItems": 1,
+                  "type": "array",
+                  "items": { "type": "string", "const": "restore_in_place_v1" }
                 }
               },
               "required": [
@@ -2399,6 +2589,7 @@
     "NODE_DESIRED_PAGE_LIMIT_MAX": 200,
     "NODE_REPORT_EVENTS_MAX": 64,
     "NODE_REPORT_EVENT_FIELDS_MAX": 24,
+    "FILESYSTEM_END_GAP_BYTES": 4194304,
     "NODE_BOOT_REPORT_ENTRIES_MAX": 1000,
     "NODE_BOOT_REPORT_MESSAGE_MAX_BYTES": 2048,
     "NODE_BOOT_REPORT_MAX_BYTES": 1048576,

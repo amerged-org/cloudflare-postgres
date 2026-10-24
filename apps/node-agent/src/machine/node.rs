@@ -372,6 +372,12 @@ impl Machine for Node {
             .await
     }
 
+    async fn filesystem_bytes(&self, id: &VolumeId) -> Result<u64, storage::Error> {
+        let id = id.clone();
+        self.storage(move |storage| storage.filesystem_bytes(&id))
+            .await
+    }
+
     async fn remove_volume(&self, id: &VolumeId, removal: Removal) -> Result<(), storage::Error> {
         let id = id.clone();
         self.storage(move |storage| match storage.remove_volume(&id, removal) {
@@ -394,6 +400,10 @@ impl Machine for Node {
     async fn needs_repair(&self, id: &VolumeId) -> Result<bool, storage::Error> {
         let id = id.clone();
         self.storage(move |storage| storage.needs_repair(&id)).await
+    }
+
+    async fn suspect_volumes(&self) -> Result<Vec<VolumeId>, storage::Error> {
+        self.storage(|storage| storage.suspects()).await
     }
 
     async fn recover_volume(
@@ -521,6 +531,20 @@ impl Machine for Node {
                     .retain(|_, held| held != database);
             }
             return stopped;
+        }
+        Ok(())
+    }
+    async fn kill(&self, database: &str) -> Result<(), units::Error> {
+        if self.pool.kill(database).await? {
+            return Ok(());
+        }
+        // A unit of its own that an earlier agent started, running or with a process left.
+        if self.units.holds_database(database).await? {
+            self.units.kill(database).await?;
+            self.legacy
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|_, held| held != database);
         }
         Ok(())
     }
@@ -1200,5 +1224,195 @@ mod lab {
         assert!(!node.has_volume(&volume).await.unwrap());
         node.remove_account(ID).await.unwrap();
         assert_eq!(node.account(ID), None);
+    }
+
+    /// The finding of the live run (US1, 2026-10-23): the delete of two databases whose
+    /// filesystems were full ended with the volume mounted, the user there and the slot unit
+    /// `failed`, and reported the databases deleted. Here a real PostgreSQL in a real slot has a
+    /// full filesystem when its database is deleted, and the machine's part of the delete
+    /// (`agent::remove`, which the agent's flow calls) leaves nothing behind: the unit is ended,
+    /// its slot is back to `inactive` and built on again, the volume and its chunks are gone, and
+    /// so is the user.
+    #[tokio::test]
+    #[ignore = "needs systemd as PID 1, root, LVM, PostgreSQL 18 and the node image's units (lab)"]
+    async fn a_database_on_a_full_filesystem_is_deleted_with_its_slot_its_volume_and_its_user() {
+        use crate::agent::remove::{end_unit, remove_volumes};
+        if !Path::new("/run/systemd/system").is_dir() || unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs systemd as PID 1 and root");
+            return;
+        }
+        let group = format!("pgcflabf{}", std::process::id());
+        let disk = std::env::temp_dir().join(format!("{group}.img"));
+        std::fs::File::create(&disk)
+            .unwrap()
+            .set_len(4 << 30)
+            .unwrap();
+        let loop_device = sh("losetup", &["-f", "--show", disk.to_str().unwrap()]);
+        let _lab = Lab {
+            disk,
+            loop_device: loop_device.clone(),
+            group: group.clone(),
+        };
+        let layout = Layout::default();
+        let node = Node::connect(
+            layout.clone(),
+            storage::Config {
+                device: loop_device.into(),
+                group,
+                ..storage::Config::default()
+            },
+            slots::POOL,
+        )
+        .await
+        .unwrap();
+        let policy = Policy {
+            reserve_bytes: 0,
+            metadata_no_room_percent: 100,
+            sample_max_age: Duration::from_secs(60),
+        };
+        let volume = VolumeId::new(ID, 1).unwrap();
+        let account = node.ensure_account(ID).await.unwrap();
+        node.poll_pool().await.unwrap();
+        node.create_volume(&volume, 1 << 30, &account, &policy)
+            .await
+            .unwrap();
+        dm_node(&node.device(&volume));
+        node.prepare_socket_directory(ID, &account).unwrap();
+        let data = layout.data(ID);
+        node.initdb(&account, &data).await.unwrap();
+        let socket = layout.socket_directory(ID);
+        let conf = settings::postgresql_conf(&settings::Settings {
+            socket_directory: &socket,
+            memory_mib: 512,
+            volume_bytes: 1 << 30,
+            max_connections: 20,
+            archive_timeout_seconds: 60,
+            archive_command: None,
+        })
+        .unwrap();
+        let ident = settings::pg_ident(&node.agent_user(), &account.name).unwrap();
+        for (name, content) in [
+            ("postgresql.conf", conf.as_str()),
+            ("pg_hba.conf", settings::PG_HBA),
+            ("pg_ident.conf", ident.as_str()),
+        ] {
+            std::fs::write(data.join(name), content).unwrap();
+            chown(data.join(name), Some(account.uid), Some(account.gid)).unwrap();
+        }
+        let limits = Limits {
+            memory_mib: 512,
+            cpu_millicores: 500,
+            tasks_max: 64,
+            io: Some(Io::scaled(node.device(&volume), 20 << 20, 500, 512)),
+        };
+        let bind = Bind {
+            device: node.device(&volume).into(),
+            data: data.clone(),
+            properties: limits.properties(),
+            volume: volume.clone(),
+            account: account.clone(),
+        };
+        node.make_slot_user().await.unwrap();
+        let bound = node.bind(ID, &bind).await.unwrap();
+        assert_eq!(bound.slot, 0);
+        node.exec(&bound).await.unwrap();
+        let unit = slots::slot_unit(0);
+        let session = postgres::agent(&socket).await.unwrap();
+        session
+            .batch("CREATE TABLE kept AS SELECT generate_series(1, 1000) AS n")
+            .await
+            .unwrap();
+        drop(session);
+
+        // A unit that a stop does not end is killed: every process gets SIGKILL, the unit is
+        // taken back from `failed`, and nothing holds the volume. PostgreSQL then starts again
+        // on it, recovers from the kill and has its data.
+        let began = std::time::Instant::now();
+        node.kill(ID).await.unwrap();
+        eprintln!(
+            "lab: the kill ended the unit in {} ms",
+            began.elapsed().as_millis()
+        );
+        assert_eq!(show(&unit, "ActiveState"), "inactive");
+        assert_eq!(node.unit_volume(ID).await.unwrap(), None);
+        let bound = node.bind(ID, &bind).await.unwrap();
+        node.exec(&bound).await.unwrap();
+        let session = postgres::agent(&socket).await.unwrap();
+        let rows = session
+            .query("SELECT count(*)::int4 FROM kept", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, i32>(0), 1000);
+        drop(session);
+
+        // The tenant fills its filesystem: it writes as its own user until nothing is left.
+        let status = Command::new("setpriv")
+            .args([
+                &format!("--reuid={}", account.uid),
+                &format!("--regid={}", account.gid),
+                "--clear-groups",
+                "dd",
+                "if=/dev/zero",
+            ])
+            .arg(format!(
+                "of={}",
+                layout.volume(ID).join("ballast").display()
+            ))
+            .args(["bs=1M"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "the filesystem was not filled");
+        let free = sh(
+            "stat",
+            &["-f", "-c", "%a", layout.volume(ID).to_str().unwrap()],
+        );
+        assert_eq!(free, "0", "no block is left for the tenant");
+
+        // The delete: the clean stop is the shutdown checkpoint, which cannot write.
+        let began = std::time::Instant::now();
+        end_unit(&node, ID).await.unwrap();
+        eprintln!(
+            "lab: the unit ended after {} ms; ActiveState {}",
+            began.elapsed().as_millis(),
+            show(&unit, "ActiveState")
+        );
+        let journal = sh("journalctl", &["-u", &unit, "--no-pager", "-o", "cat"]);
+        for line in journal
+            .lines()
+            .filter(|line| line.contains("PANIC") || line.contains("No space left"))
+        {
+            eprintln!("lab: journal: {line}");
+        }
+        assert!(
+            journal.contains("PANIC") || journal.contains("No space left"),
+            "the shutdown did not meet the full filesystem: {journal}"
+        );
+        // No unit is left failed, and nothing of the database runs.
+        assert_eq!(show(&unit, "ActiveState"), "inactive");
+        assert_eq!(node.unit_volume(ID).await.unwrap(), None);
+        assert!(!node.unit(ID).await.unwrap().active.awake());
+        let others = remove_volumes(&node, ID, 1, Some(volume.clone()))
+            .await
+            .unwrap();
+        assert!(!others);
+        node.remove_account(ID).await.unwrap();
+        assert!(!node.has_volume(&volume).await.unwrap());
+        assert_eq!(node.account(ID), None);
+        assert!(
+            !Path::new(&format!(
+                "/dev/mapper/{}",
+                node.device(&volume).trim_start_matches("/dev/mapper/")
+            ))
+            .exists()
+        );
+        // The slot is built on again, on its own number.
+        assert_eq!(node.refill_slot(1).await.unwrap(), Some(0));
+        assert_eq!(node.drain_idle_slots().await, 1);
+        let failed = sh(
+            "systemctl",
+            &["list-units", "--state=failed", "--no-legend", "--plain"],
+        );
+        assert!(!failed.contains("pgcf-slot@"), "{failed}");
     }
 }

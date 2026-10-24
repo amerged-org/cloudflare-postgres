@@ -7,11 +7,11 @@ import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import {
   MAX_VOLUMES_PER_NODE,
   choosePlacement,
-  closedPools,
   growthFits,
   placementNodes,
   type PlacementNeed,
 } from "../../src/domain/placement.ts";
+import { closedPools } from "../../src/domain/placement-closed.ts";
 import { addNode, cleanupFixtures, fixture } from "./fixtures.ts";
 import { OPEN_POOL, seedSamples, steady } from "./node-samples.ts";
 

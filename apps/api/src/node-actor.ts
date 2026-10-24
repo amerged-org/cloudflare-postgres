@@ -212,7 +212,7 @@ export class NodeActor extends DurableObject<Env> {
           ? null
           : (JSON.parse(link.sample) as NodeSample).observed_at;
       await this.env.DB.prepare(
-        `UPDATE nodes SET agent_version=?,reported_release_id=?,
+        `UPDATE nodes SET agent_version=?,reported_release_id=?,restore_in_place_capable=?,
          os_previous_observed_at=CASE WHEN os_boot_id IS ? THEN os_previous_observed_at
            ELSE COALESCE(MAX(last_observed_at,?),?,last_observed_at) END,
          os_boot_id=?,os_booted_at=?,os_kernel_release=?,os_packages_sha256=?,os_host_files_sha256=?,
@@ -223,6 +223,9 @@ export class NodeActor extends DurableObject<Env> {
           parsed.data.release_id === null
             ? null
             : FleetReleaseId.parse(parsed.data.release_id),
+          Number(
+            parsed.data.capabilities?.includes("restore_in_place_v1") === true,
+          ),
           os.boot_id,
           held,
           held,
@@ -399,10 +402,14 @@ export class NodeActor extends DurableObject<Env> {
              AND EXISTS(SELECT 1 FROM nodes WHERE id=? AND node_uid=? AND lost_at IS NULL AND ready=1)`,
         )
         .bind(now, link.node_id, link.node_id, link.node_uid),
-      db
-        .prepare("SELECT ready FROM nodes WHERE id=? AND node_uid=?")
-        .bind(link.node_id, link.node_uid),
     );
+    // Keep the readiness query's result index: hourly pruning may append another statement.
+    const readyResult =
+      statements.push(
+        db
+          .prepare("SELECT ready FROM nodes WHERE id=? AND node_uid=?")
+          .bind(link.node_id, link.node_uid),
+      ) - 1;
     if (minute.minute % 60 === 0 && link.flushed !== written(minute))
       statements.push(
         db
@@ -413,7 +420,7 @@ export class NodeActor extends DurableObject<Env> {
     this.ctx.storage.sql.exec(
       "UPDATE node_link SET flushed=?,open=? WHERE singleton=1",
       written(minute),
-      link.open === 1 || results.at(-1)?.results[0]?.ready === 1 ? 1 : 0,
+      link.open === 1 || results[readyResult]?.results[0]?.ready === 1 ? 1 : 0,
     );
   }
 

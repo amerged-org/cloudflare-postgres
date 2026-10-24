@@ -55,6 +55,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod analyze;
+
 const SCRATCH: &str = "/var/tmp/pgcf-lab-slots";
 /// The lab's slots: far from the node's, whose first numbers an agent fills.
 const POOL: std::ops::Range<u32> = 900..916;
@@ -152,9 +154,12 @@ struct Database {
     root: PathBuf,
     sockets: PathBuf,
     dir: PathBuf,
+    volume_bytes: u64,
 }
 impl Database {
-    fn new(label: &str) -> Database {
+    /// A database whose volume has `volume_bytes` (a sparse file) and whose configuration is that
+    /// of a class of `memory_mib`.
+    fn sized(label: &str, volume_bytes: u64, memory_mib: u64) -> Database {
         let id = format!(
             "labslot{label}{:012}",
             u64::from(std::process::id()) + LABS.fetch_add(1, Ordering::Relaxed)
@@ -165,7 +170,7 @@ impl Database {
         let image = dir.join("volume.img");
         fs::File::create(&image)
             .unwrap()
-            .set_len(256 << 20)
+            .set_len(volume_bytes)
             .unwrap();
         let loop_device = sh("losetup", &["-f", "--show", image.to_str().unwrap()]);
         if !Path::new(&loop_device).exists() {
@@ -206,8 +211,9 @@ impl Database {
             root,
             sockets,
             dir,
+            volume_bytes,
         };
-        lab.make_cluster();
+        lab.make_cluster(memory_mib);
         lab
     }
 
@@ -224,7 +230,7 @@ impl Database {
 
     /// The cluster, as the agent makes it: `initdb` as the database's user, the agent's
     /// configuration, and no login before `pg_hba.conf` is there.
-    fn make_cluster(&self) {
+    fn make_cluster(&self, memory_mib: u64) {
         let data = self.data();
         let status = Command::new(format!("{POSTGRES}/initdb"))
             .args(initdb_arguments(&data, None))
@@ -237,31 +243,40 @@ impl Database {
             .status()
             .unwrap();
         assert!(status.success(), "initdb");
-        let conf = settings::postgresql_conf(&settings::Settings {
-            socket_directory: &self.sockets,
-            memory_mib: 512,
-            volume_bytes: 256 << 20,
-            max_connections: 20,
-            archive_timeout_seconds: 60,
-            archive_command: None,
-        })
-        .unwrap();
         let ident = settings::pg_ident("root", DB_USER).unwrap();
         for (name, content) in [
-            ("postgresql.conf", conf.as_str()),
             ("pg_hba.conf", settings::PG_HBA),
             ("pg_ident.conf", ident.as_str()),
         ] {
             fs::write(data.join(name), content).unwrap();
             chown(data.join(name), Some(DB_ID), Some(DB_ID)).unwrap();
         }
+        self.write_conf(memory_mib, 20);
+    }
+
+    /// `postgresql.conf` of a class of `memory_mib` and `max_connections`, as the agent writes it
+    /// before a start.
+    fn write_conf(&self, memory_mib: u64, max_connections: u32) {
+        let conf = settings::postgresql_conf(&settings::Settings {
+            socket_directory: &self.sockets,
+            memory_mib,
+            volume_bytes: self.volume_bytes,
+            max_connections,
+            archive_timeout_seconds: 60,
+            archive_command: None,
+        })
+        .unwrap();
+        let path = self.data().join("postgresql.conf");
+        fs::write(&path, conf).unwrap();
+        chown(&path, Some(DB_ID), Some(DB_ID)).unwrap();
     }
 
     fn lvs(&self) -> String {
         format!(
-            r#"{{"report":[{{"lv":[{{"lv_name":"{lv}","lv_size":"268435456","lv_attr":"Vwi-a-tz--","pool_lv":"pgcf_thinpool","chunk_size":"0","lv_metadata_size":"","lv_when_full":"","zero":"zero","lv_tags":"pgcf.db.{id},pgcf.fs,pgcf.gen.1"}}]}}]}}"#,
+            r#"{{"report":[{{"lv":[{{"lv_name":"{lv}","lv_size":"{size}","lv_attr":"Vwi-a-tz--","pool_lv":"pgcf_thinpool","chunk_size":"0","lv_metadata_size":"","lv_when_full":"","zero":"zero","lv_tags":"pgcf.db.{id},pgcf.fs,pgcf.gen.1"}}]}}]}}"#,
             lv = self.volume.lv_name(),
-            id = self.id
+            id = self.id,
+            size = self.volume_bytes
         )
     }
 
@@ -333,6 +348,12 @@ struct Lab {
 impl Lab {
     /// The host and a database, in that order: the database goes first at the end.
     async fn new(label: &str) -> (Lab, Database) {
+        Self::sized(label, 256 << 20, 512).await
+    }
+
+    /// The same, for a database with a volume of `volume_bytes` and the configuration of a class of
+    /// `memory_mib`.
+    async fn sized(label: &str, volume_bytes: u64, memory_mib: u64) -> (Lab, Database) {
         let guard = ONE_AT_A_TIME.lock().await;
         assert_ne!(
             fs::read_link("/proc/1/ns/mnt").unwrap(),
@@ -360,7 +381,7 @@ impl Lab {
         account(GATEWAY_USER, GATEWAY_ID);
         account(DB_USER, DB_ID);
         let lab_without_pool = made_gateway_group;
-        let database = Database::new(label);
+        let database = Database::sized(label, volume_bytes, memory_mib);
         let pool = Self::pool_of(&database).await;
         (
             Lab {

@@ -271,6 +271,10 @@ scratch_filesystem_gap() {
 		echo "filesystem $filesystem of a volume of $bytes"
 		return 1
 	}
+	local features
+	features=$(dumpe2fs -h "/dev/mapper/pgcf-db_${id}_g1" 2>/dev/null | sed -n 's/^Filesystem features: *//p')
+	[[ " $features " == *" meta_bg "* && " $features " != *" resize_inode "* && " $features " != *" project "* ]]
+
 }
 
 scratch_id() {

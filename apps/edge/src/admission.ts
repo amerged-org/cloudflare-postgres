@@ -23,6 +23,12 @@ export interface AdmissionTimings {
   /** The limiters, which run in parallel with the Actor's admission. */
   limiters_ms?: number;
   admit_ms?: number;
+  /** A thrown RPC and an Actor's generic failure are distinct; never log exception text. */
+  admit_error?: "rpc_exception" | "actor_failure";
+  /** Cloudflare's exception flags, accepted only as booleans. No retry is implied. */
+  admit_retryable?: boolean;
+  admit_overloaded?: boolean;
+  admit_remote?: boolean;
   /** The route token version signed: v6 for an awake database, v5 for a wake ticket. */
   route?: "v6" | "v5";
   token_ms?: number;
@@ -141,6 +147,20 @@ export async function admitRoute(
     [admission, ...outcomes] = await Promise.allSettled([
       actor
         .admitWake(hints.database, hints.user, { deadline, waiterId: cid })
+        .catch((reason: unknown) => {
+          // A 12 s live stall returned 08006 without a matching Actor log. Keep the RPC's
+          // diagnostic flags, not its message/name/cause/stack, so the next probe can distinguish
+          // that failure from an Actor that ran and returned a refusal.
+          const flags =
+            typeof reason === "object" && reason !== null
+              ? (reason as Record<string, unknown>)
+              : {};
+          timings.admit_error = "rpc_exception";
+          timings.admit_retryable = flags.retryable === true;
+          timings.admit_overloaded = flags.overloaded === true;
+          timings.admit_remote = flags.remote === true;
+          throw reason;
+        })
         .finally(() => {
           timings.admit_ms = Date.now() - started;
         }),
@@ -180,6 +200,7 @@ export async function admitRoute(
           "database connection rate limit exceeded",
         );
       default:
+        timings.admit_error = "actor_failure";
         throw new AdmissionFailure("08006", "gateway connection failed");
     }
   }

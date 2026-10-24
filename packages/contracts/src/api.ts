@@ -28,7 +28,7 @@ export { Timestamp, roleExpiryInstant } from "./timestamp.ts";
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.3.0";
+export const API_CONTRACT_VERSION = "1.4.0";
 
 /** The pattern of `Timestamp` in the contract's own JSON Schema, which the OpenAPI generator drops. */
 export const TIMESTAMP_PATTERN: string = (() => {
@@ -354,7 +354,7 @@ export const DatabaseHealth = z
       status: z
         .enum(DISK_HEALTH_STATUSES)
         .describe(
-          "warning: at least 90 % of the allocated storage is used; unknown: no usage sample within 180 s, or the sample measured nothing. The node reports every volume every minute; the control plane stores a sample of an awake database's volume every minute and one of a hibernated database's (which cannot grow) each quarter hour, so a hibernated database reads unknown between its samples.",
+          "warning: at least 90 % of the mounted filesystem is used; unknown: no valid filesystem report within 180 s for the database's current node and storage generation. The node reports every volume every minute. Disk health uses actual filesystem capacity; the separate storage and usage fields retain nominal logical-volume allocation for metering.",
         ),
       used_ratio: z
         .number()
@@ -491,18 +491,44 @@ export type DatabaseIdleTime = z.infer<typeof DatabaseIdleTime>;
 const RestoreRegion = RegionId.describe(
   "The source's region, which is also the default. Another region is refused with 409 `region_unavailable`.",
 ).optional();
+export const DatabaseRestoreInPlace = z
+  .strictObject({
+    mode: z.literal("pitr"),
+    target_time: Timestamp,
+  })
+  .meta({ id: "DatabaseRestoreInPlace" });
+export type DatabaseRestoreInPlace = z.infer<typeof DatabaseRestoreInPlace>;
+export const DatabaseReplacementHistory = z
+  .strictObject({
+    operation: OperationId,
+    phase: z.enum([
+      "proving",
+      "restoring",
+      "rolling_back",
+      "succeeded",
+      "failed",
+    ]),
+    target_time: Timestamp,
+    failure: z.string().nullable(),
+    created_at: Timestamp,
+    completed_at: Timestamp.nullable(),
+    retained_until: Timestamp.nullable(),
+  })
+  .meta({ id: "DatabaseReplacementHistory" });
 export const DatabaseRestore = z
   .discriminatedUnion("mode", [
     z.strictObject({
       mode: z.literal("full"),
       name: DatabaseName,
       region_id: RestoreRegion,
+      source_operation_id: OperationId.optional(),
     }),
     z.strictObject({
       mode: z.literal("pitr"),
       name: DatabaseName,
       target_time: Timestamp,
       region_id: RestoreRegion,
+      source_operation_id: OperationId.optional(),
     }),
   ])
   .meta({ id: "DatabaseRestore" });
@@ -675,7 +701,7 @@ export const Operation = z
           .min(1)
           .max(64)
           .describe(
-            "Machine-readable reason of a failed operation, for example `operation_timeout`, `superseded`, `power_busy` or, for database.role.delete, `role_not_droppable`.",
+            "Machine-readable reason of a failed operation, for example `operation_timeout`, `superseded`, `power_busy`, for database.resize `filesystem_not_grown` (the filesystem did not reach the storage within 20 minutes of the node's report) or, for database.role.delete, `role_not_droppable`.",
           ),
         message: z.string().max(TEXT_MAX_LENGTH),
       })

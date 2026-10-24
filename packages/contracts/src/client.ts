@@ -6,6 +6,8 @@ import {
   DatabaseCreate,
   DatabaseResize,
   DatabaseRestore,
+  DatabaseRestoreInPlace,
+  DatabaseReplacementHistory,
   DatabaseRestored,
   DatabaseWithOperation,
   IdempotencyKey,
@@ -319,6 +321,28 @@ export class PgcfClient {
       DatabaseRestored,
       input(DatabaseRestore, body),
       input(IdempotencyKey, idempotencyKey),
+    );
+  }
+  restoreDatabaseInPlace(
+    id: string,
+    body: DatabaseRestoreInPlace,
+    idempotencyKey: string,
+  ): Promise<DatabaseWithOperation> {
+    return this.#request(
+      `/v1/databases/${input(DatabaseId, id)}/restore-in-place`,
+      "POST",
+      202,
+      DatabaseWithOperation,
+      input(DatabaseRestoreInPlace, body),
+      input(IdempotencyKey, idempotencyKey),
+    );
+  }
+  listDatabaseReplacements(id: string) {
+    return this.#request(
+      `/v1/databases/${input(DatabaseId, id)}/restores/in-place`,
+      "GET",
+      200,
+      listEnvelope(DatabaseReplacementHistory),
     );
   }
   createRole(

@@ -1,23 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // The cron step `database_actors` publishes the admission snapshot of one page of databases each
 // minute: the publishes of a page overlap, up to a bound, and stop starting at the step's budget.
-// Real D1 and Durable Objects; the only double wraps the real DatabaseActor binding to add the
-// latency a cold Actor has (250-1100 ms of publish, measured on EU1).
+// Real D1 and Durable Objects. Controlled publication barriers prove concurrency independently
+// of host speed; the budget test adds latency to the real DatabaseActor binding.
 import { env } from "cloudflare:workers";
 import {
   archiveDestinationPath,
   newDatabaseId,
   newOperationId,
 } from "@pgcf/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ACTOR_RECONCILE_CONCURRENCY,
   reconcileDatabaseActors,
 } from "../../src/domain/database-actor-sync.ts";
 import type { Env } from "../../src/env.ts";
+import * as admission from "../../src/domain/database-admission-snapshot.ts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
 
-afterEach(cleanupFixtures);
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await cleanupFixtures();
+});
 
 const PUBLISH_MS = 100;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -102,23 +106,58 @@ const context = (actors: ReturnType<typeof slowActors>) =>
 describe("the actors of a page", () => {
   it("are published together, never more than the bound at once", async () => {
     const ids = await databases(24);
-    const actors = slowActors();
-    const started = Date.now();
-    const page = await reconcileDatabaseActors(context(actors), undefined, 24);
-    const elapsed = Date.now() - started;
+    const publish = admission.publishDatabaseAdmission;
+    let signalFirstWave!: () => void;
+    const firstWave = new Promise<void>((resolve) => {
+      signalFirstWave = resolve;
+    });
+    let releasePublishes!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      releasePublishes = resolve;
+    });
+    const seen = {
+      inFlight: 0,
+      mostInFlight: 0,
+      started: [] as string[],
+      completed: [] as string[],
+    };
+    vi.spyOn(admission, "publishDatabaseAdmission").mockImplementation(
+      async (...args) => {
+        seen.started.push(args[1]);
+        seen.mostInFlight = Math.max(seen.mostInFlight, ++seen.inFlight);
+        if (seen.started.length === ACTOR_RECONCILE_CONCURRENCY)
+          signalFirstWave();
+        try {
+          await blocked;
+          const result = await publish(...args);
+          expect(result, `snapshot accepted for ${args[1]}`).toBe(true);
+          seen.completed.push(args[1]);
+          return result;
+        } finally {
+          seen.inFlight--;
+        }
+      },
+    );
+    // This test isolates concurrency from the deadline, which the next two tests cover.
+    const publishing = reconcileDatabaseActors(env, undefined, 24, Infinity);
+    let page: Awaited<typeof publishing>;
+    try {
+      await firstWave;
+      // No publish can finish before this assertion: the complete first wave must overlap,
+      // and an unbounded implementation must not have started the rest of the page.
+      expect(seen.started).toEqual(ids.slice(0, ACTOR_RECONCILE_CONCURRENCY));
+      expect(seen.inFlight).toBe(ACTOR_RECONCILE_CONCURRENCY);
+      expect(seen.completed).toEqual([]);
+    } finally {
+      releasePublishes();
+      page = await publishing;
+    }
     expect(page.ids).toEqual(ids);
     expect(page.next).toBe(ids.at(-1));
-    expect(new Set(actors.seen.published)).toEqual(new Set(ids));
-    expect(actors.seen.published).toHaveLength(24);
-    expect(actors.seen.mostInFlight).toBeGreaterThan(1);
-    expect(actors.seen.mostInFlight).toBeLessThanOrEqual(
-      ACTOR_RECONCILE_CONCURRENCY,
-    );
-    // One after the other the publishes alone take this long; together they take a fraction.
-    expect(
-      elapsed,
-      `${elapsed} ms for ${24 * PUBLISH_MS} ms of publishes`,
-    ).toBeLessThan((24 * PUBLISH_MS) / 2);
+    expect(seen.started).toEqual(ids);
+    expect(seen.completed.slice().sort()).toEqual(ids);
+    expect(seen.inFlight).toBe(0);
+    expect(seen.mostInFlight).toBe(ACTOR_RECONCILE_CONCURRENCY);
   }, 60_000);
 
   it("stop starting at the budget, and the next page begins after the last one that was published", async () => {

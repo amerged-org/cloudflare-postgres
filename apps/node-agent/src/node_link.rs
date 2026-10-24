@@ -371,6 +371,24 @@ fn origin_valid(origin: &Value, id: &str, storage: u64) -> bool {
             Some("move") => {
                 source_id == id && from.generation < storage && source.get("target_time").is_none()
             }
+            Some("replace") => {
+                source_id == id
+                    && from.generation < storage
+                    && origin["previous"]["storage_generation"].as_u64() == Some(from.generation)
+                    && source["target_time"].as_str().is_some()
+                    && source.get("end").is_none()
+            }
+            Some("replace_rollback") => {
+                source_id == id
+                    && source.get("target_time").is_none()
+                    && source.get("end").is_none()
+                    && origin["previous"]["storage_generation"].as_u64() == Some(from.generation)
+                    && origin["replacement_generation"]
+                        .as_u64()
+                        .is_some_and(|generation| {
+                            from.generation < generation && generation < storage
+                        })
+            }
             _ => false,
         }
 }

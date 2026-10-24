@@ -42,9 +42,11 @@ states what runs where; it does not repeat measurements.
 
 Placement follows the
 [ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#48-placement-in-cloudflare):
-a node takes new databases until its active RAM or its CPU load reaches 80 %, each measured as the
-highest 30-minute average of the last three days, and among the nodes that qualify the fullest
-wins. A node that placement has closed (pool data at 80 %, pool metadata at 50 %, the sold storage
+a node's CPU peak (its highest 30-minute average of the last three days) must be below 80 %.
+RAM uses the higher of its three-day peak and current sample, plus pending placements and the
+new database's full memory; that sum must also be below 80 %. The requested CPU must fit the
+node's physical cores. Among the nodes that qualify the fullest wins. A node that placement has
+closed (pool data at 80 %, pool metadata at 50 %, the sold storage
 at four times the pool's data, or 1,000 volumes) takes none. Each start is admitted by the node
 itself, from its own free RAM and pool. No lease expiry, stale sample or missing observation stops
 a running database: besides its own idle sleep and the node's early sleep, only explicit orders
@@ -226,16 +228,19 @@ node that still has a database placed on it (`regional_node_stale`), a failing o
 infrastructure backup, a running database whose WAL archive is failing
 (`database_archive_failing`), an awake database with no completed base backup within 36 hours of
 awake time (`database_base_backup_stale`; sleeping databases are excluded), a thin pool without
-room or without a sample (`thin_storage_blocked`), a node that keeps refusing wakes for awake
-capacity (`regional_node_capacity_refusals`), a node that placement has closed
-(`regional_node_pool_closed`: pool data at 80 %, pool metadata at 50 %, the sold storage at four
-times the pool's data, or 1,000 volumes), a database volume at 80 % or 90 % of its space or
+room or without a sample (`thin_storage_blocked`), a database deleted more than 10 minutes ago that
+its node has not finished removing (`database_delete_incomplete`), a node that keeps refusing wakes for awake
+capacity (`regional_node_capacity_refusals`), a region that
+placement has closed (`regional_node_pool_closed`: the smallest size class on offer fits no node,
+for pool data at 80 %, pool metadata at 50 %, the sold storage plus that class past four times
+the pool's data, 1,000 volumes, or RAM or CPU at 80 %; a full node beside a node that takes the
+class is no episode), a database volume at 80 % or 90 % of its space or
 inodes (`database_volume_warning`, `database_volume_critical`), an enrollment token that was presented again or too late
 (`node_enrollment_refused`) and a node that rebooted without a maintenance order
-(`node_unexpected_reboot`). Each minute-cron step runs in its own failure boundary, and the
-`CronWatchdog` Durable Object (binding `CRON_WATCHDOG`) judges the cron's heartbeat from its own
-alarm, independently of the cron trigger, raising `control_cron_stalled` and
-`control_cron_step_failing`. Every event carries a short runbook `action`; the
+(`node_unexpected_reboot`). Each minute-cron step runs in its own failure boundary with a time
+bound of its own, and the `CronWatchdog` Durable Object (binding `CRON_WATCHDOG`) evaluates every
+alert once a minute from its own alarm, independently of the cron trigger, and judges the cron's
+heartbeat, raising `control_cron_stalled` and `control_cron_step_failing`. Every event carries a short runbook `action`; the
 [alert runbook](docs/operations/infrastructure-backups.md#alert-kinds-and-runbook-actions)
 lists each kind's rule and action.
 

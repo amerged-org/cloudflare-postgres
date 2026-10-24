@@ -13,7 +13,7 @@ use crate::{
         facts,
         job::{Job, Store},
         recovery::Restored,
-        restore::{End, Failed, Host, Order, Restorer},
+        restore::{End, Failed, Host, Order, RECOVERY_FETCH_TIMEOUT, Restorer},
         server::{log_failed_job, unix_seconds},
     },
     credentials::Access,
@@ -51,6 +51,10 @@ macro_rules! build_failed {
 
 /// The tasks one database's unit may have (`TasksMax=` of the unit template).
 const TASKS_MAX: u64 = 64;
+/// One additional attempt after a proven WAL-fetch timeout; other recovery failures are not
+/// retried. The database remains unpublished until its first DONE backup, and the existing API
+/// operation deadlines still apply. A restarted agent resumes an interrupted build as before.
+const RECOVERY_ATTEMPTS: u32 = 2;
 /// How old the newest base backup of a database that runs may grow (plan 7.6).
 const BACKUP_MAX_AGE_MS: i64 = 24 * 3_600_000;
 /// How long a base backup that failed waits before it is tried again.
@@ -469,6 +473,17 @@ impl<M: Machine> Core<M> {
         entry: &Entry,
     ) -> Result<(), &'static str> {
         let origin = entry.origin.clone().ok_or_else(|| build_failed!())?;
+        if let Err(error) = self.prepare_replacement(entry).await {
+            if error == super::replacement::CLEANUP_PENDING {
+                return Err(error);
+            }
+            self.set(db, |view| {
+                view.phase = Phase::Error;
+                view.error = Some(error);
+                view.writer = None;
+            });
+            return Err(error);
+        }
         if self.waits_for_credential(db, entry, &origin) {
             return Err("credential_not_delivered");
         }
@@ -481,20 +496,71 @@ impl<M: Machine> Core<M> {
         // Before anything is written: the record of the generation that is released stays what
         // it is until it has been, so that a build that was refused is released again.
         let released = self.release_previous_generation(entry).await;
-        let built = if !released {
-            Err("build_failed")
-        } else {
-            match origin {
-                Origin::Create => self.build_create(db, entry).await,
-                Origin::Restore(source) => self.build_restored(db, entry, &source, None).await,
-                Origin::Move(source, end) => {
-                    self.build_restored(db, entry, &source, Some(end)).await
+        if released && entry.replaces_storage() {
+            // The journal is durable and the original writer is proven, stopped and detached.
+            // The target's ready report can cut over without a stale source move hold.
+            self.set(db, |view| view.moving = None);
+        }
+        let mut attempt = 1;
+        let built = loop {
+            let result = if !released {
+                Err("build_failed")
+            } else {
+                match origin.clone() {
+                    Origin::Create => self.build_create(db, entry).await,
+                    Origin::Restore(source) => self.build_restored(db, entry, &source, None).await,
+                    Origin::Replace(source, _, _) => {
+                        self.build_restored(db, entry, &source, None).await
+                    }
+                    Origin::Move(source, end) => {
+                        self.build_restored(db, entry, &source, Some(end)).await
+                    }
+                    Origin::ReplaceRollback(source, _, record, _) => {
+                        let end = End {
+                            system_identifier: record.system_identifier,
+                            timeline: record.timeline,
+                            last_segment: record.last_archived_segment,
+                        };
+                        self.build_restored(db, entry, &source, Some(end)).await
+                    }
                 }
+            };
+            if result != Err(RECOVERY_FETCH_TIMEOUT) {
+                break result;
             }
+            // A client timeout does not prove the transient systemd job ended. Stop only this
+            // target's prior fetch jobs before rebuilding or finally abandoning its files.
+            if self
+                .jobs
+                .stop_earlier(&entry.id, crate::archive::job::Kind::WalFetch)
+                .await
+                .is_err()
+            {
+                break Err("archive_unusable");
+            }
+            if attempt == RECOVERY_ATTEMPTS {
+                break Err("archive_unusable");
+            }
+            attempt += 1;
+            crate::timing::log_line(serde_json::json!({
+                "event":"restore_fetch_retry", "database_id":entry.id,
+                "operation":entry.operation, "attempt":attempt, "attempt_limit":RECOVERY_ATTEMPTS,
+            }));
+            tokio::time::sleep(self.timing.recovery_retry).await;
         };
         match built {
             Ok(()) => Ok(()),
             Err(error) => {
+                let rollback = self.replacement_rollback(entry);
+                // Report a failure only after it survives a restart. Rollback failures remain
+                // retryable at this same forward generation; the source is never removed.
+                if released && self.fail_replacement(entry).is_err() {
+                    self.set(db, |view| {
+                        view.phase = Phase::Error;
+                        view.error = Some("build_failed");
+                    });
+                    return Err("build_failed");
+                }
                 crate::timing::emit_event(serde_json::json!({
                     "event": "build_failed", "database_id": db.id,
                     "operation": entry.operation, "error": error,
@@ -508,7 +574,7 @@ impl<M: Machine> Core<M> {
                 self.set(db, |view| {
                     view.phase = Phase::Error;
                     view.error = Some(error);
-                    if released {
+                    if released && !rollback {
                         view.abandoned_build = Some(entry.archive_path.clone());
                     }
                     if forgotten {
@@ -527,7 +593,10 @@ impl<M: Machine> Core<M> {
         let delivered = self.store(&entry.archive_path, Access::ReadWrite).is_some()
             && match origin {
                 Origin::Create => true,
-                Origin::Restore(source) | Origin::Move(source, _) => {
+                Origin::Restore(source)
+                | Origin::Move(source, _)
+                | Origin::Replace(source, _, _)
+                | Origin::ReplaceRollback(source, _, _, _) => {
                     self.store(&source.path, Access::ReadOnly).is_some()
                 }
             };
@@ -564,7 +633,7 @@ impl<M: Machine> Core<M> {
         let files = self.files(id);
         match files.load() {
             Ok(Some(state)) if state.storage_generation == storage_generation => {
-                files.remove().is_ok()
+                files.forget_generation(storage_generation).is_ok()
             }
             _ => false,
         }
@@ -617,8 +686,10 @@ impl<M: Machine> Core<M> {
         Ok(resumed)
     }
 
-    /// Creates the user, the volume and its directories: the same for every origin.
-    async fn provision(&self, entry: &Entry) -> Result<(Account, VolumeId), &'static str> {
+    /// Creates the user, the volume and its directories: the same for every origin. The size of
+    /// the new filesystem is read into the view (`read_filesystem`), so that the observation of
+    /// the database that this build ends with tells it.
+    async fn provision(&self, db: &Db, entry: &Entry) -> Result<(Account, VolumeId), &'static str> {
         let id = &entry.id;
         let volume = Self::volume_id(entry).ok_or_else(|| build_failed!())?;
         let account = self
@@ -635,6 +706,9 @@ impl<M: Machine> Core<M> {
             )
             .await
             .map_err(|error| volume_error(&error))?;
+        self.read_filesystem(db, &volume)
+            .await
+            .map_err(|_| build_failed!())?;
         self.machine
             .prepare_socket_directory(id, &account)
             .map_err(|_| build_failed!())?;
@@ -651,7 +725,7 @@ impl<M: Machine> Core<M> {
             .store(&entry.archive_path, Access::ReadWrite)
             .ok_or("archive_unusable")?;
         let _ = self.begin_state(db, entry)?;
-        let (account, volume) = self.provision(entry).await?;
+        let (account, volume) = self.provision(db, entry).await?;
         let job_database = self.job_database(&volume, &account.name);
         // The archive path is the database's own and must hold nothing but backups of the cluster
         // on this volume: a generation never writes into an archive that holds something else
@@ -769,7 +843,7 @@ impl<M: Machine> Core<M> {
             .store(&source.path, Access::ReadOnly)
             .ok_or("archive_unusable")?;
         let resumed = self.begin_state(db, entry)?;
-        let (account, volume) = self.provision(entry).await?;
+        let (account, volume) = self.provision(db, entry).await?;
         // The agent that began this build went away with the units it started (a release restarts
         // it): the PostgreSQL of the recovery may run on the data directory that the restore
         // empties and fetches again (`Restorer::begin_afresh`), and it is stopped first. The
@@ -899,7 +973,7 @@ impl<M: Machine> Rebuild<M> {
 }
 impl<M: Machine> Host for Rebuild<M> {
     async fn start(&self) -> Result<(), Failed> {
-        // The restored files are the source's: the agent's own replace them before the start.
+        // The restored files are the source's: replace the configuration before the start.
         self.core
             .write_configuration(&self.entry, &self.account)
             .map_err(|_| Failed)?;

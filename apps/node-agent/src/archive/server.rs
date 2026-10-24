@@ -31,6 +31,31 @@ const READ_BOUND: Duration = Duration::from_secs(10);
 /// How much of a failed job's stderr goes to the log.
 const LOGGED_STDERR: usize = 400;
 
+/// Why this recovery's last fetch failed. Optional absence is an archive boundary; a missing
+/// segment in the proven chain is unavailable. Normal WAL uploads never alter this fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FetchFailure {
+    TimedOut,
+    Unavailable,
+}
+
+/// A handle to one registration's fetch result. A restorer retains this exact handle; a late
+/// completion on a replaced registration cannot change the next attempt's recovery facts.
+#[derive(Default)]
+pub struct FetchStatus(Mutex<Option<FetchFailure>>);
+impl FetchStatus {
+    pub(crate) fn failure(&self) -> Option<FetchFailure> {
+        *self.0.lock().expect("fetch status lock")
+    }
+    fn answered(&self, reply: Reply) {
+        *self.0.lock().expect("fetch status lock") = match reply {
+            Reply::Failed(Some("fetch_timeout")) => Some(FetchFailure::TimedOut),
+            Reply::Ok | Reply::Missing => None,
+            Reply::Failed(_) => Some(FetchFailure::Unavailable),
+        };
+    }
+}
+
 /// Where a recovering database's `restore_command` reads from.
 #[derive(Clone, Debug)]
 pub struct Recovery {
@@ -86,6 +111,7 @@ struct Entry {
     serial: tokio::sync::Mutex<()>,
     /// When the current run of failed archive calls began (Unix milliseconds).
     failing_since_ms: Mutex<Option<i64>>,
+    fetch_status: Arc<FetchStatus>,
 }
 /// The registered databases by ID; the agent keeps it as the desired page says.
 #[derive(Default)]
@@ -94,16 +120,19 @@ pub struct Table {
 }
 impl Table {
     /// Registers a database, replacing an earlier registration of it.
-    pub fn set(&self, registration: Registration) {
+    pub fn set(&self, registration: Registration) -> Arc<FetchStatus> {
+        let fetch_status = Arc::new(FetchStatus::default());
         let entry = Arc::new(Entry {
             registration,
             serial: tokio::sync::Mutex::new(()),
             failing_since_ms: Mutex::new(None),
+            fetch_status: fetch_status.clone(),
         });
         self.entries
             .write()
             .expect("table lock")
             .insert(entry.registration.database.id.clone(), entry);
+        fetch_status
     }
     pub fn remove(&self, database: &str) {
         self.entries.write().expect("table lock").remove(database);
@@ -236,7 +265,9 @@ impl Server {
         match request {
             Request::Archive { name } => self.archive(&entry, &name, deadline).await,
             Request::Fetch { name, destination } => {
-                self.fetch(&entry, &name, &destination, deadline).await
+                let reply = self.fetch(&entry, &name, &destination, deadline).await;
+                entry.fetch_status.answered(reply);
+                reply
             }
         }
     }
@@ -473,6 +504,47 @@ mod tests {
         },
         credentials::{Access, Credential},
     };
+
+    #[tokio::test]
+    async fn recovery_fetch_facts_belong_to_one_registration_and_never_to_archive_uploads() {
+        let node = Node::start("fetch-status-scope", AGENT_BOUND).await;
+        node.register(Some(node.recovery(None)));
+        let old = node.table.get(DATABASE).unwrap();
+        let current = node.table.set(old.registration.clone());
+        // An earlier attempt completes after its replacement was installed.
+        old.fetch_status
+            .answered(Reply::Failed(Some("fetch_timeout")));
+        assert_eq!(old.fetch_status.failure(), Some(FetchFailure::TimedOut));
+        assert_eq!(current.failure(), None);
+        let entry = node.table.get(DATABASE).unwrap();
+        entry.failed("upload_timeout");
+        assert_eq!(
+            current.failure(),
+            None,
+            "upload failure is not a recovery fetch"
+        );
+        current.answered(Reply::Failed(Some("fetch_failed")));
+        assert_eq!(current.failure(), Some(FetchFailure::Unavailable));
+        current.answered(Reply::Missing);
+        assert_eq!(
+            current.failure(),
+            None,
+            "confirmed end is not an unavailable archive"
+        );
+        current.answered(Reply::Failed(Some("fetch_timeout")));
+        current.answered(Reply::Ok);
+        assert_eq!(
+            current.failure(),
+            None,
+            "a later successful fetch replaces a transient error"
+        );
+        current.answered(Reply::Failed(Some("segment_missing")));
+        assert_eq!(
+            current.failure(),
+            Some(FetchFailure::Unavailable),
+            "a hole in the required archive is unavailable, not an unreachable PITR point"
+        );
+    }
 
     #[tokio::test]
     async fn ok_comes_only_after_the_object_is_in_the_bucket_and_the_segment_in_the_log() {

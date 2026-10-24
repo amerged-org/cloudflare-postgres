@@ -198,8 +198,8 @@ pub(crate) fn uuid() -> String {
 
 impl<M: Machine> Core<M> {
     /// The observation of a database as its view and its disk say it, or `None` while it has none
-    /// to give: the page has not named it, a wake is under way, or the unit of a ready database is
-    /// not known.
+    /// to give: the page has not named it, a wake is under way, the unit of a ready database is
+    /// not known, or the size of the filesystem of a ready or sleeping one has not been read.
     fn observe(&self, db: &Db, view: &View) -> Option<Value> {
         let entry = view.entry.as_ref()?;
         let (state, error) = match view.phase {
@@ -221,7 +221,14 @@ impl<M: Machine> Core<M> {
             Phase::Starting | Phase::Retired => return None,
         };
         let stored = view.state.as_ref();
-        let storage_generation = stored.map_or(entry.storage_generation, |s| s.storage_generation);
+        // A replacement refused before `begin_state` deliberately retains the source's state.
+        // Its failure still concerns the target operation and must name that generation, or the
+        // API cannot accept it and initiate the forward rollback.
+        let storage_generation = if state == "error" && entry.replaces_storage() {
+            entry.storage_generation
+        } else {
+            stored.map_or(entry.storage_generation, |s| s.storage_generation)
+        };
         let (generation, operation) = match &view.claim {
             Some(claim) => (claim.generation, claim.operation.clone()),
             None => (entry.generation, entry.operation.clone()),
@@ -259,6 +266,13 @@ impl<M: Machine> Core<M> {
             if let Some(refusal) = view.refusal {
                 observation["refusal"] = refusal.into();
             }
+        }
+        if matches!(state, "ready" | "asleep") && Self::volume_id(entry).is_some() {
+            // The size of the filesystem goes with every ready and asleep: Cloudflare ends a resize
+            // when it has the storage that was asked for, and cannot treat an observation without the
+            // size as proof of a completed resize. A database whose size is not read yet
+            // (the agent began, and has not decided on it) has no observation to give.
+            observation["storage_bytes"] = view.storage_bytes?.into();
         }
         if state == "ready" && !(view.roles_removed.is_empty() && view.roles_blocked.is_empty()) {
             observation["roles"] =
@@ -542,6 +556,41 @@ mod tests {
             let observation = observed(phase).expect("an observation");
             assert_eq!(observation["state"], state, "{phase:?}");
         }
+    }
+
+    /// Cloudflare ends a resize by the measured filesystem size, so a ready or sleeping database says
+    /// nothing until the size is read, and says it with every report after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ready_or_sleeping_database_says_the_size_of_its_filesystem_or_nothing() {
+        use crate::agent::power::{Slept, Why};
+        let Some(rig) = Rig::new("observe-size").await else {
+            return;
+        };
+        let (_, db) = rig.create().await;
+        let known = db
+            .view()
+            .storage_bytes
+            .expect("the size is read when the volume is made");
+        let mut view = db.view().clone();
+        assert_eq!(
+            rig.core.observe(&db, &view).unwrap()["storage_bytes"],
+            known
+        );
+        view.storage_bytes = None;
+        assert_eq!(rig.core.observe(&db, &view), None, "ready");
+
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let mut view = db.view().clone();
+        assert_eq!(view.phase, Phase::Asleep);
+        assert_eq!(
+            rig.core.observe(&db, &view).unwrap()["storage_bytes"],
+            known
+        );
+        view.storage_bytes = None;
+        assert_eq!(rig.core.observe(&db, &view), None, "asleep");
+        // The other states have no size to tell, and say what they are.
+        view.phase = Phase::Unproven;
+        assert_eq!(rig.core.observe(&db, &view).unwrap()["state"], "unproven");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

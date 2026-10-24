@@ -812,8 +812,11 @@ export const MoveSource = RestoreSource.omit({ target_time: true }).extend({
 export type MoveSource = z.infer<typeof MoveSource>;
 /**
  * How the node builds the storage generation: `create` (initdb, only onto an empty archive path),
- * `restore` (into a new database) or `move` (this database's previous storage generation, to the
- * end of its WAL). Absent once the generation was ready: a missing volume is then an error and
+ * `restore` (into a new database), `move` (this database's previous storage generation, to the
+ * end of its WAL), or `replace` (PITR under the same identity, preserving the proven prior
+ * generation in a durable local journal until cutover or forward-generation rollback).
+ * `replace` is sent only to a converged node advertising `restore_in_place_v1`.
+ * Absent once the generation was ready: a missing volume is then an error and
  * never a fresh build.
  *
  * A move target restores `source.backup_id` and replays the WAL of `end.timeline` until every
@@ -829,6 +832,23 @@ export const DatabaseOrigin = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("create") }),
   z.strictObject({ kind: z.literal("restore"), source: RestoreSource }),
   z.strictObject({ kind: z.literal("move"), source: MoveSource }),
+  z.strictObject({
+    kind: z.literal("replace"),
+    source: RestoreSource.extend({ target_time: Timestamp }),
+    previous: z.strictObject({
+      storage_generation: Positive,
+      end: ProvenSleepRecord,
+    }),
+  }),
+  z.strictObject({
+    kind: z.literal("replace_rollback"),
+    source: RestoreSource.omit({ target_time: true }),
+    previous: z.strictObject({
+      storage_generation: Positive,
+      end: ProvenSleepRecord,
+    }),
+    replacement_generation: Positive,
+  }),
 ]);
 export type DatabaseOrigin = z.infer<typeof DatabaseOrigin>;
 
@@ -899,7 +919,30 @@ export const NodeDesiredDatabase = z
           code: "custom",
           path: ["origin"],
           message:
-            "A restore reads another database; a move reads this database's earlier generation to its end",
+            "A restore reads another database; a move or replacement reads this database's earlier generation",
+        });
+      if (
+        (db.origin.kind === "replace" ||
+          db.origin.kind === "replace_rollback") &&
+        from?.generation !== db.origin.previous.storage_generation
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["origin", "previous"],
+          message: "A replacement preserves the generation it restores from",
+        });
+      if (
+        db.origin.kind === "replace_rollback" &&
+        !(
+          db.origin.previous.storage_generation <
+            db.origin.replacement_generation &&
+          db.origin.replacement_generation < db.storage_generation
+        )
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["origin", "replacement_generation"],
+          message: "Rollback advances beyond the failed replacement generation",
         });
     }
     refineRoles(db.roles, db.desired_state !== "deleted", ctx);
@@ -1019,8 +1062,12 @@ export type NodeDiagnosticRequest = z.infer<typeof NodeDiagnosticRequest>;
 
 /**
  * One page of the node's desired state. A database the pages do not name is never stopped or
- * deleted for that; only an order or a desired state does that. The page of a fenced node (it
- * has a `fence` order) holds no database, no release and only `fence` and `superseded` orders.
+ * deleted for that; only an order or a desired state does that. A database whose desired state is
+ * `deleted` stays on the page until its node has reported it `deleted` and the node's volume
+ * report (`NodeVolumeReport`) no longer names a volume of it: a volume an earlier agent left
+ * behind is found again that way, and only a volume of a database the page names as deleted is
+ * ever removed. The page of a fenced node (it has a `fence` order) holds no database, no release
+ * and only `fence` and `superseded` orders.
  */
 export const NodeDesiredPage = z
   .strictObject({
@@ -1110,7 +1157,9 @@ export type NodeDesiredPage = z.infer<typeof NodeDesiredPage>;
 /**
  * `building`: a create, restore or move runs; `ready`: PostgreSQL runs and the storage generation
  * has a DONE base backup; `asleep`: a proven sleep; `unproven`: stopped without a matching record,
- * recovery pending; `error`: see `error`; `deleted`: the volume is gone.
+ * recovery pending; `error`: see `error`; `deleted`: all of the database is gone from the node
+ * (its unit, its volumes, its user and its files); the node reports nothing of a delete that is
+ * not complete.
  */
 export const NODE_DATABASE_STATES = [
   "building",
@@ -1120,6 +1169,14 @@ export const NODE_DATABASE_STATES = [
   "error",
   "deleted",
 ] as const;
+/**
+ * What the filesystem of a volume leaves unused at the end of its volume (`FS_END_GAP_BYTES` of the
+ * node agent, which a test holds equal): a volume of N bytes holds a filesystem of N less this
+ * many bytes, so that the data of a database never forms a signature where libblkid looks for one
+ * (plan 4.3).
+ */
+export const FILESYSTEM_END_GAP_BYTES = 4 * 1024 * 1024;
+
 export const NODE_DATABASE_ERRORS = [
   "storage_full",
   "prefix_not_empty",
@@ -1150,6 +1207,15 @@ export const NodeDatabaseObservation = z
      */
     instance: z.uuid().optional(),
     error: z.enum(NODE_DATABASE_ERRORS).optional(),
+    /**
+     * The size of the database's filesystem in bytes, as its superblock says (its block count
+     * times its block size), sent with `ready` and `asleep`. A resize of the database ends when
+     * it is at least the storage that the resize asked for less `FILESYSTEM_END_GAP_BYTES`; a
+     * growth the kernel refused leaves the filesystem as it was, and the resize stays open until
+     * the node's next try has grown it, or the API fails it. A node that does not send it (an
+     * agent that was released before this property) cannot prove the resize, which stays open.
+     */
+    storage_bytes: Positive.optional(),
     proven_sleep: ProvenSleepRecord.nullable(),
     /**
      * A sleep this generation asked for was refused; the database stays awake and wakeable. The
@@ -1416,6 +1482,8 @@ export const NodeSample = z
     queued: Count,
     /** The `NodeCredentials` revision the node applied; null before its first read. */
     credentials_revision: Positive.nullable(),
+    /** Diagnostic copy of the binary capabilities; the connection hello is authoritative. */
+    capabilities: z.array(z.literal("restore_in_place_v1")).max(1).optional(),
   })
   .superRefine((sample, ctx) => {
     const issue = (message: string) =>
@@ -1841,6 +1909,8 @@ export const AgentLinkMessage = z.discriminatedUnion("type", [
     agent_version: z.string().min(1).max(64),
     release_id: FleetReleaseId.nullable(),
     os: NodeOs,
+    /** Authoritative capabilities of this binary/connection, accepted before new agents send them. */
+    capabilities: z.array(z.literal("restore_in_place_v1")).max(1).optional(),
   }),
   z.strictObject({ type: z.literal("sample"), sample: NodeSample }),
 ]);

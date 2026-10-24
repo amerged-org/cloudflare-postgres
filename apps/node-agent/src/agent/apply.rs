@@ -5,7 +5,7 @@
 //! desired state stops or removes what runs (plan 3.3, invariant 7): a page that does not name a
 //! database never does.
 use super::{
-    Core, Db, Desired, Entry, Phase, Policy, Reconcile,
+    Core, Db, Desired, Entry, Phase, Policy, Reconcile, now_ms,
     power::{Slept, Why, writer_of},
 };
 use crate::{
@@ -177,7 +177,13 @@ impl<M: Machine> Core<M> {
             // A move ends when the API has its result: the hold on the wakes ends with its order.
             for db in self.all() {
                 let held = db.view().moving.clone();
+                let replacing = db
+                    .view()
+                    .entry
+                    .as_ref()
+                    .is_some_and(Entry::replaces_storage);
                 if let Some(operation) = held
+                    && !replacing
                     && !page
                         .orders
                         .iter()
@@ -352,7 +358,9 @@ impl<M: Machine> Core<M> {
         let Some(entry) = db.view().entry.clone() else {
             return;
         };
-        if db.view().state.is_none() {
+        // Deletion is authorized by the page and volume identity, not by a local sleep proof.
+        // A damaged state file must block starts, but must not strand an explicitly deleted DB.
+        if entry.desired != Desired::Deleted && db.view().state.is_none() {
             match self.files(&db.id).load() {
                 Ok(state) => self.set(db, |view| view.state = state),
                 // A state that was read and cannot be trusted is not taken for a new database.
@@ -368,6 +376,15 @@ impl<M: Machine> Core<M> {
                 // about the database: like LVM and systemd, it is read again.
                 Err(error) => return Self::unread(db, "state", error.into()),
             }
+        }
+        if self.replacement_blocks(db, &entry) {
+            self.set(db, |view| {
+                view.adopted = true;
+                view.phase = Phase::Error;
+                view.error = Some("build_failed");
+                view.writer = None;
+            });
+            return;
         }
         // What cannot be read is not known: nothing is decided on a guess, and the decision is
         // tried again (`retry_until_adopted`). A volume taken for missing would fail the database;
@@ -404,9 +421,21 @@ impl<M: Machine> Core<M> {
         match step {
             Step::Nothing => {}
             Step::Build => {
-                let _ = self.build(db, &entry).await;
+                let built = self.build(db, &entry).await;
+                if built == Err(super::replacement::CLEANUP_PENDING)
+                    || (built.is_err() && self.replacement_rollback(&entry))
+                {
+                    self.set(db, |view| view.adopted = false);
+                    return;
+                }
             }
-            Step::Delete => self.delete(db, &entry).await,
+            Step::Delete => {
+                // What is left is decided again after the backoff; the database is not reported
+                // deleted, and the node does not call it decided on.
+                if !self.delete(db, &entry).await {
+                    return;
+                }
+            }
             Step::Suspend => {
                 self.sleep_locked(db, Why::Order).await;
             }
@@ -448,32 +477,57 @@ impl<M: Machine> Core<M> {
     /// database is decided on from the files below its mount point. A volume that cannot be
     /// attached is a fact to decide on (a volume that needs a repair has no `pg_control` to
     /// show); a volume list that cannot be read is not, and `false` says that nothing is decided.
+    ///
+    /// The size of the volume's filesystem is read here (`read_filesystem`), once for every
+    /// database that the agent decides on after it began: what the observation of a ready or
+    /// sleeping database tells (`View::storage_bytes`) is known before the first one is queued, so
+    /// that the resize that is open in Cloudflare is never ended by an observation that says
+    /// nothing of the filesystem. A filesystem that cannot be read is not a fact either.
     async fn attach(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) -> bool {
         let Some(volume) = Self::volume_id(entry) else {
             return true;
         };
-        if self.machine.attached(&volume) {
-            return true;
-        }
-        match self
-            .machine
-            .mount_volumes(std::slice::from_ref(&volume))
-            .await
-        {
-            Ok(failures) => {
-                for (volume, error) in failures {
-                    crate::timing::emit_event(json!({
-                        "event": "mount_failed", "database_id": volume.database(),
-                        "class": crate::diagnostics::error_code(&error.into()),
-                    }));
+        if !self.machine.attached(&volume) {
+            match self
+                .machine
+                .mount_volumes(std::slice::from_ref(&volume))
+                .await
+            {
+                Ok(failures) => {
+                    for (volume, error) in failures {
+                        crate::timing::emit_event(json!({
+                            "event": "mount_failed", "database_id": volume.database(),
+                            "class": crate::diagnostics::error_code(&error.into()),
+                        }));
+                    }
                 }
-                true
+                Err(error) => {
+                    Self::unread(db, "volume", error.into());
+                    return false;
+                }
             }
+        }
+        match self.read_filesystem(db, &volume).await {
+            Ok(()) => true,
             Err(error) => {
-                Self::unread(db, "volume", error.into());
+                Self::unread(db, "filesystem", error.into());
                 false
             }
         }
+    }
+
+    /// Reads the size of the volume's filesystem from its superblock into the view, where the
+    /// observation takes it from. A change of it is a change of the observation.
+    pub(crate) async fn read_filesystem(
+        &self,
+        db: &Db,
+        volume: &crate::storage::VolumeId,
+    ) -> Result<(), crate::storage::Error> {
+        let bytes = self.machine.filesystem_bytes(volume).await?;
+        if db.view().storage_bytes != Some(bytes) {
+            self.set(db, |view| view.storage_bytes = Some(bytes));
+        }
+        Ok(())
     }
 
     /// The unit runs, as the agent found it at its start: it is released to the gateway as ready,
@@ -565,7 +619,11 @@ impl<M: Machine> Core<M> {
 
     /// The database sizes of the entry are the unit's limits and the volume's: set again when
     /// they changed, running or asleep, and the admission knows it. A change of the settings is
-    /// written at the next start.
+    /// written at the next start. The observation carries the size that the filesystem has
+    /// (`View::storage_bytes`), read after the growth: Cloudflare ends a resize when the filesystem
+    /// has the size and not when the volume has, so a growth that failed (the kernel's -28, a pool
+    /// that took no writes) leaves the resize open, and it is tried again with every decision of
+    /// the database.
     pub(crate) async fn resize(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
         let current = Resources {
             memory_mib: entry.memory_mib,
@@ -577,26 +635,53 @@ impl<M: Machine> Core<M> {
             .state
             .as_ref()
             .and_then(|state| state.resources.clone());
-        if held.as_ref() != Some(&current) {
+        let changed = held.as_ref() != Some(&current);
+        let growing = db.view().storage_bytes.is_some_and(|bytes| {
+            bytes
+                < entry
+                    .volume_bytes()
+                    .saturating_sub(crate::storage::FS_END_GAP_BYTES)
+        });
+        if changed || growing {
             let mut applied = self.apply_limits(entry).await.is_ok();
-            if let (Some(held), Some(volume)) = (&held, Self::volume_id(entry))
-                && held.storage_gib < current.storage_gib
-                && let Err(error) = self
+            if let Some(volume) = Self::volume_id(entry)
+                && (growing
+                    || held
+                        .as_ref()
+                        .is_some_and(|held| held.storage_gib < current.storage_gib))
+            {
+                let mut result = self
                     .machine
                     .grow_volume(&volume, entry.volume_bytes())
-                    .await
-            {
-                applied = false;
-                crate::timing::emit_event(json!({
-                    "event": "resize_refused", "database_id": db.id,
-                    "class": crate::diagnostics::error_code(&error.into()),
-                }));
+                    .await;
+                if matches!(result, Err(crate::storage::Error::OfflineGrowRequired))
+                    && db.phase() == Phase::Ready
+                    && self.sleep_locked(db, Why::Order).await == Slept::Proven
+                {
+                    // Only the established quiesce/archive/stop proof may stop a warm writer.
+                    // A busy writer or archive leaves the operation pending for a later pass.
+                    result = self
+                        .machine
+                        .grow_volume(&volume, entry.volume_bytes())
+                        .await;
+                }
+                if let Err(error) = result {
+                    applied = false;
+                    crate::timing::emit_event(json!({
+                        "event": "resize_refused", "database_id": db.id,
+                        "class": crate::diagnostics::error_code(&error.into()),
+                    }));
+                }
             }
             if applied {
                 let _ = self.save_state(db, |state| state.resources = Some(current.clone()));
             }
             self.admission.resized(&db.id, entry.memory_mib);
-            self.set(db, |_| {});
+        }
+        if let Some(volume) = Self::volume_id(entry) {
+            // The size it has now; one that cannot be read leaves the size as it was (the volume
+            // is the same), and the next decision reads it again.
+            let _ = self.read_filesystem(db, &volume).await;
         }
     }
 
@@ -645,52 +730,80 @@ impl<M: Machine> Core<M> {
         }
     }
 
-    /// The desired state is `deleted` (plan 5.10): the unit stops, the volume and the user go, and
+    /// The desired state is `deleted` (plan 5.10): the unit ends, the volumes and the user go, and
     /// the node keeps nothing of the database. The R2 archive is the Worker's to expire.
-    pub(crate) async fn delete(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
+    ///
+    /// The database is deleted when all of that is gone, and not before: the node reports it
+    /// `deleted` only then, and Cloudflare stops asking for it only when it has reported it and
+    /// no volume of it is reported any more. A step that fails is said (`delete_incomplete`, with
+    /// the step, its class and the seconds the delete has been failing) and the delete is decided
+    /// again after the recovery backoff (`retry_until_adopted`) up to its longest wait, for as
+    /// long as it takes, so that a volume on a full filesystem, a unit that no signal ends in
+    /// time or a user the system cannot lock never stays behind unseen. `true` when it is
+    /// deleted.
+    pub(crate) async fn delete(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) -> bool {
         self.set(db, |view| {
             view.phase = Phase::Retired;
             view.writer = None;
         });
-        let _ = self.machine.stop(&db.id).await;
-        self.admission.stopped(&db.id);
-        self.table.remove(&db.id);
-        let generation = entry.storage_generation;
-        let mut volumes = vec![];
-        if let Ok(inventory) = self.machine.inventory().await {
-            volumes = inventory
-                .volumes
-                .into_iter()
-                .filter(|volume| {
-                    volume.id.database() == db.id && volume.id.generation() <= generation
-                })
-                .map(|volume| volume.id)
-                .collect();
+        match self.remove_all(db, entry).await {
+            Ok(()) => {
+                self.set(db, |view| {
+                    view.phase = Phase::Deleted;
+                    view.state = None;
+                    view.error = None;
+                    view.delete_failing_since_ms = None;
+                });
+                true
+            }
+            Err((step, class)) => {
+                let now = now_ms();
+                let mut view = db.view();
+                let since = *view.delete_failing_since_ms.get_or_insert(now);
+                // The node has not made its decision on the database yet, which is what the
+                // retry waits for.
+                view.adopted = false;
+                drop(view);
+                crate::timing::emit_event(json!({
+                    "event": "delete_incomplete", "database_id": db.id, "step": step,
+                    "class": class, "seconds": (now - since).max(0) / 1000,
+                }));
+                false
+            }
         }
-        if volumes.is_empty()
-            && let Some(volume) = Self::volume_id(entry)
-        {
-            volumes.push(volume);
+    }
+
+    /// Every step of a delete, each of which finds what is gone gone: the first one that fails
+    /// ends the attempt with its name and class, since the next depends on it (a volume is not
+    /// removed while PostgreSQL may run on it, the user not while its files remain).
+    async fn remove_all(&self, db: &Db, entry: &Entry) -> Result<(), (&'static str, String)> {
+        let failed = |step, error: crate::Error| (step, crate::diagnostics::error_code(&error));
+        let id = &db.id;
+        let ended = super::remove::end_unit(&*self.machine, id).await;
+        self.admission.stopped(id);
+        self.table.remove(id);
+        ended.map_err(|error| failed("unit", error.into()))?;
+        let others = super::remove::remove_volumes(
+            &*self.machine,
+            id,
+            entry.storage_generation,
+            Self::volume_id(entry),
+        )
+        .await?;
+        // The socket directory, the user (with the database's last volume: a volume of a later
+        // generation that an order of its own removes keeps its owner) and the node's files.
+        match std::fs::remove_dir_all(self.layout().socket_directory(id)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(failed("socket_directory", error.into()));
+            }
+            _ => {}
         }
-        for volume in volumes {
-            let _ = self
-                .machine
-                .remove_volume(
-                    &volume,
-                    Removal::DatabaseDeleted {
-                        storage_generation: generation,
-                    },
-                )
-                .await;
+        if !others && let Err(error) = self.machine.remove_account(id).await {
+            return Err(failed("account", error.into()));
         }
-        let _ = std::fs::remove_dir_all(self.layout().socket_directory(&db.id));
-        let _ = self.machine.remove_account(&db.id).await;
-        let _ = self.files(&db.id).remove();
-        self.set(db, |view| {
-            view.phase = Phase::Deleted;
-            view.state = None;
-            view.error = None;
-        });
+        self.files(id)
+            .remove()
+            .map_err(|error| failed("state", error.into()))
     }
 
     /// Stops the unit of a database by its name, out of admission's awake set and off the archive
@@ -831,6 +944,10 @@ impl<M: Machine> Core<M> {
             (None, _) => outcome = Err("unit_not_stopped"),
             (Some(false), _) => {}
         }
+        if remove_volume && !self.replacement_cleanup_ready(database, storage_generation) {
+            self.report_order(operation, Err("volume_not_removed"));
+            return;
+        }
         if remove_volume && let Ok(inventory) = self.machine.inventory().await {
             for volume in inventory.volumes.into_iter().filter(|volume| {
                 volume.id.database() == database && volume.id.generation() <= storage_generation
@@ -847,6 +964,11 @@ impl<M: Machine> Core<M> {
                     outcome = Err("volume_not_removed");
                 }
             }
+        }
+        if remove_volume && outcome.is_ok() {
+            outcome = self
+                .finish_replacement_cleanup(database, storage_generation)
+                .await;
         }
         self.report_order(operation, outcome);
     }
@@ -1512,6 +1634,247 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Started, "{:?}", result.reason);
         let limits = rig.machine.limits(&id).unwrap();
         assert_eq!((limits.memory_mib, limits.cpu_millicores), (512, 500));
+    }
+
+    /// A resize ends in Cloudflare when the filesystem has the size, so the observation of a
+    /// ready or sleeping database tells the size the filesystem has (its superblock's), also
+    /// after a growth, and a growth that the kernel refused leaves the old size in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_observation_tells_the_size_of_the_filesystem_and_a_refused_growth_leaves_it_as_it_is()
+     {
+        let Some(rig) = Rig::new("resize-fs").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        let (volume, created) = rig.machine.volumes()[0].clone();
+        let gap = crate::storage::FS_END_GAP_BYTES;
+        eventually(30, "the observation to tell the filesystem", || {
+            handle.view().storage_bytes == Some(created - gap)
+        })
+        .await;
+        assert_eq!(rig.observation(&id)["storage_bytes"], created - gap);
+
+        // The kernel refuses the growth: the volume has the size and the filesystem keeps its
+        // own, the page's size is not kept as applied, and the observation says so.
+        rig.machine.set_growth_refused(true);
+        next(&mut db, 6);
+        db["resources"] = json!({"memory_mib": 512, "cpu_millicores": 500, "storage_gib": 2});
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(30, "the volume to be grown", || {
+            rig.machine.volumes()[0].1 == 2 << 30
+        })
+        .await;
+        eventually(30, "the observation of the new generation", || {
+            rig.core
+                .pending_observation(&id)
+                .is_some_and(|observation| observation["generation"] == 6)
+        })
+        .await;
+        assert_eq!(rig.observation(&id)["storage_bytes"], created - gap);
+        assert_eq!(rig.machine.filesystem(&volume), Some(created - gap));
+        assert_ne!(
+            handle
+                .state()
+                .and_then(|state| state.resources)
+                .map(|resources| resources.storage_gib),
+            Some(2),
+            "a growth that failed is not kept as done"
+        );
+
+        // The next decision tries again, and the observation follows the filesystem.
+        rig.machine.set_growth_refused(false);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(30, "the filesystem to grow", || {
+            handle.view().storage_bytes == Some((2 << 30) - gap)
+        })
+        .await;
+        assert_eq!(rig.observation(&id)["storage_bytes"], (2u64 << 30) - gap);
+        assert_eq!(rig.machine.filesystem(&volume), Some((2 << 30) - gap));
+    }
+
+    /// The agent restarts while a growth is open: the size that the filesystem has is the first
+    /// thing it says of the database that it decides on, also of the one that sleeps (its state
+    /// file holds a proof, and says `asleep` before anything is decided), and also while the
+    /// volume is attached: a ready or sleeping database that tells no size is read by Cloudflare
+    /// as one of an agent that never tells it, and the resize that is open ends with the state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_agent_that_restarts_during_a_growth_says_the_size_of_the_filesystem_first() {
+        let Some(rig) = Rig::new("resize-restart").await else {
+            return;
+        };
+        let (rig, mut db, _) = restarted_sleeper(rig).await;
+        let id = id_of(&db);
+        let (volume, created) = rig.machine.volumes()[0].clone();
+        let old = created - crate::storage::FS_END_GAP_BYTES;
+        // The page grows the sleeping database, the kernel refuses the growth, and the agent
+        // cannot attach the volume yet.
+        rig.machine.set_growth_refused(true);
+        rig.machine.hold_mounts();
+        next(&mut db, 6);
+        db["resources"] = json!({"memory_mib": 256, "cpu_millicores": 250, "storage_gib": 2});
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the state file to be read", || {
+            handle.view().state.is_some()
+        })
+        .await;
+        // The state file has a proof and the entry is the page's, so the database would say
+        // `asleep`: without a size it says nothing.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(handle.view().storage_bytes, None);
+        assert!(
+            rig.core
+                .pending_observation(&id)
+                .is_none_or(|observation| observation["state"] == "unproven"
+                    || observation.get("storage_bytes").is_some()),
+            "{:?}",
+            rig.core.pending_observation(&id)
+        );
+        rig.machine.release_mounts();
+        eventually(
+            30,
+            "the database to be decided on and the growth refused",
+            || handle.view().adopted && rig.machine.volumes()[0].1 == 2 << 30,
+        )
+        .await;
+        let observation = rig.observed(&id, "asleep").await;
+        assert_eq!(observation["generation"], 6);
+        assert_eq!(observation["storage_bytes"], old);
+        assert_eq!(rig.machine.filesystem(&volume), Some(old));
+    }
+
+    /// A database that crashed, an agent that restarted, the recovery that proved its sleep and the
+    /// wake after it: every ready and asleep it says has the size the filesystem has, the one a
+    /// growth that failed left (the API ends a resize by it), and not one without.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_crash_a_restart_the_recovery_and_a_wake_never_say_ready_or_asleep_without_the_size()
+    {
+        let Some(rig) = Rig::new("resize-crash").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let (id, path) = (
+            id_of(&db),
+            db["archive"]["path"].as_str().unwrap().to_string(),
+        );
+        let _ = rig.create_from(&db).await;
+        db.as_object_mut().unwrap().remove("origin");
+        let (volume, created) = rig.machine.volumes()[0].clone();
+        let old = created - crate::storage::FS_END_GAP_BYTES;
+
+        // A growth the kernel refused, at generation 6, and then the crash of the database.
+        rig.machine.set_growth_refused(true);
+        next(&mut db, 6);
+        db["resources"] = json!({"memory_mib": 256, "cpu_millicores": 250, "storage_gib": 2});
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(30, "the volume to be grown", || {
+            rig.machine.volumes()[0].1 == 2 << 30
+        })
+        .await;
+        rig.machine.crash(&id);
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        // Whatever the agent queues for the database while this goes on.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let watch = tokio::spawn({
+            let (core, id, seen) = (rig.core.clone(), id.clone(), seen.clone());
+            async move {
+                loop {
+                    if let Some(observation) = core.pending_observation(&id)
+                        && matches!(observation["state"].as_str(), Some("ready" | "asleep"))
+                        && observation.get("storage_bytes").is_none()
+                    {
+                        seen.lock().unwrap().push(observation);
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(60, "the recovery to prove the sleep", || {
+            handle.phase() == Phase::Asleep
+                && handle.state().as_ref().is_some_and(|s| s.record.is_some())
+        })
+        .await;
+        let asleep = rig.observed(&id, "asleep").await;
+        assert_eq!(asleep["generation"], 6);
+        assert_eq!(asleep["storage_bytes"], old);
+        let mut ticket = Rig::ticket(&rig.entry_for(&db));
+        ticket.operation = "op_rrrrrrrrrrrrrrrrrrrr".into();
+        assert_eq!(rig.core.wake(&ticket).await.outcome, Outcome::Started);
+        let ready = rig.observed(&id, "ready").await;
+        assert_eq!(ready["storage_bytes"], old);
+        assert_eq!(rig.machine.filesystem(&volume), Some(old));
+        watch.abort();
+        // Never one without, at any moment the watch looked.
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_growth_stops_a_warm_database_only_with_its_sleep_proof() {
+        let Some(rig) = Rig::new("resize-legacy").await else {
+            return;
+        };
+        let mut entry = rig.entry_json();
+        let (_, db) = rig.create_from(&entry).await;
+        let id = id_of(&entry);
+        rig.machine.set_offline_growth(true);
+        next(&mut entry, 6);
+        entry["resources"]["storage_gib"] = 2.into();
+        rig.core.apply(&Rig::page(vec![entry], vec![])).await;
+        eventually(60, "legacy filesystem to grow", || {
+            db.view().storage_bytes == Some((2 << 30) - crate::storage::FS_END_GAP_BYTES)
+        })
+        .await;
+        assert_eq!(db.phase(), Phase::Asleep);
+        assert!(db.state().unwrap().record.is_some());
+        let calls = rig.machine.calls();
+        let stop = calls.iter().rposition(|call| call == &format!("stop {id}"));
+        let grow = calls.iter().rposition(|call| call == &format!("grow {id}"));
+        assert!(stop.is_some() && stop < grow, "{calls:?}");
+    }
+
+    /// A grow requested after a crash must happen before PostgreSQL recovery; otherwise a full
+    /// filesystem cannot run recovery to reach the phase in which resize used to be applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_requested_grow_precedes_recovery_of_an_unproven_database() {
+        let Some(rig) = Rig::new("resize-unproven").await else {
+            return;
+        };
+        let mut entry = rig.entry_json();
+        let _ = rig.create_from(&entry).await;
+        let id = id_of(&entry);
+        let path = entry["archive"]["path"].as_str().unwrap().to_string();
+        rig.machine.crash(&id);
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        let calls_before = rig.machine.calls().len();
+        next(&mut entry, 6);
+        entry["resources"]["storage_gib"] = 2.into();
+        rig.core.apply(&Rig::page(vec![entry], vec![])).await;
+        let db = rig.core.db(&id);
+        eventually(60, "recovery to prove sleep", || {
+            db.phase() == Phase::Asleep && db.state().is_some_and(|state| state.record.is_some())
+        })
+        .await;
+        let calls = rig.machine.calls();
+        let calls = &calls[calls_before..];
+        let grow = calls.iter().position(|call| call == &format!("grow {id}"));
+        let start = calls.iter().position(|call| call == &format!("start {id}"));
+        assert!(grow.is_some() && grow < start, "{calls:?}");
+        assert_eq!(
+            db.view().storage_bytes,
+            Some((2 << 30) - crate::storage::FS_END_GAP_BYTES)
+        );
     }
 
     /// The next generation of a page entry: the same database, moved on by the API.
@@ -2584,6 +2947,106 @@ mod tests {
         source_in_class(rig, 256, 25).await
     }
 
+    /// A live US restore hit the full WAL-fetch bound on an existing, valid archived segment.
+    /// That download failure is retried before the still-unpublished restore is failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wal_fetch_timeout_retries_the_unpublished_restore_and_keeps_its_source() {
+        let Some(rig) = Rig::new("restore-fetch-retry").await else {
+            return;
+        };
+        let (source_json, source_id, source_state) = source(&rig).await;
+        rig.deliver(
+            source_json["archive"]["path"].as_str().unwrap(),
+            "read_only",
+        );
+        rig.fixture.set("fetch-timeout-count", "1");
+        rig.fixture.set(
+            "fetch-timeout-name",
+            &source_state.record.as_ref().unwrap().last_archived_segment,
+        );
+        let mut target = rig.entry_json();
+        let id = id_of(&target);
+        target["origin"] = json!({"kind":"restore", "source":{
+            "database_id":source_id,"path":source_json["archive"]["path"],
+            "backup_id":source_state.backup.as_ref().unwrap().backup_id,
+            "credential":{"id":"crd_rrrrrrrrrrrrrrrrrrrr","expires_at":"2099-01-01T00:00:00.000Z"}}});
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![target], vec![])).await;
+        eventually(90, "the restore after one timed-out download", || {
+            matches!(handle.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+        assert_eq!(
+            std::fs::read_to_string(rig.fixture.store_directory().join("restore-attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        let data = tenant(&rig, &id).await;
+        assert_eq!(
+            data.query("SELECT count(*) FROM t", &[]).await.unwrap()[0].get::<_, i64>(0),
+            4000
+        );
+        assert!(handle.state().unwrap().built && handle.state().unwrap().backup.is_some());
+        assert_eq!(rig.core.db(&source_id).state(), Some(source_state));
+        assert_eq!(rig.core.db(&source_id).phase(), Phase::Asleep);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_wal_fetch_timeouts_are_bounded_and_are_not_a_missing_recovery_point() {
+        let Some(rig) = Rig::new("restore-fetch-bounded").await else {
+            return;
+        };
+        let (source_json, source_id, source_state) = source(&rig).await;
+        rig.deliver(
+            source_json["archive"]["path"].as_str().unwrap(),
+            "read_only",
+        );
+        rig.fixture.set("fetch-timeout-count", "100");
+        rig.fixture.set("fetch-timeout-leaves-unit", "1");
+        rig.fixture.set(
+            "fetch-timeout-name",
+            &source_state.record.as_ref().unwrap().last_archived_segment,
+        );
+        let mut target = rig.entry_json();
+        let id = id_of(&target);
+        target["origin"] = json!({"kind":"restore", "source":{
+            "database_id":source_id,"path":source_json["archive"]["path"],
+            "backup_id":source_state.backup.as_ref().unwrap().backup_id,
+            "credential":{"id":"crd_rrrrrrrrrrrrrrrrrrrr","expires_at":"2099-01-01T00:00:00.000Z"}}});
+        let handle = rig.core.db(&id);
+        rig.core
+            .apply(&Rig::page(vec![target.clone()], vec![]))
+            .await;
+        eventually(90, "the bounded archive failure", || {
+            handle.phase() == Phase::Error
+        })
+        .await;
+        assert_eq!(handle.view().error, Some("archive_unusable"));
+        pulled_again_stays_failed(&rig, &id, &target, "archive_unusable").await;
+        assert_eq!(
+            std::fs::read_to_string(rig.fixture.store_directory().join("restore-attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        let remaining = rig.fixture.running_units();
+        // The regression must also clean its fixture process if the assertion below fails.
+        rig.core
+            .jobs
+            .stop_earlier(&id, crate::archive::job::Kind::WalFetch)
+            .await
+            .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "timed-out fetch still holds its unit: {remaining:?}"
+        );
+        assert_eq!(rig.core.db(&source_id).state(), Some(source_state));
+    }
+
     /// The same, of a class of `memory_mib` and `max_connections`.
     async fn source_in_class(
         rig: &Rig,
@@ -2633,7 +3096,6 @@ mod tests {
         })
         .await;
         assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
-
         // The data of the source, in a database of the new name, under the page's roles.
         let data = tenant(&rig, &id).await;
         let rows = data.query("SELECT count(*) FROM t", &[]).await.unwrap();
@@ -3516,6 +3978,253 @@ mod tests {
             rig.core.pending_order("op_tttttttttttttttttttt").unwrap()["status"],
             "done"
         );
+    }
+
+    /// The page of a database that is deleted.
+    fn deletion(db: &Value, generation: u64) -> Value {
+        let mut page = db.clone();
+        page.as_object_mut().unwrap().remove("origin");
+        page["desired_state"] = json!("deleted");
+        page["generation"] = json!(generation);
+        page["operation"] = json!(format!("op_{:0>20}", format!("d{generation}")));
+        page
+    }
+    /// The node has decided on the database, as it has for any database of the page that is up:
+    /// the delete that follows meets a database it knows.
+    async fn decided_on(rig: &Rig, db: &Value, handle: &Db) {
+        let mut page = db.clone();
+        page.as_object_mut().unwrap().remove("origin");
+        rig.core.apply(&Rig::page(vec![page], vec![])).await;
+        eventually(30, "the node to decide on the database", || {
+            handle.view().adopted
+        })
+        .await;
+    }
+    /// The events of a database that the node kept for Cloudflare.
+    fn events_of(id: &str, name: &str) -> Vec<Value> {
+        crate::events::seen()
+            .into_iter()
+            .filter(|e| e["event"] == name && e["database_id"] == id)
+            .collect()
+    }
+
+    /// The finding of the live run (US1, 2026-10-23): a delete that left the volume, the user
+    /// and a failed slot behind reported the database deleted, logged nothing, and never tried
+    /// again, so the volumes stayed (53 GB of the pool) for two databases the API called deleted.
+    /// Now nothing is reported until all of it is gone; each failed step is said, and the delete
+    /// is decided again until it is done.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_that_leaves_a_volume_or_a_user_is_not_reported_and_goes_on_until_all_is_gone()
+    {
+        let Some(rig) = Rig::new("delete-left").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let (_, handle) = rig.create_from(&db).await;
+        decided_on(&rig, &db, &handle).await;
+        // The volume is in use for as long as the test says, and the user cannot be locked once.
+        rig.machine.fail_volume_removals(u32::MAX);
+        rig.core
+            .apply(&Rig::page(vec![deletion(&db, 10)], vec![]))
+            .await;
+        eventually(30, "the delete to fail on the volume", || {
+            events_of(&id, "delete_incomplete").len() >= 2
+        })
+        .await;
+        let failures = events_of(&id, "delete_incomplete");
+        assert_eq!(failures[0]["fields"]["step"], "volume");
+        assert_eq!(failures[0]["fields"]["class"], "storage_busy");
+        // The unit is ended, the volume and the user are there, and nothing says deleted: the
+        // observation is the one a database being removed has, none.
+        assert!(!rig.machine.running(&id));
+        assert_eq!(rig.machine.volumes().len(), 1);
+        assert!(rig.machine.has_account(&id));
+        assert_ne!(handle.phase(), Phase::Deleted);
+        assert!(
+            rig.core
+                .pending_observation(&id)
+                .is_none_or(|observation| observation["state"] != "deleted"),
+            "{:?}",
+            rig.core.pending_observation(&id)
+        );
+        assert!(
+            rig.machine
+                .calls()
+                .iter()
+                .filter(|call| **call == format!("remove {id}"))
+                .count()
+                >= 2,
+            "the removal is tried again: {:?}",
+            rig.machine.calls()
+        );
+        // The volume lets go; the user cannot be locked once; then it is all gone.
+        rig.machine.fail_volume_removals(0);
+        rig.machine.fail_account_removals(1);
+        eventually(30, "the delete to finish", || {
+            handle.phase() == Phase::Deleted
+        })
+        .await;
+        assert!(
+            events_of(&id, "delete_incomplete")
+                .iter()
+                .any(|event| event["fields"]["step"] == "account"),
+            "{:?}",
+            events_of(&id, "delete_incomplete")
+        );
+        assert!(rig.machine.volumes().is_empty());
+        assert!(!rig.machine.has_account(&id));
+        assert_eq!(rig.core.files(&id).load().unwrap(), None);
+        assert_eq!(rig.observation(&id)["state"], "deleted");
+    }
+
+    /// Deletion is authorized by the desired page and the volume's identity. A broken sleep
+    /// proof must refuse a wake, but cannot prevent the owner from deleting the database.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_authorized_delete_cleans_up_after_a_restart_with_corrupt_local_state() {
+        let Some(rig) = Rig::new("delete-corrupt").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        rig.create_from(&db).await;
+        let rig = rig.restart().await;
+        std::fs::write(
+            rig.core.files(&id).directory().join("state.json"),
+            "{not a state",
+        )
+        .unwrap();
+        let deleted = deletion(&db, 2);
+        let handle = rig.core.db(&id);
+        handle.view().entry = Some(rig.entry_for(&deleted));
+        rig.core.reconcile(&handle, &mut None).await;
+        assert_eq!(handle.phase(), Phase::Deleted);
+        assert!(!rig.machine.running(&id));
+        assert!(rig.machine.volumes().is_empty());
+        assert!(!rig.machine.has_account(&id));
+        assert_eq!(rig.core.files(&id).load().unwrap(), None);
+        assert_eq!(rig.observation(&id)["state"], "deleted");
+    }
+
+    /// A clean stop that fails (a PANIC at the shutdown checkpoint of a full filesystem, a stop
+    /// job that does not end) is followed by the kill, and the volume is removed only once no
+    /// process of the unit is left: while PostgreSQL may still run, nothing is taken from under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_ends_a_unit_that_does_not_stop_by_force_and_removes_nothing_under_a_unit_that_runs()
+     {
+        let Some(rig) = Rig::new("delete-kill").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let (_, handle) = rig.create_from(&db).await;
+        decided_on(&rig, &db, &handle).await;
+        assert!(rig.machine.running(&id));
+        // The stop fails once, and the kill ends the unit.
+        rig.machine.fail_stops(1);
+        rig.core
+            .apply(&Rig::page(vec![deletion(&db, 10)], vec![]))
+            .await;
+        eventually(60, "the delete to finish", || {
+            handle.phase() == Phase::Deleted
+        })
+        .await;
+        assert!(!rig.machine.running(&id));
+        let calls = rig.machine.calls();
+        let at = |call: String| calls.iter().position(|c| *c == call);
+        assert!(
+            at(format!("stop {id}")) < at(format!("kill {id}"))
+                && at(format!("kill {id}")) < at(format!("remove {id}")),
+            "stop, then kill, then remove: {calls:?}"
+        );
+        assert_eq!(events_of(&id, "delete_unit_killed").len(), 1);
+        assert!(rig.machine.volumes().is_empty());
+
+        // A unit that nothing ends keeps its volume: the delete says which step and goes on.
+        let other = rig.entry_json();
+        let other_id = id_of(&other);
+        let (_, other_handle) = rig.create_from(&other).await;
+        decided_on(&rig, &other, &other_handle).await;
+        rig.machine.fail_stops(u32::MAX);
+        rig.core
+            .apply(&Rig::page(vec![deletion(&other, 10)], vec![]))
+            .await;
+        eventually(30, "the delete to fail on the unit", || {
+            events_of(&other_id, "delete_incomplete").len() >= 2
+        })
+        .await;
+        assert_eq!(
+            events_of(&other_id, "delete_incomplete")[0]["fields"]["step"],
+            "unit"
+        );
+        assert!(
+            !rig.machine.calls().contains(&format!("remove {other_id}")),
+            "the volume stays under a unit that may run"
+        );
+        assert_ne!(other_handle.phase(), Phase::Deleted);
+        rig.machine.fail_stops(0);
+        eventually(60, "the delete to finish", || {
+            other_handle.phase() == Phase::Deleted
+        })
+        .await;
+        assert!(rig.machine.volumes().is_empty());
+    }
+
+    /// The two databases of the live run: the API called them deleted, the node had no record
+    /// of them any more, and their volumes and users stayed. An agent that starts finds them
+    /// from the page, which now names a deleted database while the volume is reported, and
+    /// removes them. A volume of a database that exists, or of none the page names, is not
+    /// touched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_removes_the_volume_and_the_user_a_deleted_database_left_and_nothing_else()
+     {
+        let Some(rig) = Rig::new("delete-leaked").await else {
+            return;
+        };
+        let (leaked, kept) = (rig.entry_json(), rig.entry_json());
+        let (leaked_id, kept_id) = (id_of(&leaked), id_of(&kept));
+        let (_, leaked_handle) = rig.create_from(&leaked).await;
+        let (_, kept_handle) = rig.create_from(&kept).await;
+        assert_eq!(
+            rig.core.sleep(&leaked_handle, Why::Idle).await,
+            Slept::Proven
+        );
+        assert_eq!(rig.core.sleep(&kept_handle, Why::Idle).await, Slept::Proven);
+        // What the live delete left: the volume and the user, and no file of the node's.
+        rig.core.files(&leaked_id).remove().unwrap();
+        let rig = rig.restart().await;
+        for entry in [&leaked, &kept] {
+            rig.deliver(entry["archive"]["path"].as_str().unwrap(), "read_write");
+        }
+        assert_eq!(rig.machine.volumes().len(), 2);
+        let mut kept_page = kept.clone();
+        kept_page.as_object_mut().unwrap().remove("origin");
+        rig.core
+            .apply(&Rig::page(
+                vec![deletion(&leaked, 10), kept_page.clone()],
+                vec![],
+            ))
+            .await;
+        let handle = rig.core.db(&leaked_id);
+        eventually(60, "the leaked volume to be removed", || {
+            handle.phase() == Phase::Deleted
+        })
+        .await;
+        assert_eq!(
+            rig.machine
+                .volumes()
+                .iter()
+                .map(|(volume, _)| volume.database().to_string())
+                .collect::<Vec<_>>(),
+            vec![kept_id.clone()]
+        );
+        assert!(!rig.machine.has_account(&leaked_id));
+        assert!(rig.machine.has_account(&kept_id));
+        assert_eq!(rig.observation(&leaked_id)["state"], "deleted");
+        // A page that does not name a database, and one that names it running, remove nothing.
+        rig.core.apply(&Rig::page(vec![kept_page], vec![])).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(rig.machine.volumes().len(), 1);
     }
 
     /// The first page is applied before the archive credentials are read (the gateway is served

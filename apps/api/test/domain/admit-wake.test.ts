@@ -490,6 +490,7 @@ it("an admission logs one actor_admit line with the path it took", async () => {
       "waiter_id",
       "path",
       "reused",
+      "handler_ms",
       "instance_age_ms",
       "isolate_actors",
       "at_ms",
@@ -514,7 +515,11 @@ it("an actor_admit line says how long its instance has existed and how many Acto
     vi.advanceTimersByTime(5000);
     await actor(published.id).admitWake(published.id, "app");
     const [warm] = admitLines(log, published.id);
-    expect(warm).toMatchObject({ path: "snapshot", instance_age_ms: 5000 });
+    expect(warm).toMatchObject({
+      path: "snapshot",
+      handler_ms: 0,
+      instance_age_ms: 5000,
+    });
 
     // An id nothing has called: this very admission builds its Actor, one more in the isolate.
     const cold = newDatabaseId();
@@ -534,6 +539,34 @@ it("an actor_admit line says how long its instance has existed and how many Acto
       instance_age_ms: 5007,
       isolate_actors: first!.isolate_actors,
     });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("actor handler time includes its own wait but excludes time before the call", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const log = vi.spyOn(console, "log");
+    const f = await sleeper("manual");
+    await runInDurableObject(actor(f.id), (instance) => {
+      vi.spyOn(instance, "ensureAwake").mockImplementation(async () => {
+        vi.advanceTimersByTime(37);
+        return { ok: false, sqlstate: "08006" };
+      });
+    });
+    vi.advanceTimersByTime(5000);
+    expect(await actor(f.id).admitWake(f.id, "app")).toEqual({
+      ok: false,
+      sqlstate: "08006",
+    });
+    expect(admitLines(log, f.id)).toEqual([
+      expect.objectContaining({
+        path: "ensure_awake",
+        handler_ms: 37,
+        instance_age_ms: 5037,
+      }),
+    ]);
   } finally {
     vi.useRealTimers();
   }

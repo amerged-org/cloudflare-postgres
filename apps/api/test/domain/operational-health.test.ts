@@ -160,6 +160,13 @@ it("exposes bounded administrator health from real D1 samples and preserves miss
   )
     .bind(created.database.id, producer, now, now, now, JSON.stringify(sample))
     .run();
+  await env.DB.prepare(
+    `INSERT INTO node_volumes(node_id,database_id,storage_generation,mounted,size_bytes,pool_used_bytes,
+      filesystem_total_bytes,filesystem_used_bytes,inodes_total,inodes_used,observed_at)
+     SELECT node_id,id,storage_generation,1,100,95,100,95,1000,10,? FROM databases WHERE id=?`,
+  )
+    .bind(now, created.database.id)
+    .run();
   const measured = await (
     await healthRequest("/v1/operational-health", f.admin)
   ).json<{

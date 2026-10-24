@@ -100,6 +100,37 @@ export async function restoreDatabase(
     execute: async (lease) => {
       const source = await databaseForRequest(c, sourceId, true),
         now = new Date().toISOString();
+      const historical = body.source_operation_id
+        ? await c.env.DB.prepare(
+            `SELECT source_archive_path,source_storage_generation FROM database_replacements
+           WHERE operation=? AND database_id=? AND project_id=? AND region_id=?
+             AND phase IN('succeeded','failed') AND retained_until>? AND source_cleanup_claim IS NULL AND source_archive_deleted_at IS NULL`,
+          )
+            .bind(
+              body.source_operation_id,
+              sourceId,
+              source.project_id,
+              source.region_id,
+              now,
+            )
+            .first<{
+              source_archive_path: string;
+              source_storage_generation: number;
+            }>()
+        : null;
+      if (body.source_operation_id && !historical)
+        throw new ApiError(
+          "conflict",
+          "The prior state is unavailable or outside recovery retention",
+          { reason: "archive_expired" },
+        );
+      const archiveSource = historical
+        ? {
+            ...source,
+            archive_path: historical.source_archive_path,
+            storage_generation: historical.source_storage_generation,
+          }
+        : source;
       if (body.mode === "pitr" && body.target_time > now)
         throw new ApiError(
           "invalid_request",
@@ -115,6 +146,7 @@ export async function restoreDatabase(
               .first<Retained>();
       if (
         source.deleted_at !== null &&
+        !historical &&
         !retainedArchiveRestorable(retained, source, now)
       )
         throw new ApiError(
@@ -151,7 +183,7 @@ export async function restoreDatabase(
         await regionBounds(c.env.DB, region.id),
       );
       const selected = archiveBucket(c.env),
-        prefix = validatedArchivePrefix(source, selected.bucketName);
+        prefix = validatedArchivePrefix(archiveSource, selected.bucketName);
       const backup = await restoreBackup(
         selected.bucket,
         prefix,
@@ -173,7 +205,7 @@ export async function restoreDatabase(
         });
       const targetId = newDatabaseId(),
         op = newOperationId(),
-        storageGeneration = (source.storage_generation ?? 1) + 1,
+        storageGeneration = (archiveSource.storage_generation ?? 1) + 1,
         credentials = keyring(c.env.CREDENTIAL_KEYS);
       const roles = await Promise.all(
         stored.map(async (r) => ({
@@ -233,6 +265,16 @@ export async function restoreDatabase(
         sql: "EXISTS(SELECT 1 FROM database_restores WHERE target_database_id=? AND operation_id=?)",
         bindings: [targetId, op],
       };
+      if (historical) {
+        authority.sql +=
+          " AND EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.operation=? AND rp.database_id=? AND rp.source_archive_path=? AND rp.retained_until>? AND rp.source_cleanup_claim IS NULL AND rp.source_archive_deleted_at IS NULL)";
+        authority.bindings.push(
+          body.source_operation_id!,
+          sourceId,
+          archiveSource.archive_path,
+          now,
+        );
+      }
       const statements = [
         databaseInsertStatement(c.env.DB, {
           body: {
@@ -287,8 +329,8 @@ export async function restoreDatabase(
         ).bind(
           op,
           sourceId,
-          source.archive_path,
-          source.storage_generation ?? 1,
+          archiveSource.archive_path,
+          archiveSource.storage_generation ?? 1,
           backup.id,
           body.mode === "pitr" ? body.target_time : null,
           now,

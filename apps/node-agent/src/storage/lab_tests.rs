@@ -5,11 +5,9 @@
 //! step of CI runs every ignored test in an unprivileged container and must not meet them:
 //! `RUSTFLAGS='--cfg pgcf_storage_lab' cargo test -p pgcf-node-agent --lib -- --test-threads=1 storage::lab_tests`
 use super::{
-    commands::{self, FS_TAG, RESERVE_FREED_TAG},
+    commands::{self, FS_TAG},
     lvm::{self, LogicalVolume},
-    mountinfo,
-    usage::WAL_SEGMENT_BYTES,
-    *,
+    mountinfo, *,
 };
 use std::{
     fs,
@@ -28,6 +26,7 @@ static LABS: AtomicU32 = AtomicU32::new(0);
 const TENANT: u32 = 1234;
 const ID: &str = "a1b2c3d4e5f6g7h8i9j0";
 const OTHER: &str = "k1l2m3n4o5p6q7r8s9t0";
+const THIRD: &str = "u1v2w3x4y5z6a7b8c9d0";
 
 fn sh(program: &str, args: &[&str]) -> String {
     let output = Command::new(program).args(args).output().expect("starts");
@@ -70,6 +69,9 @@ struct Lab {
 
 impl Lab {
     fn new(disk_mib: u64) -> Lab {
+        Lab::new_with(disk_mib, |_| {})
+    }
+    fn new_with(disk_mib: u64, adjust: impl FnOnce(&mut Config)) -> Lab {
         let name = format!(
             "pgcflab{}x{}",
             std::process::id(),
@@ -89,7 +91,7 @@ impl Lab {
             let number = loop_device.trim_start_matches("/dev/loop");
             sh("mknod", &[&loop_device, "b", "7", number]);
         }
-        let config = Config {
+        let mut config = Config {
             device: loop_device.clone().into(),
             group: name,
             mount_root: dir.join("db"),
@@ -97,6 +99,7 @@ impl Lab {
             pool_metadata_bytes: 8 << 20,
             ..Config::default()
         };
+        adjust(&mut config);
         Lab {
             dir,
             loop_device,
@@ -105,7 +108,10 @@ impl Lab {
     }
     /// A lab with the pool made.
     fn open(disk_mib: u64) -> Lab {
-        let lab = Lab::new(disk_mib);
+        Lab::open_with(disk_mib, |_| {})
+    }
+    fn open_with(disk_mib: u64, adjust: impl FnOnce(&mut Config)) -> Lab {
+        let lab = Lab::new_with(disk_mib, adjust);
         lab.storage.open().unwrap();
         lab
     }
@@ -681,7 +687,7 @@ fn a_volume_is_created_formatted_and_mounted_for_its_owner_alone() {
         (volume.id.clone(), volume.size_bytes),
         (id.clone(), 256 << 20)
     );
-    assert!(volume.formatted && !volume.reserve_released);
+    assert!(volume.formatted);
     assert!(!volume.fs_errors);
     let mount = volume.mount.unwrap();
     assert!(mount.usage.total_bytes > 200 << 20 && mount.usage.total_bytes < 256 << 20);
@@ -1216,9 +1222,12 @@ fn a_full_pool_marks_the_mounted_volumes_and_recovery_brings_them_back_with_thei
     ));
     assert!(!lab.mounted(&a));
     assert!(lab.link(&a).is_none());
-    // Its journal holds transactions whose flag was lost: `e2fsck -p` alone refuses (4).
+    // Its journal can hold transactions whose flag was lost, and `e2fsck -p` alone then refuses
+    // (4, which `recover_volume` answers by setting the flag): which blocks the full pool refused
+    // decides, and on the filesystem without reserved descriptors the lab has had it end 0, the
+    // journal replayed. The repair below ends well either way.
     let output = SystemRunner.run(&commands::fsck(lab.config(), &a)).unwrap();
-    assert_eq!(output.code, 4, "{}", output.stderr);
+    assert!(matches!(output.code, 0 | 1 | 4), "{}", output.stderr);
 
     lab.storage.recover_volume(&a, &policy()).unwrap();
     assert!(lab.mounted(&a));
@@ -1272,6 +1281,178 @@ fn a_full_pool_marks_a_volume_that_only_a_unit_holds_and_leaves_one_that_nothing
     assert!(lab.link(&a).is_none() && lab.link(&b).is_none());
     assert!(lab.storage.needs_repair(&a).unwrap());
     assert!(!lab.storage.needs_repair(&c).unwrap());
+}
+
+/// The finding of the code reading of 2026-10-23: a pool that takes no writes tags every volume
+/// that is open, the volume of a sleeping database included, and the first wake of that database
+/// was refused for it. Nothing writes to a volume whose database sleeps, and the lab (a pool with
+/// the agent's flags) takes it through a full data area clean: `e2fsck -p` exits 0, its data is
+/// unchanged, and the repair after space has returned lists it, clears the tag and attaches it.
+#[test]
+fn a_volume_nothing_writes_to_comes_through_a_full_data_area_clean_and_is_repaired_when_space_returns()
+ {
+    let lab = Lab::open(320);
+    let (idle, bulk) = (id(ID, 1), id(OTHER, 1));
+    lab.create(&idle, 64);
+    lab.create(&bulk, 256);
+    // The sleeping database's committed data, and the digest it is compared with at the end.
+    assert!(lab.tenant_dd(&idle, "kept", 2048, "/dev/urandom"));
+    sh("sync", &[]);
+    let kept = fs::read(lab.dir_of(&idle).join("kept")).unwrap();
+    assert!(lab.storage.suspects().unwrap().is_empty());
+
+    // Another tenant fills the pool; the pool fails its write at once and takes no more.
+    assert!(!lab.tenant_dd(&bulk, "bulk", 245_760, "/dev/urandom"));
+    sh("sync", &[]);
+    assert_eq!(
+        lab.storage.poll_pool().unwrap().mode,
+        PoolMode::OutOfDataSpace
+    );
+    let sorted = |lab: &Lab| {
+        let mut suspects = lab.storage.suspects().unwrap();
+        suspects.sort();
+        suspects
+    };
+    assert_eq!(sorted(&lab), vec![idle.clone(), bulk.clone()]);
+    // The repair writes, and the pool has no room for it yet.
+    assert!(matches!(
+        lab.storage.recover_volume(&idle, &policy()),
+        Err(Error::NoRoom(_))
+    ));
+    assert!(lab.mounted(&idle) && lab.link(&idle).is_none());
+
+    // The other database is deleted and its chunks return: the pool takes writes again.
+    lab.storage.unmount_volume(&bulk).unwrap();
+    lab.storage
+        .remove_volume(
+            &bulk,
+            Removal::DatabaseDeleted {
+                storage_generation: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(lab.storage.poll_pool().unwrap().mode, PoolMode::ReadWrite);
+    assert_eq!(lab.storage.room(&policy()), Ok(()));
+    assert_eq!(sorted(&lab), vec![idle.clone()]);
+
+    // Its filesystem is clean as it stands: nothing was written to it while the pool took none.
+    lab.storage.unmount_volume(&idle).unwrap();
+    let output = SystemRunner
+        .run(&commands::fsck(lab.config(), &idle))
+        .unwrap();
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    let began = std::time::Instant::now();
+    lab.storage.recover_volume(&idle, &policy()).unwrap();
+    eprintln!(
+        "lab: the repair of the idle volume took {} ms",
+        began.elapsed().as_millis()
+    );
+    assert!(lab.linked_to_the_mounted_volume(&idle));
+    assert!(lab.storage.suspects().unwrap().is_empty());
+    assert!(!lab.storage.needs_repair(&idle).unwrap());
+    assert_eq!(fs::read(lab.dir_of(&idle).join("kept")).unwrap(), kept);
+    assert!(lab.tenant_dd(&idle, "after", 1024, "/dev/zero"));
+}
+
+/// The same event with the pool's metadata: its area is full, the pool is read-only (the writes
+/// fail with EIO and not with ENOSPC), and every volume that is open is tagged. A larger metadata
+/// area (`lvextend --poolmetadatasize`, which an operator does) brings the pool back to read-write
+/// online, and the volume of the database that sleeps is repaired as after a full data area.
+#[test]
+fn a_volume_nothing_writes_to_comes_through_a_full_metadata_area_clean_and_is_repaired_when_it_has_room_again()
+ {
+    let lab = Lab::open(320);
+    let idle = id(ID, 1);
+    lab.create(&idle, 64);
+    assert!(lab.tenant_dd(&idle, "kept", 1024, "/dev/urandom"));
+    sh("sync", &[]);
+    let kept = fs::read(lab.dir_of(&idle).join("kept")).unwrap();
+    assert_eq!(lab.storage.poll_pool().unwrap().mode, PoolMode::ReadWrite);
+
+    // Every thin device takes a block of the pool's metadata for its tree: enough of them (made
+    // with the pool's own message, which is quick) fill the 8 MiB area, and the pool goes
+    // read-only. They are no volume of a database, and the agent does not list them.
+    let listed = lab.run(vec![
+        "dmsetup".into(),
+        "ls".into(),
+        "--target".into(),
+        "thin-pool".into(),
+    ]);
+    let pool = listed
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .find(|name| name.starts_with(&format!("{}-", lab.config().group)))
+        .unwrap()
+        .to_string();
+    let mut made = 0;
+    loop {
+        let output = SystemRunner
+            .run(&[
+                "dmsetup".into(),
+                "message".into(),
+                pool.clone(),
+                "0".into(),
+                format!("create_thin {}", 100_000 + made),
+            ])
+            .unwrap();
+        if output.code != 0 {
+            break;
+        }
+        made += 1;
+        assert!(made < 5000, "the metadata did not fill");
+    }
+    let sample = lab.storage.poll_pool().unwrap();
+    eprintln!("lab: the pool is {:?} after {made} devices", sample.mode);
+    assert_eq!(sample.mode, PoolMode::ReadOnly, "{sample:?}");
+    assert!(!sample.writable());
+    assert_eq!(lab.storage.suspects().unwrap(), vec![idle.clone()]);
+    assert!(matches!(
+        lab.storage.recover_volume(&idle, &policy()),
+        Err(Error::NoRoom(_))
+    ));
+
+    // The operator gives the pool more metadata: the disk grows by 32 MiB and the group with it.
+    let image = lab.dir.join("disk.img");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&image)
+        .unwrap()
+        .set_len((320 + 32) << 20)
+        .unwrap();
+    sh("losetup", &["-c", &lab.loop_device]);
+    sh("pvresize", &[&lab.loop_device]);
+    let target = format!("{}/{}", lab.config().group, lab.config().pool);
+    let began = std::time::Instant::now();
+    sh(
+        "lvextend",
+        &["--quiet", "--poolmetadatasize", "+4m", &target],
+    );
+    eprintln!(
+        "lab: lvextend --poolmetadatasize took {} ms",
+        began.elapsed().as_millis()
+    );
+    let sample = lab.storage.poll_pool().unwrap();
+    assert_eq!(sample.mode, PoolMode::ReadWrite, "{sample:?}");
+    assert!(sample.writable(), "{sample:?}");
+    assert_eq!(lab.storage.room(&policy()), Ok(()));
+
+    // The tag stays until the repair, which finds the filesystem clean.
+    assert_eq!(lab.storage.suspects().unwrap(), vec![idle.clone()]);
+    lab.storage.unmount_volume(&idle).unwrap();
+    let output = SystemRunner
+        .run(&commands::fsck(lab.config(), &idle))
+        .unwrap();
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    let began = std::time::Instant::now();
+    lab.storage.recover_volume(&idle, &policy()).unwrap();
+    eprintln!(
+        "lab: the repair of the idle volume took {} ms",
+        began.elapsed().as_millis()
+    );
+    assert!(lab.linked_to_the_mounted_volume(&idle));
+    assert!(lab.storage.suspects().unwrap().is_empty());
+    assert_eq!(fs::read(lab.dir_of(&idle).join("kept")).unwrap(), kept);
+    assert!(lab.tenant_dd(&idle, "after", 1024, "/dev/zero"));
 }
 
 /// A unit holds the filesystem in a namespace of its own, which the agent's unmount does not see:
@@ -1409,71 +1590,6 @@ fn after_an_agents_restart_the_old_generation_that_only_a_unit_holds_is_held_for
     assert!(lab.linked_to_the_mounted_volume(&g2));
     lab.storage.remove_volume(&g1, order).unwrap();
     assert!(lab.lv(&g1).is_none() && lab.mounted(&g2));
-}
-
-#[test]
-fn a_full_volume_gets_its_reserve_freed_after_its_database_failed_and_back_on_growth_or_when_use_drops()
- {
-    let lab = Lab::open(512);
-    let a = id(ID, 1);
-    lab.create(&a, 64);
-    let reserved = |lab: &Lab| -> u64 {
-        sh("tune2fs", &["-l", &commands::device(lab.config(), &a)])
-            .lines()
-            .find_map(|l| l.strip_prefix("Reserved block count:"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
-    };
-    let at_one_percent = reserved(&lab);
-    assert!(at_one_percent > 0);
-
-    assert!(!lab.tenant_dd(&a, "fill", 102400, "/dev/zero"));
-    let usage = lab.volume(&a).mount.unwrap().usage;
-    assert!(usage.available_bytes < WAL_SEGMENT_BYTES, "{usage:?}");
-    // The database still runs: its tenant would spend the reserve.
-    assert_eq!(
-        lab.storage.set_reserve(&a, false).unwrap(),
-        ReserveAction::Keep
-    );
-    assert_eq!(reserved(&lab), at_one_percent);
-    // It stopped on the failed write: the crash recovery and the deletes of the tenant have room.
-    assert_eq!(
-        lab.storage.set_reserve(&a, true).unwrap(),
-        ReserveAction::Release
-    );
-    assert!(lab.lv(&a).unwrap().has_tag(RESERVE_FREED_TAG));
-    assert!(lab.volume(&a).reserve_released);
-    assert_eq!(reserved(&lab), 0);
-    assert!(lab.tenant_dd(&a, "room", 256, "/dev/zero"));
-
-    // Growing the volume gives it room: the reserve goes back, 1 % of the larger filesystem.
-    lab.storage.grow_volume(&a, 256 << 20).unwrap();
-    assert!(!lab.lv(&a).unwrap().has_tag(RESERVE_FREED_TAG));
-    let grown = reserved(&lab);
-    assert!(grown > at_one_percent);
-
-    // Full again and freed again; deleting data gives it back as well.
-    assert!(!lab.tenant_dd(&a, "fill2", 262144, "/dev/zero"));
-    assert_eq!(
-        lab.storage.set_reserve(&a, true).unwrap(),
-        ReserveAction::Release
-    );
-    assert_eq!(reserved(&lab), 0);
-    for file in ["fill", "fill2", "room"] {
-        fs::remove_file(lab.dir_of(&a).join(file)).unwrap();
-    }
-    assert_eq!(
-        lab.storage.set_reserve(&a, false).unwrap(),
-        ReserveAction::Restore
-    );
-    assert!(!lab.lv(&a).unwrap().has_tag(RESERVE_FREED_TAG));
-    assert_eq!(reserved(&lab), grown);
-    assert_eq!(
-        lab.storage.set_reserve(&a, false).unwrap(),
-        ReserveAction::Keep
-    );
 }
 
 #[test]
@@ -1706,8 +1822,7 @@ fn a_filesystem_ends_before_what_libblkid_reads_at_the_end_when_made_and_when_gr
     // No block of the filesystem is one that libblkid probes.
     let farthest = PROMISE_SECTORS_FROM_THE_END.iter().max().unwrap() * 512;
     assert!((128u64 << 20) - filesystem_bytes(&lab, &a) > farthest);
-    // The tenant takes everything its filesystem has, the root-only reserve included.
-    lab.run(commands::reserve(lab.config(), &a, 0));
+    // The tenant takes everything its filesystem has.
     lab.tenant_fill_with(&a, "fill", &signature);
     assert_eq!(probed_type(&lab, &a), "ext4");
     assert!(probed_sectors_are_zero(&lab, &a));
@@ -1721,7 +1836,6 @@ fn a_filesystem_ends_before_what_libblkid_reads_at_the_end_when_made_and_when_gr
     assert_eq!(filesystem_bytes(&lab, &a), (256 << 20) - gap);
     lab.storage.grow_volume(&a, 256 << 20).unwrap();
     assert_eq!(filesystem_bytes(&lab, &a), (256 << 20) - gap);
-    lab.run(commands::reserve(lab.config(), &a, 0));
     lab.tenant_fill_with(&a, "fill2", &signature);
     assert_eq!(probed_type(&lab, &a), "ext4");
     assert!(probed_sectors_are_zero(&lab, &a));
@@ -1946,4 +2060,375 @@ fn a_volume_that_a_unit_or_a_job_still_has_open_is_busy_and_goes_when_it_lets_go
     lab.storage.remove_volume(&a, ordered).unwrap();
     release.join().unwrap();
     assert!(lab.lv(&a).is_none());
+}
+
+// ---------- growth and recovery with a real tenant PostgreSQL ----------
+
+/// A tenant's PostgreSQL on the volume of a lab: `initdb` as the tenant's user, the files of
+/// `base` and `global` in the project as the agent puts them, the agent's `postgresql.conf` for
+/// the volume's size, and the postmaster run as the tenant's user (not root, which a quota does
+/// not limit and PostgreSQL refuses). The tenant's user needs a passwd entry (the lab container
+/// makes one for `TENANT`).
+struct TenantPg {
+    data: PathBuf,
+    socket: PathBuf,
+    bin: PathBuf,
+    child: Option<Child>,
+}
+
+impl TenantPg {
+    fn new(lab: &Lab, id: &VolumeId) -> TenantPg {
+        let bin = crate::testpg::bin_directory().expect("a PostgreSQL 18 for the lab");
+        let data = lab.dir_of(id).join("data");
+        let socket = lab.dir.join(format!("sock-{}", id.generation()));
+        fs::create_dir_all(&socket).unwrap();
+        chown(&socket, Some(TENANT), Some(TENANT)).unwrap();
+        let mut initdb = Command::new(bin.join("initdb"));
+        initdb
+            .args(crate::machine::initdb_arguments(&data, None))
+            .arg("--no-sync");
+        let output = tenant(&mut initdb).output().unwrap();
+        assert!(
+            output.status.success(),
+            "initdb: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let volume_bytes = lab.lv(id).unwrap().size_bytes;
+        let conf = crate::settings::postgresql_conf(&crate::settings::Settings {
+            socket_directory: &socket,
+            memory_mib: 256,
+            volume_bytes,
+            max_connections: 20,
+            archive_timeout_seconds: 60,
+            archive_command: None,
+        })
+        .unwrap();
+        fs::write(data.join("postgresql.conf"), conf).unwrap();
+        fs::write(data.join("pg_hba.conf"), "local all all trust\n").unwrap();
+        for file in ["postgresql.conf", "pg_hba.conf"] {
+            chown(data.join(file), Some(TENANT), Some(TENANT)).unwrap();
+        }
+        let mut pg = TenantPg {
+            data,
+            socket,
+            bin,
+            child: None,
+        };
+        pg.start();
+        pg
+    }
+
+    fn start(&mut self) {
+        let mut postgres = Command::new(self.bin.join("postgres"));
+        postgres
+            .arg("-D")
+            .arg(&self.data)
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(self.log_path()).unwrap());
+        let child = tenant(&mut postgres).spawn().unwrap();
+        self.child = Some(child);
+        for _ in 0..600 {
+            if self.sql("SELECT 1").is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the postmaster is not ready:\n{}", self.log());
+    }
+
+    fn log_path(&self) -> PathBuf {
+        self.socket.join("postgres.log")
+    }
+    fn log(&self) -> String {
+        fs::read_to_string(self.log_path()).unwrap_or_default()
+    }
+
+    /// One statement as the agent's superuser over the socket: the output, or the error text.
+    fn sql(&self, statement: &str) -> Result<String, String> {
+        let mut psql = Command::new(self.bin.join("psql"));
+        psql.args(["-h"])
+            .arg(&self.socket)
+            .args([
+                "-U",
+                "postgres",
+                "-X",
+                "-q",
+                "-t",
+                "-A",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ])
+            .args(["-d", "postgres", "-c", statement]);
+        let output = tenant(&mut psql).output().unwrap();
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
+
+    /// A crash: SIGKILL of the postmaster and of what it left, and its System V segment removed.
+    fn crash(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let pid_file = fs::read_to_string(self.data.join("postmaster.pid")).unwrap_or_default();
+        let _ = Command::new("pkill")
+            .args(["-9", "-u", &TENANT.to_string(), "postgres"])
+            .output();
+        std::thread::sleep(Duration::from_millis(500));
+        if let Some(id) = pid_file
+            .lines()
+            .nth(6)
+            .and_then(|line| line.split_whitespace().nth(1))
+        {
+            let _ = Command::new("ipcrm").args(["-m", id]).output();
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status();
+            let _ = child.wait();
+        }
+    }
+
+    /// Inserts rows of `row_bytes` in batches of about 10 MB until a statement fails: the number
+    /// of rows that were acknowledged, and the error that ended it. The table has a primary key
+    /// when `indexed`.
+    fn fill(&self, table: &str, row_bytes: u64, indexed: bool) -> (u64, String) {
+        let key = if indexed { " PRIMARY KEY" } else { "" };
+        self.sql(&format!(
+            "CREATE TABLE IF NOT EXISTS {table}(id bigserial{key}, v text); \
+             ALTER TABLE {table} ALTER v SET STORAGE PLAIN"
+        ))
+        .unwrap();
+        let batch = 10_000_000 / row_bytes;
+        let mut rows = 0;
+        loop {
+            match self.sql(&format!(
+                "INSERT INTO {table}(v) SELECT repeat('x', {row_bytes}) FROM generate_series(1, {batch})"
+            )) {
+                Ok(_) => rows += batch,
+                Err(error) => return (rows, error),
+            }
+        }
+    }
+}
+
+impl Drop for TenantPg {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Runs the command as the tenant's user, as PostgreSQL's unit does.
+fn tenant(command: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    command
+        .uid(TENANT)
+        .gid(TENANT)
+        .env_clear()
+        .env("HOME", "/tmp")
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/")
+}
+
+/// An older filesystem with resize_inode and an 8 MiB journal grows safely offline.
+#[test]
+fn an_older_filesystem_grows_offline_without_losing_data() {
+    let lab = Lab::open_with(3072, |config| config.logical_cap_factor = 64);
+    let a = id(ID, 1);
+    let size = 8u64 << 30;
+    lab.run(commands::volume_create(lab.config(), &a, size));
+    lab.run(
+        [
+            "mkfs.ext4",
+            "-F",
+            "-q",
+            "-J",
+            "size=8",
+            "-i",
+            "65536",
+            "-m",
+            "1",
+            "-E",
+            "lazy_itable_init=0,lazy_journal_init=0",
+            &commands::device(lab.config(), &a),
+            &format!("{}K", commands::fs_target_kib(size)),
+        ]
+        .map(String::from)
+        .to_vec(),
+    );
+    lab.run(commands::volumes_add_tag(
+        lab.config(),
+        slice::from_ref(&a),
+        FS_TAG,
+    ));
+    lab.storage.changed_elsewhere();
+    lab.storage.mount_volume(&a).unwrap();
+    assert!(
+        !host::read_superblock(&commands::device(lab.config(), &a))
+            .unwrap()
+            .online_grow()
+    );
+    fs::write(lab.dir_of(&a).join("acknowledged"), b"committed data").unwrap();
+    let holder = lab.unit_holding(&a);
+    assert!(matches!(
+        lab.storage.grow_volume(&a, 9 << 30),
+        Err(Error::OfflineGrowRequired)
+    ));
+    assert_eq!(lab.lv(&a).unwrap().size_bytes, size);
+    assert!(lab.linked_to_the_mounted_volume(&a));
+    drop(holder);
+    lab.storage.grow_volume(&a, 9 << 30).unwrap();
+    assert_eq!(
+        filesystem_bytes(&lab, &a),
+        (9 << 30) - commands::FS_END_GAP_BYTES
+    );
+    assert_eq!(
+        fs::read(lab.dir_of(&a).join("acknowledged")).unwrap(),
+        b"committed data"
+    );
+    assert!(lab.linked_to_the_mounted_volume(&a));
+    lab.storage.grow_volume(&a, 9 << 30).unwrap();
+}
+
+/// A volume made as the agent makes it grows online under a running PostgreSQL, from the least the
+/// API creates to a terabyte in one call, and in steps from the class size, at every size: the
+/// filesystem has the size at each end, `resize2fs` is never refused, the database keeps taking
+/// writes.
+#[test]
+fn a_volume_grows_online_under_a_running_postgresql_in_one_call_and_in_steps() {
+    // The sold storage of the lab is far over its pool: the logical cap is lifted.
+    let lab = Lab::open_with(3072, |config| config.logical_cap_factor = 1 << 20);
+    let (one_call, steps) = (id(ID, 1), id(OTHER, 1));
+    let gap = commands::FS_END_GAP_BYTES;
+    for (volume, start_gib) in [(&one_call, 1u64), (&steps, 2u64)] {
+        lab.storage
+            .create_volume(volume, start_gib << 30, &policy())
+            .unwrap();
+        chown(lab.dir_of(volume), Some(TENANT), Some(TENANT)).unwrap();
+    }
+    let started = lab.pool_used();
+    let mut pg = TenantPg::new(&lab, &one_call);
+    pg.sql("CREATE TABLE written(id bigserial primary key, v text)")
+        .unwrap();
+    let write = |pg: &TenantPg, rows: u64| {
+        pg.sql(&format!(
+            "INSERT INTO written(v) SELECT repeat('w', 500) FROM generate_series(1, {rows})"
+        ))
+        .unwrap();
+    };
+    write(&pg, 20_000);
+    let tib = 1u64 << 40;
+    lab.storage.grow_volume(&one_call, tib).unwrap();
+    assert_eq!(filesystem_bytes(&lab, &one_call), tib - gap);
+    write(&pg, 20_000);
+    assert_eq!(pg.sql("SELECT count(*) FROM written").unwrap(), "40000");
+    // The checkpoint and a restart work on the grown filesystem.
+    pg.sql("CHECKPOINT").unwrap();
+    pg.stop();
+    pg.start();
+    assert_eq!(pg.sql("SELECT count(*) FROM written").unwrap(), "40000");
+    sh("sync", &[]);
+    eprintln!(
+        "pool used by 1 GiB grown to 1 TiB in one call, with 40,000 rows of 500 bytes: {} MiB",
+        (lab.pool_used() - started) >> 20
+    );
+    drop(pg);
+    lab.storage.unmount_volume(&one_call).unwrap();
+
+    let pg = TenantPg::new(&lab, &steps);
+    pg.sql("CREATE TABLE written(id bigserial primary key, v text)")
+        .unwrap();
+    let mut size_gib = 2u64;
+    for next in [3u64, 6, 25, 50, 100, 250, 1024] {
+        write(&pg, 5_000);
+        lab.storage.grow_volume(&steps, next << 30).unwrap();
+        assert_eq!(
+            filesystem_bytes(&lab, &steps),
+            (next << 30) - gap,
+            "{next} GiB"
+        );
+        size_gib = next;
+    }
+    assert_eq!(size_gib, 1024);
+    write(&pg, 5_000);
+    assert_eq!(pg.sql("SELECT count(*) FROM written").unwrap(), "40000");
+    assert!(!pg.log().contains("PANIC"), "{}", pg.log());
+    drop(pg);
+    lab.storage.unmount_volume(&steps).unwrap();
+
+    // A volume born large is the one that failed (US1, 25 GiB to 50 GiB: 1,030 credits asked of a
+    // journal that allows 678 or fewer): it has no reserved descriptors to pay for.
+    let large = id(THIRD, 1);
+    lab.storage
+        .create_volume(&large, 25 << 30, &policy())
+        .unwrap();
+    chown(lab.dir_of(&large), Some(TENANT), Some(TENANT)).unwrap();
+    for next in [50u64, 80, 400, 4096] {
+        lab.storage.grow_volume(&large, next << 30).unwrap();
+        assert_eq!(
+            filesystem_bytes(&lab, &large),
+            (next << 30) - gap,
+            "{next} GiB"
+        );
+    }
+}
+
+/// No quota reservation: a full tenant filesystem recovers by the explicitly requested grow.
+#[test]
+fn a_full_postgres_volume_recovers_by_growth_with_acknowledged_rows_intact() {
+    let lab = Lab::open(2048);
+    let a = id(ID, 1);
+    lab.create(&a, 256);
+    let mut pg = TenantPg::new(&lab, &a);
+    let (rows, error) = pg.fill("acknowledged", 2000, true);
+    assert!(rows > 0, "{error}");
+    let full = lab.volume(&a).mount.unwrap().usage;
+    assert!(full.space_percent() >= 90, "{full:?}: {error}");
+    assert_eq!(full.space_alert(), Some(Alert::Critical));
+    pg.crash();
+    lab.storage.grow_volume(&a, 512 << 20).unwrap();
+    pg.start();
+    assert_eq!(
+        pg.sql(&format!(
+            "SELECT count(*) FROM acknowledged WHERE id <= {rows}"
+        ))
+        .unwrap(),
+        rows.to_string()
+    );
+    pg.sql("INSERT INTO acknowledged(v) VALUES ('after grow'); CHECKPOINT")
+        .unwrap();
+    assert!(!pg.log().contains("PANIC"), "{}", pg.log());
+}
+
+#[test]
+fn inode_exhaustion_is_observed_and_growth_adds_usable_inodes() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 128);
+    let directory = lab.dir_of(&a).join("inodes");
+    fs::create_dir(&directory).unwrap();
+    let mut count = 0u64;
+    loop {
+        match fs::File::create(directory.join(count.to_string())) {
+            Ok(_) => count += 1,
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                break;
+            }
+        }
+    }
+    let full = lab.volume(&a).mount.unwrap().usage;
+    assert_eq!(full.inode_alert(), Some(Alert::Critical));
+    assert_eq!(full.inodes_used, full.inodes_total);
+    lab.storage.grow_volume(&a, 256 << 20).unwrap();
+    let grown = lab.volume(&a).mount.unwrap().usage;
+    assert!(grown.inodes_total > full.inodes_total);
+    fs::File::create(directory.join("after-grow")).unwrap();
 }

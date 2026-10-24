@@ -347,8 +347,9 @@ created at full size at first boot and does not grow.
   `reserve_bytes` and metadata below `metadata_no_room_percent`. The refusal is `57P03` with the
   DETAIL "storage"; running databases keep running. Cloudflare places no new database or restore on
   a node whose pool is at 80 % of its data or 50 % of its metadata, whose sold storage reached
-  four times its data, or that holds 1,000 volumes, the largest count Stage 1 measured
-  (`regional_node_pool_closed`; the bound counts sleeping databases too and is no policy field: only
+  four times its data (counting the smallest size class on offer as sold), or that holds 1,000
+  volumes, the largest count Stage 1 measured (`regional_node_pool_closed`, which fires when
+  no node of the region takes the smallest size class, for the pool, the RAM or the CPU; the bound counts sleeping databases too and is no policy field: only
   a measurement at a higher count raises it). Sold sizes do not reserve space. `thin_storage_blocked` fires when the pool has no room. Free space by deleting
   databases on the node.
 - **A full pool.** Writes fail at once (`--errorwhenfull y`) and no commit is acknowledged without
@@ -357,15 +358,49 @@ created at full size at first boot and does not grow.
   database itself: it stops the unit, unmounts the volume, repairs it with `e2fsck -p`, mounts it
   again and wakes the database through admission; PostgreSQL runs crash recovery from its durable
   WAL, and every acknowledged commit survives. A volume it cannot repair (`e2fsck` refuses) needs an
-  operator. Running writers are never stopped for storage.
-- **A full volume.** A tenant can fill its own volume by reaching its size, by using up its inodes
-  or by keeping WAL during an R2 outage. The agent reports each volume's space and inodes every 60
-  seconds, and `database_volume_warning` (80 %) and `database_volume_critical` (90 %) fire. Raise the
-  size with `PUT /v1/databases/{id}/resources` (storage only grows) or have the integrator free
-  space. When a volume is full PostgreSQL stops on the failed WAL write, and crash recovery itself
-  must write: the agent frees the filesystem's 1 % root-only reserve once so that recovery can
-  finish and the integrator can delete data or resize; a database that still cannot start needs its
-  size raised. Nothing extends a volume by itself.
+  operator. Running writers are never stopped for storage. A pool whose metadata is full is
+  read-only, not full of data: give it more with `lvextend --poolmetadatasize +<size>` on the
+  thin pool (the volume group needs free extents), which brings it back to read-write online. The
+  volumes of the databases that sleep were tagged suspect meanwhile; once the pool takes writes
+  with room again the agent repairs them in the background without starting the databases, and a
+  wake that comes first repairs its volume and starts, so no wake is refused for the tag. A volume
+  the repair is refused (`e2fsck` refuses, a job holds it) goes through the recovery above at its
+  next wake.
+- **A full volume.** A tenant can exhaust its volume's bytes or inodes, including WAL retained
+  during an R2 outage. Space and inode warnings fire at 80 % and critical alerts at 90 %. The
+  supported recovery is an explicit storage increase through `PUT /v1/databases/{id}/resources`
+  or a larger size class. New filesystems have no root-only reserve or project quota; arbitrary
+  `DELETE`, `VACUUM` and `TRUNCATE` at full are not guaranteed. The node applies the grow before
+  attempting PostgreSQL recovery, preserves the unproven state, then archives and proves recovery
+  before admitting clients. The operation succeeds only after the measured filesystem reaches
+  the requested volume size less its 4 MiB end gap. Missing or undersized observations cannot
+  complete it; a 20-minute timeout reports `filesystem_not_grown` while reconciliation continues.
+  The earlier ext4 layout needs an offline grow: a running writer first completes the normal
+  sleep proof, and the agent verifies that no unit or job still holds the filesystem before
+  `e2fsck -p -f` and `resize2fs`. Failed checks leave the volume suspect for recovery. Never force
+  an unmount, reformat an existing volume, or replay an uncertain application write. Nothing
+  extends a volume without an explicit request.
+
+- **A delete that does not finish.** The node reports a database `deleted` only when its unit,
+  its volumes, its user and its files are gone. A step that fails is a `node_event` line in
+  Workers Logs, `delete_incomplete`, with the `step` (`unit`, `inventory`, `volume`,
+  `socket_directory`, `account`, `state`), its `class` and the `seconds` the delete has been
+  failing, and is tried again after 1 s, doubling to 30 s, for as long as it takes. The delete
+  operation stays `pending` or `running` until the node confirms cleanup; an accepted deletion
+  cannot be cancelled and has no operation timeout. The operator is told independently:
+  `database_delete_incomplete` fires when a database
+  deleted more than 10 minutes ago is still on its node's page (not reported `deleted`, or a volume
+  of it still reported by the node, which is also what an agent that did not run the whole delete
+  leaves) and ends when the node has reported it `deleted` and names no volume of it. A node marked
+  lost is ignored: nothing there can finish. A
+  `volume` step with `storage_busy` and an `account` step mean that something still holds the
+  volume or runs as the database's user, most likely a job of the database (`systemctl
+  list-units 'pgcf-job-*'`, a base backup or a WAL upload); the delete goes on when it ends. A
+  `unit` step means the clean stop and the kill both failed, and nothing is removed under a unit
+  that may still run. Cloudflare lists a deleted database on its node's page for as long as the
+  node's volume report (every 60 s) names a volume of it, so a volume that an earlier agent left
+  behind is found and removed by the agent that reads the page, with no hand step. A slot unit
+  that ended `failed` is taken back to `inactive` at its stop and when the agent starts.
 
 Thin physical allocation metrics stay null until a real measurement exists; neither a logical
 quota nor zero stands in for an unknown measurement. The agent's full-pool and full-volume recovery

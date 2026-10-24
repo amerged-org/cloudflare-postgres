@@ -270,6 +270,12 @@ pub trait Machine: Send + Sync + 'static {
         id: &VolumeId,
         size_bytes: u64,
     ) -> impl Future<Output = Result<(), storage::Error>> + Send;
+    /// The size of the volume's filesystem in bytes, as its superblock says: what a growth made it,
+    /// and not what the volume has.
+    fn filesystem_bytes(
+        &self,
+        id: &VolumeId,
+    ) -> impl Future<Output = Result<u64, storage::Error>> + Send;
     fn remove_volume(
         &self,
         id: &VolumeId,
@@ -283,6 +289,9 @@ pub trait Machine: Send + Sync + 'static {
         &self,
         id: &VolumeId,
     ) -> impl Future<Output = Result<bool, storage::Error>> + Send;
+    /// The volumes a pool without writes tagged as suspect and no repair has cleared since.
+    fn suspect_volumes(&self)
+    -> impl Future<Output = Result<Vec<VolumeId>, storage::Error>> + Send;
     /// Full-pool recovery of one volume whose unit is stopped (plan 4.3).
     fn recover_volume(
         &self,
@@ -344,6 +353,10 @@ pub trait Machine: Send + Sync + 'static {
     /// A fast shutdown, returning when the unit is over; the slot that held the database is free
     /// again then.
     fn stop(&self, database: &str) -> impl Future<Output = Result<(), units::Error>> + Send;
+    /// Ends the database's PostgreSQL by force, for a database that is being deleted and whose
+    /// clean stop failed: every process of its unit is killed and the unit is stopped. A database
+    /// with no unit is already ended.
+    fn kill(&self, database: &str) -> impl Future<Output = Result<(), units::Error>> + Send;
     /// Sets the limits of the database's size on the slot that holds it, now. A database that is
     /// asleep holds nothing; its limits are those of the entry at its next bind.
     fn set_limits(

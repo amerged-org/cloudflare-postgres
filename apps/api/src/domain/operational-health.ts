@@ -46,10 +46,17 @@ export const DiskHealth = HealthClock.safeExtend({
   status: z
     .enum(DISK_HEALTH_STATUSES)
     .describe(
-      "warning: at least 90 % of the allocated storage is used; unknown: no agent usage sample within 180 s. An awake database is sampled every minute, a hibernated one once in each quarter hour.",
+      "warning: at least 90 % of the mounted filesystem is used; unknown: no valid current-node/current-generation filesystem report within 180 s. Provisioned logical storage for metering is reported separately by Database.storage.",
     ),
   storage_used_bytes: z.number().int().nonnegative().nullable(),
-  storage_allocated_bytes: z.number().int().positive().nullable(),
+  storage_allocated_bytes: z
+    .number()
+    .int()
+    .positive()
+    .nullable()
+    .describe(
+      "Measured filesystem capacity used for disk health, not nominal logical-volume allocation used for metering.",
+    ),
   used_fraction: z.number().nonnegative().nullable(),
 });
 export const BackupHealthSample = z.strictObject({
@@ -124,7 +131,12 @@ export function backupHealth(
   };
 }
 export function diskHealth(
-  sample: z.infer<typeof UsageSample> | null,
+  sample: {
+    source: string;
+    observed_at: string;
+    storage_used_bytes: number | null;
+    storage_allocated_bytes: number | null;
+  } | null,
   now = Date.now(),
 ): z.infer<typeof DiskHealth> {
   const seconds = age(sample?.observed_at, now);
@@ -157,11 +169,35 @@ export type AgentUsageSample = Extract<
   z.infer<typeof UsageSample>,
   { source: "agent" }
 >;
-/** The payload of a database's newest agent sample: the one source of its disk health and storage. */
+/** The newest agent usage sample supplies nominal storage allocation for metering. */
 export function latestAgentSampleSql(database = "databases"): string {
   if (!/^[a-z][a-z0-9_]*$/.test(database))
     throw new Error("invalid_database_alias");
   return `(SELECT payload FROM usage_samples s WHERE s.database_id=${database}.id AND s.source='agent' ORDER BY s.observed_at DESC,s.producer_id DESC,s.sequence DESC LIMIT 1)`;
+}
+/** Disk health must use the mounted filesystem of the database's current physical identity. */
+export function latestFilesystemSampleSql(database = "databases"): string {
+  if (!/^[a-z][a-z0-9_]*$/.test(database))
+    throw new Error("invalid_database_alias");
+  return `(SELECT json_object('source','agent','observed_at',v.observed_at,
+    'storage_used_bytes',v.filesystem_used_bytes,'storage_allocated_bytes',v.filesystem_total_bytes)
+    FROM node_volumes v WHERE v.database_id=${database}.id AND v.node_id=${database}.node_id
+    AND v.storage_generation=${database}.storage_generation AND v.mounted=1)`;
+}
+const FilesystemSample = z.strictObject({
+  source: z.literal("agent"),
+  observed_at: Timestamp,
+  storage_used_bytes: z.number().int().nonnegative(),
+  storage_allocated_bytes: z.number().int().positive(),
+});
+function parseFilesystemSample(payload: string | null | undefined) {
+  if (payload == null) return null;
+  try {
+    const parsed = FilesystemSample.safeParse(JSON.parse(payload));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
 }
 export function parseAgentSample(
   payload: string | null | undefined,
@@ -183,6 +219,7 @@ export interface DatabaseHealthSource {
   backup_last_completed_at?: string | null;
   backup_last_failed_at?: string | null;
   agent_sample?: string | null;
+  filesystem_sample?: string | null;
 }
 /**
  * The backup and disk verdicts of one database. The operator listing and the integrator's
@@ -198,7 +235,7 @@ export function databaseHealthOf(row: DatabaseHealthSource, now = Date.now()) {
   });
   return {
     backup: backupHealth(backup.success ? backup.data : null, now),
-    disk: diskHealth(sample, now),
+    disk: diskHealth(parseFilesystemSample(row.filesystem_sample), now),
     sample,
   };
 }
@@ -292,7 +329,7 @@ export async function readOperationalHealth(
   const result = await db
     .prepare(
       `SELECT id,region_id,node_id,created_at,backup_observed_at,backup_health,backup_last_completed_at,backup_last_failed_at,
-    ${latestAgentSampleSql()} agent_sample
+    ${latestAgentSampleSql()} agent_sample,${latestFilesystemSampleSql()} filesystem_sample
     FROM databases WHERE deleted_at IS NULL AND ${cursor.sql} ORDER BY created_at DESC,id DESC LIMIT ?`,
     )
     .bind(...cursor.bindings, limit)

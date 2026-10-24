@@ -224,13 +224,37 @@ fn read_set(
     plan: impl FnOnce(Duration, &AtomicBool) -> Plan,
 ) -> Report {
     let left = BIND_BUDGET.saturating_sub(began.elapsed());
-    let report = plan(left, cancel).issue(
-        Limits {
-            budget: BIND_BUDGET.saturating_sub(began.elapsed()),
-            max_bytes: bytes,
+    // The planner itself opens directories and files. A queued or cancelled reading must stop
+    // before those lookups, not merely before its first page advice.
+    let stopped = if cancel.load(Ordering::Relaxed) {
+        Some(prefetch::Stop::Cancelled)
+    } else if left.is_zero() {
+        Some(prefetch::Stop::Budget)
+    } else {
+        None
+    };
+    let report = match stopped {
+        Some(stop) => Report {
+            stop,
+            files: 0,
+            planned_bytes: 0,
+            missing: 0,
+            skipped: 0,
+            pieces: 0,
+            issued_bytes: 0,
+            advised: 0,
+            resident_bytes: Some(0),
+            plan_us: 0,
+            issue_us: 0,
         },
-        cancel,
-    );
+        None => plan(left, cancel).issue(
+            Limits {
+                budget: BIND_BUDGET.saturating_sub(began.elapsed()),
+                max_bytes: bytes,
+            },
+            cancel,
+        ),
+    };
     crate::timing::emit_event(line(database, set, Hook::Bind, &report));
     report
 }
@@ -255,8 +279,9 @@ impl<M: Machine> Core<M> {
         let (data, id) = (self.layout().data(database), database.to_string());
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
+        // Time spent waiting for a blocking worker is part of the bind's budget too.
+        let began = Instant::now();
         tokio::task::spawn_blocking(move || {
-            let began = Instant::now();
             let report = read_set(&id, "start", began, START_BYTES, &stop, |budget, cancel| {
                 prefetch::start(&data, budget, cancel)
             });
@@ -510,6 +535,101 @@ mod tests {
         assert!(!flag.load(Ordering::Relaxed));
         drop(guard);
         assert!(flag.load(Ordering::Relaxed));
+    }
+
+    /// An expired bind budget must not even invoke the planner: directory metadata reads are
+    /// disk work too, even when no page advice would be issued afterwards.
+    #[test]
+    fn an_expired_bind_budget_does_not_begin_planning() {
+        let report = read_set(
+            "abcdefghijklmnopqrst",
+            "start",
+            Instant::now() - BIND_BUDGET,
+            START_BYTES,
+            &AtomicBool::new(false),
+            |_, _| panic!("planning began after the bind budget expired"),
+        );
+        assert_eq!(report.stop, prefetch::Stop::Budget);
+        assert_eq!(
+            (report.files, report.pieces, report.issued_bytes),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_bind_reading_does_not_begin_planning() {
+        let report = read_set(
+            "abcdefghijklmnopqrst",
+            "start",
+            Instant::now(),
+            START_BYTES,
+            &AtomicBool::new(true),
+            |_, _| panic!("planning began after the start ended"),
+        );
+        assert_eq!(report.stop, prefetch::Stop::Cancelled);
+        assert_eq!(
+            (report.files, report.pieces, report.issued_bytes),
+            (0, 0, 0)
+        );
+    }
+
+    /// A task queued behind another blocking job spends the same bind budget as one that starts
+    /// immediately. Keep its guard alive so cancellation cannot hide a fresh late budget.
+    #[test]
+    fn a_queued_bind_reading_spends_its_budget_before_the_worker_starts() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let Some(rig) = Rig::with_prefetch(
+                "readahead-queued",
+                Prefetch {
+                    program: false,
+                    start: Start::On,
+                    hot_list: false,
+                },
+            )
+            .await
+            else {
+                return;
+            };
+            let id = crate::testpg::database_id();
+            let data = rig.core.layout().data(&id);
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(data.join("PG_VERSION"), b"18\n").unwrap();
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            crate::agent::testing::within(5, "the blocking worker to be occupied", waiting)
+                .await
+                .unwrap();
+            let guard = rig.core.readahead_at_bind(&id).unwrap();
+            tokio::time::sleep(BIND_BUDGET * 2).await;
+            assert!(
+                events(&id, "prefetch").is_empty(),
+                "the worker is still occupied"
+            );
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            eventually(5, "both queued bind sets to be reported", || {
+                events(&id, "prefetch").len() == 2
+            })
+            .await;
+            for reading in events(&id, "prefetch") {
+                let fields = &reading["fields"];
+                assert_eq!(fields["stop"], "budget", "{reading}");
+                assert_eq!(fields["files"], 0, "{reading}");
+                assert_eq!(fields["pieces"], 0, "{reading}");
+                assert_eq!(fields["issued_bytes"], 0, "{reading}");
+            }
+            drop(guard);
+        });
     }
 
     /// A wake reads the hot list ahead from the moment it has released the database, off its path,

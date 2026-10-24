@@ -3,7 +3,7 @@ import { AUDIT_RETENTION_DAYS, type AdminScope } from "@pgcf/contracts";
 import type { MiddlewareHandler } from "hono";
 import { routePath } from "hono/route";
 import { ApiError } from "../api-error.ts";
-import { cronErrorCode } from "../domain/cron-health.ts";
+import { cronErrorCode, cronErrorMessage } from "../domain/cron-health.ts";
 import type { ApiContext, ApiEnv } from "../env.ts";
 
 /** The methods that only read; every other request of an administrator key is audited. */
@@ -27,7 +27,7 @@ function insert(
 ) {
   return c.env.DB.prepare(
     `INSERT INTO audit_events(id,key_id,scope,method,route,status,request_id,created_at)
-     VALUES(?,?,?,?,?,?,?,?)`,
+     VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`,
   )
     .bind(
       id,
@@ -65,30 +65,58 @@ async function deletePastRetention(c: ApiContext): Promise<void> {
 }
 
 /**
+ * How often the row that precedes a change is written before the request is refused, and the
+ * pauses between the attempts. D1 loses a request now and then ("Network connection lost" after
+ * about 12 s, 2026-10-23 16:03:35, which refused a create that nothing else was wrong with). The
+ * row has its identifier before the first attempt and the insert ignores a row of that identifier,
+ * so an attempt whose answer was lost after D1 committed it is repeated without a second row.
+ */
+export const AUDIT_WRITE_ATTEMPTS = 3;
+const AUDIT_RETRY_PAUSES_MS = [100, 300];
+
+/**
  * Records, before the handler runs, that an administrator key is about to make a request that is
  * not a read. The change cannot be undone once it has happened, so a row that cannot be written
- * refuses the request instead (it fails closed): nothing runs that the log does not know of. The
- * outcome is completed by `recordAuditOutcome` once the answer is known.
+ * refuses the request instead (it fails closed): nothing runs that the log does not know of. A
+ * fault of D1 is tried again (`AUDIT_WRITE_ATTEMPTS`); only a row that no attempt could write
+ * refuses the request. The outcome is completed by `recordAuditOutcome` once the answer is known.
  */
 export async function auditBeforeChange(
   c: ApiContext,
   key: { id: string; scope: AdminScope },
 ): Promise<void> {
   const id = crypto.randomUUID();
-  try {
-    await insert(c, id, key, null);
-  } catch (error) {
-    console.error(
-      JSON.stringify({
-        event: "audit_write_failed",
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await insert(c, id, key, null);
+      break;
+    } catch (error) {
+      const failure = {
         phase: "before_change",
         error_code: cronErrorCode(error),
-      }),
-    );
-    throw new ApiError(
-      "internal",
-      "The audit log could not be written, so the request was not run",
-    );
+        message: cronErrorMessage(error),
+      };
+      if (attempt < AUDIT_WRITE_ATTEMPTS) {
+        console.error(
+          JSON.stringify({ event: "audit_write_retried", attempt, ...failure }),
+        );
+        await new Promise((resolve) =>
+          setTimeout(resolve, AUDIT_RETRY_PAUSES_MS[attempt - 1]),
+        );
+        continue;
+      }
+      console.error(
+        JSON.stringify({
+          event: "audit_write_failed",
+          ...failure,
+          attempts: attempt,
+        }),
+      );
+      throw new ApiError(
+        "internal",
+        "The audit log could not be written, so the request was not run",
+      );
+    }
   }
   c.set("auditEventId", id);
   await deletePastRetention(c);

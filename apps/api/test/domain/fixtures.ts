@@ -6,6 +6,7 @@ import {
 } from "cloudflare:test";
 import {
   ErrorBody,
+  FILESYSTEM_END_GAP_BYTES,
   NodeDesiredPage,
   RELEASE_FILES,
   bytesToHex,
@@ -104,7 +105,7 @@ export async function cleanupFixtures(): Promise<void> {
 
 /** The database mutations that refuse a request without an Idempotency-Key, as `METHOD path`. */
 const KEYED_DATABASE_MUTATION =
-  /^(?:(?:POST|PATCH|DELETE) \/v1\/databases(?:\/[a-z][a-z0-9]{19}(?:\/(?:suspend|resume|restore))?)?|PUT \/v1\/databases\/[a-z][a-z0-9]{19}\/(?:resource-profile|idle-time|resources))$/;
+  /^(?:(?:POST|PATCH|DELETE) \/v1\/databases(?:\/[a-z][a-z0-9]{19}(?:\/(?:suspend|resume|restore|restore-in-place))?)?|PUT \/v1\/databases\/[a-z][a-z0-9]{19}\/(?:resource-profile|idle-time|resources))$/;
 export async function request(
   path: string,
   key: string,
@@ -113,6 +114,8 @@ export async function request(
   /** A string is sent as is; `null` sends none; omitted sends a fresh key where one is required. */
   idempotency?: string | null,
   extraHeaders?: HeadersInit,
+  /** Bindings the Worker sees instead of the test's own, such as a database that faults. */
+  bindings?: Partial<Env>,
 ): Promise<Response> {
   const context = createExecutionContext();
   const headers = new Headers(extraHeaders);
@@ -134,6 +137,7 @@ export async function request(
       ...env,
       DB_ENDPOINT_HOST: ["db", "invalid"].join("."),
       NODE_API_ORIGIN: API_ORIGIN,
+      ...bindings,
     },
     context,
   );
@@ -462,16 +466,21 @@ export async function observationOf(
   extra: Record<string, unknown> = {},
 ) {
   const row = await env.DB.prepare(
-    "SELECT storage_generation FROM databases WHERE id=?",
+    "SELECT d.storage_generation,r.storage_gib FROM databases d JOIN database_resources r ON r.database_id=d.id WHERE d.id=?",
   )
     .bind(id)
-    .first<{ storage_generation: number }>();
+    .first<{ storage_generation: number; storage_gib: number }>();
   const now = new Date().toISOString();
   return {
     id,
     generation,
     operation: await operationOf(id, generation),
     storage_generation: row?.storage_generation ?? 1,
+    ...((state === "ready" || state === "asleep") && row
+      ? {
+          storage_bytes: row.storage_gib * 1024 ** 3 - FILESYSTEM_END_GAP_BYTES,
+        }
+      : {}),
     state,
     ...(state === "ready" ? { instance: instanceOf(id) } : {}),
     proven_sleep:

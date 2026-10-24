@@ -1288,15 +1288,24 @@ or a reboot), so the two disagree until then.
 
 ## Capacity policy, purchases and notifications
 
-Placement follows plan 4.8 and needs no policy: a node takes new databases until its active RAM or
-its CPU load reaches 80 %, each measured as the highest 30-minute average of the last three days,
-and the fullest qualifying node wins. Two more things close a node to new databases, and neither is
+Placement follows plan 4.8 and needs no policy. Its CPU peak (the highest 30-minute average of the
+last three days) must be below 80 %, and the requested CPU must fit its physical cores. RAM uses
+the higher of that three-day peak and the current sample, plus the full memory of databases placed
+since that sample and the requested database; this sum must also be below 80 %. The fullest
+qualifying node wins. Two more things close a node to new databases, and neither is
 a policy field: its thin pool (data at 80 %, metadata at 50 %, or the sold storage at four times its
 data) and **1,000 thin volumes**, the largest count Stage 1 measured on EU1 and the constant
 `MAX_VOLUMES_PER_NODE` in `apps/api/src/domain/placement.ts`. The bound counts every volume the node
 reports, sleeping databases included, because each holds its volume; at 1,000 the node takes no
 create, restore or move, a resize of a database it already holds still works, and the alert
-`regional_node_pool_closed` fires. A node closed this way cannot take the database that waits, so
+`regional_node_pool_closed` fires once no other node takes the class. The alert is the region's,
+not the node's: it fires when the smallest size class on offer (the enabled class with the least
+memory, CPU and storage) fits no node, for the pool, the volume bound, the logical cap (the storage
+sold plus that class past four times the pool's data), or because no node that reports and is open
+has room for the class under those RAM and CPU rules. Unlike placement, the alert excludes the
+transient full RAM counted for databases placed since the newest sample; it still adds the
+smallest class's memory. It ends as soon as one node takes the class again; a node at the bound
+beside a node with room is no episode. A region closed this way cannot take the database that waits, so
 the capacity cron finds a shortage; with `autoscale_enabled` it then adopts the next unused
 `adopt_instance_ids` entry or, with `purchases_enabled` and an `order`, reserves an order addition
 (below). Volumes created between two samples can take a node a little past 1,000, and the bound
