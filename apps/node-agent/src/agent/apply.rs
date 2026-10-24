@@ -381,7 +381,11 @@ impl<M: Machine> Core<M> {
             self.set(db, |view| {
                 view.adopted = true;
                 view.phase = Phase::Error;
-                view.error = Some("build_failed");
+                if view.abandoned_build.as_deref() == Some(entry.archive_path.as_str()) {
+                    view.error.get_or_insert("build_failed");
+                } else {
+                    view.error = Some("build_failed");
+                }
                 view.writer = None;
             });
             return;
