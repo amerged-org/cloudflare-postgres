@@ -402,10 +402,14 @@ export class NodeActor extends DurableObject<Env> {
              AND EXISTS(SELECT 1 FROM nodes WHERE id=? AND node_uid=? AND lost_at IS NULL AND ready=1)`,
         )
         .bind(now, link.node_id, link.node_id, link.node_uid),
-      db
-        .prepare("SELECT ready FROM nodes WHERE id=? AND node_uid=?")
-        .bind(link.node_id, link.node_uid),
     );
+    // Keep the readiness query's result index: hourly pruning may append another statement.
+    const readyResult =
+      statements.push(
+        db
+          .prepare("SELECT ready FROM nodes WHERE id=? AND node_uid=?")
+          .bind(link.node_id, link.node_uid),
+      ) - 1;
     if (minute.minute % 60 === 0 && link.flushed !== written(minute))
       statements.push(
         db
@@ -416,7 +420,7 @@ export class NodeActor extends DurableObject<Env> {
     this.ctx.storage.sql.exec(
       "UPDATE node_link SET flushed=?,open=? WHERE singleton=1",
       written(minute),
-      link.open === 1 || results.at(-1)?.results[0]?.ready === 1 ? 1 : 0,
+      link.open === 1 || results[readyResult]?.results[0]?.ready === 1 ? 1 : 0,
     );
   }
 
