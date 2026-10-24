@@ -667,7 +667,8 @@ impl<M: Machine> Core<M> {
         self.awake_at_start.contains(id)
     }
 
-    /// The store of an archive path the node holds a credential for; `None` before it was delivered.
+    /// The store built from a delivered archive endpoint. The requested access scope can differ
+    /// from the one that supplied the endpoint; callers still need a live credential for it.
     pub(crate) fn store(&self, path: &str, access: Access) -> Option<Store> {
         let endpoint = self
             .endpoints

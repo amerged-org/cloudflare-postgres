@@ -199,8 +199,14 @@ fn wake_phase(result: &pgcf_native_protocol::wake::WakeResult) -> Option<&'stati
 /// that reads the archive it is built from.
 fn credential_ids(entry: &Entry) -> Vec<String> {
     let mut ids = vec![entry.credential_id.clone()];
-    if let Some(Origin::Restore(source) | Origin::Move(source, _)) = &entry.origin {
-        ids.push(source.credential_id.clone());
+    match &entry.origin {
+        Some(
+            Origin::Restore(source)
+            | Origin::Move(source, _)
+            | Origin::Replace(source, _, _)
+            | Origin::ReplaceRollback(source, _, _, _),
+        ) => ids.push(source.credential_id.clone()),
+        Some(Origin::Create) | None => {}
     }
     ids
 }
@@ -2560,6 +2566,121 @@ mod tests {
                 && machine.credentials_applied().len() == 1
         })
         .await;
+        service.stop();
+    }
+
+    /// In-place restore and forward rollback keep the same database ID, but require separate
+    /// source read-only and destination read-write credentials through the real delivery path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replacement_and_rollback_fetch_the_source_read_only_credential() {
+        use crate::credentials::Access;
+        let Some((machine, _fixture, _root)) = site("replacement-credentials", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let source = database(&database_id(0));
+        let id = source["id"].as_str().unwrap();
+        let source_path = source["archive"]["path"].as_str().unwrap();
+        let source_write = source["archive"]["credential"]["id"].as_str().unwrap();
+        let source_read = "crd_rrrrrrrrrrrrrrrrrrrr";
+        let target_write = "crd_tttttttttttttttttttt";
+        let rollback_write = "crd_uuuuuuuuuuuuuuuuuuuu";
+        let target_path = format!("s3://pgcf-eu/eu-dev/{id}/g2-op_tttttttttttttttttttt");
+        let rollback_path = format!("s3://pgcf-eu/eu-dev/{id}/g3-op_tttttttttttttttttttt");
+        cloud.with(|inner| {
+            for (credential, path) in [
+                (source_write, source_path),
+                (source_read, source_path),
+                (target_write, &target_path),
+                (rollback_write, &rollback_path),
+            ] {
+                inner
+                    .credential_paths
+                    .insert(credential.into(), path.into());
+            }
+            inner.read_only_credentials.insert(source_read.into());
+        });
+        let service = serve(&machine, &cloud, &base).await;
+        service
+            .deliver_credentials(&Rig::page(vec![source.clone()], vec![]))
+            .await;
+        let held = |path: &str, access| {
+            service.core.store(path, access).is_some_and(|store| {
+                service
+                    .core
+                    .credentials
+                    .get(&store.scope, crate::archive::server::unix_seconds())
+                    .is_ok()
+            })
+        };
+        assert!(held(source_path, Access::ReadWrite));
+        assert!(
+            !held(source_path, Access::ReadOnly),
+            "the source's writer credential is no reader credential"
+        );
+        let mut target = source.clone();
+        target["generation"] = json!(6);
+        target["storage_generation"] = json!(2);
+        target["archive"]["path"] = json!(target_path);
+        target["archive"]["credential"]["id"] = json!(target_write);
+        target["origin"] = json!({"kind":"replace","source":{
+            "database_id":id,"path":source_path,"backup_id":"20261024T050511",
+            "target_time":"2026-10-24T05:06:02.186Z",
+            "credential":{"id":source_read,"expires_at":"2099-01-01T00:00:00.000Z"}
+        },"previous":{"storage_generation":1,"end":{
+            "system_identifier":"7431215993172011234","timeline":1,
+            "checkpoint_lsn":"0/1A2B3C48","last_archived_segment":"000000010000000000000003",
+            "proven_at":"2026-10-24T05:06:26.000Z"
+        }}});
+        service
+            .deliver_credentials(&Rig::page(vec![target.clone()], vec![]))
+            .await;
+        assert!(
+            held(source_path, Access::ReadOnly),
+            "replacement must fetch the source reader credential"
+        );
+        assert!(held(&target_path, Access::ReadWrite));
+        let source_reads = || {
+            cloud
+                .requests()
+                .iter()
+                .filter(|request| request.path().ends_with(source_read))
+                .count()
+        };
+        assert_eq!(source_reads(), 1);
+        // A restart/failed earlier delivery needs the rollback's source too; do not rely on the
+        // replacement having already recorded the source credential as delivered.
+        service.delivered.lock().unwrap().remove(source_read);
+        target["generation"] = json!(7);
+        target["storage_generation"] = json!(3);
+        target["archive"]["path"] = json!(rollback_path);
+        target["archive"]["credential"]["id"] = json!(rollback_write);
+        target["origin"]["kind"] = json!("replace_rollback");
+        target["origin"]["replacement_generation"] = json!(2);
+        target["origin"]["source"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_time");
+        service
+            .deliver_credentials(&Rig::page(vec![target.clone()], vec![]))
+            .await;
+        assert_eq!(
+            source_reads(),
+            2,
+            "rollback must request its source reader credential"
+        );
+        assert!(held(&rollback_path, Access::ReadWrite));
+        service
+            .deliver_credentials(&Rig::page(vec![target], vec![]))
+            .await;
+        assert_eq!(
+            source_reads(),
+            2,
+            "a delivered credential is not fetched again"
+        );
         service.stop();
     }
 

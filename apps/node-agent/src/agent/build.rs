@@ -590,14 +590,20 @@ impl<M: Machine> Core<M> {
     /// been delivered, and has not waited for it for `Timing::credential_wait` yet. Past that wait
     /// the build is begun, and fails with `archive_unusable` like any build without its archive.
     fn waits_for_credential(&self, db: &Db, entry: &Entry, origin: &Origin) -> bool {
-        let delivered = self.store(&entry.archive_path, Access::ReadWrite).is_some()
+        // An endpoint is shared by the scopes of its archive path. In particular, a retained
+        // source writer credential does not supply the read-only credential of its replacement.
+        let usable = |path: &str, access| {
+            self.store(path, access)
+                .is_some_and(|store| self.credentials.get(&store.scope, unix_seconds()).is_ok())
+        };
+        let delivered = usable(&entry.archive_path, Access::ReadWrite)
             && match origin {
                 Origin::Create => true,
                 Origin::Restore(source)
                 | Origin::Move(source, _)
                 | Origin::Replace(source, _, _)
                 | Origin::ReplaceRollback(source, _, _, _) => {
-                    self.store(&source.path, Access::ReadOnly).is_some()
+                    usable(&source.path, Access::ReadOnly)
                 }
             };
         let now = super::now_ms();
