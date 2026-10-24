@@ -30,6 +30,7 @@ import {
 import { hintNode } from "./node-hints.ts";
 import { sourceArchiveHolds } from "./database-moves.ts";
 import { supersededStatement } from "./lifecycle-orders.ts";
+import { USAGE_SNAPSHOT_SQL } from "./resources.ts";
 import {
   choosePlacement,
   placementNodes,
@@ -411,6 +412,13 @@ async function finish(
         row.node_id,
         ...guard.bindings,
       ),
+      env.DB.prepare(
+        `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
+         SELECT d.id,'ready',d.node_id,d.size_class_id,d.generation,?,${USAGE_SNAPSHOT_SQL}
+         FROM databases d JOIN database_resources r ON r.database_id=d.id
+         WHERE d.id=? AND d.generation=? AND ?=1
+         AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=d.id AND kind='ready' AND generation=d.generation)`,
+      ).bind(at, row.database_id, generation, Number(awake)),
       env.DB.prepare(
         `UPDATE database_replacements SET phase=?,completed_at=?,updated_at=?,retained_until=strftime('%Y-%m-%dT%H:%M:%fZ',?,'+'||(SELECT s.backup_retention_days FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=database_replacements.database_id)||' days')
     WHERE operation=? AND phase=? AND changes()=1`,

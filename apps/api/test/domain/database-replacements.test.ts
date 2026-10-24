@@ -229,6 +229,13 @@ it("keeps the public identity and credentials, holds all admissions, and cuts ov
     ]),
   );
   expect((await replacement(op))?.phase).toBe("succeeded");
+  expect(
+    await env.DB.prepare(
+      "SELECT kind,generation FROM lifecycle_events WHERE database_id=? AND generation=? AND kind='ready'",
+    )
+      .bind(f.id, entry.generation)
+      .first(),
+  ).toMatchObject({ kind: "ready", generation: entry.generation });
   expect(await f.row()).toMatchObject({
     id: f.id,
     node_id: f.node,
