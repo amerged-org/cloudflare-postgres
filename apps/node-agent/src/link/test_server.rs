@@ -60,7 +60,9 @@ pub fn release_vectors() -> Vec<Value> {
 /// A desired database of the contract's example page, under another identifier.
 pub fn database(id: &str) -> Value {
     let page = vector("NodeDesiredPage", "full-page");
-    let example = page["databases"][0].clone();
+    let mut example = page["databases"][0].clone();
+    example["archive"]["credential"]["expires_at"] =
+        serde_json::Value::String("2099-01-01T00:00:00.000Z".into());
     serde_json::from_str(
         &example
             .to_string()
@@ -579,6 +581,7 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
         )
     } else if let Some(id) = path.strip_prefix(paths["archiveCredentials"].as_str().unwrap()) {
         let mut credential = vector("ArchiveCredential", "read-write");
+        credential["expires_at"] = serde_json::Value::String("2099-01-01T00:00:00.000Z".into());
         credential["id"] = id.into();
         if inner.read_only_credentials.contains(id) {
             credential["access"] = "read_only".into();
@@ -891,6 +894,33 @@ pub fn tempdir() -> TempDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn example_database_credentials_do_not_expire() {
+        let database = database("a0000000000000000000");
+        let expires_at = database["archive"]["credential"]["expires_at"]
+            .as_str()
+            .unwrap();
+        assert!(
+            expires_at.starts_with("2099-01-01"),
+            "example credential expires during the test day: {expires_at}"
+        );
+        let target = format!(
+            "{}{}",
+            constant("NODE_API_PATHS")["archiveCredentials"]
+                .as_str()
+                .unwrap(),
+            database["archive"]["credential"]["id"].as_str().unwrap()
+        );
+        let cloud = Cloud::start().await;
+        let response = cloud.with(|inner| route(inner, "GET", &target, &json!({})));
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.body["expires_at"].as_str().unwrap(),
+            "2099-01-01T00:00:00.000Z",
+            "the test double must not hand out an expired credential"
+        );
+    }
 
     #[test]
     fn a_temporary_directory_is_removed_with_its_contents_when_dropped() {

@@ -1975,6 +1975,10 @@ mod tests {
         // sessions: the gateway, which connects again as soon as it can, is never told that the
         // database sleeps or is gone, which would end them.
         service.stop();
+        let mut tasks = std::mem::take(&mut *service.tasks.lock().unwrap());
+        tokio::time::timeout(Duration::from_secs(5), tasks.shutdown())
+            .await
+            .expect("the old agent loops did not stop");
         drop(service);
         assert!(machine.running(&id));
         let (second, events) = link().await;

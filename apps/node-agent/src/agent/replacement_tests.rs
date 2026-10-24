@@ -172,6 +172,34 @@ async fn an_unreachable_pitr_point_is_not_retried_as_a_temporary_fetch_failure()
             .await
             .unwrap()
     );
+    for _ in 0..3 {
+        rig.core
+            .apply(&Rig::page(vec![target.clone()], vec![]))
+            .await;
+        for _ in 0..15 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(
+                matches!(
+                    handle.view().error,
+                    Some("no_recovery_point" | "start_failed")
+                ),
+                "{:?}",
+                handle.view().error
+            );
+        }
+    }
+    let mut unrelated = target.clone();
+    unrelated["generation"] = json!(12);
+    unrelated["storage_generation"] = json!(3);
+    unrelated["operation"] = json!("op_ssssssssssssssssssss");
+    unrelated["archive"]["path"] = json!(format!(
+        "s3://pgcf-eu/eu-dev/{id}/g3-op_ssssssssssssssssssss"
+    ));
+    rig.core.apply(&Rig::page(vec![unrelated], vec![])).await;
+    eventually(60, "the unrelated replacement to be refused", || {
+        handle.view().error == Some("build_failed")
+    })
+    .await;
 }
 
 async fn source(rig: &Rig) -> (Value, DatabaseState, String) {
