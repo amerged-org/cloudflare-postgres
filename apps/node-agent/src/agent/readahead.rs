@@ -426,12 +426,12 @@ mod tests {
             .filter(|event| event["event"] == name && event["database_id"] == database)
             .collect()
     }
-    /// The `program_warm` events (they have no database), after the first `after` of them.
-    fn passes(after: usize) -> Vec<Value> {
-        crate::events::seen()
+    /// Program events have no database ID, so capture only this rig's calls.
+    fn program_events(capture: &crate::events::Capture) -> Vec<Value> {
+        capture
+            .seen()
             .into_iter()
             .filter(|event| event["event"] == "program_warm")
-            .skip(after)
             .collect()
     }
 
@@ -812,9 +812,21 @@ mod tests {
         else {
             return;
         };
-        let seen = passes(0).len();
-        rig.core.warm_program().await;
-        let first = passes(seen);
+        let capture = crate::events::Capture::default();
+        // Another agent can emit before our assertion. Force that interleaving
+        // instead of relying on the test runner to schedule a competing service or rig here.
+        let other = Rig::new("readahead-unrelated-agent").await.unwrap();
+        assert_eq!(
+            tokio::spawn(async move {
+                other.core.warm_program().await;
+                other.core.readahead.program_passes()
+            })
+            .await
+            .unwrap(),
+            1
+        );
+        capture.scope(rig.core.warm_program()).await;
+        let first = program_events(&capture);
         assert_eq!(first.len(), 1, "the first pass is always reported");
         let fields = &first[0]["fields"];
         assert_eq!(fields["pass"], 1);
@@ -826,28 +838,28 @@ mod tests {
         );
 
         // Not due: nothing runs, whatever the cache holds.
-        rig.core.warm_program().await;
-        assert_eq!(passes(seen).len(), 1);
+        capture.scope(rig.core.warm_program()).await;
+        assert_eq!(program_events(&capture).len(), 1);
         assert_eq!(rig.core.readahead.passes().passes, 1);
 
         // A maintenance order holds the pass back without using up its turn.
         tokio::time::sleep(Duration::from_millis(450)).await;
         rig.core.maintenance.store(true, Ordering::Relaxed);
-        rig.core.warm_program().await;
+        capture.scope(rig.core.warm_program()).await;
         assert_eq!(rig.core.readahead.passes().passes, 1, "in maintenance");
         rig.core.maintenance.store(false, Ordering::Relaxed);
 
         // Due and quiet: the second pass runs. It is reported only if it read something back.
-        rig.core.warm_program().await;
+        capture.scope(rig.core.warm_program()).await;
         assert_eq!(rig.core.readahead.passes().passes, 2);
-        for event in passes(seen).iter().skip(1) {
+        for event in program_events(&capture).iter().skip(1) {
             assert!(event["fields"]["advised"].as_u64() > Some(0), "{event}");
         }
 
         // So does a fence, which is the node's whole stop.
         tokio::time::sleep(Duration::from_millis(450)).await;
         rig.core.fences.fence("op_ffffffffffffffffffff").unwrap();
-        rig.core.warm_program().await;
+        capture.scope(rig.core.warm_program()).await;
         assert_eq!(rig.core.readahead.passes().passes, 2, "fenced");
     }
 
@@ -878,9 +890,9 @@ mod tests {
             })
             .collect();
         rig.core.readahead.passes().found = Some(Arc::new(Program::from_files(files)));
-        let seen = passes(0).len();
-        rig.core.warm_program().await;
-        let first = passes(seen);
+        let capture = crate::events::Capture::default();
+        capture.scope(rig.core.warm_program()).await;
+        let first = program_events(&capture);
         assert_eq!(first.len(), 1, "the first pass is always reported");
         let fields = &first[0]["fields"];
         if fields["advised"].as_u64() != Some(0) {
@@ -896,11 +908,11 @@ mod tests {
             (Some(1), Some(2))
         );
         for _ in 0..3 {
-            rig.core.warm_program().await;
+            capture.scope(rig.core.warm_program()).await;
         }
         assert_eq!(rig.core.readahead.passes().passes, 4);
         assert_eq!(
-            passes(seen).len(),
+            program_events(&capture).len(),
             1,
             "a whole program is not reported again"
         );
