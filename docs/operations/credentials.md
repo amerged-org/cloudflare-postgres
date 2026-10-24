@@ -137,8 +137,8 @@ restart ends every open client session: the gateway stops accepting (its socket 
 connection that arrives meanwhile waits for the next gateway), closes the idle sessions at once,
 gives a busy one 10 seconds, and clients reconnect. The socket handover does not cover
 `cloudflared`: while it registers with Cloudflare again, the Edge cannot reach the node and a new
-connection fails. **How long that gap lasts has not been measured.** The owner's go and, from the
-canary on, an announced window apply to each step.
+connection fails. **How long that gap lasts has not been measured.** The owner's go and, from
+production acceptance onward, an announced window apply to each step.
 
 **What is not known.** No route reports which key IDs a node's gateway holds. D1 holds the revision
 it has for the node (`nodes.credentials_revision`), and the node's newest sample
