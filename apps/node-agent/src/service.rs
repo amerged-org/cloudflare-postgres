@@ -830,11 +830,12 @@ impl<M: Machine> Service<M> {
         }
     }
 
-    /// Installs the release's binaries, and restarts what runs one that changed: the gateway
-    /// (its sessions reconnect) and then the agent, which exits and is started by systemd from the
-    /// new link. The databases keep running: they are units of their own. A release that the key
-    /// did not sign is not touched: the node keeps what it runs. It answers whether the binaries
-    /// are in place and this agent is the one that runs them, so that the host files may follow.
+    /// Installs the release's binaries. The gateway restarts if its binary changed; an existing
+    /// agent restarts for every new release ID so its startup identity catches up with `current`,
+    /// even when its binary is unchanged. It exits and is started by systemd from the new link.
+    /// The databases keep running: they are units of their own. A release that the key did not sign
+    /// is not touched: the node keeps what it runs. It answers whether the binaries are in place and
+    /// this agent is the one that runs them, so that the host files may follow.
     async fn install(&self, release: &update::Release, bin: &std::path::Path) -> bool {
         if self.verified(release).await.is_err() {
             return false;

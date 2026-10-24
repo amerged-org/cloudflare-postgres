@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Updates (plan 9.3). A release names the four binaries the node runs and the Debian package lock
 //! of its image. The binaries are downloaded into the release's own directory, checked against the
-//! digests the page pins, and only then does the `current` link move; the services that run a
-//! changed binary restart, and a database never stops for it. The packages change only in a
+//! digests the page pins, and only then does the `current` link move. The gateway restarts when
+//! its binary changes; an existing agent restarts for every new release ID so its startup identity
+//! converges. A database never stops for an update. The packages change only in a
 //! maintenance cycle: the lock says which versions the image has, what differs from the node is
 //! installed through apt from the release's snapshot, and the node reboots if the kernel or a
 //! core library changed.
@@ -263,7 +264,8 @@ impl Release {
     }
 }
 
-/// Which services run a binary that this release changes.
+/// Which services must restart to adopt this release: the agent for every new release ID, and the
+/// gateway when its binary changes.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Switched {
     pub agent: bool,
@@ -329,7 +331,7 @@ where
     } else {
         Switched {
             // Without a release that ran before, nothing runs that could be told to restart.
-            agent: changed(AGENT).unwrap_or(false),
+            agent: previous.is_some(),
             gateway: changed(GATEWAY).unwrap_or(false),
         }
     };
@@ -1273,5 +1275,44 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["current", "r2", "r3"]);
+    }
+
+    #[tokio::test]
+    async fn a_new_release_id_restarts_the_agent_with_unchanged_binaries() {
+        let bin = crate::link::test_server::tempdir();
+        let files: Vec<(&str, &[u8])> = names()
+            .iter()
+            .map(|name| (*name, b"same".as_slice()))
+            .collect();
+        let (first, second) = (release("r1", &files), release("r2", &files));
+        let served = |release: &Release| {
+            release
+                .binaries
+                .iter()
+                .map(|(_, pinned)| (pinned.url.clone(), b"same".to_vec()))
+                .collect::<Vec<_>>()
+        };
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let switched = install_binaries(&bin, &first, serving(served(&first), count.clone()))
+            .await
+            .unwrap();
+        assert_eq!(switched, Switched::default(), "nothing ran before it");
+
+        let switched = install_binaries(&bin, &second, serving(served(&second), count.clone()))
+            .await
+            .unwrap();
+        assert_eq!(current_release(&bin).as_deref(), Some("r2"));
+        assert_eq!(
+            switched,
+            Switched {
+                agent: true,
+                gateway: false,
+            }
+        );
+
+        let switched = install_binaries(&bin, &second, serving(vec![], count))
+            .await
+            .unwrap();
+        assert_eq!(switched, Switched::default());
     }
 }
