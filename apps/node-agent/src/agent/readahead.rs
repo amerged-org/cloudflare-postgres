@@ -27,9 +27,8 @@
 //!   PostgreSQL's own `fsync`s begin, once, and the reading ends at `BIND_BUDGET` or with the start
 //!   (the lab of 2026-10-20: prefetch of 100 MB and more that overlapped those `fsync`s made the
 //!   WAKE 230 to 600 ms slower on EU1's disk, whose scheduler is `none`; the catalogs alone, 5 MB
-//!   from the fork, cost nothing and cut the login from 73 / 269 to 23 / 44 ms). The variant
-//!   `Start::Alternate` is the A/B: every second start reads the sets, the first does, and every
-//!   start says which it was (`prefetch_arm`).
+//!   from the fork, cost nothing and cut the login from 73 / 269 to 23 / 44 ms). This hook is off
+//!   in the build, as selected by the whole-request diagnostic below.
 //! - **The hot list from ready.** Once the wake has released the database, the blocks of
 //!   `autoprewarm.blocks` are read ahead for at most `HOT_LIST_BUDGET`. It overlaps the first
 //!   request and PostgreSQL's own autoprewarm, and nothing of the wake waits for it. Measured in
@@ -37,9 +36,9 @@
 //!
 //! **The switch.** `PREFETCH` below is the one line that says what a build runs; the A/B is a
 //! release that changes it, and the node's page carries no setting for it. The program and the hot
-//! list are on, and the release ships `Start::Alternate` for the sets at the bind: it is the live
-//! interleaved A/B on the pooled path (at least 18 starts per arm, on the 24 h and 1 h strata), and
-//! the decision after it is a release with `Start::On` or `Start::Off`.
+//! list are on, and the sets at the bind are off. The US1 interleaved Dev diagnostic of
+//! 2026-10-25 selected Off by the lower whole-request p95: 964 ms (29 starts), against
+//! 4,126 ms for On (30 starts). This choice does not close the observed slow tail.
 //!
 //! Every reading says what it did in an event (`prefetch`, `program_warm`): its set and hook, why
 //! it ended, and the counts and times of `prefetch::Report`; a list that is not there or not
@@ -55,7 +54,7 @@ use serde_json::{Value, json};
 use std::{
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -76,17 +75,13 @@ pub struct Prefetch {
 pub enum Start {
     Off,
     On,
-    /// The first start, the third and every other after, and not the second, the fourth and so on:
-    /// the arms of one A/B on the same databases in the same hours.
-    Alternate,
 }
 
-/// What this build runs: the program kept warm, the sets at the bind on every second start (the
-/// live A/B), the hot list. The decision after the A/B is a release with `start: Start::On` or
-/// `Start::Off`.
+/// What this build runs: the program kept warm and the hot list, with the start set and catalogs
+/// at the bind off, as selected by the whole-request diagnostic.
 pub const PREFETCH: Prefetch = Prefetch {
     program: true,
-    start: Start::Alternate,
+    start: Start::Off,
     hot_list: true,
 };
 
@@ -168,8 +163,6 @@ impl Drop for AtBind {
 
 /// What the agent remembers of its readings.
 pub(crate) struct Readahead {
-    /// The starts that asked whether to read at the bind (`Start::Alternate` counts them).
-    starts: AtomicU64,
     /// Raised by every start, lowered before a pass over the program: a pass ends when a start begins.
     start_began: Arc<AtomicBool>,
     program: Mutex<ProgramPasses>,
@@ -184,7 +177,6 @@ struct ProgramPasses {
 impl Readahead {
     pub(crate) fn new() -> Self {
         Self {
-            starts: AtomicU64::new(0),
             start_began: Arc::new(AtomicBool::new(false)),
             program: Mutex::new(ProgramPasses::default()),
         }
@@ -200,17 +192,6 @@ impl Readahead {
     #[cfg(test)]
     pub(crate) fn program_passes(&self) -> u64 {
         self.passes().passes
-    }
-    /// Whether this start reads at the bind.
-    fn at_bind(&self, start: Start) -> bool {
-        match start {
-            Start::Off => false,
-            Start::On => true,
-            Start::Alternate => self
-                .starts
-                .fetch_add(1, Ordering::Relaxed)
-                .is_multiple_of(2),
-        }
     }
 }
 
@@ -265,15 +246,7 @@ impl<M: Machine> Core<M> {
     /// that the start does not wait for, and ends at its budget or when the returned guard is
     /// dropped, which is when the start ends.
     pub(crate) fn readahead_at_bind(&self, database: &str) -> Option<AtBind> {
-        let start = self.prefetch.start;
-        let on = self.readahead.at_bind(start);
-        if start == Start::Alternate {
-            crate::timing::emit_event(json!({
-                "event": "prefetch_arm", "database_id": database,
-                "arm": if on { "start" } else { "none" },
-            }));
-        }
-        if !on {
+        if self.prefetch.start == Start::Off {
             return None;
         }
         let (data, id) = (self.layout().data(database), database.to_string());
@@ -435,31 +408,19 @@ mod tests {
             .collect()
     }
 
-    /// The variant of a build names the hooks it runs, and the build ships the measured ones, the
-    /// program kept warm and the hot list from ready, and the sets at the bind for every second
-    /// start: the live A/B of the module's documentation.
+    /// The build keeps the program warm and reads the hot list from ready, with the start set
+    /// and catalogs at the bind off, as selected by the whole-request diagnostic.
     #[test]
-    fn the_build_ships_the_program_and_the_hot_list_and_alternates_the_sets_at_the_bind() {
+    fn the_build_ships_the_program_and_the_hot_list_without_the_sets_at_the_bind() {
         assert_eq!(
             PREFETCH,
             Prefetch {
                 program: true,
-                start: Start::Alternate,
+                start: Start::Off,
                 hot_list: true
             }
         );
         assert_eq!(HOT_LIST_BUDGET, Duration::from_millis(150));
-        // The arms of the A/B: nothing, every start, and every second start beginning with the
-        // first.
-        let readahead = Readahead::new();
-        let arms = |start| (0..5).map(|_| readahead.at_bind(start)).collect::<Vec<_>>();
-        assert_eq!(arms(Start::Off), [false; 5]);
-        assert_eq!(arms(Start::On), [true; 5]);
-        assert_eq!(
-            arms(Start::Alternate),
-            [true, false, true, false, true],
-            "the starts of the other variants do not count"
-        );
     }
 
     /// What a reading says travels to Cloudflare: its fields are numbers and short words, within
@@ -633,16 +594,10 @@ mod tests {
     }
 
     /// A wake reads the hot list ahead from the moment it has released the database, off its path,
-    /// and says what it did; nothing is read at the bind in a variant without the sets (the build
-    /// ships `Start::Alternate`, tested below).
+    /// and says what it did; the build reads nothing at the bind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_wake_reads_the_hot_list_ahead_from_ready_and_the_sets_only_when_the_variant_says_so()
-    {
-        let variant = Prefetch {
-            start: Start::Off,
-            ..PREFETCH
-        };
-        let Some(rig) = Rig::with_prefetch("readahead-default", variant).await else {
+    async fn a_wake_reads_the_hot_list_ahead_from_ready_without_the_sets_at_the_bind() {
+        let Some(rig) = Rig::with_prefetch("readahead-default", PREFETCH).await else {
             return;
         };
         let (entry, db) = rig.create().await;
@@ -737,42 +692,6 @@ mod tests {
             hot_list: false,
         };
         wake_in(variant, "readahead-off", &[]).await;
-    }
-
-    /// The A/B variant: the first start reads the sets, the second does not, and each says which
-    /// it was, with the database, so that the wakes can be joined to their arm.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_alternating_variant_reads_at_every_second_start_and_says_which() {
-        let variant = Prefetch {
-            start: Start::Alternate,
-            hot_list: false,
-            ..PREFETCH
-        };
-        let Some(rig) = Rig::with_prefetch("readahead-alternate", variant).await else {
-            return;
-        };
-        let (entry, db) = rig.create().await;
-        // The create is a start too: it took the first arm.
-        let arm = |n: usize| events(&entry.id, "prefetch_arm")[n]["fields"]["arm"].clone();
-        assert_eq!(arm(0), "start");
-        for expected in ["none", "start"] {
-            assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
-            let result = rig.core.wake(&Rig::ticket(&entry)).await;
-            assert_eq!(result.outcome, Outcome::Started, "{result:?}");
-            let seen = events(&entry.id, "prefetch_arm");
-            assert_eq!(seen.last().unwrap()["fields"]["arm"], expected, "{seen:?}");
-        }
-        // The two starts that read have their sets (the create's and the last wake's), and the one
-        // that did not has none.
-        eventually(10, "the readings of the starts", || {
-            events(&entry.id, "prefetch")
-                .iter()
-                .filter(|event| event["fields"]["set"] == "start")
-                .count()
-                >= 2
-        })
-        .await;
-        assert_eq!(events(&entry.id, "prefetch_arm").len(), 3);
     }
 
     /// A database without a list says so, and the agent wakes it all the same.
