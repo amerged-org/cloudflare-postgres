@@ -35,59 +35,80 @@ operator procedures are in the other runbooks ([recovery](recovery.md),
 ## Read first
 
 The [dated ULTRA update](../architecture/cloudflare-convergence-and-serverless-plan.md#production-readiness-update--2026-10-24)
-sets the current scope and overrides historical deployment status in the plan's retained rows.
-The latest recorded API deployment is signed main `e7d60f00` (exact-owner lease fencing); Edge remains on the compatible
-`434f47d4` and migrations through `0089` are applied. US1 desires and observes signed
-`sha-202a9db6036c`, with its active agent binary verified and no repeated restart after activation;
-EU1 also desires and observes `sha-202a9db6036c` after assignment revision 8 at 12:09 UTC.
-The active agent binary hash matches on both nodes; the EU gateway/Tunnel stayed unchanged.
-US1 OS maintenance completed at 12:14 UTC in 25.166 s without reboot: signed OS digests match,
-`os_converged=true`, readiness and exact fixture data were preserved. EU1 OS maintenance remains open. The API's
-replacement completion/Ready-ordering correction passed signed main and is deployed; fresh
-regional native receipts remain open. Read fresh observations before rollout; installed binaries
-alone do not prove an active release.
-US1's complete provider API suite passed on `f125540b`, including positive in-place PITR,
-retained-history/new-ID restores, snapshot export/import and negative forward rollback. Native
-collection found a missing positive in-place lifecycle Ready event; the correction is deployed in
-the API, but fresh affected native receipts and cleanup remain open. These API results do not
-close regional product, fault, storage or cold acceptance.
-A fresh corrected-API run subsequently passed all four SQL/API restore paths. Review of its
-immutable native receipts confirms all four originally required generation/backup/Ready sequences,
-including the negative cause and preserved data. The additional post-terminal manual-suspension
-probe was our extra condition; it is unmeasured and outside the agreed gate. Reuse the valid results. The owner reduced remaining acceptance to small disposable Dev fixtures with synthetic
-data; an additional old historical-fixture restore is outside the G11 critical path. Guarded
-archive copy repair is complete for the current 279-prefix set (251 nonempty prefixes, 2,833
-verified objects / 4,772,644,496 bytes; 28 explained empty prefixes), with no unsettled PUT.
-A bounded US restore batch exposed per-job cgroup kills at 256 MiB during extraction, before
-PostgreSQL recovery. The reviewed local correction adds Restore-only MemoryHigh below the existing
-hard limit; signed delivery and one affected live check without OOM remain open. A separate
-real D1 lost-response defect now has a reviewed, locally validated exact-owner lease fix (1,170
-API tests passed), now delivered after its fully green signed main without a migration. Do not
-automatically replay uncertain writes; tenant SQL, provider calls and one-time secrets never gain replay
-permission from API idempotency.
-This delivery ends with the verified generic PGCF contract and this handover; OMH implementation,
-connection rollout, customer migration and its control-database migration follow separately.
-There is no 72-hour canary or written integrator acknowledgement requirement for G11.
-The October 25 bounded EU prefetch comparison selected Off by whole-request p95: 29 Off requests
-566/964/1,995 ms p50/p95/max, versus 30 On requests 524/4,126/7,387 ms. Every request completed,
-but three exceeded 1 s. This mixed diagnostic is not the final G3 gate. Off is fixed in the next
-source candidate with program warming/hot list retained; signed delivery and both regional
-one-hour/24-hour cohorts remain open. Slow-tail analysis and actual supported request cadence
-remain part of the final operating envelope.
-The healthy-archive timeout plus upload is not an unconditional recovery-point bound during a
-backlog or R2 outage; regional archive lag and migration/load capacity still need measurement.
+is the authority for current scope and measured results; older deployment rows are history.
+API is signed main `e7d60f00`, Worker version `968c26e2-b667-48df-8a6d-5da34126235c`;
+Edge remains on compatible `434f47d4`, with migrations through `0089` applied.
+Both regional nodes now run qualified signed release `sha-eb9d0f729663`: US1's actual process
+was verified at 14:43 UTC and EU1's at 15:00:26 UTC on October 25. Their active agent bytes
+match the signed release, with one expected deployment restart each; the EU gateway and Tunnel stayed unchanged.
+This release fixes bind-start Prefetch Off and adds Restore-only MemoryHigh at 90% of the
+existing hard limit. Program warming, hot list, hard memory, zero swap, parent backup budget,
+I/O and concurrency retain their existing bounds.
+
+Both nodes now have matching signed kernel/package/host-file pins and `os_converged=true`.
+Neither maintenance cycle required a reboot. US1's server cycle took 25.166 seconds;
+EU1's loaded cycle took 79 minutes 19.188 seconds while draining 69 due base backups through
+the configured single big-job slot. Both post-maintenance data comparisons matched, and all
+maintenance-owned keys/processes are cleaned. These different measured loads do not establish
+a universal maintenance duration.
+
+The corrected API and native runtime passed all four original provider restore paths on each
+region: positive same-identity PITR, retained-history/new-ID restore, normal new-ID restore and
+negative forward rollback, including cached credentials, original data and actual first-DONE-before-Ready
+ordering. EU1's single small-fixture suite also passed transport, roles, extensions and snapshot
+export/import; all three owned databases/volumes, its key and processes were cleaned after native
+receipts finalized. US1's earlier valid four-path receipt is reused without rewriting its old
+collector failure. The extra post-terminal manual-suspension probe is outside the agreed gate;
+it was unmeasured in that US run and passed incidentally in the same EU run, without a new campaign.
+
+The US1 product subset passed ordinary ANALYZE, actual autovacuum, expression-memory/remedy,
+SM resize and manual suspend (`57P03`) followed by explicit resume. Actual XS/SM leaf limits are
+recorded in [4.2](#42-awake-databases-what-a-sold-memory-size-means). One oversized ANALYZE
+returned `57014` after about 63 seconds before any kernel OOM; that branch is inconclusive for
+OOM and is not repeated. The run recorded 686 acknowledged intents; subsequent checks matched
+100 source markers and all 337 witness rows. No unknown write, owned key or process remained.
+This does not promise arbitrary SQL fits in 256 MiB or close the remaining storage/fault/isolation work.
+
+The earlier bounded US restore batch had three per-job memory-limit failures during extraction,
+before PostgreSQL recovery. Its failed targets were deleted with verified API/physical cleanup
+and preserved lineage; that G9 run is aborted and reconciled, not passed. The affected replacement
+on `sha-eb9d0f729663` reached Ready and matched all seven counts and bit-xor fingerprints
+(533,386,943 bytes) at 14:55:08.622 UTC; its key is revoked. Natural idle sleep was proven at
+15:00:15.373 UTC and the Hibernate operation completed at 15:00:15.958. The scoped observer found
+no matching loaded job unit, so actual MemoryHigh, peak and OOM/event counters could not be
+measured; the reason for the unit's absence is not established. The successful restore/data proof is valid; no native
+pressure-counter pass is claimed. The existing required G9 long-fetch/restart campaign can read
+those properties without another restore solely for observation.
+
+The owner reduced remaining acceptance to small disposable Dev fixtures with synthetic data.
+An additional old historical fixture and deliberate OOM are outside the critical path; honest
+failed/inconclusive receipts stay preserved. Guarded archive repair is complete for 279 prefixes
+(251 nonempty, 2,833 verified objects / 4,772,644,496 bytes; 28 explained empty prefixes), with no
+unsettled PUT. Active backup dependencies must still be preserved. Exact-owner API lease fencing
+is deployed; it never authorizes automatic replay of uncertain SQL, provider calls or one-time secrets.
+
+The bounded EU prefetch A/B selected Off: 29 Off requests had p50/p95/max 566/964/1,995 ms;
+30 On requests had 524/4,126/7,387 ms. All completed, but three were at or above 1,000 ms.
+Its rapid diagnostic cadence accumulated warm databases, so this is not G3. The final protocol
+is 150 seconds between requests and at least 59 per region per one-hour/24-hour stratum, with
+zero errors or requests at or above 1,000 ms. G3, bounded restore/restart, storage and fault gates
+remain open. Regional archive lag and the final operating envelope still need their required measurements.
+This delivery ends with verified generic PGCF readiness and this handover; OMH implementation,
+customer connection/data migration and its control-database migration follow separately.
+No 72-hour canary or written integrator acknowledgement is required for G11.
 
 | Topic | Latest recorded state on 2026-10-25 |
 | --- | --- |
-| Runtime | EU1 (`eu-dev`) and US1 (`us-dev`) each run sandboxed systemd PostgreSQL 18 services on thin LVM volumes, an idle sandbox-slot pool and one Rust node agent; there is no Kubernetes. Historical lifecycle, sleep/wake and isolation results remain below. Release B preserved all 9,081 acknowledged commits in the tested kills, without replay or a second writer; its actual database-start wakes took 4.35 s quiet and 6.06–11.33 s loaded, so the 3 s restart target remains open. The current candidate, storage/fault campaigns, final density and cold gates still require live acceptance on both regions. |
+| Runtime | EU1 and US1 run sandboxed systemd PostgreSQL 18 services on thin LVM, an idle slot pool and one Rust agent. Both actual processes are verified on signed `sha-eb9d0f729663`; both OS pin sets converge. The original four provider paths passed regionally. Release B's 9,081 acknowledged commits remain historical kill-safety evidence. Storage/fault, final density, bounded restore/restart and cold gates remain open; no complete production-readiness pass is claimed. |
+| EU agent restart | The October 25 15:06 UTC SIGKILL check on final `sha-eb9d0f729663` passed: first successful public client SQL within 2,274.224501 ms, agent exit 11.689326 ms, 30/30 probes successful. All 254 acknowledged intents matched exactly; 12 explicit write refusals were absent, with no unknown/lost/duplicate/payload errors. Three writer postmasters, gateway, Tunnel and mount holder stayed unchanged, with exclusive locks/adopted slots and no overlapping writer. Own keys/processes are cleaned. Four non-cohort fault fixtures remain for storage checks; this is one passed EU fault case, not G3 or complete fault/storage acceptance. |
 | First request after a wake | The whole request is one HTTP `/sql` transaction of six statements, sent from a Worker over the public hostname. After about 50 h asleep, 59 samples on 2026-10-23: p50 948 ms, p95 1,583 ms, 26 of 59 at or above 1 s. After 1 h or more asleep, 59 samples on 2026-10-20: p50 1,126 ms, p95 1,814 ms. **The go-live target, whole-request p95 strictly below 1,000 ms independently in each region, is not met yet** ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)). |
 | Backups | Every database archives its WAL and base backups into the installation's one R2 bucket, which is in the EU jurisdiction, for both regions (cutover 2026-10-23). A new database is ready only after its first base backup is DONE. The four production classes keep a 7-day recovery window. The scheduled infrastructure backup of 2026-10-24 also completed in the new bucket; G6 remains closed ([2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point)). |
 | Redundancy | One node per region, one PostgreSQL instance per database, no replica, no second node in a region. Losing a node stops every database on it until it is restored from R2 into new IDs. **Extrapolated** on 2026-10-23 for EU1's 167 databases and 23.4 GB of archives from a sample of 8 restores, of which 7 became ready: about 2.2 to 3.4 h in all, if every restore succeeds. The eighth failed `archive_unusable`; the total assumes every restore succeeds, which that sample did not establish; later restore fixes are deployed in baseline B, but final batch acceptance remains open ([7.3](#73-recovery-time), [7.4](#74-eu1-lost)). |
-| Capacity numbers | The previous release passed the one-hour density pattern and 1,000 exact-counter cycles; storm p95 7.9–17.2 s failed. Release B changed storm/sleep behavior, so the affected campaign requires a final rerun. Pool-full, own-volume-full and inode-exhaustion acceptance on the candidate remain open. The numbers in [4](#4-capacity-and-limits-you-must-enforce) distinguish admission rules from dated measurements. |
+| Capacity numbers | At the October 25 14:54 UTC read, EU1 had 311 nondeleted databases and 312 thin volumes: its existing population already exceeds 300. Zero databases were awake/starting/queued and no backup job or WAL backlog was active in that snapshot. Physical pool total/used was 310,776,954,880 / 69,188,845,568 bytes, sold storage 986 GiB and nominal pool storage 987 GiB. Earlier density/cycle evidence is reusable where unchanged; affected storm, storage and final loaded cold acceptance remain open. The four small EU fault fixtures need no additional population campaign. |
 | New databases | Every database lives on a thin LVM volume of its node, placed by the 80 % rule of [2.1](#21-create). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced. After a burst of awake databases a node stays closed for the length of the placement window: 3 days (owner decision O6 of 2026-10-23; deployed in baseline B, [2.1](#21-create)). |
 | Alerts | Infrastructure alerts go to the operator's alert webhook and the owner receives them (go-live gate G5 met on 2026-10-20); you receive none from PGCF ([6](#6-alerts-and-operations)). |
 | Your key | The October 24 live access checks passed: cross-project resources returned 404, read-only admin writes returned 403, and rotation left the revoked key at 401 and its successor at 200. Run-owned keys were revoked. This closes the exercised G10 access subset; production catalog and dependent population cleanup remain open. |
-| Maintenance | A maintenance cycle (new packages, a new kernel) closes placement on the node, holds wakes with `57P03`, puts every awake database to sleep with the proof and reboots the node if the kernel or core libraries changed; the first live cycle took 67 s end to end (2026-10-19). From production acceptance onward both regional stacks are production (`pgcf-api-dev`, `eu-dev` and `us-dev` are only names): reboots need an announced window, and Debian kernel security reboots are pre-approved within 7 days of an advisory, one node at a time. The default window is Tuesday 02:00 to 04:00 UTC (plan default D15, 11.5) until the owner names another; the operator forwards each announcement to you, because the alert webhook reaches only the operator and the owner ([7.1](#71-what-happens-in-each-situation)). |
+| Maintenance | Maintenance closes placement, holds wakes with `57P03`, proves every awake database asleep and reboots only when required. On October 25, neither node needed a reboot: US1 completed in 25.166 seconds; loaded EU1 took 79 minutes 19.188 seconds while draining 69 due backups. Exact post-maintenance data and signed OS pins matched on both, and owned keys/processes were cleaned. These are measured loads, not a fixed outage bound. From production acceptance onward reboots use an announced window, with kernel security reboots pre-approved within 7 days, one node at a time. The default window is Tuesday 02:00–04:00 UTC until the owner names another; the operator forwards the announcement ([7.1](#71-what-happens-in-each-situation)). |
 
 ## 1. The model
 
@@ -901,8 +922,11 @@ cold gate, first pass of the 1 h stratum on the final code"); the passes above n
 **The target is not met.** The owner-confirmed target of 2026-10-24 is whole-request p95
 **strictly below 1,000 ms**, including connection, wake, authentication and all six statements.
 There is no additional 750 ms gate. Measure EU1 and US1 independently from a Cloudflare Worker
-through the public endpoint, using the established one-hour/24-hour protocol and at least 59 cold
-samples per stratum at the declared density and background load, including normal backups.
+through the public endpoint, using the established one-hour/24-hour protocol, 150 seconds between
+requests and at least 59 cold samples per region per stratum at declared density/background load,
+including normal backups. Final acceptance requires zero errors or requests at or above 1,000 ms;
+every scheduled first request, retry and pool miss remains counted. The historical passes above used
+their recorded eight-second spacing; the rapid mixed A/B is not a final G3 pass.
 Record release, colo, class, dataset, load, p50/p95/max, errors and capacity waits. The Germany-laptop
 path is reported separately. The best full historical EU1 pass above has p95 1,583 ms; neither
 region has a passing final-release result. An empty-node run, connect-only timing, trivial query
@@ -915,8 +939,8 @@ wake the gateway waits for 313 / 751 (the node agent's own total 309 / 711: bind
 the login 116 / 280 and the six statements 270 / 522. All 59 wakes took an idle slot. These
 component percentiles cannot be added to reconstruct whole-request p95. This historical pass
 predates the current program warming and bind-prefetch experiment; it cannot select a prefetch
-mode or qualify the candidate. The dated plan requires one bounded comparison, then a fixed mode
-for final acceptance in each region.
+mode or qualify the candidate. The October 25 bounded comparison selected Off, now fixed in
+signed `sha-eb9d0f729663`; both final regional one-hour/24-hour gates remain open.
 
 **A node that is busy with base backups is slower.** A cold request that met a node with due base
 backups was three to eight times slower (the 1,717 / 5,522 ms row above): databases that sleep all
@@ -1172,6 +1196,18 @@ keeps reporting the truth.
 What you must do: keep `sleep_after_seconds` short, avoid always-warm classes except where needed,
 and shed load on `57P03` instead of retrying in a tight loop.
 
+**Measured leaf-cgroup limits, US1, October 25:** these are the observed limits of the exercised
+XS database and its SM resize, not a reservation of physical RAM against every other tenant.
+
+| Class | MemoryMax | MemoryHigh | CPU ceiling | Write bandwidth | Write IOPS | Swap | Read limits |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| XS | 256 MiB | 230 MiB | 0.25 CPU | 8 MB/s | 1,000 | 0 | uncapped |
+| SM | 1,024 MiB | 921 MiB | 0.5 CPU | 32 MB/s | 4,000 | 0 | uncapped |
+
+The SM resize, manual-suspend refusal and explicit resume passed, with the source's 100 markers
+and the witness's 337 full rows subsequently verified. These observations do not close pool-full,
+volume/inode-full, fault or final density acceptance.
+
 **Statistics target and the sold memory.** PostgreSQL's `ANALYZE`, run by a session or by
 autovacuum, keeps a sample of 300 × `default_statistics_target` rows in memory, each as wide as it
 lies on its page: up to about 8 KB for rows that are never toasted (`STORAGE PLAIN` columns) and
@@ -1220,9 +1256,13 @@ tables for expression indexes whose value is wider than about 1 KB (`to_tsvector
   95 MB became 206 MB for 4,000 documents of 22 KB (the GIN index was 5,760 kB either way), and every
   write of `body` computes it.
 
-The values are decided from the PostgreSQL 18 source and *measured in a lab* on 2026-10-23 (plan
-11.1, "ANALYZE and autovacuum stay inside every class's memory"); they apply to a database at its
-first wake after the agent release that carries them, and have not been measured live.
+The class derivation and the detailed expression examples were *measured in a lab* on
+2026-10-23 (plan 11.1, "ANALYZE and autovacuum stay inside every class's memory"). On US1 on
+October 25, ordinary ANALYZE, actual autovacuum, expression-memory and the supported remedy passed
+live. A single oversized ANALYZE reached statement timeout (`57014`, about 63 seconds) before any
+kernel OOM, so it establishes no OOM result. Its inconclusive receipt is retained without another
+deliberate OOM gate; actual confinement/recovery requirements remain. The reported lab values for
+other classes are not converted into unmeasured regional passes.
 
 ### 4.3 Thin storage
 
@@ -1637,19 +1677,19 @@ of the row of the plan's
 | RPO on US1 | The same archived-WAL rule and backlog/outage caveat; the WAL travels from US1 to the EU-jurisdiction bucket | archive time per call from US1 **to be measured** | "G8 one archive bucket: the cutover on Dev, steps 1 to 11" | [1.2](#12-regions), [7.2](#72-recovery-point) |
 | WAL archive rate | About one 16 MiB WAL segment per second per node, shared by all its databases (about 4.5 s per call, 3 MB/s on the wire) | measured 2026-10-20 | "WAL archive throughput of a node" (plan 11.2) | [4.4](#44-capacity-caps) |
 | PITR window | 7 days in each of `xs`, `sm`, `md` and `lg` (`backup_retention_days`). A point-in-time restore into a new database was ready after 50.1 s (52.4 s from the new bucket) | window decided 2026-10-19; restores measured 2026-10-23; a restore at the edge of a full window **to be measured** | "Production size classes `xs`, `sm`, `md`, `lg` created"; "Live acceptance on the slot-pool release, part 1"; "G8 one archive bucket: the cutover on Dev, steps 1 to 11" | [2.7](#27-backups-restorable-window-and-restore) |
-| Ready only after the first base backup | Yes: 8 of 8 creates were ready only after their first base backup was DONE; create to ready met the target of 30.7 s in 6 of 8 (30.8 s and 32.8 s while other creates or resizes ran) | measured 2026-10-23 | "Live acceptance on the slot-pool release, part 1" | [2.1](#21-create) |
+| Ready only after the first base backup | Historical creates: 8/8 first DONE before Ready, 6/8 within 30.7 s. October 25: all four provider restore paths in each region have actual native first-DONE-before-Ready receipts, including exact negative rollback generation/backup ordering | measured 2026-10-23 and 2026-10-25 | Dated ULTRA update; "Live acceptance on the slot-pool release, part 1" | [2.1](#21-create), [2.7](#27-backups-restorable-window-and-restore) |
 | Cold request p50 and p95 | About 50 h asleep: p50 948 ms, p95 1,583 ms over 59 (26 at or above 1 s). 1 h or more asleep: p50 1,126 ms, p95 1,814 ms over 59 (39 at or above 1 s) | measured 2026-10-23 and 2026-10-20 | "Slot pool live on EU1 and US1, and the first 24 h cold pass on it"; "Stage 5.3 cold gate, 1 h stratum, full pass of 59 samples" | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) |
-| Cold target (G3) and its state | First complete six-statement request, including connection, wake and authentication: p95 strictly below 1,000 ms independently on EU1 and US1 at declared load. No additional 750 ms gate. **Not met** | owner-confirmed scope 2026-10-24; historical EU1 result measured 2026-10-23 | Dated ULTRA update; "Slot pool live on EU1 and US1, and the first 24 h cold pass on it" | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) |
+| Cold target (G3) and its state | Whole six-statement request p95 strictly below 1,000 ms independently on each region. Final one-hour/24-hour strata use 150-second cadence, at least 59 samples each, and zero errors or requests at or above 1,000 ms. The mixed Off/On diagnostic does not qualify either region. **Open** | owner-confirmed scope and protocol, reconciled 2026-10-25 | Dated ULTRA update | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) |
 | What the first request may be | One HTTP `/sql` transaction of the established six statements through the public endpoint; WebSocket compatibility remains required, and the laptop path is reported separately | decided 2026-10-19 (D1), clarified in the dated scope 2026-10-24 | Dated ULTRA update; plan 11.3 | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [3.7](#37-http-query-mode-neon) |
 | Warm request times | The six-statement batch against an awake database: 275 to 340 ms from a Worker. A new connection to an awake database: median 124.5 ms (service binding) and 133.5 ms (public hostname) | measured 2026-10-20 and 2026-10-18; a warm p95 is **to be measured** | "Stage 5.3 cold gate, first pass of the 1 h stratum on the final code"; "Cloudflare Access in front of the node gateways, live on EU1" | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) |
 | `57P03` meanings and the retry rule | DETAIL `storage`: no room in the node's thin pool. DETAIL `node at awake capacity` with HINT `retry after <n> s`: no awake capacity within the queue wait. DETAIL `node busy starting databases` with HINT `retry after <n> s`: the node was starting as many databases as it may and the wake's turn did not come within the queue wait. A bare `57P03`: suspension, provisioning, maintenance hold, move, pending recovery, offline node and the other holds. Retry 1 s, 2 s, 4 s, then 8 s, for about 90 s | meanings decided (code and contracts); retry rule is a recommendation | "Stage 3 lanes A, D and C integrated on branch `integrate/stage3`" (the DETAIL and HINT of a refused wake); the contracts | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [A.4](#a4-sqlstate-at-connect-time) |
 | Early sleep (D2) | Only while a wake waits for room, one per waiting wake, never with client activity in the last 30 s, never an always-warm database; the wake that waited takes seconds and is counted in the p95. A full sleep proof took 1,016.6 ms at p50 and 1,084.4 ms at p95 | decided: plan default D2, not named otherwise by the owner; proof time measured 2026-10-17; counts under load **to be measured** (Stage 5.6) | "Stage 1 Block 2: create and sleep costs"; plan 11.5, D2 | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [4.2](#42-awake-databases-what-a-sold-memory-size-means) |
-| What a sold memory size means (D3) | A hard ceiling while the database is awake, not a guarantee: under the rule `measured` awake databases are not reserved against each other | decided: plan default D3 (a), not named otherwise by the owner; memory per awake database by size **to be measured** (Stage 5.6) | plan 11.5, D3 | [4.2](#42-awake-databases-what-a-sold-memory-size-means) |
+| What a sold memory size means (D3) | A hard ceiling while awake, not a cross-tenant reservation under `measured`. Observed US1 leaf limits: XS 256/230 MiB Max/High, CPU 0.25, writes 8 MB/s and 1,000 IOPS; SM 1,024/921 MiB, CPU 0.5, writes 32 MB/s and 4,000 IOPS. Both have zero swap and uncapped reads | rule decided D3; these leaf limits measured 2026-10-25, not a complete density/OOM envelope | Dated ULTRA update; plan 11.5 D3 | [4.2](#42-awake-databases-what-a-sold-memory-size-means) |
 | Volume-full and pool-full behaviour | A full volume or exhausted inodes stop that database's writes; recovery is by explicit growth with observed filesystem capacity, no hidden reserve or SQL-cleanup promise. A pool without room refuses wakes, creates and restores with `57P03` `storage`, and a full pool fails writes at once and stops the databases on it, which the node recovers once space is back | design; the live tests are **to be measured** (Stage 5.5). A volume filled in three minutes in a live run on 2026-10-19 | "Storage samples every minute and alert IDs that name the error"; plan 4.3 | [4.3](#43-thin-storage), [7.1](#71-what-happens-in-each-situation) |
 | Connection limits | 12,000 new connections per 60 s per database; 6,000 per 60 s per database, role and source network; 12,000 per 60 s from a service binding; 12,000 admissions per minute per database; 32 waiters per wake; 200 sessions per database through a gateway | Dev values, recorded 2026-10-23; these carry into production acceptance unless the operator changes them and informs the integrator | "Dev connection limits recorded (S6-03)" | [3.6](#36-connection-limits) |
-| Outage classes and maintenance windows | Idle sleep, suspend, maintenance cycle (67 s), agent restart (historically 5.3 s at 167 volumes and up to 46 s after a kill at 312 volumes; baseline B successful client results 4.82 s quiet, 6.51–11.78 s loaded, with clock uncertainty), gateway release, node reboot or crash (the node reported again 26.8 s after a power cut's start request; the writer was acknowledged again 84.3 s after a VM restart), archiving failing, volume full, pool full, node lost, Cloudflare unavailable. Default window: Tuesday 02:00 to 04:00 UTC, which the operator forwards to you (the alert webhook reaches only the operator and the owner), until the owner names another | historical durations measured 2026-10-18 to 2026-10-23, reconciled in the dated 2026-10-24 update; the need for an announced window decided 2026-10-19 (D10); the default window is a plan default, decided as such (D15, 11.5) | "First live maintenance cycle on EU1"; "First release through the normal flow, with an agent change"; "Stage 5.4 results on EU1, runner `s5_chaos.py`"; "Live acceptance on the slot-pool release, part 3: fault tests 5.4 at density, and an outage"; plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
+| Outage classes and maintenance windows | Idle sleep, suspend, maintenance, process/node failure, archive or storage failure, node loss and Cloudflare outage remain distinct. October 25 maintenance: US1 25.166 s; EU1 79 min 19.188 s with 69 due backups drained first; no reboot, exact data and signed OS pins preserved on both. These are load-specific observations. Default announced window: Tuesday 02:00–04:00 UTC, forwarded by the operator | maintenance measured 2026-10-25; announced window D10 and default D15 remain owner decisions | Dated ULTRA update; plan 11.3 D10 and 11.5 D15 | [7.1](#71-what-happens-in-each-situation) |
 | Security reboots | Within 7 days of a Debian security advisory that fixes the kernel, in an announced window (default Tuesday 02:00 to 04:00 UTC), one node at a time; every other reboot also needs the owner's go | decided 2026-10-19 (D10); window: plan default D15 | plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
-| IDs after restore, move and node loss | `/restore`: a new ID; `/restore-in-place`: same ID after capability-gated recovery, exercised through the US1 API; native evidence and final regional qualification remain open. Move: the ID is kept. Node loss: new IDs, restored from R2 | restore decided 2026-10-15 (plan 11.3); US1 API suite measured 2026-10-24 in the dated ULTRA update; a move keeps the ID (plan 11.4) and has not been timed (**to be measured**, Stage 5.7); node loss is D4, the plan's default | Dated ULTRA update; "Moves keep the ID; automatic rebalancing after go-live" (plan 11.4); plan 11.5, D4 | [1.2](#12-regions), [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) |
+| IDs after restore, move and node loss | `/restore` creates a new ID; `/restore-in-place` retains ID and cached credentials. The four original SQL/API and native restore paths passed on both regions, including original-data recovery after a failed target. Move keeps ID; node-loss restoration uses new IDs. Remaining G9 batch/restart and regional safety gates stay open | provider paths measured 2026-10-25; move/node-loss identity follows the existing decisions | Dated ULTRA update; plan 11.4 and D4 | [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) |
 | Losing a node | About 2.2 to 3.4 h for EU1's 167 databases and 23.4 GB if every restore succeeds: fence 30 s, reinstall 174 to 197 s, restores about 2.2 to 3.3 h. **7 of the 8 sample restores succeeded; the total assumes the `archive_unusable` defect is fixed** (baseline B includes the failed-build/timeout fixes; final batch acceptance remains open) | extrapolated 2026-10-23 from a sample of restores; fence and reinstall measured 2026-10-19 and 2026-10-22; the full drill has not been run | "Live acceptance on the slot-pool release, part 1"; "G9: what is left after the 2026-10-19 loss and reinstall"; "US1 installed into `us-dev` from the image" | [7.3](#73-recovery-time), [7.4](#74-eu1-lost) |
 | Capacity caps | Placement requires CPU's three-day peak and projected RAM below 80 % (RAM includes the higher of peak and current sample, pending placements and the new class); pool closed at 80 % data or 50 % metadata; sold storage at most 4 times the pool; 1,000 volumes; 8 starts at once on EU1; a storm of 40 wakes answered in at most 5.8 s (HTTP) and 7.1 s (WebSocket) with none refused | dated rows in 4.4 are historical measurements; the prior density pattern and cycles passed, the later storm failed, and final-release density/storage acceptance remains open (dated ULTRA update, 2026-10-24) | "Stage 1 Block 1: LVM at scale"; "Stage 5.6 wake storm, first measurement" | [4.4](#44-capacity-caps) |
 | Reserved role names | `postgres`, `pgcf_backup`, `public`, `none` and every name starting with `pg_` are refused (`400`); `streaming_replica`, `cnpg_*` and `pgcf_maintenance` are ordinary names | decided (W2-C/W2-C2), included in deployed baseline B with migration `0085`; final regional role/connection acceptance remains open | Dated ULTRA baseline; `packages/contracts/src/ids-core.ts`; served OpenAPI `RoleName` | [2.3](#23-roles-connection-uri-and-passwords) |
