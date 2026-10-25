@@ -980,8 +980,12 @@ impl<M: Machine> Rebuild<M> {
 impl<M: Machine> Host for Rebuild<M> {
     async fn start(&self) -> Result<(), Failed> {
         // The restored files are the source's: replace the configuration before the start.
-        self.core
+        let config = self
+            .core
             .write_configuration(&self.entry, &self.account)
+            .map_err(|_| Failed)?;
+        self.core
+            .save_state(&self.db, |state| state.config = Some(config))
             .map_err(|_| Failed)?;
         self.start_unit().await
     }
@@ -1300,6 +1304,83 @@ mod tests {
             "objects/{}/database/base/{backup_id}/backup.json",
             entry.archive_path.strip_prefix("s3://").unwrap()
         ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restores_configuration_is_persisted_before_its_first_cold_wake() {
+        use crate::agent::power::{Slept, Why};
+        use pgcf_native_protocol::wake::Outcome;
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(rig) = Rig::new("restore-config").await else {
+            return;
+        };
+        let (source, source_db) = rig.create().await;
+        let data = postgres::connect(
+            &rig.machine.layout().socket_directory(&source.id),
+            "postgres",
+            &source.id,
+        )
+        .await
+        .unwrap();
+        data.batch("CREATE TABLE t AS SELECT generate_series(1, 4000) AS a")
+            .await
+            .unwrap();
+        drop(data);
+        assert_eq!(rig.core.sleep(&source_db, Why::Idle).await, Slept::Proven);
+        let backup = source_db.state().unwrap().backup.unwrap();
+        rig.deliver(&source.archive_path, "read_only");
+        let mut restored = rig.entry_json();
+        restored["origin"] = json!({"kind": "restore", "source": {
+            "database_id": source.id, "path": source.archive_path, "backup_id": backup.backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"}}});
+        let (entry, db) = rig.create_from(&restored).await;
+
+        // The cache describes the target files durably, before any wake could repair it.
+        let account = rig.machine.account(&entry.id).unwrap();
+        let (configuration, hash) = rig.core.configuration(&entry, &account).unwrap();
+        assert_eq!(db.state().unwrap().config.as_ref(), Some(&hash));
+        assert_eq!(
+            rig.core
+                .files(&entry.id)
+                .load()
+                .unwrap()
+                .unwrap()
+                .config
+                .as_ref(),
+            Some(&hash)
+        );
+        let data_path = rig.machine.layout().data(&entry.id);
+        let held: Vec<_> = configuration
+            .iter()
+            .map(|(name, content)| {
+                let path = data_path.join(name);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), *content);
+                // Hold the old inode open so a needless unlink/rewrite cannot reuse it.
+                (path.clone(), std::fs::File::open(path).unwrap())
+            })
+            .collect();
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let woke = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(woke.outcome, Outcome::Started, "{woke:?}");
+        for (path, file) in held {
+            let before = file.metadata().unwrap();
+            let after = std::fs::metadata(path).unwrap();
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        }
+        let data = postgres::connect(
+            &rig.machine.layout().socket_directory(&entry.id),
+            "postgres",
+            &entry.id,
+        )
+        .await
+        .unwrap();
+        let rows = data
+            .query("SELECT count(*), sum(a) FROM t", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 4000);
+        assert_eq!(rows[0].get::<_, i64>(1), 8_002_000);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
