@@ -177,8 +177,9 @@ Existing-database latency has only **cold** (PostgreSQL sleeps and the request w
 **warm** (PostgreSQL is already running). Creating a database is a separate lifecycle operation;
 its first-Ready time includes the initial DONE backup and is not cold-start latency. The current
 slow Off diagnostic was predominantly inside the node, not the Europe-to-US network path. A
-confirmed missing configuration-hash update after restore is being corrected; its first-wake
-impact and remaining phase tails still require affected verification and the final regional gate.
+confirmed missing configuration-hash update after restore has a tested source correction;
+qualification, first-wake verification on both regions and the final regional gate remain open.
+Already-built databases with an empty hash retain their existing one-time refresh on the next wake.
 
 ## 1. The model
 
