@@ -32,11 +32,13 @@
 //! - **The hot list from ready.** Once the wake has released the database, the blocks of
 //!   `autoprewarm.blocks` are read ahead for at most `HOT_LIST_BUDGET`. It overlaps the first
 //!   request and PostgreSQL's own autoprewarm, and nothing of the wake waits for it. Measured in
-//!   the prefetch lab of 2026-10-20 (arm I): the statements took about 10 ms less at p50.
+//!   the prefetch lab of 2026-10-20 (arm I): the statements took about 10 ms less at p50. This
+//!   optional agent hook is off while its overlap with login and the first request is evaluated;
+//!   PostgreSQL's own autoprewarm remains on.
 //!
 //! **The switch.** `PREFETCH` below is the one line that says what a build runs; the A/B is a
-//! release that changes it, and the node's page carries no setting for it. The program and the hot
-//! list are on, and the sets at the bind are off. The US1 interleaved Dev diagnostic of
+//! release that changes it, and the node's page carries no setting for it. The program is on;
+//! the hot list and the sets at the bind are off. The EU1 interleaved Dev diagnostic of
 //! 2026-10-25 selected Off by the lower whole-request p95: 964 ms (29 starts), against
 //! 4,126 ms for On (30 starts). This choice does not close the observed slow tail.
 //!
@@ -77,12 +79,11 @@ pub enum Start {
     On,
 }
 
-/// What this build runs: the program kept warm and the hot list, with the start set and catalogs
-/// at the bind off, as selected by the whole-request diagnostic.
+/// What this build runs: the program kept warm, without the agent's bind or ready reads.
 pub const PREFETCH: Prefetch = Prefetch {
     program: true,
     start: Start::Off,
-    hot_list: true,
+    hot_list: false,
 };
 
 /// How long the hot list may take to plan, and how long its pieces may be issued: the request it
@@ -408,16 +409,15 @@ mod tests {
             .collect()
     }
 
-    /// The build keeps the program warm and reads the hot list from ready, with the start set
-    /// and catalogs at the bind off, as selected by the whole-request diagnostic.
+    /// The build keeps the program warm, without the agent's bind or ready reads.
     #[test]
-    fn the_build_ships_the_program_and_the_hot_list_without_the_sets_at_the_bind() {
+    fn the_build_ships_the_program_without_the_bind_or_ready_reads() {
         assert_eq!(
             PREFETCH,
             Prefetch {
                 program: true,
                 start: Start::Off,
-                hot_list: true
+                hot_list: false
             }
         );
         assert_eq!(HOT_LIST_BUDGET, Duration::from_millis(150));
@@ -593,11 +593,15 @@ mod tests {
         });
     }
 
-    /// A wake reads the hot list ahead from the moment it has released the database, off its path,
-    /// and says what it did; the build reads nothing at the bind.
+    /// A wake in the hot-list variant reads it from ready, off its path, and says what it did;
+    /// this variant reads nothing at the bind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_wake_reads_the_hot_list_ahead_from_ready_without_the_sets_at_the_bind() {
-        let Some(rig) = Rig::with_prefetch("readahead-default", PREFETCH).await else {
+        let variant = Prefetch {
+            hot_list: true,
+            ..PREFETCH
+        };
+        let Some(rig) = Rig::with_prefetch("readahead-hot-list", variant).await else {
             return;
         };
         let (entry, db) = rig.create().await;
@@ -678,6 +682,7 @@ mod tests {
     async fn the_start_set_and_the_catalogs_are_read_at_the_bind_in_their_variant() {
         let variant = Prefetch {
             start: Start::On,
+            hot_list: true,
             ..PREFETCH
         };
         wake_in(variant, "readahead-both", &["catalog", "list", "start"]).await;
@@ -697,7 +702,11 @@ mod tests {
     /// A database without a list says so, and the agent wakes it all the same.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_database_without_a_list_says_so_and_wakes_all_the_same() {
-        let Some(rig) = Rig::with_timing("readahead-no-list", timing()).await else {
+        let variant = Prefetch {
+            hot_list: true,
+            ..PREFETCH
+        };
+        let Some(rig) = Rig::with_prefetch("readahead-no-list", variant).await else {
             return;
         };
         let (entry, db) = rig.create().await;
