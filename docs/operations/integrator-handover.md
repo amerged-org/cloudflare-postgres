@@ -39,7 +39,9 @@ sets the current scope and overrides historical deployment status in the plan's 
 The latest recorded API deployment is signed main `3e38cf4a`; Edge remains on the compatible
 `434f47d4` and migrations through `0089` are applied. US1 desires and observes signed
 `sha-202a9db6036c`, with its active agent binary verified and no repeated restart after activation;
-EU1 remains on `sha-b75dae82d08a`. Both nodes still report `os_converged: false`. The API's
+EU1 also desires and observes `sha-202a9db6036c` after assignment revision 8 at 12:09 UTC.
+The active agent binary hash matches on both nodes; the EU gateway/Tunnel stayed unchanged.
+OS convergence remains pending, with US1 maintenance accepted at 12:13 UTC. The API's
 replacement completion/Ready-ordering correction passed signed main and is deployed; fresh
 regional native receipts remain open. Read fresh observations before rollout; installed binaries
 alone do not prove an active release.
@@ -48,14 +50,16 @@ retained-history/new-ID restores, snapshot export/import and negative forward ro
 collection found a missing positive in-place lifecycle Ready event; the correction is deployed in
 the API, but fresh affected native receipts and cleanup remain open. These API results do not
 close regional product, fault, storage or cold acceptance.
-A fresh corrected-API run subsequently passed all four SQL/API restore paths and three native
-receipts; the actual post-terminal manual-suspension SQL receipt remains open. Reuse the valid
-results. The owner reduced remaining acceptance to small disposable Dev fixtures with synthetic
+A fresh corrected-API run subsequently passed all four SQL/API restore paths. Review of its
+immutable native receipts confirms all four originally required generation/backup/Ready sequences,
+including the negative cause and preserved data. The additional post-terminal manual-suspension
+probe was our extra condition; it is unmeasured and outside the agreed gate. Reuse the valid results. The owner reduced remaining acceptance to small disposable Dev fixtures with synthetic
 data; an additional old historical-fixture restore is outside the G11 critical path. Guarded
 archive copy repair is complete for the current 279-prefix set (251 nonempty prefixes, 2,833
 verified objects / 4,772,644,496 bytes; 28 explained empty prefixes), with no unsettled PUT.
 A bounded US restore batch exposed per-job cgroup kills at 256 MiB during extraction, before
-PostgreSQL recovery; the targeted runtime correction and affected check remain open. A separate
+PostgreSQL recovery. The reviewed local correction adds Restore-only MemoryHigh below the existing
+hard limit; signed delivery and one affected live check without OOM remain open. A separate
 real D1 lost-response defect now has a reviewed, locally validated exact-owner lease fix (1,170
 API tests passed), pending qualified delivery. Do not automatically replay uncertain writes on
 the current deployed API; tenant SQL, provider calls and one-time secrets never gain replay

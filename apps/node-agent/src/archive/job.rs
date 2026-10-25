@@ -358,6 +358,10 @@ pub fn systemd_run_arguments(
         format!("TemporaryFileSystem={STATE_DIRECTORY}:ro"),
         format!("InaccessiblePaths=-{AGENT_RUN_DIRECTORY}"),
     ];
+    if job.kind == Kind::Restore {
+        // Reclaim dirty restore output before the hard limit can kill the extractor.
+        properties.push(format!("MemoryHigh={}M", memory_mib.saturating_mul(9) / 10));
+    }
     properties.push(format!(
         "MountImages={device}:{volume}:root:{MOUNT_OPTIONS}"
     ));
@@ -975,6 +979,24 @@ mod tests {
             format!("{}M", busiest_mib(&Limits::default())),
             "{slice}"
         );
+    }
+
+    #[test]
+    fn a_restore_sets_reclaim_pressure_below_its_unchanged_hard_limit() {
+        let db = database();
+        let restore = Job::restore(&store('a'), "20261017T225342", &db.data_directory());
+        let arguments = systemd_run_arguments(
+            "unit",
+            &db,
+            &restore,
+            BASE_BACKUP_MEMORY_MIB,
+            Path::new("/e"),
+            Path::new("/usr/bin"),
+        );
+        assert!(arguments.contains(&"MemoryHigh=230M".to_string()));
+        assert!(arguments.contains(&"MemoryMax=256M".to_string()));
+        assert!(arguments.contains(&"MemorySwapMax=0".to_string()));
+        assert_eq!(busiest_mib(&Limits::default()), 512);
     }
 
     #[test]
