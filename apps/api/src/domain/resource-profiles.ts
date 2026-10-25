@@ -77,13 +77,13 @@ export async function updateResourceProfile(
       const result = await c.env.DB.batch([
         c.env.DB.prepare(
           `INSERT INTO resource_profiles(id,revision,created_at,updated_at)
-          SELECT ?,0,?,? WHERE ?=0 ON CONFLICT(id) DO NOTHING`,
-        ).bind(id, now, now, body.expected_revision),
+          SELECT ?,0,?,? WHERE ?=0 AND (${lease.guard.sql}) ON CONFLICT(id) DO NOTHING`,
+        ).bind(id, now, now, body.expected_revision, ...lease.guard.bindings),
         c.env.DB.prepare(
           `INSERT INTO size_classes(id,memory_mib,cpu_millicores,
           storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,
           enabled,created_at,updated_at)
-          SELECT ?,?,?,?,?,?,?,?,?,?,? FROM resource_profiles WHERE id=? AND revision=?`,
+          SELECT ?,?,?,?,?,?,?,?,?,?,? FROM resource_profiles WHERE id=? AND revision=? AND (${lease.guard.sql})`,
         ).bind(
           size,
           value.memory_mib,
@@ -98,6 +98,7 @@ export async function updateResourceProfile(
           now,
           id,
           body.expected_revision,
+          ...lease.guard.bindings,
         ),
         c.env.DB.prepare(
           `INSERT INTO resource_profile_revisions
@@ -106,7 +107,7 @@ export async function updateResourceProfile(
         ).bind(id, next, size, resources, sha256, now),
         c.env.DB.prepare(
           `UPDATE resource_profiles SET revision=?,updated_at=? WHERE id=? AND revision=?
-          AND EXISTS(SELECT 1 FROM resource_profile_revisions WHERE profile_id=? AND revision=? AND sha256=?)`,
+          AND changes()=1 AND EXISTS(SELECT 1 FROM resource_profile_revisions WHERE profile_id=? AND revision=? AND sha256=?)`,
         ).bind(next, now, id, body.expected_revision, id, next, sha256),
         lease.completeStatement(id, 200, { sql: "changes()=1", bindings: [] }),
       ]);
@@ -231,13 +232,14 @@ export async function updateResourceProfileRollout(
         c.env.DB.prepare(
           `UPDATE resource_profiles SET rollout_revision=?,updated_at=? WHERE id=? AND rollout_revision=?
           AND EXISTS(SELECT 1 FROM resource_profile_revisions r JOIN size_classes s ON s.id=r.size_class_id
-            WHERE r.profile_id=resource_profiles.id AND r.revision=? AND s.enabled=1)`,
+            WHERE r.profile_id=resource_profiles.id AND r.revision=? AND s.enabled=1) AND (${lease.guard.sql})`,
         ).bind(
           body.profile_revision,
           new Date().toISOString(),
           id,
           body.expected_revision,
           body.profile_revision,
+          ...lease.guard.bindings,
         ),
         lease.completeStatement(id, 200, { sql: "changes()=1", bindings: [] }),
       ]);

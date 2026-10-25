@@ -237,7 +237,7 @@ export async function restoreDatabase(
       const authority = {
         sql: `EXISTS(SELECT 1 FROM databases src WHERE src.id=? AND src.project_id=? AND src.region_id=? AND src.generation=? AND src.updated_at=? AND src.archive_path=? AND src.storage_generation=? AND src.deleted_at IS ?
    AND (src.deleted_at IS NULL OR EXISTS(SELECT 1 FROM retained_archives ra WHERE ra.source_database_id=src.id AND ra.archive_path=src.archive_path AND ra.storage_generation=src.storage_generation AND ra.expires_at>? AND ra.cleanup_claim IS NULL AND ra.roles_json=?)))
-   AND (SELECT json_group_array(json_object('name',r.name,'revision',r.password_revision,'ciphertext',r.password_ciphertext)) FROM (SELECT * FROM roles WHERE database_id=? AND deleted_at IS NULL ORDER BY name) r)=?`,
+   AND (SELECT json_group_array(json_object('name',r.name,'revision',r.password_revision,'ciphertext',r.password_ciphertext)) FROM (SELECT * FROM roles WHERE database_id=? AND deleted_at IS NULL ORDER BY name) r)=? AND (${lease.guard.sql})`,
         bindings: [
           sourceId,
           source.project_id,
@@ -259,6 +259,7 @@ export async function restoreDatabase(
                 ciphertext: r.password_ciphertext,
               })),
           ),
+          ...lease.guard.bindings,
         ],
       };
       const guard = {

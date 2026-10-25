@@ -9,6 +9,7 @@ import type { NodeMaintenance } from "@pgcf/contracts/nodes";
 import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
 import { hintNode } from "./node-hints.ts";
+import type { AdmissionSqlGuard } from "./admission-mutations.ts";
 
 /**
  * The explicit orders that Cloudflare gives a node for moves, retired generations and maintenance
@@ -174,6 +175,7 @@ export async function startNodeMaintenance(
   request: { nodeId: string; nodeUid: string },
   complete: (operation: string) => D1PreparedStatement,
   now = Date.now(),
+  authority: AdmissionSqlGuard = { sql: "1=1", bindings: [] },
 ): Promise<NodeMaintenance> {
   const { nodeId } = request;
   const node = await env.DB.prepare(
@@ -222,8 +224,8 @@ export async function startNodeMaintenance(
       FROM nodes n JOIN fleet_region_releases f ON f.region_id=n.region_id
       WHERE n.id=? AND n.node_uid=? AND n.lost_at IS NULL AND n.reported_release_id=f.release_id
         AND NOT EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=n.id)
-        AND NOT EXISTS(SELECT 1 FROM lifecycle_orders o WHERE o.node_id=n.id AND o.type='maintenance' AND o.closed_at IS NULL)`,
-    ).bind(operation, at, at, nodeId, request.nodeUid),
+        AND NOT EXISTS(SELECT 1 FROM lifecycle_orders o WHERE o.node_id=n.id AND o.type='maintenance' AND o.closed_at IS NULL) AND (${authority.sql})`,
+    ).bind(operation, at, at, nodeId, request.nodeUid, ...authority.bindings),
     env.DB.prepare(
       `UPDATE nodes SET database_placement_closed_at=(SELECT placement_closed_at FROM lifecycle_orders WHERE operation=?),updated_at=?
       WHERE id=? AND database_placement_closed_at IS NULL

@@ -196,7 +196,7 @@ export async function startDatabaseReplacement(
      AND NOT EXISTS(SELECT 1 FROM database_replacements WHERE database_id=d.id AND ${ACTIVE_REPLACEMENT})
      AND NOT EXISTS(SELECT 1 FROM database_moves WHERE database_id=d.id AND status IN('proving','restoring'))
      AND NOT EXISTS(SELECT 1 FROM operations WHERE database_id=d.id AND status IN('pending','running'))
-     AND EXISTS(SELECT 1 FROM nodes n WHERE ${capacity.sql}) AND ${guard.sql}`,
+     AND EXISTS(SELECT 1 FROM nodes n WHERE ${capacity.sql}) AND ${guard.sql} AND ${lease.guard.sql}`,
             ).bind(
               op,
               at,
@@ -207,6 +207,7 @@ export async function startDatabaseReplacement(
               source.archive_path,
               ...capacity.bindings,
               ...guard.bindings,
+              ...lease.guard.bindings,
             ),
             c.env.DB.prepare(
               `INSERT INTO database_replacements(operation,database_id,node_id,project_id,region_id,phase,source_generation,source_storage_generation,source_archive_path,requested_backup_id,target_time,created_at,updated_at)

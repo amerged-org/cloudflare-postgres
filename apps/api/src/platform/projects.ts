@@ -32,9 +32,19 @@ export async function createProject(
       try {
         await c.env.DB.batch([
           c.env.DB.prepare(
-            "INSERT INTO projects (id, name, external_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-          ).bind(id, body.name, body.external_id ?? null, now, now),
-          lease.completeStatement(id, 201),
+            `INSERT INTO projects (id, name, external_id, created_at, updated_at) SELECT ?, ?, ?, ?, ? WHERE ${lease.guard.sql}`,
+          ).bind(
+            id,
+            body.name,
+            body.external_id ?? null,
+            now,
+            now,
+            ...lease.guard.bindings,
+          ),
+          lease.completeStatement(id, 201, {
+            sql: "changes()=1",
+            bindings: [],
+          }),
         ]);
       } catch (error) {
         if (
@@ -115,10 +125,10 @@ export async function deleteProject(
           const results = await mutation.batch([
             c.env.DB.prepare(
               `UPDATE projects SET deleted_at=?,updated_at=? WHERE id=? AND deleted_at IS NULL
-            AND NOT EXISTS(SELECT 1 FROM databases d WHERE d.project_id=projects.id AND (d.desired_state<>'deleted' OR d.observed_state<>'deleted' OR d.observed_generation<>d.generation OR d.deleted_at IS NULL)) AND (${guard.sql})`,
-            ).bind(now, now, id, ...guard.bindings),
+            AND NOT EXISTS(SELECT 1 FROM databases d WHERE d.project_id=projects.id AND (d.desired_state<>'deleted' OR d.observed_state<>'deleted' OR d.observed_generation<>d.generation OR d.deleted_at IS NULL)) AND (${guard.sql}) AND (${lease.guard.sql})`,
+            ).bind(now, now, id, ...guard.bindings, ...lease.guard.bindings),
             c.env.DB.prepare(
-              `UPDATE api_keys SET revoked_at=? WHERE project_id=? AND revoked_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=? AND deleted_at=?) AND (${guard.sql})`,
+              `UPDATE api_keys SET revoked_at=? WHERE changes()=1 AND project_id=? AND revoked_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=? AND deleted_at=?) AND (${guard.sql})`,
             ).bind(now, id, id, now, ...guard.bindings),
             lease.completeStatement(id, 204, {
               sql: `EXISTS(SELECT 1 FROM projects WHERE id=? AND deleted_at=?) AND (${guard.sql})`,

@@ -197,6 +197,8 @@ export async function requestNodeMaintenance(
             sql: "EXISTS(SELECT 1 FROM lifecycle_orders WHERE operation=? AND node_id=?)",
             bindings: [operation, id],
           }),
+        undefined,
+        lease.guard,
       );
       return maintenanceResponse(c, id, maintenance.operation);
     },

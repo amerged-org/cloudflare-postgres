@@ -42,7 +42,7 @@ export async function upsertSizeClass(
           `INSERT INTO size_classes
           (id, memory_mib, cpu_millicores, storage_gib, max_connections, sleep_after_seconds,
            archive_timeout_seconds, backup_retention_days, enabled, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${lease.guard.sql}
           ON CONFLICT(id) DO UPDATE SET memory_mib = excluded.memory_mib, cpu_millicores = excluded.cpu_millicores,
             storage_gib = excluded.storage_gib, max_connections = excluded.max_connections,
             sleep_after_seconds = excluded.sleep_after_seconds, archive_timeout_seconds = excluded.archive_timeout_seconds,
@@ -78,6 +78,7 @@ export async function upsertSizeClass(
           body.enabled ? 1 : 0,
           now,
           now,
+          ...lease.guard.bindings,
         ),
         lease.completeStatement(id, 200, {
           sql: "changes() = 1",

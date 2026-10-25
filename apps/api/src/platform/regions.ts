@@ -44,11 +44,11 @@ export async function createRegion(
     execute: async (lease) => {
       const now = new Date().toISOString();
       try {
-        await c.env.DB.batch([
+        const results = await c.env.DB.batch([
           c.env.DB.prepare(
             `INSERT INTO regions
             (id, provider, provider_region, gateway_url, gateway_binding,
-             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+             created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${lease.guard.sql}`,
           ).bind(
             body.id,
             body.provider,
@@ -57,9 +57,15 @@ export async function createRegion(
             body.gateway_binding ?? null,
             now,
             now,
+            ...lease.guard.bindings,
           ),
-          lease.completeStatement(body.id, 201),
+          lease.completeStatement(body.id, 201, {
+            sql: "changes()=1",
+            bindings: [],
+          }),
         ]);
+        if (results[0]!.meta.changes !== 1)
+          throw new ApiError("conflict", "Region creation changed");
       } catch (error) {
         if (
           error instanceof Error &&
@@ -250,7 +256,7 @@ export async function updateRegionConfiguration(
           return mutation.batch([
             c.env.DB.prepare(
               `UPDATE regions SET gateway_url=?,gateway_binding=?,updated_at=?
-          WHERE ${configurationFields.map((field) => `${field} IS ?`).join(" AND ")} AND ${guard.sql}`,
+          WHERE ${configurationFields.map((field) => `${field} IS ?`).join(" AND ")} AND ${guard.sql} AND (${lease.guard.sql})`,
             ).bind(
               body.gateway_url,
               body.gateway_binding,
@@ -259,6 +265,7 @@ export async function updateRegionConfiguration(
                 (field) => before[field] as string | number | null,
               ),
               ...guard.bindings,
+              ...lease.guard.bindings,
             ),
             lease.completeStatement(id, 200, {
               sql: "changes() = 1",

@@ -66,9 +66,18 @@ export async function changePower(
           op = newOperationId();
           const now = new Date().toISOString();
           await c.env.DB.prepare(
-            `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) SELECT ?,'database.resume','succeeded',project_id,id,generation,?,?,? FROM databases WHERE id=? AND generation=? AND updated_at=? AND desired_state='running' AND observed_state='ready' AND observed_generation=generation ON CONFLICT DO NOTHING`,
+            `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) SELECT ?,'database.resume','succeeded',project_id,id,generation,?,?,? FROM databases WHERE id=? AND generation=? AND updated_at=? AND desired_state='running' AND observed_state='ready' AND observed_generation=generation AND (${lease.guard.sql}) ON CONFLICT DO NOTHING`,
           )
-            .bind(op, now, now, now, id, row.generation, row.updated_at)
+            .bind(
+              op,
+              now,
+              now,
+              now,
+              id,
+              row.generation,
+              row.updated_at,
+              ...lease.guard.bindings,
+            )
             .run();
           op = (
             await c.env.DB.prepare(
@@ -114,7 +123,11 @@ export async function changePower(
         c.env,
         [id],
         async (mutation) => {
-          const guard = mutation.guard(id);
+          const admission = mutation.guard(id);
+          const guard = {
+            sql: `(${admission.sql}) AND (${lease.guard.sql})`,
+            bindings: [...admission.bindings, ...lease.guard.bindings],
+          };
           return mutation.batch([
             ...powerTransitionStatements(
               c.env.DB,
