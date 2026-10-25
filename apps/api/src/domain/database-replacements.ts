@@ -342,6 +342,7 @@ async function finish(
   success: boolean,
   observed: NodeDatabaseObservation,
   now: number,
+  observedAt: string,
 ) {
   const at = new Date(now).toISOString(),
     rolled = row.phase === "rolling_back";
@@ -412,13 +413,7 @@ async function finish(
         row.node_id,
         ...guard.bindings,
       ),
-      env.DB.prepare(
-        `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-         SELECT d.id,'ready',d.node_id,d.size_class_id,d.generation,?,${USAGE_SNAPSHOT_SQL}
-         FROM databases d JOIN database_resources r ON r.database_id=d.id
-         WHERE d.id=? AND d.generation=? AND ?=1
-         AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=d.id AND kind='ready' AND generation=d.generation)`,
-      ).bind(at, row.database_id, generation, Number(awake)),
+      // Consume the database update's result before the optional Ready insert changes it.
       env.DB.prepare(
         `UPDATE database_replacements SET phase=?,completed_at=?,updated_at=?,retained_until=strftime('%Y-%m-%dT%H:%M:%fZ',?,'+'||(SELECT s.backup_retention_days FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=database_replacements.database_id)||' days')
     WHERE operation=? AND phase=? AND changes()=1`,
@@ -429,6 +424,21 @@ async function finish(
         at,
         row.operation,
         row.phase,
+      ),
+      env.DB.prepare(
+        `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
+         SELECT d.id,'ready',d.node_id,d.size_class_id,d.generation,?,${USAGE_SNAPSHOT_SQL}
+         FROM databases d JOIN database_resources r ON r.database_id=d.id
+         WHERE d.id=? AND d.node_id=? AND d.generation=? AND ?=1 AND changes()=1
+         AND ${terminal.sql}
+         AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=d.id AND kind='ready' AND generation=d.generation)`,
+      ).bind(
+        observedAt,
+        row.database_id,
+        row.node_id,
+        generation,
+        Number(awake),
+        ...terminal.bindings,
       ),
       env.DB.prepare(
         `UPDATE operations SET generation=?,status=?,error_code=?,error_message=?,updated_at=?,completed_at=? WHERE id=? AND ${terminal.sql}`,
@@ -636,7 +646,7 @@ export async function progressReplacements(
           observed.proven_sleep?.system_identifier !== end.system_identifier
         )
           continue;
-        await finish(env, row, !rollback, observed, now);
+        await finish(env, row, !rollback, observed, now, report.observed_at);
       }
     }
     await hintNode(env, nodeId).catch(() => 0);
