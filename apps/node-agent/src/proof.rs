@@ -100,6 +100,11 @@ async fn prepare(proof: &Proof) -> Result<Running, Refusal> {
     let switched = sleep::switch(&session).await?;
     let started = tokio::time::Instant::now();
     loop {
+        // A dead postmaster cannot clear archive_status. Release the proof so recovery can
+        // restart it, instead of holding its flow lock for the whole archive deadline.
+        if session.client.is_closed() {
+            return Err(Refusal::Unknown);
+        }
         let archived = proof
             .upload_log
             .contains(&switched.segment)
@@ -522,6 +527,86 @@ mod tests {
         // The archive is back: the next proof succeeds.
         std::fs::remove_file(rig.directory.join("fail")).unwrap();
         drop(agent);
+        assert!(matches!(
+            run(&rig.proof(), &Recording::new(&rig.cluster)).await,
+            Outcome::Proven(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_postmaster_killed_while_its_archive_is_pending_releases_the_proof_for_recovery() {
+        let Some(rig) = Rig::new("archive-wait-crash") else {
+            return;
+        };
+        rig.cluster.start();
+        let agent = rig.cluster.agent().await;
+        rig.write(&agent).await;
+        // Drain earlier work so the next .ready file belongs to this proof's switch.
+        let switched = sleep::switch(&agent).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !rig.log.contains(&switched.segment).unwrap()
+                || !facts::ready_files(&rig.cluster.data()).unwrap().is_empty()
+            {
+                tokio::time::sleep(ARCHIVE_POLL).await;
+            }
+        })
+        .await
+        .expect("the initial archive drained");
+        std::fs::write(rig.directory.join("fail"), "").unwrap();
+        let steps = Recording::new(&rig.cluster);
+        let mut proof = rig.proof();
+        proof.archive_wait = Duration::from_secs(30);
+        let proving = run(&proof, &steps);
+        tokio::pin!(proving);
+        let waiting = async {
+            loop {
+                if !facts::ready_files(&rig.cluster.data()).unwrap().is_empty() {
+                    let rows = agent
+                        .query(
+                            "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE pid <> pg_catalog.pg_backend_pid() AND state = 'idle' AND query = $1",
+                            &[&sleep::sql("SWITCH")],
+                        )
+                        .await
+                        .unwrap();
+                    if rows[0].get::<_, i64>(0) == 1 {
+                        return;
+                    }
+                }
+                tokio::time::sleep(ARCHIVE_POLL).await;
+            }
+        };
+        tokio::select! {
+            outcome = &mut proving => panic!("proof ended before its archive wait: {outcome:?}"),
+            result = tokio::time::timeout(Duration::from_secs(10), waiting) => result.expect("proof switched WAL and is idle waiting for the archive"),
+        }
+        // Drive the switch reply into the proof before killing its postmaster.
+        tokio::select! {
+            biased;
+            outcome = &mut proving => panic!("a pending archive cannot prove sleep: {outcome:?}"),
+            () = tokio::time::sleep(ARCHIVE_POLL * 2) => {},
+        }
+        rig.cluster.kill();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), &mut proving)
+            .await
+            .expect("a dead PostgreSQL session must not hold recovery for the archive deadline");
+        assert_eq!(outcome, Outcome::Refused(Refusal::Unknown));
+        assert_eq!(steps.calls(), ["quiesce", "resume"]);
+        assert!(!facts::ready_files(&rig.cluster.data()).unwrap().is_empty());
+        drop(agent);
+
+        // Normal PostgreSQL crash recovery preserves every committed row; the next proof works.
+        std::fs::remove_file(rig.directory.join("fail")).unwrap();
+        rig.cluster.start();
+        let recovered = rig.cluster.agent().await;
+        let rows = recovered
+            .query("SELECT count(*), min(a), max(a), sum(a) FROM t", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 5000);
+        assert_eq!(rows[0].get::<_, i32>(1), 1);
+        assert_eq!(rows[0].get::<_, i32>(2), 5000);
+        assert_eq!(rows[0].get::<_, i64>(3), 12_502_500);
+        drop(recovered);
         assert!(matches!(
             run(&rig.proof(), &Recording::new(&rig.cluster)).await,
             Outcome::Proven(_)
