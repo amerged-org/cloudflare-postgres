@@ -214,28 +214,38 @@ it("keeps the public identity and credentials, holds all admissions, and cuts ov
     ]),
   );
   expect((await replacement(op))?.phase).toBe("restoring");
-  await applyLifecycleObservations(
-    env,
-    f.node,
-    report([
-      observation({
-        id: f.id,
-        generation: entry.generation,
-        operation: op,
-        storage_generation: 2,
-        state: "ready",
-        backup: { ...BACKUP, timeline: 2 },
-      }),
-    ]),
-  );
+  const ready = report([
+    observation({
+      id: f.id,
+      generation: entry.generation,
+      operation: op,
+      storage_generation: 2,
+      state: "ready",
+      backup: { ...BACKUP, timeline: 2 },
+    }),
+  ]);
+  ready.observed_at = new Date(Date.now() - 1500).toISOString();
+  await applyLifecycleObservations(env, f.node, ready);
   expect((await replacement(op))?.phase).toBe("succeeded");
   expect(
     await env.DB.prepare(
-      "SELECT kind,generation FROM lifecycle_events WHERE database_id=? AND generation=? AND kind='ready'",
+      "SELECT kind,node_id,generation,occurred_at,resource_snapshot FROM lifecycle_events WHERE database_id=? AND generation=? AND kind='ready'",
     )
       .bind(f.id, entry.generation)
       .first(),
-  ).toMatchObject({ kind: "ready", generation: entry.generation });
+  ).toMatchObject({
+    kind: "ready",
+    node_id: f.node,
+    generation: entry.generation,
+    occurred_at: ready.observed_at,
+    resource_snapshot: JSON.stringify(
+      await env.DB.prepare(
+        "SELECT memory_mib,cpu_millicores FROM database_resources WHERE database_id=?",
+      )
+        .bind(f.id)
+        .first(),
+    ),
+  });
   expect(await f.row()).toMatchObject({
     id: f.id,
     node_id: f.node,
@@ -358,6 +368,123 @@ it("rolls failure forward to the exact proven end, stays closed during rollback 
       .bind(op)
       .first(),
   ).toEqual({ status: "failed", error_code: "no_recovery_point" });
+});
+
+it("terminalizes an asleep forward rollback without publishing a Ready event", async () => {
+  const f = await capable();
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='suspended',suspension_reason='manual' WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
+  const op = await start(f),
+    entry = await stage(f, op);
+  await applyLifecycleObservations(
+    env,
+    f.node,
+    report([
+      observation({
+        id: f.id,
+        generation: entry.generation,
+        operation: op,
+        storage_generation: 2,
+        state: "error",
+        error: "no_recovery_point",
+      }),
+    ]),
+  );
+  const rollback = (await pageOf(f.node)).databases.find((d) => d.id === f.id)!;
+  const asleep = report([
+    observation({
+      id: f.id,
+      generation: rollback.generation,
+      operation: op,
+      storage_generation: 3,
+      state: "asleep",
+      backup: { ...BACKUP, timeline: 2 },
+    }),
+  ]);
+  await applyLifecycleObservations(env, f.node, asleep);
+  expect((await replacement(op))?.phase).toBe("failed");
+  expect(
+    await env.DB.prepare(
+      "SELECT status,generation,error_code FROM operations WHERE id=?",
+    )
+      .bind(op)
+      .first(),
+  ).toEqual({
+    status: "failed",
+    generation: rollback.generation,
+    error_code: "no_recovery_point",
+  });
+  expect(await f.row()).toMatchObject({
+    generation: rollback.generation,
+    storage_generation: 3,
+    archive_path: rollback.archive.path,
+    desired_state: "suspended",
+  });
+  const terminal = await replacement(op);
+  await applyLifecycleObservations(env, f.node, asleep);
+  expect(await replacement(op)).toEqual(terminal);
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM lifecycle_events WHERE database_id=? AND generation=? AND kind='ready'",
+    )
+      .bind(f.id, rollback.generation)
+      .first(),
+  ).toEqual({ n: 0 });
+  expect(
+    await env.DB.prepare(
+      "SELECT closed_at FROM lifecycle_orders WHERE operation=?",
+    )
+      .bind(op)
+      .first(),
+  ).toEqual({ closed_at: expect.any(String) });
+});
+
+it("terminalizes a replacement when its Ready event already exists without duplicating it", async () => {
+  const f = await capable(),
+    op = await start(f),
+    entry = await stage(f, op);
+  await env.DB.prepare(
+    `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
+     SELECT database_id,kind,node_id,size_class_id,?,occurred_at,resource_snapshot
+     FROM lifecycle_events WHERE database_id=? AND kind='ready' ORDER BY id LIMIT 1`,
+  )
+    .bind(entry.generation, f.id)
+    .run();
+  const existing = await env.DB.prepare(
+    "SELECT * FROM lifecycle_events WHERE database_id=? AND generation=? AND kind='ready'",
+  )
+    .bind(f.id, entry.generation)
+    .first();
+  const ready = report([
+    observation({
+      id: f.id,
+      generation: entry.generation,
+      operation: op,
+      storage_generation: 2,
+      state: "ready",
+      backup: { ...BACKUP, timeline: 2 },
+    }),
+  ]);
+  await applyLifecycleObservations(env, f.node, ready);
+  expect((await replacement(op))?.phase).toBe("succeeded");
+  expect(
+    await env.DB.prepare("SELECT status,generation FROM operations WHERE id=?")
+      .bind(op)
+      .first(),
+  ).toEqual({ status: "succeeded", generation: entry.generation });
+  await applyLifecycleObservations(env, f.node, ready);
+  expect(
+    (
+      await env.DB.prepare(
+        "SELECT * FROM lifecycle_events WHERE database_id=? AND generation=? AND kind='ready'",
+      )
+        .bind(f.id, entry.generation)
+        .all()
+    ).results,
+  ).toEqual([existing]);
 });
 
 it("requires advertised support on the currently converged release and refuses a missing idempotency key", async () => {
@@ -815,6 +942,13 @@ it("a delayed replacement-ready report cannot overwrite a completed forward roll
       remove_volume: true,
     }),
   );
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM lifecycle_events WHERE database_id=? AND generation=? AND kind='ready'",
+    )
+      .bind(f.id, entry.generation)
+      .first(),
+  ).toEqual({ n: 0 });
 });
 
 it("ignores a ready observation carrying another operation through the authenticated intake", async () => {
