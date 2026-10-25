@@ -758,15 +758,24 @@ impl<M: Machine> Service<M> {
 
     /// Brings the node to the release (plan 9.3). The order is one rule: the binaries first, the
     /// host files after them, and the files are written by the agent that runs the release's own
-    /// binary. A release whose agent changed is therefore installed by the agent that runs before
-    /// it, which then leaves; the agent that starts from the new link finds the binaries current
-    /// and writes the files. The new agent knows what the new files are for (a unit that it makes
-    /// links for, a socket it serves), and the old agent never writes a file for a release it does
-    /// not run. A release whose agent did not change gets its files straight after its binaries.
+    /// binary. A release whose agent binary changed is therefore installed by the agent that runs
+    /// before it, which then leaves; the agent that starts from the new link finds the binaries
+    /// current and writes the files. The new agent knows what the new files are for (a unit that it
+    /// makes links for, a socket it serves), and the old agent never writes a file for a release
+    /// whose binary it does not run. A release whose agent binary did not change gets its files
+    /// before the agent restarts to adopt the new release ID.
     async fn update(&self, release: &update::Release, bin: &std::path::Path) {
-        if update::current_release(bin).as_deref() != Some(release.id.as_str())
-            && !self.install(release, bin).await
-        {
+        if update::current_release(bin).as_deref() != Some(release.id.as_str()) {
+            let Some(switched) = self.install(release, bin).await else {
+                return;
+            };
+            if !switched.agent {
+                self.host_files(release).await;
+            }
+            if switched.restart_agent {
+                self.superseded.store(true, Ordering::Release);
+                self.restart.notify_one();
+            }
             return;
         }
         self.host_files(release).await;
@@ -830,15 +839,17 @@ impl<M: Machine> Service<M> {
         }
     }
 
-    /// Installs the release's binaries. The gateway restarts if its binary changed; an existing
-    /// agent restarts for every new release ID so its startup identity catches up with `current`,
-    /// even when its binary is unchanged. It exits and is started by systemd from the new link.
-    /// The databases keep running: they are units of their own. A release that the key did not sign
-    /// is not touched: the node keeps what it runs. It answers whether the binaries are in place and
-    /// this agent is the one that runs them, so that the host files may follow.
-    async fn install(&self, release: &update::Release, bin: &std::path::Path) -> bool {
+    /// Installs the release's binaries and restarts the gateway if its binary changed. The switch
+    /// facts let the caller order the host files and agent restart. The databases keep running:
+    /// they are units of their own. A release that the key did not sign is not touched: the node
+    /// keeps what it runs.
+    async fn install(
+        &self,
+        release: &update::Release,
+        bin: &std::path::Path,
+    ) -> Option<update::Switched> {
         if self.verified(release).await.is_err() {
-            return false;
+            return None;
         }
         let link = self.link.clone();
         let switched = update::install_binaries(bin, release, |pinned, path| {
@@ -856,7 +867,7 @@ impl<M: Machine> Service<M> {
                     "event": "release_not_installed", "release": release.id,
                     "class": crate::diagnostics::error_code(&error),
                 }));
-                return false;
+                return None;
             }
         };
         crate::timing::emit_event(json!({"event": "release_installed", "release": release.id}));
@@ -867,11 +878,7 @@ impl<M: Machine> Service<M> {
                 "event": "gateway_not_restarted", "class": crate::diagnostics::error_code(&error.into()),
             }));
         }
-        if switched.agent {
-            self.superseded.store(true, Ordering::Release);
-            self.restart.notify_one();
-        }
-        !switched.agent
+        Some(switched)
     }
 
     /// Writes the release's host files (`hostfiles`, plan 9.3) once the binaries are in place and
@@ -3660,6 +3667,13 @@ mod tests {
             .unwrap()
             .host_files_digest();
         assert!(!said_host_files(&cloud).contains(&wanted));
+        // The agent binary is unchanged, but adopting the new release ID still restarts the agent.
+        tokio::time::timeout(Duration::from_secs(10), service.restart_requested())
+            .await
+            .expect("the agent adopts the new release ID");
+        service.stop();
+        drop(service);
+        let service = serve(&machine, &cloud, &base).await;
         // The next release has a list the rules allow: its files are written.
         let next = release_with(&cloud, "r2-rules", &files, b"{}", &[UNITS[2]]);
         cloud.with(|inner| inner.release = Some(next));

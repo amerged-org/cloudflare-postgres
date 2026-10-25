@@ -264,12 +264,13 @@ impl Release {
     }
 }
 
-/// Which services must restart to adopt this release: the agent for every new release ID, and the
-/// gateway when its binary changes.
+/// Which binaries changed, and whether a new release ID requires an agent restart even when the
+/// agent binary is unchanged.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Switched {
     pub agent: bool,
     pub gateway: bool,
+    pub restart_agent: bool,
 }
 
 /// Whether the file is the pinned one: its size and digest.
@@ -330,9 +331,10 @@ where
         Switched::default()
     } else {
         Switched {
-            // Without a release that ran before, nothing runs that could be told to restart.
-            agent: previous.is_some(),
+            agent: changed(AGENT).unwrap_or(false),
             gateway: changed(GATEWAY).unwrap_or(false),
+            // Without a release that ran before, nothing runs that could be told to restart.
+            restart_agent: previous.is_some(),
         }
     };
     if !same {
@@ -1239,7 +1241,8 @@ mod tests {
             switched,
             Switched {
                 agent: true,
-                gateway: false
+                gateway: false,
+                restart_agent: true,
             }
         );
         assert_eq!(current_release(&bin).as_deref(), Some("r2"));
@@ -1305,8 +1308,9 @@ mod tests {
         assert_eq!(
             switched,
             Switched {
-                agent: true,
+                agent: false,
                 gateway: false,
+                restart_agent: true,
             }
         );
 
