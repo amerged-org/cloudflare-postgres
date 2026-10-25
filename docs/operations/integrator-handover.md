@@ -36,12 +36,13 @@ operator procedures are in the other runbooks ([recovery](recovery.md),
 
 The [dated ULTRA update](../architecture/cloudflare-convergence-and-serverless-plan.md#production-readiness-update--2026-10-24)
 sets the current scope and overrides historical deployment status in the plan's retained rows.
-The latest recorded API deployment is signed main `3e38cf4a`; Edge remains on the compatible
+The latest recorded API deployment is signed main `e7d60f00` (exact-owner lease fencing); Edge remains on the compatible
 `434f47d4` and migrations through `0089` are applied. US1 desires and observes signed
 `sha-202a9db6036c`, with its active agent binary verified and no repeated restart after activation;
 EU1 also desires and observes `sha-202a9db6036c` after assignment revision 8 at 12:09 UTC.
 The active agent binary hash matches on both nodes; the EU gateway/Tunnel stayed unchanged.
-OS convergence remains pending, with US1 maintenance accepted at 12:13 UTC. The API's
+US1 OS maintenance completed at 12:14 UTC in 25.166 s without reboot: signed OS digests match,
+`os_converged=true`, readiness and exact fixture data were preserved. EU1 OS maintenance remains open. The API's
 replacement completion/Ready-ordering correction passed signed main and is deployed; fresh
 regional native receipts remain open. Read fresh observations before rollout; installed binaries
 alone do not prove an active release.
@@ -61,12 +62,18 @@ A bounded US restore batch exposed per-job cgroup kills at 256 MiB during extrac
 PostgreSQL recovery. The reviewed local correction adds Restore-only MemoryHigh below the existing
 hard limit; signed delivery and one affected live check without OOM remain open. A separate
 real D1 lost-response defect now has a reviewed, locally validated exact-owner lease fix (1,170
-API tests passed), pending qualified delivery. Do not automatically replay uncertain writes on
-the current deployed API; tenant SQL, provider calls and one-time secrets never gain replay
+API tests passed), now delivered after its fully green signed main without a migration. Do not
+automatically replay uncertain writes; tenant SQL, provider calls and one-time secrets never gain replay
 permission from API idempotency.
 This delivery ends with the verified generic PGCF contract and this handover; OMH implementation,
 connection rollout, customer migration and its control-database migration follow separately.
 There is no 72-hour canary or written integrator acknowledgement requirement for G11.
+The October 25 bounded EU prefetch comparison selected Off by whole-request p95: 29 Off requests
+566/964/1,995 ms p50/p95/max, versus 30 On requests 524/4,126/7,387 ms. Every request completed,
+but three exceeded 1 s. This mixed diagnostic is not the final G3 gate. Off is fixed in the next
+source candidate with program warming/hot list retained; signed delivery and both regional
+one-hour/24-hour cohorts remain open. Slow-tail analysis and actual supported request cadence
+remain part of the final operating envelope.
 The healthy-archive timeout plus upload is not an unconditional recovery-point bound during a
 backlog or R2 outage; regional archive lag and migration/load capacity still need measurement.
 
