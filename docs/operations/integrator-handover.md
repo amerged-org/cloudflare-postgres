@@ -63,7 +63,7 @@ backlog or R2 outage; regional archive lag and migration/load capacity still nee
 | New databases | Every database lives on a thin LVM volume of its node, placed by the 80 % rule of [2.1](#21-create). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced. After a burst of awake databases a node stays closed for the length of the placement window: 3 days (owner decision O6 of 2026-10-23; deployed in baseline B, [2.1](#21-create)). |
 | Alerts | Infrastructure alerts go to the operator's alert webhook and the owner receives them (go-live gate G5 met on 2026-10-20); you receive none from PGCF ([6](#6-alerts-and-operations)). |
 | Your key | The October 24 live access checks passed: cross-project resources returned 404, read-only admin writes returned 403, and rotation left the revoked key at 401 and its successor at 200. Run-owned keys were revoked. This closes the exercised G10 access subset; production catalog and dependent population cleanup remain open. |
-| Maintenance | A maintenance cycle (new packages, a new kernel) closes placement on the node, holds wakes with `57P03`, puts every awake database to sleep with the proof and reboots the node if the kernel changed; the first live cycle took 67 s end to end (2026-10-19). From production acceptance onward both regional stacks are production (`pgcf-api-dev`, `eu-dev` and `us-dev` are only names): reboots need an announced window, and Debian kernel security reboots are pre-approved within 7 days of an advisory, one node at a time. The default window is Tuesday 02:00 to 04:00 UTC (plan default D15, 11.5) until the owner names another; the operator forwards each announcement to you, because the alert webhook reaches only the operator and the owner ([7.1](#71-what-happens-in-each-situation)). |
+| Maintenance | A maintenance cycle (new packages, a new kernel) closes placement on the node, holds wakes with `57P03`, puts every awake database to sleep with the proof and reboots the node if the kernel or core libraries changed; the first live cycle took 67 s end to end (2026-10-19). From production acceptance onward both regional stacks are production (`pgcf-api-dev`, `eu-dev` and `us-dev` are only names): reboots need an announced window, and Debian kernel security reboots are pre-approved within 7 days of an advisory, one node at a time. The default window is Tuesday 02:00 to 04:00 UTC (plan default D15, 11.5) until the owner names another; the operator forwards each announcement to you, because the alert webhook reaches only the operator and the owner ([7.1](#71-what-happens-in-each-situation)). |
 
 ## 1. The model
 
@@ -123,8 +123,8 @@ the same digest ("US1 database acceptance in `us-dev`").
 **Both regions archive into the installation's one R2 bucket, which is in the EU jurisdiction**
 (cutover 2026-10-23, "G8 one archive bucket: the cutover on Dev, steps 1 to 11"). The WAL of a US1
 database therefore travels from the US node to an EU-jurisdiction bucket. The archive time per call
-from US1 is **to be measured**, and no recovery point is stated for US1 databases beyond the bound
-of [7.2](#72-recovery-point).
+and committed-WAL lag from US1 are **to be measured** separately. The healthy timeout-plus-upload
+expectation does not bound data loss during backlog or an R2 outage ([7.2](#72-recovery-point)).
 
 ### 1.3 Size classes
 
@@ -139,7 +139,7 @@ creation or resize. Disabled classes (`enabled: false`) are listed but refused.
 | `storage_gib`                              | 1 to 65,536                                            | The thin volume's size; the pool hands out real space only as the database writes. It grows online and never shrinks |
 | `max_connections`                          | 10 to 10,000                                           | PostgreSQL `max_connections`                                                                                                              |
 | `sleep_after_seconds`                      | 60 to 2,592,000, or `null`                             | Idle time before hibernation of a database that sets none of its own; `null` is always warm                                               |
-| `archive_timeout_seconds`                  | 30 to 3,600                                            | PostgreSQL `archive_timeout`: bounds how old unarchived WAL can get                                                                       |
+| `archive_timeout_seconds`                  | 30 to 3,600                                            | PostgreSQL `archive_timeout`: switches an active WAL segment after this interval; it does not bound completed archive lag                                                                       |
 | `backup_retention_days`                    | 1 to 3,650                                             | Recovery window: after each DONE backup the Worker deletes older base backups and the WAL only they need, never the newest DONE backup; also how long a deleted database stays restorable |
 
 A class that databases reference cannot change its resources or policies (`409`); a class that a
@@ -261,9 +261,12 @@ operation}`) and `Location: /v1/operations/{id}`.
   role; the served document marks it required on exactly these routes. The same key with the same
   method, path and JSON body returns the retained result (for database operations the original
   operation, read fresh); the same key with another request is `409 idempotency_conflict`; while
-  the first call still runs it is `409 idempotency_in_progress`. A request that fails is not
-  cached: a retry with the same key executes again. Keys are kept for 24 hours per API key. `GET`
-  needs none. Never retry a mutation under a new key after an uncertain response.
+  the first call still runs it is `409 idempotency_in_progress`. Only an uncompleted reservation
+  is discarded after failure; a completed mutation remains reserved even if producing its
+  response fails. Keys are kept for 24 hours per API key. `GET`
+  needs none. Never retry a mutation under a new key after an uncertain response. After key
+  rotation or the retention period, reconcile the original resource or operation before a new
+  submission; the old reservation no longer protects it.
 - **Refusals and retries.** Every error body is `{error: {code, message, request_id, details?}}`.
   Where one code stands for several causes, `error.details.reason` names the cause from a closed
   set; switch on it and never on the message, which may change. A refusal that can clear by
@@ -846,8 +849,8 @@ client and PostgreSQL, and PGCF's Edge and gateway only relay it.
 ### 3.4 Timeouts and retries for a sleeping database
 
 An existing database has only two temperature states: **warm** means its serving PostgreSQL is
-running; **cold** means it is not running. A cold database's volume stays mounted, and an eligible
-connection takes an idle slot of the node's pool, binds it and starts PostgreSQL through the node's
+running; **cold** means it is not running. During ordinary idle sleep its volume stays mounted.
+An eligible connection takes an idle slot of the node's pool, binds it and starts PostgreSQL through the node's
 admission. One-hour and 24-hour cohorts are measurements of the same cold state. Cached pages,
 prestarted slots, suspension, recovery and maintenance do not add temperature states; manual
 suspension still requires an authorized resume.
@@ -920,10 +923,14 @@ Recommended policy (derived from those numbers, not a PGCF guarantee):
 | --- | --- | --- |
 | Connect timeout | at least 65 s; 70 s used above | 60 s Edge deadline plus login and startup; a wake that waits in the node's queue takes seconds, not milliseconds |
 | Statement timeout | separate from the connect timeout | a connect timeout does not bound a query |
-| Retry `57P03`, `08006`, `53300` | exponential backoff with jitter: 1 s, 2 s, 4 s, then 8 s, for about 90 s in total | transient by definition |
+| Connection/admission refusals `57P03`, `08006`, `53300` | reconnect with exponential backoff and jitter: 1 s, 2 s, 4 s, then 8 s, for about 90 s in total | inspect the admission cause and retry hints; manual suspension requires resume, and unavailable storage requires operator action |
 | Retry `28P01`, `3D000`, `28000`, `0A000`, `08P01` | never | configuration or credentials; fix, do not loop |
-| After a dropped connection | reconnect; never replay a write unless it is idempotent | PGCF never replays SQL; whether an in-flight `COMMIT` took effect is unknown to you and to PGCF |
+| After SQL was sent and its answer was lost | reconnect; reconcile the outcome or use application-level idempotency before reissuing a write | PGCF never replays SQL; an in-flight statement or `COMMIT` can still complete after the error |
 | Latency-sensitive paths | pre-wake with `POST /resume`, keep the database awake longer (`sleep_after_seconds`), or use an always-warm class (`sleep_after_seconds: null`) | removes the wake from the request |
+
+The connection retry rule does not authorize retrying a transaction whose outcome is unknown
+(`08007`, a dropped response, or the HTTP result-size refusal described in 3.7). An API
+`Idempotency-Key` does not deduplicate SQL statements.
 
 **What a `57P03` means.** It is PostgreSQL's "cannot accept connections now"; every cause below is
 safe to retry under the rule above. The error's DETAIL and HINT name the cause where the node
@@ -1005,6 +1012,11 @@ into production acceptance (plan Stage 7) unless the operator changes them and t
 is no separate set of production values yet. They are
 installation configuration, and counters are per Cloudflare location and eventually consistent.
 
+Application concurrency is bounded by the available non-reserved PostgreSQL slots, any role
+limit, the 200-session per-database gateway cap and the shared 2,000-session gateway cap. The
+`lg` class's 300 PostgreSQL connections do not raise the gateway's 200-session cap. These are
+ceilings, not a guarantee that all slots are available.
+
 SQL statements on an established connection do not count against the rate limits, so keep
 connections and pool them: a platform that opens a connection per request meets the per-database
 limit first.
@@ -1080,7 +1092,7 @@ samples, sleep times and statements ([3.4](#34-timeouts-and-retries-for-a-sleepi
 | Batch writes | one `transaction()` in HTTP mode; on WebSocket, one multi-statement query or pipelined queries instead of one round trip each | saves one round trip per statement | a batch fails or commits as a whole |
 | Close without waiting | `ctx.waitUntil(client.end())` instead of `await client.end()` (WebSocket mode) | one round trip of user-visible time | none |
 | Connect early | on login or navigation, open the connection or send one cheap query (`SELECT 1` over HTTP) before the user's request needs data | hides the wake (the node's part had a p50 of 313 ms in the 24 h pass of 3.4) behind user think time | wakes the database and spends admissions; do it on real user intent only |
-| Hold one socket for a burst | a Durable Object per database and role keeps one WebSocket `Client` open for a short idle window (5-10 s) and closes it when idle | saves the connection setup on every request after the first in a burst | must close when idle, or the database never sleeps and the handshake limit is spent |
+| Hold one socket for a burst | a Durable Object per database and role keeps one WebSocket `Client` open for a short idle window (5-10 s) and closes it when idle | saves the connection setup on every request after the first in a burst | uses a session while open; an idle socket does not prevent sleep and PGCF may close it, so reconnect on demand |
 
 ## 4. Capacity and limits you must enforce
 
@@ -1194,15 +1206,18 @@ Every database lives on its own thin LVM volume of its node's one thin pool. The
 the database's `storage_gib`, real space is taken only as the database writes (an empty database
 used 68.6 MiB when it was ready on EU1, 2026-10-17, "Stage 1 Block 2: create and sleep costs"), and the pool does not grow. Sold sizes do not reserve
 space: the sizes of the volumes on a node may add up to more than its disk, within a cap of four
-times the pool's data. Chunks are zeroed before reuse, so space freed by one database is never
+times the pool's physical data area. Report physical pool bytes, nominal allocated volume bytes
+and the sold-storage admission cap separately; the four-times cap is not additional disk or a
+measured workload envelope. Chunks are zeroed before reuse, so space freed by one database is never
 readable by another.
 
 - **The pool.** Placement closes a node's pool at 80 % of its data, 50 % of its metadata or the
   cap, and the node itself at 1,000 volumes (the technical bound: the largest count measured on a
   node, raised only after a measurement at a higher count, not a sales limit): nothing new is
   created, restored or moved there, and running databases keep running. A resize creates no
-  volume and takes no real space, so a node closed by the pool's data, its metadata or the volume
-  count still grows a database's storage while its pool has room. Only the cap, or a pool with no
+  new volume and does not reserve the full nominal increase, but filesystem growth can allocate
+  metadata. A node closed by the pool's data, its metadata or the volume count still grows a
+  database's storage while its pool has room. Only the cap, or a pool with no
   room (below), refuses it: on a node at the cap, whatever else has closed it, raising storage gets
   `503 capacity_exhausted` (section 2.5). A region whose nodes are all closed
   holds a new database as "Waiting for verified regional capacity" until a node is added. A node
@@ -1414,7 +1429,7 @@ disk verdicts for every project at once.
 | --- | --- | --- | --- |
 | Idle sleep | PostgreSQL stops after the sleep proof (every committed transaction is in R2 first); the volume stays mounted; the next connection starts PostgreSQL from it. Measured: asleep 66 s after the last statement at a 60 s idle time (2026-10-23, "Live acceptance on the slot-pool release, part 1") | in R2 and on the volume | reconnect |
 | Manual suspend | refused with `57P03` until resume. Measured: asleep 2.5 s after the request (2026-10-18, "Stage 5.2 sleep and wake on EU1") | as above | `POST /resume` |
-| Node maintenance cycle (new packages, a kernel update) | placement on the node is closed, so creates wait; the node holds new wakes with a bare `57P03` ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)), puts every awake database to sleep with the proof and reboots only if a kernel or core library changed. **Measured:** the first live cycle took 67 s end to end, the node reported its new kernel 56 s after the call and placement was open again after 74 s (2026-10-19, "First live maintenance cycle on EU1"). **Windows (decided):** from production acceptance onward a reboot needs an announced window. Debian kernel security updates follow the owner's standing approval of 2026-10-19 (D10, plan 11.3): a cycle within 7 days of a Debian security advisory, in an announced window, one node at a time; every other reboot also needs the owner's go. **The default window is Tuesday 02:00 to 04:00 UTC (plan default D15, 11.5), until the owner names another.** You learn of a window from the operator, who forwards it over the contact channel it names at handover ([7.6](#76-escalation)): the alert webhook reaches only the operator and the owner, PGCF sends integrators no event for a window and has no alert kind for it, and the plan sets no lead time | kept | plan around the window; ask the operator for it |
+| Node maintenance cycle (new packages, a kernel update) | placement on the node is closed, so creates wait; the node holds new wakes with a bare `57P03` ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)), puts every awake database to sleep with the proof and reboots only if a kernel or core library changed. A successful cycle reopens placement only if it closed it; a failed cycle leaves placement closed, although wakes can resume. **Measured:** the first live cycle took 67 s end to end, the node reported its new kernel 56 s after the call and placement was open again after 74 s (2026-10-19, "First live maintenance cycle on EU1"). **Windows (decided):** from production acceptance onward a reboot needs an announced window. Debian kernel security updates follow the owner's standing approval of 2026-10-19 (D10, plan 11.3): a cycle within 7 days of a Debian security advisory, in an announced window, one node at a time; every other reboot also needs the owner's go. **The default window is Tuesday 02:00 to 04:00 UTC (plan default D15, 11.5), until the owner names another.** You learn of a window from the operator, who forwards it over the contact channel it names at handover ([7.6](#76-escalation)): the alert webhook reaches only the operator and the owner, PGCF sends integrators no event for a window and has no alert kind for it, and the plan sets no lead time | kept | plan around the window; ask the operator for it |
 | Agent restart (a node release) | running databases keep running: an agent restart never stops a database. New wakes wait for the agent. Measured: the agent was serving 5.3 s after its restart at 167 volumes (2026-10-20, "First release through the normal flow, with an agent change"); a kill -9 of the agent at 312 volumes left new connections waiting up to 46 s, with no write lost (2026-10-23, "Live acceptance on the slot-pool release, part 3: fault tests 5.4 at density, and an outage"; 36.6 s at 167 volumes on 2026-10-20, "Stage 5.4 results on EU1, runner `s5_chaos.py`"). Baseline B includes that hardening. Its later actual database-start wakes took 4.35 s quiet and 6.06–11.33 s loaded; successful client results took 4.82 s and 6.51–11.78 s, with clock uncertainty. The 3 s restart target remains open; a refusal is not a served wake. The new candidate's initial pool observation and bounded adoption still require live acceptance (dated ULTRA update) | kept | retry with backoff |
 | Gateway release (a new gateway binary, or a change of the node's route keys) | the gateway on the node is replaced. It closes your idle connections at once with WebSocket close code 1012; a connection in a transaction or running a statement keeps up to 10 s. At that bound a session idle in a transaction is ended with `57P01` and its transaction is rolled back. A session with a statement running is ended with `08007` and **its statement is not stopped**: PostgreSQL finishes it, and the `COMMIT` sent behind it, and notices that the client is gone only when it writes its answer, so the work can commit after the error, up to the statement's run time later (a check made at the error finds nothing yet). An HTTP `/sql` request still running at the bound is answered `08007` in the same way (outcome unknown, not retried). Connections that arrive meanwhile wait for the new gateway, at most those 10 s and its start (and its first table from the node's agent, normally milliseconds, 5 s at most); the one connection the old gateway had accepted at the moment of the signal and not yet read gets `08006`. Designed and tested for that bound; **not yet seen on a node**, so no live outage duration is stated for it ("The gateway drains on a release swap and hands its socket over"). **One time, for the release that brings this behaviour:** the node's agent restarts the gateway before it writes the new unit files, so the first stop is of the previous gateway, which holds every WebSocket for up to 29 s (idle ones too) and keeps its port without accepting for up to 30 s, then resets the connections that waited; a new connection can fail for up to 30 s then, longer than the retry rule, and an HTTP `/sql` request still running at 30 s gets no answer from the gateway (the Edge reports its own `08007`). The restart after the unit files has the new drain but no socket handover (a connection that arrives meanwhile waits in the old process and is reset when it exits, at most 12 s later); the release after that is the first with the handover | a transaction that committed is kept; one idle in a transaction at the bound is rolled back; a statement running at the bound has an unknown outcome and can commit after the error | reconnect on 1012; retry `08006` and `57P01`; after `08007` repeat only an idempotent write, and check a write's effect only after the statement's run time has passed |
 | Node reboot or crash | every awake database stops with the node; when it is back, its agent finds each database that stopped without a proof, starts it through admission, lets it archive and proves its sleep, and a connection wakes it as usual. **Measured, each with writes in flight and no acknowledged commit lost:** a hard power cut (2026-10-18, "Stage 5.4 hard power cut under writes on EU1": 3,040 of 3,040 acknowledged rows present, the node reported again 26.8 s after the start request); a VM restart through the Contabo API (2026-10-20, "Stage 5.4 results on EU1, runner `s5_chaos.py`": the writer was acknowledged again after 84.3 s); a kill -9 of the postmaster (first write again after 7.8 s) and of the gateway (served again after 3.0 s). No outage duration is promised | kept (local volume) | retry with backoff; check `observed_state` |
@@ -1428,26 +1443,27 @@ disk verdicts for every project at once.
 
 There is no synchronous replica and no zero-loss promise for a lost volume. What can be lost
 depends on what happened; all four production classes (`xs`, `sm`, `md`, `lg`) have the same
-`archive_timeout_seconds` of 60 and the same 7-day window, so the recovery point is the same for
-each class.
+`archive_timeout_seconds` of 60 and the same 7-day window. The actual recovery point depends on
+the last committed WAL that reached R2, including the region's archive queue and any outage.
 
 | Situation | Recovery point | Kind, date and source |
 | --- | --- | --- |
 | A database with a proven sleep (idle sleep, manual suspend) | nothing is lost: every committed transaction is in R2 before PostgreSQL stops | decided (plan 7.1 and 7.9) |
 | A reboot, crash, power cut or VM reset with the disk intact | no acknowledged commit is lost | measured on EU1: a hard power cut under writes (2026-10-18, "Stage 5.4 hard power cut under writes on EU1") and, on 2026-10-20, kills of the postmaster, agent and gateway, a VM restart and an R2 block with a reboot ("Stage 5.4 results on EU1, runner `s5_chaos.py`"): every acknowledged row present and no write replayed |
-| An awake database whose node is lost with its disk (host failure is treated as node loss) | at most `archive_timeout_seconds` (60 s) plus the upload time of the last segment; what is not yet in R2 is lost | the bound is decided (catalog of 2026-10-19, "Production size classes `xs`, `sm`, `md`, `lg` created"; plan 7.1). The only measurement of the lag is 66.7 s with a 60 s timeout on the retired runtime (plan 7.1); the lag on the node runtime, per class, is **to be measured** |
-| The same, for a database on US1 | the same bound; the segments travel from US1 to the EU-jurisdiction bucket | the archive time per call from US1 is **to be measured** |
-| A bulk load that writes WAL faster than the node archives | the lag grows beyond the bound, and the database stays awake until its WAL is archived | measured 2026-10-20: a node archives about one 16 MiB segment a second ([4.4](#44-capacity-caps)) |
+| An awake database whose node is lost with its disk (host failure is treated as node loss) | the last committed WAL actually archived in R2; healthy archiving without backlog normally exposes about `archive_timeout_seconds` (60 s) plus upload time, but backlog or an outage can exceed it; unarchived commits are lost | the healthy-path expectation is decided (catalog of 2026-10-19, "Production size classes `xs`, `sm`, `md`, `lg` created"; plan 7.1). The only measurement of the lag is 66.7 s with a 60 s timeout on the retired runtime (plan 7.1); the lag on the node runtime, per class, is **to be measured** |
+| The same, for a database on US1 | the same archived-WAL rule and backlog/outage caveat; the segments travel from US1 to the EU-jurisdiction bucket | the archive time per call from US1 is **to be measured** |
+| A bulk load that writes WAL faster than the node archives | the lag grows beyond the healthy timeout-plus-upload expectation, and the database stays awake until its WAL is archived | measured 2026-10-20: a node archives about one 16 MiB segment a second ([4.4](#44-capacity-caps)) |
 
-- WAL is archived when a segment fills or after `archive_timeout_seconds`, so the exposure of an
-  awake database is that timeout plus upload time. A 16 MiB segment is one synchronous upload that
-  R2 acknowledges only once the data is durable.
+- A segment becomes eligible for archival when it fills or after `archive_timeout_seconds`.
+  Queueing, failed uploads or an R2 outage can delay completion beyond timeout plus upload time.
+  Recoverability follows completed archived WAL, not the configured timeout alone.
 - A reboot with an intact volume loses no committed transaction. A clean idle or manual sleep
   archives the final WAL before PostgreSQL stops (the sleep proof), so a hibernated database is as
   recent as its last activity.
-- Point-in-time recovery reaches any instant between the oldest retained complete base backup and
-  the last archived WAL; `GET /v1/databases/{id}/backups` states the window of a database. The
-  window of the four production classes is 7 days ([2.7](#27-backups-restorable-window-and-restore));
+- Point-in-time recovery needs a complete base backup and the WAL needed to reach the requested
+  point. `GET /v1/databases/{id}/backups` reports the window; its latest time is an upload-time
+  upper bound, so a target after the archive's last commit can still fail (2.7). The window of
+  the four production classes is 7 days ([2.7](#27-backups-restorable-window-and-restore));
   a restore at the edge of a full window is **to be measured**.
 
 ### 7.3 Recovery time
@@ -1592,9 +1608,9 @@ of the row of the plan's
 
 | Item | Value | Kind and date | Source | Where |
 | --- | --- | --- | --- | --- |
-| RPO per class | After a proven sleep: nothing lost. Reboot, crash, power cut or VM reset with the disk intact: no acknowledged commit lost. Awake database on a lost disk: at most `archive_timeout_seconds` plus upload time, which is 60 s plus upload in each of `xs`, `sm`, `md` and `lg` | bound decided 2026-10-19; no loss with an intact disk measured 2026-10-18 and 2026-10-20; the lag on the node runtime is **to be measured**; the only measurement is 66.7 s with a 60 s timeout on the retired runtime | "Production size classes `xs`, `sm`, `md`, `lg` created"; "Stage 5.4 hard power cut under writes on EU1"; "Stage 5.4 results on EU1, runner `s5_chaos.py`"; plan 7.1 | [7.2](#72-recovery-point) |
-| RPO for host failure (node loss) | Treated as node loss: restore from R2; the same bound as an awake database on a lost disk. A VM reset cannot show whether the provider's host honours disk flushes, so no more is claimed | decided (plan 7.1) | plan 7.1 | [7.2](#72-recovery-point), [7.4](#74-eu1-lost) |
-| RPO on US1 | The same bound; the WAL travels from US1 to the EU-jurisdiction bucket | archive time per call from US1 **to be measured** | "G8 one archive bucket: the cutover on Dev, steps 1 to 11" | [1.2](#12-regions), [7.2](#72-recovery-point) |
+| RPO per class | After a proven sleep: nothing lost. Reboot, crash, power cut or VM reset with the disk intact: no acknowledged commit lost. Awake database on a lost disk: only commits archived in R2 are recoverable. Healthy timeout plus upload is an expectation, not a bound during backlog or an R2 outage | healthy-path expectation decided 2026-10-19; no loss with an intact disk measured 2026-10-18 and 2026-10-20; the lag on the node runtime is **to be measured**; the only measurement is 66.7 s with a 60 s timeout on the retired runtime | "Production size classes `xs`, `sm`, `md`, `lg` created"; "Stage 5.4 hard power cut under writes on EU1"; "Stage 5.4 results on EU1, runner `s5_chaos.py`"; plan 7.1 | [7.2](#72-recovery-point) |
+| RPO for host failure (node loss) | Treated as node loss: restore from R2 using the same actual archived-WAL recovery point and backlog/outage caveat as an awake database on a lost disk. A VM reset cannot show whether the provider's host honours disk flushes, so no more is claimed | decided (plan 7.1) | plan 7.1 | [7.2](#72-recovery-point), [7.4](#74-eu1-lost) |
+| RPO on US1 | The same archived-WAL rule and backlog/outage caveat; the WAL travels from US1 to the EU-jurisdiction bucket | archive time per call from US1 **to be measured** | "G8 one archive bucket: the cutover on Dev, steps 1 to 11" | [1.2](#12-regions), [7.2](#72-recovery-point) |
 | WAL archive rate | About one 16 MiB WAL segment per second per node, shared by all its databases (about 4.5 s per call, 3 MB/s on the wire) | measured 2026-10-20 | "WAL archive throughput of a node" (plan 11.2) | [4.4](#44-capacity-caps) |
 | PITR window | 7 days in each of `xs`, `sm`, `md` and `lg` (`backup_retention_days`). A point-in-time restore into a new database was ready after 50.1 s (52.4 s from the new bucket) | window decided 2026-10-19; restores measured 2026-10-23; a restore at the edge of a full window **to be measured** | "Production size classes `xs`, `sm`, `md`, `lg` created"; "Live acceptance on the slot-pool release, part 1"; "G8 one archive bucket: the cutover on Dev, steps 1 to 11" | [2.7](#27-backups-restorable-window-and-restore) |
 | Ready only after the first base backup | Yes: 8 of 8 creates were ready only after their first base backup was DONE; create to ready met the target of 30.7 s in 6 of 8 (30.8 s and 32.8 s while other creates or resizes ran) | measured 2026-10-23 | "Live acceptance on the slot-pool release, part 1" | [2.1](#21-create) |
