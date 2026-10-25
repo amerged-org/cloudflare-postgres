@@ -179,6 +179,13 @@ were clean. The helper retained exit 1 after safely refusing a fifth signal with
 `postmaster_identity_changed`; its changed field was not recorded. No clean helper exit is claimed.
 US pool/R2-hard-cut acceptance and owned cleanup subsequently passed; remaining density and final cold gates are still open.
 
+The first declared-load one-hour pair on af03 stopped at EU1 1,295 ms versus US1 296 ms
+(one complete six-statement public request each, AMS). This is a failed zero-miss attempt, not a
+qualified p95. Both loads, all keys and pressure readers were cleaned. A minimal candidate now
+disables only the agent's optional ready-list readahead to evaluate observed I/O competition;
+PostgreSQL autoprewarm, program warming, bind Off and PostgreSQL configuration are unchanged.
+The existing 16 readahead tests and scoped checks pass; signing and live effect remain pending.
+
 Existing-database latency has only **cold** (PostgreSQL sleeps and the request wakes it) and
 **warm** (PostgreSQL is already running). Creating a database is a separate lifecycle operation;
 its first-Ready time includes the initial DONE backup and is not cold-start latency. The current
