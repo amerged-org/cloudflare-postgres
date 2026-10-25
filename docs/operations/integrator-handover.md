@@ -80,7 +80,7 @@ recorded in [4.2](#42-awake-databases-what-a-sold-memory-size-means). One oversi
 returned `57014` after about 63 seconds before any kernel OOM; that branch is inconclusive for
 OOM and is not repeated. The run recorded 686 acknowledged intents; subsequent checks matched
 100 source markers and all 337 witness rows. No unknown write, owned key or process remained.
-This does not promise arbitrary SQL fits in 256 MiB or close the remaining regional storage/fault/isolation work.
+This does not promise arbitrary SQL fits in 256 MiB. The required subsequent storage/fault receipts are recorded below.
 
 EU1 passed full-volume and inode-exhaustion recovery on the same four owned fault fixtures.
 The volume reached `ENOSPC` after 1,976,037,376 bytes with zero space available. Its 2-to-5-GiB
@@ -177,14 +177,25 @@ at 19:02:32.027834 (4.455963 seconds), proof before normal marker wake (7.428105
 and exact marker plus fresh natural sleep at 19:03:37.392/generation 12. Owned keys/processes/faults
 were clean. The helper retained exit 1 after safely refusing a fifth signal with
 `postmaster_identity_changed`; its changed field was not recorded. No clean helper exit is claimed.
-US pool/R2-hard-cut acceptance and owned cleanup subsequently passed; remaining density and final cold gates are still open.
+US pool/R2-hard-cut acceptance, owned cleanup and density subsequently passed; final regional cold gates are still open.
 
 The first declared-load one-hour pair on af03 stopped at EU1 1,295 ms versus US1 296 ms
-(one complete six-statement public request each, AMS). This is a failed zero-miss attempt, not a
-qualified p95. Both loads, all keys and pressure readers were cleaned. A minimal candidate now
-disables only the agent's optional ready-list readahead to evaluate observed I/O competition;
-PostgreSQL autoprewarm, program warming, bind Off and PostgreSQL configuration are unchanged.
-The existing 16 readahead tests and scoped checks pass; signing and live effect remain pending.
+(one complete six-statement public request each, AMS). This is a failed zero-miss attempt,
+not a qualified p95. The joined trace attributes EU 867 ms to the native gateway, 38 ms to
+its transport envelope and 29 ms to Edge work; 361 ms remains outside the instrumented Edge
+handler and is not proven TLS delay. US is 148 + 119 + 22 + 7 = 296 ms. Both Actor handlers
+were hot at 0 ms, and all 36 recorded warmer cycles completed without failure or overrun;
+no warmer adjustment is supported. Both loads, all keys and pressure readers were cleaned.
+The performance candidate disables only the agent's optional ready-list readahead to evaluate
+observed I/O competition. PostgreSQL autoprewarm, program warming, bind Off and PostgreSQL
+configuration are unchanged. The existing 16 readahead tests and scoped checks pass.
+
+PR #13's first CI attempt failed during an initial test create. A deterministic regression
+then reproduced an agent guard's lock surviving its scope through an inherited descriptor.
+The minimal explicit-unlock correction passed all 34 slot tests, the exact real-PostgreSQL
+move test, formatting, all-target Clippy and independent review. PostgreSQL's separate
+lifetime lock is unchanged. Full CI/signing and regional qualification remain pending;
+no live performance improvement is claimed yet.
 
 Existing-database latency has only **cold** (PostgreSQL sleeps and the request wakes it) and
 **warm** (PostgreSQL is already running). Creating a database is a separate lifecycle operation;

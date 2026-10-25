@@ -348,6 +348,13 @@ impl DataLock {
         }
     }
 }
+impl Drop for DataLock {
+    fn drop(&mut self) {
+        // A concurrent fork may retain this open-file description until exec. End the agent's
+        // critical section now, rather than letting that unrelated child extend the lock.
+        let _ = self._file.unlock();
+    }
+}
 
 fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1905,9 +1912,13 @@ mod tests {
         pool.bind(D1, &bind_of(D1, 1, &data)).await.unwrap();
         // The agent's own lock, held while it writes a sleeping database's files, is a lock too.
         let lock = DataLock::try_new(&data).unwrap();
+        // A parallel fork can inherit the same open-file description until exec. Keep that
+        // reference alive: it must not extend the agent guard's completed critical section.
+        let inherited = lock._file.try_clone().unwrap();
         assert!(matches!(data_lock_free(&data), Err(Error::Held)));
         drop(lock);
         data_lock_free(&data).unwrap();
+        drop(inherited);
     }
 
     /// The database's unit of its own, if one runs, is a holder too.
