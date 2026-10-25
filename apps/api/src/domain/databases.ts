@@ -257,6 +257,7 @@ export async function createDatabase(
               id,
               archivePath: archive,
               now,
+              authority: lease.guard,
             }),
             c.env.DB.prepare(
               `INSERT INTO roles (database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at)
@@ -495,6 +496,13 @@ export async function scheduleDatabaseResize(
   own?: ResourceOverrides,
 ): Promise<string> {
   const db = env.DB;
+  const writeAuthority = {
+    sql: `(${authority?.sql ?? "1=1"}) AND (${lease?.guard.sql ?? "1=1"})`,
+    bindings: [
+      ...(authority?.bindings ?? []),
+      ...(lease?.guard.bindings ?? []),
+    ],
+  };
   if (
     row.deleted_at !== null ||
     !["running", "suspended"].includes(row.desired_state)
@@ -538,7 +546,7 @@ export async function scheduleDatabaseResize(
         .prepare(
           `UPDATE databases SET own_memory_mib=?,own_cpu_millicores=?,own_storage_gib=?
          WHERE id=? AND project_id=? AND generation=? AND size_class_id=? AND updated_at=? AND deleted_at IS NULL
-           AND own_memory_mib IS ? AND own_cpu_millicores IS ? AND own_storage_gib IS ?`,
+           AND own_memory_mib IS ? AND own_cpu_millicores IS ? AND own_storage_gib IS ? AND (${writeAuthority.sql})`,
         )
         .bind(
           resources.memory_mib,
@@ -552,6 +560,7 @@ export async function scheduleDatabaseResize(
           current.memory_mib,
           current.cpu_millicores,
           current.storage_gib,
+          ...writeAuthority.bindings,
         )
         .run();
       if (stored.meta.changes !== 1)
@@ -565,7 +574,7 @@ export async function scheduleDatabaseResize(
        SELECT ?,'database.resize','succeeded',project_id,id,generation,?,?,? FROM databases
        WHERE id=? AND project_id=? AND generation=? AND size_class_id=? AND updated_at=? AND deleted_at IS NULL
          AND desired_state=? AND observed_state=? AND observed_generation=generation
-         AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
+         AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL) AND (${writeAuthority.sql})
        ON CONFLICT DO NOTHING`,
       )
       .bind(
@@ -580,6 +589,7 @@ export async function scheduleDatabaseResize(
         row.updated_at,
         row.desired_state,
         row.observed_state,
+        ...writeAuthority.bindings,
       )
       .run();
     const existing = await db
@@ -660,7 +670,7 @@ export async function scheduleDatabaseResize(
         row,
         target,
         now,
-        authority,
+        writeAuthority,
         guard,
         resources,
         capacity,
@@ -797,8 +807,13 @@ export async function setDatabaseIdleTime(
       const [write] = await c.env.DB.batch([
         c.env.DB.prepare(
           `UPDATE databases SET sleep_after_seconds=? WHERE id=? AND project_id=? AND ${live}
-           AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)`,
-        ).bind(body.sleep_after_seconds, id, row.project_id),
+           AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL) AND (${lease.guard.sql})`,
+        ).bind(
+          body.sleep_after_seconds,
+          id,
+          row.project_id,
+          ...lease.guard.bindings,
+        ),
         lease.completeStatement(id, 200, {
           sql: `EXISTS(SELECT 1 FROM databases WHERE id=? AND sleep_after_seconds IS ? AND ${live})`,
           bindings: [id, body.sleep_after_seconds],
@@ -847,7 +862,11 @@ export async function deleteDatabase(
             .bind(id, row.project_id)
             .first<{ generation: number }>();
           generation = (current?.generation ?? row.generation) + 1;
-          const guard = mutation.guard(id);
+          const admission = mutation.guard(id);
+          const guard = {
+            sql: `(${admission.sql}) AND (${lease.guard.sql})`,
+            bindings: [...admission.bindings, ...lease.guard.bindings],
+          };
           return mutation.batch([
             c.env.DB.prepare(
               `UPDATE databases SET desired_state='deleted',generation=generation+1,deleted_at=?,updated_at=?

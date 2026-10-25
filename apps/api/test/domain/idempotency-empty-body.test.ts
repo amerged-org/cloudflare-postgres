@@ -9,10 +9,85 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Hono } from "hono";
 import { createApp } from "../../src/app.ts";
 import type { ApiEnv } from "../../src/env.ts";
-import { requestHash } from "../../src/middleware/idempotency.ts";
+import {
+  requestHash,
+  withIdempotency,
+  type IdempotencyLease,
+} from "../../src/middleware/idempotency.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
+
+it("an invalidated lease cannot guard or complete a newer reservation for the same caller and request", async () => {
+  const f = await fixture(),
+    key = crypto.randomUUID();
+  let first: IdempotencyLease | undefined,
+    executions = 0;
+  let entered!: () => void, release!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const app = new Hono<ApiEnv>();
+  app.post("/lease", (c) =>
+    withIdempotency(c, {
+      async execute(lease) {
+        executions++;
+        if (executions === 1) {
+          first = lease;
+          throw new Error("first request failed before its write");
+        }
+        entered();
+        await gate;
+        expect(
+          (await lease.completeStatement("current-result", 202).run()).meta
+            .changes,
+        ).toBe(1);
+        return c.json({ id: "current-result" }, 202);
+      },
+      replay: (id, status) =>
+        Promise.resolve(Response.json({ id }, { status })),
+    }),
+  );
+  const send = async () => {
+    const context = createExecutionContext();
+    const response = await app.fetch(
+      new Request("https://api.invalid/lease", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${f.integrator}`,
+          "Idempotency-Key": key,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ action: "same" }),
+      }),
+      env,
+      context,
+    );
+    await waitOnExecutionContext(context);
+    return response;
+  };
+  expect((await send()).status).toBe(500);
+  const second = send();
+  await waiting;
+  try {
+    expect(
+      (await first!.completeStatement("stale-result", 202).run()).meta.changes,
+    ).toBe(0);
+    expect(
+      await env.DB.prepare(`SELECT 1 valid WHERE ${first!.guard.sql}`)
+        .bind(...first!.guard.bindings)
+        .first(),
+    ).toBeNull();
+  } finally {
+    release();
+    await second;
+  }
+  expect(await (await send()).json()).toEqual({ id: "current-result" });
+  expect(executions).toBe(2);
+});
 
 function streamRequest(
   path: string,

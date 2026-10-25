@@ -17,6 +17,7 @@ interface IdempotencyRow {
   response_status: number | null;
 }
 export interface IdempotencyLease {
+  readonly guard: { sql: string; bindings: (string | number | null)[] };
   completeStatement(
     resourceId: string,
     status: number,
@@ -85,19 +86,22 @@ export async function withIdempotency(
     if (requiredIdempotentPublicRoutes.has(routeKey(c)))
       throw new ApiError("invalid_request", "Idempotency-Key is required");
     return execute({
+      guard: { sql: "1=1", bindings: [] },
       completeStatement: () => c.env.DB.prepare("SELECT 1"),
     });
   }
   if (!IDEMPOTENCY_KEY_PATTERN.test(key))
     throw new ApiError("invalid_request", "Invalid Idempotency-Key");
   const hash = await requestHash(c);
+  // An unfinished row holds this attempt's owner; completion replaces it with the resource ID.
+  const owner = `lease_${crypto.randomUUID()}`;
   const inserted = await c.env.DB.prepare(
     `
-    INSERT INTO idempotency_keys (api_key_id, key, request_hash, state, created_at)
-    VALUES (?, ?, ?, 'in_progress', ?) ON CONFLICT(api_key_id, key) DO NOTHING
+    INSERT INTO idempotency_keys (api_key_id, key, request_hash, state, resource_id, created_at)
+    VALUES (?, ?, ?, 'in_progress', ?, ?) ON CONFLICT(api_key_id, key) DO NOTHING
   `,
   )
-    .bind(auth.id, key, hash, new Date().toISOString())
+    .bind(auth.id, key, hash, owner, new Date().toISOString())
     .run();
   const read = () =>
     c.env.DB.prepare(
@@ -130,11 +134,15 @@ export async function withIdempotency(
     return handlers.replay(previous.resource_id, previous.response_status);
   }
   const lease: IdempotencyLease = {
+    guard: {
+      sql: "EXISTS(SELECT 1 FROM idempotency_keys lease WHERE lease.api_key_id=? AND lease.key=? AND lease.request_hash=? AND lease.state='in_progress' AND lease.resource_id=?)",
+      bindings: [auth.id, key, hash, owner],
+    },
     completeStatement(resourceId, status, guard) {
       return c.env.DB.prepare(
         `
         UPDATE idempotency_keys SET state = 'completed', resource_id = ?, response_status = ?
-        WHERE api_key_id = ? AND key = ? AND request_hash = ? AND state = 'in_progress'
+        WHERE api_key_id = ? AND key = ? AND request_hash = ? AND state = 'in_progress' AND resource_id = ?
         ${guard ? `AND (${guard.sql})` : ""}
       `,
       ).bind(
@@ -143,6 +151,7 @@ export async function withIdempotency(
         auth.id,
         key,
         hash,
+        owner,
         ...(guard?.bindings ?? []),
       );
     },
@@ -157,9 +166,9 @@ export async function withIdempotency(
     // Completed mutations remain reserved even if producing the response fails.
     await c.env.DB.prepare(
       `DELETE FROM idempotency_keys
-      WHERE api_key_id = ? AND key = ? AND request_hash = ? AND state = 'in_progress'`,
+      WHERE api_key_id = ? AND key = ? AND request_hash = ? AND state = 'in_progress' AND resource_id = ?`,
     )
-      .bind(auth.id, key, hash)
+      .bind(auth.id, key, hash, owner)
       .run();
     throw error;
   }

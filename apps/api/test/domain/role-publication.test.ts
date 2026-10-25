@@ -120,6 +120,114 @@ async function withReporter() {
   return { f, id };
 }
 
+it("a delayed password reset cannot change credentials after its idempotency lease was removed", async () => {
+  const { f, id } = await withReporter(),
+    key = crypto.randomUUID();
+  const role = () =>
+    env.DB.prepare(
+      "SELECT * FROM roles WHERE database_id=? AND name='reporter'",
+    )
+      .bind(id)
+      .first();
+  const database = () =>
+    env.DB.prepare("SELECT generation,updated_at FROM databases WHERE id=?")
+      .bind(id)
+      .first();
+  const beforeRole = await role(),
+    beforeDatabase = await database();
+  let delayed: D1PreparedStatement[] | undefined;
+  let reservations = 0,
+    lostFences = 0;
+  const originals = new WeakMap<D1PreparedStatement, D1PreparedStatement>();
+  const sqlOf = new WeakMap<D1PreparedStatement, string>();
+  const wrap = (
+    statement: D1PreparedStatement,
+    sql: string,
+  ): D1PreparedStatement => {
+    const proxy = new Proxy(statement, {
+      get(target, property) {
+        if (property === "bind")
+          return (...args: Parameters<D1PreparedStatement["bind"]>) =>
+            wrap(target.bind(...args), sql);
+        if (property === "run" && sql.includes("INSERT INTO idempotency_keys"))
+          return async () => {
+            const result = await target.run();
+            reservations += result.meta.changes;
+            return result;
+          };
+        if (property === "all" && sql.includes("mutation_outcome='fenced'"))
+          return () => {
+            if (lostFences++ === 0)
+              return Promise.reject(new Error("Network connection lost."));
+            return target.all();
+          };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    originals.set(proxy, statement);
+    sqlOf.set(proxy, sql);
+    return proxy;
+  };
+  const DB = new Proxy(env.DB, {
+    get(target, property) {
+      if (property === "prepare")
+        return (sql: string) => wrap(target.prepare(sql), sql);
+      if (property === "batch")
+        return (statements: D1PreparedStatement[]) => {
+          const native = statements.map(
+            (statement) => originals.get(statement) ?? statement,
+          );
+          if (
+            !delayed &&
+            statements.some((statement) =>
+              sqlOf
+                .get(statement)
+                ?.includes("UPDATE roles SET password_ciphertext="),
+            )
+          ) {
+            delayed = native;
+            return Promise.reject(new Error("Network connection lost."));
+          }
+          return target.batch(native);
+        };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const submit = () => resetPassword(f, id, key, { DB });
+  expect((await submit()).response.status).toBe(500);
+  expect(delayed).toBeDefined();
+  expect(lostFences).toBe(1);
+  expect(reservations).toBe(1);
+  expect(
+    await env.DB.prepare("SELECT COUNT(*) n FROM idempotency_keys WHERE key=?")
+      .bind(key)
+      .first(),
+  ).toEqual({ n: 0 });
+  expect(
+    await env.DB.prepare(
+      "SELECT mutation_status FROM database_admission_epochs WHERE database_id=?",
+    )
+      .bind(id)
+      .first(),
+  ).toEqual({ mutation_status: "pending" });
+  // A repeated caller/key/body has a new lease, but the pending epoch refuses its writer.
+  expect((await submit()).response.status).toBe(409);
+  expect(reservations).toBe(2);
+  const result = await env.DB.batch(delayed!);
+  expect(result[0]!.meta.changes).toBe(0);
+  expect(result[1]!.meta.changes).toBe(0);
+  expect(result[2]!.meta.changes).toBe(0);
+  expect(await role()).toEqual(beforeRole);
+  expect(await database()).toEqual(beforeDatabase);
+  expect(
+    await env.DB.prepare("SELECT COUNT(*) n FROM idempotency_keys WHERE key=?")
+      .bind(key)
+      .first(),
+  ).toEqual({ n: 0 });
+});
+
 it("a role create is answered 201 although the publication after its commit fails, and the same key replays it and opens the barrier", async () => {
   const f = await fixture(),
     id = await database(f),

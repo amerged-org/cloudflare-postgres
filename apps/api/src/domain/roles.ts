@@ -166,7 +166,7 @@ export async function createRole(
           SELECT id,?,0,?,?,?,1,?,?,?,?,?,?,? FROM databases WHERE id=? AND project_id=? AND generation=? AND deleted_at IS NULL
           AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
           AND (SELECT COUNT(*) FROM roles WHERE database_id=databases.id)<${ROLE_LIMIT}
-          AND ${MEMBER_TARGETS_SQL} AND ${guard.sql}`,
+          AND ${MEMBER_TARGETS_SQL} AND ${guard.sql} AND (${lease.guard.sql})`,
             ).bind(
               body.name,
               password.ciphertext,
@@ -186,6 +186,7 @@ export async function createRole(
               JSON.stringify(attributes.memberOf),
               attributes.memberOf.length,
               ...guard.bindings,
+              ...lease.guard.bindings,
             ),
             c.env.DB.prepare(
               `UPDATE databases SET generation=generation+1,updated_at=? WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND ${guard.sql}`,
@@ -258,7 +259,7 @@ export async function resetPassword(
             `UPDATE roles SET password_ciphertext=?,password_iv=?,password_kid=?,password_revision=password_revision+1,updated_at=?
         WHERE database_id=? AND name=? AND password_revision=? AND deleted_at IS NULL
         AND EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=roles.database_id AND d.project_id=? AND d.generation=? AND d.deleted_at IS NULL)
-        AND ${guard.sql}`,
+        AND ${guard.sql} AND (${lease.guard.sql})`,
           ).bind(
             password.ciphertext,
             password.iv,
@@ -270,6 +271,7 @@ export async function resetPassword(
             db.project_id,
             db.generation,
             ...guard.bindings,
+            ...lease.guard.bindings,
           ),
           c.env.DB.prepare(
             `UPDATE databases SET generation=generation+1,updated_at=? WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND ${guard.sql}`,
@@ -373,7 +375,7 @@ export async function deleteRole(
             AND ${tombstone ? "deleted_at IS NOT NULL AND delete_operation_id IS ?" : "deleted_at IS NULL"}
             AND ${scope}
             AND NOT EXISTS(SELECT 1 FROM roles m, json_each(m.member_of_json) j WHERE m.database_id=roles.database_id AND m.deleted_at IS NULL AND m.name<>roles.name AND j.value=roles.name)
-            AND ${guard.sql}`,
+            AND ${guard.sql} AND (${lease.guard.sql})`,
           ).bind(
             now,
             now,
@@ -385,6 +387,7 @@ export async function deleteRole(
             db.project_id,
             db.generation,
             ...guard.bindings,
+            ...lease.guard.bindings,
           ),
           c.env.DB.prepare(
             `UPDATE databases SET generation=generation+1,updated_at=? WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND ${guard.sql}`,

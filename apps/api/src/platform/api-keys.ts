@@ -120,7 +120,7 @@ export async function createApiKey(
       const result = await c.env.DB.batch([
         c.env.DB.prepare(
           `INSERT INTO api_keys (id, lookup_id, key_hash, scope, project_id, name, created_at, expires_at)
-          SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ? IS NULL OR EXISTS (SELECT 1 FROM projects WHERE id = ? AND deleted_at IS NULL)`,
+          SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE (? IS NULL OR EXISTS (SELECT 1 FROM projects WHERE id = ? AND deleted_at IS NULL)) AND (${lease.guard.sql})`,
         ).bind(
           id,
           generated.lookupId,
@@ -132,6 +132,7 @@ export async function createApiKey(
           expires_at,
           body.project_id ?? null,
           body.project_id ?? null,
+          ...lease.guard.bindings,
         ),
         lease.completeStatement(id, 201, {
           sql: "EXISTS (SELECT 1 FROM api_keys WHERE id = ?)",
@@ -186,9 +187,12 @@ export async function deleteApiKey(
       if (!row) throw new ApiError("not_found", "API key not found");
       await c.env.DB.batch([
         c.env.DB.prepare(
-          "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
-        ).bind(new Date().toISOString(), id),
-        lease.completeStatement(id, 204),
+          `UPDATE api_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ? AND (${lease.guard.sql})`,
+        ).bind(new Date().toISOString(), id, ...lease.guard.bindings),
+        lease.completeStatement(id, 204, {
+          sql: "changes()=1",
+          bindings: [],
+        }),
       ]);
       return c.body(null, 204);
     },

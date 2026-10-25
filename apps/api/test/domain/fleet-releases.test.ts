@@ -127,6 +127,114 @@ it("approves immutable releases with idempotent replay and rejects a changed one
   ).rejects.toThrow();
 });
 
+it("a delayed region assignment cannot write after its lease was replaced", async () => {
+  const f = await setup(),
+    key = crypto.randomUUID();
+  expect((await f.approve()).status).toBe(200);
+  let delayed: D1PreparedStatement[] | undefined;
+  let entered!: () => void, release!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const originals = new WeakMap<D1PreparedStatement, D1PreparedStatement>();
+  const sqlOf = new WeakMap<D1PreparedStatement, string>();
+  const wrap = (
+    statement: D1PreparedStatement,
+    sql: string,
+  ): D1PreparedStatement => {
+    const proxy = new Proxy(statement, {
+      get(target, property) {
+        if (property === "bind")
+          return (...args: Parameters<D1PreparedStatement["bind"]>) =>
+            wrap(target.bind(...args), sql);
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    originals.set(proxy, statement);
+    sqlOf.set(proxy, sql);
+    return proxy;
+  };
+  const DB = new Proxy(env.DB, {
+    get(target, property) {
+      if (property === "prepare")
+        return (sql: string) => wrap(target.prepare(sql), sql);
+      if (property === "batch")
+        return (statements: D1PreparedStatement[]) => {
+          const native = statements.map(
+            (statement) => originals.get(statement) ?? statement,
+          );
+          if (
+            statements.some((statement) =>
+              sqlOf
+                .get(statement)
+                ?.includes("INSERT INTO fleet_region_releases("),
+            )
+          ) {
+            if (!delayed) {
+              delayed = native;
+              return Promise.reject(new Error("Network connection lost."));
+            }
+            entered();
+            return gate.then(() => target.batch(native));
+          }
+          return target.batch(native);
+        };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const submit = () =>
+    request(
+      `/v1/regions/${f.region}/release`,
+      f.admin,
+      "PUT",
+      {
+        expected_revision: 0,
+        release_id: f.id,
+      },
+      key,
+      undefined,
+      { DB },
+    );
+  expect((await submit()).status).toBe(500);
+  expect(delayed).toBeDefined();
+  expect(
+    await env.DB.prepare("SELECT 1 FROM idempotency_keys WHERE key=?")
+      .bind(key)
+      .first(),
+  ).toBeNull();
+  const second = submit();
+  await waiting;
+  try {
+    const result = await env.DB.batch(delayed!);
+    expect(result[0]!.meta.changes).toBe(0);
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM fleet_region_releases WHERE region_id=?",
+      )
+        .bind(f.region)
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT state FROM idempotency_keys WHERE key=?")
+        .bind(key)
+        .first("state"),
+    ).toBe("in_progress");
+  } finally {
+    release();
+    await second;
+  }
+  expect((await second).status).toBe(200);
+  expect(await (await submit()).json()).toMatchObject({
+    revision: 1,
+    desired_release_id: f.id,
+  });
+});
+
 it("refuses a body that is not a registration: a full spec, a URL, an unknown field or an unpinned digest", async () => {
   const f = await setup();
   for (const body of [

@@ -256,6 +256,7 @@ export async function assignFleetRegionRelease(
           `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at)
           SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM regions WHERE id=?)
             AND (?=0 OR EXISTS(SELECT 1 FROM fleet_region_releases WHERE region_id=? AND revision=?))
+            AND (${lease.guard.sql})
           ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,
             revision=excluded.revision,updated_at=excluded.updated_at WHERE fleet_region_releases.revision=?`,
         ).bind(
@@ -267,6 +268,7 @@ export async function assignFleetRegionRelease(
           input.expected_revision,
           regionId,
           input.expected_revision,
+          ...lease.guard.bindings,
           input.expected_revision,
         ),
         lease.completeStatement(regionId, 200, {

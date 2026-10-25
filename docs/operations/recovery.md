@@ -1,20 +1,23 @@
 # Operator recovery
 
 The operator deployment uses local PostgreSQL volumes and R2 archives. Loss of a VPS is recovered
-from R2. A database whose sleep was proven loses nothing; an awake one loses at most its
-`archive_timeout_seconds` plus the upload time, because the last recoverable commit depends on the
-WAL that actually reached R2. There is no synchronous replica or zero-loss promise. Record both
+from R2. A database whose sleep was proven loses nothing. For an awake database on a lost disk,
+only committed WAL that actually reached R2 is recoverable. Healthy timeout plus upload time is
+an expectation, not a bound during archive backlog or an R2 outage. There is no synchronous
+replica or zero-loss promise. Record both
 recovery duration and the last restored commit in the ULTRA plan after each real drill.
 
-The operator topology is EU only: customer EU1 (6 vCPU, 12 GB RAM), as recorded in the canonical
-[ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md). EU1 is the region's
-only node, so losing it stops every database until each is restored from R2 onto new capacity.
+The operator topology has EU1 in `eu-dev` and US1 in `us-dev`, one node per region, as recorded
+in the canonical [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md).
+Losing a region's only node stops that region's databases until they are restored from R2 onto
+replacement capacity. There is no automatic cross-region relocation.
 Never order a replacement node without the owner's explicit, costed go.
 
 Recovery drills use separate targets while preserving the healthy source and its committed data.
-Do not reset, re-adopt, fence, delete or decommission EU1 for an acceptance drill. The incident
-procedures below apply to an actual loss or a separately reviewed drill that preserves or
-recovers the same customer EU1.
+Do not reinstall, re-adopt, fence, delete or decommission a healthy regional node for a recovery
+drill. Controlled power cuts and reboots are separate, explicitly scoped fault-acceptance actions.
+The incident procedures below apply to an actual loss or a reviewed drill that preserves or
+recovers the same regional node.
 
 ## Restore or PITR
 

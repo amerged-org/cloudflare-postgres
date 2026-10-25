@@ -94,6 +94,104 @@ it("creates and restores a database in a region whose node release is assigned",
   );
   expect(restored.status).toBe(202);
 });
+it("a delayed new-ID restore batch cannot create an unreceipted target after its lease is removed", async () => {
+  const f = await archived(),
+    key = crypto.randomUUID(),
+    name = "lost-restore-target";
+  let delayed: D1PreparedStatement[] | undefined;
+  const originals = new WeakMap<D1PreparedStatement, D1PreparedStatement>();
+  const sqlOf = new WeakMap<D1PreparedStatement, string>();
+  const wrap = (
+    statement: D1PreparedStatement,
+    sql: string,
+  ): D1PreparedStatement => {
+    const proxy = new Proxy(statement, {
+      get(target, property) {
+        if (property === "bind")
+          return (...args: Parameters<D1PreparedStatement["bind"]>) =>
+            wrap(target.bind(...args), sql);
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    originals.set(proxy, statement);
+    sqlOf.set(proxy, sql);
+    return proxy;
+  };
+  const DB = new Proxy(env.DB, {
+    get(target, property) {
+      if (property === "prepare")
+        return (sql: string) => wrap(target.prepare(sql), sql);
+      if (property === "batch")
+        return (statements: D1PreparedStatement[]) => {
+          const native = statements.map(
+            (statement) => originals.get(statement) ?? statement,
+          );
+          if (
+            !delayed &&
+            statements.some((statement) =>
+              sqlOf.get(statement)?.includes("INSERT INTO database_restores("),
+            )
+          ) {
+            delayed = native;
+            return Promise.reject(new Error("Network connection lost."));
+          }
+          return target.batch(native);
+        };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const before = await env.DB.prepare(
+    "SELECT generation,storage_generation FROM databases WHERE id=?",
+  )
+    .bind(f.id)
+    .first();
+  const response = await request(
+    `/v1/databases/${f.id}/restore`,
+    f.integrator,
+    "POST",
+    { name, mode: "full" },
+    key,
+    undefined,
+    { DB },
+  );
+  expect(response.status).toBe(500);
+  expect(delayed).toBeDefined();
+  expect(
+    await env.DB.prepare("SELECT COUNT(*) n FROM idempotency_keys WHERE key=?")
+      .bind(key)
+      .first(),
+  ).toEqual({ n: 0 });
+  const result = await env.DB.batch(delayed!);
+  expect(result[0]!.meta.changes).toBe(0);
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM databases WHERE name=? AND project_id=?",
+    )
+      .bind(name, f.project)
+      .first(),
+  ).toEqual({ n: 0 });
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM database_restores WHERE source_database_id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ n: 0 });
+  expect(
+    await env.DB.prepare("SELECT COUNT(*) n FROM idempotency_keys WHERE key=?")
+      .bind(key)
+      .first(),
+  ).toEqual({ n: 0 });
+  expect(
+    await env.DB.prepare(
+      "SELECT generation,storage_generation FROM databases WHERE id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual(before);
+});
 it("answers the replay of a restore with its operation although the publication of the target's Actor fails", async () => {
   const f = await archived(),
     key = crypto.randomUUID(),

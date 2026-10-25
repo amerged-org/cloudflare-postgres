@@ -65,6 +65,123 @@ it("refuses in-place PITR before any work when the owning node has not advertise
   ).toBe(0);
 });
 
+it("a delayed replacement batch cannot outlive its cleaned idempotency reservation", async () => {
+  const f = await capable(),
+    before = await f.row(),
+    key = crypto.randomUUID();
+  let delayed: D1PreparedStatement[] | undefined;
+  let reservations = 0,
+    lostFences = 0;
+  const originals = new WeakMap<D1PreparedStatement, D1PreparedStatement>();
+  const sqlOf = new WeakMap<D1PreparedStatement, string>();
+  const wrap = (
+    statement: D1PreparedStatement,
+    sql: string,
+  ): D1PreparedStatement => {
+    const proxy = new Proxy(statement, {
+      get(target, property) {
+        if (property === "bind")
+          return (...args: Parameters<D1PreparedStatement["bind"]>) =>
+            wrap(target.bind(...args), sql);
+        if (property === "run" && sql.includes("INSERT INTO idempotency_keys"))
+          return async () => {
+            const result = await target.run();
+            reservations += result.meta.changes;
+            return result;
+          };
+        if (property === "all" && sql.includes("mutation_outcome='fenced'"))
+          return () => {
+            if (lostFences++ === 0)
+              return Promise.reject(new Error("Network connection lost."));
+            return target.all();
+          };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    originals.set(proxy, statement);
+    sqlOf.set(proxy, sql);
+    return proxy;
+  };
+  const DB = new Proxy(env.DB, {
+    get(target, property) {
+      if (property === "prepare")
+        return (sql: string) => wrap(target.prepare(sql), sql);
+      if (property === "batch")
+        return (statements: D1PreparedStatement[]) => {
+          const native = statements.map(
+            (statement) => originals.get(statement) ?? statement,
+          );
+          if (
+            !delayed &&
+            statements.some((statement) =>
+              sqlOf
+                .get(statement)
+                ?.includes("INSERT INTO database_replacements("),
+            )
+          ) {
+            delayed = native;
+            return Promise.reject(new Error("Network connection lost."));
+          }
+          return target.batch(native);
+        };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const submit = () =>
+    request(
+      `/v1/databases/${f.id}/restore-in-place`,
+      f.integrator,
+      "POST",
+      { mode: "pitr", target_time: "2026-10-18T09:32:00.000Z" },
+      key,
+      undefined,
+      { DB },
+    );
+  expect((await submit()).status).toBe(500);
+  expect(delayed).toBeDefined();
+  expect(lostFences).toBe(1);
+  expect(reservations).toBe(1);
+  expect(
+    await env.DB.prepare("SELECT COUNT(*) n FROM idempotency_keys WHERE key=?")
+      .bind(key)
+      .first(),
+  ).toEqual({ n: 0 });
+  expect(
+    await env.DB.prepare(
+      "SELECT mutation_status FROM database_admission_epochs WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ mutation_status: "pending" });
+  // The same caller/key/body reserves again, but the original pending epoch refuses its writer.
+  expect((await submit()).status).toBe(409);
+  expect(reservations).toBe(2);
+  expect(
+    await env.DB.prepare("SELECT COUNT(*) n FROM idempotency_keys WHERE key=?")
+      .bind(key)
+      .first(),
+  ).toEqual({ n: 0 });
+  const result = await env.DB.batch(delayed!);
+  expect(result[0]!.meta.changes).toBe(0);
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM database_replacements WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ n: 0 });
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM operations WHERE database_id=? AND kind='database.restore'",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ n: 0 });
+  expect(await f.row()).toEqual(before);
+});
+
 async function capable() {
   const f = await lifecycle(),
     release = await assignRelease(f);
