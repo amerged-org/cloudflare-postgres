@@ -21,8 +21,14 @@ speed campaign, general restore campaign, schedule or automatic node purchase is
   both-node release/OS readback. The empty default refuses extended features. Deleting or
   resizing their resources never reauthorizes an old native release.
 - Stage the matching API without traffic, update both existing nodes through supported signed
-  release/OS convergence, then pause management mutations/background producers for the D1/API
-  switch. Apply `0090`–`0094` and immediately activate the staged matching API before resuming
+  release/OS convergence, then activate the qualified API with `CONTROL_PLANE_MAINTENANCE="on"`
+  before the D1/API switch. This pre-D1 gate refuses HTTP and admission/mutation RPCs, defers
+  independent alarms with versioned hold logs, and guards actor D1 access; existing native SQL
+  sessions are not stopped. Drain old invocations and Workflows to terminal states separately;
+  pausing a Workflow does not upgrade its pinned code, so never resume an incompatible old
+  continuation after the schema change.
+  Removing the cron trigger alone cannot pause the independent watchdog. Apply `0090`–`0094`
+  and activate the identical qualified API source with maintenance off before resuming
   producers. This has a brief management-API interruption: old API code cannot use the new D1
   schema. No reinstall is needed. Old API rollback after `0090`, and incompatible native rollback
   after the format floor is raised, are forbidden; recover forward with compatible code.
@@ -36,6 +42,14 @@ speed campaign, general restore campaign, schedule or automatic node purchase is
 See [the integration handover](../operations/integrator-handover.md#integration-contract-150--candidate-2026-10-26)
 for wire shapes, operator rollout sequence and integration limits. Local checks are recorded in
 the Done rows; neither those checks nor diagram freshness assert a live release or customer cutover.
+
+**Release preflight correction:** the independent watchdog could not be quiesced by removing the
+Worker cron trigger. The candidate now includes the maintenance gate above. Six focused Workerd
+checks cover HTTP/scheduled work, D1 guarding, admission/mutation RPCs, independent alarms, native
+control-link closure and Workflow entry refusal; the full API suite passed 1,205 tests in 116 files.
+API typecheck, lint, formatting, public-plan privacy and the five selected diagram freshness checks
+passed. This is local qualification only; fresh exact-revision CI, signing and live drain/readback
+remain required. No deployment or D1 migration is asserted by this record.
 
 # Production readiness update — 2026-10-24
 

@@ -54,11 +54,27 @@ still require the qualified extension release and their own exact catalog readba
 native-release workflow. Stage the management Worker version without routing traffic to it,
 then update both existing nodes to the same qualified native release through normal release/OS
 convergence; no reinstall is required. Read back the actual release, process and OS identities.
-Pause management-API mutations and its background mutation producers for the D1/API switch,
-apply migrations `0090`–`0094`, and immediately activate the staged matching API. Migration
+For the D1/API switch, activate that same qualified API source first with the operator binding
+`CONTROL_PLANE_MAINTENANCE="on"`. It serves pre-authentication/pre-D1 HTTP 503 with `Retry-After`,
+the maintenance header and actual Worker version; refuses new admission and mutation RPCs;
+and defers independent watchdog, warmer and node-sample alarms without reading or writing D1.
+Those alarms keep their next wake and local state. `control_maintenance_hold` records the source
+and Worker version of each deferred producer. Native control links reconnect after maintenance;
+existing tenant SQL sessions remain native and are not stopped, but new connections are refused.
+The paused source can run against either schema because the HTTP gate and actor D1 guard run
+before schema-dependent work. Removing the minute cron alone is insufficient.
+
+Confirm the paused version and its producer holds, and drain old invocations and existing Workflow
+instances to terminal states before touching the schema: a new binding cannot stop an already-running
+old invocation. A temporary Workflow pause may help inspection, but does not upgrade pinned code;
+never resume an old schema-dependent continuation after `0090`. Any nonterminal old instance needs
+explicit compatible forward handling before the migration may proceed. New Workflow runs are refused
+at their entrypoint. Snapshot the trigger/Workflow state and record the drain evidence outside D1.
+Apply migrations `0090`–`0094`,
+and activate the identical qualified source with maintenance off. Migration
 `0090` drops the old GiB columns: the old API cannot run against the migrated schema. Treat the
-switch as a brief management-API interruption, not as a zero-interruption deployment. Resume
-producers only after matching schema/API readback and operational-health checks. Keep SQL writes
+switch as a brief management-API interruption, not as a zero-interruption deployment. Restore
+compatible producers only after matching schema/API readback and operational-health checks. Keep SQL writes
 out of any separate customer cutover until that migration's own checks pass.
 
 Set `NATIVE_EXTENDED_RESOURCES_RELEASE_IDS` to a JSON array containing only signed release IDs

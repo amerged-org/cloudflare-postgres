@@ -8,12 +8,14 @@ import {
   type WorkflowStep,
 } from "cloudflare:workers";
 import type { Env } from "../env.ts";
+import { requireControlAvailable } from "../control-maintenance.ts";
 
 export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
   override async run(
     event: WorkflowEvent<{ operation_id: string }>,
     step: WorkflowStep,
   ) {
+    requireControlAvailable(this.env);
     const { AddNode: Implementation } = await import("./add-node.ts");
     return new Implementation(this.ctx, this.env).run(event, step);
   }
@@ -27,6 +29,7 @@ export class InfrastructureBackup extends WorkflowEntrypoint<
     event: WorkflowEvent<{ run_id: string }>,
     step: WorkflowStep,
   ) {
+    requireControlAvailable(this.env);
     const { InfrastructureBackup: Implementation } =
       await import("./infrastructure-backup.ts");
     return new Implementation(this.ctx, this.env).run(event, step);

@@ -21,6 +21,10 @@ import { Timestamp, roleExpiryInstant } from "@pgcf/contracts/timestamp";
 import { z } from "zod";
 
 import type { Env } from "./env.ts";
+import {
+  maintenanceEnvironment,
+  requireControlAvailable,
+} from "./control-maintenance.ts";
 import type { DatabaseRow } from "./domain/rows.ts";
 import {
   AdmissionMutationIntent,
@@ -192,7 +196,7 @@ function verifiedTarget(
 
 export class DatabaseActor extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
+    super(ctx, maintenanceEnvironment(env));
     isolateActors++;
   }
   /** When this instance was constructed (not the isolate: workerd answers Date.now() with 0 in the global scope). */
@@ -267,6 +271,7 @@ export class DatabaseActor extends DurableObject<Env> {
    * holder. (The RPC that waited is measured by its caller, as the publish steps are.)
    */
   private gate<T>(name: string, callback: () => Promise<T>): Promise<T> {
+    requireControlAvailable(this.env);
     return this.ctx.blockConcurrencyWhile(async () => {
       const started = Date.now();
       try {
@@ -287,6 +292,7 @@ export class DatabaseActor extends DurableObject<Env> {
   }
   /** Trusted mutation RPC. The closed barrier is durable before the caller can touch desired state. */
   async beginAdmissionMutation(value: unknown): Promise<boolean> {
+    requireControlAvailable(this.env);
     const intent = AdmissionMutationIntent.parse(value);
     this.identity(intent.database_id);
     return this.gate("beginAdmissionMutation", () =>
@@ -345,6 +351,7 @@ export class DatabaseActor extends DurableObject<Env> {
     value: unknown,
     completedMutation: string | null = null,
   ): Promise<boolean> {
+    requireControlAvailable(this.env);
     const snapshot = DatabaseAdmissionSnapshot.parse(value);
     this.identity(snapshot.database_id);
     return this.gate("publishAdmissionSnapshot", () =>
@@ -590,6 +597,7 @@ export class DatabaseActor extends DurableObject<Env> {
   }
   /** Management RPC only: incoming hints never invoke seeding or authoritative repair. */
   async seed(value: unknown): Promise<void> {
+    requireControlAvailable(this.env);
     const parsed = DatabasePresence.safeParse(value);
     if (!parsed.success) throw new Error("invalid_actor_snapshot");
     this.identity(parsed.data.database_id);
@@ -653,6 +661,7 @@ export class DatabaseActor extends DurableObject<Env> {
     });
   }
   async admit(databaseId: unknown, user: unknown): Promise<DatabaseAdmission> {
+    requireControlAvailable(this.env);
     const id = DatabaseId.safeParse(databaseId);
     if (!id.success) return { ok: false, sqlstate: "3D000" };
     const role = RoleName.safeParse(user);
@@ -704,6 +713,7 @@ export class DatabaseActor extends DurableObject<Env> {
     user: unknown,
     options?: { deadline?: number; waiterId?: string },
   ): Promise<DatabaseWakeAdmission> {
+    requireControlAvailable(this.env);
     const started = Date.now();
     const trace: AdmissionTrace = { path: "refused", reused: null };
     const result = await this.#admitWake(
@@ -1394,6 +1404,7 @@ export class DatabaseActor extends DurableObject<Env> {
     user: unknown,
     options?: { deadline?: number; waiterId?: string },
   ): Promise<DatabaseAdmission> {
+    requireControlAvailable(this.env);
     const result = await this.#ensureAwake(databaseId, user, options);
     if (!result.ok) this.refused("ensure_awake", databaseId, result.sqlstate);
     return result;
@@ -1538,6 +1549,7 @@ export class DatabaseActor extends DurableObject<Env> {
     revision: number,
     operation: string | null,
   ): Promise<boolean> {
+    requireControlAvailable(this.env);
     this.identity(DatabaseId.parse(databaseId));
     if (
       !this.wake ||
@@ -1664,6 +1676,7 @@ export class DatabaseActor extends DurableObject<Env> {
     databaseId: string,
     waiterId: string,
   ): Promise<boolean> {
+    requireControlAvailable(this.env);
     this.identity(DatabaseId.parse(databaseId));
     if (!z.uuid().safeParse(waiterId).success) return false;
     const waiter = this.waiters.get(waiterId);
@@ -1683,6 +1696,7 @@ export class DatabaseActor extends DurableObject<Env> {
     generation: number;
     operation: string;
   } | null> {
+    requireControlAvailable(this.env);
     const ticket = this.presence() ? this.storedTicket() : undefined;
     return ticket?.state === "pending"
       ? { generation: ticket.generation, operation: ticket.operation }
@@ -1693,6 +1707,7 @@ export class DatabaseActor extends DurableObject<Env> {
     operation: string,
     milliseconds: number,
   ): Promise<void> {
+    requireControlAvailable(this.env);
     const claim = this.claim;
     if (claim?.operation !== operation) return;
     let timer: ReturnType<typeof setTimeout> | undefined;

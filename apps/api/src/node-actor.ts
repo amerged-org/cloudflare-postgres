@@ -12,6 +12,14 @@ import {
   type ServerLinkMessage,
 } from "@pgcf/contracts";
 import type { Env } from "./env.ts";
+import {
+  controlMaintenance,
+  controlProducerPaused,
+  CONTROL_MAINTENANCE_RETRY_MS,
+  maintenanceEnvironment,
+  maintenanceResponse,
+  requireControlAvailable,
+} from "./control-maintenance.ts";
 
 /** The node whose sockets and samples this object holds, as the Worker authenticated it. */
 export const NODE_HEADER = "X-PGCF-Node";
@@ -122,7 +130,7 @@ export function foldSample(
  */
 export class NodeActor extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
+    super(ctx, maintenanceEnvironment(env));
     ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair("ping", "pong"),
     );
@@ -131,6 +139,8 @@ export class NodeActor extends DurableObject<Env> {
     );
   }
   override async fetch(request: Request): Promise<Response> {
+    if (controlMaintenance(this.env))
+      return maintenanceResponse(request, this.env);
     if (
       request.method !== "GET" ||
       request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
@@ -178,6 +188,10 @@ export class NodeActor extends DurableObject<Env> {
     socket: WebSocket,
     message: string | ArrayBuffer,
   ): Promise<void> {
+    if (controlMaintenance(this.env)) {
+      socket.close(1013, "Control plane maintenance");
+      return;
+    }
     const attachment = socket.deserializeAttachment() as Attachment | null;
     const link = this.link();
     let value: unknown;
@@ -297,6 +311,12 @@ export class NodeActor extends DurableObject<Env> {
     );
   }
   override async alarm(): Promise<void> {
+    if (controlProducerPaused(this.env, "node_sample")) {
+      await this.ctx.storage.setAlarm(
+        Date.now() + CONTROL_MAINTENANCE_RETRY_MS,
+      );
+      return;
+    }
     const link = this.link();
     if (!link?.minute || !link.sample) return;
     const minute = JSON.parse(link.minute) as Minute;
@@ -429,6 +449,7 @@ export class NodeActor extends DurableObject<Env> {
    * the socket of an agent that said hello, and the page it pulls holds the truth either way.
    */
   async notify(ids?: string[]): Promise<number> {
+    requireControlAvailable(this.env);
     const message: ServerLinkMessage = {
       type: "desired",
       ...(ids ? { ids: ids.map((id) => DatabaseId.parse(id)) } : {}),
@@ -454,6 +475,7 @@ export class NodeActor extends DurableObject<Env> {
    * pull it and the link is closed. The fenced key cannot join a new link.
    */
   async fence(): Promise<void> {
+    requireControlAvailable(this.env);
     this.send(JSON.stringify({ type: "desired" } satisfies ServerLinkMessage));
     for (const socket of this.ctx.getWebSockets())
       socket.close(1008, "Node declared lost");
