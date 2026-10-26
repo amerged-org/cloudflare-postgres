@@ -32,15 +32,19 @@ gate G11 asks for in one table, with its kind, date and source. The plan's
 operator procedures are in the other runbooks ([recovery](recovery.md),
 [credentials](credentials.md), [infrastructure backups](infrastructure-backups.md)).
 
-## Integration contract 1.5.0 — candidate, 2026-10-26
+## Integration contract 1.5.0 — delivered, 2026-10-26
 
-This revision documents implemented integration changes that still require the qualified release
-and bounded live checks. It does not replace the dated deployed-release receipts below with a
-new deployment claim. Confirm the installation's served `/v1/openapi.json` before using the new
-fields. The accepted latency exception and prohibition on new general speed/restore campaigns
-remain unchanged.
+Contract 1.5.0 is live: signed native release `sha-6aee8263071e` runs on both nodes, migrations
+0090 to 0094 are applied and API version `c0d24652` has served the contract since 20:10:05 UTC
+(the control plane was in maintenance from 18:59:11, 1 h 10 min 54 s). The dated receipts, the
+bounded live check on US1 and one unexplained `power_busy` refusal of a suspend issued right after
+the last client closed are in the
+[ULTRA plan's Done table](../architecture/cloudflare-convergence-and-serverless-plan.md#111-done),
+row "Integration release delivered to both regions and the control plane (2026-10-26)". Confirm
+the installation's served `/v1/openapi.json` before using the new fields. The accepted latency
+exception and prohibition on new general speed/restore campaigns remain unchanged.
 
-The candidate adds exact MiB storage, restricted role memberships, independent alert destinations
+The release adds exact MiB storage, restricted role memberships, independent alert destinations
 and recovery notifications. These are generic platform capabilities; adopter classes, prices,
 wallets, customer migration and the end of adopter-to-Neon traffic remain the adopter's work.
 The owner-approved G10 catalog follow-up completed on 2026-10-26 at 15:26:51 UTC.
