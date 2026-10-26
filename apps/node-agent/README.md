@@ -580,7 +580,9 @@ plan 9.3, "Changing the page"; it is written there once.
 - **Create.** User, volume, filesystem, `initdb`, configuration, a check that the database's R2
   prefix is empty, the roles and the first base backup. The database is ready only when that backup
   is DONE. A create that a restart interrupted resumes when every backup in the archive belongs to the
-  cluster on the volume.
+  cluster on the volume. Fresh clusters use PostgreSQL's built-in `C.UTF-8` locale provider and
+  UTF-8 encoding; the tenant database inherits the template. Existing and restored clusters keep
+  their provider and collation metadata because they do not run `initdb`.
 - **Restore and move target.** `barman-cloud-restore` as the new database's user, recovery through
   the archive socket (`pgcf-recovery.conf`, included by `postgresql.conf` and removed afterwards),
   promotion on a later timeline with the backup's system identifier, then the first base backup of

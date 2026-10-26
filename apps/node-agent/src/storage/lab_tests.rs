@@ -2085,7 +2085,7 @@ impl TenantPg {
         chown(&socket, Some(TENANT), Some(TENANT)).unwrap();
         let mut initdb = Command::new(bin.join("initdb"));
         initdb
-            .args(crate::machine::initdb_arguments(&data, None))
+            .args(crate::machine::initdb_arguments(&data))
             .arg("--no-sync");
         let output = tenant(&mut initdb).output().unwrap();
         assert!(

@@ -193,9 +193,11 @@ pub use node::Node;
 
 /// The arguments of `initdb` for a database cluster at `data`: the agent is the cluster's
 /// superuser, and nobody logs in until the agent has written `pg_hba.conf` (a start without it
-/// would refuse every login).
-pub fn initdb_arguments(data: &std::path::Path, locale: Option<&str>) -> Vec<String> {
-    let mut arguments: Vec<String> = [
+/// would refuse every login). Fresh clusters use PostgreSQL's built-in C.UTF-8 provider, so
+/// their Unicode case behavior does not depend on the host libc. Existing and restored clusters
+/// never run initdb and retain their own provider, locale and collation version.
+pub fn initdb_arguments(data: &std::path::Path) -> Vec<String> {
+    [
         "-D",
         &data.to_string_lossy(),
         "-U",
@@ -205,14 +207,11 @@ pub fn initdb_arguments(data: &std::path::Path, locale: Option<&str>) -> Vec<Str
         "-E",
         "UTF8",
         "--no-instructions",
+        "--locale-provider=builtin",
+        "--locale=C.UTF-8",
     ]
     .map(String::from)
-    .into();
-    match locale {
-        Some(locale) => arguments.push(format!("--locale={locale}")),
-        None => arguments.push("--no-locale".into()),
-    }
-    arguments
+    .into()
 }
 
 pub trait Machine: Send + Sync + 'static {
@@ -561,6 +560,55 @@ mod tests {
         ] {
             assert_eq!(broken, None);
         }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_native_database_uses_builtin_utf8_without_changing_existing_database_locales()
+    {
+        use crate::{agent::testing::Rig, postgres, roles};
+        let Some(rig) = Rig::new("builtin-locale").await else {
+            return;
+        };
+        let (entry, _) = rig.create().await;
+        let socket = rig.machine.layout().socket_directory(&entry.id);
+        let session = postgres::connect(&socket, crate::settings::AGENT_ROLE, &entry.id)
+            .await
+            .unwrap();
+        let row = session.query(
+            "SELECT datlocprovider::text,datlocale,datcollversion,pg_encoding_to_char(encoding) FROM pg_database WHERE datname=current_database()",
+            &[],
+        ).await.unwrap().remove(0);
+        assert_eq!(row.get::<_, String>(0), "b");
+        assert_eq!(row.get::<_, String>(1), "C.UTF-8");
+        assert_eq!(row.get::<_, String>(2), "1");
+        assert_eq!(row.get::<_, String>(3), "UTF8");
+        let row = session.query(
+            "SELECT lower('ÄÖẞİΣ'),upper('äößıſς'), 'İstanbul' ILIKE 'i%', ARRAY(SELECT value FROM unnest(ARRAY['Ä','a','A','é','é','東京','😀']) value ORDER BY value)",
+            &[],
+        ).await.unwrap().remove(0);
+        assert_eq!(row.get::<_, String>(0), "äößiσ");
+        assert_eq!(row.get::<_, String>(1), "ÄÖßISΣ");
+        assert!(row.get::<_, bool>(2));
+        assert_eq!(
+            row.get::<_, Vec<String>>(3),
+            ["A", "a", "é", "Ä", "é", "東京", "😀"]
+        );
+
+        // Reconciliation must never rewrite a database's existing provider or locale.
+        let agent = rig.agent(&entry.id).await;
+        agent
+            .batch_long(
+                "CREATE DATABASE legacy_locale TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C'",
+            )
+            .await
+            .unwrap();
+        roles::ensure_database(&agent, "legacy_locale", "app")
+            .await
+            .unwrap();
+        let row = agent.query("SELECT datlocprovider::text,datcollate,datctype FROM pg_database WHERE datname='legacy_locale'", &[]).await.unwrap().remove(0);
+        assert_eq!(row.get::<_, String>(0), "c");
+        assert_eq!(row.get::<_, String>(1), "C");
+        assert_eq!(row.get::<_, String>(2), "C");
     }
 
     #[tokio::test]

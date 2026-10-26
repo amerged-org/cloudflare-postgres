@@ -591,6 +591,15 @@ operation}`) and `Location: /v1/operations/{id}`.
 
 ### 2.1 Create
 
+Fresh clusters created by the integration-extension release use PostgreSQL's built-in locale
+provider with `C.UTF-8`, UTF-8 encoding and collation version `1`. The tenant database inherits
+that template. Unicode case behavior therefore follows PostgreSQL rather than the node's libc.
+Existing clusters, physical restores and move targets retain their original provider, locale
+and collation version; an update never rewrites their collations. For a logical import, compare
+the source's `pg_database` locale metadata and application-sensitive case/sort/unique behavior
+with the actual target before admitting writes. This is a fixed fresh-cluster default, not a new
+per-integrator locale option.
+
 ```sh
 KEY="create-$(uuidgen)"   # persist with your intent; reuse for every retry of this creation
 pgcf -i -X POST "$PGCF_API/v1/databases" -H 'Content-Type: application/json' \

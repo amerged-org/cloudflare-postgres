@@ -51,6 +51,19 @@ API typecheck, lint, formatting, public-plan privacy and the five selected diagr
 passed. This is local qualification only; fresh exact-revision CI, signing and live drain/readback
 remain required. No deployment or D1 migration is asserted by this record.
 
+**Native qualification follow-up:** PR run `40357858010` passed the image build but failed one
+maintenance test because the new package digest was never reported. A deterministic regression
+reproduced an older concurrent host-file OS snapshot replacing the newer package snapshot in the
+next real link hello. The candidate serializes OS snapshot reading and publication; install order
+and maintenance timeouts are unchanged. Fresh clusters now explicitly select PostgreSQL's built-in
+`C.UTF-8` provider, UTF-8 encoding and collation version `1`; existing and restored clusters retain
+their original locale metadata. A real native create regression failed first with libc provider
+`c`, and tests now cover the new metadata, Unicode case/sort behavior and preservation of an
+existing libc database. Both regressions passed after the changes; the full native library run
+passed 813 tests with zero failures (23 kernel-only tests excluded), and formatting plus all-target
+Clippy with warnings denied passed on Linux aarch64, Rust 1.99.0 and PostgreSQL 18.6. These are
+candidate changes pending fresh exact-revision amd64/kernel qualification and live readback.
+
 # Production readiness update — 2026-10-24
 
 **Current objective:** finish EU1 and US1 for production on the same accepted release and OS state, with the existing functional, durability and operating acceptance, and owner-accepted cold latency as recorded below. This delivery ends at verified PGCF production readiness and a complete generic integration handover. Integrator implementation, customer migration and the integrator control database belong to the next task. **The owner explicitly removed the 72-hour canary requirement on 2026-10-24.** Operational closeout is complete; merging this accepted record closes G11 with the latency exception below.

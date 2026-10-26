@@ -233,7 +233,7 @@ impl Database {
     fn make_cluster(&self, memory_mib: u64) {
         let data = self.data();
         let status = Command::new(format!("{POSTGRES}/initdb"))
-            .args(initdb_arguments(&data, None))
+            .args(initdb_arguments(&data))
             .uid(DB_ID)
             .gid(DB_ID)
             .env_clear()
