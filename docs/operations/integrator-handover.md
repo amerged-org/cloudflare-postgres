@@ -38,21 +38,24 @@ The [dated ULTRA update](../architecture/cloudflare-convergence-and-serverless-p
 is the authority for current scope and measured results; older deployment rows are history.
 API is signed main `e7d60f00`, Worker version `968c26e2-b667-48df-8a6d-5da34126235c`;
 Edge remains on compatible `434f47d4`, with migrations through `0089` applied.
-Both regional nodes now run qualified signed `sha-af03b0a3b37a`, main
-`af03b0a3b37a81e07711891b1eac88f7a879780a` (full workflow `40235134709`, attempt 1).
-The 21:59:07 UTC barrier verified actual agent bytes/current links, ready/placeable state and
-OS convergence: US revision 12, PID 57069; EU revision 11, PID 59382. Each had exactly one
-expected agent restart, with gateway, Tunnel, mount holder and boot unchanged. US retains its
-post-hard-cut boot `14a628e6-0f57-4f2f-89e1-ab96565455fa`.
-Spec SHA-256 is `e057a60753d413606f96202492c367e47bb827bfe97b5cb10289644141548013`;
-the 27,471,152-byte agent is `ca46b2a0eb78b146c8db2ffff6896471a79311ccdf460071c717db3bcbf140fb`.
-Barrier SHA-256: `279be3c51eef498bea4247c9a8bfe4fac3163ab6def237f3c717ee5a07c057b6`.
-Only the native agent runtime changed: restores now retain their configuration hash. The existing
-minimal affected check passed on both regions; its cold/warm marker timings are US1
-577.755/433.726 ms and EU1 355.308/169.066 ms (one attempt each, not G3). Before the first target
-SQL the cached configuration hash matched its files, which remained unchanged across sleep/wake.
-All four temporary databases/LVs/accounts and four keys are clean; the shared producer lock was
-released at 22:08:39.974 UTC.
+Both regional nodes now run qualified signed `sha-acb21e26e064`, main
+`acb21e26e0647c0d565cc209cfb7682b36eb7129` (full workflow `40245152144`, attempt 1).
+The October 26 00:23:05.906 UTC barrier verified actual agent bytes/current links and
+ready/placeable/OS convergence: US revision 13, PID 70170; EU revision 12, PID 80587.
+Each had exactly one expected agent restart, with gateway, Tunnel, mount holder and boot unchanged.
+US boot is `14a628e6-0f57-4f2f-89e1-ab96565455fa`; EU boot is
+`4db3fa4b-a958-4691-9457-652ebd838d3c`. Spec SHA-256 is
+`0ff6bddcd464cbcaf77fc7d1ec9f0b6491020ac3312dd0a30420e1ade00f130d`;
+the 27,466,384-byte agent is `3f89f7a3b0e8c636ef0b9c88628e58990abe2b8195f062b6a5b51c8767c07e1e`.
+Barrier SHA-256: `4769c6007bc444c866c6ea92f25b301201a111f114d2979b2fe92d80168a86b5`.
+The agent ready hot list is Off; program warming is On, bind prefetch Off, PostgreSQL autoprewarm
+On and PostgreSQL configuration unchanged. The scoped agent DataLock explicitly unlocks its own
+open-file description; PostgreSQL's separate lifetime lock is unchanged. Other binaries and OS pins match.
+The preceding `sha-af03b0a3b37a` configuration-cache correction passed its minimal checks on both
+regions: cold/warm marker timings were US1 577.755/433.726 ms and EU1 355.308/169.066 ms
+(one attempt each, not G3). Cached hashes and files matched before and across the first cold wake.
+All four temporary databases/LVs/accounts and four keys were cleaned at October 25 22:08:39.974 UTC.
+
 The prior `sha-f0e7090629fe` proof-recovery and hard-cut receipts below are historical acceptance,
 reused for unchanged behavior. Fixed Prefetch Off, other binaries and signed OS pins are unchanged.
 Future servers use the same signed golden image/release/OS pins; verify each node's identity,
@@ -141,18 +144,18 @@ zero errors or requests at or above 1,000 ms. Bounded G9 queue/restart acceptanc
 the required combined R2/hard-cut cases passed in both regions. All five US and four EU fault fixtures are physically
 clean. The full 241-target US density barrier passed at 21:19:40 UTC, with all 221 other
 density/background databases naturally asleep; this is not a one-hour/24-hour cold-gate pass. Root has accepted the required EU proof-recovery
-path; G11 is not ready and this phase performs no customer migration. Regional healthy archive observations and final cold measurements remain; the US operating-envelope snapshot is recorded below.
+path; G11 is not ready and this phase performs no customer migration. Regional healthy archive points are now observed; final cold measurements remain; the US operating-envelope snapshot is recorded below.
 This delivery ends with verified generic PGCF readiness and this handover; OMH implementation,
 customer connection/data migration and its control-database migration follow separately.
 No 72-hour canary or written integrator acknowledgement is required for G11. The owner also
 waived operator-contact and maintenance-lead-time completion as G11 gates on October 25.
 
-| Topic | Latest recorded state on 2026-10-25 |
+| Topic | Latest recorded state on 2026-10-26 |
 | --- | --- |
-| Runtime | Both nodes run signed `sha-af03b0a3b37a`, spec `e057a60753d413606f96202492c367e47bb827bfe97b5cb10289644141548013`, with actual agent/OS convergence at 21:59:07 UTC. Only the agent changed; its minimal affected configuration-cache check passed in both regions and its four temporary databases/keys are fully cleaned. Required EU recovery and US full-pool/R2-hard-cut cases remain accepted; all five US and four EU owned fault fixtures are physically clean. US density is complete. Final one-hour/24-hour cold acceptance and handover remain open. |
+| Runtime | Both nodes run signed `sha-acb21e26e064`, spec `0ff6bddcd464cbcaf77fc7d1ec9f0b6491020ac3312dd0a30420e1ade00f130d`, agent `3f89f7a3b0e8c636ef0b9c88628e58990abe2b8195f062b6a5b51c8767c07e1e`, with actual process/OS convergence at October 26 00:23:05.906 UTC. US revision 13/PID 70170 and EU revision 12/PID 80587 each needed one agent restart; other services/boots/pins stayed unchanged. Agent hot list Off, program warming On, bind Off, PostgreSQL autoprewarm On; PostgreSQL configuration unchanged. Required product/storage/recovery and US density evidence remain accepted. The fresh r2 phase failed at 01:44:14.348 UTC on its fourth EU cold request (2,036 ms, versus US 293 ms). All keys, writers and pressure readers are clean; no p95/pass is certified. The first acb one-hour G3 run failed at 00:26:28.283 on an unacknowledged background attempt; a single warm read later found the uncertain increment absent at that read, with no terminal commit conclusion or replay. Final one-hour/24-hour gates, cleanup and handover remain open. |
 | EU agent restart | The October 25 15:06 UTC SIGKILL check on final `sha-eb9d0f729663` passed: first successful public client SQL within 2,274.224501 ms, agent exit 11.689326 ms, 30/30 probes successful. All 254 acknowledged intents matched exactly; 12 explicit write refusals were absent, with no unknown/lost/duplicate/payload errors. Three writer postmasters, gateway, Tunnel and mount holder stayed unchanged, with exclusive locks/adopted slots and no overlapping writer. Own keys/processes are cleaned. The same four non-cohort fixtures also passed the EU storage and combined outage/hard-cut cases; their later cleanup is recorded above. G3 and remaining regional acceptance are not certified by this receipt. |
-| First request after a wake | The whole request is one HTTP `/sql` transaction of six statements, sent from a Worker over the public hostname. After about 50 h asleep, 59 samples on 2026-10-23: p50 948 ms, p95 1,583 ms, 26 of 59 at or above 1 s. After 1 h or more asleep, 59 samples on 2026-10-20: p50 1,126 ms, p95 1,814 ms. **The go-live target, whole-request p95 strictly below 1,000 ms independently in each region, is not met yet** ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)). |
-| Backups | Every database archives its WAL and base backups into the installation's one R2 bucket, which is in the EU jurisdiction, for both regions (cutover 2026-10-23). A new database is ready only after its first base backup is DONE. The four production classes keep a 7-day recovery window. The scheduled infrastructure backup of 2026-10-24 also completed in the new bucket; G6 remains closed ([2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point)). A US healthy archive witness used acknowledged sequence 42; segment `009` remained open after 180 seconds. R2 object metadata later gives a 222.799-second ACK-to-Last-Modified wall-clock difference, with one-second precision and uncalibrated clocks; the observation-gap upper bound is 1,835.597 seconds. These do not establish an unconditional RPO guarantee or a latency SLO. Continuous healthy observations remain planned within the final background workload. |
+| First request after a wake | The whole request is one HTTP `/sql` transaction of six statements, sent from a Worker over the public hostname. After about 50 h asleep, 59 samples on 2026-10-23: p50 948 ms, p95 1,583 ms, 26 of 59 at or above 1 s. After 1 h or more asleep, 59 samples on 2026-10-20: p50 1,126 ms, p95 1,814 ms. **The go-live target, whole-request p95 strictly below 1,000 ms independently in each region, is not met yet** ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)). The first acb one-hour phase failed at October 26 00:26:28.283 after its first individual cold requests of EU1 617 ms / US1 275 ms (n=1 each). A separate background write returned unknown `08007`; its increment was absent at a later owned warm read. The original unknown is retained without a terminal commit conclusion. This is not p95 or a gate pass. |
+| Backups | Every database archives its WAL and base backups into the installation's one R2 bucket, which is in the EU jurisdiction, for both regions (cutover 2026-10-23). A new database is ready only after its first base backup is DONE. The four production classes keep a 7-day recovery window. The scheduled infrastructure backup of 2026-10-24 also completed in the new bucket; G6 remains closed ([2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point)). A US healthy archive witness used acknowledged sequence 42; segment `009` remained open after 180 seconds. R2 object metadata later gives a 222.799-second ACK-to-Last-Modified wall-clock difference, with one-second precision and uncalibrated clocks; the observation-gap upper bound is 1,835.597 seconds. These do not establish an unconditional RPO guarantee or a latency SLO. One healthy point per region has now been observed during the r2 background workload before its later cold-gate failure: EU 53.393087333 s and US 54.673786958 s acknowledged-attempt-start-to-operator-positive upper bounds, not ACK-response/upload latency or unconditional RPO. No cohort SQL, WAL switch, replay or extra write was used; the bounded observer processes exited. |
 | Redundancy | One node per region, one PostgreSQL instance per database, no replica, no second node in a region. Losing a node stops every database on it until it is restored from R2 into new IDs. **Extrapolated** on 2026-10-23 for EU1's 167 databases and 23.4 GB of archives from a sample of 8 restores, of which 7 became ready: about 2.2 to 3.4 h in all, if every restore succeeds. The eighth failed `archive_unusable`; the total assumes every restore succeeds, which that sample did not establish; later restore fixes are deployed and bounded G9 queue/restart acceptance passed on October 25; the extrapolated total is still not a full-node recovery-time guarantee ([7.3](#73-recovery-time), [7.4](#74-eu1-lost)). |
 | Capacity numbers | The October 25 14:54 UTC EU1 snapshot had 311 nondeleted databases and 312 thin volumes, with none awake/starting/queued. The extra `pgcfcheckscratch0000/g1` is the intentional reusable 1-GiB health-check volume; keep it outside tenant cleanup. EU's required storm/recovery path is accepted. US1's full 241-target density barrier completed at 21:19:40 UTC: all creates succeeded, all 221 other density/background databases were naturally asleep, no active database operation or producer remained, and the lock was released. Its baseline was 318 nondeleted/zero awake: 316 auto-idle plus two manually suspended; legacy raw `provisioning` labels are not errors. The protected 59 checkpoint is unchanged (`4b8b6c62…`); 30 hashes present/29 empty were recorded without SQL, wake or backfill. See the dated ULTRA density checkpoint for full manifest/binding/barrier hashes. |
 | US operating envelope | At 21:19:02 UTC: 6,000 millicores/11,966 MiB allocatable; pool total/used/free 310,776,954,880 / 92,948,070,400 / 217,828,884,480 bytes; metadata used/total 48,865,280 / 1,073,741,824 bytes. Nominal storage 1,195,074,650,112 bytes, 48,033,169,408 bytes below the 4× cap. Policy read at 20:26 UTC: 9,937-MiB awake budget, 600-MiB floor/8-MiB overhead, 8 starts, 10-second queue/5-second retry, one big archive job, 6-GiB reserve. XS: 256 MiB/250 millicores/2 GiB/20 PostgreSQL connections. Gateway 2,000 total/200 per database are source defaults, not runtime-verified values; safe metadata exposed no global connection limit. These are dated capacity/configuration observations, not a cold-latency pass. |
@@ -179,6 +182,8 @@ were clean. The helper retained exit 1 after safely refusing a fifth signal with
 `postmaster_identity_changed`; its changed field was not recorded. No clean helper exit is claimed.
 US pool/R2-hard-cut acceptance, owned cleanup and density subsequently passed; final regional cold gates are still open.
 
+**Historical af03 attempt and correction — 2026-10-25:**
+
 The first declared-load one-hour pair on af03 stopped at EU1 1,295 ms versus US1 296 ms
 (one complete six-statement public request each, AMS). This is a failed zero-miss attempt,
 not a qualified p95. The joined trace attributes EU 867 ms to the native gateway, 38 ms to
@@ -197,6 +202,46 @@ move test, formatting, all-target Clippy and independent review. PostgreSQL's se
 lifetime lock is unchanged. Full CI/signing and regional qualification remain pending;
 no live performance improvement is claimed yet.
 
+**Current signed rollout and measurement — 2026-10-26:** corrected PR #13 CI `40243216160`
+and full main `40245152144` attempt 1 passed; the original failed `40241752915` remains failed.
+Registration verified the signature and every pin. US's single assignment was accepted on
+October 25 at 23:59:31 UTC (12→13); EU's on October 26 at 00:02:30.375 (11→12).
+EU's slow first-binary transfer and expired 13-minute read-only observer remain recorded;
+a later independent actual-process/OS barrier passed at 00:23:05.906 with no reassignment,
+manual staging or forced restart. The later resource snapshots already had the new process,
+so the historical slow-transfer cause remains unproven. The actual one-hour G3 phase began
+at 00:23:49.943 UTC and failed at 00:26:28.283 with `background_unacknowledged_attempt`.
+Its first individual six-statement cold requests were EU1 617 ms / US1 275 ms, n=1 each;
+these are not p95 or a gate pass. EU background database `szk21izt40x62f0jmfb2`, run
+`g3hotlisteu10251h`, attempt 73 returned unknown `08007` after 2,101.205 ms at
+00:26:18.209733. One owned read while warm at 00:30:48.629 returned n=2, matching latest
+acknowledged attempt 53. Unknown attempt 73 would have produced n=3; its increment was absent
+at that read. Preserve the original unknown without replay or a terminal commit conclusion.
+Cloudflare CID `a2fd374b-a1d9-47d1-ad99-be81d94f24c4` reports 520/`08007`, 2,036-ms gateway
+timing and 8-ms admission. None of the nine selected native-window rows matched the database
+or CID; no source/product fault is established. Fresh EU ready/OS state and controls remained
+healthy, with keys/readers clean. Reconciliation-summary SHA-256:
+`a9fc59b5d2212985fd2bf67b1ac9c274285d1e41ba1723096a69cc118a0ad180`.
+The individual total/native/wake/auth/query timings were EU 617/503/258/37/204 ms and US
+275/98/67/8/22 ms, n=1 per region; no distribution is qualified.
+All three phase keys are revoked. Pressure coordinator 17224 closed at 00:26:36 without
+errors; all pressure readers and SSH sessions are closed. The original failed phase retains
+`cleanup_errors: ['eu-dev_background_cleanup_or_outcome_unconfirmed']`: the semantic
+outcome is still unconfirmed; this does not mean a key leaked. Final one-hour/24-hour gates,
+dependent cleanup and handover remain open.
+
+**Next fresh G3 phase — prospective rule dated 2026-10-26:** every required cold first request
+(at least 59 per regional stratum) must still succeed below 1,000 ms, with zero errors.
+The additional all-background-writes-acknowledged helper rule is being corrected for a new
+phase with fresh r2 labels: at most one write `08007` unknown per region per phase is allowed,
+with every uncertain attempt, duration and acknowledgement/unknown-derived counter bound retained.
+There is no replay or catch-up; only the next distinct normally scheduled transaction proceeds.
+Setup failures, refusals, other faults, a repeated unknown or a data/counter mismatch stop the run.
+All 20 background databases per region must remain active at one transaction per 30 seconds each.
+The old phase stays failed. The next one-hour phase requires the consumed first IDs' fresh
+completed natural Hibernate proof plus 3,660 seconds; the 24-hour phase uses actual 24-hour sleep.
+The corrected private generator passed its failing-first regression, three background-policy checks, nine unchanged cold guards and independent review. This was recorded before the fresh r2 launch below; it establishes no p95/pass. Fresh operation receipts place the earliest common one-hour eligibility at October 26 01:32:20.874 UTC, provided both consumed databases remain cold; their current/observed generations are EU 40 and US 8. No forced wake, age reset or clock adjustment is used.
+
 Existing-database latency has only **cold** (PostgreSQL sleeps and the request wakes it) and
 **warm** (PostgreSQL is already running). Creating a database is a separate lifecycle operation;
 its first-Ready time includes the initial DONE backup and is not cold-start latency. The current
@@ -204,6 +249,8 @@ slow Off diagnostic was predominantly inside the node, not the Europe-to-US netw
 confirmed missing configuration-hash update after restore is corrected, qualified and verified
 on both regions before and across their first cold wake. The complete regional G3 gates remain open.
 Already-built databases with an empty hash retain their existing one-time refresh on the next wake.
+
+**Second acb measurement — failed, 2026-10-26:** the fresh r2 one-hour phase started at 01:33:44.477 UTC after valid operation-derived cold-age checks. All 20 background databases per region completed their first ACK cycle before sampling at 01:35:35.827. Four public six-statement requests completed per region: EU1 375/506/449/2,036 ms; US1 511/684/613/293 ms. The fourth EU request failed the strict below-1,000-ms cell at 01:44:14.348 UTC. Background unknown/error outcomes were zero; all three keys are revoked, writers stopped and pressure readers closed without cleanup errors. These are n=4 descriptions, not a qualified p95 or G3/G11 pass. Its exact EU trace is whole 2,036 ms, Edge 2,028 ms (admission RPC 1,437 + gateway hop 591), and native gateway 538 ms (wake 155/authentication 36/SQL 340); the Actor handler recorded 0 ms on an instance aged 1,125,946 ms. The principal delay is within the Cloudflare admission boundary; queueing, response commit and transport still require distinction. No additional PostgreSQL tuning, replay or identical rerun follows from it. The original failures and all attempts remain preserved. Only after a supported correction and a complete one-hour pass will the follow-up schedule the actual 24-hour natural-sleep condition.
 
 ## 1. The model
 
@@ -1599,7 +1646,7 @@ disk verdicts for every project at once.
 | Node reboot or crash | every awake database stops with the node; when it is back, its agent finds each database that stopped without a proof, starts it through admission, lets it archive and proves its sleep, and a connection wakes it as usual. **Measured, each with writes in flight and no acknowledged commit lost:** a hard power cut (2026-10-18, "Stage 5.4 hard power cut under writes on EU1": 3,040 of 3,040 acknowledged rows present, the node reported again 26.8 s after the start request); a VM restart through the Contabo API (2026-10-20, "Stage 5.4 results on EU1, runner `s5_chaos.py`": the writer was acknowledged again after 84.3 s); a kill -9 of the postmaster (first write again after 7.8 s) and of the gateway (served again after 3.0 s). The October 25 final-release EU combined R2/provider-hard-cut case also matched all 1,057 acknowledged writes, with five explicit refusals and the single uncertain write at sequence 809 confirmed absent, without replay. The October 25 US case also preserved its cumulative 1,875 acknowledgements across one provider stop/start under R2 denial, with complete owned cleanup. No outage duration is promised | kept (local volume) | retry with backoff; check `observed_state` |
 | Archiving failing (`health.archiving: failing`, for example an R2 problem) | connections keep working; WAL accumulates on the volume until archiving works again, and a full volume stops writes (standard PostgreSQL behaviour, not tested here). Measured with R2 blocked (2026-10-20, "Stage 5.4 results on EU1, runner `s5_chaos.py`"): the first archive failure came 21.8 s after the block, the API showed archiving failing after 43.1 s, 6,465 writes were acknowledged meanwhile and none was lost, and after a reboot and the unblock the archive caught up. On October 25 the final-release EU guard persisted over one provider stop/start, recorded nine post-boot denials and was removed before verified archive coverage of pre-cut LSN `0/1D0015E0`; all acknowledged data matched and cleanup completed. The later US case recorded 11 additional post-boot denials and verified archive coverage through segment `3D` before final cleanup | recoverable window goes stale | escalate at once |
 | Volume or inodes full | PostgreSQL cannot write; the required recovery is explicit growth, with success based on measured filesystem capacity. No arbitrary SQL cleanup at zero available space is promised. Common-code labs and the October 25 EU1 live byte/inode cases passed: both grew from 2 to 5 GiB before filler removal, with exact 29/109 acknowledged writes and no unknown outcome or loss. US1 full-pool acceptance subsequently passed; reuse the EU byte/inode checks for the unchanged common implementation. | no acknowledged commit may be lost; verify the recovered digest | have the size raised (admin `PUT /v1/databases/{id}/resources`) or move to a larger class ([2.5](#25-resize)) |
-| Proof after PostgreSQL disappears | Before the fix, automatic PostgreSQL Ready took 604.210285 seconds and proof 609.532 seconds. The historical `sha-f0e7090629fe` deployment qualified this path, which is reused on current `sha-af03b0a3b37a`; root accepted it after four verified kills: automatic Ready 4.455963 seconds, proof before normal marker wake with a 7.428105-second upper bound, exact marker and fresh natural sleep. The helper safely aborted before a fifth signal (`postmaster_identity_changed`), retaining exit 1; no clean helper exit or general recovery bound is claimed | exact marker matched; owned keys/processes/faults clean | do not replay uncertain writes |
+| Proof after PostgreSQL disappears | Before the fix, automatic PostgreSQL Ready took 604.210285 seconds and proof 609.532 seconds. The historical `sha-f0e7090629fe` deployment qualified this path, which is reused on current `sha-acb21e26e064`; root accepted it after four verified kills: automatic Ready 4.455963 seconds, proof before normal marker wake with a 7.428105-second upper bound, exact marker and fresh natural sleep. The helper safely aborted before a fifth signal (`postmaster_identity_changed`), retaining exit 1; no clean helper exit or general recovery bound is claimed | exact marker matched; owned keys/processes/faults clean | do not replay uncertain writes |
 | Thin pool full | New block allocations fail. Already-mapped writes can continue: the US live ledger kept 41 acknowledged writes at 100% pool usage. Deleting only the owned filler restored space; all 1,789 acknowledgements matched and three cold marker queries succeeded without preparatory resume. This is not evidence that every write failed, that the ledger crashed or that a damaged filesystem recovered | exact acknowledged data preserved in this case | wait for space and retry admissible starts; do not replay uncertain writes |
 | **A node lost (EU1 or US1)** | **all databases on it are down.** Their local volumes are gone with the server | only what reached R2 | [7.4](#74-eu1-lost) |
 | Cloudflare unavailable | no path to any database: all traffic enters through Cloudflare. While the Edge still routes but the API or D1 is unavailable, awake databases keep running and wakes fail | kept | wait |

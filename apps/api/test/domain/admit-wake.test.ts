@@ -359,6 +359,119 @@ const admitLines = (log: { mock: { calls: unknown[][] } }, id: string) =>
     .map((line) => JSON.parse(line) as Record<string, unknown>)
     .filter((line) => line.database_id === id);
 
+const syncLines = (log: { mock: { calls: unknown[][] } }, id: string) =>
+  log.mock.calls
+    .map(([line]) => (typeof line === "string" ? line : ""))
+    .filter((line) => line.includes('"actor_admit_pending_sync"'))
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((line) => line.database_id === id);
+
+it("a new ticket observes pending sync before its claim without holding the reply", async () => {
+  const awake = await admissionSnapshotFixture();
+  expect(await publishDatabaseAdmission(env, awake.id)).toBe(true);
+  const f = await sleeper();
+  const held = await holdClaims(f.id);
+  let open!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  let claimsAtSync: number | undefined;
+  const sync = await runInDurableObject(actor(f.id), (_instance, state) =>
+    vi.spyOn(state.storage, "sync").mockImplementation(() => {
+      claimsAtSync = held.started();
+      return pending;
+    }),
+  );
+  const awakeSync = await runInDurableObject(
+    actor(awake.id),
+    (_instance, state) => vi.spyOn(state.storage, "sync"),
+  );
+  const log = vi.spyOn(console, "log");
+  const waiterId = crypto.randomUUID();
+  try {
+    let answered = false;
+    const reply = actor(f.id).admitWake(f.id, "reader", { waiterId });
+    void reply.then(
+      () => {
+        answered = true;
+      },
+      () => {
+        answered = true;
+      },
+    );
+    await expect
+      .poll(() => answered, { interval: 5, timeout: 3000 })
+      .toBe(true);
+    const admitted = await reply;
+    expect(admitted).toMatchObject({ ok: true, wake: await expectedWake(f) });
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(claimsAtSync).toBe(0);
+    expect(syncLines(log, f.id)).toEqual([]);
+    expect(await actor(f.id).admitWake(f.id, "reader")).toEqual(admitted);
+    expect(await actor(f.id).admitWake(undefined, "reader")).toEqual({
+      ok: false,
+      sqlstate: "3D000",
+    });
+    expect((await actor(awake.id).admitWake(awake.id, "app")).ok).toBe(true);
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(awakeSync).not.toHaveBeenCalled();
+    open();
+    await expect.poll(() => syncLines(log, f.id).length).toBe(1);
+    expect(syncLines(log, f.id)[0]).toMatchObject({
+      database_id: f.id,
+      waiter_id: waiterId,
+      operation: (admitted as { wake: { operation: string } }).wake.operation,
+      generation: f.sleepGeneration + 1,
+      outcome: "synced",
+    });
+  } finally {
+    open();
+    held.open();
+    await expect
+      .poll(async () => (await ticket(f.id))[0]?.state)
+      .toBe("claimed");
+  }
+});
+
+it("a failed pending-sync observer keeps the admission and logs only fixed fields", async () => {
+  const f = await sleeper();
+  const held = await holdClaims(f.id);
+  const log = vi.spyOn(console, "log");
+  const sync = await runInDurableObject(actor(f.id), (_instance, state) =>
+    vi
+      .spyOn(state.storage, "sync")
+      .mockRejectedValue(new Error("private sync error detail")),
+  );
+  try {
+    const admitted = await actor(f.id).admitWake(f.id, "reader");
+    expect(admitted).toMatchObject({ ok: true, wake: await expectedWake(f) });
+    expect(sync).toHaveBeenCalledTimes(1);
+    await expect.poll(() => syncLines(log, f.id).length).toBe(1);
+    const line = syncLines(log, f.id)[0]!;
+    expect(Object.keys(line)).toEqual([
+      "event",
+      "database_id",
+      "waiter_id",
+      "operation",
+      "generation",
+      "started_at_ms",
+      "sync_ms",
+      "outcome",
+      "at_ms",
+    ]);
+    expect(line.waiter_id).toBeNull();
+    expect(line.outcome).toBe("failed");
+    expect(line.sync_ms).toBeGreaterThanOrEqual(0);
+    expect(line.at_ms).toBeGreaterThanOrEqual(line.started_at_ms as number);
+    expect(JSON.stringify(line)).not.toContain("private sync error detail");
+  } finally {
+    held.open();
+    await expect
+      .poll(async () => (await ticket(f.id))[0]?.state)
+      .toBe("claimed");
+  }
+});
+
 it("an admission runs no statement SQLite counts as a write", async () => {
   // SQLite counts CREATE TABLE IF NOT EXISTS as a write even when the table exists, and workerd
   // holds the answer of an Actor that wrote until the write has committed.
