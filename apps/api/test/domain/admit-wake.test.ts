@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { newDatabaseId } from "@pgcf/contracts";
 import { roleRevisionHash } from "@pgcf/contracts/route-token";
 import { afterEach, expect, it, vi } from "vitest";
@@ -154,6 +154,8 @@ it("parallel admitWake calls during the claim reuse one ticket", async () => {
   await expect
     .poll(() => commit.batches(), { interval: 5, timeout: 3000 })
     .toBe(1);
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(false);
+  expect((await ticket(f.id))[0]?.operation).toBe(first.wake.operation);
   const during = await Promise.all(
     Array.from({ length: 5 }, () => actor(f.id).admitWake(f.id, "app")),
   );
@@ -175,6 +177,8 @@ it("parallel admitWake calls during the claim reuse one ticket", async () => {
       },
     ]);
   expect(await wakeOperations(f.id)).toBe(1);
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  expect((await ticket(f.id))[0]?.operation).toBe(first.wake.operation);
   // The snapshot published after the claim is the woken, not yet admissible generation.
   expect(await actor(f.id).admitWake(f.id, "reader")).toEqual({
     ok: true,
@@ -366,10 +370,55 @@ const syncLines = (log: { mock: { calls: unknown[][] } }, id: string) =>
     .map((line) => JSON.parse(line) as Record<string, unknown>)
     .filter((line) => line.database_id === id);
 
-it("a new ticket observes pending sync before its claim without holding the reply", async () => {
+it("the first cold admission reuses its published ticket without any own SQL write", async () => {
+  const f = await sleeper();
+  const held = await holdClaims(f.id);
+  const notify = await nodeNotifications(f.node);
+  const prepared = await ticket(f.id);
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  expect(await ticket(f.id)).toEqual(prepared);
+  expect(held.started()).toBe(0);
+  expect(await wakeOperations(f.id)).toBe(0);
+  expect(notify).not.toHaveBeenCalled();
+  const exec = await sqlTexts(f.id);
+  const prepare = vi.spyOn(Object.getPrototypeOf(env.DB), "prepare");
+  try {
+    const admitted = await actor(f.id).admitWake(f.id, "reader");
+    expect(
+      texts(exec).filter((text) =>
+        /^\s*(CREATE|INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER)\b/i.test(text),
+      ),
+    ).toEqual([]);
+    expect(prepare).not.toHaveBeenCalled();
+    exec.mockRestore();
+    prepare.mockRestore();
+    expect(admitted).toMatchObject({ ok: true, wake: await expectedWake(f) });
+    expect(prepared).toEqual(await ticket(f.id));
+    expect(prepared).toEqual([
+      {
+        operation: (admitted as { wake: { operation: string } }).wake.operation,
+        generation: f.sleepGeneration + 1,
+        state: "pending",
+      },
+    ]);
+    expect(held.started()).toBe(1);
+  } finally {
+    exec.mockRestore();
+    prepare.mockRestore();
+    held.open();
+    await expect
+      .poll(async () => (await ticket(f.id))[0]?.state)
+      .toBe("claimed");
+  }
+});
+
+it("a missing prepared ticket observes fallback sync before its claim without holding the reply", async () => {
   const awake = await admissionSnapshotFixture();
   expect(await publishDatabaseAdmission(env, awake.id)).toBe(true);
   const f = await sleeper();
+  await runInDurableObject(actor(f.id), (_instance, state) => {
+    state.storage.sql.exec("DELETE FROM database_ticket");
+  });
   const held = await holdClaims(f.id);
   let open!: () => void;
   const pending = new Promise<void>((resolve) => {
@@ -435,6 +484,9 @@ it("a new ticket observes pending sync before its claim without holding the repl
 
 it("a failed pending-sync observer keeps the admission and logs only fixed fields", async () => {
   const f = await sleeper();
+  await runInDurableObject(actor(f.id), (_instance, state) => {
+    state.storage.sql.exec("DELETE FROM database_ticket");
+  });
   const held = await holdClaims(f.id);
   const log = vi.spyOn(console, "log");
   const sync = await runInDurableObject(actor(f.id), (_instance, state) =>
@@ -589,7 +641,7 @@ it("an admission logs one actor_admit line with the path it took", async () => {
   expect(
     admitLines(log, sleeping.id).map(({ path, reused }) => [path, reused]),
   ).toEqual([
-    ["ticket", false],
+    ["ticket", true],
     ["ticket", true],
   ]);
   expect(admitLines(log, legacy.id).map(({ path }) => path)).toEqual([
@@ -695,6 +747,150 @@ it("a manual suspension is not wakeable and answers 57P03", async () => {
   expect(await wakeOperations(f.id)).toBe(0);
 });
 
+it("a manual suspension at the prepared generation invalidates the unrequested ticket", async () => {
+  const f = await sleeper();
+  const [prepared] = await ticket(f.id);
+  expect(prepared?.generation).toBe(f.sleepGeneration + 1);
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE databases SET generation=generation+1,suspension_reason='manual' WHERE id=?",
+    ).bind(f.id),
+    env.DB.prepare(
+      "UPDATE database_admission_epochs SET admission_revision=admission_revision+1,route_revision=route_revision+1 WHERE database_id=?",
+    ).bind(f.id),
+  ]);
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  expect(await ticket(f.id)).toEqual([]);
+  expect(await actor(f.id).admitWake(f.id, "reader")).toEqual({
+    ok: false,
+    sqlstate: "57P03",
+  });
+  expect(await wakeOperations(f.id)).toBe(0);
+});
+
+it("a changed role and route prepare a coherent ticket that survives actual eviction", async () => {
+  const f = await sleeper();
+  const [before] = await ticket(f.id);
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE roles SET password_revision=password_revision+1 WHERE database_id=? AND name='reader'",
+    ).bind(f.id),
+    env.DB.prepare(
+      "UPDATE databases SET generation=generation+1 WHERE id=?",
+    ).bind(f.id),
+    env.DB.prepare(
+      "UPDATE database_admission_epochs SET admission_revision=admission_revision+1,route_revision=route_revision+1 WHERE database_id=?",
+    ).bind(f.id),
+  ]);
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  const snapshot = (await readDatabaseAdmissionSnapshot(env, f.id))!.snapshot;
+  const [prepared] = await ticket(f.id);
+  expect(prepared?.operation).not.toBe(before?.operation);
+  await evictDurableObject(actor(f.id));
+  expect(await ticket(f.id)).toEqual([prepared]);
+  const held = await holdClaims(f.id);
+  try {
+    expect(await actor(f.id).admitWake(f.id, "reader")).toMatchObject({
+      ok: true,
+      wake: {
+        operation: prepared!.operation,
+        generation: snapshot.generation + 1,
+        route_revision: snapshot.route_revision,
+        role_revision_hash: await roleRevisionHash(snapshot.roles),
+      },
+    });
+  } finally {
+    held.open();
+    await expect
+      .poll(async () => (await ticket(f.id))[0]?.state)
+      .toBe("claimed");
+  }
+});
+
+it("a failed snapshot write rolls back ticket preparation and table knowledge together", async () => {
+  const f = await sleeper();
+  const stored = await runInDurableObject(actor(f.id), (instance, state) => {
+    state.storage.sql.exec("DROP TABLE database_ticket");
+    (Reflect.get(instance, "tables") as Set<string>).delete("database_ticket");
+    state.storage.sql.exec(
+      "CREATE TRIGGER refuse_snapshot BEFORE INSERT ON database_snapshot BEGIN SELECT RAISE(ABORT,'snapshot interrupted'); END",
+    );
+    return state.storage.sql
+      .exec<{ snapshot: string }>("SELECT snapshot FROM database_snapshot")
+      .one().snapshot;
+  });
+  await runInDurableObject(actor(f.id), async (instance, state) => {
+    // Catch inside the actor so a deliberate failure does not reset it through the outer
+    // concurrency gate: the same instance must discard its rolled-back table knowledge.
+    const publish = Reflect.get(instance, "publishAdmissionSnapshotLocked") as (
+      snapshot: typeof f.snapshot,
+      completed: string | null,
+    ) => Promise<boolean>;
+    await expect(publish.call(instance, f.snapshot, null)).rejects.toThrow(
+      "snapshot interrupted",
+    );
+    expect(
+      state.storage.sql
+        .exec("SELECT name FROM sqlite_master WHERE name='database_ticket'")
+        .toArray(),
+    ).toEqual([]);
+    expect(
+      state.storage.sql
+        .exec<{ snapshot: string }>("SELECT snapshot FROM database_snapshot")
+        .one().snapshot,
+    ).toBe(stored);
+    expect(
+      (Reflect.get(instance, "tables") as Set<string>).has("database_ticket"),
+    ).toBe(false);
+    state.storage.sql.exec("DROP TRIGGER refuse_snapshot");
+  });
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  expect(await ticket(f.id)).toHaveLength(1);
+  expect(await wakeOperations(f.id)).toBe(0);
+});
+
+it("a prepared ticket reports the actual admission time before waiting for the previous claim", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  let open = () => {};
+  try {
+    const f = await sleeper();
+    const preparedAt = await runInDurableObject(
+      actor(f.id),
+      (_instance, state) =>
+        state.storage.sql
+          .exec<{ issued_at: number }>("SELECT issued_at FROM database_ticket")
+          .one().issued_at,
+    );
+    const previous = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    await runInDurableObject(actor(f.id), (instance) => {
+      Reflect.set(instance, "claim", { operation: "previous", done: previous });
+    });
+    vi.advanceTimersByTime(60_000);
+    const requestedAt = Date.now();
+    const log = vi.spyOn(console, "log");
+    expect((await actor(f.id).admitWake(f.id, "reader")).ok).toBe(true);
+    vi.advanceTimersByTime(5000);
+    open();
+    await expect
+      .poll(async () => (await ticket(f.id))[0]?.state)
+      .toBe("claimed");
+    const lines = log.mock.calls
+      .map(([line]) => (typeof line === "string" ? line : ""))
+      .filter((line) => line.includes('"event":"actor_claim"'))
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((line) => line.database_id === f.id);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.requested_at_ms).toBe(requestedAt);
+    expect(requestedAt).toBeGreaterThan(preparedAt);
+    expect(syncLines(log, f.id)).toEqual([]);
+  } finally {
+    open();
+    vi.useRealTimers();
+  }
+});
+
 it("a stored snapshot of an earlier release is no snapshot: the Actor falls back, and the next publish replaces it", async () => {
   // Live after the node release: the Actors still held snapshots with cache_capable, roles without
   // valid_until and no node, so every read of them threw a ZodError and a cron step failed each minute.
@@ -739,6 +935,7 @@ it("a stored snapshot of an earlier release is no snapshot: the Actor falls back
 
 it("a snapshot without wakeable falls back to ensureAwake", async () => {
   const f = await sleeper();
+  const prepared = await ticket(f.id);
   const calls: unknown[][] = [];
   await runInDurableObject(actor(f.id), (instance, state) => {
     // A snapshot persisted before the wakeable field existed.
@@ -767,7 +964,7 @@ it("a snapshot without wakeable falls back to ensureAwake", async () => {
     sqlstate: "08006",
   });
   expect(calls).toEqual([[f.id, "reader", options]]);
-  expect(await ticket(f.id)).toEqual([]);
+  expect(await ticket(f.id)).toEqual(prepared);
 });
 
 it("a running database at a generation not yet observed waits through ensureAwake", async () => {

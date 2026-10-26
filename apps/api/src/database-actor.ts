@@ -55,11 +55,12 @@ interface WakeTicket {
   route_revision: number;
   role_revision_hash: string;
   state: "pending" | "claimed" | "refused";
+  /** Creation time, which may precede a connect; claim timing uses the actual admission time. */
   issued_at: number;
 }
 /**
  * How one admitWake was answered, for the actor_admit line: from the snapshot of an awake database,
- * with a wake ticket (`reused` when it is one an earlier connect issued), through ensureAwake, or
+ * with a wake ticket (`reused` when already prepared or issued), through ensureAwake, or
  * refused by the Actor's own state.
  */
 interface AdmissionTrace {
@@ -362,6 +363,14 @@ export class DatabaseActor extends DurableObject<Env> {
     )
       return false;
     if (state.snapshot?.deleted && !snapshot.deleted) return false;
+    // Hash before the final authority read, never between that check and the local commit.
+    const hash =
+      !snapshot.deleted &&
+      !snapshot.replacement_active &&
+      snapshot.node !== null &&
+      (snapshot.wakeable === true || this.storedTicket() !== undefined)
+        ? await roleRevisionHash(snapshot.roles)
+        : undefined;
     const epoch = await this.env.DB.prepare(
       "SELECT admission_revision,route_revision,mutation_id,completed_mutation_id FROM database_admission_epochs WHERE database_id=?",
     )
@@ -393,7 +402,53 @@ export class DatabaseActor extends DurableObject<Env> {
       snapshot.runtime.observed_at < state.snapshot.runtime.observed_at
     )
       return false;
-    this.saveAdmissionState(snapshot, undefined);
+    const held = this.storedTicket();
+    let next: WakeTicket | undefined;
+    if (snapshot.wakeable === true && hash !== undefined) {
+      next =
+        held?.state !== "refused" &&
+        held?.generation === snapshot.generation + 1 &&
+        held.route_revision === snapshot.route_revision &&
+        held.role_revision_hash === hash
+          ? held
+          : {
+              operation: newOperationId(),
+              generation: snapshot.generation + 1,
+              route_revision: snapshot.route_revision,
+              role_revision_hash: hash,
+              state: "pending",
+              issued_at: Date.now(),
+            };
+    } else if (
+      held &&
+      held.state !== "refused" &&
+      held.generation === snapshot.generation &&
+      held.role_revision_hash === hash &&
+      (held.route_revision === snapshot.route_revision ||
+        held.route_revision + 1 === snapshot.route_revision) &&
+      (this.ticketWasClaimed(held) ||
+        (this.claim?.operation === held.operation &&
+          completedMutation !== null &&
+          completedMutation === this.ticketMutation))
+    ) {
+      next = held;
+    }
+    // Publish the pair or neither. A rollback must also discard table-existence knowledge
+    // learned inside the transaction, so a later publication can create its tables again.
+    const tables = new Set(this.tables);
+    try {
+      this.ctx.storage.transactionSync(() => {
+        if (next && next !== held) this.saveTicket(next);
+        else if (!next && held)
+          this.ctx.storage.sql.exec(
+            "DELETE FROM database_ticket WHERE singleton=1",
+          );
+        this.saveAdmissionState(snapshot, undefined);
+      });
+    } catch (error) {
+      this.tables = tables;
+      throw error;
+    }
     if (
       this.waiters.size &&
       snapshot.admissible &&
@@ -651,7 +706,13 @@ export class DatabaseActor extends DurableObject<Env> {
   ): Promise<DatabaseWakeAdmission> {
     const started = Date.now();
     const trace: AdmissionTrace = { path: "refused", reused: null };
-    const result = await this.#admitWake(databaseId, user, options, trace);
+    const result = await this.#admitWake(
+      databaseId,
+      user,
+      options,
+      trace,
+      started,
+    );
     if (!result.ok) this.refused("admit_wake", databaseId, result.sqlstate);
     // The waiter is the Edge's connection id, so this line joins its conn_admission.
     console.log(
@@ -710,6 +771,7 @@ export class DatabaseActor extends DurableObject<Env> {
     user: unknown,
     options: { deadline?: number; waiterId?: string } | undefined,
     trace: AdmissionTrace,
+    requestedAt: number,
   ): Promise<DatabaseWakeAdmission> {
     const id = DatabaseId.safeParse(databaseId),
       role = RoleName.safeParse(user);
@@ -746,12 +808,15 @@ export class DatabaseActor extends DurableObject<Env> {
       if (!current.roles.some((value) => value.name === role.data))
         return { ok: false, sqlstate: "28P01" };
       let ticket = this.storedTicket();
-      const reused =
+      let reused =
         ticket !== undefined &&
         ticket.state !== "refused" &&
         ((ticket.generation === current.generation + 1 &&
-          current.wakeable === true) ||
-          (ticket.generation === current.generation && !current.admissible));
+          current.wakeable === true &&
+          ticket.route_revision === current.route_revision) ||
+          (ticket.generation === current.generation &&
+            !current.admissible &&
+            this.ticketWasClaimed(ticket)));
       if (!reused) {
         // Not an idle sleeper and not admissible yet: resuming, being created, restarting at a
         // generation the controller has not reported, or suspended by hand. ensureAwake waits
@@ -760,22 +825,41 @@ export class DatabaseActor extends DurableObject<Env> {
           trace.path = "ensure_awake";
           return await this.ensureAwake(id.data, role.data, options);
         }
-        ticket = {
-          operation: newOperationId(),
-          generation: current.generation + 1,
-          route_revision: current.route_revision,
-          role_revision_hash: await roleRevisionHash(current.roles),
-          state: "pending",
-          issued_at: Date.now(),
-        };
-        this.saveTicket(ticket);
-        if (current.node !== null)
-          this.observePendingSync(id.data, options?.waiterId, ticket);
+        const hash = await roleRevisionHash(current.roles);
+        const latest = this.admissionState();
+        if (
+          latest?.barrier ||
+          latest?.snapshot?.admission_revision !== current.admission_revision ||
+          latest.snapshot.route_revision !== current.route_revision ||
+          latest.snapshot.generation !== current.generation
+        )
+          return { ok: false, sqlstate: "57P03" };
+        // A concurrent first call or publisher may have prepared this ticket during the hash.
+        ticket = this.storedTicket();
+        reused =
+          ticket !== undefined &&
+          ticket.state !== "refused" &&
+          ticket.generation === current.generation + 1 &&
+          ticket.route_revision === current.route_revision &&
+          ticket.role_revision_hash === hash;
+        if (!reused) {
+          ticket = {
+            operation: newOperationId(),
+            generation: current.generation + 1,
+            route_revision: current.route_revision,
+            role_revision_hash: hash,
+            state: "pending",
+            issued_at: Date.now(),
+          };
+          this.saveTicket(ticket);
+          if (current.node !== null)
+            this.observePendingSync(id.data, options?.waiterId, ticket);
+        }
       }
       trace.path = "ticket";
       trace.reused = reused;
       if (ticket!.state === "pending")
-        this.startClaim(id.data, role.data, ticket!);
+        this.startClaim(id.data, role.data, ticket!, requestedAt);
       console.log(
         JSON.stringify({
           event: "actor_ticket",
@@ -817,6 +901,20 @@ export class DatabaseActor extends DurableObject<Env> {
         "SELECT operation,generation,route_revision,role_revision_hash,state,issued_at FROM database_ticket WHERE singleton=1",
       )
       .toArray()[0];
+  }
+  /** A prepared pending ticket alone is not evidence that its generation is a requested wake. */
+  private ticketWasClaimed(ticket: WakeTicket): boolean {
+    if (ticket.state === "claimed") return true;
+    if (!this.hasTable("database_wake")) return false;
+    const wake = this.ctx.storage.sql
+      .exec<{ operation: string; revision: number }>(
+        "SELECT operation,revision FROM database_wake WHERE singleton=1",
+      )
+      .toArray()[0];
+    return (
+      wake?.operation === ticket.operation &&
+      wake.revision === ticket.generation
+    );
   }
   private saveTicket(ticket: WakeTicket): void {
     this.createTable(
@@ -873,11 +971,16 @@ export class DatabaseActor extends DurableObject<Env> {
     }
   }
   /** Starts the ticket's claim unless it is already in flight; claims run one after another. */
-  private startClaim(id: string, user: string, ticket: WakeTicket): void {
+  private startClaim(
+    id: string,
+    user: string,
+    ticket: WakeTicket,
+    requestedAt: number,
+  ): void {
     if (this.claim?.operation === ticket.operation) return;
     const previous = this.claim?.done ?? Promise.resolve();
     const done: Promise<void> = previous
-      .then(() => this.claimTicket(id, user, ticket))
+      .then(() => this.claimTicket(id, user, ticket, requestedAt))
       .catch(() => undefined)
       .finally(() => {
         if (this.claim?.done === done) this.claim = undefined;
@@ -894,6 +997,7 @@ export class DatabaseActor extends DurableObject<Env> {
     id: string,
     user: string,
     ticket: WakeTicket,
+    requestedAt: number,
   ): Promise<void> {
     const started = Date.now();
     let outcome: "claimed" | "already" | "refused" | "lost" | "failed" =
@@ -950,7 +1054,7 @@ export class DatabaseActor extends DurableObject<Env> {
                 ticket.operation,
                 ticket.generation,
                 started,
-                ticket.issued_at,
+                requestedAt,
               );
             return transition;
           },
@@ -1570,9 +1674,10 @@ export class DatabaseActor extends DurableObject<Env> {
     return true;
   }
   /**
-   * The wake ticket whose claim D1 has not committed yet. The node releases a wake before that
-   * commit, so its first report may name this generation while D1 still names the previous one
-   * (`observationVerdict`).
+   * The reserved pending ticket, which may have been prepared before any claim started. The
+   * node's intake still requires its exact operation/generation and then D1's matching committed
+   * operation: preparation alone cannot accept a report (`observationVerdict`). A real wake may
+   * be released before that commit, while D1 still names the previous generation.
    */
   async pendingTicket(): Promise<{
     generation: number;
