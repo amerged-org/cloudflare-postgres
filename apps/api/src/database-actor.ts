@@ -663,6 +663,7 @@ export class DatabaseActor extends DurableObject<Env> {
         reused: trace.reused,
         // Time in this handler, excluding delivery/queueing before entry and transport afterwards.
         // Compare with the Edge's admit_ms using waiter_id/cid; this alone is not the RPC duration.
+        // Cloudflare's clock advances after I/O: 0 does not prove that no CPU time was spent.
         handler_ms: Date.now() - started,
         // 0 when this very call built the instance; a node report or another call may have built it.
         instance_age_ms: Date.now() - this.constructedAt,
@@ -768,6 +769,8 @@ export class DatabaseActor extends DurableObject<Env> {
           issued_at: Date.now(),
         };
         this.saveTicket(ticket);
+        if (current.node !== null)
+          this.observePendingSync(id.data, options?.waiterId, ticket);
       }
       trace.path = "ticket";
       trace.reused = reused;
@@ -829,6 +832,45 @@ export class DatabaseActor extends DurableObject<Env> {
       ticket.state,
       ticket.issued_at,
     );
+  }
+  /**
+   * Observe all writes pending now, before the claim's microtask starts. This completion interval
+   * includes JavaScript scheduling, not just disk time; later claim writes may still gate the
+   * reply. The observer never holds admission, and the automatic output gate remains unchanged.
+   */
+  private observePendingSync(
+    databaseId: string,
+    waiterId: string | undefined,
+    ticket: WakeTicket,
+  ): void {
+    const started = Date.now();
+    const waiter = z.uuid().safeParse(waiterId);
+    const report = (outcome: "synced" | "failed") => {
+      const at = Date.now();
+      console.log(
+        JSON.stringify({
+          event: "actor_admit_pending_sync",
+          database_id: databaseId,
+          waiter_id: waiter.success ? waiter.data : null,
+          operation: ticket.operation,
+          generation: ticket.generation,
+          started_at_ms: started,
+          sync_ms: Math.max(0, at - started),
+          outcome,
+          at_ms: at,
+        }),
+      );
+    };
+    try {
+      this.ctx.waitUntil(
+        this.ctx.storage.sync().then(
+          () => report("synced"),
+          () => report("failed"),
+        ),
+      );
+    } catch {
+      report("failed");
+    }
   }
   /** Starts the ticket's claim unless it is already in flight; claims run one after another. */
   private startClaim(id: string, user: string, ticket: WakeTicket): void {
