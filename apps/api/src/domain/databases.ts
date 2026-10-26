@@ -11,6 +11,12 @@ import {
   OWNER_ROLE_NAME,
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
+import {
+  combineNativeGuard,
+  databaseNeedsExtended,
+  needsExtendedStorage,
+  requireExtendedNative,
+} from "./native-capabilities.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
 import type { ApiContext, Env } from "../env.ts";
 import {
@@ -93,7 +99,7 @@ export interface DatabaseInsertSnapshot {
   nodeId: string | null;
   /** The memory and storage pending on that node when `placementNodes` read it, and the instant of that read. */
   pendingMemoryMib?: number;
-  pendingStorageGib?: number;
+  pendingStorageMib?: number;
   decidedAt?: number;
   id: string;
   archivePath: string;
@@ -105,10 +111,10 @@ export function databaseInsertStatement(
   snapshot: DatabaseInsertSnapshot,
 ): D1PreparedStatement {
   const own = snapshot.resources ?? NO_OVERRIDES,
-    ownValues = [own.memory_mib, own.cpu_millicores, own.storage_gib],
+    ownValues = [own.memory_mib, own.cpu_millicores, own.storage_mib],
     sizeValues = [
       snapshot.size.memory_mib,
-      snapshot.size.storage_gib,
+      snapshot.size.storage_mib,
       snapshot.size.cpu_millicores,
       snapshot.size.max_connections,
       snapshot.size.sleep_after_seconds,
@@ -118,10 +124,10 @@ export function databaseInsertStatement(
   if (snapshot.nodeId === null) {
     return db
       .prepare(
-        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,status_message,created_at,updated_at,own_memory_mib,own_cpu_millicores,own_storage_gib)
+        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,status_message,created_at,updated_at,own_memory_mib,own_cpu_millicores,own_storage_mib)
       SELECT ?,p.id,r.id,NULL,?,s.id,?,'running',1,?,'Waiting for verified regional capacity',?,?,?,?,?
       FROM projects p JOIN regions r ON r.id=? JOIN size_classes s ON s.id=? AND s.enabled=1
-      WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=?
+      WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_mib=? AND s.cpu_millicores=?
       AND ${admissionScopesOpenSql("p.id", "r.id", "NULL")}
       AND s.max_connections=? AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?
       AND (${snapshot.authority?.sql ?? "1=1"})`,
@@ -144,17 +150,17 @@ export function databaseInsertStatement(
   const guard = placementGuard("n", {
     nodeId: snapshot.nodeId,
     pendingMemoryMib: snapshot.pendingMemoryMib ?? 0,
-    pendingStorageGib: snapshot.pendingStorageGib ?? 0,
+    pendingStorageMib: snapshot.pendingStorageMib ?? 0,
     now: snapshot.decidedAt ?? Date.parse(snapshot.now),
   });
   return db
     .prepare(
-      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,created_at,updated_at,placed_at,own_memory_mib,own_cpu_millicores,own_storage_gib)
+      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,created_at,updated_at,placed_at,own_memory_mib,own_cpu_millicores,own_storage_mib)
             SELECT ?,p.id,n.region_id,n.id,?,s.id,?,'running',1,?,?,?,?,?,?,? FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
             JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id
             WHERE n.region_id=? AND ${guard.sql}
             AND ${admissionScopesOpenSql("p.id", "r.id", "n.id")}
-            AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=? AND s.max_connections=?
+            AND s.memory_mib=? AND s.storage_mib=? AND s.cpu_millicores=? AND s.max_connections=?
             AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=? AND (${snapshot.authority?.sql ?? "1=1"})`,
     )
     .bind(
@@ -214,6 +220,11 @@ export async function createDatabase(
         own,
         await regionBounds(c.env.DB, region.id),
       );
+      const native = await requireExtendedNative(
+        c.env,
+        { regionId: region.id },
+        needsExtendedStorage(effective.storage_mib),
+      );
       const id = newDatabaseId(),
         op = newOperationId(),
         now = new Date().toISOString();
@@ -252,12 +263,12 @@ export async function createDatabase(
               resources: own,
               nodeId: node?.id ?? null,
               pendingMemoryMib: node?.pending_memory_mib,
-              pendingStorageGib: node?.pending_storage_gib,
+              pendingStorageMib: node?.pending_storage_mib,
               decidedAt,
               id,
               archivePath: archive,
               now,
-              authority: lease.guard,
+              authority: combineNativeGuard(lease.guard, native),
             }),
             c.env.DB.prepare(
               `INSERT INTO roles (database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at)
@@ -296,7 +307,7 @@ export async function createDatabase(
             );
           throw error;
         }
-        if (result[0]!.meta.changes === 1) {
+        if (result[0]!.meta.changes > 0) {
           if (node !== null) hint(c, [id]);
           else c.executionCtx.waitUntil(runNodeCapacity(c.env, region.id));
           return databaseOperationResponse(c, op);
@@ -369,7 +380,7 @@ export async function listDatabases(c: ApiContext): Promise<Response> {
  */
 export interface ResizeCapacity {
   pendingMemoryMib: number;
-  pendingStorageGib: number;
+  pendingStorageMib: number;
   decidedAt: number;
   grows: boolean;
 }
@@ -388,19 +399,19 @@ export function databaseResizeStatement(
     own = [
       resources.memory_mib,
       resources.cpu_millicores,
-      resources.storage_gib,
+      resources.storage_mib,
     ],
-    wasOwn = [current.memory_mib, current.cpu_millicores, current.storage_gib],
+    wasOwn = [current.memory_mib, current.cpu_millicores, current.storage_mib],
     ownSet =
-      "size_class_id=?,own_memory_mib=?,own_cpu_millicores=?,own_storage_gib=?",
+      "size_class_id=?,own_memory_mib=?,own_cpu_millicores=?,own_storage_mib=?",
     ownRead =
-      "own_memory_mib IS ? AND own_cpu_millicores IS ? AND own_storage_gib IS ?",
-    classRead = `s.memory_mib=? AND s.cpu_millicores=? AND s.storage_gib=? AND s.max_connections=?
+      "own_memory_mib IS ? AND own_cpu_millicores IS ? AND own_storage_mib IS ?",
+    classRead = `s.memory_mib=? AND s.cpu_millicores=? AND s.storage_mib=? AND s.max_connections=?
       AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?`,
     classValues = [
       size.memory_mib,
       size.cpu_millicores,
-      size.storage_gib,
+      size.storage_mib,
       size.max_connections,
       size.sleep_after_seconds,
       size.archive_timeout_seconds,
@@ -411,7 +422,7 @@ export function databaseResizeStatement(
       ? null
       : nodeLoadGuard("n", {
           pendingMemoryMib: capacity.pendingMemoryMib,
-          pendingStorageGib: capacity.pendingStorageGib,
+          pendingStorageMib: capacity.pendingStorageMib,
           now: capacity.decidedAt,
         });
   if (row.desired_state === "suspended")
@@ -535,8 +546,18 @@ export async function scheduleDatabaseResize(
     resources,
     await regionBounds(db, row.region_id),
   );
-  if (after.storage_gib < before.storage_gib)
+  if (after.storage_mib < before.storage_mib)
     throw new ApiError("invalid_request", "Storage shrink is not supported");
+  const native = await requireExtendedNative(
+    env,
+    row.node_id === null
+      ? { regionId: row.region_id }
+      : { nodeId: row.node_id },
+    needsExtendedStorage(after.storage_mib) ||
+      (await databaseNeedsExtended(env, row.id)),
+  );
+  writeAuthority.sql = `(${writeAuthority.sql}) AND (${native.sql})`;
+  writeAuthority.bindings.push(...native.bindings);
   const sleeping = row.desired_state === "suspended";
   const op = newOperationId();
   if (target.id === previous.id && sameResources(before, after)) {
@@ -544,14 +565,14 @@ export async function scheduleDatabaseResize(
     if (!sameOverrides(current, resources)) {
       const stored = await db
         .prepare(
-          `UPDATE databases SET own_memory_mib=?,own_cpu_millicores=?,own_storage_gib=?
+          `UPDATE databases SET own_memory_mib=?,own_cpu_millicores=?,own_storage_mib=?
          WHERE id=? AND project_id=? AND generation=? AND size_class_id=? AND updated_at=? AND deleted_at IS NULL
-           AND own_memory_mib IS ? AND own_cpu_millicores IS ? AND own_storage_gib IS ? AND (${writeAuthority.sql})`,
+           AND own_memory_mib IS ? AND own_cpu_millicores IS ? AND own_storage_mib IS ? AND (${writeAuthority.sql})`,
         )
         .bind(
           resources.memory_mib,
           resources.cpu_millicores,
-          resources.storage_gib,
+          resources.storage_mib,
           row.id,
           row.project_id,
           row.generation,
@@ -559,11 +580,11 @@ export async function scheduleDatabaseResize(
           row.updated_at,
           current.memory_mib,
           current.cpu_millicores,
-          current.storage_gib,
+          current.storage_mib,
           ...writeAuthority.bindings,
         )
         .run();
-      if (stored.meta.changes !== 1)
+      if (stored.meta.changes === 0)
         throw new ApiError("conflict", "Database changed; retry the request", {
           reason: "generation_changed",
         });
@@ -638,10 +659,10 @@ export async function scheduleDatabaseResize(
     memory_mib: sleeping
       ? 0
       : Math.max(0, after.memory_mib - before.memory_mib),
-    storage_gib: Math.max(0, after.storage_gib - before.storage_gib),
+    storage_mib: Math.max(0, after.storage_mib - before.storage_mib),
     cpu_millicores: sleeping ? 0 : after.cpu_millicores,
   };
-  if (!sleeping || growth.storage_gib > 0) {
+  if (!sleeping || growth.storage_mib > 0) {
     const decidedAt = Date.parse(now),
       node = (await placementNodes(db, row.region_id, decidedAt)).find(
         (value) => value.id === row.node_id,
@@ -653,10 +674,10 @@ export async function scheduleDatabaseResize(
         { reason: "node_capacity" },
       );
     // Growth is written only while the node still reports and nothing else was placed on it.
-    if (growth.memory_mib > 0 || growth.storage_gib > 0)
+    if (growth.memory_mib > 0 || growth.storage_mib > 0)
       capacity = {
         pendingMemoryMib: node.pending_memory_mib,
-        pendingStorageGib: node.pending_storage_gib,
+        pendingStorageMib: node.pending_storage_mib,
         decidedAt,
         grows: growth.memory_mib > 0,
       };
@@ -722,7 +743,7 @@ export async function scheduleDatabaseResize(
         }),
       );
     const result = await mutation.batch(statements);
-    if (result[0]!.meta.changes !== 1) {
+    if (result[0]!.meta.changes === 0) {
       const changed = await db
         .prepare("SELECT * FROM databases WHERE id=?")
         .bind(row.id)
@@ -882,7 +903,7 @@ export async function deleteDatabase(
             c.env.DB.prepare(
               `INSERT INTO retained_archives(source_database_id,project_id,region_id,archive_path,storage_generation,roles_json,deleted_at,expires_at)
           SELECT d.id,d.project_id,d.region_id,d.archive_path,d.storage_generation,
-          (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'password_revision',r.password_revision,'updated_at',r.updated_at,'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'bypass_rls',r.bypass_rls)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL),
+          (SELECT json_group_array(json_patch(json_object('name',r.name,'owner',r.owner,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'password_revision',r.password_revision,'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'bypass_rls',r.bypass_rls),CASE WHEN r.membership_options=3 THEN '{}' ELSE json_object('membership_options',r.membership_options) END)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL),
           d.deleted_at,strftime('%Y-%m-%dT%H:%M:%fZ',d.deleted_at,'+'||s.backup_retention_days||' days')
           FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.project_id=? AND d.generation=? AND d.deleted_at=? AND (${guard.sql})`,
             ).bind(id, row.project_id, generation, now, ...guard.bindings),

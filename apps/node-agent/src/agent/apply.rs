@@ -632,7 +632,7 @@ impl<M: Machine> Core<M> {
         let current = Resources {
             memory_mib: entry.memory_mib,
             cpu_millicores: entry.cpu_millicores,
-            storage_gib: entry.storage_gib,
+            storage_mib: entry.storage_mib,
         };
         let held = db
             .view()
@@ -652,7 +652,7 @@ impl<M: Machine> Core<M> {
                 && (growing
                     || held
                         .as_ref()
-                        .is_some_and(|held| held.storage_gib < current.storage_gib))
+                        .is_some_and(|held| held.storage_mib < current.storage_mib))
             {
                 let mut result = self
                     .machine
@@ -1386,7 +1386,7 @@ mod tests {
                 .state
                 .as_ref()
                 .and_then(|s| s.resources.clone())
-                .is_some_and(|r| r.storage_gib == 2)
+                .is_some_and(|r| r.storage_mib == 2048)
         })
         .await;
         assert_eq!(rig.machine.limits(&id).unwrap().cpu_millicores, 500);
@@ -1602,22 +1602,25 @@ mod tests {
             .unwrap()
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_database_resized_while_it_sleeps_wakes_within_its_new_limits() {
+    async fn a_sub_gib_database_resized_while_it_sleeps_wakes_within_its_new_limits() {
         let Some(rig) = Rig::new("resize-asleep").await else {
             return;
         };
         let mut db = rig.entry_json();
+        db["resources"] = json!({"memory_mib":256,"cpu_millicores":250,"storage_mib":500});
         let id = id_of(&db);
         let handle = rig.core.db(&id);
         rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
         eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        assert_eq!(rig.machine.volumes()[0].1, 500 << 20);
+        assert_eq!(handle.state().unwrap().resources.unwrap().storage_mib, 500);
         assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
 
         // The page resizes the sleeping database: its volume takes the new size before anything
         // starts it, and the slot it then binds takes the limits of the new size from its entry,
         // so that it never runs its new settings in its old limits.
         next(&mut db, 6);
-        db["resources"] = json!({"memory_mib": 512, "cpu_millicores": 500, "storage_gib": 2});
+        db["resources"] = json!({"memory_mib": 512, "cpu_millicores": 500, "storage_gib": 1});
         rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
         eventually(30, "the new size to be kept", || {
             handle
@@ -1627,7 +1630,8 @@ mod tests {
                 .is_some_and(|resources| resources.memory_mib == 512)
         })
         .await;
-        assert_eq!(rig.machine.volumes()[0].1, 2 << 30);
+        assert_eq!(rig.machine.volumes()[0].1, 1 << 30);
+        assert_eq!(handle.state().unwrap().resources.unwrap().storage_mib, 1024);
         assert_eq!(handle.phase(), Phase::Asleep);
         assert_eq!(
             rig.machine.limits(&id),
@@ -1684,8 +1688,8 @@ mod tests {
             handle
                 .state()
                 .and_then(|state| state.resources)
-                .map(|resources| resources.storage_gib),
-            Some(2),
+                .map(|resources| resources.storage_mib),
+            Some(2048),
             "a growth that failed is not kept as done"
         );
 

@@ -29,6 +29,7 @@ import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
 import { hintNode } from "./node-hints.ts";
 import { releaseIsSigned } from "./release-signature.ts";
+import { extendedReleaseAssignmentGuard } from "./native-capabilities.ts";
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -251,12 +252,27 @@ export async function assignFleetRegionRelease(
   return withIdempotency(c, {
     replay: read,
     execute: async (lease) => {
+      const native = extendedReleaseAssignmentGuard(
+        c.env,
+        regionId,
+        input.release_id,
+      );
+      if (
+        !(await c.env.DB.prepare(`SELECT 1 WHERE ${native.sql}`)
+          .bind(...native.bindings)
+          .first())
+      )
+        throw new ApiError(
+          "conflict",
+          "This region has used formats requiring a qualified native release; downgrade is refused",
+          { reason: "not_ready" },
+        );
       const results = await c.env.DB.batch([
         c.env.DB.prepare(
           `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at)
           SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM regions WHERE id=?)
             AND (?=0 OR EXISTS(SELECT 1 FROM fleet_region_releases WHERE region_id=? AND revision=?))
-            AND (${lease.guard.sql})
+            AND (${lease.guard.sql}) AND (${native.sql})
           ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,
             revision=excluded.revision,updated_at=excluded.updated_at WHERE fleet_region_releases.revision=?`,
         ).bind(
@@ -269,6 +285,7 @@ export async function assignFleetRegionRelease(
           regionId,
           input.expected_revision,
           ...lease.guard.bindings,
+          ...native.bindings,
           input.expected_revision,
         ),
         lease.completeStatement(regionId, 200, {

@@ -31,12 +31,18 @@
   // Optional authenticated alert receiver; direct Resend also supports API-configured sender/recipient.
   // "services": [{ "binding": "INFRASTRUCTURE_ALERT_WEBHOOK", "service": "your-alert-receiver", "entrypoint": "InfrastructureAlertsService" }],
   "vars": {
+    // CONTROL_PLANE_MAINTENANCE="on" quiesces D1-facing HTTP/RPC/background work for a schema
+    // cutover. Existing native SQL sessions are unchanged; new connections are temporarily refused.
+    // Pause/drain existing Workflows separately and verify the paused version before migrating.
     // Registering a release and adding a node need NODE_API_ORIGIN (this Worker's https origin: it
     // names the URLs of a release's files, which the Worker streams from the ARCHIVE bucket's
     // node-images/ prefix, and it is where the installer enrolls), NODE_DNS_SERVERS (a JSON array of one to three resolver addresses the installed node
     // uses) and, for the node's Tunnel and its hostnames, NODE_GATEWAY_DOMAIN and
     // NODE_GATEWAY_ZONE_ID (see the secrets below). A node whose region has no release assigned
     // waits for one.
+    // NATIVE_EXTENDED_RESOURCES_RELEASE_IDS: a JSON array of signed release IDs qualified for MiB
+    // storage and restrictive role memberships. Unset/invalid means none; enable only after native
+    // rollout and OS/readback verification. Keep compatible current and next release IDs during updates.
     // NODE_SHELL_HOSTNAME: "true" also gives each node a shell hostname (pgcf-shell-<id>.<domain>) on
     // its Tunnel; any other value, or none (the default), gives none and removes the one a node has.
     // Keep it off until Cloudflare Access guards the shell (scripts/operations/setup-access.ts

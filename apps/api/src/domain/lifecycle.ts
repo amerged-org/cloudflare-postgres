@@ -2,6 +2,7 @@
 import {
   newOperationId,
   DatabaseId,
+  type DatabasePowerChange,
   OperationId,
   Timestamp,
 } from "@pgcf/contracts";
@@ -24,16 +25,36 @@ async function nodeCanResume(db: D1Database, id: string): Promise<boolean> {
   return row?.fits === 1;
 }
 
+const generationChanged = () =>
+  new ApiError("conflict", "Database changed; retry the request", {
+    reason: "generation_changed",
+  });
+
+async function assertCurrentGeneration(db: D1Database, row: DatabaseRow) {
+  const generation = await db
+    .prepare("SELECT generation FROM databases WHERE id=? AND project_id=?")
+    .bind(row.id, row.project_id)
+    .first<number>("generation");
+  if (generation !== row.generation) throw generationChanged();
+}
+
 export async function changePower(
   c: ApiContext,
   id: string,
   action: "suspend" | "resume",
+  body: DatabasePowerChange = {},
 ): Promise<Response> {
   await databaseForRequest(c, id, true);
   return withIdempotency(c, {
     replay: (op, status) => databaseOperationResponse(c, op, status),
     execute: async (lease) => {
       const row = await databaseForRequest(c, id, true);
+      // Replays return their accepted operation before this new intent's precondition.
+      if (
+        body.expected_generation !== undefined &&
+        body.expected_generation !== row.generation
+      )
+        throw generationChanged();
       if (row.desired_state === "deleted" || row.deleted_at !== null)
         throw new ApiError("conflict", "Database is deleted", {
           reason: "database_deleted",
@@ -44,18 +65,30 @@ export async function changePower(
           row.suspension_reason === "manual"
         : row.desired_state === "running";
       if (same) {
-        const existing = await c.env.DB.prepare(
-          `SELECT id FROM operations WHERE database_id=? AND project_id=? AND generation=? AND kind IN (?,?) ORDER BY created_at DESC,id DESC LIMIT 1`,
-        )
-          .bind(
-            id,
-            row.project_id,
-            row.generation,
-            `database.${action}`,
-            sleeping ? "database.suspend" : "database.wake",
+        const existingOperation = () =>
+          c.env.DB.prepare(
+            `SELECT id FROM operations WHERE database_id=? AND project_id=? AND generation=? AND kind IN (?,?) ORDER BY created_at DESC,id DESC LIMIT 1`,
           )
-          .first<{ id: string }>();
-        let op = existing?.id;
+            .bind(
+              id,
+              row.project_id,
+              row.generation,
+              `database.${action}`,
+              sleeping ? "database.suspend" : "database.wake",
+            )
+            .first<{ id: string }>();
+        // Adopting an existing operation is an acceptance boundary too. A newer operator
+        // intent must not be adopted using the generation read before it won.
+        const stateGuard = {
+          sql: `EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? AND d.project_id=? AND d.generation=? AND d.desired_state=? AND d.deleted_at IS NULL ${sleeping ? "AND d.suspension_reason='manual'" : ""})`,
+          bindings: [id, row.project_id, row.generation, row.desired_state],
+        };
+        const complete = (operation: string) =>
+          lease.completeStatement(operation, 202, {
+            sql: `EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?) AND (${stateGuard.sql})`,
+            bindings: [operation, row.project_id, ...stateGuard.bindings],
+          });
+        let op = (await existingOperation())?.id;
         if (
           !op &&
           !sleeping &&
@@ -65,10 +98,12 @@ export async function changePower(
         ) {
           op = newOperationId();
           const now = new Date().toISOString();
-          await c.env.DB.prepare(
-            `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) SELECT ?,'database.resume','succeeded',project_id,id,generation,?,?,? FROM databases WHERE id=? AND generation=? AND updated_at=? AND desired_state='running' AND observed_state='ready' AND observed_generation=generation AND (${lease.guard.sql}) ON CONFLICT DO NOTHING`,
-          )
-            .bind(
+          // Commit the noop and its reservation together: a lost answer is replayable and
+          // no operator request can interleave between the insert and acceptance.
+          const result = await c.env.DB.batch([
+            c.env.DB.prepare(
+              `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) SELECT ?,'database.resume','succeeded',project_id,id,generation,?,?,? FROM databases WHERE id=? AND generation=? AND updated_at=? AND desired_state='running' AND observed_state='ready' AND observed_generation=generation AND observed_power='awake' AND (${stateGuard.sql}) AND (${lease.guard.sql}) ON CONFLICT DO NOTHING`,
+            ).bind(
               op,
               now,
               now,
@@ -76,29 +111,26 @@ export async function changePower(
               id,
               row.generation,
               row.updated_at,
+              ...stateGuard.bindings,
               ...lease.guard.bindings,
-            )
-            .run();
-          op = (
-            await c.env.DB.prepare(
-              `SELECT id FROM operations WHERE database_id=? AND generation=? AND kind='database.resume'`,
-            )
-              .bind(id, row.generation)
-              .first<{ id: string }>()
-          )?.id;
+            ),
+            complete(op),
+          ]);
+          if (result[1]!.meta.changes === 1)
+            return databaseOperationResponse(c, op);
+          // Another same-generation noop may have won the unique operation slot.
+          op = (await existingOperation())?.id;
         }
-        if (!op)
+        if (!op) {
+          await assertCurrentGeneration(c.env.DB, row);
           throw new ApiError(
             "conflict",
             "Database configuration is not ready",
             { reason: "not_ready" },
           );
-        await lease
-          .completeStatement(op, 202, {
-            sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
-            bindings: [op, row.project_id],
-          })
-          .run();
+        }
+        if ((await complete(op).run()).meta.changes !== 1)
+          throw generationChanged();
         return databaseOperationResponse(c, op);
       }
       const verifiedIdle =
@@ -146,6 +178,7 @@ export async function changePower(
         },
       );
       if (result[0]!.meta.changes !== 1) {
+        await assertCurrentGeneration(c.env.DB, row);
         // A start that the node cannot hold is told apart from a change that raced the request.
         if (!sleeping && !(await nodeCanResume(c.env.DB, id)))
           throw new ApiError(
@@ -153,9 +186,7 @@ export async function changePower(
             "Current node has insufficient memory, CPU or storage",
             { reason: "node_capacity" },
           );
-        throw new ApiError("conflict", "Database changed; retry the request", {
-          reason: "generation_changed",
-        });
+        throw generationChanged();
       }
       hint(c, [id]);
       return databaseOperationResponse(c, op);

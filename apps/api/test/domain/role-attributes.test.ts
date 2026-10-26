@@ -8,6 +8,7 @@ import {
   fixture,
   request,
   report,
+  qualifyExtendedNative,
 } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
@@ -44,6 +45,74 @@ async function desiredRoles(f: Fixture, id: string): Promise<unknown[]> {
 }
 
 describe("role attributes", () => {
+  it("persists restrictive membership options through replay, password reset, listing and desired state", async () => {
+    const f = await fixture(),
+      id = await database(f),
+      idempotency = key();
+    await qualifyExtendedNative(f);
+    await createRole(f, id, { name: "reader" });
+    const body = {
+      name: "limited",
+      member_of: ["reader"],
+      membership_options: { inherit: true, set: false },
+    };
+    for (const response of [
+      await createRole(f, id, body, idempotency),
+      await createRole(f, id, body, idempotency),
+    ]) {
+      expect(response.status).toBe(201);
+      expect(Role.parse(await response.json())).toMatchObject(body);
+    }
+    const reset = await request(
+      `/v1/databases/${id}/roles/limited/reset-password`,
+      f.integrator,
+      "POST",
+      undefined,
+      key(),
+    );
+    expect(reset.status).toBe(200);
+    expect(Role.parse(await reset.json())).toMatchObject({
+      ...body,
+      password_revision: 2,
+    });
+    expect(
+      (await listRoles(f, id)).find((role) => role.name === "limited"),
+    ).toMatchObject(body);
+    expect(
+      (await desiredRoles(f, id)).find(
+        (role) => (role as { name: string }).name === "limited",
+      ),
+    ).toMatchObject(body);
+    expect(
+      (
+        await createRole(
+          f,
+          id,
+          { ...body, membership_options: { inherit: false, set: false } },
+          idempotency,
+        )
+      ).status,
+    ).toBe(409);
+  });
+
+  it("omits explicitly requested default membership flags from public and node responses", async () => {
+    const f = await fixture(),
+      id = await database(f);
+    await createRole(f, id, { name: "reader" });
+    const response = await createRole(f, id, {
+      name: "plain_member",
+      member_of: ["reader"],
+      membership_options: { inherit: true, set: true },
+    });
+    expect(response.status).toBe(201);
+    expect(await response.json()).not.toHaveProperty("membership_options");
+    expect(
+      (await desiredRoles(f, id)).find(
+        (role) => (role as { name: string }).name === "plain_member",
+      ),
+    ).not.toHaveProperty("membership_options");
+  });
+
   it("creates a role with expiry, a connection limit, memberships and RLS bypass and lists them", async () => {
     const f = await fixture(),
       id = await database(f);

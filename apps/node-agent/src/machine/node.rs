@@ -34,8 +34,6 @@ use std::{
 const APT_SOURCES: &str = "/etc/apt/sources.list.d/trixie.sources";
 /// The group of the gateway, which reads the database's socket directory (plan 5.5).
 const GATEWAY_GROUP: &str = "pgcf-gateway";
-/// The locale of every database (plan Appendix C): the image has it.
-const LOCALE: &str = "C.UTF-8";
 /// Clock ticks per second of `/proc/stat`; the kernel's `USER_HZ`, 100 on every Linux the node
 /// image runs.
 const USER_HZ: u64 = 100;
@@ -459,7 +457,7 @@ impl Machine for Node {
 
     async fn initdb(&self, account: &Account, data: &Path) -> io::Result<()> {
         let output = tokio::process::Command::new(self.layout.postgres_bin.join("initdb"))
-            .args(initdb_arguments(data, Some(LOCALE)))
+            .args(initdb_arguments(data))
             .uid(account.uid)
             .gid(account.gid)
             .env_clear()

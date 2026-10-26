@@ -224,7 +224,9 @@ it("names a failing step in the event id: another step is another error, the sam
     .map((value) => value.key);
   expect(sent).toEqual([
     `${first.event_id}:${first.occurred_at}`,
+    `${first.event_id}:${new Date(now + 1000).toISOString()}:resolved`,
     `${other.event_id}:${other.occurred_at}`,
+    `${other.event_id}:${new Date(now + 3000).toISOString()}:resolved`,
     `${again.event_id}:${again.occurred_at}`,
   ]);
 });

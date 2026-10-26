@@ -6,6 +6,7 @@ import {
   Database,
   DatabaseWithOperation,
   type DatabaseCreate,
+  type DatabasePowerChange,
 } from "../src/api.ts";
 import {
   newDatabaseId,
@@ -389,6 +390,76 @@ it("uses the management operation and role paths with caller-owned mutation keys
         .map(([, init]) => new Headers(init!.headers).get("Idempotency-Key")),
     ),
   ).toEqual(new Set(Object.values(keys)));
+  for (const index of [2, 3]) {
+    const init = fetcher.mock.calls[index]![1]!;
+    expect(init.body).toBeUndefined();
+    expect(new Headers(init.headers).has("Content-Type")).toBe(false);
+  }
+});
+
+it("sends optional power generation guards with the caller's mutation keys", async () => {
+  const f = fixtures();
+  const acknowledgement = { database: f.database, operation: f.operation };
+  const fetcher = vi
+    .fn<typeof fetch>()
+    .mockImplementation(async () =>
+      Response.json(acknowledgement, { status: 202 }),
+    );
+  const client = new PgcfClient({ baseUrl, apiKey: f.apiKey, fetch: fetcher });
+  const suspendKey = crypto.randomUUID(),
+    resumeKey = crypto.randomUUID();
+  expect(
+    await client.suspendDatabase(f.database.id, suspendKey, {
+      expected_generation: 1,
+    }),
+  ).toEqual(DatabaseWithOperation.parse(acknowledgement));
+  expect(
+    await client.resumeDatabase(f.database.id, resumeKey, {
+      expected_generation: 2,
+    }),
+  ).toEqual(DatabaseWithOperation.parse(acknowledgement));
+  expect(
+    fetcher.mock.calls.map(([url, init]) => [
+      new URL(String(url)).pathname,
+      init!.method,
+      JSON.parse(String(init!.body)),
+      new Headers(init!.headers).get("Idempotency-Key"),
+      new Headers(init!.headers).get("Content-Type"),
+    ]),
+  ).toEqual([
+    [
+      `/v1/databases/${f.database.id}/suspend`,
+      "POST",
+      { expected_generation: 1 },
+      suspendKey,
+      "application/json",
+    ],
+    [
+      `/v1/databases/${f.database.id}/resume`,
+      "POST",
+      { expected_generation: 2 },
+      resumeKey,
+      "application/json",
+    ],
+  ]);
+});
+
+it("rejects invalid power guards before sending", async () => {
+  const f = fixtures();
+  const fetcher = vi.fn<typeof fetch>();
+  const client = new PgcfClient({ baseUrl, apiKey: f.apiKey, fetch: fetcher });
+  await expect(async () =>
+    client.suspendDatabase(f.database.id, f.idempotencyKey, {
+      expected_generation: 0,
+    }),
+  ).rejects.toMatchObject({ code: "invalid_request" });
+  await expect(async () =>
+    client.resumeDatabase(f.database.id, f.idempotencyKey, {
+      expected_generation: 1,
+      force: true,
+    } as DatabasePowerChange),
+  ).rejects.toMatchObject({ code: "invalid_request" });
+  expect(fetcher).not.toHaveBeenCalled();
 });
 
 it("rejects invalid configuration, IDs, roles, input and missing idempotency keys before fetch", () => {

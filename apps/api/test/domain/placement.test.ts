@@ -34,7 +34,7 @@ const DAY = 86_400_000;
 const SMALL: PlacementNeed = {
   memory_mib: 256,
   cpu_millicores: 500,
-  storage_gib: 5,
+  storage_mib: 5120,
 };
 
 /** A node that reported a minute ago and has no pending placements; override what a case needs. */
@@ -61,7 +61,7 @@ function node(overrides: Partial<PlacementNode> = {}): PlacementNode {
     cpu_peak_ppm: 0,
     ram_now_ppm: 0,
     pending_memory_mib: 0,
-    pending_storage_gib: 0,
+    pending_storage_mib: 0,
     ...overrides,
   };
 }
@@ -240,12 +240,29 @@ describe("which node takes a new database", () => {
       node({
         pool_data_total_bytes: 100 * GIB,
         pool_nominal_bytes: 390 * GIB,
-        pending_storage_gib: pending,
+        pending_storage_mib: pending * 1024,
       });
     // The cap is 400 GiB; 390 GiB are reported, the database brings 5 GiB.
     expect(pick([pool(5)])).not.toBeNull();
     expect(pick([pool(6)])).toBeNull();
     expect(pick([pool(10)])).toBeNull();
+  });
+
+  it("counts mixed whole-GiB and sub-GiB storage without rounding at the pool cap", () => {
+    const mib = 1024 ** 2;
+    const pool = node({
+      pool_data_total_bytes: 100 * GIB,
+      pool_nominal_bytes: 398 * GIB,
+      pending_storage_mib: 1024 + 500,
+    });
+    expect(pick([pool], { ...SMALL, storage_mib: 524 })).not.toBeNull();
+    expect(pick([pool], { ...SMALL, storage_mib: 528 })).toBeNull();
+    expect(
+      pick([{ ...pool, pool_nominal_bytes: 398 * GIB + mib }], {
+        ...SMALL,
+        storage_mib: 524,
+      }),
+    ).toBeNull();
   });
 
   it("needs a node with the cores the database is allowed to use", () => {
@@ -283,7 +300,7 @@ const closedBy = (closers: Closers) =>
     pool_nominal_bytes: (closers.cap ? 400 : 50) * GIB,
     volumes_total: closers.volumes ? MAX_VOLUMES_PER_NODE : 10,
   });
-const GROW = { memory_mib: 0, cpu_millicores: 0, storage_gib: 1 };
+const GROW = { memory_mib: 0, cpu_millicores: 0, storage_mib: 1024 };
 
 describe("which node takes the storage growth of a database it holds (plan 3.5)", () => {
   const cases: [string, Closers][] = [
@@ -337,7 +354,7 @@ describe("which node takes the storage growth of a database it holds (plan 3.5)"
     });
     expect(growthFits(noRoom, GROW, NOW)).toBe(false);
     expect(
-      growthFits(noRoom, { ...GROW, storage_gib: 0, memory_mib: 256 }, NOW),
+      growthFits(noRoom, { ...GROW, storage_mib: 0, memory_mib: 256 }, NOW),
     ).toBe(true);
   });
 
@@ -349,7 +366,9 @@ describe("which node takes the storage growth of a database it holds (plan 3.5)"
         pool_nominal_bytes: nominal * GIB,
       });
     expect(growthFits(full(399), GROW, NOW)).toBe(true);
-    expect(growthFits(full(399), { ...GROW, storage_gib: 2 }, NOW)).toBe(false);
+    expect(growthFits(full(399), { ...GROW, storage_mib: 2048 }, NOW)).toBe(
+      false,
+    );
     expect(growthFits(full(400), GROW, NOW)).toBe(false);
   });
 });
@@ -586,7 +605,7 @@ describe("the storage a node has not finished", () => {
           : new Date(operation.completedAt).toISOString();
     await env.DB.batch([
       env.DB.prepare(
-        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,archive_path,created_at,updated_at,deleted_at,own_storage_gib)
+        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,archive_path,created_at,updated_at,deleted_at,own_storage_mib)
         VALUES(?,?,?,?,?,?,?,'ready',1,'s3://b/x',?,?,?,?)`,
       ).bind(
         database,
@@ -599,7 +618,7 @@ describe("the storage a node has not finished", () => {
         at,
         at,
         operation.deleted ? at : null,
-        storage,
+        storage * 1024,
       ),
       env.DB.prepare(
         `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at)
@@ -618,7 +637,7 @@ describe("the storage a node has not finished", () => {
   }
   const pending = async (region: string, nodeId: string) =>
     (await placementNodes(env.DB, region, NOW)).find((n) => n.id === nodeId)!
-      .pending_storage_gib;
+      .pending_storage_mib;
 
   it("is the storage of the databases whose create, restore or resize is still open, or finished after the node's newest sample", async () => {
     const f = await fixture(0),
@@ -662,8 +681,8 @@ describe("the storage a node has not finished", () => {
       kind: "database.create",
       status: "pending",
     });
-    expect(await pending(f.region, a)).toBe(7 + 11 + 13 + 3);
-    expect(await pending(f.region, b)).toBe(100);
+    expect(await pending(f.region, a)).toBe((7 + 11 + 13 + 3) * 1024);
+    expect(await pending(f.region, b)).toBe(100 * 1024);
   });
 
   it("is zero for a node with nothing in flight and for a node that never reported", async () => {
@@ -690,7 +709,7 @@ describe("placement over real samples", () => {
     const nodes = await placementNodes(env.DB, f.region, now);
     expect(nodes.find((n) => n.id === recent)?.ram_peak_ppm).toBe(850_000);
     expect(nodes.find((n) => n.id === older)?.ram_peak_ppm).toBe(50_000);
-    const need = { memory_mib: 256, cpu_millicores: 500, storage_gib: 5 };
+    const need = { memory_mib: 256, cpu_millicores: 500, storage_mib: 5120 };
     expect(choosePlacement(nodes, need, now)?.id).toBe(older);
     expect(
       choosePlacement(
@@ -739,13 +758,13 @@ describe("placement over real samples", () => {
       choosePlacement(nodes, {
         memory_mib: 512,
         cpu_millicores: 500,
-        storage_gib: 5,
+        storage_mib: 5120,
       })?.id,
     ).toBe(busy);
     expect(
       choosePlacement(
         nodes.filter((n) => n.id !== busy),
-        { memory_mib: 512, cpu_millicores: 500, storage_gib: 5 },
+        { memory_mib: 512, cpu_millicores: 500, storage_mib: 5120 },
       )?.id,
     ).toBe(quiet);
   });

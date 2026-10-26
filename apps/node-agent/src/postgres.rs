@@ -82,8 +82,8 @@ pub async fn agent(socket_directory: &Path) -> Result<Session, Error> {
 /// `timestamptz`, NULL for no expiry and possibly `infinity`; `rolconnlimit` is -1 for no limit.
 /// No row is a role PostgreSQL does not have.
 pub(crate) const ROLE_CATALOG_QUERY: &str = "SELECT rolname, rolcanlogin, rolvaliduntil, rolconnlimit, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = $1";
-/// The roles a role is a member of, one row each.
-pub(crate) const MEMBERSHIP_QUERY: &str = "SELECT granted.rolname FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid JOIN pg_catalog.pg_roles member ON member.oid = m.member WHERE member.rolname = $1";
+/// Every grant of a role membership, including its grantor and effective options.
+pub(crate) const MEMBERSHIP_QUERY: &str = "SELECT granted.rolname, grantor.rolname, m.inherit_option, m.set_option, m.admin_option FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid JOIN pg_catalog.pg_roles member ON member.oid = m.member JOIN pg_catalog.pg_roles grantor ON grantor.oid = m.grantor WHERE member.rolname = $1 ORDER BY granted.rolname, grantor.rolname";
 /// The objects and privileges in any database that depend on a role: what makes `DROP ROLE` fail.
 pub(crate) const DEPENDENCIES_QUERY: &str = "SELECT count(*) FROM pg_catalog.pg_shdepend d JOIN pg_catalog.pg_roles r ON r.oid = d.refobjid WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass AND r.rolname = $1";
 /// Ends the sessions of a role; the role is bound, never part of the text.

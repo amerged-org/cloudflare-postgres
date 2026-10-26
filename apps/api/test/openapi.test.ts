@@ -26,7 +26,11 @@ type Operation = {
   }[];
   responses: Record<
     string,
-    { headers?: Record<string, unknown>; content?: unknown }
+    {
+      description?: string;
+      headers?: Record<string, unknown>;
+      content?: unknown;
+    }
   >;
 };
 type Document = {
@@ -158,7 +162,8 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(listed.responses["400"]!.headers).toHaveProperty(
       "X-PGCF-Diagnostic-Id",
     );
-    expect(listed.responses).not.toHaveProperty("503");
+    expect(listed.responses).toHaveProperty("503");
+    expect(listed.responses["503"]!.description).toContain("Control plane");
     expect(listed.responses).not.toHaveProperty("409");
     expect(
       operation(publicDoc, "/v1/operational-health", "get").responses,
@@ -356,6 +361,7 @@ describe("actual generated API references in the Workers runtime", () => {
       "401",
       "403",
       "500",
+      "503",
     ]);
     expect(audit.description).toContain("admin_read");
     // A read-only key reads what administrators read and is refused every change.
@@ -418,6 +424,7 @@ describe("actual generated API references in the Workers runtime", () => {
       "404",
       "409",
       "500",
+      "503",
     ]);
     expect(remove.responses["202"]!.headers).toHaveProperty("Location");
     for (const text of ["NOLOGIN", "role_not_droppable", "hibernated"])
@@ -440,6 +447,7 @@ describe("actual generated API references in the Workers runtime", () => {
       "valid_until",
       "connection_limit",
       "member_of",
+      "membership_options",
       "bypass_rls",
     ]);
     expect(input.properties!.connection_limit).toMatchObject({
@@ -451,6 +459,12 @@ describe("actual generated API references in the Workers runtime", () => {
       type: "array",
       maxItems: 8,
       uniqueItems: true,
+    });
+    expect(input.properties!.membership_options).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["inherit", "set"],
+      properties: { inherit: { type: "boolean" }, set: { type: "boolean" } },
     });
     expect(input.examples?.length).toBeGreaterThan(0);
     const role = schemas.Role!;
@@ -622,9 +636,35 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(
       (schemas.ConnectionUri!.properties!.uri as { pattern?: string }).pattern,
     ).toBe("^postgres:\\/\\/");
-    expect(schemas.SizeClassUpsert!.properties!.memory_mib).toMatchObject({
-      multipleOf: 256,
-      minimum: 256,
+    const sizeAlternatives = schemas.SizeClassUpsert!.anyOf!;
+    expect(sizeAlternatives).toHaveLength(2);
+    for (const alternative of sizeAlternatives)
+      expect(alternative.properties!.memory_mib).toMatchObject({
+        multipleOf: 256,
+        minimum: 256,
+      });
+    const mibClass = sizeAlternatives.find(
+      (schema) => schema.properties!.storage_mib,
+    )!;
+    const gibClass = sizeAlternatives.find(
+      (schema) => schema.properties!.storage_gib,
+    )!;
+    expect(mibClass.properties!.storage_mib).toMatchObject({
+      minimum: 4,
+      multipleOf: 4,
+      maximum: 67_108_864,
+    });
+    expect(gibClass.properties!.storage_gib).toMatchObject({
+      minimum: 1,
+      maximum: 65_536,
+    });
+    expect(mibClass).toMatchObject({
+      additionalProperties: false,
+      required: expect.arrayContaining(["storage_mib"]),
+    });
+    expect(gibClass).toMatchObject({
+      additionalProperties: false,
+      required: expect.arrayContaining(["storage_gib"]),
     });
     // Counters are safe integers, as the contracts bound them.
     expect(schemas.Database!.properties!.generation).toMatchObject({

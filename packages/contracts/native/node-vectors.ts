@@ -1317,6 +1317,49 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     [
+      "member-with-restricted-set-role",
+      withDatabase({
+        roles: [
+          owner,
+          reader,
+          {
+            ...reader,
+            name: "report",
+            member_of: ["reader"],
+            membership_options: { inherit: true, set: false },
+          },
+        ],
+      }),
+      true,
+    ],
+    [
+      "membership-options-without-memberships",
+      withDatabase({
+        roles: [
+          owner,
+          { ...reader, membership_options: { inherit: true, set: false } },
+        ],
+      }),
+      false,
+      true,
+    ],
+    [
+      "membership-options-without-set-flag",
+      withDatabase({
+        roles: [
+          owner,
+          reader,
+          {
+            ...reader,
+            name: "report",
+            member_of: ["reader"],
+            membership_options: { inherit: true },
+          },
+        ],
+      }),
+      false,
+    ],
+    [
       "duplicate-database",
       { ...page, orders: [], databases: [database, database] },
       false,

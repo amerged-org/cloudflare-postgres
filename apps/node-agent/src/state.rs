@@ -54,11 +54,90 @@ impl ProvenSleepRecord {
 
 /// The size the node last set a database to: its unit's limits and its volume.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ResourceFields", into = "ResourceFields")]
 pub struct Resources {
     pub memory_mib: u64,
     pub cpu_millicores: u32,
-    pub storage_gib: u64,
+    pub storage_mib: u64,
+}
+
+/// Read existing state and desired resources without rounding their nominal volume size. The
+/// strict alternatives reject ambiguous fields (including nulls), rather than picking a unit.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum ResourceFields {
+    Gib {
+        memory_mib: u64,
+        cpu_millicores: u32,
+        storage_gib: u64,
+    },
+    Mib {
+        memory_mib: u64,
+        cpu_millicores: u32,
+        storage_mib: u64,
+    },
+}
+
+impl Resources {
+    fn valid(&self) -> bool {
+        (4..=67_108_864).contains(&self.storage_mib) && self.storage_mib.is_multiple_of(4)
+    }
+}
+
+impl TryFrom<ResourceFields> for Resources {
+    type Error = &'static str;
+
+    fn try_from(fields: ResourceFields) -> Result<Self, Self::Error> {
+        let resources = match fields {
+            ResourceFields::Gib {
+                memory_mib,
+                cpu_millicores,
+                storage_gib,
+            } => Self {
+                memory_mib,
+                cpu_millicores,
+                storage_mib: storage_gib.checked_mul(1024).ok_or("storage overflow")?,
+            },
+            ResourceFields::Mib {
+                memory_mib,
+                cpu_millicores,
+                storage_mib,
+            } => Self {
+                memory_mib,
+                cpu_millicores,
+                storage_mib,
+            },
+        };
+        resources
+            .valid()
+            .then_some(resources)
+            .ok_or("storage must be a positive 4 MiB multiple at most 64 TiB")
+    }
+}
+
+impl From<Resources> for ResourceFields {
+    fn from(resources: Resources) -> Self {
+        let Resources {
+            memory_mib,
+            cpu_millicores,
+            storage_mib,
+        } = resources;
+        // Keep existing whole-GiB state readable by older agents. A genuinely sub-GiB size is
+        // deliberately unreadable to one that cannot represent it.
+        if storage_mib.is_multiple_of(1024) {
+            Self::Gib {
+                memory_mib,
+                cpu_millicores,
+                storage_gib: storage_mib / 1024,
+            }
+        } else {
+            Self::Mib {
+                memory_mib,
+                cpu_millicores,
+                storage_mib,
+            }
+        }
+    }
 }
 
 /// The newest DONE base backup of the storage generation (`NodeDatabaseObservation.backup`).
@@ -122,6 +201,7 @@ impl DatabaseState {
             && (1..=9_007_199_254_740_991).contains(&self.storage_generation)
             && self.record.as_ref().is_none_or(ProvenSleepRecord::valid)
             && self.backup.as_ref().is_none_or(Backup::valid)
+            && self.resources.as_ref().is_none_or(Resources::valid)
             && self.config.as_ref().is_none_or(|sha| {
                 sha.len() == 64
                     && sha
@@ -209,6 +289,70 @@ mod tests {
     }
 
     #[test]
+    fn resources_read_both_storage_units_and_keep_whole_gib_state_compatible() {
+        let legacy = json!({"memory_mib":256,"cpu_millicores":250,"storage_gib":2});
+        let resources: Resources = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(resources.storage_mib, 2048);
+        assert_eq!(serde_json::to_value(resources).unwrap(), legacy);
+
+        let small = json!({"memory_mib":256,"cpu_millicores":250,"storage_mib":500});
+        let resources: Resources = serde_json::from_value(small.clone()).unwrap();
+        assert_eq!(resources.storage_mib, 500);
+        assert_eq!(serde_json::to_value(resources).unwrap(), small);
+
+        let whole = json!({"memory_mib":256,"cpu_millicores":250,"storage_mib":2048});
+        let resources: Resources = serde_json::from_value(whole).unwrap();
+        assert_eq!(serde_json::to_value(resources).unwrap(), legacy);
+
+        for (storage, expected) in [
+            (json!({"storage_mib":4}), 4),
+            (json!({"storage_mib":67_108_864}), 67_108_864),
+            (json!({"storage_gib":65_536}), 67_108_864),
+        ] {
+            let mut value = json!({"memory_mib":256,"cpu_millicores":250});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(storage.as_object().unwrap().clone());
+            assert_eq!(
+                serde_json::from_value::<Resources>(value)
+                    .unwrap()
+                    .storage_mib,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn storage_resources_refuse_ambiguous_unaligned_and_out_of_range_sizes() {
+        for storage in [
+            json!({}),
+            json!({"storage_gib":1,"storage_mib":1024}),
+            json!({"storage_gib":null,"storage_mib":500}),
+            json!({"storage_gib":1,"storage_mib":null}),
+            json!({"storage_mib":null}),
+            json!({"storage_mib":500.5}),
+            json!({"storage_mib":502}),
+            json!({"storage_mib":0}),
+            json!({"storage_mib":67_108_868}),
+            json!({"storage_gib":0}),
+            json!({"storage_gib":65_537}),
+            json!({"storage_gib":u64::MAX}),
+            json!({"storage_mib":500,"unexpected":true}),
+        ] {
+            let mut value = json!({"memory_mib":256,"cpu_millicores":250});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(storage.as_object().unwrap().clone());
+            assert!(
+                serde_json::from_value::<Resources>(value).is_err(),
+                "{storage}"
+            );
+        }
+    }
+
+    #[test]
     fn a_proven_sleep_record_is_what_the_contract_states_and_nothing_else() {
         assert!(record().valid());
         let json = serde_json::to_value(record()).unwrap();
@@ -247,6 +391,11 @@ mod tests {
         state.roles.insert("app".into(), 4);
         state.record = Some(record());
         state.config = Some("a".repeat(64));
+        state.resources = Some(Resources {
+            memory_mib: 256,
+            cpu_millicores: 250,
+            storage_mib: 500,
+        });
         state.backup = Some(Backup {
             backup_id: "20261018T101112".into(),
             timeline: 1,

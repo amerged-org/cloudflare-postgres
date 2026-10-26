@@ -31,6 +31,7 @@ type ConfigRow = {
   d1_database_id: string | null;
   d1_region_id: string | null;
   notification_recipient: string | null;
+  notification_recipients: string;
   notification_sender: string | null;
   revision: number;
   enabled_at: string | null;
@@ -80,6 +81,7 @@ function configView(row: ConfigRow | null | undefined) {
     d1_database_id: row.d1_database_id,
     d1_region_id: row.d1_region_id,
     notification_recipient: row.notification_recipient,
+    notification_recipients: JSON.parse(row.notification_recipients),
     notification_sender: row.notification_sender,
     revision: row.revision,
     enabled_at: row.enabled_at,
@@ -127,13 +129,16 @@ export async function configureInfrastructureBackups(
     ),
     env.DB.prepare(
       `UPDATE infrastructure_backup_config SET enabled=?,d1_account_id=?,d1_database_id=?,d1_region_id=?,
-      notification_recipient=?,notification_sender=?,revision=revision+1,enabled_at=CASE WHEN ?=1 AND enabled=0 THEN ? WHEN ?=0 THEN NULL ELSE enabled_at END,updated_at=? WHERE singleton=1`,
+      notification_recipient=?,notification_recipients=COALESCE(?,notification_recipients),notification_sender=?,revision=revision+1,enabled_at=CASE WHEN ?=1 AND enabled=0 THEN ? WHEN ?=0 THEN NULL ELSE enabled_at END,updated_at=? WHERE singleton=1`,
     ).bind(
       config.enabled ? 1 : 0,
       config.d1_account_id,
       config.d1_database_id,
       config.d1_region_id,
       config.notification_recipient,
+      config.notification_recipients === undefined
+        ? null
+        : JSON.stringify(config.notification_recipients),
       config.notification_sender,
       config.enabled ? 1 : 0,
       at,

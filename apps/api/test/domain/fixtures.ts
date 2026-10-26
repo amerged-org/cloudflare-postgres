@@ -42,6 +42,8 @@ const fixtures: {
   size: string;
 }[] = [];
 const stagedObjects: string[] = [];
+const qualifiedNativeReleases: string[] = [];
+const nativeTestBindings: Partial<Env> = {};
 export async function cleanupFixtures(): Promise<void> {
   if (stagedObjects.length > 0)
     await env.ARCHIVE.delete(stagedObjects.splice(0));
@@ -101,6 +103,11 @@ export async function cleanupFixtures(): Promise<void> {
       env.DB.prepare("DELETE FROM size_classes WHERE id=?").bind(fixture.size),
     ]);
   }
+  for (const id of qualifiedNativeReleases.splice(0))
+    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+      .bind(id)
+      .run();
+  delete nativeTestBindings.NATIVE_EXTENDED_RESOURCES_RELEASE_IDS;
 }
 
 /** The database mutations that refuse a request without an Idempotency-Key, as `METHOD path`. */
@@ -137,6 +144,7 @@ export async function request(
       ...env,
       DB_ENDPOINT_HOST: ["db", "invalid"].join("."),
       NODE_API_ORIGIN: API_ORIGIN,
+      ...nativeTestBindings,
       ...bindings,
     },
     context,
@@ -241,7 +249,7 @@ export async function fixture(memory = 4096, storage: number | null = 30) {
       "INSERT INTO projects (id,name,created_at,updated_at) VALUES (?,?,?,?)",
     ).bind(other, "two", now, now),
     env.DB.prepare(
-      `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at) VALUES (?,512,500,5,50,NULL,60,7,1,?,?)`,
+      `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_mib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at) VALUES (?,512,500,5120,50,NULL,60,7,1,?,?)`,
     ).bind(size, now, now),
   ];
   for (const id of [region, foreign])
@@ -357,6 +365,7 @@ export async function rawRequest(
       ...env,
       DB_ENDPOINT_HOST: ["db", "invalid"].join("."),
       NODE_API_ORIGIN: API_ORIGIN,
+      ...nativeTestBindings,
       ...bindings,
     },
     context,
@@ -466,10 +475,10 @@ export async function observationOf(
   extra: Record<string, unknown> = {},
 ) {
   const row = await env.DB.prepare(
-    "SELECT d.storage_generation,r.storage_gib FROM databases d JOIN database_resources r ON r.database_id=d.id WHERE d.id=?",
+    "SELECT d.storage_generation,r.storage_mib FROM databases d JOIN database_resources r ON r.database_id=d.id WHERE d.id=?",
   )
     .bind(id)
-    .first<{ storage_generation: number; storage_gib: number }>();
+    .first<{ storage_generation: number; storage_mib: number }>();
   const now = new Date().toISOString();
   return {
     id,
@@ -478,7 +487,7 @@ export async function observationOf(
     storage_generation: row?.storage_generation ?? 1,
     ...((state === "ready" || state === "asleep") && row
       ? {
-          storage_bytes: row.storage_gib * 1024 ** 3 - FILESYSTEM_END_GAP_BYTES,
+          storage_bytes: row.storage_mib * 1024 ** 2 - FILESYSTEM_END_GAP_BYTES,
         }
       : {}),
     state,
@@ -841,4 +850,32 @@ export async function assignRelease(
     ).status,
   ).toBe(200);
   return id;
+}
+
+/** A qualified immutable signed release and the current OS/readback used by native admission. */
+export async function qualifyExtendedNative(
+  f: Pick<Fixture, "region" | "admin" | "node">,
+) {
+  const id = await assignRelease(f);
+  qualifiedNativeReleases.push(id);
+  nativeTestBindings.NATIVE_EXTENDED_RESOURCES_RELEASE_IDS = JSON.stringify(
+    qualifiedNativeReleases,
+  );
+  const os = nodeOs();
+  await env.DB.prepare(
+    `UPDATE nodes SET reported_release_id=?,os_boot_id=?,os_booted_at=?,os_kernel_release=?,
+    os_packages_sha256=?,os_host_files_sha256=?,last_observed_at=? WHERE id=?`,
+  )
+    .bind(
+      id,
+      os.boot_id,
+      os.booted_at,
+      os.kernel_release,
+      os.packages_sha256,
+      os.host_files_sha256,
+      new Date().toISOString(),
+      f.node,
+    )
+    .run();
+  return { id, bindings: { ...nativeTestBindings } };
 }

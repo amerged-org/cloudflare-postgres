@@ -158,8 +158,8 @@ it("sets the idle time while a resize is pending, without touching the resize", 
   const target = "i" + crypto.randomUUID().replaceAll("-", "").slice(0, 20);
   classes.push(target);
   await env.DB.prepare(
-    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
-    SELECT ?,1024,750,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,1,created_at,updated_at FROM size_classes WHERE id=?`,
+    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_mib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
+    SELECT ?,1024,750,storage_mib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,1,created_at,updated_at FROM size_classes WHERE id=?`,
   )
     .bind(target, f.size)
     .run();

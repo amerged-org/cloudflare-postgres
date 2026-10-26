@@ -2,6 +2,10 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env.ts";
 import {
+  controlProducerPaused,
+  maintenanceEnvironment,
+} from "./control-maintenance.ts";
+import {
   cronErrorCode,
   cronErrorMessage,
   runWithin,
@@ -109,6 +113,9 @@ export async function evaluateAlerts(
  * 11:00 to 18:15.
  */
 export class CronWatchdog extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, maintenanceEnvironment(env));
+  }
   /** Idempotent: keeps the pending alarm and starts the chain when there is none. */
   async arm(): Promise<void> {
     if ((await this.ctx.storage.getAlarm()) === null)
@@ -117,6 +124,7 @@ export class CronWatchdog extends DurableObject<Env> {
   override async alarm(): Promise<void> {
     // Scheduled first, so a failing or slow evaluation can never end the chain.
     await this.ctx.storage.setAlarm(Date.now() + CRON_WATCHDOG_INTERVAL_MS);
+    if (controlProducerPaused(this.env, "cron_watchdog")) return;
     try {
       await evaluateAlerts(this.env);
     } catch (error) {

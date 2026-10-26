@@ -26,6 +26,10 @@ import { admissionScopesOpenSql } from "./admission-state.ts";
 import { hintDatabases } from "./node-hints.ts";
 import { ApiError } from "../api-error.ts";
 import {
+  databaseNeedsExtended,
+  extendedNativeGuard,
+} from "./native-capabilities.ts";
+import {
   assertResourcesAllowed,
   effectiveResources,
   NO_OVERRIDES,
@@ -39,6 +43,7 @@ export async function placePendingDatabases(
   db: D1Database,
   regionId: string,
   limit = 8,
+  qualifiedNativeReleases?: string,
 ): Promise<string[]> {
   RegionId.parse(regionId);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 8)
@@ -70,11 +75,28 @@ export async function placePendingDatabases(
         decidedAt,
       );
     if (!node) continue;
+    const capabilityEnv = {
+      DB: db,
+      NATIVE_EXTENDED_RESOURCES_RELEASE_IDS: qualifiedNativeReleases,
+    };
+    const native = extendedNativeGuard(
+      capabilityEnv,
+      { nodeId: node.id },
+      await databaseNeedsExtended(capabilityEnv, row.id),
+      decidedAt,
+    );
+    if (
+      !(await db
+        .prepare(`SELECT 1 WHERE ${native.sql}`)
+        .bind(...native.bindings)
+        .first())
+    )
+      continue;
     const now = new Date().toISOString(),
       guard = placementGuard("n", {
         nodeId: node.id,
         pendingMemoryMib: node.pending_memory_mib,
-        pendingStorageGib: node.pending_storage_gib,
+        pendingStorageMib: node.pending_storage_mib,
         now: decidedAt,
       });
     const results = await db.batch([
@@ -89,7 +111,7 @@ export async function placePendingDatabases(
         AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=databases.size_class_id AND s.enabled=1
           WHERE n.region_id=databases.region_id AND ${guard.sql}
           AND ${admissionScopesOpenSql("databases.project_id", "databases.region_id", "n.id")}
-          AND s.memory_mib=? AND s.cpu_millicores=? AND s.storage_gib=?)`,
+          AND s.memory_mib=? AND s.cpu_millicores=? AND s.storage_mib=?) AND (${native.sql})`,
         )
         .bind(
           node.id,
@@ -105,7 +127,8 @@ export async function placePendingDatabases(
           ...guard.bindings,
           size.memory_mib,
           size.cpu_millicores,
-          size.storage_gib,
+          size.storage_mib,
+          ...native.bindings,
         ),
       db
         .prepare(
@@ -155,7 +178,14 @@ export async function runNodeCapacity(
       order_config: string | null;
       adopt_instance_ids: string;
     }>();
-  const placed = dryRun ? [] : await placePendingDatabases(env.DB, regionId);
+  const placed = dryRun
+    ? []
+    : await placePendingDatabases(
+        env.DB,
+        regionId,
+        8,
+        env.NATIVE_EXTENDED_RESOURCES_RELEASE_IDS,
+      );
   if (placed.length) await hintDatabases(env, placed);
   const result = {
     region_id: regionId,

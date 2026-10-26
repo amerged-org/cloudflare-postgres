@@ -7,6 +7,7 @@ import {
   DatabaseCreate,
   DatabaseIdleTime,
   DatabasePatch,
+  DatabasePowerChange,
   DatabaseResize,
   OperationKind,
   ERROR_CODES,
@@ -144,6 +145,14 @@ describe("role lifecycle attributes", () => {
       { member_of: ["none"] },
       { member_of: ["report_job"] },
       { member_of: "reader" },
+      { membership_options: { inherit: true, set: false } },
+      { member_of: [], membership_options: { inherit: true, set: false } },
+      { member_of: ["reader"], membership_options: { inherit: true } },
+      { member_of: ["reader"], membership_options: { inherit: true, set: 0 } },
+      {
+        member_of: ["reader"],
+        membership_options: { inherit: true, set: false, admin: true },
+      },
       { bypass_rls: "yes" },
       { superuser: true },
       { password: "chosen" },
@@ -157,6 +166,20 @@ describe("role lifecycle attributes", () => {
       RoleCreate.safeParse({ ...base, connection_limit: 10000, member_of: [] })
         .success,
     ).toBe(true);
+  });
+  it("accepts uniform explicit membership flags while preserving omitted defaults", () => {
+    const body = {
+      name: "report_job",
+      member_of: ["reader", "writer"],
+      membership_options: { inherit: true, set: false },
+    };
+    expect(RoleCreate.parse(body)).toEqual(body);
+    expect(
+      RoleCreate.parse({
+        ...body,
+        membership_options: { inherit: false, set: true },
+      }),
+    ).toMatchObject({ membership_options: { inherit: false, set: true } });
   });
   it("returns every attribute on a role", () => {
     const row = {
@@ -322,6 +345,7 @@ describe("errors", () => {
       expect(errorStatus(code)).toBeGreaterThanOrEqual(400);
     }
     expect(errorStatus("capacity_exhausted")).toBe(503);
+    expect(errorStatus("service_unavailable")).toBe(503);
     expect(errorStatus("idempotency_conflict")).toBe(409);
     expect(
       errorBody("conflict", "x", "r", { field: "name" }).error.details,
@@ -371,6 +395,7 @@ describe("errors", () => {
     expect(retryAfterSeconds("conflict")).toBeUndefined();
     // These codes are transient by their meaning alone.
     expect(retryAfterSeconds("capacity_exhausted")).toBeGreaterThan(0);
+    expect(retryAfterSeconds("service_unavailable")).toBe(60);
     expect(retryAfterSeconds("idempotency_in_progress")).toBeGreaterThan(0);
     for (const code of [
       "invalid_request",
@@ -522,6 +547,31 @@ describe("request bodies", () => {
     expect(DatabasePatch.safeParse({ size_class_id: "small" }).success).toBe(
       true,
     );
+  });
+
+  it("accepts an optional positive safe generation for strict power changes", () => {
+    expect(DatabasePowerChange.parse({})).toEqual({});
+    for (const generation of [1, Number.MAX_SAFE_INTEGER])
+      expect(
+        DatabasePowerChange.parse({ expected_generation: generation }),
+      ).toEqual({ expected_generation: generation });
+    for (const generation of [
+      0,
+      -1,
+      1.5,
+      Number.MAX_SAFE_INTEGER + 1,
+      "1",
+      null,
+    ])
+      expect(
+        DatabasePowerChange.safeParse({ expected_generation: generation })
+          .success,
+      ).toBe(false);
+    expect(
+      DatabasePowerChange.safeParse({ expected_generation: 1, force: true })
+        .success,
+    ).toBe(false);
+    expect(DatabasePowerChange.safeParse(null).success).toBe(false);
   });
 
   it("takes a database's own idle time of 60 to 900 s, or null for its class's", () => {

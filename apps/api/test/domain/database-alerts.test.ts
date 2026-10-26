@@ -57,18 +57,21 @@ const awake = (now: number, extra: Record<string, string | number | null>) => ({
   created_at: ago(now, 100 * HOUR),
   ...extra,
 });
-/** The webhook receiver of the alert tests: records each event and acknowledges it. */
+/** Record warnings and recoveries separately; the existing assertions count warning episodes. */
 function receiver() {
   const events: { event: InfraAlert; key: string | null }[] = [];
+  const recoveries: typeof events = [];
   const fetcher: typeof fetch = async (_url, init) => {
-    events.push({
-      event: InfraAlert.parse(JSON.parse(init!.body as string)),
+    const event = InfraAlert.parse(JSON.parse(init!.body as string));
+    (event.state === "resolved" ? recoveries : events).push({
+      event,
       key: new Headers(init!.headers).get("Idempotency-Key"),
     });
     return new Response(null, { status: 204 });
   };
   return {
     events,
+    recoveries,
     fetcher,
     env: {
       ...env,
@@ -124,7 +127,9 @@ it("alarms a failing WAL archive once, with the databases and the runbook action
   expect(sent).toHaveLength(1);
   const episode = await status(f, "database_archive_failing");
   expect(episode).toMatchObject({ active: true });
-  expect(sent[0]!.key).toBe(`${episode!.event_id}:${episode!.occurred_at}`);
+  expect(sent[0]!.key).toBe(
+    `${episode!.event_id}:${episode!.occurred_at}:${episode!.deliveries.find((delivery) => delivery.channel === "email")!.destination_id}`,
+  );
   // The mail API asks for a user agent; a Worker's outbound request does not always carry one.
   expect(sent[0]!.agent).toBe("pgcf-infrastructure-alerts");
   expect(sent[0]!.body.subject).toBe(
@@ -181,6 +186,11 @@ it("never alarms an unknown archive, keeps an episode through an unknown reading
     delivered_at: new Date(now + 4000).toISOString(),
   });
   expect(second!.occurred_at).not.toBe(first!.occurred_at);
+  expect(hook.recoveries).toHaveLength(1);
+  expect(hook.recoveries[0]!.event).toMatchObject({
+    state: "resolved",
+    episode_started_at: first!.occurred_at,
+  });
   expect(hook.events.map((value) => value.event.kind)).toEqual([
     "database_archive_failing",
     "database_archive_failing",
@@ -819,7 +829,7 @@ it("does not clear an episode that came back under the same id while its clearin
         return (sql: string) => {
           if (
             sql.startsWith(
-              "UPDATE infrastructure_alerts SET active=0 WHERE region_id=? AND kind=? AND event_id=?",
+              "UPDATE infrastructure_alerts SET active=0,resolved_at=? WHERE region_id=? AND kind=? AND event_id=?",
             )
           )
             void target

@@ -15,6 +15,7 @@ import {
   refusal,
   report,
   request,
+  qualifyExtendedNative,
 } from "./fixtures.ts";
 import { GIB, OPEN_POOL, seedSamples, steady } from "./node-samples.ts";
 
@@ -43,7 +44,7 @@ const read = async (f: Fixture, id: string) =>
   Database.parse(await (await request(`/v1/databases/${id}`, f.admin)).json());
 const stored = (id: string) =>
   env.DB.prepare(
-    "SELECT own_memory_mib,own_cpu_millicores,own_storage_gib,generation FROM databases WHERE id=?",
+    "SELECT own_memory_mib,own_cpu_millicores,own_storage_mib,generation FROM databases WHERE id=?",
   )
     .bind(id)
     .first();
@@ -83,7 +84,7 @@ describe("resources of a database", () => {
     expect(await stored(id)).toEqual({
       own_memory_mib: 1024,
       own_cpu_millicores: 750,
-      own_storage_gib: 8,
+      own_storage_mib: 8192,
       generation: 2,
     });
     expect((await read(f, id)).resources.memory_mib).toBe(1024);
@@ -168,7 +169,7 @@ describe("resources of a database", () => {
     expect(back.database.generation).toBe(3);
     expect(await stored(id)).toMatchObject({
       own_memory_mib: null,
-      own_storage_gib: 8,
+      own_storage_mib: 8192,
     });
   });
 
@@ -229,7 +230,7 @@ describe("resources of a database", () => {
     ).toMatchObject({ status: 400, code: "invalid_request" });
     // null would hand back the class's 5 GiB, which is a shrink as well.
     expect((await put(f, id, own({}))).status).toBe(400);
-    expect((await stored(id))?.own_storage_gib).toBe(8);
+    expect((await stored(id))?.own_storage_mib).toBe(8192);
   });
 
   it("changes nothing when the effective values stay and records an own value that equals the class's", async () => {
@@ -329,7 +330,7 @@ describe("resources of a database", () => {
       code: "capacity_exhausted",
       reason: "node_capacity",
     });
-    expect((await stored(id))?.own_storage_gib).toBe(10);
+    expect((await stored(id))?.own_storage_mib).toBe(10240);
   });
 
   it("applies at the next wake for a database that sleeps, whatever its node reports", async () => {
@@ -386,13 +387,13 @@ describe("storage growth of a database that sleeps", () => {
       code: "capacity_exhausted",
       reason: "node_capacity",
     });
-    expect((await stored(id))?.own_storage_gib).toBeNull();
+    expect((await stored(id))?.own_storage_mib).toBeNull();
     expect(
       (await put(f, id, own({ memory_mib: 2048, storage_gib: 8 }))).status,
     ).toBe(202);
     expect(await stored(id)).toMatchObject({
       own_memory_mib: 2048,
-      own_storage_gib: 8,
+      own_storage_mib: 8192,
     });
   });
 });
@@ -421,8 +422,101 @@ describe("resources on create", () => {
     expect(await stored(result.database.id)).toMatchObject({
       own_memory_mib: 1024,
       own_cpu_millicores: null,
-      own_storage_gib: 20,
+      own_storage_mib: 20480,
     });
+  });
+
+  it("offers a 500 MiB class and carries its exact storage into new databases", async () => {
+    const f = await fixture();
+    await qualifyExtendedNative(f);
+    const response = await request(
+      `/v1/size-classes/${f.size}`,
+      f.admin,
+      "PUT",
+      {
+        memory_mib: 256,
+        cpu_millicores: 250,
+        storage_mib: 500,
+        max_connections: 20,
+        sleep_after_seconds: 300,
+        archive_timeout_seconds: 60,
+        backup_retention_days: 7,
+        enabled: true,
+      },
+    );
+    expect(response.status).toBe(200);
+    const catalog = await response.json();
+    expect(catalog).toMatchObject({ id: f.size, storage_mib: 500 });
+    expect(catalog).not.toHaveProperty("storage_gib");
+    const listing = await request("/v1/size-classes", f.integrator);
+    expect(await listing.json()).toMatchObject({
+      data: expect.arrayContaining([catalog]),
+    });
+    const created = DatabaseWithOperation.parse(
+      await (await f.create()).json(),
+    );
+    expect(created.database.resources).toEqual({
+      memory_mib: 256,
+      cpu_millicores: 250,
+      storage_mib: 500,
+    });
+    expect(await stored(created.database.id)).toMatchObject({
+      own_storage_mib: null,
+    });
+  });
+
+  it("keeps an exact 500 MiB override through create, desired state and growth", async () => {
+    const f = await fixture();
+    await qualifyExtendedNative(f);
+    const response = await create(f, { storage_mib: 500 });
+    expect(response.status).toBe(202);
+    const { database } = DatabaseWithOperation.parse(await response.json());
+    expect(database.resources).toEqual({
+      memory_mib: 512,
+      cpu_millicores: 500,
+      storage_mib: 500,
+    });
+    expect(await stored(database.id)).toMatchObject({ own_storage_mib: 500 });
+    expect(
+      (await desiredPage(f)).databases.find((row) => row.id === database.id)
+        ?.resources,
+    ).toEqual(database.resources);
+    await applied(f, database.id, 1);
+
+    expect(
+      (
+        await put(f, database.id, {
+          memory_mib: null,
+          cpu_millicores: null,
+          storage_mib: 496,
+        })
+      ).status,
+    ).toBe(400);
+    const grown = await put(f, database.id, {
+      memory_mib: null,
+      cpu_millicores: null,
+      storage_mib: 1024,
+    });
+    expect(grown.status).toBe(202);
+    expect(
+      DatabaseWithOperation.parse(await grown.json()).database.resources,
+    ).toEqual({ memory_mib: 512, cpu_millicores: 500, storage_gib: 1 });
+    expect(await stored(database.id)).toMatchObject({ own_storage_mib: 1024 });
+  });
+
+  it("refuses ambiguous units and unaligned storage without creating a database", async () => {
+    const f = await fixture();
+    expect((await create(f, { storage_mib: 500, storage_gib: 1 })).status).toBe(
+      400,
+    );
+    expect((await create(f, { storage_mib: 501 })).status).toBe(400);
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM databases WHERE project_id=?",
+      )
+        .bind(f.project)
+        .first("count"),
+    ).toBe(0);
   });
 
   it("refuses an integrator key and values outside the region's bounds", async () => {

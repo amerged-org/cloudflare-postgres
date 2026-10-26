@@ -11,7 +11,12 @@ import {
 } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
-import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import {
+  cleanupFixtures,
+  fixture,
+  request,
+  qualifyExtendedNative,
+} from "./fixtures.ts";
 
 const keys: string[] = [];
 afterEach(async () => {
@@ -24,6 +29,7 @@ const key = () => crypto.randomUUID();
 /** A database with an archive that a restore can read, and two roles with attributes. */
 async function source() {
   const f = await fixture();
+  await qualifyExtendedNative(f);
   const created = (await (await f.create()).json()) as {
     database: { id: string };
   };
@@ -62,6 +68,7 @@ async function source() {
       valid_until: until,
       connection_limit: 7,
       member_of: ["reader"],
+      membership_options: { inherit: true, set: false },
       bypass_rls: true,
     },
   ])
@@ -105,6 +112,7 @@ const attributes = (until: string) => ({
   valid_until: until,
   connection_limit: 7,
   member_of: ["reader"],
+  membership_options: { inherit: true, set: false },
   bypass_rls: true,
 });
 
@@ -125,6 +133,23 @@ it("a restore copy carries the attributes of every live role", async () => {
     member_of: [],
     bypass_rls: false,
   });
+});
+
+it("does not copy restricted memberships onto a node whose native release is unknown", async () => {
+  const f = await source();
+  await env.DB.prepare("UPDATE nodes SET reported_release_id=NULL WHERE id=?")
+    .bind(f.node)
+    .run();
+  const response = await restore(f, "copy-unsupported");
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({
+    error: { details: { reason: "not_ready" } },
+  });
+  expect(
+    await env.DB.prepare("SELECT COUNT(*) n FROM databases WHERE project_id=?")
+      .bind(f.project)
+      .first("n"),
+  ).toBe(1);
 });
 
 it("a role being deleted is not copied into a restore", async () => {
@@ -161,6 +186,7 @@ it("the retained archive of a deleted database keeps the attributes for a later 
     valid_until: f.until,
     connection_limit: 7,
     member_of: ["reader"],
+    membership_options: 2,
     bypass_rls: 1,
   });
   const { roles } = await targetRoles(f, await restore(f, "copy-retained"));
@@ -184,7 +210,7 @@ it("an archive retained before roles had attributes restores plain roles", async
   ).toBe(202);
   // The shape written by the release that introduced retained archives: no attribute keys.
   await env.DB.prepare(
-    `UPDATE retained_archives SET roles_json=(SELECT json_group_array(json_remove(value,'$.valid_until','$.connection_limit','$.member_of','$.bypass_rls')) FROM json_each(roles_json)) WHERE source_database_id=?`,
+    `UPDATE retained_archives SET roles_json=(SELECT json_group_array(json_remove(value,'$.valid_until','$.connection_limit','$.member_of','$.membership_options','$.bypass_rls')) FROM json_each(roles_json)) WHERE source_database_id=?`,
   )
     .bind(f.id)
     .run();
@@ -233,8 +259,8 @@ async function deletedWithLargestRoles(keyLength: number, revision: number) {
     env.DB.prepare("DELETE FROM roles WHERE database_id=?").bind(f.id),
     ...rows.map((row) =>
       env.DB.prepare(
-        `INSERT INTO roles(database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at,valid_until,connection_limit,member_of_json,bypass_rls)
-         VALUES(?,?,?,?,?,?,${revision},?,?,?,10000,?,1)`,
+        `INSERT INTO roles(database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at,valid_until,connection_limit,member_of_json,membership_options,bypass_rls)
+         VALUES(?,?,?,?,?,?,${revision},?,?,?,10000,?,0,1)`,
       ).bind(
         f.id,
         row.name,
@@ -269,10 +295,9 @@ async function deletedWithLargestRoles(keyLength: number, revision: number) {
   return stored!;
 }
 
-// The plan (11.1, row "Diagnostics are stored within the bound of a backup") quotes these sizes and
-// the key version lengths from which the statement passes D1's limit. `roles_json` is 96,401 bytes
-// with a key version of 2 characters and a one-digit revision, and each further character of the
-// key version or digit of the revision adds 100 (once for each of the 100 roles).
+// New retained rows omit duplicate database_id/updated_at values and encode the uniform flags
+// as one integer. With all optional attributes and nondefault flags, roles_json is 91,001 bytes
+// at a two-character key version and one-digit revision; each further character adds 100 bytes.
 const D1_STATEMENT_MAX = 100_000;
 
 /**
@@ -331,42 +356,16 @@ it("the rest of the INSERT of a retained archive is 223 to 405 bytes", async () 
   expect(stored.statement - stored.roles).toBeLessThanOrEqual(405);
 });
 
-it("a key version of 64 characters, the longest the keyring takes, can make a retained archive that D1 cannot import", async () => {
-  const stored = await deletedWithLargestRoles(64, 1);
-  expect(stored.roles).toBe(96_401 + 62 * 100);
-  expect(stored.statement).toBeGreaterThan(D1_STATEMENT_MAX);
-});
-
-it("a key version of the live length cannot, whatever the roles and the revision", async () => {
+it("retained roles with the live key length leave headroom with nondefault membership flags", async () => {
   // 4 characters, and a revision of 16 digits, the most a JSON number holds exactly.
   const stored = await deletedWithLargestRoles(4, Number.MAX_SAFE_INTEGER);
-  expect(stored.roles).toBe(96_401 + 2 * 100 + 15 * 100);
+  expect(stored.roles).toBe(91_001 + 2 * 100 + 15 * 100);
   expect(stored.statement).toBeLessThan(D1_STATEMENT_MAX);
 });
 
-it("a key version of 18 characters keeps every combination below the limit, and 19 does not", async () => {
-  // The most roles, a revision of 16 digits, the longest path and a held claim.
-  const rest = await longestRest();
-  const below = await deletedWithLargestRoles(18, Number.MAX_SAFE_INTEGER);
-  expect(below.roles).toBe(96_401 + 16 * 100 + 15 * 100);
-  expect(below.roles + rest).toBe(99_906);
-  const above = await deletedWithLargestRoles(19, Number.MAX_SAFE_INTEGER);
-  expect(above.roles + rest).toBe(100_006);
-  expect(above.roles + rest).toBeGreaterThan(D1_STATEMENT_MAX);
-});
-
-it("a key version of 34 characters and a first password can pass the limit, 33 cannot", async () => {
-  const rest = await longestRest();
-  const below = await deletedWithLargestRoles(33, 1);
-  expect(below.roles + rest).toBeLessThan(D1_STATEMENT_MAX);
-  const above = await deletedWithLargestRoles(34, 1);
-  expect(above.roles + rest).toBe(100_006);
-});
-
-it("a key version of 36 characters passes the limit whatever the path and the claim", async () => {
-  const stored = await deletedWithLargestRoles(36, 1);
-  expect(stored.roles + (await shortestRest())).toBeGreaterThan(
-    D1_STATEMENT_MAX,
-  );
-  expect(stored.statement).toBeGreaterThan(D1_STATEMENT_MAX);
+it("the largest role set, key version, revision, flags, path and held claim stay below D1's import limit", async () => {
+  const stored = await deletedWithLargestRoles(64, Number.MAX_SAFE_INTEGER);
+  expect(stored.roles).toBe(91_001 + 62 * 100 + 15 * 100);
+  expect(stored.roles + (await longestRest())).toBe(99_106);
+  expect(stored.statement).toBeLessThan(D1_STATEMENT_MAX);
 });

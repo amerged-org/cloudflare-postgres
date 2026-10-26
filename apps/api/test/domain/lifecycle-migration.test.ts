@@ -69,8 +69,11 @@ async function preLifecycle() {
     // Today's tables lost columns that the genuine pre-0008 schema requires: the regional agent
     // key goes with the node link and the archive bucket and its endpoint with the one bucket of the
     // installation, so the history gets a placeholder in their place. A node's hostname was the
-    // Kubernetes node name.
-    const renamed: Record<string, string> = { k8s_node_name: "hostname" };
+    // Kubernetes node name; these legacy fixtures all have exact whole-GiB volumes.
+    const renamed: Record<string, string> = {
+      k8s_node_name: "hostname",
+      storage_gib: "storage_mib/1024",
+    };
     const placeholders: Record<string, string> = {
       agent_key_hash: "lower(hex(randomblob(32)))",
       backup_bucket: "'history-bucket'",

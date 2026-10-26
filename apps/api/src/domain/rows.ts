@@ -4,6 +4,7 @@ import {
   Operation,
   Role,
   SizeClass,
+  serializeStorage,
   type DesiredState,
   type ObservedState,
 } from "@pgcf/contracts";
@@ -29,13 +30,13 @@ export interface DatabaseRow extends DatabaseHealthSource {
   /** The database's own resources; null takes the size class's. */
   own_memory_mib?: number | null;
   own_cpu_millicores?: number | null;
-  own_storage_gib?: number | null;
+  own_storage_mib?: number | null;
   /** When the database was placed on its node; null before it is. */
   placed_at?: string | null;
   /** Read with effectiveResourcesColumnsSql. */
   effective_memory_mib?: number;
   effective_cpu_millicores?: number;
-  effective_storage_gib?: number;
+  effective_storage_mib?: number;
   sleep_after_seconds?: number | null;
   /** Read with effectiveSleepAfterSql. */
   effective_sleep_after_seconds?: number | null;
@@ -79,6 +80,8 @@ export interface RoleRow {
   connection_limit: number | null;
   /** A JSON array of role names, ordered. */
   member_of_json: string;
+  /** Bit 1 INHERIT, bit 0 SET, uniform across member_of; ADMIN is never granted. */
+  membership_options: number;
   bypass_rls: number;
   created_by_key_id: string | null;
   deleted_by_key_id: string | null;
@@ -100,8 +103,12 @@ export interface OperationRow {
 export interface RegionRow {
   id: string;
 }
-export interface SizeRow extends Omit<SizeClass, "enabled"> {
+export interface SizeRow extends Omit<
+  SizeClass,
+  "enabled" | "storage_gib" | "storage_mib"
+> {
   enabled: number;
+  storage_mib: number;
 }
 /** The idle time before a database sleeps: its own, else its size class's; null is always warm. */
 export function effectiveSleepAfterSql(database: string): string {
@@ -115,6 +122,7 @@ export function effectiveSleepAfterSql(database: string): string {
  */
 export function databaseView(row: DatabaseRow, now = Date.now()): Database {
   const { backup, disk, sample } = databaseHealthOf(row, now);
+  const { storage_mib, ...resources } = effectiveOf(row);
   return Database.parse({
     id: row.id,
     project_id: row.project_id,
@@ -122,7 +130,7 @@ export function databaseView(row: DatabaseRow, now = Date.now()): Database {
     node_id: row.node_id,
     name: row.name,
     size_class_id: row.size_class_id,
-    resources: effectiveOf(row),
+    resources: { ...resources, ...serializeStorage(storage_mib) },
     sleep_after_seconds: row.sleep_after_seconds ?? null,
     effective_sleep_after_seconds: row.effective_sleep_after_seconds,
     desired_state: row.desired_state,
@@ -170,8 +178,21 @@ export function roleView(row: RoleRow): Role {
     valid_until: row.valid_until,
     connection_limit: row.connection_limit,
     member_of: JSON.parse(row.member_of_json) as string[],
+    ...roleMembershipOptions(row.membership_options),
     bypass_rls: Boolean(row.bypass_rls),
   });
+}
+
+/** Keep default responses compatible with the original role contract. */
+export function roleMembershipOptions(options: number) {
+  return options === 3
+    ? {}
+    : {
+        membership_options: {
+          inherit: (options & 2) !== 0,
+          set: (options & 1) !== 0,
+        },
+      };
 }
 export function operationView(row: OperationRow): Operation {
   return Operation.parse({

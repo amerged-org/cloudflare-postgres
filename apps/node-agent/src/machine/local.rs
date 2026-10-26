@@ -187,6 +187,8 @@ struct State {
     volume_reads_fail: u32,
     unit_reads_fail: u32,
     pool_sample_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Holds one already-captured package snapshot, to exercise concurrent OS reports.
+    package_read_gate: Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>,
     pool_reads: u64,
     pool_unobserved: bool,
     volume_reads: u64,
@@ -536,6 +538,15 @@ impl Local {
             .iter()
             .map(|(name, version)| (name.to_string(), version.to_string()))
             .collect();
+    }
+
+    pub fn hold_next_package_snapshot(
+        &self,
+    ) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+        let captured = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        self.state().package_read_gate = Some((captured.clone(), release.clone()));
+        (captured, release)
     }
     /// How many slot numbers have a user on this machine.
     pub fn slot_users(&self) -> usize {
@@ -1330,7 +1341,7 @@ impl Machine for Local {
 
     async fn initdb(&self, _account: &Account, data: &Path) -> io::Result<()> {
         let output = tokio::process::Command::new(self.layout.postgres_bin.join("initdb"))
-            .args(initdb_arguments(data, None))
+            .args(initdb_arguments(data))
             .arg("--no-sync")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1651,7 +1662,15 @@ impl Machine for Local {
     }
 
     async fn installed_packages(&self) -> io::Result<BTreeMap<String, String>> {
-        Ok(self.state().packages.clone())
+        let (packages, gate) = {
+            let mut state = self.state();
+            (state.packages.clone(), state.package_read_gate.take())
+        };
+        if let Some((captured, release)) = gate {
+            captured.add_permits(1);
+            release.acquire().await.unwrap().forget();
+        }
+        Ok(packages)
     }
 
     /// Apt's effect on the package list: the versions named are installed. A package file is only

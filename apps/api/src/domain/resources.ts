@@ -7,35 +7,42 @@ import {
   DATABASE_CPU_MIN_MILLICORES,
   DATABASE_MEMORY_DEFAULT_MAXIMUM_MIB,
   DATABASE_MEMORY_STEP_MIB,
-  DATABASE_STORAGE_MIN_GIB,
-  type DatabaseEffectiveResources,
-  type DatabaseResources,
+  DATABASE_STORAGE_STEP_MIB,
+  normalizeStorage,
   type DatabaseResourcesCreate,
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { DatabaseRow, SizeRow } from "./rows.ts";
 
 /** The database's own values; null takes the size class's. */
-export type ResourceOverrides = DatabaseResources;
-type Resources = DatabaseEffectiveResources;
+export interface ResourceOverrides {
+  memory_mib: number | null;
+  cpu_millicores: number | null;
+  storage_mib: number | null;
+}
+type Resources = {
+  memory_mib: number;
+  cpu_millicores: number;
+  storage_mib: number;
+};
 
 export const NO_OVERRIDES: ResourceOverrides = {
   memory_mib: null,
   cpu_millicores: null,
-  storage_gib: null,
+  storage_mib: null,
 };
 
 /** The database's own values as stored. */
 export function ownResources(
   row: Pick<
     DatabaseRow,
-    "own_memory_mib" | "own_cpu_millicores" | "own_storage_gib"
+    "own_memory_mib" | "own_cpu_millicores" | "own_storage_mib"
   >,
 ): ResourceOverrides {
   return {
     memory_mib: row.own_memory_mib ?? null,
     cpu_millicores: row.own_cpu_millicores ?? null,
-    storage_gib: row.own_storage_gib ?? null,
+    storage_mib: row.own_storage_mib ?? null,
   };
 }
 export function overridesOfCreate(
@@ -44,29 +51,30 @@ export function overridesOfCreate(
   return {
     memory_mib: resources?.memory_mib ?? null,
     cpu_millicores: resources?.cpu_millicores ?? null,
-    storage_gib: resources?.storage_gib ?? null,
+    storage_mib:
+      resources === undefined ? null : (normalizeStorage(resources) ?? null),
   };
 }
 export const sameOverrides = (a: ResourceOverrides, b: ResourceOverrides) =>
   a.memory_mib === b.memory_mib &&
   a.cpu_millicores === b.cpu_millicores &&
-  a.storage_gib === b.storage_gib;
+  a.storage_mib === b.storage_mib;
 
 /** A database's own value, else its size class's. */
 export function effectiveResources(
-  size: Pick<SizeRow, "memory_mib" | "cpu_millicores" | "storage_gib">,
+  size: Pick<SizeRow, "memory_mib" | "cpu_millicores" | "storage_mib">,
   own: ResourceOverrides,
 ): Resources {
   return {
     memory_mib: own.memory_mib ?? size.memory_mib,
     cpu_millicores: own.cpu_millicores ?? size.cpu_millicores,
-    storage_gib: own.storage_gib ?? size.storage_gib,
+    storage_mib: own.storage_mib ?? size.storage_mib,
   };
 }
 export const sameResources = (a: Resources, b: Resources) =>
   a.memory_mib === b.memory_mib &&
   a.cpu_millicores === b.cpu_millicores &&
-  a.storage_gib === b.storage_gib;
+  a.storage_mib === b.storage_mib;
 
 /**
  * The resource snapshot a lifecycle event keeps for usage (plan 3.4: effective limits times awake
@@ -91,19 +99,19 @@ export function effectiveOf(
     DatabaseRow,
     | "effective_memory_mib"
     | "effective_cpu_millicores"
-    | "effective_storage_gib"
+    | "effective_storage_mib"
   >,
 ): Resources {
   if (
     row.effective_memory_mib == null ||
     row.effective_cpu_millicores == null ||
-    row.effective_storage_gib == null
+    row.effective_storage_mib == null
   )
     throw new Error("database_resources_not_selected");
   return {
     memory_mib: row.effective_memory_mib,
     cpu_millicores: row.effective_cpu_millicores,
-    storage_gib: row.effective_storage_gib,
+    storage_mib: row.effective_storage_mib,
   };
 }
 
@@ -173,8 +181,13 @@ export function assertResourcesAllowed(
         `CPU exceeds the ${bounds.maximum_cpu_millicores} millicores of the region's largest node`,
       );
   }
-  if (effective.storage_gib < DATABASE_STORAGE_MIN_GIB)
-    throw invalid(`Storage is at least ${DATABASE_STORAGE_MIN_GIB} GiB`);
+  if (
+    effective.storage_mib < DATABASE_STORAGE_STEP_MIB ||
+    effective.storage_mib % DATABASE_STORAGE_STEP_MIB !== 0
+  )
+    throw invalid(
+      `Storage must be a positive multiple of ${DATABASE_STORAGE_STEP_MIB} MiB`,
+    );
 }
 
 /** The SQL columns that `DatabaseRow.effective_*` reads, for a query over `databases` as `alias`. */
@@ -185,5 +198,5 @@ export function effectiveResourcesColumnsSql(alias: string): string {
     `(SELECT ${column} FROM size_classes WHERE id=${alias}.size_class_id)`;
   return `COALESCE(${alias}.own_memory_mib,${klass("memory_mib")}) effective_memory_mib,
     COALESCE(${alias}.own_cpu_millicores,${klass("cpu_millicores")}) effective_cpu_millicores,
-    COALESCE(${alias}.own_storage_gib,${klass("storage_gib")}) effective_storage_gib`;
+    COALESCE(${alias}.own_storage_mib,${klass("storage_mib")}) effective_storage_mib`;
 }

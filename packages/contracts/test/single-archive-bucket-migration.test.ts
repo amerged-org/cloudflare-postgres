@@ -147,8 +147,8 @@ it("runs the SQL of the bucket-move runbook on the migrated schema and selects w
     NOW,
   );
   run(
-    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,archive_timeout_seconds,backup_retention_days,created_at,updated_at)
-     VALUES('small',512,500,10,100,60,7,?,?)`,
+    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_mib,max_connections,archive_timeout_seconds,backup_retention_days,created_at,updated_at)
+     VALUES('small',512,500,10240,100,60,7,?,?)`,
     NOW,
     NOW,
   );

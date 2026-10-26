@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   bytesToHex,
+  normalizeStorage,
+  serializeStorage,
   DatabaseResourceProfile,
   ResourceProfileRevision,
   type ResourceProfileUpdate,
@@ -63,7 +65,17 @@ export async function updateResourceProfile(
     execute: async (lease) => {
       const now = new Date().toISOString(),
         next = body.expected_revision + 1;
-      const resources = JSON.stringify(body.resources);
+      const settings = Object.fromEntries(
+        Object.entries(body.resources).filter(
+          ([key]) => key !== "storage_gib" && key !== "storage_mib",
+        ),
+      );
+      const storage = normalizeStorage(body.resources)!;
+      const value = body.resources;
+      const resources = JSON.stringify({
+        ...settings,
+        ...serializeStorage(storage),
+      });
       const sha256 = bytesToHex(
         new Uint8Array(
           await crypto.subtle.digest(
@@ -72,8 +84,7 @@ export async function updateResourceProfile(
           ),
         ),
       );
-      const size = `rp-${sha256.slice(0, 28)}`,
-        value = body.resources;
+      const size = `rp-${sha256.slice(0, 28)}`;
       const result = await c.env.DB.batch([
         c.env.DB.prepare(
           `INSERT INTO resource_profiles(id,revision,created_at,updated_at)
@@ -81,14 +92,14 @@ export async function updateResourceProfile(
         ).bind(id, now, now, body.expected_revision, ...lease.guard.bindings),
         c.env.DB.prepare(
           `INSERT INTO size_classes(id,memory_mib,cpu_millicores,
-          storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,
+          storage_mib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,
           enabled,created_at,updated_at)
           SELECT ?,?,?,?,?,?,?,?,?,?,? FROM resource_profiles WHERE id=? AND revision=? AND (${lease.guard.sql})`,
         ).bind(
           size,
           value.memory_mib,
           value.cpu_millicores,
-          value.storage_gib,
+          storage,
           value.max_connections,
           value.sleep_after_seconds,
           value.archive_timeout_seconds,

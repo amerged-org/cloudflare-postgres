@@ -189,6 +189,43 @@ export type StandingNodeCostProfile = z.infer<typeof StandingNodeCostProfile>;
 const PPM = "Integer parts per million: 1000000 = 100 %, 800000 = 80 %.";
 const KEEP = "Omitted on PUT: keeps the stored value.";
 const WARNING = `${PPM} null disables the warning and clears its episode. ${KEEP}`;
+/** Alert-only pressure policy. It neither authorizes purchases nor schedules database moves. */
+export const CapacityAlertPolicy = z
+  .strictObject({
+    warning_threshold_ppm: ThresholdPpm.default(700_000),
+    action_threshold_ppm: ThresholdPpm.default(750_000),
+    clear_threshold_ppm: ThresholdPpm.default(650_000),
+    metadata_warning_threshold_ppm: ThresholdPpm.default(400_000),
+    metadata_action_threshold_ppm: ThresholdPpm.default(450_000),
+    metadata_clear_threshold_ppm: ThresholdPpm.default(350_000),
+    persistence_seconds: z
+      .number()
+      .int()
+      .min(60)
+      .max(86_400)
+      .multipleOf(60)
+      .default(1800),
+  })
+  .superRefine((policy, context) => {
+    if (
+      !(
+        policy.clear_threshold_ppm < policy.warning_threshold_ppm &&
+        policy.warning_threshold_ppm < policy.action_threshold_ppm
+      ) ||
+      !(
+        policy.metadata_clear_threshold_ppm <
+          policy.metadata_warning_threshold_ppm &&
+        policy.metadata_warning_threshold_ppm <
+          policy.metadata_action_threshold_ppm
+      )
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Capacity clear thresholds must be below warning thresholds, and warning thresholds below action thresholds",
+      });
+  });
+export type CapacityAlertPolicy = z.infer<typeof CapacityAlertPolicy>;
 export const NodeRegionPolicy = z
   .strictObject({
     region_id: RegionId,
@@ -209,6 +246,11 @@ export const NodeRegionPolicy = z
         "Permits paid provider orders: the capacity cron reserves an order addition, and it is dispatched, only while this is true and its order equals `order`. Requires `order`.",
       ),
     autoscale_enabled: z.boolean().optional(),
+    capacity_alert_policy: CapacityAlertPolicy.nullable()
+      .optional()
+      .describe(
+        "Opt-in current-pressure notifications, independent of purchases and moves. {} selects 70% warning, 75% sustained for 30 minutes action, 65% clear for RAM/CPU/data; metadata 40/45/35%. Warnings and clearing use the latest fresh sample; action uses consecutive minute rollups, never the three-day placement peak. Replaces the three legacy node warning thresholds while enabled. null disables; omission preserves the stored policy.",
+      ),
     node_ram_warning_threshold_ppm: ThresholdPpm.nullable()
       .optional()
       .describe(

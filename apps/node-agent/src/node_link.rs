@@ -444,6 +444,11 @@ fn roles_valid(db: &Value) -> bool {
         .iter()
         .filter(|role| role.get("state").is_none())
         .all(|role| {
+            if role.get("membership_options").is_some()
+                && role["member_of"].as_array().is_none_or(Vec::is_empty)
+            {
+                return false;
+            }
             role["member_of"]
                 .as_array()
                 .into_iter()

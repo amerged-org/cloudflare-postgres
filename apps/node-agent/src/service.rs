@@ -157,6 +157,8 @@ pub struct Service<M: Machine> {
     /// When the next try to tell systemd what the host files need may be made, after one failed:
     /// a page does not repeat a restart that has just failed.
     host_files_retry: Mutex<Retry>,
+    /// OS snapshots from host-file and package convergence publish in their read order.
+    os_reporting: tokio::sync::Mutex<()>,
     /// The release whose host files this agent's own rules refused and that was reported, so that
     /// the refusal is one event however many pages name the release.
     refused_files: Mutex<Option<update::Release>>,
@@ -370,6 +372,7 @@ impl<M: Machine> Service<M> {
             release: Mutex::new(None),
             host_files_held: Mutex::new(None),
             host_files_retry: Mutex::new(Retry::default()),
+            os_reporting: tokio::sync::Mutex::new(()),
             refused_files: Mutex::new(None),
             release_key: config.release_key,
             verdict: Mutex::new(None),
@@ -1188,6 +1191,7 @@ impl<M: Machine> Service<M> {
     /// hello of the link names the digest of what is installed now (SEC-03). After a reboot the
     /// agent starts again and says it.
     async fn report_os(&self) {
+        let _report = self.os_reporting.lock().await;
         let reported = match crate::machine::os_report(&*self.machine).await {
             Ok(os) => self.link.set_os(&os),
             Err(error) => Err(error),
@@ -4282,6 +4286,52 @@ mod tests {
             machine.calls()
         );
         service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_older_os_snapshot_cannot_replace_the_report_after_a_package_change() {
+        let Some((machine, _fixture, _root)) =
+            site("os-report-order", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        machine.set_packages(&[("bash", "5.2")]);
+        let cloud = Cloud::start().await;
+        let service = serve(&machine, &cloud, &tempdir()).await;
+        let (captured, release) = machine.hold_next_package_snapshot();
+        let old = tokio::spawn({
+            let service = service.clone();
+            async move { service.report_os().await }
+        });
+        within(
+            10,
+            "the old package snapshot to be captured",
+            captured.acquire(),
+        )
+        .await
+        .unwrap()
+        .forget();
+        machine.set_packages(&[("bash", "5.3")]);
+        let newest = crate::machine::os_report(&*machine).await.unwrap();
+        let next = service.report_os();
+        tokio::pin!(next);
+        // Poll the later report while the earlier snapshot is held. Without serialization it
+        // publishes the new packages immediately, and the released old snapshot overwrites them.
+        let next_pending = futures_util::poll!(&mut next).is_pending();
+        release.add_permits(1);
+        old.await.unwrap();
+        if next_pending {
+            next.await;
+        }
+        let before = cloud.with(|inner| inner.hellos.len());
+        cloud.drop_links();
+        eventually(10, "a fresh hello after both OS reports", || {
+            cloud.with(|inner| inner.hellos.len() > before)
+        })
+        .await;
+        let last = cloud.with(|inner| inner.hellos.last().unwrap()["os"].clone());
+        service.stop();
+        assert_eq!(last, newest, "a late old snapshot must not win");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

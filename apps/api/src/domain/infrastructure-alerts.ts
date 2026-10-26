@@ -30,6 +30,10 @@ import {
 } from "./cron-health.ts";
 import { closedPools } from "./placement-closed.ts";
 import { purgeNodeDiagnostics } from "./node-diagnostics.ts";
+import {
+  capacityPressureObservations,
+  CAPACITY_PRESSURE_KINDS,
+} from "./capacity-pressure.ts";
 import type { Env } from "../env.ts";
 import { regionalNodeCountSql } from "./node-capacity-count.ts";
 
@@ -40,6 +44,7 @@ interface AlertRow {
   payload: string;
   delivered_at: string | null;
   last_attempt_at: string | null;
+  fanout_initialized?: number;
 }
 interface AlertCondition {
   kind: InfraAlertKind;
@@ -223,8 +228,68 @@ export async function infrastructureAlertStatus(
     )
     .bind(regionId)
     .all<AlertRow>();
+  const deliveries = await db
+    .prepare(
+      "SELECT d.* FROM infrastructure_alert_deliveries d JOIN infrastructure_alerts a ON a.region_id=d.region_id AND a.kind=d.kind AND a.event_id=d.event_id AND json_extract(a.payload,'$.occurred_at')=d.occurred_at WHERE d.region_id=? ORDER BY d.channel,d.destination_id",
+    )
+    .bind(regionId)
+    .all<DeliveryRow>();
+  const recoveries = await db
+    .prepare(
+      "SELECT * FROM infrastructure_alert_recoveries WHERE region_id=? ORDER BY occurred_at DESC,kind LIMIT 32",
+    )
+    .bind(regionId)
+    .all<AlertRow>();
+  const recoveryDeliveries = await db
+    .prepare(
+      `SELECT d.* FROM infrastructure_alert_recovery_deliveries d JOIN
+      (SELECT region_id,kind,event_id,occurred_at FROM infrastructure_alert_recoveries WHERE region_id=? ORDER BY occurred_at DESC,kind LIMIT 32) r
+      ON r.region_id=d.region_id AND r.kind=d.kind AND r.event_id=d.event_id AND r.occurred_at=d.occurred_at
+      ORDER BY d.channel,d.destination_id`,
+    )
+    .bind(regionId)
+    .all<DeliveryRow>();
+  const receiptView = (d: DeliveryRow) => ({
+    destination_id: d.destination_id,
+    channel: d.channel,
+    recipient: d.recipient,
+    delivered_at: d.delivered_at,
+    last_attempt_at: d.last_attempt_at,
+    attempts: d.attempts,
+    last_status: d.last_status,
+    last_error: d.last_error,
+  });
   return rows.results.map((row) =>
     InfraAlertStatus.parse({
+      recoveries: recoveries.results
+        .filter((r) => r.kind === row.kind)
+        .map((r) => {
+          const event = InfraAlert.parse(JSON.parse(r.payload));
+          return {
+            event_id: r.event_id,
+            occurred_at: event.occurred_at,
+            episode_started_at: event.episode_started_at,
+            delivered_at: r.delivered_at,
+            last_attempt_at: r.last_attempt_at,
+            deliveries: recoveryDeliveries.results
+              .filter(
+                (d) =>
+                  d.kind === r.kind &&
+                  d.event_id === r.event_id &&
+                  d.occurred_at === event.occurred_at,
+              )
+              .map(receiptView),
+          };
+        }),
+      deliveries: deliveries.results
+        .filter(
+          (d) =>
+            d.kind === row.kind &&
+            d.event_id === row.event_id &&
+            d.occurred_at ===
+              InfraAlert.parse(JSON.parse(row.payload)).occurred_at,
+        )
+        .map(receiptView),
       kind: row.kind,
       active: row.active === 1,
       event_id: row.event_id,
@@ -298,12 +363,13 @@ export async function runInfrastructureAlerts(
   deadline?: number,
 ): Promise<{ delivered: number; pending: number }> {
   const policy = await env.DB.prepare(
-    "SELECT max_nodes,cap_warning_enabled,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm FROM node_region_policies WHERE region_id=?",
+    "SELECT max_nodes,cap_warning_enabled,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm,capacity_alert_policy FROM node_region_policies WHERE region_id=?",
   )
     .bind(regionId)
     .first<{
       max_nodes: number | null;
       cap_warning_enabled: number;
+      capacity_alert_policy: string | null;
       node_ram_warning_threshold_ppm: number | null;
       node_cpu_warning_threshold_ppm: number | null;
       node_storage_warning_threshold_ppm: number | null;
@@ -337,15 +403,26 @@ export async function runInfrastructureAlerts(
     },
   ];
   for (const kind of Object.keys(nodeUtilization) as NodeWarningKind[])
-    conditions.push(await nodeWarning(env.DB, regionId, kind, policy, now));
+    conditions.push(
+      policy.capacity_alert_policy === null
+        ? await nodeWarning(env.DB, regionId, kind, policy, now)
+        : {
+            kind,
+            active: false,
+            snapshot: {
+              sql: "EXISTS(SELECT 1 FROM node_region_policies WHERE region_id=? AND capacity_alert_policy IS ?)",
+              bindings: [regionId, policy.capacity_alert_policy],
+            },
+          },
+    );
   for (const { kind, active, snapshot, takeover, detail } of conditions) {
     // Unknown measurements retain an enabled episode; explicitly disabling its policy clears it.
     if (active === null) continue;
     if (!active) {
       await env.DB.prepare(
-        `UPDATE infrastructure_alerts SET active=0 WHERE region_id=? AND kind=? AND active=1 AND ${snapshot.sql}`,
+        `UPDATE infrastructure_alerts SET active=0,resolved_at=? WHERE region_id=? AND kind=? AND active=1 AND ${snapshot.sql}`,
       )
-        .bind(regionId, kind, ...snapshot.bindings)
+        .bind(timestamp, regionId, kind, ...snapshot.bindings)
         .run();
       continue;
     }
@@ -364,7 +441,7 @@ export async function runInfrastructureAlerts(
     const written = await env.DB.prepare(
       `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)
       SELECT ?,?,1,?,? WHERE ${snapshot.sql} ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,
-        payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0${
+        payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL,resolved_at=NULL,fanout_initialized=1 WHERE infrastructure_alerts.active=0${
           takeover ? ` OR ${takeover.sql}` : ""
         }`,
     )
@@ -380,11 +457,11 @@ export async function runInfrastructureAlerts(
     if (written.meta.changes > 0) logEpisodeOpened(event);
   }
   const pending = await env.DB.prepare(
-    "SELECT * FROM infrastructure_alerts WHERE region_id=? AND active=1 AND delivered_at IS NULL ORDER BY kind",
+    "SELECT * FROM infrastructure_alerts WHERE region_id=? AND active=1 ORDER BY kind",
   )
     .bind(regionId)
     .all<AlertRow>();
-  return deliverAlertRows(
+  const delivered = await deliverAlertRows(
     env,
     regionId,
     pending.results,
@@ -393,6 +470,26 @@ export async function runInfrastructureAlerts(
     conditions,
     deadline,
   );
+  const pressure = await capacityPressureObservations(
+    env.DB,
+    regionId,
+    policy.capacity_alert_policy,
+    now,
+  );
+  const pressureDelivery = await reconcileAndDeliver(
+    env,
+    regionId,
+    pressure,
+    await storedEpisodes(env.DB, regionId),
+    CAPACITY_PRESSURE_KINDS,
+    now,
+    fetcher,
+    deadline,
+  );
+  return {
+    delivered: delivered.delivered + pressureDelivery.delivered,
+    pending: delivered.pending + pressureDelivery.pending,
+  };
 }
 
 /**
@@ -400,6 +497,20 @@ export async function runInfrastructureAlerts(
  * (epoch milliseconds): once it has passed, the remaining rows are left unclaimed, so the next
  * run retries them at once instead of after the retry interval.
  */
+interface DeliveryRow {
+  region_id: string;
+  kind: InfraAlertKind;
+  event_id: string;
+  occurred_at: string;
+  destination_id: string;
+  channel: "webhook" | "email";
+  recipient: string | null;
+  delivered_at: string | null;
+  last_attempt_at: string | null;
+  attempts: number;
+  last_status: number | null;
+  last_error: string | null;
+}
 export async function deliverAlertRows(
   env: Env,
   regionId: string,
@@ -409,140 +520,307 @@ export async function deliverAlertRows(
   conditions?: AlertCondition[],
   deadline?: number,
 ) {
-  if (rows.length === 0) return { delivered: 0, pending: 0 };
+  if (!rows.length) return { delivered: 0, pending: 0 };
   const webhook = callback(env),
     config = await readInfrastructureBackupConfig(env.DB);
-  const email =
-    !webhook &&
-    env.RESEND_API_KEY &&
-    config.notification_recipient &&
-    config.notification_sender
-      ? {
-          token: env.RESEND_API_KEY,
-          recipient: config.notification_recipient,
-          sender: config.notification_sender,
-        }
-      : null;
-  if (!webhook && !email) return { delivered: 0, pending: rows.length };
+  type Destination = {
+    id: string;
+    channel: "webhook" | "email";
+    recipient: string | null;
+    url: string;
+    token: string;
+    service?: Fetcher;
+    legacy: boolean;
+  };
+  const destinations: Destination[] = [];
+  const hash = async (value: string) =>
+    bytesToHex(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+      ),
+    );
+  if (webhook)
+    destinations.push({
+      ...webhook,
+      id: `webhook:${await hash(webhook.url)}`,
+      channel: "webhook",
+      recipient: null,
+      legacy: true,
+    });
+  if (env.RESEND_API_KEY && config.notification_sender) {
+    const recipients = new Map<string, string>();
+    for (const address of [
+      config.notification_recipient,
+      ...config.notification_recipients,
+    ])
+      if (address) recipients.set(address.toLowerCase(), address);
+    for (const normalized of recipients.keys())
+      destinations.push({
+        id: `email:${await hash(`${normalized}\n${config.notification_sender}`)}`,
+        channel: "email",
+        recipient: normalized,
+        url: "https://api.resend.com/emails",
+        token: env.RESEND_API_KEY,
+        legacy:
+          !webhook &&
+          normalized === config.notification_recipient?.toLowerCase(),
+      });
+  }
+  if (!destinations.length) return { delivered: 0, pending: rows.length };
   const timestamp = new Date(now).toISOString();
-  let delivered = 0;
-  for (const [index, row] of rows.entries()) {
-    if (deadline !== undefined && Date.now() >= deadline) {
-      console.error(
-        JSON.stringify({
-          event: "infrastructure_alert_deferred",
-          region_id: regionId,
-          deferred: rows.length - index,
-        }),
-      );
-      break;
-    }
+  let delivered = 0,
+    pending = 0;
+  for (const row of rows) {
     const condition = conditions?.find((value) => value.kind === row.kind);
     if (conditions && condition?.active !== true) continue;
-    const claim = await env.DB.prepare(
-      `UPDATE infrastructure_alerts SET last_attempt_at=? WHERE region_id=? AND kind=? AND event_id=? AND payload=? AND active=1 AND delivered_at IS NULL AND (last_attempt_at IS NULL OR last_attempt_at<=?)${condition ? " AND " + condition.snapshot.sql : ""}`,
+    if (deadline !== undefined && Date.now() >= deadline) {
+      pending++;
+      continue;
+    }
+    const event = InfraAlert.parse(JSON.parse(row.payload));
+    const recovery = event.state === "resolved";
+    const sourceTable = recovery
+      ? "infrastructure_alert_recoveries"
+      : "infrastructure_alerts";
+    const deliveryTable = recovery
+      ? "infrastructure_alert_recovery_deliveries"
+      : "infrastructure_alert_deliveries";
+    // Backfill the receipt of the formerly exclusive destination once. New destinations still
+    // get their own pending row. The existing webhook's receipt never acknowledges an email.
+    const keys = [regionId, row.kind, row.event_id, event.occurred_at];
+    const known = await env.DB.prepare(
+      `SELECT * FROM ${deliveryTable} WHERE region_id=? AND kind=? AND event_id=? AND occurred_at=?`,
     )
-      .bind(
-        timestamp,
-        regionId,
-        row.kind,
-        row.event_id,
-        row.payload,
-        new Date(now - retryMs).toISOString(),
-        ...(condition?.snapshot.bindings ?? []),
+      .bind(...keys)
+      .all<DeliveryRow>();
+    if (
+      destinations.every((destination) =>
+        known.results.some(
+          (receipt) =>
+            receipt.destination_id === destination.id &&
+            receipt.delivered_at !== null,
+        ),
       )
-      .run();
-    if (claim.meta.changes !== 1) continue;
-    const abort = new AbortController();
-    let expired = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const url = webhook?.url ?? "https://api.resend.com/emails";
-      const body = webhook
-        ? row.payload
-        : JSON.stringify({
-            from: email!.sender,
-            to: [email!.recipient],
-            subject: `PGCF infrastructure: ${row.kind} (${regionId})`,
-            text: JSON.stringify(JSON.parse(row.payload), null, 2),
-          });
-      const options: RequestInit = {
-        method: "POST",
-        redirect: "manual",
-        signal: abort.signal,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${webhook?.token ?? email!.token}`,
-          "Idempotency-Key": `${row.event_id}:${InfraAlert.parse(JSON.parse(row.payload)).occurred_at}`,
-          "User-Agent": "pgcf-infrastructure-alerts",
-        },
-        body,
-      };
-      const delivery = (
-        webhook?.service
-          ? webhook.service.fetch(new Request(url, options))
-          : fetcher(url, options)
-      ).then((response) => {
-        if (expired) {
-          void response.body?.cancel().catch(() => {});
-          throw new Error("infrastructure_alert_timeout");
-        }
-        return response;
-      });
-      const deadline = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => {
-          expired = true;
-          abort.abort();
-          reject(new Error("infrastructure_alert_timeout"));
-        }, 5000);
-      });
-      const response = await Promise.race([delivery, deadline]);
-      void response.body?.cancel().catch(() => {});
-      if (!response.ok) {
-        // Status only: the body and the destination's details stay out of the log.
-        console.error(
-          JSON.stringify({
-            event: "infrastructure_alert_delivery_failed",
-            region_id: regionId,
-            kind: row.kind,
-            event_id: row.event_id,
-            status: response.status,
-          }),
-        );
-        continue;
+    ) {
+      // A continuing, fully acknowledged episode is read-only. Repair an interrupted aggregate
+      // acknowledgement without contacting a destination again.
+      if (row.delivered_at === null) {
+        const ack = await env.DB.prepare(
+          `UPDATE ${sourceTable} SET delivered_at=? WHERE region_id=? AND kind=? AND event_id=? AND payload=? AND active=1 AND delivered_at IS NULL`,
+        )
+          .bind(timestamp, regionId, row.kind, row.event_id, row.payload)
+          .run();
+        delivered += ack.meta.changes;
       }
-      const ack = await env.DB.prepare(
-        "UPDATE infrastructure_alerts SET delivered_at=? WHERE region_id=? AND kind=? AND event_id=? AND active=1 AND delivered_at IS NULL AND last_attempt_at=?",
+      continue;
+    }
+    await env.DB.batch(
+      destinations.map((destination) =>
+        env.DB.prepare(
+          `INSERT INTO ${deliveryTable}(region_id,kind,event_id,occurred_at,destination_id,channel,recipient,delivered_at,last_attempt_at)
+       SELECT ?,?,?,?,?,?,?,CASE WHEN fanout_initialized=0 AND ?=1 THEN delivered_at ELSE NULL END,
+       CASE WHEN fanout_initialized=0 AND ?=1 THEN last_attempt_at ELSE NULL END
+       FROM ${sourceTable} WHERE region_id=? AND kind=? AND event_id=? AND payload=? AND active=1
+       ON CONFLICT(region_id,kind,event_id,occurred_at,destination_id) DO NOTHING`,
+        ).bind(
+          ...keys,
+          destination.id,
+          destination.channel,
+          destination.recipient,
+          Number(destination.legacy),
+          Number(destination.legacy),
+          regionId,
+          row.kind,
+          row.event_id,
+          row.payload,
+        ),
+      ),
+    );
+    const initialized = await env.DB.prepare(
+      `UPDATE ${sourceTable} SET fanout_initialized=1 WHERE region_id=? AND kind=? AND event_id=? AND payload=? AND active=1`,
+    )
+      .bind(regionId, row.kind, row.event_id, row.payload)
+      .run();
+    if (initialized.meta.changes !== 1) {
+      pending++;
+      continue;
+    }
+    const placeholders = destinations.map(() => "?").join(",");
+    const incomplete = async () =>
+      (await env.DB.prepare(
+        `SELECT COUNT(*) count FROM ${deliveryTable} WHERE region_id=? AND kind=? AND event_id=? AND occurred_at=? AND destination_id IN(${placeholders}) AND delivered_at IS NULL`,
       )
-        .bind(timestamp, regionId, row.kind, row.event_id, timestamp)
+        .bind(...keys, ...destinations.map((d) => d.id))
+        .first<number>("count")) ?? 0;
+    if (await incomplete())
+      await env.DB.prepare(
+        `UPDATE ${sourceTable} SET delivered_at=NULL WHERE region_id=? AND kind=? AND event_id=? AND payload=? AND active=1`,
+      )
+        .bind(regionId, row.kind, row.event_id, row.payload)
         .run();
-      delivered += ack.meta.changes;
-    } catch (error) {
-      /* Same event ID and payload on retry; recipients must deduplicate callbacks, Resend uses its idempotency key. */
-      console.error(
-        JSON.stringify({
-          event: "infrastructure_alert_delivery_failed",
-          region_id: regionId,
-          kind: row.kind,
-          event_id: row.event_id,
-          reason:
+    // All destinations begin independently. A webhook timeout cannot starve email behind the
+    // watchdog's deadline, and a failed email cannot cause successful recipients to be retried.
+    await Promise.all(
+      destinations.map(async (destination) => {
+        const claim = await env.DB.prepare(
+          `UPDATE ${deliveryTable} SET last_attempt_at=?,attempts=attempts+1,last_status=NULL,last_error=NULL
+         WHERE region_id=? AND kind=? AND event_id=? AND occurred_at=? AND destination_id=? AND delivered_at IS NULL
+         AND (last_attempt_at IS NULL OR last_attempt_at<=?)
+         AND EXISTS(SELECT 1 FROM ${sourceTable} WHERE region_id=? AND kind=? AND event_id=? AND payload=? AND active=1${condition ? " AND " + condition.snapshot.sql : ""})`,
+        )
+          .bind(
+            timestamp,
+            ...keys,
+            destination.id,
+            new Date(now - retryMs).toISOString(),
+            regionId,
+            row.kind,
+            row.event_id,
+            row.payload,
+            ...(condition?.snapshot.bindings ?? []),
+          )
+          .run();
+        if (claim.meta.changes !== 1) return;
+        await env.DB.prepare(
+          `UPDATE ${sourceTable} SET last_attempt_at=? WHERE region_id=? AND kind=? AND event_id=? AND payload=? AND active=1`,
+        )
+          .bind(timestamp, regionId, row.kind, row.event_id, row.payload)
+          .run();
+        const abort = new AbortController();
+        let expired = false,
+          timer: ReturnType<typeof setTimeout> | undefined;
+        let status: number | null = null,
+          failure: string | null = null;
+        try {
+          const body =
+            destination.channel === "webhook"
+              ? row.payload
+              : JSON.stringify({
+                  from: config.notification_sender,
+                  to: [destination.recipient],
+                  subject: `PGCF infrastructure${recovery ? " recovered" : ""}: ${row.kind} (${regionId})`,
+                  text: JSON.stringify(event, null, 2),
+                });
+          const options: RequestInit = {
+            method: "POST",
+            redirect: "manual",
+            signal: abort.signal,
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${destination.token}`,
+              "Idempotency-Key": `${row.event_id}:${event.occurred_at}${recovery ? ":resolved" : ""}${destination.channel === "email" ? ":" + destination.id : ""}`,
+              "User-Agent": "pgcf-infrastructure-alerts",
+            },
+            body,
+          };
+          const request = (
+            destination.service
+              ? destination.service.fetch(new Request(destination.url, options))
+              : fetcher(destination.url, options)
+          ).then((response) => {
+            if (expired) {
+              void response.body?.cancel().catch(() => {});
+              throw new Error("infrastructure_alert_timeout");
+            }
+            return response;
+          });
+          const timeout = new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => {
+              expired = true;
+              abort.abort();
+              reject(new Error("infrastructure_alert_timeout"));
+            }, 5000);
+          });
+          const response = await Promise.race([request, timeout]);
+          void response.body?.cancel().catch(() => {});
+          status = response.status;
+          if (!response.ok) failure = "http";
+        } catch (error) {
+          failure =
             error instanceof Error &&
             error.message === "infrastructure_alert_timeout"
               ? "timeout"
-              : "transport",
-        }),
-      );
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
+              : "transport";
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+        await env.DB.prepare(
+          `UPDATE ${deliveryTable} SET delivered_at=?,last_status=?,last_error=?
+        WHERE region_id=? AND kind=? AND event_id=? AND occurred_at=? AND destination_id=? AND last_attempt_at=? AND delivered_at IS NULL`,
+        )
+          .bind(
+            failure === null ? timestamp : null,
+            status,
+            failure,
+            ...keys,
+            destination.id,
+            timestamp,
+          )
+          .run();
+        if (failure)
+          console.error(
+            JSON.stringify({
+              event: "infrastructure_alert_delivery_failed",
+              region_id: regionId,
+              kind: row.kind,
+              event_id: row.event_id,
+              channel: destination.channel,
+              ...(status === null ? { reason: failure } : { status }),
+            }),
+          );
+      }),
+    );
+    if (await incomplete()) {
+      pending++;
+      continue;
     }
+    const ack = await env.DB.prepare(
+      `UPDATE ${sourceTable} SET delivered_at=? WHERE region_id=? AND kind=? AND event_id=? AND payload=? AND active=1 AND delivered_at IS NULL`,
+    )
+      .bind(timestamp, regionId, row.kind, row.event_id, row.payload)
+      .run();
+    delivered += ack.meta.changes;
   }
-  return { delivered, pending: rows.length - delivered };
+  return { delivered, pending };
+}
+
+/** A separate outbox survives recurrence and keeps the recovery payload immutable on retry. */
+async function deliverRecoveries(
+  env: Env,
+  regionId: string,
+  now: number,
+  fetcher: typeof fetch,
+  deadline?: number,
+) {
+  const rows = await env.DB.prepare(
+    `SELECT * FROM infrastructure_alert_recoveries r WHERE region_id=? AND delivered_at IS NULL
+      AND (announced=1 OR EXISTS(SELECT 1 FROM infrastructure_alert_deliveries d
+        WHERE d.region_id=r.region_id AND d.kind=r.kind AND d.event_id=r.event_id
+          AND d.occurred_at=json_extract(r.payload,'$.episode_started_at') AND d.delivered_at IS NOT NULL))
+      ORDER BY occurred_at,kind LIMIT 32`,
+  )
+    .bind(regionId)
+    .all<AlertRow>();
+  return deliverAlertRows(
+    env,
+    regionId,
+    rows.results,
+    now,
+    fetcher,
+    undefined,
+    deadline,
+  );
 }
 
 type EventDetail = Partial<
   Pick<
     InfraAlert,
-    "node_ids" | "backup_artifacts" | "database_ids" | "thin_storage" | "cron"
+    | "node_ids"
+    | "backup_artifacts"
+    | "database_ids"
+    | "thin_storage"
+    | "cron"
+    | "capacity"
   >
 >;
 /**
@@ -569,7 +847,10 @@ function listedSubjects(payload: string): Set<string> {
       database_ids?: unknown;
       node_ids?: unknown;
       thin_storage?: unknown;
+      capacity?: InfraAlert["capacity"];
     };
+    for (const entry of event.capacity ?? [])
+      ids.add(`${entry.node_id}:${entry.resource}`);
     for (const list of [event.database_ids, event.node_ids])
       if (Array.isArray(list))
         for (const id of list) if (typeof id === "string") ids.add(id);
@@ -605,9 +886,15 @@ async function reconcileEpisode(
   if (observation.state === "resolved") {
     if (!active) return false;
     await env.DB.prepare(
-      "UPDATE infrastructure_alerts SET active=0 WHERE region_id=? AND kind=? AND event_id=? AND payload=?",
+      "UPDATE infrastructure_alerts SET active=0,resolved_at=? WHERE region_id=? AND kind=? AND event_id=? AND payload=?",
     )
-      .bind(regionId, kind, current!.event_id, current!.payload)
+      .bind(
+        new Date(now).toISOString(),
+        regionId,
+        kind,
+        current!.event_id,
+        current!.payload,
+      )
       .run();
     return true;
   }
@@ -634,7 +921,7 @@ async function reconcileEpisode(
   });
   // Arms a cleared episode, or replaces exactly the one this evaluation read.
   const written = await env.DB.prepare(
-    `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES(?,?,1,?,?) ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0 OR (infrastructure_alerts.event_id=? AND infrastructure_alerts.payload=?)`,
+    `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES(?,?,1,?,?) ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL,resolved_at=NULL,fanout_initialized=1 WHERE infrastructure_alerts.active=0 OR (infrastructure_alerts.event_id=? AND infrastructure_alerts.payload=?)`,
   )
     .bind(
       regionId,
@@ -822,7 +1109,7 @@ async function readNodeSubjects(
         FROM databases d JOIN database_resources r ON r.database_id=d.id,p
         WHERE d.region_id=p.region AND d.deleted_at IS NULL AND d.node_id IS NOT NULL
           AND d.observed_generation=d.generation AND d.observed_storage_bytes IS NOT NULL
-          AND d.observed_storage_bytes<r.storage_gib*1073741824-${FILESYSTEM_END_GAP_BYTES}
+          AND d.observed_storage_bytes<r.storage_mib*1048576-${FILESYSTEM_END_GAP_BYTES}
         ORDER BY d.id LIMIT 64)`,
     )
     .bind(
@@ -872,12 +1159,7 @@ const pendingOf = (
   kinds: readonly InfraAlertKind[],
 ) =>
   [...episodes]
-    .filter(
-      (row) =>
-        row.active === 1 &&
-        row.delivered_at === null &&
-        kinds.includes(row.kind),
-    )
+    .filter((row) => row.active === 1 && kinds.includes(row.kind))
     .sort((a, b) => (a.kind < b.kind ? -1 : 1));
 
 async function regionHealthAlerts(
@@ -1122,7 +1404,7 @@ async function reconcileAndDeliver(
   const rows = written
     ? pendingOf((await storedEpisodes(env.DB, regionId)).values(), kinds)
     : pendingOf(current.values(), kinds);
-  await deliverAlertRows(
+  const delivery = await deliverAlertRows(
     env,
     regionId,
     rows,
@@ -1131,7 +1413,18 @@ async function reconcileAndDeliver(
     undefined,
     deadline,
   );
+  const recoveries = await deliverRecoveries(
+    env,
+    regionId,
+    now,
+    fetcher,
+    deadline,
+  );
   if (failure) throw failure.error;
+  return {
+    delivered: delivery.delivered + recoveries.delivered,
+    pending: delivery.pending + recoveries.pending,
+  };
 }
 
 /**

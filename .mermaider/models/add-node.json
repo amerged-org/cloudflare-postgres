@@ -35,7 +35,7 @@
       },
       {
         "id": "03-ready",
-        "label": "Ready: place pending databases and hint their nodes",
+        "label": "Ready: place eligible pending databases and hint their nodes",
         "evidence": [
           {
             "line": 213,
@@ -44,9 +44,9 @@
             "symbol": "AddNode"
           },
           {
-            "line": 37,
+            "line": 42,
             "path": "apps/api/src/domain/node-capacity.ts",
-            "sha256": "8e21d958cbcf02ea0c8848e0766e8b673092372ee72bba1529643c9db36d623b",
+            "sha256": "079e5fe98f9697bde3897a8973eab0850d2cb5b5426dd6a70af2496430320302",
             "symbol": "placePendingDatabases"
           }
         ]
@@ -68,7 +68,7 @@
             "symbol": "dispatchNodeOrder"
           },
           {
-            "line": 665,
+            "line": 677,
             "path": "apps/api/src/domain/node-state.ts",
             "sha256": "6f59b5f38206f55a8cd8c8f22fd81d8880f91a38ec65f75b56bb93a9f297e0f6",
             "symbol": "claimNodeDispatch"

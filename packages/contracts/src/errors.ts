@@ -10,6 +10,7 @@ export const ERROR_CODES = [
   "idempotency_conflict",
   "idempotency_in_progress",
   "capacity_exhausted",
+  "service_unavailable",
   "rate_limited",
   "internal",
 ] as const;
@@ -26,6 +27,7 @@ export const ERROR_HTTP_STATUS = {
   idempotency_conflict: 409,
   idempotency_in_progress: 409,
   capacity_exhausted: 503,
+  service_unavailable: 503,
   rate_limited: 429,
   internal: 500,
 } as const satisfies Record<ErrorCode, number>;
@@ -99,6 +101,7 @@ export function retryAfterSeconds(
     return RETRYABLE_ERROR_REASONS[reason as RetryableErrorReason];
   if (code === "capacity_exhausted")
     return RETRYABLE_ERROR_REASONS.node_capacity;
+  if (code === "service_unavailable") return 60;
   if (code === "idempotency_in_progress") return 1;
   return undefined;
 }

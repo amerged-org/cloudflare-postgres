@@ -9,6 +9,7 @@ import {
   type RoleCreate,
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
+import { requireExtendedNative } from "./native-capabilities.ts";
 import { keyring } from "../crypto/keyring.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
@@ -96,6 +97,7 @@ interface RoleAttributes {
   validUntil: string | null;
   connectionLimit: number | null;
   memberOf: string[];
+  membershipOptions: number;
   bypassRls: boolean;
 }
 /**
@@ -133,6 +135,11 @@ async function roleAttributes(
     validUntil: body.valid_until ?? null,
     connectionLimit: body.connection_limit ?? null,
     memberOf,
+    membershipOptions:
+      body.membership_options === undefined
+        ? 3
+        : Number(body.membership_options.inherit) * 2 +
+          Number(body.membership_options.set),
     bypassRls: body.bypass_rls ?? false,
   };
 }
@@ -148,6 +155,13 @@ export async function createRole(
     replay: async (name) => replayedRole(c, id, name, 201),
     execute: async (lease) => {
       const attributes = await roleAttributes(c, id, body);
+      const native = await requireExtendedNative(
+        c.env,
+        db.node_id === null
+          ? { regionId: db.region_id }
+          : { nodeId: db.node_id },
+        attributes.membershipOptions !== 3,
+      );
       const now = new Date().toISOString(),
         generation = db.generation + 1,
         issuer = (await getAuth(c)).id;
@@ -162,11 +176,11 @@ export async function createRole(
           const guard = mutation.guard(id);
           return mutation.batch([
             c.env.DB.prepare(
-              `INSERT INTO roles (database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at,valid_until,connection_limit,member_of_json,bypass_rls,created_by_key_id)
-          SELECT id,?,0,?,?,?,1,?,?,?,?,?,?,? FROM databases WHERE id=? AND project_id=? AND generation=? AND deleted_at IS NULL
+              `INSERT INTO roles (database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at,valid_until,connection_limit,member_of_json,membership_options,bypass_rls,created_by_key_id)
+          SELECT id,?,0,?,?,?,1,?,?,?,?,?,?,?,? FROM databases WHERE id=? AND project_id=? AND generation=? AND deleted_at IS NULL
           AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
           AND (SELECT COUNT(*) FROM roles WHERE database_id=databases.id)<${ROLE_LIMIT}
-          AND ${MEMBER_TARGETS_SQL} AND ${guard.sql} AND (${lease.guard.sql})`,
+          AND ${MEMBER_TARGETS_SQL} AND ${guard.sql} AND (${lease.guard.sql}) AND (${native.sql})`,
             ).bind(
               body.name,
               password.ciphertext,
@@ -177,6 +191,7 @@ export async function createRole(
               attributes.validUntil,
               attributes.connectionLimit,
               JSON.stringify(attributes.memberOf),
+              attributes.membershipOptions,
               Number(attributes.bypassRls),
               issuer,
               id,
@@ -187,6 +202,7 @@ export async function createRole(
               attributes.memberOf.length,
               ...guard.bindings,
               ...lease.guard.bindings,
+              ...native.bindings,
             ),
             c.env.DB.prepare(
               `UPDATE databases SET generation=generation+1,updated_at=? WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND ${guard.sql}`,
@@ -214,7 +230,7 @@ export async function createRole(
         }
         throw error;
       }
-      if (result[0]!.meta.changes !== 1 || result[1]!.meta.changes !== 1) {
+      if (result[0]!.meta.changes === 0 || result[1]!.meta.changes !== 1) {
         // A full database (a role awaiting its removal counts) is not cured by repeating.
         const held = await c.env.DB.prepare(
           "SELECT COUNT(*) count FROM roles WHERE database_id=?",

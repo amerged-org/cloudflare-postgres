@@ -116,6 +116,7 @@ it("documents unique list operation IDs, meaningful summaries and only actual er
     "401",
     "403",
     "500",
+    "503",
   ]);
   const error =
     document.paths["/v1/fleet/releases/{id}"]!.get!.responses["500"]!.content[

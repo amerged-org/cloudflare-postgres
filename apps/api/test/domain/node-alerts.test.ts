@@ -47,20 +47,22 @@ const MINUTE = 60_000;
 const SMALLEST: PlacementNeed = {
   memory_mib: 512,
   cpu_millicores: 500,
-  storage_gib: 5,
+  storage_mib: 5120,
 };
 const WEBHOOK = {
   INFRASTRUCTURE_ALERT_WEBHOOK_URL: "https://receiver.invalid/events",
   INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN: "test-alert-receiver-token",
 };
-/** The webhook receiver of the alert tests: records each event and acknowledges it. */
+/** Record warnings and recoveries separately; the existing assertions count warning episodes. */
 function receiver() {
   const events: InfraAlert[] = [];
+  const recoveries: InfraAlert[] = [];
   const fetcher: typeof fetch = async (_url, init) => {
-    events.push(InfraAlert.parse(JSON.parse(init!.body as string)));
+    const event = InfraAlert.parse(JSON.parse(init!.body as string));
+    (event.state === "resolved" ? recoveries : events).push(event);
     return new Response(null, { status: 204 });
   };
-  return { events, fetcher, env: { ...env, ...WEBHOOK } };
+  return { events, recoveries, fetcher, env: { ...env, ...WEBHOOK } };
 }
 const status = async (f: Fixture, kind: InfraAlertKind) =>
   (await infrastructureAlertStatus(env.DB, f.region)).find(
@@ -263,6 +265,11 @@ it("keeps a node warning while a named node is unknown and clears once every nam
     active: false,
   });
   // The other node crosses; a lost node clears its own episode.
+  expect(hook.recoveries).toHaveLength(1);
+  expect(hook.recoveries[0]).toMatchObject({
+    state: "resolved",
+    node_ids: [f.node],
+  });
   await seedSamples(second, [{ at: later + 2, pool: full }]);
   await runInfrastructureAlerts(hook.env, f.region, later + 2, hook.fetcher);
   expect(hook.events).toMatchObject([
@@ -343,10 +350,10 @@ it("alarms a pool that placement has closed, by its data, its metadata or the lo
 async function offerClass(id: string, storageGib: number, enabled = true) {
   const at = new Date().toISOString();
   await env.DB.prepare(
-    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
+    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_mib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
     VALUES (?,256,250,?,50,NULL,60,7,?,?,?)`,
   )
-    .bind(id, storageGib, Number(enabled), at, at)
+    .bind(id, storageGib * 1024, Number(enabled), at, at)
     .run();
 }
 

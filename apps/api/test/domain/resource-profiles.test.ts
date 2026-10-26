@@ -175,3 +175,32 @@ it("assigns a profile through the existing generation and regional desired-state
     applied: true,
   });
 });
+
+it("stores exact sub-GiB classes and preserves the whole-GiB response form", async () => {
+  const f = await fixture();
+  const settings = { ...resources, storage_gib: undefined };
+  const path = "/v1/resource-profiles/small-storage";
+  const first = await request(path, f.admin, "PUT", {
+    expected_revision: 0,
+    resources: { ...settings, storage_mib: 500 },
+  });
+  expect(first.status).toBe(200);
+  const initial = await first.json<{
+    size_class_id: string;
+    resources: unknown;
+  }>();
+  expect(initial.resources).toEqual({ ...settings, storage_mib: 500 });
+  expect(
+    await env.DB.prepare("SELECT storage_mib FROM size_classes WHERE id=?")
+      .bind(initial.size_class_id)
+      .first("storage_mib"),
+  ).toBe(500);
+  const next = await request(path, f.admin, "PUT", {
+    expected_revision: 1,
+    resources: { ...settings, storage_mib: 1024 },
+  });
+  expect(next.status).toBe(200);
+  expect(await next.json()).toMatchObject({
+    resources: { ...settings, storage_gib: 1 },
+  });
+});

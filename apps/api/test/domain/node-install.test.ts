@@ -447,9 +447,18 @@ describe("an enrollment that raises an alert", () => {
     ]);
     expect(events[0]!.action).toBe(INFRA_ALERT_ACTIONS.node_enrollment_refused);
     expect(await episode(i.f.region)).toMatchObject({ active: true });
-    // The episode is sent once while it stands, and a day after the refusal it ends.
+    // The episode is sent once while it stands; after the refusal expires, its recovery is sent.
     expect(await evaluate(now + 60_000)).toEqual([]);
-    expect(await evaluate(now + 25 * 3_600_000)).toEqual([]);
+    expect(await evaluate(now + 25 * 3_600_000)).toMatchObject([
+      {
+        kind: "node_enrollment_refused",
+        event_id: events[0]!.event_id,
+        state: "resolved",
+        episode_started_at: events[0]!.occurred_at,
+        occurred_at: new Date(now + 25 * 3_600_000).toISOString(),
+      },
+    ]);
+    expect(await evaluate(now + 25 * 3_600_000 + 60_000)).toEqual([]);
     expect(await episode(i.f.region)).toMatchObject({ active: false });
   });
 

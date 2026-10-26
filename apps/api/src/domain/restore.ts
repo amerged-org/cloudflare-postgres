@@ -6,6 +6,10 @@ import {
   newOperationId,
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
+import {
+  needsExtendedStorage,
+  requireExtendedNative,
+} from "./native-capabilities.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
@@ -49,6 +53,9 @@ type SourceRole = Omit<
   | "valid_until"
   | "connection_limit"
   | "member_of_json"
+  | "membership_options"
+  | "database_id"
+  | "updated_at"
   | "bypass_rls"
   | "created_by_key_id"
   | "deleted_by_key_id"
@@ -57,7 +64,11 @@ type SourceRole = Omit<
   Partial<
     Pick<
       RoleRow,
-      "valid_until" | "connection_limit" | "member_of_json" | "bypass_rls"
+      | "valid_until"
+      | "connection_limit"
+      | "member_of_json"
+      | "membership_options"
+      | "bypass_rls"
     >
   > & { member_of?: string[] };
 function attributesOf(role: SourceRole) {
@@ -70,6 +81,7 @@ function attributesOf(role: SourceRole) {
         ? (JSON.parse(role.member_of_json) as string[])
         : []),
     bypassRls: role.bypass_rls ? 1 : 0,
+    membershipOptions: role.membership_options ?? 3,
   };
 }
 async function response(
@@ -199,6 +211,12 @@ export async function restoreDatabase(
               .all<RoleRow>()
           ).results;
       const issuer = (await getAuth(c)).id;
+      const native = await requireExtendedNative(
+        c.env,
+        { regionId: region.id },
+        needsExtendedStorage(effective.storage_mib) ||
+          stored.some((role) => (role.membership_options ?? 3) !== 3),
+      );
       if (stored.filter((r) => r.owner === 1).length !== 1)
         throw new ApiError("conflict", "Source credentials are unavailable", {
           reason: "source_unavailable",
@@ -237,7 +255,7 @@ export async function restoreDatabase(
       const authority = {
         sql: `EXISTS(SELECT 1 FROM databases src WHERE src.id=? AND src.project_id=? AND src.region_id=? AND src.generation=? AND src.updated_at=? AND src.archive_path=? AND src.storage_generation=? AND src.deleted_at IS ?
    AND (src.deleted_at IS NULL OR EXISTS(SELECT 1 FROM retained_archives ra WHERE ra.source_database_id=src.id AND ra.archive_path=src.archive_path AND ra.storage_generation=src.storage_generation AND ra.expires_at>? AND ra.cleanup_claim IS NULL AND ra.roles_json=?)))
-   AND (SELECT json_group_array(json_object('name',r.name,'revision',r.password_revision,'ciphertext',r.password_ciphertext)) FROM (SELECT * FROM roles WHERE database_id=? AND deleted_at IS NULL ORDER BY name) r)=? AND (${lease.guard.sql})`,
+   AND (SELECT json_group_array(json_object('name',r.name,'revision',r.password_revision,'ciphertext',r.password_ciphertext)) FROM (SELECT * FROM roles WHERE database_id=? AND deleted_at IS NULL ORDER BY name) r)=? AND (${lease.guard.sql}) AND (${native.sql})`,
         bindings: [
           sourceId,
           source.project_id,
@@ -260,6 +278,7 @@ export async function restoreDatabase(
               })),
           ),
           ...lease.guard.bindings,
+          ...native.bindings,
         ],
       };
       const guard = {
@@ -289,7 +308,7 @@ export async function restoreDatabase(
           resources: own,
           nodeId: node?.id ?? null,
           pendingMemoryMib: node?.pending_memory_mib,
-          pendingStorageGib: node?.pending_storage_gib,
+          pendingStorageMib: node?.pending_storage_mib,
           decidedAt,
           id: targetId,
           archivePath: archive,
@@ -302,7 +321,7 @@ export async function restoreDatabase(
         ...roles.map(({ row: r, encrypted: e }) => {
           const attributes = attributesOf(r);
           return c.env.DB.prepare(
-            "INSERT INTO roles(database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at,valid_until,connection_limit,member_of_json,bypass_rls,created_by_key_id) SELECT id,?,?,?,?,?,?,?,?,?,?,?,?,? FROM databases WHERE id=? AND project_id=? AND created_at=?",
+            "INSERT INTO roles(database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at,valid_until,connection_limit,member_of_json,membership_options,bypass_rls,created_by_key_id) SELECT id,?,?,?,?,?,?,?,?,?,?,?,?,?,? FROM databases WHERE id=? AND project_id=? AND created_at=?",
           ).bind(
             r.name,
             r.owner,
@@ -315,6 +334,7 @@ export async function restoreDatabase(
             attributes.validUntil,
             attributes.connectionLimit,
             JSON.stringify(attributes.memberOf),
+            attributes.membershipOptions,
             attributes.bypassRls,
             issuer,
             targetId,
@@ -353,7 +373,7 @@ export async function restoreDatabase(
           );
         throw error;
       }
-      if (result[0]!.meta.changes !== 1)
+      if (result[0]!.meta.changes === 0)
         throw new ApiError(
           "conflict",
           "Source credentials, retention or placement changed; retry the request",

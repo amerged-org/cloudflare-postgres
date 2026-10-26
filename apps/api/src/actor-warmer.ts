@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env.ts";
+import {
+  controlProducerPaused,
+  CONTROL_MAINTENANCE_RETRY_MS,
+  maintenanceEnvironment,
+  requireControlAvailable,
+} from "./control-maintenance.ts";
 import type { WarmCache } from "./domain/actor-warm.ts";
 
 /** What one warmer does: shard `shard` of `shards`, one cycle every `interval_ms`, while the lease lasts. */
@@ -28,6 +34,9 @@ interface ActorWarmerConfig extends ActorWarmerShape {
  * imports no more than a Durable Object needs; the cycle loads with the first alarm.
  */
 export class ActorWarmer extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, maintenanceEnvironment(env));
+  }
   private config: ActorWarmerConfig | undefined;
   private readonly cache: WarmCache = {};
 
@@ -36,6 +45,7 @@ export class ActorWarmer extends DurableObject<Env> {
    * when no alarm is pending (the first cycle runs one interval from now).
    */
   async arm(shape: ActorWarmerShape, leaseMs: number): Promise<void> {
+    requireControlAvailable(this.env);
     const config = { ...shape, lease_until: Date.now() + leaseMs };
     this.config = config;
     await this.ctx.storage.put("config", config);
@@ -44,6 +54,12 @@ export class ActorWarmer extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    if (controlProducerPaused(this.env, "actor_warmer")) {
+      await this.ctx.storage.setAlarm(
+        Date.now() + CONTROL_MAINTENANCE_RETRY_MS,
+      );
+      return;
+    }
     const started = Date.now();
     const config = (this.config ??=
       await this.ctx.storage.get<ActorWarmerConfig>("config"));

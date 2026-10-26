@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import type { SizeClassUpsert } from "@pgcf/contracts";
+import { normalizeStorage, type SizeClassUpsert } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth, requireScope } from "../middleware/auth.ts";
@@ -40,11 +40,11 @@ export async function upsertSizeClass(
       const results = await c.env.DB.batch([
         c.env.DB.prepare(
           `INSERT INTO size_classes
-          (id, memory_mib, cpu_millicores, storage_gib, max_connections, sleep_after_seconds,
+          (id, memory_mib, cpu_millicores, storage_mib, max_connections, sleep_after_seconds,
            archive_timeout_seconds, backup_retention_days, enabled, created_at, updated_at)
           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${lease.guard.sql}
           ON CONFLICT(id) DO UPDATE SET memory_mib = excluded.memory_mib, cpu_millicores = excluded.cpu_millicores,
-            storage_gib = excluded.storage_gib, max_connections = excluded.max_connections,
+            storage_mib = excluded.storage_mib, max_connections = excluded.max_connections,
             sleep_after_seconds = excluded.sleep_after_seconds, archive_timeout_seconds = excluded.archive_timeout_seconds,
             backup_retention_days = excluded.backup_retention_days, enabled = excluded.enabled,
             updated_at = CASE WHEN EXISTS(SELECT 1 FROM resource_profile_revisions WHERE size_class_id=size_classes.id)
@@ -52,7 +52,7 @@ export async function upsertSizeClass(
           WHERE (NOT EXISTS(SELECT 1 FROM resource_profile_revisions WHERE size_class_id=size_classes.id)
             OR (size_classes.memory_mib IS excluded.memory_mib
               AND size_classes.cpu_millicores IS excluded.cpu_millicores
-              AND size_classes.storage_gib IS excluded.storage_gib
+              AND size_classes.storage_mib IS excluded.storage_mib
               AND size_classes.max_connections IS excluded.max_connections
               AND size_classes.sleep_after_seconds IS excluded.sleep_after_seconds
               AND size_classes.archive_timeout_seconds IS excluded.archive_timeout_seconds
@@ -61,7 +61,7 @@ export async function upsertSizeClass(
             AND (NOT EXISTS (SELECT 1 FROM databases WHERE size_class_id = size_classes.id)
             OR (size_classes.memory_mib IS excluded.memory_mib
               AND size_classes.cpu_millicores IS excluded.cpu_millicores
-              AND size_classes.storage_gib IS excluded.storage_gib
+              AND size_classes.storage_mib IS excluded.storage_mib
               AND size_classes.max_connections IS excluded.max_connections
               AND size_classes.sleep_after_seconds IS excluded.sleep_after_seconds
               AND size_classes.archive_timeout_seconds IS excluded.archive_timeout_seconds
@@ -70,7 +70,7 @@ export async function upsertSizeClass(
           id,
           body.memory_mib,
           body.cpu_millicores,
-          body.storage_gib,
+          normalizeStorage(body),
           body.max_connections,
           body.sleep_after_seconds,
           body.archive_timeout_seconds,

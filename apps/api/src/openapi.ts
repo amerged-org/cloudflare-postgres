@@ -30,6 +30,7 @@ const scopes = [
       "Timestamps are UTC with exactly three fractional digits and a literal `Z`, as `Date#toISOString` renders them.",
       "Lists are ordered newest first and take `limit` (1 to 100) and the opaque `cursor` of the previous page's `next_cursor`.",
       "An error is `{error: {code, message, request_id, details?}}`. `details.reason` is the stable cause where a code stands for several, and a `Retry-After` header advises the delay of a transient refusal.",
+      "During operator control-plane maintenance, every route may return 503 service_unavailable before authentication or database access, with Retry-After: 60. No mutation is admitted by that refusal.",
       "A mutation that names `Idempotency-Key` is repeated safely under the same key for 24 hours, per API key.",
       "A resource of another project is reported as `404`, never `403`.",
       "An administrator key has scope `admin` (reads and changes) or `admin_read` (reads only: a request that is not a GET is refused with `403` before it runs, on every route). A route described as for administrator keys takes `admin_read` as well when it only reads. An API key may carry an `expires_at`, from which it is refused with `401` like a revoked one. Every request of an administrator key that is not a GET, and the refusal of a revoked or expired one presented with its real secret, is recorded in the audit log (`GET /v1/audit-events`); a change whose record cannot be written is not run.",
@@ -42,6 +43,7 @@ const scopes = [
     [
       "A node calls these routes. Every one but the enrollment, the installer's report and the release files carries `Authorization: Bearer pgcf_nr1.<claims>.<signature>`: an Ed25519 signature of the request's method, its path with the query and the SHA-256 of its body, valid for 60 seconds.",
       "Request bodies are JSON of at most 4 MiB.",
+      "During operator control-plane maintenance, every route may return 503 service_unavailable before authentication or database access, with Retry-After: 60.",
       'A node declared lost reaches only the desired page and the observations; every other route answers `403 {"error":"node_fenced"}`.',
     ].join("\n\n"),
   ],
@@ -70,7 +72,7 @@ const errors: Record<number, string> = {
   404: "Resource not found or inaccessible",
   409: "Request conflicts with current authority or state",
   500: "Internal server error",
-  503: "Capacity unavailable",
+  503: "Control plane temporarily unavailable or capacity unavailable",
 };
 /** What a read-only administrator key (`admin_read`) may do: a GET, never a change. */
 const authDescription = (auth: DocumentationAuth, reads: boolean): string => {
@@ -111,7 +113,7 @@ const responseHeaders = {
 
 /** Present on a 409 or 503 whose cause is transient; the same rule decides it in apiError. */
 const retryAfterHeader = {
-  description: `Seconds to wait before repeating the request. Sent when the refusal is transient: error.details.reason is one of ${Object.keys(RETRYABLE_ERROR_REASONS).join(", ")}, or the code is capacity_exhausted or idempotency_in_progress. A hint, not a promise.`,
+  description: `Seconds to wait before repeating the request. Sent when the refusal is transient: error.details.reason is one of ${Object.keys(RETRYABLE_ERROR_REASONS).join(", ")}, or the code is service_unavailable, capacity_exhausted or idempotency_in_progress. A hint, not a promise.`,
   schema: { type: "integer" as const, minimum: 1 },
 };
 
@@ -222,8 +224,15 @@ function describeOperation(key: string, operation: Operation): void {
                 : "bearerAuth"]: [],
           },
         ];
-  const statuses =
-    metadata.errors ?? publicRouteErrors[key] ?? nodeRouteErrors[key];
+  const statuses = [
+    ...new Set([
+      ...(metadata.errors ??
+        publicRouteErrors[key] ??
+        nodeRouteErrors[key] ??
+        []),
+      503,
+    ]),
+  ];
   if (statuses) {
     for (const status of Object.keys(operation.responses ?? {}))
       if (Number(status) >= 400 && !statuses.includes(Number(status)))
@@ -275,6 +284,9 @@ function describeOperation(key: string, operation: Operation): void {
   for (const [status, response] of Object.entries(operation.responses ?? {})) {
     if ("$ref" in response) continue;
     response.headers = { ...responseHeaders, ...response.headers };
+    if (status === "503" && !response.description.includes("Control plane"))
+      response.description +=
+        " Control plane maintenance also returns service_unavailable.";
     if (status === "409" || status === "503")
       response.headers["Retry-After"] = retryAfterHeader;
     const location = locationResponses[key]?.[status];

@@ -38,7 +38,6 @@ export const AVERAGE_MINIMUM_SPAN_SECONDS = 600;
 export const MEMORY_FLOOR_MIB = 600;
 
 const MIB = 1024n ** 2n;
-const GIB = 1024n ** 3n;
 const PPM = 1_000_000n;
 const ceilDiv = (a: bigint, b: bigint) => (a + b - 1n) / b;
 
@@ -72,14 +71,14 @@ export interface PlacementNode {
   /** Memory of the databases placed after the node's newest sample: no sample includes them yet. */
   pending_memory_mib: number;
   /** Storage of the databases whose volume the node may not have counted in `pool_nominal_bytes` yet. */
-  pending_storage_gib: number;
+  pending_storage_mib: number;
 }
 
 /** What a new database asks of its node. */
 export interface PlacementNeed {
   memory_mib: number;
   cpu_millicores: number;
-  storage_gib: number;
+  storage_mib: number;
 }
 
 /**
@@ -123,7 +122,7 @@ type PoolState =
  * Whether the node's thin pool is open for placement (plan 4.3): readable, with room, below 80 %
  * of its data and 50 % of its metadata, with the sold storage below the logical cap, and with
  * fewer than `MAX_VOLUMES_PER_NODE` volumes. The sold storage is what the node reported plus the
- * databases it has not counted yet, and `needGib` more must fit under the cap as well. The pool of
+ * databases it has not counted yet, and `needMib` more must fit under the cap as well. The pool of
  * an offline node is judged by its last sample. The states that stop a resize that grows storage
  * (no reading, no room, the cap) come first and keep their names whatever else has closed the
  * node; data, metadata and the volume count close it for new databases only and come after them,
@@ -139,9 +138,9 @@ export function poolState(
     | "pool_metadata_used_bytes"
     | "pool_nominal_bytes"
     | "volumes_total"
-    | "pending_storage_gib"
+    | "pending_storage_mib"
   >,
-  needGib = 0,
+  needMib = 0,
 ): PoolState {
   if (
     pool.pool_data_total_bytes === null ||
@@ -156,8 +155,8 @@ export function poolState(
   const dataTotal = BigInt(pool.pool_data_total_bytes),
     cap = dataTotal * BigInt(LOGICAL_CAP_FACTOR),
     sold =
-      BigInt(pool.pool_nominal_bytes) + BigInt(pool.pending_storage_gib) * GIB;
-  if (sold >= cap || sold + BigInt(needGib) * GIB > cap) return "cap";
+      BigInt(pool.pool_nominal_bytes) + BigInt(pool.pending_storage_mib) * MIB;
+  if (sold >= cap || sold + BigInt(needMib) * MIB > cap) return "cap";
   // used / total >= limit, in integers.
   if (
     BigInt(pool.pool_data_used_bytes) * PPM >=
@@ -214,7 +213,7 @@ export function choosePlacement(
   for (const node of nodes) {
     if (!nodeOnline(node, now) || !nodeOpen(node)) continue;
     if (
-      poolState(node, need.storage_gib) !== "open" ||
+      poolState(node, need.storage_mib) !== "open" ||
       node.cpu_cores === null ||
       need.cpu_millicores > node.cpu_cores * 1000 ||
       node.cpu_peak_ppm === null ||
@@ -236,7 +235,7 @@ export function choosePlacement(
 /** What a resize adds to the node its database stays on; a shrink adds nothing. */
 interface PlacementGrowth {
   memory_mib: number;
-  storage_gib: number;
+  storage_mib: number;
   cpu_millicores: number;
 }
 /**
@@ -252,15 +251,15 @@ export function growthFits(
   growth: PlacementGrowth,
   now = Date.now(),
 ): boolean {
-  if (growth.memory_mib > 0 || growth.storage_gib > 0) {
+  if (growth.memory_mib > 0 || growth.storage_mib > 0) {
     if (!nodeOnline(node, now)) return false;
     if (growth.memory_mib > 0) {
       const figures = load(node, growth.memory_mib);
       if (figures === null || figures.projected >= BigInt(PLACEMENT_LIMIT_PPM))
         return false;
     }
-    if (growth.storage_gib > 0) {
-      const state = poolState(node, growth.storage_gib);
+    if (growth.storage_mib > 0) {
+      const state = poolState(node, growth.storage_mib);
       if (state === "unavailable" || state === "no_room" || state === "cap")
         return false;
     }
@@ -271,13 +270,13 @@ export function growthFits(
 }
 
 /**
- * The storage in GiB of the databases on a node whose create, restore or resize has not finished,
+ * The storage in MiB of the databases on a node whose create, restore or resize has not finished,
  * or finished after `sampleAt`, the node's newest sample: the node's `pool_nominal_bytes` cannot
  * count their volumes yet. A database counts at its whole storage, which the node may have counted
  * already; the sum only shrinks when a sample taken after the operation ends it.
  */
 function pendingStorageSql(node: string, sampleAt: string): string {
-  return `COALESCE((SELECT SUM(r.storage_gib) FROM databases d JOIN database_resources r ON r.database_id=d.id
+  return `COALESCE((SELECT SUM(r.storage_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
     WHERE d.node_id=${node}.id AND d.deleted_at IS NULL AND EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id
       AND o.kind IN('database.create','database.restore','database.resize')
       AND (o.status IN('pending','running') OR o.completed_at>${sampleAt}))),0)`;
@@ -349,7 +348,7 @@ export async function placementNodes(
           THEN (l.memory_total_bytes-l.memory_available_bytes)*1000000/l.memory_total_bytes END ram_now_ppm,
         COALESCE((SELECT SUM(r.memory_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
           WHERE d.node_id=n.id AND d.deleted_at IS NULL AND d.placed_at>COALESCE(l.observed_at,'')),0) pending_memory_mib,
-        ${pendingStorageSql("n", "l.observed_at")} pending_storage_gib
+        ${pendingStorageSql("n", "l.observed_at")} pending_storage_mib
       FROM nodes n LEFT JOIN latest l ON l.node_id=n.id LEFT JOIN peaks p ON p.node_id=n.id
       WHERE n.region_id=? ORDER BY n.id`,
     )
@@ -381,7 +380,7 @@ const aliasOf = (alias: string) => {
  */
 export function nodeLoadGuard(
   nodeAlias: string,
-  claim: { pendingMemoryMib: number; pendingStorageGib: number; now: number },
+  claim: { pendingMemoryMib: number; pendingStorageMib: number; now: number },
 ): { sql: string; bindings: (string | number)[] } {
   const node = aliasOf(nodeAlias),
     stamp = (offset: string) =>
@@ -392,7 +391,7 @@ export function nodeLoadGuard(
       AND COALESCE((SELECT SUM(r.memory_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
         WHERE d.node_id=${node}.id AND d.deleted_at IS NULL AND d.placed_at>COALESCE(${node}.last_observed_at,'')),0)=?
       AND ${pendingStorageSql(node, newest)}=?)`,
-    bindings: [claim.pendingMemoryMib, claim.pendingStorageGib],
+    bindings: [claim.pendingMemoryMib, claim.pendingStorageMib],
   };
 }
 /** `nodeLoadGuard` for a node that must also be ready, open for new databases and the one named. */
@@ -401,7 +400,7 @@ export function placementGuard(
   claim: {
     nodeId: string;
     pendingMemoryMib: number;
-    pendingStorageGib: number;
+    pendingStorageMib: number;
     now: number;
   },
 ): { sql: string; bindings: (string | number)[] } {

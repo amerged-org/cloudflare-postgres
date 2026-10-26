@@ -164,7 +164,7 @@ fn save_state(lab: &Lab, n: usize, control: &[u8]) {
     state.resources = Some(Resources {
         memory_mib: entry.memory_mib,
         cpu_millicores: entry.cpu_millicores,
-        storage_gib: entry.storage_gib,
+        storage_mib: entry.storage_mib,
     });
     Files::new(lab.layout.database_files(&database_id(n)))
         .save(&state)

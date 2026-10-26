@@ -13,6 +13,7 @@ import {
   DatabaseRestored,
   DatabaseId,
   DatabaseListQuery,
+  DatabasePowerChange,
   DatabaseWithOperation,
   ErrorBody,
   IdempotencyKey,
@@ -26,6 +27,7 @@ import {
 } from "@pgcf/contracts";
 import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
+import { ApiError } from "../api-error.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { restoreDatabase } from "../domain/restore.ts";
 import {
@@ -312,10 +314,42 @@ export function registerDomain(app: ApiApp): void {
         path: `/v1/databases/{id}/${action}`,
         security,
         tags: ["Databases"],
-        request: { headers, params },
+        description:
+          "The optional expected_generation precondition requires the current database generation, including when the requested power state already holds. A mismatch returns 409 conflict with error.details.reason generation_changed. Repeating an accepted request with the same Idempotency-Key and body returns its original operation even after the generation advances; retain that original body and key after an unknown outcome. An omitted body preserves unconditional power intent.",
+        request: {
+          headers,
+          params,
+          body: {
+            required: false,
+            // A plain schema documents the contract without installing Hono's JSON
+            // validator, which rejects a legacy empty body with a JSON Content-Type.
+            content: {
+              "application/json": {
+                // Retain every field but drop the root component metadata: this schema
+                // is inline, so it must not refer to document-root definitions.
+                schema: z.toJSONSchema(DatabasePowerChange.omit({}), {
+                  target: "draft-2020-12",
+                }),
+              },
+            },
+          } as NonNullable<RouteConfig["request"]>["body"],
+        },
         responses: responses(DatabaseWithOperation, 202),
       },
-      async (c) => changePower(c, DatabaseId.parse(c.req.param("id")), action),
+      async (c) => {
+        const text = await c.req.text();
+        const parsed = DatabasePowerChange.safeParse(
+          text === "" ? {} : JSON.parse(text),
+        );
+        if (!parsed.success)
+          throw new ApiError("invalid_request", "Invalid power change request");
+        return changePower(
+          c,
+          DatabaseId.parse(c.req.param("id")),
+          action,
+          parsed.data,
+        );
+      },
     );
   register(
     app,
@@ -349,7 +383,7 @@ export function registerDomain(app: ApiApp): void {
       security,
       tags: ["Roles"],
       description:
-        "Creates a login role and answers 201 with it. The service generates its password; an integrator key reads it with the connection URI. Optional attributes: `valid_until` (a time in the future, applied at whole seconds, truncated; PostgreSQL's VALID UNTIL: from then on the role cannot log in, and an expired credential does not wake a hibernated database), `connection_limit` (1 to 10000, PostgreSQL's CONNECTION LIMIT), `member_of` (up to 8 other live roles of this database, never `app`; the role inherits their privileges) and `bypass_rls` (PostgreSQL's BYPASSRLS). A database holds at most 100 roles; a deleted role counts until PostgreSQL has confirmed its removal. The role is registered at once and can connect when the database's `observed_generation` has reached its `generation`. An Idempotency-Key is required; a replay returns the retained result, also after `valid_until` has passed.",
+        "Creates a login role and answers 201 with it. The service generates its password; an integrator key reads it with the connection URI. Optional attributes: `valid_until` (a time in the future, applied at whole seconds, truncated; PostgreSQL's VALID UNTIL: from then on the role cannot log in, and an expired credential does not wake a hibernated database), `connection_limit` (1 to 10000, PostgreSQL's CONNECTION LIMIT), `member_of` (up to 8 other live roles of this database, never `app`), `membership_options` (both booleans `inherit` and `set`, applied to every membership; omission means true/true and ADMIN is always false; options require nonempty member_of) and `bypass_rls` (PostgreSQL's BYPASSRLS). A database holds at most 100 roles; a deleted role counts until PostgreSQL has confirmed its removal. The role is registered at once and can connect when the database's `observed_generation` has reached its `generation`. An Idempotency-Key is required; a replay returns the retained result, also after `valid_until` has passed.",
       request: {
         headers,
         params,

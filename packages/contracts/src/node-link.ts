@@ -16,12 +16,14 @@
  * for it: a new property is `.optional()` or `.default(...)` with the default in its comment.
  */
 import { z } from "zod";
+import { DatabaseEffectiveResources } from "./database-resources.ts";
 import {
   BucketName,
   HttpsUrl,
   ROLE_CONNECTION_LIMIT_MAX,
   ROLE_LIMIT,
   ROLE_MEMBER_OF_MAX,
+  RoleMembershipOptions,
   TEXT_MAX_LENGTH,
   Timestamp,
 } from "./api.ts";
@@ -579,6 +581,7 @@ export const DesiredRole = z.strictObject({
       "Other present roles of this record the role is a member of. Absent means none.",
     )
     .optional(),
+  membership_options: RoleMembershipOptions.optional(),
   bypass_rls: z
     .literal(true)
     .describe("BYPASSRLS. Absent means NOBYPASSRLS.")
@@ -648,7 +651,13 @@ export function refineRoles(
   const present = new Map(
     presentRoles({ roles }).map((role) => [role.name, role] as const),
   );
-  for (const role of present.values())
+  for (const role of present.values()) {
+    if (role.membership_options !== undefined && !role.member_of?.length)
+      ctx.addIssue({
+        code: "custom",
+        path: ["roles"],
+        message: `${role.name} has membership_options without member_of roles`,
+      });
     for (const target of role.member_of ?? [])
       if (
         target === role.name ||
@@ -660,6 +669,7 @@ export function refineRoles(
           path: ["roles"],
           message: `${role.name} is a member of ${target}, which is not another role of this database`,
         });
+  }
   if (owners > 1 || (exists && owners !== 1))
     ctx.addIssue({
       code: "custom",
@@ -874,11 +884,7 @@ export const NodeDesiredDatabase = z
     storage_generation: Positive,
     pg_major: z.literal(18),
     /** The effective resources: the class's, or the database's own override. */
-    resources: z.strictObject({
-      memory_mib: z.number().int().min(256).max(1_048_576).multipleOf(256),
-      cpu_millicores: z.number().int().min(100).max(256_000),
-      storage_gib: z.number().int().min(1).max(65_536),
-    }),
+    resources: DatabaseEffectiveResources,
     settings: z.strictObject({
       max_connections: z.number().int().min(10).max(10_000),
       archive_timeout_seconds: z.number().int().min(30).max(3600),

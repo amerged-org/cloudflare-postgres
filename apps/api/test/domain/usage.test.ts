@@ -237,6 +237,52 @@ describe("hourly usage", () => {
         .run(),
     ).rejects.toThrow("immutable");
   });
+  it("keeps millisecond memory exact through 1000 lifecycle segments and reports unsafe totals as gaps", async () => {
+    const f = await setup();
+    const database = {
+      id: f.id,
+      project_id: f.project,
+      created_at: iso(epoch),
+    };
+    const events = Array.from({ length: 1000 }, (_, index) => ({
+      id: index + 1,
+      kind: index === 0 ? "ready" : "resized",
+      occurred_at: iso(epoch + index * 3600),
+      resource_snapshot: JSON.stringify({ ...resources, memory_mib: 256 }),
+    }));
+    const row = computeUsageHour(
+      database,
+      epoch,
+      events,
+      [],
+      epoch + 3 * USAGE_HOUR_MS,
+    );
+    expect(row.metrics.memory_mib_seconds).toBe(256 * 3600);
+    expect(row.metrics.memory_mib_seconds! * 1000).toBe(256 * USAGE_HOUR_MS);
+    expect(row.metrics.cpu_millicore_seconds).toBeCloseTo(
+      resources.cpu_millicores * 3600,
+      7,
+    );
+    const unsafe = computeUsageHour(
+      database,
+      epoch,
+      [
+        {
+          id: 1,
+          kind: "ready",
+          occurred_at: iso(epoch),
+          resource_snapshot: JSON.stringify({
+            ...resources,
+            memory_mib: Number.MAX_SAFE_INTEGER,
+          }),
+        },
+      ],
+      [],
+      epoch + 3 * USAGE_HOUR_MS,
+    );
+    expect(unsafe.metrics.memory_mib_seconds).toBeNull();
+    expect(unsafe.gaps).toContain("memory_mib_seconds");
+  });
   it("does not rewrite a lifecycle transition on a retry with a newer timestamp", async () => {
     const f = await setup();
     await env.DB.batch([
