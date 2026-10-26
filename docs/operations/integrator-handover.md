@@ -158,7 +158,7 @@ waived operator-contact and maintenance-lead-time completion as G11 gates on Oct
 | Backups | Every database archives its WAL and base backups into the installation's one R2 bucket, which is in the EU jurisdiction, for both regions (cutover 2026-10-23). A new database is ready only after its first base backup is DONE. The four production classes keep a 7-day recovery window. The scheduled infrastructure backup of 2026-10-24 also completed in the new bucket; G6 remains closed ([2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point)). A US healthy archive witness used acknowledged sequence 42; segment `009` remained open after 180 seconds. R2 object metadata later gives a 222.799-second ACK-to-Last-Modified wall-clock difference, with one-second precision and uncalibrated clocks; the observation-gap upper bound is 1,835.597 seconds. These do not establish an unconditional RPO guarantee or a latency SLO. One healthy point per region has now been observed during the r2 background workload before its later cold-gate failure: EU 53.393087333 s and US 54.673786958 s acknowledged-attempt-start-to-operator-positive upper bounds, not ACK-response/upload latency or unconditional RPO. No cohort SQL, WAL switch, replay or extra write was used; the bounded observer processes exited. |
 | Redundancy | One node per region, one PostgreSQL instance per database, no replica, no second node in a region. Losing a node stops every database on it until it is restored from R2 into new IDs. **Extrapolated** on 2026-10-23 for EU1's 167 databases and 23.4 GB of archives from a sample of 8 restores, of which 7 became ready: about 2.2 to 3.4 h in all, if every restore succeeds. The eighth failed `archive_unusable`; the total assumes every restore succeeds, which that sample did not establish; later restore fixes are deployed and bounded G9 queue/restart acceptance passed on October 25; the extrapolated total is still not a full-node recovery-time guarantee ([7.3](#73-recovery-time), [7.4](#74-eu1-lost)). |
 | Capacity numbers | The October 25 14:54 UTC EU1 snapshot had 311 nondeleted databases and 312 thin volumes, with none awake/starting/queued. The extra `pgcfcheckscratch0000/g1` is the intentional reusable 1-GiB health-check volume; keep it outside tenant cleanup. EU's required storm/recovery path is accepted. US1's full 241-target density barrier completed at 21:19:40 UTC: all creates succeeded, all 221 other density/background databases were naturally asleep, no active database operation or producer remained, and the lock was released. Its baseline was 318 nondeleted/zero awake: 316 auto-idle plus two manually suspended; legacy raw `provisioning` labels are not errors. The protected 59 checkpoint is unchanged (`4b8b6c62…`); 30 hashes present/29 empty were recorded without SQL, wake or backfill. See the dated ULTRA density checkpoint for full manifest/binding/barrier hashes. |
-| US operating envelope | At 21:19:02 UTC: 6,000 millicores/11,966 MiB allocatable; pool total/used/free 310,776,954,880 / 92,948,070,400 / 217,828,884,480 bytes; metadata used/total 48,865,280 / 1,073,741,824 bytes. Nominal storage 1,195,074,650,112 bytes, 48,033,169,408 bytes below the 4× cap. Policy read at 20:26 UTC: 9,937-MiB awake budget, 600-MiB floor/8-MiB overhead, 8 starts, 10-second queue/5-second retry, one big archive job, 6-GiB reserve. XS: 256 MiB/250 millicores/2 GiB/20 PostgreSQL connections. Gateway 2,000 total/200 per database are source defaults, not runtime-verified values; safe metadata exposed no global connection limit. These are dated capacity/configuration observations, not a cold-latency pass. |
+| US operating envelope | At 21:19:02 UTC: 6,000 millicores/11,966 MiB allocatable; pool total/used/free 310,776,954,880 / 92,948,070,400 / 217,828,884,480 bytes; metadata used/total 48,865,280 / 1,073,741,824 bytes. Nominal storage 1,195,074,650,112 bytes, 48,033,169,408 bytes below the 4× cap. Policy read at 20:26 UTC: 9,937-MiB awake budget, 600-MiB floor/8-MiB overhead, 8 starts, 10-second queue/5-second retry, one big archive job, 6-GiB reserve. XS: 256 MiB/250 millicores/2 GiB/20 PostgreSQL connections. The October 26 check confirmed native fixed count ceilings of 2,000 total/200 per database and default accounted byte budgets of 192/96 MiB on both nodes; these are not measured usable concurrency or RSS guarantees. These are dated capacity/configuration observations, not a cold-latency pass. |
 | EU storm | Preserve the first 39/40 failure and later 40/40 HTTP result (p95/max 4,373.5/14,315.8 ms). On the qualified proof fix, four verified affected-only kills gave 4.455963-second automatic Ready versus 604.210285 seconds before. Proof preceded normal marker wake, bounded above by 7.428105 seconds; marker/data and natural sleep matched. Root accepted this required path. The helper safely aborted before a fifth signal with an unrecorded identity-field change, exit 1 preserved; no clean helper exit or extra case is claimed. Reuse unchanged one-hour/1,000-cycle/transport evidence; no additional WS or US 3-second matrix. |
 | New databases | Every database lives on a thin LVM volume of its node, placed by the 80 % rule of [2.1](#21-create). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced. After a burst of awake databases a node stays closed for the length of the placement window: 3 days (owner decision O6 of 2026-10-23; deployed in baseline B, [2.1](#21-create)). |
 | Alerts | Infrastructure alerts go to the operator's alert webhook and the owner receives them (go-live gate G5 met on 2026-10-20); you receive none from PGCF ([6](#6-alerts-and-operations)). |
@@ -896,8 +896,8 @@ awake at once, and a start that the node cannot fit within its admission wait is
 that restore `start_failed`. The summed memory of the size classes of a batch must stay within the
 awake budget of the region's node policy (the operator tells you; the plan's value for EU1 is
 9,937 MiB: at most 38 xs-sized (256 MiB) or 9 gate-sized (1 GiB) restores at a time, or a mix that
-adds up to it, and less what the node's other awake databases hold). This bound is derived from the
-code and the policy and has not been tried live. The same wait counts for a create: creates that
+adds up to it, and less what the node's other awake databases hold). This capacity bound is derived from code and policy. The October 25 nine-target bounded batch
+passed; other batch sizes are not certified by that receipt. The same wait counts for a create: creates that
 you send together on one node queue for the same slot and are awake together too.
 
 On an installation whose release does not have the report-based timeout, the 20 minutes run from
@@ -940,9 +940,9 @@ On US1 a full restore was ready in 26.5 s ("US1 database acceptance in `us-dev`"
 restore times of test databases, not a recovery-time promise; the time to restore a whole node is
 in [7.3](#73-recovery-time).
 
-Two defects of the 2026-10-23 acceptance concern restores and are listed in
-[8](#8-not-available-yet): treat a `failed` restore operation as final, delete its target database
-and restore again.
+The October 23 restore failures listed in [8](#8-not-available-yet) are historical. The corrected
+regional provider paths and bounded G9 queue/restart acceptance passed on October 25. A terminal
+failed `/restore` operation remains failed; reconcile its target before requesting another restore.
 
 ## 3. Connecting
 
@@ -1105,10 +1105,11 @@ through a service binding and 989 ms through the public hostname, after at least
 databases each, before the slot pool (2026-10-19, "First live binary update of EU1 and the cold
 request after it"). These are small samples and no p95.
 
-What the Edge does: it waits at most **60 s** for a wake (`ADMISSION_DEADLINE_MS`), coalesces all
-connections of one database into one wake and admits at most 32 waiters per database. Giving up
-removes your waiter only; the wake itself continues, so a retry soon after normally finds the
-database ready.
+Edge/Actor admission has a **60-second deadline** (`ADMISSION_DEADLINE_MS`); the Actor fallback
+coalesces connections of one database and admits at most 32 waiters. A native wake-ticket hold
+has a separate **25-second bound**, counted from the HTTP request receipt or WebSocket upgrade,
+and returns `57P03` on timeout. Giving up removes that connection or waiter; it does not cancel
+the database wake. A later connection may therefore find the database already ready.
 
 Recommended policy (derived from those numbers, not a PGCF guarantee):
 
@@ -1134,7 +1135,7 @@ supplied one:
 | `storage` | The node's thin pool has no room: free data is below the reserve, or metadata is at 75 %. The node refuses every wake, create and restore until space is back; running databases keep running. | back off; waiting does not make room, so there is no hint |
 | `node at awake capacity`, HINT `retry after <n> s` | The node could not admit the start within its queue wait for want of memory: under the memory rule `measured` its available memory, minus the starts in flight and the 600 MiB floor, was below the database's memory (or the start ahead of it in the queue could not start). Starting values: a wait of up to 10 s and a hint of 5 s. | retry after the hint; shed load |
 | `node busy starting databases`, HINT `retry after <n> s` | The node had the memory but could not begin the start within its queue wait, because it was starting as many databases as the policy allows at once (EU1 runs 8, 4.1): many databases were waking together. The same wait and hint as above. | retry after the hint; shed load |
-| none (a bare `57P03`) | A hold that carries no detail: a manual suspension, a database that is being created, restored or resized, a maintenance cycle that holds new wakes on the node, the source of a move, a database whose recovery after a crash is pending, a volume that cannot start, a node that is offline, lost, closed or fenced, a node whose copy of the database's state was still older than the connection after 8 s (a connection right after an idle sleep makes it fetch the state at once and wait for it; a longer wait means its link to Cloudflare is down), more than 32 waiters, or a wake that did not finish within the 60 s deadline | by cause, from the table below |
+| none (a bare `57P03`) | A hold that carries no detail: a manual suspension, a database that is being created, restored or resized, a maintenance cycle that holds new wakes on the node, the source of a move, a database whose recovery after a crash is pending, a volume that cannot start, a node that is offline, lost, closed or fenced, a node whose copy of the database's state was still older than the connection after 8 s (a connection right after an idle sleep makes it fetch the state at once and wait for it; a longer wait means its link to Cloudflare is down), more than 32 waiters, or a native held wake that did not finish within 25 s (the separate Edge/Actor admission deadline is 60 s) | by cause, from the table below |
 
 **Early sleep (decision D2, the plan's default: the owner has not named another).** When a wake
 waits for room, the node may put one idle but awake database to sleep for each waiting wake, before
@@ -1189,12 +1190,16 @@ second, [4.4](#44-capacity-caps)).
 | --- | --- | --- |
 | Server sessions | the class's `max_connections` (`xs` 20, `sm` 100, `md` 200, `lg` 300); PostgreSQL reserves a few for superusers (the node agent connects as one) | PostgreSQL; refusal is `53300` |
 | Sessions of one role | the role's `connection_limit` when set ([2.3](#23-roles-connection-uri-and-passwords)) | PostgreSQL; refusal is `53300` "too many connections for role" |
-| Sessions per database through one gateway | 200 (2,000 per gateway); beyond that the connection fails as `08006` | gateway constants |
+| Sessions per database through one gateway | 200 (2,000 per gateway), including parked HTTP-SQL backend sessions; a WebSocket connection beyond the cap fails as `08006` | fixed native gateway constants; no count override |
 | New connections per database, all roles and networks | 12,000 per 60 s (**Dev value**) | Edge rate limiter `DATABASE_CONNECTION_RATE_LIMITER`; refusal is `53300` |
 | New connections per database, role and source network | 6,000 per 60 s (**Dev value**) | Edge rate limiter `CONNECTION_RATE_LIMITER`; refusal is `53300` |
 | New connections per database and role from a same-account Worker on a service binding (no `CF-Connecting-IP`) | 12,000 per 60 s (**Dev value**), in a limiter of its own; such a caller never counts in the two public limiters above | Edge rate limiter `BINDING_CONNECTION_RATE_LIMITER`; refusal is `53300` |
 | Admissions per database per minute | 12,000 (**Dev value**) | DatabaseActor; the API Worker's `DATABASE_CONNECTION_LIMIT_PER_MINUTE` |
-| Waiters during one wake | 32 per database | DatabaseActor |
+| Waiters during a fallback Actor wake | 32 per database | DatabaseActor |
+| Held native wake connections | 32 per database, 512 per gateway; 25 s bound | native gateway wake queue |
+| Simultaneous request handshakes | 128 per gateway; not a running-query concurrency limit | native gateway |
+| Accounted gateway buffer bytes | 192 MiB total, 96 MiB per database on both nodes; a session reserves a 144-KiB base lease | native gateway; both environment overrides absent in the October 26 snapshot |
+| HTTP-SQL idle backend pool | Four per database/role; 10 s idle and 60 s lifetime | native gateway |
 
 **The four rate values are the Dev installation's.** They were read from its Edge and API
 configuration, which holds no secret, and recorded on 2026-10-23 ("Dev connection limits recorded
@@ -1208,7 +1213,11 @@ installation configuration, and counters are per Cloudflare location and eventua
 Application concurrency is bounded by the available non-reserved PostgreSQL slots, any role
 limit, the 200-session per-database gateway cap and the shared 2,000-session gateway cap. The
 `lg` class's 300 PostgreSQL connections do not raise the gateway's 200-session cap. These are
-ceilings, not a guarantee that all slots are available.
+ceilings, not a guarantee that all slots are available. The gateway byte budget may refuse before
+the count ceiling; its accounting is not a process-RSS hard cap. Both running gateways had
+unlimited systemd MemoryMax/MemoryHigh, MemoryLow 128 MiB and LimitNOFILE 65,536 in the
+October 26 selected snapshot. The fixed limits and their sources are unchanged in the accepted
+`acb21e26` release; no saturation-derived usable-concurrency promise is made.
 
 SQL statements on an established connection do not count against the rate limits, so keep
 connections and pool them: a platform that opens a connection per request meets the per-database
@@ -1768,7 +1777,8 @@ When reporting an incident, send:
   databases (the restore time of a node's population is extrapolated from a sample of which 7 of 8
   restores succeeded, [7.3](#73-recovery-time)); automatic rebalancing (an operator can move a database under its ID,
   and a move has not been timed; `/restore` creates a new ID, while `/restore-in-place` preserves it).
-- Completion of the remaining density population and final cold acceptance ([4.4](#44-capacity-caps)); required EU byte/inode/recovery and US full-pool/R2-hard-cut cases passed with complete owned cleanup. The prior density pattern and exact-counter cycles are reused where unchanged.
+- Final regional one-hour/24-hour cold acceptance. Required density, storage and recovery receipts
+  are accepted in the dated ULTRA update; dependent test-population cleanup remains open.
 - Alerts for integrators (alerts go to the operator); alert history, acknowledgement and test send.
 - Finding deleted databases: the lists exclude them, so keep the IDs you were given.
 - An event stream or webhooks, an audit log of integrator keys (the administrator keys have one).
@@ -1782,9 +1792,9 @@ When reporting an incident, send:
 - Maintenance-window notifications: the operator announces a window, and PGCF sends no event for it.
 - Importing existing databases from another provider; moving them is your task.
 
-**Known defects.** The live acceptance of 2026-10-23 ("Live acceptance on the slot-pool release,
-part 1") found three. The failed-build/timeout and role-response fixes are included in baseline B;
-these are historical symptoms whose affected final acceptance remains open, not unmerged work:
+**Historical defects.** The October 23 acceptance found the symptoms below. Their fixes are
+deployed; subsequent regional provider and bounded G9 receipts are accepted in the dated update.
+The original failed receipts remain historical failures:
 
 - After a restore ended `no_recovery_point`, the node rebuilt the same failed restore 11 times in
   5 minutes while the control database flipped between states.
