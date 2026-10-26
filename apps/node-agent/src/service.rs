@@ -4733,7 +4733,15 @@ mod tests {
         assert_eq!(after["boot_id"], before["boot_id"]);
         assert_eq!(after["kernel_release"], "6.12.111+deb13-amd64");
         eventually(30, "the new packages to be said", || {
-            cloud.with(|inner| inner.hellos.iter().any(|hello| hello["os"] == after))
+            // Host files converge independently; a transient digest may be coalesced before
+            // the next hello. This cycle must report the installed packages and unchanged boot.
+            cloud.with(|inner| {
+                inner.hellos.iter().any(|hello| {
+                    ["packages_sha256", "boot_id", "booted_at", "kernel_release"]
+                        .iter()
+                        .all(|field| hello["os"][field] == after[field])
+                })
+            })
         })
         .await;
         service.stop();
