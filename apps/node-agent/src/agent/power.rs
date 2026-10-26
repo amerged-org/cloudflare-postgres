@@ -4142,6 +4142,9 @@ mod tests {
         assert!(!rig.machine.running(&entry.id));
 
         // Without the lock the same wake writes the new configuration and starts.
+        // Other tests fork concurrently; a child may retain this file description until exec.
+        // Release the simulated holder's lock explicitly, as production DataLock does.
+        held.unlock().unwrap();
         drop(held);
         let result = rig.core.wake(&ticket).await;
         assert_eq!(result.outcome, WakeOutcome::Started, "{result:?}");

@@ -43,9 +43,12 @@ remain unchanged.
 The candidate adds exact MiB storage, restricted role memberships, independent alert destinations
 and recovery notifications. These are generic platform capabilities; adopter classes, prices,
 wallets, customer migration and the end of adopter-to-Neon traffic remain the adopter's work.
-The latest catalog review still found six historical `dev-*` classes and `small` enabled without
-live references. Operator disposition and a productive catalog readback remain prerequisites for
-customer cutover; the referenced `rp-*` profile must not be removed by name.
+The owner-approved G10 catalog follow-up completed on 2026-10-26 at 15:26:51 UTC.
+A complete three-page inventory found zero live references to the six historical `dev-*`
+classes and `small`; all seven were disabled through the management API and read back.
+The referenced `rp-*` profile remains enabled with 108 live database references, alongside
+101 `xs` and one `sm` database. No database, key or archive was deleted. New adopter classes
+still require the qualified extension release and their own exact catalog readback.
 
 **Operator deployment order.** Qualify the exact commit with the existing CI and signed image/
 native-release workflow. Stage the management Worker version without routing traffic to it,
@@ -439,8 +442,9 @@ and the operator created it on 2026-10-20 ("Production size classes `xs`, `sm`, 
 | `lg` | 4 GiB | 2 | 50 GiB | 300 |
 
 All four have `sleep_after_seconds` 300, `archive_timeout_seconds` 60 and `backup_retention_days` 7.
-The operator's test classes stay enabled until the last Stage 5 run is done, so
-`GET /v1/size-classes` still lists them: create only in these four.
+The historical test classes and `small` were disabled in the October 26 G10 follow-up above.
+`GET /v1/size-classes` also lists disabled entries; integrators must use their explicitly
+approved catalog rather than treating every returned class as a product offering.
 
 ### 1.4 Projects and keys
 

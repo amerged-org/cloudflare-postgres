@@ -92,7 +92,23 @@ fn source(value: &Value) -> Option<Source> {
 impl Entry {
     /// `None` for an entry that is not what the contract states.
     pub fn parse(db: &Value) -> Option<Self> {
-        let resources: Resources = serde_json::from_value(db["resources"].clone()).ok()?;
+        // Desired pages may add fields in a later release. Persisted resource state is strict,
+        // so pass only the fields this build understands while retaining both storage fields
+        // when supplied: the shared parser must still refuse ambiguous units and nulls.
+        let resources = db["resources"].as_object()?;
+        let resources: Resources = serde_json::from_value(Value::Object(
+            resources
+                .iter()
+                .filter(|(key, _)| {
+                    matches!(
+                        key.as_str(),
+                        "memory_mib" | "cpu_millicores" | "storage_gib" | "storage_mib"
+                    )
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ))
+        .ok()?;
         let origin = match db.get("origin") {
             None => None,
             Some(origin) => Some(match origin["kind"].as_str()? {
@@ -273,6 +289,8 @@ mod tests {
         assert_eq!(entry.storage_mib, 500);
         assert_eq!(entry.volume_bytes(), 524_288_000);
         assert_eq!(entry.volume_bytes() - storage::FS_END_GAP_BYTES, 496 << 20);
+        db["resources"]["future_resource"] = json!({"value":1});
+        assert_eq!(Entry::parse(&db), Some(entry));
         db["resources"]["storage_gib"] = json!(1);
         assert_eq!(
             Entry::parse(&db),

@@ -26,10 +26,12 @@ speed campaign, general restore campaign, schedule or automatic node purchase is
   producers. This has a brief management-API interruption: old API code cannot use the new D1
   schema. No reinstall is needed. Old API rollback after `0090`, and incompatible native rollback
   after the format floor is raised, are forbidden; recover forward with compatible code.
-- The catalog remainder is still open: six historical `dev-*` classes and `small` remain enabled
-  without live references in the latest operator readback. Preserve the referenced `rp-*` profile;
-  resolve catalog ownership/compatibility and read back the approved productive classes before
-  any customer cutover.
+- The owner-approved G10 catalog remainder closed at 2026-10-26 15:26:51 UTC: a complete
+  three-page inventory proved zero live references to the six historical `dev-*` classes and
+  `small`, and all seven were disabled through the management API with matching readback.
+  The referenced `rp-*` profile remains enabled with 108 live databases; 101 `xs` and one `sm`
+  database remain unchanged. No database, key or archive was deleted. New adopter classes still
+  need the qualified extension release and exact catalog readback before customer cutover.
 
 See [the integration handover](../operations/integrator-handover.md#integration-contract-150--candidate-2026-10-26)
 for wire shapes, operator rollout sequence and integration limits. Local checks are recorded in
