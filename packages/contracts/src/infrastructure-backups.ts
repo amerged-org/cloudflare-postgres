@@ -25,8 +25,15 @@ const ConfigFields = {
     "Existing region the D1 export is recorded under; the export is stored in the installation's one R2 archive bucket.",
   ),
   notification_recipient: Email.nullable().describe(
-    "Address that receives infrastructure alert emails. Email is sent only when the Worker secret RESEND_API_KEY and both addresses are set and no valid alert webhook is configured; null disables email.",
+    "Address that receives infrastructure alert emails. This legacy address is combined with notification_recipients, without duplicates. Email and webhook delivery are independent; RESEND_API_KEY and notification_sender are required.",
   ),
+  notification_recipients: z
+    .array(Email)
+    .max(10)
+    .optional()
+    .describe(
+      "Additional independent alert email destinations, combined with notification_recipient without case-insensitive duplicates. Omitted on PUT preserves the stored list; [] clears it. Each has its own delivery receipt and retry.",
+    ),
   notification_sender: Email.nullable().describe(
     "From address of alert emails. It must belong to a domain verified in the Resend account of RESEND_API_KEY; a rejected send stays undelivered and is retried. null disables email.",
   ),
@@ -46,6 +53,7 @@ export const InfrastructureBackupConfigInput = z
   });
 export const InfrastructureBackupConfig = z.strictObject({
   ...ConfigFields,
+  notification_recipients: z.array(Email).max(10).default([]),
   revision: z
     .number()
     .int()

@@ -230,7 +230,7 @@ test(
       const { DB } = (await actor.getEnv()) as { DB: D1Database };
       const now = new Date().toISOString();
       await DB.prepare(
-        `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,archive_timeout_seconds,backup_retention_days,created_at,updated_at) VALUES('small',512,250,1,20,300,7,?,?)`,
+        `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_mib,max_connections,archive_timeout_seconds,backup_retention_days,created_at,updated_at) VALUES('small',512,250,1024,20,300,7,?,?)`,
       )
         .bind(now, now)
         .run();

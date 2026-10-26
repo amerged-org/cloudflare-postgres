@@ -62,6 +62,7 @@ it("keeps fresh purchasing and warnings off and preserves omitted optional capac
     node_ram_warning_threshold_ppm: null,
     node_cpu_warning_threshold_ppm: null,
     node_storage_warning_threshold_ppm: null,
+    capacity_alert_policy: null,
     cap_warning_enabled: false,
   });
   await configureNodeRegionPolicy(env.DB, {
@@ -86,6 +87,7 @@ it("keeps fresh purchasing and warnings off and preserves omitted optional capac
     node_ram_warning_threshold_ppm: null,
     node_cpu_warning_threshold_ppm: null,
     node_storage_warning_threshold_ppm: null,
+    capacity_alert_policy: null,
     cap_warning_enabled: false,
   });
   expect(removed.status).toBe(200);
@@ -94,6 +96,7 @@ it("keeps fresh purchasing and warnings off and preserves omitted optional capac
     node_ram_warning_threshold_ppm: null,
     node_cpu_warning_threshold_ppm: null,
     node_storage_warning_threshold_ppm: null,
+    capacity_alert_policy: null,
     cap_warning_enabled: false,
   });
 });
@@ -110,6 +113,7 @@ it("returns the exact public capacity policy from PUT and GET after persisting i
     node_ram_warning_threshold_ppm: 900000,
     node_cpu_warning_threshold_ppm: 850000,
     node_storage_warning_threshold_ppm: 800000,
+    capacity_alert_policy: null,
     cap_warning_enabled: false,
     autoscale_enabled: false,
     adopt_instance_ids: [
@@ -213,6 +217,7 @@ it("maps stored order JSON and enabled booleans without exposing persistence col
     node_ram_warning_threshold_ppm: null,
     node_cpu_warning_threshold_ppm: null,
     node_storage_warning_threshold_ppm: null,
+    capacity_alert_policy: null,
     cap_warning_enabled: false,
   });
 });

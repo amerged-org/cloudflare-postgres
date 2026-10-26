@@ -5,6 +5,7 @@ use crate::{
     admission,
     archive::{job::Limits as JobLimits, restore::End},
     roles::{self, Wanted},
+    state::Resources,
     storage,
 };
 use pgcf_native_protocol::wake;
@@ -57,7 +58,7 @@ pub struct Entry {
     pub storage_generation: u64,
     pub memory_mib: u64,
     pub cpu_millicores: u32,
-    pub storage_gib: u64,
+    pub storage_mib: u64,
     pub max_connections: u32,
     pub archive_timeout_seconds: u32,
     /// The effective idle time; `None` is always warm.
@@ -91,6 +92,7 @@ fn source(value: &Value) -> Option<Source> {
 impl Entry {
     /// `None` for an entry that is not what the contract states.
     pub fn parse(db: &Value) -> Option<Self> {
+        let resources: Resources = serde_json::from_value(db["resources"].clone()).ok()?;
         let origin = match db.get("origin") {
             None => None,
             Some(origin) => Some(match origin["kind"].as_str()? {
@@ -133,9 +135,9 @@ impl Entry {
             },
             route_revision: number(db, "route_revision")?,
             storage_generation: number(db, "storage_generation")?,
-            memory_mib: number(&db["resources"], "memory_mib")?,
-            cpu_millicores: u32::try_from(number(&db["resources"], "cpu_millicores")?).ok()?,
-            storage_gib: number(&db["resources"], "storage_gib")?,
+            memory_mib: resources.memory_mib,
+            cpu_millicores: resources.cpu_millicores,
+            storage_mib: resources.storage_mib,
             max_connections: u32::try_from(number(&db["settings"], "max_connections")?).ok()?,
             archive_timeout_seconds: u32::try_from(number(
                 &db["settings"],
@@ -154,7 +156,9 @@ impl Entry {
     }
     /// The nominal size of the volume.
     pub fn volume_bytes(&self) -> u64 {
-        self.storage_gib << 30
+        self.storage_mib
+            .checked_mul(1 << 20)
+            .expect("validated nominal storage fits in bytes")
     }
     pub(crate) fn replaces_storage(&self) -> bool {
         matches!(
@@ -237,8 +241,8 @@ mod tests {
         assert_eq!(entry.operation, "op_cccccccccccccccccccc");
         assert_eq!(entry.desired, Desired::Running);
         assert_eq!(
-            (entry.memory_mib, entry.cpu_millicores, entry.storage_gib),
-            (256, 250, 1)
+            (entry.memory_mib, entry.cpu_millicores, entry.storage_mib),
+            (256, 250, 1024)
         );
         assert_eq!(entry.volume_bytes(), 1 << 30);
         assert_eq!(
@@ -258,6 +262,22 @@ mod tests {
         assert_eq!(
             entry.role_hash(),
             wake::role_revision_hash([("app", 1), ("reader", 2)])
+        );
+    }
+
+    #[test]
+    fn a_mib_entry_uses_the_exact_nominal_volume_and_keeps_the_filesystem_end_gap() {
+        let mut db = database("dbbbbbbbbbbbbbbbbbbb");
+        db["resources"] = json!({"memory_mib":256,"cpu_millicores":250,"storage_mib":500});
+        let entry = Entry::parse(&db).unwrap();
+        assert_eq!(entry.storage_mib, 500);
+        assert_eq!(entry.volume_bytes(), 524_288_000);
+        assert_eq!(entry.volume_bytes() - storage::FS_END_GAP_BYTES, 496 << 20);
+        db["resources"]["storage_gib"] = json!(1);
+        assert_eq!(
+            Entry::parse(&db),
+            None,
+            "neither storage field takes precedence"
         );
     }
 

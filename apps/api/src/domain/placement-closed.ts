@@ -31,7 +31,7 @@ export async function smallestOfferedClass(
 ): Promise<SizeRow | null> {
   return db
     .prepare(
-      "SELECT * FROM size_classes WHERE enabled=1 ORDER BY memory_mib,cpu_millicores,storage_gib,id LIMIT 1",
+      "SELECT * FROM size_classes WHERE enabled=1 ORDER BY memory_mib,cpu_millicores,storage_mib,id LIMIT 1",
     )
     .first<SizeRow>();
 }
@@ -64,7 +64,7 @@ export async function smallestOfferedNeed(
 const NOTHING: PlacementNeed = {
   memory_mib: 0,
   cpu_millicores: 0,
-  storage_gib: 0,
+  storage_mib: 0,
 };
 
 /**
@@ -100,7 +100,7 @@ export async function closedPools(
     nodes
       .filter((node) =>
         ["data", "metadata", "cap", "volumes"].includes(
-          poolState(node, asked.storage_gib),
+          poolState(node, asked.storage_mib),
         ),
       )
       .map((node) => node.id),
@@ -113,7 +113,7 @@ export async function closedPools(
         nodeOnline(node, now) &&
         nodeOpen(node) &&
         !["unavailable", "no_room"].includes(
-          poolState(node, asked.storage_gib),
+          poolState(node, asked.storage_mib),
         ) &&
         node.ram_peak_ppm !== null &&
         node.cpu_peak_ppm !== null &&

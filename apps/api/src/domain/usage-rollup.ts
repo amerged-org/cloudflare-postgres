@@ -94,7 +94,8 @@ export function computeUsageHour(
     awake = false,
     known = hour < Date.parse(database.created_at);
   let resources: UsageResourceSnapshot | null = null,
-    cursor = hour;
+    cursor = hour,
+    memoryMiBMilliseconds = 0;
   metrics.provisioned_seconds = 0;
   metrics.awake_seconds = 0;
   for (const key of resourceMetrics) metrics[key] = 0;
@@ -119,10 +120,16 @@ export function computeUsageHour(
         gaps.add("resource_snapshot");
         for (const key of resourceMetrics) metrics[key] = null;
       } else {
-        if (metrics.memory_mib_seconds !== null)
-          metrics.memory_mib_seconds += awake
-            ? resources.memory_mib * seconds
-            : 0;
+        if (metrics.memory_mib_seconds !== null) {
+          // Timestamp precision is milliseconds and memory is an integer. Sum that exact
+          // product before converting once: summing seconds can accumulate rounding drift
+          // over the bounded 10,000 lifecycle events. Unsafe totals remain unknown.
+          const next =
+            memoryMiBMilliseconds +
+            (awake ? resources.memory_mib * (until - cursor) : 0);
+          if (Number.isSafeInteger(next)) memoryMiBMilliseconds = next;
+          else metrics.memory_mib_seconds = null;
+        }
         if (metrics.cpu_millicore_seconds !== null)
           metrics.cpu_millicore_seconds += awake
             ? resources.cpu_millicores * seconds
@@ -188,6 +195,8 @@ export function computeUsageHour(
     }
   }
   segment(measuredEnd);
+  if (metrics.memory_mib_seconds !== null)
+    metrics.memory_mib_seconds = memoryMiBMilliseconds / 1000;
   if (gaps.has("lifecycle")) {
     metrics.provisioned_seconds = null;
     metrics.awake_seconds = null;

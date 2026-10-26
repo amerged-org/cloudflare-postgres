@@ -153,5 +153,10 @@ erDiagram
 - [apps/api/migrations/0087_database_delete_incomplete_alert.sql:1](../../../apps/api/migrations/0087_database_delete_incomplete_alert.sql#L1)
 - [apps/api/migrations/0088_database_replacements.sql:1](../../../apps/api/migrations/0088_database_replacements.sql#L1)
 - [apps/api/migrations/0089_database_storage_bytes.sql:1](../../../apps/api/migrations/0089_database_storage_bytes.sql#L1)
+- [apps/api/migrations/0090_storage_mib.sql:1](../../../apps/api/migrations/0090_storage_mib.sql#L1)
+- [apps/api/migrations/0091_role_membership_options.sql:1](../../../apps/api/migrations/0091_role_membership_options.sql#L1)
+- [apps/api/migrations/0092_independent_alert_delivery.sql:1](../../../apps/api/migrations/0092_independent_alert_delivery.sql#L1)
+- [apps/api/migrations/0093_native_protocol_floor.sql:1](../../../apps/api/migrations/0093_native_protocol_floor.sql#L1)
+- [apps/api/migrations/0094_alert_recoveries.sql:1](../../../apps/api/migrations/0094_alert_recoveries.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

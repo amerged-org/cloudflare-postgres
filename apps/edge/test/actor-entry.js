@@ -48,9 +48,9 @@ export async function seedFixtureDatabase(
       "INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
     ).bind(project, "edge-test", now, now),
     env.DB.prepare(
-      `INSERT INTO size_classes (id, memory_mib, cpu_millicores, storage_gib,
+      `INSERT INTO size_classes (id, memory_mib, cpu_millicores, storage_mib,
       max_connections, archive_timeout_seconds, backup_retention_days, created_at, updated_at)
-      VALUES ('small', 512, 250, 1, 20, 300, 7, ?, ?)`,
+      VALUES ('small', 512, 250, 1024, 20, 300, 7, ?, ?)`,
     ).bind(now, now),
     env.DB.prepare(
       `INSERT INTO regions (id, provider, provider_region, gateway_url,

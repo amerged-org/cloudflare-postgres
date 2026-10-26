@@ -167,8 +167,8 @@ class Statements {
              AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.operation=operations.id)
              AND NOT EXISTS(SELECT 1 FROM operations newer WHERE newer.database_id=operations.database_id
                AND newer.kind=operations.kind AND newer.kind='database.resize' AND newer.generation>operations.generation)
-             AND (kind<>'database.resize' OR ?>=(SELECT r.storage_gib FROM database_resources r
-               WHERE r.database_id=operations.database_id)*1073741824-?)
+             AND (kind<>'database.resize' OR ?>=(SELECT r.storage_mib FROM database_resources r
+               WHERE r.database_id=operations.database_id)*1048576-?)
              AND ${applied.sql}`,
         )
         .bind(

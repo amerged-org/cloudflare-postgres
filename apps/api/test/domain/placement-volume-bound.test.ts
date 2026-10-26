@@ -24,7 +24,7 @@ afterEach(async () => {
 const SMALL: PlacementNeed = {
   memory_mib: 512,
   cpu_millicores: 500,
-  storage_gib: 1,
+  storage_mib: 1024,
 };
 /** Each report is a little newer than the one before, so the node's newest sample is the last one. */
 let clock = 0;
@@ -77,7 +77,11 @@ describe("the technical volume bound of a node (plan 4.8, 4.11)", () => {
     await report(f.node, 1000);
     const node = await nodeOf(f, Date.now());
     expect(
-      growthFits(node, { memory_mib: 256, cpu_millicores: 0, storage_gib: 1 }),
+      growthFits(node, {
+        memory_mib: 256,
+        cpu_millicores: 0,
+        storage_mib: 1024,
+      }),
     ).toBe(true);
   });
 
@@ -90,7 +94,7 @@ describe("the technical volume bound of a node (plan 4.8, 4.11)", () => {
     const node = await nodeOf(f, Date.now());
     expect(node.pool_nominal_bytes).toBe(4 * OPEN_POOL.dataTotal);
     expect(
-      growthFits(node, { memory_mib: 0, cpu_millicores: 0, storage_gib: 1 }),
+      growthFits(node, { memory_mib: 0, cpu_millicores: 0, storage_mib: 1024 }),
     ).toBe(false);
   });
 

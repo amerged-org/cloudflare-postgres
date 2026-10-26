@@ -11,6 +11,11 @@ import {
   type NodeObservationReport,
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
+import {
+  combineNativeGuard,
+  databaseNeedsExtended,
+  extendedNativeGuard,
+} from "./native-capabilities.ts";
 import type { Env } from "../env.ts";
 import { withAdmissionMutation } from "./admission-mutations.ts";
 import { archiveBucket } from "./archive-bucket.ts";
@@ -132,14 +137,15 @@ const liveNodeSql = `n.lost_at IS NULL AND NOT EXISTS(SELECT 1 FROM node_losses 
  * placed on the node meanwhile.
  */
 async function targetOpen(
-  db: D1Database,
+  env: Pick<Env, "DB" | "NATIVE_EXTENDED_RESOURCES_RELEASE_IDS">,
   databaseId: string,
   targetNodeId: string,
   now: number,
-): Promise<{ sql: string; bindings: (string | number)[] } | null> {
+): Promise<{ sql: string; bindings: (string | number | null)[] } | null> {
+  const db = env.DB;
   const need = await db
     .prepare(
-      `SELECT d.region_id,r.memory_mib,r.cpu_millicores,r.storage_gib FROM databases d
+      `SELECT d.region_id,r.memory_mib,r.cpu_millicores,r.storage_mib FROM databases d
       JOIN database_resources r ON r.database_id=d.id WHERE d.id=?`,
     )
     .bind(databaseId)
@@ -147,32 +153,48 @@ async function targetOpen(
       region_id: string;
       memory_mib: number;
       cpu_millicores: number;
-      storage_gib: number;
+      storage_mib: number;
     }>();
   if (!need) return null;
   const node = (await placementNodes(db, need.region_id, now)).find(
     (value) => value.id === targetNodeId,
   );
   if (!node || choosePlacement([node], need, now) === null) return null;
+  const native = extendedNativeGuard(
+    env,
+    { nodeId: targetNodeId },
+    await databaseNeedsExtended(env, databaseId),
+    now,
+  );
+  if (
+    !(await db
+      .prepare(`SELECT 1 WHERE ${native.sql}`)
+      .bind(...native.bindings)
+      .first())
+  )
+    return null;
   const guard = placementGuard("n", {
     nodeId: targetNodeId,
     pendingMemoryMib: node.pending_memory_mib,
-    pendingStorageGib: node.pending_storage_gib,
+    pendingStorageMib: node.pending_storage_mib,
     now,
   });
-  return {
-    sql: `EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=d.region_id AND ${liveNodeSql} AND ${guard.sql})`,
-    bindings: guard.bindings,
-  };
+  return combineNativeGuard(
+    {
+      sql: `EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=d.region_id AND ${liveNodeSql} AND ${guard.sql})`,
+      bindings: guard.bindings,
+    },
+    native,
+  );
 }
 
 async function targetFits(
-  db: D1Database,
+  env: Pick<Env, "DB" | "NATIVE_EXTENDED_RESOURCES_RELEASE_IDS">,
   databaseId: string,
   targetNodeId: string,
   now: number,
 ): Promise<boolean> {
-  return (await targetOpen(db, databaseId, targetNodeId, now)) !== null;
+  return (await targetOpen(env, databaseId, targetNodeId, now)) !== null;
 }
 
 /**
@@ -180,7 +202,7 @@ async function targetFits(
  * move when the same one is already running.
  */
 export async function startDatabaseMove(
-  env: Pick<Env, "DB" | "NODE_ACTOR">,
+  env: Pick<Env, "DB" | "NODE_ACTOR" | "NATIVE_EXTENDED_RESOURCES_RELEASE_IDS">,
   input: { databaseId: string; targetNodeId: string },
   now = Date.now(),
 ): Promise<DatabaseMove> {
@@ -250,7 +272,7 @@ export async function startDatabaseMove(
       "conflict",
       "The source and the target must be nodes that are neither lost nor fenced",
     );
-  const open = await targetOpen(db, databaseId, targetNodeId, now);
+  const open = await targetOpen(env, databaseId, targetNodeId, now);
   if (open === null)
     throw new ApiError(
       "conflict",
@@ -550,7 +572,7 @@ async function beginRestore(
       storageGeneration,
       move.operation,
     ),
-    open = await targetOpen(env.DB, database.id, move.target_node_id, now);
+    open = await targetOpen(env, database.id, move.target_node_id, now);
   if (open === null) return false;
   const results = await env.DB.batch([
     env.DB.prepare(
@@ -751,7 +773,7 @@ export async function progressMoves(
       else
         await fail(
           move,
-          (await targetFits(env.DB, move.database_id, move.target_node_id, now))
+          (await targetFits(env, move.database_id, move.target_node_id, now))
             ? "database_changed"
             : "target_not_eligible",
         );

@@ -142,15 +142,16 @@ export async function configureNodeRegionPolicy(
   const policy = NodeRegionPolicy.parse(value);
   const result = await db
     .prepare(
-      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,maximum_database_memory_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm,cap_warning_enabled)
-    SELECT r.id,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,?,?,COALESCE(?,0) FROM regions r WHERE r.id=? AND r.provider='contabo'
+      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,maximum_database_memory_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm,cap_warning_enabled,capacity_alert_policy)
+    SELECT r.id,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,?,?,COALESCE(?,0),? FROM regions r WHERE r.id=? AND r.provider='contabo'
     ON CONFLICT(region_id) DO UPDATE SET max_nodes=CASE WHEN ?=1 THEN excluded.max_nodes ELSE node_region_policies.max_nodes END,purchases_enabled=excluded.purchases_enabled,order_config=excluded.order_config,
       maximum_database_memory_mib=excluded.maximum_database_memory_mib,standing_cost_profile=excluded.standing_cost_profile,standing_cost_profile_hash=excluded.standing_cost_profile_hash,
       autoscale_enabled=COALESCE(?,node_region_policies.autoscale_enabled),adopt_instance_ids=COALESCE(?,node_region_policies.adopt_instance_ids),
       node_ram_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.node_ram_warning_threshold_ppm ELSE node_region_policies.node_ram_warning_threshold_ppm END,
       node_cpu_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.node_cpu_warning_threshold_ppm ELSE node_region_policies.node_cpu_warning_threshold_ppm END,
       node_storage_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.node_storage_warning_threshold_ppm ELSE node_region_policies.node_storage_warning_threshold_ppm END,
-      cap_warning_enabled=CASE WHEN ?=1 THEN excluded.cap_warning_enabled ELSE node_region_policies.cap_warning_enabled END`,
+      cap_warning_enabled=CASE WHEN ?=1 THEN excluded.cap_warning_enabled ELSE node_region_policies.cap_warning_enabled END,
+      capacity_alert_policy=CASE WHEN ?=1 THEN excluded.capacity_alert_policy ELSE node_region_policies.capacity_alert_policy END`,
     )
     .bind(
       policy.max_nodes ?? null,
@@ -175,6 +176,9 @@ export async function configureNodeRegionPolicy(
       policy.cap_warning_enabled === undefined
         ? null
         : Number(policy.cap_warning_enabled),
+      policy.capacity_alert_policy == null
+        ? null
+        : JSON.stringify(policy.capacity_alert_policy),
       policy.region_id,
       Number(policy.max_nodes !== undefined),
       policy.autoscale_enabled === undefined
@@ -187,6 +191,7 @@ export async function configureNodeRegionPolicy(
       Number(policy.node_cpu_warning_threshold_ppm !== undefined),
       Number(policy.node_storage_warning_threshold_ppm !== undefined),
       Number(policy.cap_warning_enabled !== undefined),
+      Number(policy.capacity_alert_policy !== undefined),
     )
     .run();
   if (result.meta.changes !== 1)

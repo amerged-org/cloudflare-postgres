@@ -523,7 +523,9 @@ it("first failed run is failing without an older success; stale grace expires an
   const failed = (await infrastructureAlertStatus(env.DB, f.region)).find(
     (a) => a.kind === "infrastructure_backup_failed",
   )!;
-  expect(sent[0]!.key).toBe(`${failed.event_id}:${failed.occurred_at}`);
+  expect(sent[0]!.key).toBe(
+    `${failed.event_id}:${failed.occurred_at}:${failed.deliveries.find((delivery) => delivery.channel === "email")!.destination_id}`,
+  );
   await env.DB.prepare("DELETE FROM infrastructure_backup_runs").run();
   expect(
     await infrastructureBackupHealth(env, at + 37 * 3600000),

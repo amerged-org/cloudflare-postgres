@@ -318,7 +318,7 @@ it("places a restore where a node has room and keeps one that no node can take w
 it("restores with the resources of its source", async () => {
   const f = await archived();
   await env.DB.prepare(
-    "UPDATE databases SET own_memory_mib=1024,own_storage_gib=12 WHERE id=?",
+    "UPDATE databases SET own_memory_mib=1024,own_storage_mib=12288 WHERE id=?",
   )
     .bind(f.id)
     .run();

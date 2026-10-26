@@ -5,6 +5,8 @@ import { DatabaseId, NodeId, RegionId } from "./ids.ts";
 
 export const InfraAlertKind = z
   .enum([
+    "regional_node_capacity_warning",
+    "regional_node_capacity_action",
     "regional_node_cap_reached",
     "regional_node_stale",
     "infrastructure_backup_failed",
@@ -35,6 +37,10 @@ export type InfraAlertKind = z.infer<typeof InfraAlertKind>;
 
 /** One short English runbook action per kind; it travels in every new event's `action` field. */
 export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
+  regional_node_capacity_warning:
+    "Current node pressure reached the configured warning threshold. Review the affected resource and available same-region capacity. This alert never purchases or moves a database.",
+  regional_node_capacity_action:
+    "Current node pressure stayed above its action threshold for the configured duration. Review same-region capacity and plan a database move or an approved node addition. Purchases and moves require separate authority.",
   regional_node_cap_reached:
     "The region reached max_nodes. Raise max_nodes with PUT /v1/regions/{id}/capacity-policy or free a node slot; no node is added while the cap holds.",
   regional_node_stale:
@@ -90,6 +96,15 @@ export const InfraCronHeartbeat = z.strictObject({
 export type InfraCronHeartbeat = z.infer<typeof InfraCronHeartbeat>;
 export const InfraAlert = z.strictObject({
   version: z.literal(1),
+  state: z
+    .literal("resolved")
+    .optional()
+    .describe(
+      "Present only on a recovery notification; absent on the initial warning and its retries.",
+    ),
+  episode_started_at: Timestamp.optional().describe(
+    "For recovery notifications, the original warning's occurred_at.",
+  ),
   event_id: z
     .uuid()
     .describe(
@@ -98,7 +113,7 @@ export const InfraAlert = z.strictObject({
   kind: InfraAlertKind,
   region_id: RegionId,
   occurred_at: Timestamp.describe(
-    "When the episode of this notification started; it differs between two episodes of the same event_id.",
+    "When the warning started, or when it resolved for a recovery notification. episode_started_at links a recovery to its warning.",
   ),
   regional_ram_utilization_ppm: z
     .null()
@@ -127,6 +142,17 @@ export const InfraAlert = z.strictObject({
   /** Per-node warnings: the configured threshold and the highest utilization among node_ids. */
   threshold_ppm: Ppm.nullable().optional(),
   utilization_ppm: Ppm.nullable().optional(),
+  capacity: z
+    .array(
+      z.strictObject({
+        node_id: NodeId,
+        resource: z.enum(["ram", "cpu", "data", "metadata"]),
+        utilization_ppm: Ppm,
+        threshold_ppm: Ppm,
+      }),
+    )
+    .max(16)
+    .optional(),
   /** Database kinds: the affected databases, longest-standing first. */
   database_ids: z.array(DatabaseId).max(64).optional(),
   /** thin_storage_blocked: each listed node with its thin_pool_* code. */
@@ -146,12 +172,35 @@ export const InfraAlert = z.strictObject({
 });
 export type InfraAlert = z.infer<typeof InfraAlert>;
 
+export const InfraAlertDeliveryStatus = z.strictObject({
+  destination_id: z.string().min(1).max(80),
+  channel: z.enum(["webhook", "email"]),
+  recipient: z.string().nullable(),
+  delivered_at: Timestamp.nullable(),
+  last_attempt_at: Timestamp.nullable(),
+  attempts: z.number().int().nonnegative(),
+  last_status: z.number().int().nullable(),
+  last_error: z.string().nullable(),
+});
 export const InfraAlertStatus = z.strictObject({
   kind: InfraAlertKind,
+  deliveries: z.array(InfraAlertDeliveryStatus).default([]),
+  recoveries: z
+    .array(
+      z.strictObject({
+        event_id: z.uuid(),
+        occurred_at: Timestamp,
+        episode_started_at: Timestamp,
+        delivered_at: Timestamp.nullable(),
+        last_attempt_at: Timestamp.nullable(),
+        deliveries: z.array(InfraAlertDeliveryStatus),
+      }),
+    )
+    .default([]),
   active: z
     .boolean()
     .describe(
-      "True while the episode's condition holds, or while its measurement is unknown; false once it cleared or its warning was disabled. A cleared episode sends nothing.",
+      "True while the episode's condition holds, or while its measurement is unknown; false once it cleared or its warning was disabled. A previously delivered warning creates a durable recovery notification, retried independently for every destination.",
     ),
   event_id: z
     .uuid()
@@ -163,7 +212,7 @@ export const InfraAlertStatus = z.strictObject({
     "When that episode started; two episodes of the same event_id differ in it.",
   ),
   delivered_at: Timestamp.nullable().describe(
-    "When the alert webhook or the Resend API accepted the notification with a 2xx status; this is not inbox delivery. null while undelivered, including without a configured destination.",
+    "When every configured destination accepted the episode with a 2xx status; this is not inbox delivery. Individual receipts are in deliveries. null while any configured destination is undelivered, including without a configured destination.",
   ),
   last_attempt_at: Timestamp.nullable().describe(
     "Start of the latest delivery attempt; null if none was made. A retry waits at least 60 s after it.",

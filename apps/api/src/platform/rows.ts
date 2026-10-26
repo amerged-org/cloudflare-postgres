@@ -6,6 +6,7 @@ import {
   Project,
   Region,
   SizeClass,
+  serializeStorage,
 } from "@pgcf/contracts";
 import type { NodeFleet } from "../domain/fleet-releases.ts";
 export type Row = Record<string, unknown>;
@@ -28,11 +29,14 @@ export const keyRow = (row: Row): ApiKey =>
     expires_at: row.expires_at,
     revoked_at: row.revoked_at,
   });
-export const sizeRow = (row: Row): SizeClass =>
-  SizeClass.parse({
-    ...row,
+export const sizeRow = (row: Row): SizeClass => {
+  const { storage_mib, ...fields } = row;
+  return SizeClass.parse({
+    ...fields,
+    ...serializeStorage(Number(storage_mib)),
     enabled: row.enabled === 1,
   });
+};
 export const regionRow = (row: Row): Region =>
   Region.parse({
     id: row.id,

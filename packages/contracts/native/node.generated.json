@@ -753,28 +753,7 @@
                 "maximum": 9007199254740991
               },
               "pg_major": { "type": "number", "const": 18 },
-              "resources": {
-                "type": "object",
-                "properties": {
-                  "memory_mib": {
-                    "type": "integer",
-                    "minimum": 256,
-                    "maximum": 1048576,
-                    "multipleOf": 256
-                  },
-                  "cpu_millicores": {
-                    "type": "integer",
-                    "minimum": 100,
-                    "maximum": 256000
-                  },
-                  "storage_gib": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 65536
-                  }
-                },
-                "required": ["memory_mib", "cpu_millicores", "storage_gib"]
-              },
+              "resources": { "$ref": "#/$defs/DatabaseEffectiveResources" },
               "settings": {
                 "type": "object",
                 "properties": {
@@ -831,6 +810,15 @@
                           "type": "array",
                           "items": { "$ref": "#/$defs/RoleName" },
                           "description": "Other present roles of this record the role is a member of. Absent means none."
+                        },
+                        "membership_options": {
+                          "type": "object",
+                          "properties": {
+                            "inherit": { "type": "boolean" },
+                            "set": { "type": "boolean" }
+                          },
+                          "required": ["inherit", "set"],
+                          "description": "Options applied to every member_of grant. Omitted means INHERIT TRUE and SET TRUE. ADMIN is always FALSE. Immutable after creation."
                         },
                         "bypass_rls": {
                           "type": "boolean",
@@ -1200,6 +1188,57 @@
         },
         "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
         "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "DatabaseEffectiveResources": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "memory_mib": {
+                  "type": "integer",
+                  "minimum": 256,
+                  "maximum": 1048576,
+                  "multipleOf": 256
+                },
+                "cpu_millicores": {
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 256000
+                },
+                "storage_gib": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65536,
+                  "description": "Legacy whole-GiB nominal volume size; exactly converted to MiB. Supply either storage_gib or storage_mib, never both."
+                }
+              },
+              "required": ["memory_mib", "cpu_millicores", "storage_gib"]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "memory_mib": {
+                  "type": "integer",
+                  "minimum": 256,
+                  "maximum": 1048576,
+                  "multipleOf": 256
+                },
+                "cpu_millicores": {
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 256000
+                },
+                "storage_mib": {
+                  "type": "integer",
+                  "minimum": 4,
+                  "maximum": 67108864,
+                  "multipleOf": 4,
+                  "description": "Nominal total database volume in MiB, including PostgreSQL/WAL and filesystem overhead; a positive multiple of 4. Volumes never shrink. An operator must qualify a class before offering it."
+                }
+              },
+              "required": ["memory_mib", "cpu_millicores", "storage_mib"]
+            }
+          ]
+        },
         "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
         "Timestamp": {
           "type": "string",
@@ -2625,6 +2664,7 @@
       "valid_until",
       "connection_limit",
       "member_of",
+      "membership_options",
       "bypass_rls"
     ],
     "ADMISSION_STARTS": [

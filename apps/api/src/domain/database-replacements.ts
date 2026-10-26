@@ -11,6 +11,10 @@ import {
   type NodeObservationReport,
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
+import {
+  databaseNeedsExtended,
+  requireExtendedNative,
+} from "./native-capabilities.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import {
@@ -152,14 +156,20 @@ export async function startDatabaseReplacement(
         throw new ApiError("conflict", "Database configuration is not ready", {
           reason: "not_ready",
         });
+      const native = await requireExtendedNative(
+        c.env,
+        { nodeId: source.node_id },
+        await databaseNeedsExtended(c.env, id),
+        now,
+      );
       const resources = await c.env.DB.prepare(
-        "SELECT memory_mib,cpu_millicores,storage_gib FROM database_resources WHERE database_id=?",
+        "SELECT memory_mib,cpu_millicores,storage_mib FROM database_resources WHERE database_id=?",
       )
         .bind(id)
         .first<{
           memory_mib: number;
           cpu_millicores: number;
-          storage_gib: number;
+          storage_mib: number;
         }>();
       const node = (await placementNodes(c.env.DB, source.region_id, now)).find(
         (n) => n.id === source.node_id,
@@ -173,7 +183,7 @@ export async function startDatabaseReplacement(
       const capacity = placementGuard("n", {
         nodeId: node.id,
         pendingMemoryMib: node.pending_memory_mib,
-        pendingStorageGib: node.pending_storage_gib,
+        pendingStorageMib: node.pending_storage_mib,
         now,
       });
       const selected = archiveBucket(c.env),
@@ -196,7 +206,7 @@ export async function startDatabaseReplacement(
      AND NOT EXISTS(SELECT 1 FROM database_replacements WHERE database_id=d.id AND ${ACTIVE_REPLACEMENT})
      AND NOT EXISTS(SELECT 1 FROM database_moves WHERE database_id=d.id AND status IN('proving','restoring'))
      AND NOT EXISTS(SELECT 1 FROM operations WHERE database_id=d.id AND status IN('pending','running'))
-     AND EXISTS(SELECT 1 FROM nodes n WHERE ${capacity.sql}) AND ${guard.sql} AND ${lease.guard.sql}`,
+     AND EXISTS(SELECT 1 FROM nodes n WHERE ${capacity.sql}) AND ${guard.sql} AND ${lease.guard.sql} AND (${native.sql})`,
             ).bind(
               op,
               at,
@@ -208,6 +218,7 @@ export async function startDatabaseReplacement(
               ...capacity.bindings,
               ...guard.bindings,
               ...lease.guard.bindings,
+              ...native.bindings,
             ),
             c.env.DB.prepare(
               `INSERT INTO database_replacements(operation,database_id,node_id,project_id,region_id,phase,source_generation,source_storage_generation,source_archive_path,requested_backup_id,target_time,created_at,updated_at)

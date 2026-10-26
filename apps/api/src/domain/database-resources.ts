@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { normalizeStorage, type DatabaseResources } from "@pgcf/contracts";
 import type { ApiContext } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
@@ -7,14 +8,13 @@ import {
   hint,
   scheduleDatabaseResize,
 } from "./databases.ts";
-import type { ResourceOverrides } from "./resources.ts";
 import { databaseForRequest } from "./rows.ts";
 
 /** PUT /v1/databases/{id}/resources: an admin key sets the database's own values, as a resize. */
 export async function setDatabaseResources(
   c: ApiContext,
   id: string,
-  body: ResourceOverrides,
+  body: DatabaseResources,
 ): Promise<Response> {
   await requireScope(c, "admin");
   await databaseForRequest(c, id, true);
@@ -29,7 +29,11 @@ export async function setDatabaseResources(
         new Date().toISOString(),
         lease,
         undefined,
-        body,
+        {
+          memory_mib: body.memory_mib,
+          cpu_millicores: body.cpu_millicores,
+          storage_mib: normalizeStorage(body) ?? null,
+        },
       );
       hint(c, [id]);
       return databaseOperationResponse(c, op);

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
+  serializeStorage,
   NodeDesiredPage,
   NodePolicy,
   NodeRelease,
@@ -14,13 +15,18 @@ import {
 import { ApiError } from "../api-error.ts";
 import { keyring } from "../crypto/keyring.ts";
 import type { ApiContext, Env } from "../env.ts";
-import { effectiveSleepAfterSql, type RoleRow } from "./rows.ts";
+import {
+  effectiveSleepAfterSql,
+  roleMembershipOptions,
+  type RoleRow,
+} from "./rows.ts";
 import type { NodeCaller } from "./node-auth.ts";
 import { ensureArchiveCredentials } from "./archive-credentials.ts";
 import { moveTargets } from "./database-moves.ts";
 import { replacementTargets } from "./database-replacements.ts";
 import { openNodeOrders } from "./lifecycle-orders.ts";
 import { openDiagnosticRequests } from "./node-diagnostics.ts";
+import { requireExtendedNative } from "./native-capabilities.ts";
 import {
   credentialsRevision,
   nodeRouteKeyring,
@@ -42,7 +48,7 @@ interface DatabaseRow {
   route_revision: number;
   memory_mib: number;
   cpu_millicores: number;
-  storage_gib: number;
+  storage_mib: number;
   max_connections: number;
   archive_timeout_seconds: number;
   sleep_after_seconds: number | null;
@@ -164,6 +170,7 @@ async function databaseRoles(
         ? {}
         : { connection_limit: role.connection_limit }),
       ...(role.member_of.length === 0 ? {} : { member_of: role.member_of }),
+      ...roleMembershipOptions(role.membership_options),
       ...(role.bypass_rls ? { bypass_rls: true as const } : {}),
     });
   }
@@ -235,17 +242,29 @@ export async function nodeDesiredPage(
       next: null,
     });
   const now = Date.now();
+  const extended = !!(await env.DB.prepare(
+    `SELECT 1 FROM regions r WHERE r.id=?
+    AND r.native_extended_resources_required=1 AND (
+      EXISTS(SELECT 1 FROM databases d WHERE d.node_id=?)
+      OR EXISTS(SELECT 1 FROM node_volumes v WHERE v.node_id=?)
+      OR EXISTS(SELECT 1 FROM database_moves m WHERE m.target_node_id=? AND m.status='restoring'))`,
+  )
+    .bind(node.region_id, node.id, node.id, node.id)
+    .first());
+  // Refuse the whole page, never omit entries: an empty list can retire databases. A compatible
+  // current release may still pull its next qualified release before its first post-restart sample.
+  await requireExtendedNative(env, { nodeId: node.id }, extended, now, true);
   // The databases of the node, and those a move restores onto it from another.
   const result = await env.DB.prepare(
     `SELECT d.id,d.generation,d.desired_state,d.suspension_reason,d.storage_generation,d.archive_path,d.pg_major,
-       COALESCE(ae.route_revision,1) route_revision,dr.memory_mib,dr.cpu_millicores,dr.storage_gib,s.max_connections,
+       COALESCE(ae.route_revision,1) route_revision,dr.memory_mib,dr.cpu_millicores,dr.storage_mib,s.max_connections,
        s.archive_timeout_seconds,${effectiveSleepAfterSql("d")} sleep_after_seconds,
        COALESCE((SELECT rp.operation FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase='proving'),
          (SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
           ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1)) operation,
        (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,
           'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'deleted_at',r.deleted_at,
-          'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'bypass_rls',r.bypass_rls))
+          'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'membership_options',r.membership_options,'bypass_rls',r.bypass_rls))
           FROM roles r WHERE r.database_id=d.id) roles_json,
        EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
        EXISTS(SELECT 1 FROM operations co WHERE co.database_id=d.id AND co.kind='database.create' AND co.status='failed') create_failed,
@@ -361,7 +380,7 @@ export async function nodeDesiredPage(
       resources: {
         memory_mib: row.memory_mib,
         cpu_millicores: row.cpu_millicores,
-        storage_gib: row.storage_gib,
+        ...serializeStorage(row.storage_mib),
       },
       settings: {
         max_connections: row.max_connections,

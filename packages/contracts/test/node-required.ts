@@ -188,10 +188,16 @@ export const NODE_REQUIRED: Record<string, string[]> = {
     "expires_at",
     "id",
   ],
-  "NodeDesiredPage.databases[].resources": [
+  // Contract 1.5 keeps the legacy arm and gates the MiB arm on the qualified native floor.
+  "NodeDesiredPage.databases[].resources|0": [
     "cpu_millicores",
     "memory_mib",
     "storage_gib",
+  ],
+  "NodeDesiredPage.databases[].resources|1": [
+    "cpu_millicores",
+    "memory_mib",
+    "storage_mib",
   ],
   "NodeDesiredPage.databases[].roles[]|0": [
     "name",
@@ -200,6 +206,11 @@ export const NODE_REQUIRED: Record<string, string[]> = {
     "revision",
   ],
   "NodeDesiredPage.databases[].roles[]|1": ["name", "state"],
+  // Optional object, omitted for the legacy TRUE/TRUE default; API activation follows native rollout.
+  "NodeDesiredPage.databases[].roles[]|0.membership_options": [
+    "inherit",
+    "set",
+  ],
   "NodeDesiredPage.databases[].settings": [
     "archive_timeout_seconds",
     "max_connections",

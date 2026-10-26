@@ -6,6 +6,8 @@ import { Timestamp } from "./timestamp.ts";
 import {
   DatabaseEffectiveResources,
   DatabaseResourcesCreate,
+  StorageGiB,
+  StorageMiB,
 } from "./database-resources.ts";
 import {
   ApiKeyId,
@@ -28,7 +30,7 @@ export { Timestamp, roleExpiryInstant } from "./timestamp.ts";
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.4.0";
+export const API_CONTRACT_VERSION = "1.5.0";
 
 /** The pattern of `Timestamp` in the contract's own JSON Schema, which the OpenAPI generator drops. */
 export const TIMESTAMP_PATTERN: string = (() => {
@@ -167,7 +169,6 @@ export type ProjectCreate = z.infer<typeof ProjectCreate>;
 const SizeClassFields = {
   memory_mib: z.number().int().min(256).max(1_048_576),
   cpu_millicores: z.number().int().min(100).max(256_000),
-  storage_gib: z.number().int().min(1).max(65_536),
   max_connections: z.number().int().min(10).max(10_000),
   sleep_after_seconds: z
     .number()
@@ -183,13 +184,17 @@ const SizeClassFields = {
   enabled: z.boolean(),
 };
 
+const SizeClassMetadata = {
+  id: SizeClassId,
+  ...SizeClassFields,
+  created_at: Timestamp,
+  updated_at: Timestamp,
+};
 export const SizeClass = z
-  .strictObject({
-    id: SizeClassId,
-    ...SizeClassFields,
-    created_at: Timestamp,
-    updated_at: Timestamp,
-  })
+  .union([
+    z.strictObject({ ...SizeClassMetadata, storage_gib: StorageGiB }),
+    z.strictObject({ ...SizeClassMetadata, storage_mib: StorageMiB }),
+  ])
   .meta({
     id: "SizeClass",
     description:
@@ -198,13 +203,17 @@ export const SizeClass = z
 export type SizeClass = z.infer<typeof SizeClass>;
 
 /** Body of PUT /v1/size-classes/{id}. */
+const SizeClassInputFields = {
+  ...SizeClassFields,
+  memory_mib: SizeClassFields.memory_mib
+    .multipleOf(256)
+    .meta({ multipleOf: 256 }),
+};
 export const SizeClassUpsert = z
-  .strictObject({
-    ...SizeClassFields,
-    memory_mib: SizeClassFields.memory_mib
-      .multipleOf(256)
-      .meta({ multipleOf: 256 }),
-  })
+  .union([
+    z.strictObject({ ...SizeClassInputFields, storage_gib: StorageGiB }),
+    z.strictObject({ ...SizeClassInputFields, storage_mib: StorageMiB }),
+  ])
   .meta({
     id: "SizeClassUpsert",
     description: "memory_mib is a multiple of 256; a violation is a 400.",
@@ -549,6 +558,13 @@ const RoleConnectionLimit = z
   .min(1)
   .max(ROLE_CONNECTION_LIMIT_MAX);
 
+/** Uniform PostgreSQL membership flags; membership administration is never granted. */
+export const RoleMembershipOptions = z
+  .strictObject({ inherit: z.boolean(), set: z.boolean() })
+  .describe(
+    "Options applied to every member_of grant. Omitted means INHERIT TRUE and SET TRUE. ADMIN is always FALSE. Immutable after creation.",
+  );
+
 export const Role = z
   .strictObject({
     database_id: DatabaseId,
@@ -567,8 +583,9 @@ export const Role = z
       .array(RoleName)
       .max(ROLE_MEMBER_OF_MAX)
       .describe(
-        "The roles this role is a member of and inherits privileges from, ordered by name.",
+        "The roles this role is a member of, ordered by name; membership_options controls inheritance and SET ROLE.",
       ),
+    membership_options: RoleMembershipOptions.optional(),
     bypass_rls: z
       .boolean()
       .describe(
@@ -612,6 +629,7 @@ export const RoleCreate = z
           "Distinct live roles of this database the role becomes a member of, at most 8; never `app`, the role itself, `postgres` or `pg_*`.",
       })
       .optional(),
+    membership_options: RoleMembershipOptions.optional(),
     bypass_rls: z
       .boolean()
       .describe("PostgreSQL BYPASSRLS; defaults to false.")
@@ -626,6 +644,15 @@ export const RoleCreate = z
       path: ["member_of"],
       message:
         "member_of names distinct roles other than the owner and the role itself",
+    },
+  )
+  .refine(
+    (role) =>
+      role.membership_options === undefined ||
+      (role.member_of?.length ?? 0) > 0,
+    {
+      path: ["membership_options"],
+      message: "membership_options requires at least one member_of role",
     },
   )
   .meta({

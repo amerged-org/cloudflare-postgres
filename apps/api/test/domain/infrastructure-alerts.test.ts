@@ -11,13 +11,253 @@ import {
   configureNodeRegionPolicy,
   reserveNodeAddition,
 } from "../../src/domain/node-state.ts";
+import {
+  configureInfrastructureBackups,
+  readInfrastructureBackupConfig,
+} from "../../src/domain/infrastructure-backups.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 afterEach(async () => {
   await env.DB.prepare(
-    "UPDATE infrastructure_backup_config SET notification_recipient=NULL,notification_sender=NULL WHERE singleton=1",
+    "UPDATE infrastructure_backup_config SET notification_recipient=NULL,notification_recipients='[]',notification_sender=NULL WHERE singleton=1",
   ).run();
   await cleanupFixtures();
+});
+
+it("delivers each email and the webhook independently and retries only the failed destination", async () => {
+  const f = await setup(),
+    at = Date.now();
+  await reachCap(f);
+  await env.DB.prepare(
+    "UPDATE infrastructure_backup_config SET notification_recipient=?,notification_recipients=?,notification_sender=? WHERE singleton=1",
+  )
+    .bind(
+      "first@example.test",
+      JSON.stringify(["first@example.test", "second@example.test"]),
+      "alerts@example.test",
+    )
+    .run();
+  const calls: { destination: string; key: string }[] = [];
+  let failSecond = true;
+  const fetcher: typeof fetch = async (url, options) => {
+    const body = JSON.parse(String(options!.body));
+    const destination = String(url).includes("resend")
+      ? (body.to[0] as string)
+      : "webhook";
+    calls.push({
+      destination,
+      key: new Headers(options!.headers).get("Idempotency-Key")!,
+    });
+    return new Response(null, {
+      status: destination === "second@example.test" && failSecond ? 503 : 204,
+    });
+  };
+  const configuredEnv = { ...configured(), RESEND_API_KEY: "test-resend" };
+  await Promise.all([
+    runInfrastructureAlerts(configuredEnv, f.region, at, fetcher),
+    runInfrastructureAlerts(configuredEnv, f.region, at, fetcher),
+  ]);
+  expect(calls.map((c) => c.destination).sort()).toEqual([
+    "first@example.test",
+    "second@example.test",
+    "webhook",
+  ]);
+  expect(new Set(calls.map((c) => c.key)).size).toBe(3);
+  const [status] = await infrastructureAlertStatus(env.DB, f.region);
+  expect(status).toMatchObject({ delivered_at: null });
+  expect(status!.deliveries).toHaveLength(3);
+  expect(
+    status!.deliveries.filter((d) => d.delivered_at !== null),
+  ).toHaveLength(2);
+  await runInfrastructureAlerts(configuredEnv, f.region, at + 59_000, fetcher);
+  expect(calls).toHaveLength(3);
+  failSecond = false;
+  expect(
+    await runInfrastructureAlerts(
+      configuredEnv,
+      f.region,
+      at + 60_000,
+      fetcher,
+    ),
+  ).toEqual({ delivered: 1, pending: 0 });
+  expect(calls).toHaveLength(4);
+  expect(calls[3]).toEqual(
+    calls.find((c) => c.destination === "second@example.test"),
+  );
+  await runInfrastructureAlerts(configuredEnv, f.region, at + 120_000, fetcher);
+  expect(calls).toHaveLength(4);
+});
+
+it("preserves the legacy webhook receipt while adding independent recipients to an existing episode", async () => {
+  const f = await setup(),
+    at = Date.now();
+  await reachCap(f);
+  await runInfrastructureAlerts(env, f.region, at);
+  await env.DB.prepare(
+    "UPDATE infrastructure_alerts SET delivered_at=?,last_attempt_at=? WHERE region_id=?",
+  )
+    .bind(new Date(at).toISOString(), new Date(at).toISOString(), f.region)
+    .run();
+  const config = await readInfrastructureBackupConfig(env.DB);
+  const update = {
+    enabled: config.enabled,
+    d1_account_id: config.d1_account_id,
+    d1_database_id: config.d1_database_id,
+    d1_region_id: config.d1_region_id,
+    notification_recipient: "first@example.test",
+    notification_sender: "alerts@example.test",
+  };
+  await configureInfrastructureBackups(env, {
+    ...update,
+    notification_recipients: ["second@example.test"],
+  });
+  // An older client that only knows the original six fields cannot remove the additional list.
+  await configureInfrastructureBackups(env, update);
+  expect(await readInfrastructureBackupConfig(env.DB)).toMatchObject({
+    ...update,
+    notification_recipients: ["second@example.test"],
+  });
+  const sent: string[] = [];
+  const fetcher: typeof fetch = async (url, options) => {
+    expect(String(url)).toBe("https://api.resend.com/emails");
+    sent.push(JSON.parse(String(options!.body)).to[0]);
+    return new Response(null, { status: 204 });
+  };
+  await runInfrastructureAlerts(
+    { ...configured(), RESEND_API_KEY: "test-resend" },
+    f.region,
+    at + 1,
+    fetcher,
+  );
+  expect(sent.sort()).toEqual(["first@example.test", "second@example.test"]);
+  const [status] = await infrastructureAlertStatus(env.DB, f.region);
+  expect(
+    status!.deliveries.find((delivery) => delivery.channel === "webhook"),
+  ).toMatchObject({ delivered_at: new Date(at).toISOString(), attempts: 0 });
+  expect(
+    status!.deliveries.every((delivery) => delivery.delivered_at !== null),
+  ).toBe(true);
+});
+
+it("durably delivers recovery to three destinations and retries a failed recovery after recurrence", async () => {
+  const f = await setup(),
+    at = Date.now();
+  await reachCap(f);
+  await env.DB.prepare(
+    "UPDATE infrastructure_backup_config SET notification_recipient=?,notification_recipients=?,notification_sender=? WHERE singleton=1",
+  )
+    .bind(
+      "first@example.test",
+      '["second@example.test"]',
+      "alerts@example.test",
+    )
+    .run();
+  const calls: {
+    destination: string;
+    state: string;
+    key: string;
+    body: string;
+  }[] = [];
+  let failRecovery = true;
+  const fetcher: typeof fetch = async (url, options) => {
+    const envelope = JSON.parse(String(options!.body));
+    const destination = String(url).includes("resend")
+      ? envelope.to[0]
+      : "webhook";
+    const body =
+      destination === "webhook" ? String(options!.body) : envelope.text;
+    const event = JSON.parse(body);
+    calls.push({
+      destination,
+      state: event.state ?? "active",
+      key: new Headers(options!.headers).get("Idempotency-Key")!,
+      body,
+    });
+    return new Response(null, {
+      status:
+        event.state === "resolved" &&
+        destination === "second@example.test" &&
+        failRecovery
+          ? 503
+          : 204,
+    });
+  };
+  const configuredEnv = { ...configured(), RESEND_API_KEY: "test-resend" };
+  await runInfrastructureAlerts(configuredEnv, f.region, at, fetcher);
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 3,
+  });
+  await Promise.all([
+    runInfrastructureAlerts(configuredEnv, f.region, at + 1_000, fetcher),
+    runInfrastructureAlerts(configuredEnv, f.region, at + 1_000, fetcher),
+  ]);
+  expect(
+    calls
+      .filter((c) => c.state === "resolved")
+      .map((c) => c.destination)
+      .sort(),
+  ).toEqual(["first@example.test", "second@example.test", "webhook"]);
+  expect(new Set(calls.map((c) => c.key)).size).toBe(6);
+  // A fresh episode cannot replace the failed recovery's durable payload or receipt.
+  await reachCap(f);
+  await runInfrastructureAlerts(configuredEnv, f.region, at + 2_000, fetcher);
+  failRecovery = false;
+  await runInfrastructureAlerts(configuredEnv, f.region, at + 61_000, fetcher);
+  const recoveries = calls.filter((c) => c.state === "resolved");
+  expect(recoveries).toHaveLength(4);
+  expect(recoveries[3]).toEqual(
+    recoveries.find((c) => c.destination === "second@example.test"),
+  );
+  await runInfrastructureAlerts(configuredEnv, f.region, at + 121_000, fetcher);
+  expect(calls.filter((c) => c.state === "resolved")).toHaveLength(4);
+  const [status] = await infrastructureAlertStatus(env.DB, f.region);
+  expect(status!.recoveries[0]!.deliveries).toHaveLength(3);
+  expect(
+    status!.recoveries[0]!.deliveries.every((d) => d.delivered_at !== null),
+  ).toBe(true);
+});
+
+it("keeps a recovery when the warning receipt arrives after the condition cleared", async () => {
+  const f = await setup(),
+    at = Date.now();
+  await reachCap(f);
+  let started!: () => void, release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const events: InfraAlert[] = [];
+  const fetcher: typeof fetch = async (_url, options) => {
+    const event = InfraAlert.parse(JSON.parse(String(options!.body)));
+    events.push(event);
+    if (event.state !== "resolved") {
+      started();
+      await held;
+    }
+    return new Response(null, { status: 204 });
+  };
+  const sending = runInfrastructureAlerts(configured(), f.region, at, fetcher);
+  await entered;
+  try {
+    await configureNodeRegionPolicy(env.DB, {
+      region_id: f.region,
+      max_nodes: 3,
+    });
+    await runInfrastructureAlerts(configured(), f.region, at + 1_000, fetcher);
+    expect(events).toHaveLength(1);
+  } finally {
+    release();
+    await sending;
+  }
+  await runInfrastructureAlerts(configured(), f.region, at + 2_000, fetcher);
+  expect(events).toHaveLength(2);
+  expect(events[1]).toMatchObject({
+    state: "resolved",
+    episode_started_at: events[0]!.occurred_at,
+  });
 });
 async function setup(
   warnings: {
@@ -239,7 +479,7 @@ it("retries an unknown callback with its identical durable event and re-announce
   await runInfrastructureAlerts(configured(), f.region, at + 1, uncertain);
   expect(bodies).toHaveLength(1);
   await env.DB.prepare(
-    "UPDATE infrastructure_alerts SET last_attempt_at=? WHERE region_id=?",
+    "UPDATE infrastructure_alert_deliveries SET last_attempt_at=? WHERE region_id=?",
   )
     .bind(new Date(at - 60001).toISOString(), f.region)
     .run();
@@ -261,9 +501,10 @@ it("retries an unknown callback with its identical durable event and re-announce
   });
   await reachCap(f);
   await runInfrastructureAlerts(configured(), f.region, at + 4, receiver);
-  expect(bodies).toHaveLength(3);
+  expect(bodies).toHaveLength(4);
+  expect(JSON.parse(bodies[2]!)).toMatchObject({ state: "resolved" });
   // The notice that comes back is the same error: the same id, and a new start to tell it apart.
-  const [first, again] = [bodies[0]!, bodies[2]!].map((body) =>
+  const [first, again] = [bodies[0]!, bodies[3]!].map((body) =>
     InfraAlert.parse(JSON.parse(body)),
   );
   expect(again!.event_id).toBe(first!.event_id);
@@ -325,7 +566,8 @@ it("counts control and provider-assigned VPS for the cap notice, excluding an un
     max_nodes: null,
   });
   await runInfrastructureAlerts(configured(), f.region, Date.now(), receiver);
-  expect(events).toHaveLength(1);
+  expect(events).toHaveLength(2);
+  expect(events[1]).toMatchObject({ state: "resolved" });
   expect(await infrastructureAlertStatus(env.DB, f.region)).toMatchObject([
     { kind: "regional_node_cap_reached", active: false },
   ]);

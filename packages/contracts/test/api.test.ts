@@ -144,6 +144,14 @@ describe("role lifecycle attributes", () => {
       { member_of: ["none"] },
       { member_of: ["report_job"] },
       { member_of: "reader" },
+      { membership_options: { inherit: true, set: false } },
+      { member_of: [], membership_options: { inherit: true, set: false } },
+      { member_of: ["reader"], membership_options: { inherit: true } },
+      { member_of: ["reader"], membership_options: { inherit: true, set: 0 } },
+      {
+        member_of: ["reader"],
+        membership_options: { inherit: true, set: false, admin: true },
+      },
       { bypass_rls: "yes" },
       { superuser: true },
       { password: "chosen" },
@@ -157,6 +165,20 @@ describe("role lifecycle attributes", () => {
       RoleCreate.safeParse({ ...base, connection_limit: 10000, member_of: [] })
         .success,
     ).toBe(true);
+  });
+  it("accepts uniform explicit membership flags while preserving omitted defaults", () => {
+    const body = {
+      name: "report_job",
+      member_of: ["reader", "writer"],
+      membership_options: { inherit: true, set: false },
+    };
+    expect(RoleCreate.parse(body)).toEqual(body);
+    expect(
+      RoleCreate.parse({
+        ...body,
+        membership_options: { inherit: false, set: true },
+      }),
+    ).toMatchObject({ membership_options: { inherit: false, set: true } });
   });
   it("returns every attribute on a role", () => {
     const row = {

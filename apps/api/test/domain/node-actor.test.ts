@@ -62,7 +62,7 @@ async function insideAMinute() {
 const placementNeed: PlacementNeed = {
   memory_mib: 256,
   cpu_millicores: 500,
-  storage_gib: 5,
+  storage_mib: 5120,
 };
 const actor = (node: string) =>
   env.NODE_ACTOR.get(env.NODE_ACTOR.idFromName(node));

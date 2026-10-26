@@ -21,6 +21,8 @@ export type Env = Cloudflare.Env & {
   /** The API's origin, which a node's installer enrolls at, and the resolvers it configures (a JSON array). */
   NODE_API_ORIGIN?: string;
   NODE_DNS_SERVERS?: string;
+  /** JSON array of qualified signed native release IDs supporting MiB storage and membership flags. */
+  NATIVE_EXTENDED_RESOURCES_RELEASE_IDS?: string;
   /**
    * The DNS zone that holds the hostnames of the nodes' gateways (and of their shells, see NODE_SHELL_HOSTNAME),
    * and its domain. CLOUDFLARE_API_TOKEN needs Zone: DNS: Edit on it: fencing a lost node deletes its records there.

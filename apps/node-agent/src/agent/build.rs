@@ -154,7 +154,7 @@ fn resources(entry: &Entry) -> state::Resources {
     state::Resources {
         memory_mib: entry.memory_mib,
         cpu_millicores: entry.cpu_millicores,
-        storage_gib: entry.storage_gib,
+        storage_mib: entry.storage_mib,
     }
 }
 

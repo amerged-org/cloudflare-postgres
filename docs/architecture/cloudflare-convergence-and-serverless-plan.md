@@ -1,3 +1,40 @@
+# Integration extension candidate — 2026-10-26
+
+**Current implementation scope:** generic contract 1.5.0, integer-MiB total volumes with exact
+legacy-GiB compatibility, restricted role memberships, operator capacity notifications,
+independent webhook/email delivery and durable recovery notifications. These changes support the
+separate adopter migration. They are local candidate work; the signed release, EU1/US1 rollout
+and bounded new-feature acceptance have not been established by this update. Preserve the
+October 26 deployed baseline and all historical failed/accepted receipts below. No renewed
+speed campaign, general restore campaign, schedule or automatic node purchase is authorized here.
+
+- `0090` converts stored volume units exactly and drops old GiB columns. Existing volume sizes,
+  IDs and data remain unchanged. `storage_mib` is total nominal volume, including engine/WAL/
+  filesystem overhead; 500 MiB is not rounded to a larger volume or sold as 500 MiB of table data.
+- `0091` records immutable membership options; omitted options retain legacy INHERIT/SET
+  behavior. Explicit INHERIT true/SET false still denies role switching, with ADMIN always false.
+  Native application checks actual grant flags and preserves role self-configured defaults.
+- `0092` adds independent destinations and opt-in current-pressure notifications; `0094` adds
+  durable recovery outboxes. Notifications request operator action, not purchases or moves.
+- `0093` persists a monotonic regional native-format floor. Configure
+  `NATIVE_EXTENDED_RESOURCES_RELEASE_IDS` only with qualified signed releases after actual
+  both-node release/OS readback. The empty default refuses extended features. Deleting or
+  resizing their resources never reauthorizes an old native release.
+- Stage the matching API without traffic, update both existing nodes through supported signed
+  release/OS convergence, then pause management mutations/background producers for the D1/API
+  switch. Apply `0090`–`0094` and immediately activate the staged matching API before resuming
+  producers. This has a brief management-API interruption: old API code cannot use the new D1
+  schema. No reinstall is needed. Old API rollback after `0090`, and incompatible native rollback
+  after the format floor is raised, are forbidden; recover forward with compatible code.
+- The catalog remainder is still open: six historical `dev-*` classes and `small` remain enabled
+  without live references in the latest operator readback. Preserve the referenced `rp-*` profile;
+  resolve catalog ownership/compatibility and read back the approved productive classes before
+  any customer cutover.
+
+See [the integration handover](../operations/integrator-handover.md#integration-contract-150--candidate-2026-10-26)
+for wire shapes, operator rollout sequence and integration limits. Local checks are recorded in
+the Done rows; neither those checks nor diagram freshness assert a live release or customer cutover.
+
 # Production readiness update — 2026-10-24
 
 **Current objective:** finish EU1 and US1 for production on the same accepted release and OS state, with the existing functional, durability and operating acceptance, and owner-accepted cold latency as recorded below. This delivery ends at verified PGCF production readiness and a complete generic integration handover. Integrator implementation, customer migration and the integrator control database belong to the next task. **The owner explicitly removed the 72-hour canary requirement on 2026-10-24.** Operational closeout is complete; merging this accepted record closes G11 with the latency exception below.
@@ -2046,6 +2083,9 @@ From the canary on, the EU1 stack is production.
 
 | Completed step | Measurement or boundary |
 | --- | --- |
+| Integration candidate checks and documentation (local, 2026-10-26) | Contract 1.5.0 and migrations 0090–0094 are documented as an undeployed candidate, including the controlled management-API/D1 interruption and qualified native floor. All workspace typechecks, lint, formatting, privacy scan, six generated-contract checks and 118 CI/operator tests passed. Contracts: 324 tests; TypeScript Edge: 120 plus 3 workerd/node tests; CLI: 31; release signer: 35; e2e helpers: 88 passed, 2 PostgreSQL-binary-dependent tests skipped. Native protocol: 20, node contract: 5 passed; native formatting passed. The full API sweep passed 1,198 tests and exposed one old expectation that clearing an enrollment alert emits nothing; it was corrected to require a linked, once-delivered recovery and that file then passed all 17 tests. The new unit schema also exposed/fixed the required-property baseline and old SQL fixtures in archive/Edge tests. Full `pnpm test` is not a pass: the fresh checkout lacks the Rust Edge built shim/Wasm prerequisite. Existing CI must build it and run the full Linux/kernel gates; the earlier local archive timeout remains unclaimed. All five saved Mermaider views were regenerated with reviewed process evidence, checked and visually inspected on desktop and at 390 px with Fit/navigation. No deployment, purchase, live acceptance or customer cutover is claimed. |
+| Exact hourly memory integration (local, 2026-10-26) | The usage rollup accumulates integer configured MiB × lifecycle milliseconds and converts once to the unchanged `memory_mib_seconds` wire metric. Every intermediate total must be a safe integer; overflow stays unknown with a memory gap. This removes observed floating drift over 1,000 valid 3.6-second segments (previously 921599.9999999845, now exactly 921600 MiB-seconds at 256 MiB). The regression failed before the fix; all 50 usage and usage-cron tests pass. No price or wallet logic enters PGCF, and no deployed acceptance is claimed. |
+| Native protocol floor, recovery notifications and current pressure review (local, 2026-10-26) | Migrations `0093` and `0094` persist a monotonic regional native-format floor and a durable recovery outbox. A resize, role removal or database deletion cannot reopen incompatible native release assignment; empty nodes can still fetch their qualified update. Recovery delivery is independent for webhook and each email, survives recurrence and a warning acknowledgement arriving after recovery, and is exposed in operational health. Capacity warnings and clearing use the latest fresh sample; only action requires the sustained minute history. Regressions failed before each fix. Locally green: 187 focused API tests across 13 files, 30 contract/migration tests, API typecheck; no live rollout or acceptance claimed. |
 | Option C decided (owner, 2026-10-17) | Kubernetes, CNPG, Talos, OpenEBS, slot pool and control server retired; EU1 image and Rust service rebuilt; thin-slice overbooking central |
 | Old work archived | `archive/kubernetes-runtime` at `6761e7f0` (= main `4bfbe546` + stall-alerts work in progress) |
 | Research for this plan (2026-10-17) | Open source (nothing adoptable), OS image (Debian 13), overbooking model, backups (barman-cloud kept), supervision lab, code inventory (about 202k lines deletable) |

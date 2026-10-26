@@ -280,6 +280,7 @@ export async function getCapacityPolicy(
       node_ram_warning_threshold_ppm: number | null;
       node_cpu_warning_threshold_ppm: number | null;
       node_storage_warning_threshold_ppm: number | null;
+      capacity_alert_policy: string | null;
       cap_warning_enabled: number;
       purchases_enabled: number;
       order_config: string | null;
@@ -298,6 +299,10 @@ export async function getCapacityPolicy(
       node_cpu_warning_threshold_ppm: row.node_cpu_warning_threshold_ppm,
       node_storage_warning_threshold_ppm:
         row.node_storage_warning_threshold_ppm,
+      capacity_alert_policy:
+        row.capacity_alert_policy === null
+          ? null
+          : JSON.parse(row.capacity_alert_policy),
       cap_warning_enabled: Boolean(row.cap_warning_enabled),
       purchases_enabled: Boolean(row.purchases_enabled),
       autoscale_enabled: Boolean(row.autoscale_enabled),
@@ -330,6 +335,7 @@ export async function setCapacityPolicy(
     node_cpu_warning_threshold_ppm: policy.node_cpu_warning_threshold_ppm,
     node_storage_warning_threshold_ppm:
       policy.node_storage_warning_threshold_ppm,
+    capacity_alert_policy: policy.capacity_alert_policy,
     cap_warning_enabled: policy.cap_warning_enabled,
     purchases_enabled: policy.purchases_enabled,
     order: policy.order,

@@ -27,6 +27,21 @@ pub const OWNER_ROLE: &str = "app";
 /// How long the sessions of a role that is being removed may take to end.
 const SESSIONS_END: Duration = Duration::from_secs(3);
 
+/// Uniform options on every membership; ADMIN is unconditionally false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MembershipOptions {
+    pub inherit: bool,
+    pub set: bool,
+}
+impl Default for MembershipOptions {
+    fn default() -> Self {
+        Self {
+            inherit: true,
+            set: true,
+        }
+    }
+}
+
 /// A role the page states (`DesiredRole`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Role {
@@ -38,6 +53,7 @@ pub struct Role {
     pub valid_until: Option<String>,
     pub connection_limit: Option<u32>,
     pub member_of: Vec<String>,
+    pub membership_options: MembershipOptions,
     pub bypass_rls: bool,
 }
 
@@ -89,6 +105,14 @@ pub fn parse(roles: &[Value]) -> Option<Vec<Wanted>> {
                 .flatten()
                 .map(|target| target.as_str().filter(|t| role_name(t)).map(String::from))
                 .collect::<Option<Vec<_>>>()?;
+            let membership_options = match role.get("membership_options") {
+                None => MembershipOptions::default(),
+                Some(options) if !member_of.is_empty() => MembershipOptions {
+                    inherit: options["inherit"].as_bool()?,
+                    set: options["set"].as_bool()?,
+                },
+                Some(_) => return None,
+            };
             Some(Wanted::Present(Role {
                 name: name.into(),
                 owner: role["owner"].as_bool()?,
@@ -103,6 +127,7 @@ pub fn parse(roles: &[Value]) -> Option<Vec<Wanted>> {
                     Some(limit) => Some(u32::try_from(limit.as_u64()?).ok()?),
                 },
                 member_of,
+                membership_options,
                 bypass_rls: role["bypass_rls"] == true,
             }))
         })
@@ -184,16 +209,127 @@ pub struct Report {
     pub blocked: Vec<String>,
 }
 
-/// The roles `role` is a member of, sorted.
-async fn held_roles(session: &Session, role: &str) -> Result<Vec<String>, Error> {
-    let mut held = session
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Membership {
+    target: String,
+    grantor: String,
+    options: MembershipOptions,
+    admin: bool,
+}
+impl Membership {
+    fn wanted_by(&self, role: &Role) -> bool {
+        role.member_of.contains(&self.target)
+            && self.grantor == AGENT_ROLE
+            && self.options == role.membership_options
+            && !self.admin
+    }
+}
+
+/// Each grantor's row matters: PostgreSQL combines privileges from all grants of a membership.
+async fn held_memberships(session: &Session, role: &str) -> Result<Vec<Membership>, Error> {
+    Ok(session
         .query(MEMBERSHIP_QUERY, &[&role])
         .await?
         .iter()
-        .map(|row| row.try_get::<_, String>(0))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|row| {
+            Ok(Membership {
+                target: row.try_get(0)?,
+                grantor: row.try_get(1)?,
+                options: MembershipOptions {
+                    inherit: row.try_get(2)?,
+                    set: row.try_get(3)?,
+                },
+                admin: row.try_get(4)?,
+            })
+        })
+        .collect::<Result<Vec<_>, tokio_postgres::Error>>()?)
+}
+
+#[cfg(test)]
+async fn held_roles(session: &Session, role: &str) -> Result<Vec<String>, Error> {
+    let mut held: Vec<String> = held_memberships(session, role)
+        .await?
+        .into_iter()
+        .map(|grant| grant.target)
+        .collect();
     held.sort();
+    held.dedup();
     Ok(held)
+}
+
+/// Normalize all managed roles in one transaction, then verify exact grants before accepting
+/// their revisions. Revocation comes first: CASCADE can remove dependent grants made with a
+/// legacy ADMIN option. The second pass rebuilds only the desired, non-admin grants.
+async fn reconcile_memberships(session: &Session, wanted: &[Wanted]) -> Result<(), Error> {
+    session.batch("BEGIN").await?;
+    let result = async {
+        for role in wanted {
+            let Wanted::Present(role) = role else {
+                continue;
+            };
+            for grant in held_memberships(session, &role.name).await? {
+                if !grant.wanted_by(role) {
+                    session
+                        .batch(&format!(
+                            "REVOKE {} FROM {} GRANTED BY {} CASCADE",
+                            quote_identifier(&grant.target),
+                            quote_identifier(&role.name),
+                            quote_identifier(&grant.grantor),
+                        ))
+                        .await?;
+                }
+            }
+        }
+        for role in wanted {
+            let Wanted::Present(role) = role else {
+                continue;
+            };
+            let held = held_memberships(session, &role.name).await?;
+            for target in &role.member_of {
+                if !held
+                    .iter()
+                    .any(|grant| &grant.target == target && grant.wanted_by(role))
+                {
+                    session
+                        .batch(&format!(
+                            "GRANT {} TO {} WITH INHERIT {}, SET {}, ADMIN FALSE GRANTED BY {}",
+                            quote_identifier(target),
+                            quote_identifier(&role.name),
+                            if role.membership_options.inherit {
+                                "TRUE"
+                            } else {
+                                "FALSE"
+                            },
+                            if role.membership_options.set {
+                                "TRUE"
+                            } else {
+                                "FALSE"
+                            },
+                            quote_identifier(AGENT_ROLE),
+                        ))
+                        .await?;
+                }
+            }
+        }
+        for role in wanted {
+            let Wanted::Present(role) = role else {
+                continue;
+            };
+            let held = held_memberships(session, &role.name).await?;
+            if held.len() != role.member_of.len() || held.iter().any(|grant| !grant.wanted_by(role))
+            {
+                return Err::<(), Error>("role memberships did not converge".into());
+            }
+        }
+        session.batch("COMMIT").await
+    }
+    .await;
+    if result.is_err() {
+        // A failed pass never claims applied revisions; closing the caller's session also
+        // rolls back if the connection itself was lost before this cleanup could complete.
+        let _ = session.batch("ROLLBACK").await;
+    }
+    result
 }
 
 /// Whether PostgreSQL has the role, and whether it can still log in.
@@ -325,28 +461,7 @@ pub async fn apply(
         }
         revisions.insert(role.name.clone(), role.revision);
     }
-    for role in wanted {
-        let Wanted::Present(role) = role else {
-            continue;
-        };
-        let held = held_roles(session, &role.name).await?;
-        let mut wanted_roles = role.member_of.clone();
-        wanted_roles.sort();
-        let quoted = quote_identifier(&role.name);
-        for target in wanted_roles.iter().filter(|target| !held.contains(target)) {
-            session
-                .batch(&format!("GRANT {} TO {quoted}", quote_identifier(target)))
-                .await?;
-        }
-        for target in held.iter().filter(|target| !wanted_roles.contains(target)) {
-            session
-                .batch(&format!(
-                    "REVOKE {} FROM {quoted}",
-                    quote_identifier(target)
-                ))
-                .await?;
-        }
-    }
+    reconcile_memberships(session, wanted).await?;
     let (mut removed, mut blocked) = (Vec::new(), Vec::new());
     for role in wanted {
         if let Wanted::Absent(name) = role {
@@ -453,6 +568,7 @@ mod tests {
         };
         assert_eq!(reader.connection_limit, Some(9));
         assert_eq!(reader.member_of, ["base"]);
+        assert_eq!(reader.membership_options, MembershipOptions::default());
         assert!(reader.bypass_rls);
         // A role that could not be written as a name, or that has no credential, is no role.
         for broken in [
@@ -461,6 +577,9 @@ mod tests {
             json!({"name":"x","owner":false,"revision":1}),
             json!({"name":"x","owner":false,"password":pw()}),
             json!({"name":"x","state":"present"}),
+            json!({"name":"x","owner":false,"password":pw(),"revision":1,"member_of":["base"],"membership_options":{"inherit":true}}),
+            json!({"name":"x","owner":false,"password":pw(),"revision":1,"member_of":["base"],"membership_options":{"inherit":true,"set":0}}),
+            json!({"name":"x","owner":false,"password":pw(),"revision":1,"membership_options":{"inherit":true,"set":false}}),
         ] {
             assert!(parse(std::slice::from_ref(&broken)).is_none(), "{broken}");
         }
@@ -483,6 +602,7 @@ mod tests {
                 "valid_until",
                 "connection_limit",
                 "member_of",
+                "membership_options",
                 "bypass_rls"
             ]
         );
@@ -588,6 +708,123 @@ mod tests {
             login(&cluster, role, pw()).await.unwrap();
             assert!(login(&cluster, role, other_pw()).await.is_err(), "{role}");
         }
+    }
+
+    #[tokio::test]
+    async fn restrictive_memberships_replace_every_grantor_and_preserve_role_settings() {
+        let Some((cluster, agent)) = started().await else {
+            return;
+        };
+        let mut roles = page();
+        roles[2]["membership_options"] = json!({"inherit":true,"set":false});
+        let wanted_roles = wanted(roles);
+        // A restored catalog can contain multiple grants for the same pair, including an
+        // ADMIN/SET-capable grant made by an ordinary grantor. The effective privilege is their
+        // union, so replacing only postgres's grant must not be reported as success.
+        agent
+            .batch(
+                "CREATE ROLE base; CREATE ROLE reader; CREATE ROLE other_grantor; \
+            GRANT base TO other_grantor WITH ADMIN TRUE; \
+            GRANT base TO reader WITH ADMIN TRUE; \
+            GRANT base TO reader WITH ADMIN TRUE GRANTED BY other_grantor; \
+            ALTER ROLE reader SET statement_timeout = '7s'; \
+            CREATE TABLE inherited_data (value integer); INSERT INTO inherited_data VALUES (42); \
+            GRANT SELECT ON inherited_data TO base",
+            )
+            .await
+            .unwrap();
+        let first = apply(&agent, &wanted_roles, &BTreeMap::new(), false)
+            .await
+            .unwrap();
+        let rows = agent.query("SELECT m.inherit_option,m.set_option,m.admin_option,g.rolname::text \
+            FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member JOIN pg_roles g ON g.oid=m.grantor \
+            WHERE r.rolname='reader'", &[]).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get::<_, bool>(0));
+        assert!(!rows[0].get::<_, bool>(1));
+        assert!(!rows[0].get::<_, bool>(2));
+        assert_eq!(rows[0].get::<_, String>(3), AGENT_ROLE);
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host_path(cluster.socket_directory())
+            .port(crate::layout::PORT)
+            .user("reader")
+            .password(pw())
+            .dbname("postgres");
+        let (reader, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(connection);
+        assert_eq!(
+            reader
+                .query_one("SELECT value FROM inherited_data", &[])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            42
+        );
+        assert!(reader.simple_query("SET ROLE base").await.is_err());
+        assert!(reader.simple_query("GRANT base TO app").await.is_err());
+        assert_eq!(
+            reader
+                .query_one("SHOW statement_timeout", &[])
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+            "7s"
+        );
+        // A later password revision must not overwrite ALTER ROLE ... SET configuration either.
+        let mut revised = wanted_roles.clone();
+        if let Wanted::Present(role) = &mut revised[2] {
+            role.revision += 1;
+        }
+        apply(&agent, &revised, &first.revisions, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            agent
+                .query(
+                    "SELECT rolconfig::text FROM pg_roles WHERE rolname='reader'",
+                    &[]
+                )
+                .await
+                .unwrap()[0]
+                .get::<_, String>(0),
+            "{statement_timeout=7s}"
+        );
+        // Reconciliation is exact even if the credential revision was already applied.
+        agent
+            .batch("GRANT base TO reader WITH ADMIN TRUE")
+            .await
+            .unwrap();
+        apply(&agent, &wanted_roles, &first.revisions, false)
+            .await
+            .unwrap();
+        assert!(!agent.query("SELECT admin_option FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member WHERE r.rolname='reader'", &[])
+            .await.unwrap()[0].get::<_, bool>(0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_membership_reconciliation_keeps_the_prior_grants() {
+        let Some((_cluster, agent)) = started().await else {
+            return;
+        };
+        let roles = wanted(page());
+        let first = apply(&agent, &roles, &BTreeMap::new(), false)
+            .await
+            .unwrap();
+        let mut invalid = roles.clone();
+        if let Wanted::Present(reader) = &mut invalid[2] {
+            reader.member_of = vec!["nonexistent".into()];
+        }
+        assert!(
+            apply(&agent, &invalid, &first.revisions, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(held_roles(&agent, "reader").await.unwrap(), ["base"]);
+        // A later valid pass can use the same session after the failed transaction was rolled back.
+        apply(&agent, &roles, &first.revisions, false)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

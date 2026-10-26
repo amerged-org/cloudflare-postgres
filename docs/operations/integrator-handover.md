@@ -32,6 +32,43 @@ gate G11 asks for in one table, with its kind, date and source. The plan's
 operator procedures are in the other runbooks ([recovery](recovery.md),
 [credentials](credentials.md), [infrastructure backups](infrastructure-backups.md)).
 
+## Integration contract 1.5.0 — candidate, 2026-10-26
+
+This revision documents implemented integration changes that still require the qualified release
+and bounded live checks. It does not replace the dated deployed-release receipts below with a
+new deployment claim. Confirm the installation's served `/v1/openapi.json` before using the new
+fields. The accepted latency exception and prohibition on new general speed/restore campaigns
+remain unchanged.
+
+The candidate adds exact MiB storage, restricted role memberships, independent alert destinations
+and recovery notifications. These are generic platform capabilities; adopter classes, prices,
+wallets, customer migration and the end of adopter-to-Neon traffic remain the adopter's work.
+The latest catalog review still found six historical `dev-*` classes and `small` enabled without
+live references. Operator disposition and a productive catalog readback remain prerequisites for
+customer cutover; the referenced `rp-*` profile must not be removed by name.
+
+**Operator deployment order.** Qualify the exact commit with the existing CI and signed image/
+native-release workflow. Stage the management Worker version without routing traffic to it,
+then update both existing nodes to the same qualified native release through normal release/OS
+convergence; no reinstall is required. Read back the actual release, process and OS identities.
+Pause management-API mutations and its background mutation producers for the D1/API switch,
+apply migrations `0090`–`0094`, and immediately activate the staged matching API. Migration
+`0090` drops the old GiB columns: the old API cannot run against the migrated schema. Treat the
+switch as a brief management-API interruption, not as a zero-interruption deployment. Resume
+producers only after matching schema/API readback and operational-health checks. Keep SQL writes
+out of any separate customer cutover until that migration's own checks pass.
+
+Set `NATIVE_EXTENDED_RESOURCES_RELEASE_IDS` to a JSON array containing only signed release IDs
+whose actual native binaries are qualified for MiB storage and membership options. The default
+empty array refuses extended operations. Their admission checks current signed release, fresh
+node observations, regional assignment and OS convergence. The first extended database/role
+mutation raises a durable regional format floor; later resizing, deleting the role or deleting
+the database cannot lower it. Do not roll back to an API before `0090`, or to a native release
+outside the qualified allowlist after that floor is raised. Restore/move/desired-state delivery
+also preserve these constraints. Keep newly provisioned nodes on the same qualified image and
+release. Complete the focused small-volume and temporary-login checks before exposing adopter
+classes; no new purchase or customer write is implied by this documentation.
+
 ## Current release decision — 2026-10-26
 
 The owner accepts the existing cold latency and has cancelled all further speed tests, including the additional EU diagnostic and final 1h/24h campaigns. G3 is an **owner-accepted exception**, not a measured subsecond-p95 pass. The failed EU 1,516-ms / US 452-ms six-statement phase and later EU 563-ms diagnostic remain recorded; the cause of the outlier is not proven. Do not promise p95 below 1,000 ms. Cold/warm are the only existing-database states; first creation until Ready is separate.
@@ -359,11 +396,18 @@ creation or resize. Disabled classes (`enabled: false`) are listed but refused.
 | ------------------------------------------ | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `memory_mib`                               | 256 to 1,048,576 in steps of 256                       | The database's hard memory ceiling while it is awake; PostgreSQL's settings follow it (`shared_buffers` an eighth, `effective_cache_size` three quarters of it) |
 | `cpu_millicores`                           | 100 to 256,000                                         | CPU size: the database's CPU weight is proportional to it and a quota of it applies once PostgreSQL has started; after a wake the quota comes only after the region's CPU burst (the node policy's `cpu_boost_ms`, 5 s at first), during which the database is not held to its size: it takes its weight's share of contested CPU and what is idle. Each wake has such a burst, so frequent suspend and resume cycles repeat it |
-| `storage_gib`                              | 1 to 65,536                                            | The thin volume's size; the pool hands out real space only as the database writes. It grows online and never shrinks |
+| `storage_mib` or legacy `storage_gib` | MiB: 4 to 67,108,864 in multiples of 4; GiB: whole numbers 1 to 65,536 | Nominal total volume size, including PostgreSQL, WAL and filesystem overhead; exactly one storage field. Growth only. Operator-defined classes still require qualification. |
 | `max_connections`                          | 10 to 10,000                                           | PostgreSQL `max_connections`                                                                                                              |
 | `sleep_after_seconds`                      | 60 to 2,592,000, or `null`                             | Idle time before hibernation of a database that sets none of its own; `null` is always warm                                               |
 | `archive_timeout_seconds`                  | 30 to 3,600                                            | PostgreSQL `archive_timeout`: switches an active WAL segment after this interval; it does not bound completed archive lag                                                                       |
 | `backup_retention_days`                    | 1 to 3,650                                             | Recovery window: after each DONE backup the Worker deletes older base backups and the WAL only they need, never the newest DONE backup; also how long a deleted database stays restorable |
+
+Storage is integer MiB inside the control plane and native agent. Old whole-GiB inputs convert
+exactly by multiplying by 1,024. Responses retain `storage_gib` for whole-GiB values and use
+`storage_mib` otherwise; upgrade clients before they read a new sub-GiB class. Supplying both
+fields is invalid. A 500 MiB volume is 524,288,000 bytes, never rounded to 512 MiB or 1 GiB; the
+filesystem ends 4 MiB before the volume's end, then filesystem/engine/WAL overhead consumes
+space inside it. This is not a promise of 500 MiB of customer table data or a separate soft quota.
 
 A class that databases reference cannot change its resources or policies (`409`); a class that a
 resource profile revision references cannot change at all. New values need a new class.
@@ -371,8 +415,8 @@ resource profile revision references cannot change at all. New values need a new
 **Resources of one database.** The class supplies a database's memory, CPU and storage, and an
 **admin key** may give one database its own: in `resources` on `POST /v1/databases`, or with
 `PUT /v1/databases/{id}/resources` (an integrator key gets `403`). Every `Database` reports the
-values it runs with in `resources` (`memory_mib`, `cpu_millicores`, `storage_gib`). A `PUT` sets all
-three fields, and `null` hands one back to the class. Memory is a multiple of 256 MiB up to the
+values it runs with in `resources` (`memory_mib`, `cpu_millicores`, and one of
+`storage_mib`/`storage_gib`). A `PUT` sets all three resource values, and `null` hands one back to the class. Memory is a multiple of 256 MiB up to the
 region's per-database maximum; CPU is at least 100 millicores and at most the cores of the region's
 largest node; storage is at least the database's current size and never shrinks. The change is a
 resize ([2.5](#25-resize)), and a change of class keeps the database's own values. A restore
@@ -380,7 +424,7 @@ creates its database with the source's resources.
 
 The API refuses a class whose memory exceeds the region's per-database maximum (`400`; 4,096 MiB
 unless the operator sets another). It does **not** refuse a class that no node can host, for
-example a `storage_gib` that would take a node's sold storage past four times its pool, or a CPU
+example a volume size that would take a node's sold storage past four times its pool, or a CPU
 size above the node's cores: creates of such a class are accepted and then wait unplaced. Ask the
 operator which classes are placeable.
 
@@ -449,7 +493,7 @@ work.
 ## 2. Lifecycle API
 
 The machine-readable reference is `GET /v1/openapi.json` (no key needed). Its `info.version` is
-the version of the API contract (`1.4.0` for this document): it changes when the contract changes
+the version of the API contract (`1.5.0` for this candidate document): it changes when the contract changes
 and not with a Worker release, which is named in `info.x-worker-version`. Rules a schema cannot
 state are in descriptions ([Appendix C](#appendix-c-what-the-served-openapi-document-states-in-words)).
 Its operation IDs are listed below. Examples assume:
@@ -506,12 +550,12 @@ operation}`) and `Location: /v1/operations/{id}`.
 | `listDatabases`                                               | `GET /v1/databases`                                   | filters `project_id`, `region_id`, `node_id`, `desired_state`, `observed_state` and `name` (exact, case-sensitive; unique among the live databases of a project, so one match inside your project); excludes deleted    |
 | `getDatabase`                                                 | `GET /v1/databases/{id}`                              | also returns a deleted database (`desired_state: deleted`)                                                                                                                                                              |
 | `resizeDatabase`                                              | `PATCH /v1/databases/{id}`                            | body `{size_class_id}` only; no rename                                                                                                                                                                                  |
-| `setDatabaseResources`                                        | `PUT /v1/databases/{id}/resources`                    | admin key only (`403` otherwise); body `{memory_mib, cpu_millicores, storage_gib}`, each a value or `null` for the size class's ([1.3](#13-size-classes)); 202 with the operation, a resize; `Idempotency-Key` required |
+| `setDatabaseResources`                                        | `PUT /v1/databases/{id}/resources`                    | admin key only (`403` otherwise); body `{memory_mib, cpu_millicores, storage_mib}` (or legacy `storage_gib`, never both), each a value or `null` for the size class's ([1.3](#13-size-classes)); 202 with the operation, a resize; `Idempotency-Key` required |
 | `setDatabaseIdleTime`                                         | `PUT /v1/databases/{id}/idle-time`                    | body `{sleep_after_seconds}`; 200 with the database, no operation ([3.5](#35-idle-sleep-and-wake-on-connect)); `Idempotency-Key` required                                                                               |
 | `deleteDatabase`                                              | `DELETE /v1/databases/{id}`                           | 202                                                                                                                                                                                                                     |
 | `suspendDatabase`, `resumeDatabase`                           | `POST /v1/databases/{id}/suspend`, `/resume`          | 202                                                                                                                                                                                                                     |
 | `restoreDatabase`                                             | `POST /v1/databases/{id}/restore`                     | 202, creates a new database                                                                                                                                                                                             |
-| `listDatabaseRoles`, `createDatabaseRole`                     | `GET`, `POST /v1/databases/{id}/roles`                | at most 100 roles; optional `valid_until`, `connection_limit`, `member_of`, `bypass_rls` ([2.3](#23-roles-connection-uri-and-passwords)); `Idempotency-Key` required                                                    |
+| `listDatabaseRoles`, `createDatabaseRole`                     | `GET`, `POST /v1/databases/{id}/roles`                | at most 100 roles; optional `valid_until`, `connection_limit`, `member_of`, `membership_options`, `bypass_rls` ([2.3](#23-roles-connection-uri-and-passwords)); `Idempotency-Key` required                                                    |
 | `resetDatabaseRolePassword`                                   | `POST /v1/databases/{id}/roles/{name}/reset-password` | `Idempotency-Key` required                                                                                                                                                                                              |
 | `deleteDatabaseRole`                                          | `DELETE /v1/databases/{id}/roles/{name}`              | 202, operation `database.role.delete` ([2.3](#23-roles-connection-uri-and-passwords)); `Idempotency-Key` required                                                                                                       |
 | `getDatabaseConnectionUri`                                    | `GET /v1/databases/{id}/roles/{name}/connection-uri`  | password included for integrator keys                                                                                                                                                                                   |
@@ -652,14 +696,29 @@ pgcf -X POST "$PGCF_API/v1/databases/<database-id>/roles" -H 'Content-Type: appl
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `valid_until`      | PostgreSQL `VALID UNTIL`: from this time the role cannot log in                                                                                                               | a [timestamp](#20-conventions) in the future when the request executes, no maximum; PostgreSQL applies it at whole seconds, truncated, so `…:05.678Z` expires at `…:05.000Z` and a value whose whole second has already begun is refused with `400` |
 | `connection_limit` | PostgreSQL `CONNECTION LIMIT`: concurrent sessions of the role; one more gets `53300` "too many connections for role"                                                         | 1 to 10,000; omitted means unlimited                                                                                                                                                                                                                |
-| `member_of`        | the role is a member of these roles and inherits their privileges (`INHERIT`; `SET ROLE` to them stays possible, as for any PostgreSQL membership)                            | at most 8 distinct live roles of this database; never `app` or the role itself; otherwise `400`                                                                                                               |
+| `member_of`        | membership targets; omitted options retain inherited privileges and `SET ROLE`; explicit `membership_options` can restrict both                            | at most 8 distinct live roles of this database; never `app` or the role itself; otherwise `400`                                                                                                               |
 | `bypass_rls`       | PostgreSQL `BYPASSRLS`: the role ignores row-level security policies, also `FORCE ROW LEVEL SECURITY`; it still needs table privileges. Typical use: an export or backup role | boolean, default `false`                                                                                                                                                                                                                            |
 
-`GET /v1/databases/{id}/roles` returns all four on every role (`null`, `[]`, `false` when not
-set). A role past its `valid_until` stays listed and counts toward the 100 roles until you delete
+`membership_options: {"inherit": true, "set": false}` applies uniformly to all entries of
+`member_of`: the role inherits the targets' grants but cannot `SET ROLE` to them. Both booleans
+are required when supplied; options without membership targets are invalid. `ADMIN OPTION` is
+always false. Omission means `{inherit:true,set:true}`; default options remain omitted in the
+response and desired page. Native reconciliation verifies grant options as well as target names,
+including after restore, and refuses an unexpected grantor rather than accepting a permissive
+parallel grant. These creation-time attributes remain immutable; no role PATCH is added.
+
+`GET /v1/databases/{id}/roles` returns the existing attributes on every role (`null`, `[]`,
+`false` when not set) and non-default membership options when present. A role past its `valid_until` stays listed and counts toward the 100 roles until you delete
 it; its connection URI is still readable but a connection with it is refused. Expiry stops new
 logins only: **a session that is already open is not ended by it**. Delete the role to end its
 sessions.
+
+An ordinary role may set its own session defaults through an authenticated connection, for
+example `ALTER ROLE CURRENT_USER SET statement_timeout='60s'`. Role application/password reset
+does not reset those defaults. The owner `app` cannot create roles or change other roles' defaults;
+use the role API and then authenticate as the intended role. SQL role comments require role
+administration privileges that `app` does not hold; maintain integration provenance in the
+integrator's scoped resource/operation records instead.
 
 **Expired credentials.** The Edge refuses a role past `valid_until` with `28P01` before it would
 wake a hibernated database or spend connection budget, exactly the SQLSTATE PostgreSQL answers an
@@ -889,7 +948,7 @@ credentials.
 | Database ID and PostgreSQL database name                                                            | `<source-id>` | **new** `<target-id>`                                                                                                                                                                                         |
 | `name`                                                                                              | the old label | the `name` of the request; it must differ from every live database of the project (`409` otherwise)                                                                                                           |
 | Project, size class, region                                                                         |               | the same (region unless `region_id` is given)                                                                                                                                                                 |
-| Role names, passwords and attributes (`valid_until`, `connection_limit`, `member_of`, `bypass_rls`) |               | the same names, passwords and attributes registered at the time of the call (from the retained record for a deleted source); a role awaiting its removal is not copied, and an expired role is copied expired |
+| Role names, passwords and attributes (`valid_until`, `connection_limit`, `member_of`, `membership_options`, `bypass_rls`) |               | the same names, passwords and attributes registered at the time of the call (from the retained record for a deleted source); a role awaiting its removal is not copied, and an expired role is copied expired |
 | Data, grants, sequences                                                                             |               | from the backup, as of `target_time` or the end of the archive                                                                                                                                                |
 
 The source keeps running until you delete it. Persist `source_id -> target_id`, the restore
@@ -1457,7 +1516,7 @@ other classes are not converted into unmeasured regional passes.
 ### 4.3 Thin storage
 
 Every database lives on its own thin LVM volume of its node's one thin pool. The volume's size is
-the database's `storage_gib`, real space is taken only as the database writes (an empty database
+the database's nominal volume size (`storage_mib`, or the equivalent legacy `storage_gib`), real space is taken only as the database writes (an empty database
 used 68.6 MiB when it was ready on EU1, 2026-10-17, "Stage 1 Block 2: create and sleep costs"), and the pool does not grow. Sold sizes do not reserve
 space: the sizes of the volumes on a node may add up to more than its disk, within a cap of four
 times the pool's physical data area. Report physical pool bytes, nominal allocated volume bytes
@@ -1576,6 +1635,10 @@ pgcf -G "$PGCF_API/v1/usage" \
 | `backup_bytes_max`                                                   | maximum archive size in R2 measured in the period                                                                                                                             |
 | `ingress_bytes`, `egress_bytes`, `connections`, `connection_seconds` | gateway counters of the hour, summed over its measurement intervals (none spans two hours); `null` with `traffic_coverage` when an interval of the hour is missing or unknown |
 
+The memory integral accumulates integer configured MiB × lifecycle milliseconds and divides
+once to produce the unchanged `memory_mib_seconds` metric. An unsafe integer accumulation
+remains unknown with a memory gap; it is not rounded into a billable value.
+
 For compute time price `awake_seconds` and `memory_mib_seconds`; for storage use
 `storage_allocated_bytes` and `storage_used_bytes_max`; for traffic read `ingress_bytes` and
 `egress_bytes` of final rows. The retired Kubernetes runtime's three `reserved_*` metrics are gone
@@ -1614,8 +1677,9 @@ any price.
 
 ## 6. Alerts and operations
 
-Alerts are infrastructure alerts for the **operator**. You do not receive them: they go to the
-operator's alert webhook. The owner confirmed the recipient on 2026-10-19 and, on the evening of
+Alerts are infrastructure alerts for the **operator**. The candidate independently sends them
+to the authenticated operator webhook and configured email recipients. Integrator alert
+subscriptions are not introduced. The owner confirmed the recipient on 2026-10-19 and, on the evening of
 2026-10-20, that the alerts arrive; the control database held delivered episodes of several kinds,
 go-live gate G5 is met and every kind carries its runbook action ("G5 met: the alerts reach the
 owner's webhook"). The operator reads the alerts' state in
@@ -1624,14 +1688,39 @@ owner's webhook"). The operator reads the alerts' state in
 One episode exists per region and kind. Its `event_id` names the error: the same error (same
 region, kind and failing subjects) has the same `event_id` every time it occurs, also after it
 cleared and came back, and a different set of subjects is a new error with a new `event_id`. An
-episode is delivered at least once with retries at least 60 s apart and a five-second deadline
-(a retry repeats the `event_id`, the `occurred_at` and the body), and clears only when its
+episode is delivered at least once to each destination, with retries at least 60 s apart and a
+five-second deadline (a retry repeats the `event_id`, `occurred_at` and body), and clears only when its
 measurement is fresh and below the threshold. A recurrence has the same `event_id` and a new
 `occurred_at`; a receiver deduplicates the pair and treats a known `event_id` with a new
 `occurred_at` as a new occurrence of the incident that ID names.
 
+Configure `notification_recipients` (up to ten additional addresses) alongside the legacy
+`notification_recipient` and `notification_sender` at `/v1/infrastructure-backups/config`.
+Omitting the new list on PUT preserves it; `[]` clears it. Addresses are deduplicated without
+case sensitivity. Email requires `RESEND_API_KEY` and a verified sender; a webhook does not
+suppress email. Each destination has its own receipt/retry, so failure of one does not repeat
+an acknowledged delivery to another. Aggregate `delivered_at` means every configured destination
+returned 2xx, not inbox delivery. Operational health exposes destination receipts and sanitized
+failure status, without secrets or request bodies.
+
+When an announced episode clears, a separate durable recovery outbox records `state:"resolved"`,
+the resolution in `occurred_at`, and `episode_started_at` linking the warning. It survives a
+new recurrence and retries independently; a warning acknowledgement arriving after resolution
+still makes recovery eligible. Operational health includes the latest recovery records and
+per-destination delivery status. Receivers must distinguish warning/recovery payloads and
+idempotency keys, not interpret resolution as a new warning.
+
+The optional `capacity_alert_policy` replaces the three legacy utilization warnings while set.
+`{}` selects RAM/CPU/data warning at 70%, sustained action at 75% for 30 minutes, and clear below
+65%; metadata uses 40/45/35%. Warning and clear use the latest fresh observation. Action needs
+every minute of the configured window; stale, missing or unknown measurements neither establish
+pressure nor falsely clear an existing episode. These notifications request **manual operator
+action**: they do not order a node, enable autoscaling or move databases. Existing placement and
+purchase authorization remain separate, and no automatic redistribution is added.
+
 | Kind                                                          | Fires when                                                                                                                                   | Threshold (set in the capacity policy; the plan's value, 4.10, where it names one) |
 | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `regional_node_capacity_warning`, `regional_node_capacity_action` | current pressure reaches the warning or sustained-action threshold | optional `capacity_alert_policy`; thresholds and hysteresis above |
 | `regional_node_ram_warning`                                   | any node's 30-minute average of active RAM reaches the threshold                                                                             | `node_ram_warning_threshold_ppm`, 850,000 (85 %) |
 | `regional_node_cpu_warning`                                   | any node's 30-minute average CPU load reaches it                                                                                             | `node_cpu_warning_threshold_ppm`, 900,000 (90 %)  |
 | `regional_node_storage_warning`                               | the node's thin-pool data or metadata fill reaches it (placement closes a pool at 80 % data or 50 % metadata)                                | `node_storage_warning_threshold_ppm`; the plan names no value (placement closes the pool at 800,000 for data and 500,000 for metadata) |
@@ -1815,13 +1904,13 @@ When reporting an incident, send:
   and a move has not been timed; `/restore` creates a new ID, while `/restore-in-place` preserves it).
 - Final regional one-hour/24-hour cold acceptance. Required density, storage and recovery receipts
   are accepted in the dated ULTRA update; dependent test-population cleanup remains open.
-- Alerts for integrators (alerts go to the operator); alert history, acknowledgement and test send.
+- Alerts for integrators (alerts go to the operator); operator acknowledgement and test send. Operational health exposes delivery/recovery receipts, not a complete event-history API.
 - Finding deleted databases: the lists exclude them, so keep the IDs you were given.
 - An event stream or webhooks, an audit log of integrator keys (the administrator keys have one).
 - Last-use display and key rotation as a feature; an API domain with rate limiting.
 - Infrastructure metrics history and measured CPU and RAM per database.
 - Changing a role after creation (expiry, limit, membership), user-chosen passwords, a grants API,
-  per-role settings, renaming a database.
+  a role-settings API (ordinary roles can set their own SQL session defaults), renaming a database.
 - Cancel requests, replication connections, TCP access; in HTTP query mode, `COPY` and
   `authToken`.
 - Budgets, quotas per tenant, compute and storage autoscaling, branching.

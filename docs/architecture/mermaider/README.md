@@ -20,7 +20,7 @@ as source; download it or open the local checkout to use the gallery.
 | [AddNode orchestration](add-node.md) | A reviewed, source-backed interpretation of the implemented provisioning workflow. |
 
 The D1 view selects nine core tables to remain readable; the migration stream also
-contains provisioning, usage, fleet, storage and capacity tables. Its omission of
+contains provisioning, usage, fleet, storage, capacity and independent alert-delivery/recovery tables. Its omission of
 other tables is deliberate. It does not claim that every relationship is a
 declared foreign key or display every constraint.
 

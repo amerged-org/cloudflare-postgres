@@ -28,10 +28,10 @@ async function growing(storage: number) {
   const target = "g" + crypto.randomUUID().replaceAll("-", "").slice(0, 20);
   classes.push(target);
   await env.DB.prepare(
-    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
+    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_mib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
      SELECT ?,memory_mib,cpu_millicores,?,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,1,created_at,updated_at FROM size_classes WHERE id=?`,
   )
-    .bind(target, storage, f.size)
+    .bind(target, storage * 1024, f.size)
     .run();
   const resized = await request(`/v1/databases/${id}`, f.integrator, "PATCH", {
     size_class_id: target,
