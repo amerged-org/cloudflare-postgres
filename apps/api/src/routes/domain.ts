@@ -13,6 +13,7 @@ import {
   DatabaseRestored,
   DatabaseId,
   DatabaseListQuery,
+  DatabasePowerChange,
   DatabaseWithOperation,
   ErrorBody,
   IdempotencyKey,
@@ -26,6 +27,7 @@ import {
 } from "@pgcf/contracts";
 import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
+import { ApiError } from "../api-error.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { restoreDatabase } from "../domain/restore.ts";
 import {
@@ -312,10 +314,42 @@ export function registerDomain(app: ApiApp): void {
         path: `/v1/databases/{id}/${action}`,
         security,
         tags: ["Databases"],
-        request: { headers, params },
+        description:
+          "The optional expected_generation precondition requires the current database generation, including when the requested power state already holds. A mismatch returns 409 conflict with error.details.reason generation_changed. Repeating an accepted request with the same Idempotency-Key and body returns its original operation even after the generation advances; retain that original body and key after an unknown outcome. An omitted body preserves unconditional power intent.",
+        request: {
+          headers,
+          params,
+          body: {
+            required: false,
+            // A plain schema documents the contract without installing Hono's JSON
+            // validator, which rejects a legacy empty body with a JSON Content-Type.
+            content: {
+              "application/json": {
+                // Retain every field but drop the root component metadata: this schema
+                // is inline, so it must not refer to document-root definitions.
+                schema: z.toJSONSchema(DatabasePowerChange.omit({}), {
+                  target: "draft-2020-12",
+                }),
+              },
+            },
+          } as NonNullable<RouteConfig["request"]>["body"],
+        },
         responses: responses(DatabaseWithOperation, 202),
       },
-      async (c) => changePower(c, DatabaseId.parse(c.req.param("id")), action),
+      async (c) => {
+        const text = await c.req.text();
+        const parsed = DatabasePowerChange.safeParse(
+          text === "" ? {} : JSON.parse(text),
+        );
+        if (!parsed.success)
+          throw new ApiError("invalid_request", "Invalid power change request");
+        return changePower(
+          c,
+          DatabaseId.parse(c.req.param("id")),
+          action,
+          parsed.data,
+        );
+      },
     );
   register(
     app,

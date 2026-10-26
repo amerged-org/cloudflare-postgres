@@ -64,6 +64,29 @@ passed 813 tests with zero failures (23 kernel-only tests excluded), and formatt
 Clippy with warnings denied passed on Linux aarch64, Rust 1.99.0 and PostgreSQL 18.6. These are
 candidate changes pending fresh exact-revision amd64/kernel qualification and live readback.
 
+**Maintenance wire correction:** the initial gate used an error label outside the published
+contract and omitted the request ID. A real Worker/published-client regression reproduced
+`invalid_response`. The candidate now returns the normal error envelope with additive
+`service_unavailable` (503), request/diagnostic identifiers and `Retry-After: 60`; both OpenAPI
+surfaces describe the pre-handler refusal. No control operation is admitted by that response.
+
+**Conditional power intent:** suspend/resume now accept an optional positive safe-integer
+`expected_generation`; omitted bodies retain existing behavior. Stale requests return
+`409 conflict` / `generation_changed` at the transition or same-state acceptance boundary.
+Ready-resume noops commit their operation and idempotency receipt atomically, and exact original
+key/body replay returns the accepted operation after later generation changes. Six focused
+Workerd/D1 regressions failed first, including operator interleavings and a lost noop answer;
+all nine power-contract checks, the seven existing lifecycle tests, fifteen served-OpenAPI
+checks and 39 focused shared-contract/client tests passed after correction. API/contracts
+typechecks and independent source review passed. These are local candidate checks only;
+no deployment, live power mutation or customer migration is claimed.
+
+**Combined local qualification:** the final power/maintenance source passed all 1,215 API tests
+in 117 files, all 327 shared-contract tests, all 118 CI/operator tests, workspace typechecks,
+lint, formatting, privacy and the five selected diagram freshness checks. The cold-import gate
+explicitly allows the maintenance helper and verifies that it has no runtime dependencies.
+Exact-revision full CI, signing, native/OS rollout and bounded live acceptance remain required.
+
 # Production readiness update — 2026-10-24
 
 **Current objective:** finish EU1 and US1 for production on the same accepted release and OS state, with the existing functional, durability and operating acceptance, and owner-accepted cold latency as recorded below. This delivery ends at verified PGCF production readiness and a complete generic integration handover. Integrator implementation, customer migration and the integrator control database belong to the next task. **The owner explicitly removed the 72-hour canary requirement on 2026-10-24.** Operational closeout is complete; merging this accepted record closes G11 with the latency exception below.

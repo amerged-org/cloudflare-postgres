@@ -491,6 +491,21 @@ export const DatabaseResize = z
   .meta({ id: "DatabaseResize" });
 export type DatabaseResize = z.infer<typeof DatabaseResize>;
 
+export const DatabasePowerChange = z
+  .strictObject({
+    expected_generation: z
+      .number()
+      .int()
+      .positive()
+      .max(Number.MAX_SAFE_INTEGER)
+      .describe(
+        "Apply the power change only when the database's current generation matches this value.",
+      )
+      .optional(),
+  })
+  .meta({ id: "DatabasePowerChange" });
+export type DatabasePowerChange = z.infer<typeof DatabasePowerChange>;
+
 export const DatabaseIdleTime = z
   .strictObject({ sleep_after_seconds: DatabaseSleepAfter })
   .meta({ id: "DatabaseIdleTime" });

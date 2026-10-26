@@ -55,7 +55,8 @@ native-release workflow. Stage the management Worker version without routing tra
 then update both existing nodes to the same qualified native release through normal release/OS
 convergence; no reinstall is required. Read back the actual release, process and OS identities.
 For the D1/API switch, activate that same qualified API source first with the operator binding
-`CONTROL_PLANE_MAINTENANCE="on"`. It serves pre-authentication/pre-D1 HTTP 503 with `Retry-After`,
+`CONTROL_PLANE_MAINTENANCE="on"`. It serves pre-authentication/pre-D1 HTTP 503 `service_unavailable`
+in the normal versioned error envelope with a request ID and `Retry-After`,
 the maintenance header and actual Worker version; refuses new admission and mutation RPCs;
 and defers independent watchdog, warmer and node-sample alarms without reading or writing D1.
 Those alarms keep their next wake and local state. `control_maintenance_hold` records the source
@@ -808,12 +809,25 @@ archive does not drain, the operation fails with `power_busy` or `power_archive`
 keeps running: drain your pools first. Suspending a database that is already manually suspended returns
 its existing operation.
 
+**Conditional power intent (1.5.0 candidate).** Both endpoints accept an optional JSON body
+`{"expected_generation": 12}`. The value must be a positive safe integer. Omit the body (or send
+`{}`) for the existing unconditional behavior; an empty body remains valid with or without a JSON
+Content-Type. The generation is checked at acceptance, including existing-state and ready-resume
+shortcuts. A mismatch returns HTTP `409`, `error.code: "conflict"` and
+`error.details.reason: "generation_changed"` before changing power or adopting another operation.
+Read the new state and decide whether a new intent is still authorized; do not automatically
+replace the expected generation. After an unknown outcome, resend the **same original body and
+Idempotency-Key**. An accepted request replays its original operation even if the database has
+since advanced; the database object alongside it describes the current state. The published
+client accepts the body as the optional third argument to `suspendDatabase(id, key, body)` and
+`resumeDatabase(id, key, body)`.
+
 `resume` also works as a **pre-wake** of an idle-hibernated database: it is the supported way to
 wake before traffic (poll the operation, then run `SELECT 1`). When the node cannot take the
 start (no report within 180 s, no room in its thin pool, or less memory available than the
 database's memory plus the node's 600 MiB floor), `resume` answers `409 conflict` with reason `node_capacity` and `Retry-After: 30`: retry later or
-free capacity. A `409` with reason `generation_changed` is a change that raced the request and is
-retried at once. Measured: a resume pre-woke a manually suspended database in 0.8 s (2026-10-23, "Live acceptance
+free capacity. A `409` with reason `generation_changed` means the generation precondition failed
+or a change raced the request; reconcile the current intent before retrying. Measured: a resume pre-woke a manually suspended database in 0.8 s (2026-10-23, "Live acceptance
 on the slot-pool release, part 1", Stage 5.2). Over 1,001 resumes and 1,004 suspends through the
 API (5 databases, 200 cycles each, 2026-10-20) the average resume took 1.2 s and the average
 suspend 3.5 s ("Stage 5.6 1,000 resume/suspend cycles through the API").

@@ -4,6 +4,7 @@ import {
   ConnectionUri,
   Database,
   DatabaseCreate,
+  DatabasePowerChange,
   DatabaseResize,
   DatabaseRestore,
   DatabaseRestoreInPlace,
@@ -273,26 +274,28 @@ export class PgcfClient {
   suspendDatabase(
     id: string,
     idempotencyKey: string,
+    body?: DatabasePowerChange,
   ): Promise<DatabaseWithOperation> {
     return this.#request(
       `/v1/databases/${input(DatabaseId, id)}/suspend`,
       "POST",
       202,
       DatabaseWithOperation,
-      undefined,
+      body === undefined ? undefined : input(DatabasePowerChange, body),
       input(IdempotencyKey, idempotencyKey),
     );
   }
   resumeDatabase(
     id: string,
     idempotencyKey: string,
+    body?: DatabasePowerChange,
   ): Promise<DatabaseWithOperation> {
     return this.#request(
       `/v1/databases/${input(DatabaseId, id)}/resume`,
       "POST",
       202,
       DatabaseWithOperation,
-      undefined,
+      body === undefined ? undefined : input(DatabasePowerChange, body),
       input(IdempotencyKey, idempotencyKey),
     );
   }

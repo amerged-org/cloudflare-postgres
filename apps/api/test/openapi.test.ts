@@ -26,7 +26,11 @@ type Operation = {
   }[];
   responses: Record<
     string,
-    { headers?: Record<string, unknown>; content?: unknown }
+    {
+      description?: string;
+      headers?: Record<string, unknown>;
+      content?: unknown;
+    }
   >;
 };
 type Document = {
@@ -158,7 +162,8 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(listed.responses["400"]!.headers).toHaveProperty(
       "X-PGCF-Diagnostic-Id",
     );
-    expect(listed.responses).not.toHaveProperty("503");
+    expect(listed.responses).toHaveProperty("503");
+    expect(listed.responses["503"]!.description).toContain("Control plane");
     expect(listed.responses).not.toHaveProperty("409");
     expect(
       operation(publicDoc, "/v1/operational-health", "get").responses,
@@ -356,6 +361,7 @@ describe("actual generated API references in the Workers runtime", () => {
       "401",
       "403",
       "500",
+      "503",
     ]);
     expect(audit.description).toContain("admin_read");
     // A read-only key reads what administrators read and is refused every change.
@@ -418,6 +424,7 @@ describe("actual generated API references in the Workers runtime", () => {
       "404",
       "409",
       "500",
+      "503",
     ]);
     expect(remove.responses["202"]!.headers).toHaveProperty("Location");
     for (const text of ["NOLOGIN", "role_not_droppable", "hibernated"])

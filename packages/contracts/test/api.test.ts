@@ -7,6 +7,7 @@ import {
   DatabaseCreate,
   DatabaseIdleTime,
   DatabasePatch,
+  DatabasePowerChange,
   DatabaseResize,
   OperationKind,
   ERROR_CODES,
@@ -344,6 +345,7 @@ describe("errors", () => {
       expect(errorStatus(code)).toBeGreaterThanOrEqual(400);
     }
     expect(errorStatus("capacity_exhausted")).toBe(503);
+    expect(errorStatus("service_unavailable")).toBe(503);
     expect(errorStatus("idempotency_conflict")).toBe(409);
     expect(
       errorBody("conflict", "x", "r", { field: "name" }).error.details,
@@ -393,6 +395,7 @@ describe("errors", () => {
     expect(retryAfterSeconds("conflict")).toBeUndefined();
     // These codes are transient by their meaning alone.
     expect(retryAfterSeconds("capacity_exhausted")).toBeGreaterThan(0);
+    expect(retryAfterSeconds("service_unavailable")).toBe(60);
     expect(retryAfterSeconds("idempotency_in_progress")).toBeGreaterThan(0);
     for (const code of [
       "invalid_request",
@@ -544,6 +547,31 @@ describe("request bodies", () => {
     expect(DatabasePatch.safeParse({ size_class_id: "small" }).success).toBe(
       true,
     );
+  });
+
+  it("accepts an optional positive safe generation for strict power changes", () => {
+    expect(DatabasePowerChange.parse({})).toEqual({});
+    for (const generation of [1, Number.MAX_SAFE_INTEGER])
+      expect(
+        DatabasePowerChange.parse({ expected_generation: generation }),
+      ).toEqual({ expected_generation: generation });
+    for (const generation of [
+      0,
+      -1,
+      1.5,
+      Number.MAX_SAFE_INTEGER + 1,
+      "1",
+      null,
+    ])
+      expect(
+        DatabasePowerChange.safeParse({ expected_generation: generation })
+          .success,
+      ).toBe(false);
+    expect(
+      DatabasePowerChange.safeParse({ expected_generation: 1, force: true })
+        .success,
+    ).toBe(false);
+    expect(DatabasePowerChange.safeParse(null).success).toBe(false);
   });
 
   it("takes a database's own idle time of 60 to 900 s, or null for its class's", () => {

@@ -6,6 +6,8 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { expect, it } from "vitest";
+import { ErrorBody, newApiKey, newDatabaseId } from "@pgcf/contracts";
+import { PgcfClient } from "@pgcf/contracts/client";
 import worker from "../src/index.ts";
 import { DatabaseActor } from "../src/database-actor.ts";
 import { NodeActor } from "../src/node-actor.ts";
@@ -30,6 +32,10 @@ it("refuses HTTP before authentication or D1 and does not start scheduled produc
     expect(response.headers.get("X-PGCF-Control-Maintenance")).toBe("on");
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     if (method === "HEAD") expect(await response.text()).toBe("");
+    else
+      expect(ErrorBody.parse(await response.json()).error.code).toBe(
+        "service_unavailable",
+      );
   }
   const before = await env.DB.prepare("SELECT * FROM cron_heartbeat").all();
   worker.scheduled({} as ScheduledController, paused(), context);
@@ -43,6 +49,25 @@ it("refuses HTTP before authentication or D1 and does not start scheduled produc
     context,
   );
   expect(resumed.status).toBe(200);
+});
+
+it("gives the published client a retryable service error rather than an invalid response", async () => {
+  const context = createExecutionContext();
+  const client = new PgcfClient({
+    baseUrl: "https://control.invalid",
+    apiKey: newApiKey().key,
+    fetch: (input, init) =>
+      worker.fetch(
+        new Request(input, init) as Parameters<typeof worker.fetch>[0],
+        paused(),
+        context,
+      ),
+  });
+  await expect(client.getDatabase(newDatabaseId())).rejects.toMatchObject({
+    code: "service_unavailable",
+    status: 503,
+    requestId: expect.any(String),
+  });
 });
 
 it("refuses new Workflow invocations before loading their D1 implementations", async () => {
