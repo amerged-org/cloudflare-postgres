@@ -17,6 +17,7 @@ import worker from "../../src/index.ts";
 import {
   runUsageCron,
   USAGE_CRON_PAGE_LIMIT,
+  USAGE_CRON_SCAN_LIMIT,
   USAGE_CRON_STATEMENT_LIMIT,
   USAGE_PRUNE_BATCH,
   USAGE_SAMPLE_RETENTION_MS,
@@ -948,5 +949,153 @@ describe("raw usage sample retention", () => {
     const remaining = await perHour(id);
     expect(remaining[0]).toBeUndefined();
     expect(remaining[1]).toBeUndefined();
+  });
+});
+
+describe("usage cron with a large closed history", () => {
+  const closed = 1517,
+    active = 10,
+    now = start + 40 * USAGE_HOUR_MS,
+    deletedAt = start + 600_000;
+  /** Sorted ids: the closed history first, so the cursor reaches the active databases last. */
+  async function history() {
+    const f = await cohort(closed + active),
+      last = f.ids[closed - 1]!;
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE databases SET desired_state='deleted',deleted_at=?,observed_state='deleted' WHERE id BETWEEN ? AND ?",
+      ).bind(iso(deletedAt), f.ids[0]!, last),
+      // The cron finalized every closed history long ago: its pointer is past the deletion hour.
+      env.DB.prepare(
+        "INSERT INTO usage_rollup_progress(database_id,next_hour) SELECT id,? FROM databases WHERE id BETWEEN ? AND ?",
+      ).bind(iso(start + USAGE_HOUR_MS), f.ids[0]!, last),
+      ...f.ids
+        .slice(closed)
+        .flatMap((id) => [f.event(id, "created"), f.event(id, "ready")]),
+    ]);
+    return f;
+  }
+  const hourlyCount = async (id: string) =>
+    (await env.DB.prepare(
+      "SELECT count(*) n FROM usage_hourly WHERE database_id=?",
+    )
+      .bind(id)
+      .first<{ n: number }>())!.n;
+  const sampleCount = async (id: string) =>
+    (await env.DB.prepare(
+      "SELECT count(*) n FROM usage_samples WHERE database_id=?",
+    )
+      .bind(id)
+      .first<{ n: number }>())!.n;
+  async function cycle(limit = 6) {
+    const results = [];
+    for (let visit = 0; visit < limit; visit++) {
+      const result = await runUsageCron(env.DB, now);
+      results.push(result);
+      expect(result.statements).toBeLessThanOrEqual(USAGE_CRON_STATEMENT_LIMIT);
+      if (result.next === null) break;
+    }
+    return results;
+  }
+
+  it("reaches fresh active databases behind more than 1500 closed ones within the scan windows that cover them", async () => {
+    expect(closed).toBeGreaterThan(USAGE_CRON_SCAN_LIMIT);
+    const f = await history(),
+      fresh = f.ids.slice(closed);
+    const first = await runUsageCron(env.DB, now);
+    const second = await runUsageCron(env.DB, now);
+    for (const id of fresh)
+      expect(await progress(id)).toBe(iso(start + 2 * USAGE_HOUR_MS));
+    expect(first.failed + second.failed).toBe(0);
+    expect(first.statements).toBeLessThanOrEqual(USAGE_CRON_STATEMENT_LIMIT);
+    expect(second.statements).toBeLessThanOrEqual(USAGE_CRON_STATEMENT_LIMIT);
+    expect(second.databases).toBe(active);
+    // The closed history keeps its immutable state: neither rows nor pointers moved.
+    for (const id of [f.ids[0]!, f.ids[closed - 1]!]) {
+      expect(await hourlyCount(id)).toBe(0);
+      expect(await progress(id)).toBe(iso(start + USAGE_HOUR_MS));
+    }
+    expect(second.next).toBeNull();
+    console.log(
+      JSON.stringify({
+        event: "usage_cron_closed_history",
+        closed,
+        active,
+        first: { databases: first.databases, statements: first.statements },
+        second: { databases: second.databases, statements: second.statements },
+      }),
+    );
+  });
+
+  it("still visits a closed-looking database while any usage obligation remains", async () => {
+    const f = await history(),
+      [unrolled, leftover, behind, corrupt, window] = [
+        100, 600, 1200, 1300, 1400,
+      ].map((index) => f.ids[index]!);
+    const lifecycle = (id: string) => [
+      f.event(id, "created"),
+      f.event(id, "ready"),
+      f.event(id, "deleted", deletedAt - start),
+    ];
+    await env.DB.batch([
+      // Deleted, but no pointer: its deletion hour was never rolled up.
+      env.DB.prepare(
+        "DELETE FROM usage_rollup_progress WHERE database_id=?",
+      ).bind(unrolled!),
+      ...lifecycle(unrolled!),
+      // Deleted and rolled up, but a raw sample outside the retention day is still stored.
+      env.DB.prepare(
+        `INSERT INTO usage_samples(database_id,source,producer_id,sequence,interval_start,interval_end,observed_at,payload)
+        VALUES(?,'backup','r2_a',1,?,?,?,?)`,
+      ).bind(
+        leftover!,
+        iso(start),
+        iso(start),
+        iso(start),
+        JSON.stringify({
+          source: "backup",
+          database_id: leftover,
+          producer_id: "r2_a",
+          sequence: 1,
+          observed_at: iso(start),
+          backup_bytes: 1,
+        }),
+      ),
+      // Deleted with its pointer still before the deletion hour.
+      env.DB.prepare(
+        "UPDATE usage_rollup_progress SET next_hour=? WHERE database_id=?",
+      ).bind(iso(start), behind!),
+      ...lifecycle(behind!),
+      // A pointer outside the window is corruption and stays a visible failure.
+      env.DB.prepare(
+        "UPDATE usage_rollup_progress SET next_hour=? WHERE database_id=?",
+      ).bind(iso(now + 5 * USAGE_HOUR_MS), corrupt!),
+      // Deleted in the current hour: the measurement window of its last hour is still open.
+      env.DB.prepare("UPDATE databases SET deleted_at=? WHERE id=?").bind(
+        iso(now + 600_000),
+        window!,
+      ),
+      env.DB.prepare(
+        "DELETE FROM usage_rollup_progress WHERE database_id=?",
+      ).bind(window!),
+    ]);
+    const results = await cycle();
+    expect(results.at(-1)!.next).toBeNull();
+    expect(
+      results.reduce((sum, result) => sum + result.failed, 0),
+    ).toBeGreaterThanOrEqual(1);
+    for (const id of [unrolled!, behind!]) {
+      const saved = await rows(id);
+      expect(saved).toHaveLength(1);
+      expect(saved[0]!.final).toBe(1);
+      expect(await progress(id)).toBe(iso(start + USAGE_HOUR_MS));
+    }
+    expect(await sampleCount(leftover!)).toBe(0);
+    expect(await progress(corrupt!)).toBe(iso(now + 5 * USAGE_HOUR_MS));
+    expect(await hourlyCount(corrupt!)).toBe(0);
+    expect(await progress(window!)).toBeDefined();
+    // Every other closed database was left alone.
+    expect(await hourlyCount(f.ids[0]!)).toBe(0);
+    expect(await hourlyCount(f.ids[closed - 1]!)).toBe(0);
   });
 });

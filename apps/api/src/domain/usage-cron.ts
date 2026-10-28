@@ -8,6 +8,8 @@ import type { ArchiveEnvironment } from "./archive-bucket.ts";
 export const USAGE_CRON_PAGE_LIMIT = 24;
 export const USAGE_CRON_STATEMENT_LIMIT = 600;
 export const USAGE_CRON_CATCHUP_HOURS = 2;
+/** Databases one visit looks at after its cursor; closed history inside it costs no page slot. */
+export const USAGE_CRON_SCAN_LIMIT = 1000;
 /** Raw samples of a finalized hour stay one UTC day behind its immutable rollup. */
 export const USAGE_SAMPLE_RETENTION_MS = 24 * USAGE_HOUR_MS;
 /** Rows removed per database visit, so the backlog drains without holding D1 for long. */
@@ -178,14 +180,48 @@ export async function runUsageCron(
   if (!state) throw new Error("usage_cron_cursor_missing");
   if (state.cursor !== null) DatabaseId.parse(state.cursor);
   let cursor = state.cursor;
-  const page = await db
-    .prepare(
-      `SELECT d.id,d.created_at,
+  // A closed database owes nothing: it is deleted, its deletion hour lies before the current hour,
+  // every hour through the deletion hour is final (its pointer is past it), no raw sample is left
+  // to prune and its backup measurement window has ended. Visiting it again changes nothing, so
+  // it must not take a page slot from the databases that still owe usage. Any doubt (no pointer,
+  // a pointer outside the window, a malformed time, a stored sample) leaves the row in the page,
+  // where the visit finalizes, prunes or fails visibly as before. The statement looks at no more
+  // than USAGE_CRON_SCAN_LIMIT rows after the cursor; the cursor then moves past the whole window.
+  const window = "SELECT id FROM databases WHERE id>? ORDER BY id LIMIT ?";
+  const [pageResult, windowResult] = (await db.batch([
+    db
+      .prepare(
+        `SELECT s.id,s.created_at,s.terminal_at FROM (
+    SELECT d.id,d.created_at,d.observed_state,
     CASE WHEN d.observed_state='deleted' THEN COALESCE((SELECT MAX(occurred_at) FROM lifecycle_events WHERE database_id=d.id AND kind='deleted'),d.deleted_at) ELSE NULL END terminal_at
-    FROM databases d WHERE d.id>? ORDER BY d.id LIMIT ?`,
-    )
-    .bind(cursor ?? "", USAGE_CRON_PAGE_LIMIT + 1)
-    .all<DatabasePageRow>();
+    FROM databases d WHERE d.id IN (${window})) s
+    WHERE NOT COALESCE(s.observed_state='deleted'
+      AND strftime('%Y-%m-%dT%H:%M:%fZ',s.terminal_at)=s.terminal_at
+      AND strftime('%Y-%m-%dT%H:%M:%fZ',s.created_at)=s.created_at
+      AND substr(s.terminal_at,1,13)>=substr(s.created_at,1,13)
+      AND substr(s.terminal_at,1,13)<substr(?,1,13)
+      AND EXISTS(SELECT 1 FROM usage_rollup_progress p WHERE p.database_id=s.id
+        AND strftime('%Y-%m-%dT%H:%M:%fZ',p.next_hour)=p.next_hour
+        AND p.next_hour>substr(s.terminal_at,1,13)||':00:00.000Z' AND p.next_hour<=?)
+      AND NOT EXISTS(SELECT 1 FROM usage_samples u WHERE u.database_id=s.id),0)
+    ORDER BY s.id LIMIT ?`,
+      )
+      .bind(
+        cursor ?? "",
+        USAGE_CRON_SCAN_LIMIT,
+        iso(current),
+        iso(current + USAGE_HOUR_MS),
+        USAGE_CRON_PAGE_LIMIT + 1,
+      ),
+    db
+      .prepare(`SELECT count(*) n,max(id) last FROM (${window})`)
+      .bind(cursor ?? "", USAGE_CRON_SCAN_LIMIT),
+  ])) as [
+    D1Result<DatabasePageRow>,
+    D1Result<{ n: number; last: string | null }>,
+  ];
+  const page = pageResult;
+  const scanned = windowResult.results[0]!;
   const rows = page.results.slice(0, USAGE_CRON_PAGE_LIMIT);
   for (const row of rows) {
     if (budget.remaining() < 2) {
@@ -306,15 +342,18 @@ export async function runUsageCron(
     rows.length === result.databases &&
     page.results.length <= USAGE_CRON_PAGE_LIMIT
   ) {
+    // Everything the window offered was visited or is closed: move past the window, or wrap when
+    // the window reached the end of the databases.
+    const wrapped = scanned.n < USAGE_CRON_SCAN_LIMIT;
     if (budget.remaining() < 1) result.exhausted = true;
     else {
       const updated = await db
         .prepare(
-          "UPDATE usage_cron_cursor SET cursor=NULL WHERE singleton=1 AND cursor IS ?",
+          "UPDATE usage_cron_cursor SET cursor=? WHERE singleton=1 AND cursor IS ?",
         )
-        .bind(cursor)
+        .bind(wrapped ? null : scanned.last, cursor)
         .run();
-      if (updated.meta.changes === 1) cursor = null;
+      if (updated.meta.changes === 1) cursor = wrapped ? null : scanned.last;
       else result.overlap = true;
     }
   }
