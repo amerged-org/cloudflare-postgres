@@ -79,16 +79,27 @@ export const ACTOR_RECONCILE_BUDGET_MS = 20_000;
 /**
  * One bounded keyset page; the cron and trusted callers decide when to read the next. The
  * publishes of the page overlap (`ACTOR_RECONCILE_CONCURRENCY`) and start only until the budget is
- * spent: `ids` are the databases published, the head of the page, and `next` the cursor after them
- * (the page's last, or `null` after the last page of the table). A failure of any publish stops
- * the starts and is the page's; the cursor then stays where it was.
+ * spent: `ids` are the databases whose publish was attempted, the head of the page, and `next` the
+ * cursor after them (the page's last, or `null` after the last page of the table). A publish that
+ * fails is named in `failed` and does not stop the others: one Actor that cannot publish must not
+ * hold the cursor and with it the reconciliation of every database behind it. The cursor moves on
+ * and the failed one is tried again when the cursor comes round.
  */
+export interface ActorPublishFailure {
+  readonly database_id: string;
+  readonly message: string;
+}
+
 export async function reconcileDatabaseActors(
   env: Env,
   after?: string,
   limit = 200,
   budgetMs = ACTOR_RECONCILE_BUDGET_MS,
-): Promise<{ ids: string[]; next: string | null }> {
+): Promise<{
+  ids: string[];
+  next: string | null;
+  failed: ActorPublishFailure[];
+}> {
   if (after !== undefined) DatabaseId.parse(after);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200)
     throw new Error("invalid_actor_page_limit");
@@ -96,23 +107,31 @@ export async function reconcileDatabaseActors(
   // Not a static import: a ticket claim loads this module (`actor-admission-imports.test.ts` pins
   // how little else it loads), and only the cron reads a page.
   const { eachBounded } = await import("./bounded.ts");
+  const { cronErrorMessage } = await import("./cron-health.ts");
   const page = await env.DB.prepare(
     `SELECT id FROM databases ${after ? "WHERE id>?" : ""} ORDER BY id LIMIT ?`,
   )
     .bind(...(after ? [after, limit] : [limit]))
     .all<{ id: string }>();
   const found = page.results.map((row) => row.id);
+  const failed: ActorPublishFailure[] = [];
   const started = await eachBounded(
     found,
     ACTOR_RECONCILE_CONCURRENCY,
     until,
     async (id) => {
-      await sync(env, DatabaseId.parse(id));
+      try {
+        await sync(env, DatabaseId.parse(id));
+      } catch (error) {
+        failed.push({ database_id: id, message: cronErrorMessage(error) });
+      }
     },
   );
   const ids = found.slice(0, started);
+  failed.sort((a, b) => (a.database_id < b.database_id ? -1 : 1));
   return {
     ids,
+    failed,
     next:
       started < found.length
         ? (ids.at(-1) ?? after ?? null)

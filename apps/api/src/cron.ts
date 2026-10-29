@@ -342,6 +342,13 @@ export async function runCron(
     )
       .bind(actorPage.next, cursor.cursor)
       .run();
+    // The cursor has moved on; the step still fails, so the heartbeat and the alerts see it, and
+    // each Actor that did not publish is named in the log.
+    for (const failure of actorPage.failed)
+      console.error(
+        JSON.stringify({ event: "actor_publish_failed", ...failure }),
+      );
+    if (actorPage.failed.length > 0) throw new Error("actor_publish_failed");
   });
   // Keeps the DatabaseActors warm; its own failure boundary, since a Worker without the binding
   // must still reconcile and meter.
