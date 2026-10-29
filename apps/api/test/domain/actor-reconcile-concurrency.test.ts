@@ -191,11 +191,30 @@ describe("the actors of a page", () => {
     expect(actors.seen.published).toHaveLength(60);
   }, 60_000);
 
+  it("name a publish that fails, and neither stop the others nor hold the cursor", async () => {
+    const ids = await databases(6);
+    const publish = admission.publishDatabaseAdmission;
+    const spy = vi
+      .spyOn(admission, "publishDatabaseAdmission")
+      .mockImplementation(async (...args) => {
+        if (args[1] === ids[2])
+          throw new Error("internal error; reference = abc123");
+        return publish(...args);
+      });
+    const page = await reconcileDatabaseActors(env, undefined, 6, Infinity);
+    expect(spy).toHaveBeenCalledTimes(6);
+    expect(page.ids).toEqual(ids);
+    expect(page.next).toBe(ids[5]);
+    expect(page.failed).toEqual([
+      { database_id: ids[2], message: "internal error; reference = abc123" },
+    ]);
+  });
+
   it("keep the cursor where it was when the budget is spent before the first publish", async () => {
     const ids = await databases(3);
     const actors = slowActors();
     const page = await reconcileDatabaseActors(context(actors), ids[0], 3, 0);
-    expect(page).toEqual({ ids: [], next: ids[0] });
+    expect(page).toEqual({ ids: [], next: ids[0], failed: [] });
     expect(actors.seen.published).toEqual([]);
   });
 });
