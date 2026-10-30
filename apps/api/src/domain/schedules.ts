@@ -7,6 +7,7 @@ import {
   type ScheduleRunAccepted,
   type ScheduleUpsert,
 } from "@pgcf/contracts/schedules";
+import { isAdminScope } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
 import type {
@@ -15,6 +16,7 @@ import type {
   StoredSchedule,
 } from "../trigger-actor.ts";
 import { parseCron } from "./cron-expression.ts";
+import { getAuth } from "../middleware/auth.ts";
 import { databaseForRequest } from "./rows.ts";
 
 const iso = (ms: number | null): string | null =>
@@ -65,15 +67,27 @@ async function assertLiveRole(
   if (!found) throw new ApiError("invalid_request", "The role does not exist");
 }
 
+/**
+ * A schedule runs statements as a customer's role. That is the integrator's own right; an
+ * administrator key never receives a role's password, and a schedule must not be a way around it.
+ */
+async function requireIntegrator(c: ApiContext): Promise<void> {
+  const auth = await getAuth(c);
+  if (isAdminScope(auth.scope))
+    throw new ApiError(
+      "forbidden",
+      "Only a project key can create or run schedules",
+    );
+}
+
 export async function putSchedule(
   c: ApiContext,
   databaseId: string,
   name: string,
   body: ScheduleUpsert,
 ): Promise<Response> {
+  await requireIntegrator(c);
   const database = await databaseForRequest(c, databaseId);
-  if (database.deleted_at !== null)
-    throw new ApiError("conflict", "The database is deleted");
   if (body.cron !== undefined) {
     const parsed = parseCron(body.cron);
     if (!parsed.ok)
@@ -155,10 +169,11 @@ export async function runScheduleNow(
   databaseId: string,
   name: string,
 ): Promise<Response> {
-  const database = await databaseForRequest(c, databaseId);
-  if (database.deleted_at !== null)
-    throw new ApiError("conflict", "The database is deleted");
+  await requireIntegrator(c);
+  await databaseForRequest(c, databaseId);
   const outcome = await actor(c, databaseId).runNow(name);
+  if (outcome === "disabled")
+    throw new ApiError("conflict", "The schedule is disabled");
   if (outcome === "not_found")
     throw new ApiError("not_found", "Schedule not found");
   if (outcome === "busy")

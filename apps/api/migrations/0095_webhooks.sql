@@ -26,6 +26,9 @@ CREATE TABLE webhook_subscriptions (
 CREATE INDEX webhook_subscriptions_project
   ON webhook_subscriptions(project_id, created_at DESC, id DESC) WHERE deleted_at IS NULL;
 
+-- The event producer reads finished operations in the order they finished.
+CREATE INDEX operations_completed ON operations(completed_at, id) WHERE completed_at IS NOT NULL;
+
 -- Where the event producer stopped reading the lifecycle log and the finished operations. A new
 -- installation of this migration starts at the present: history is not announced.
 CREATE TABLE webhook_cursors (

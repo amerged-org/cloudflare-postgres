@@ -9,6 +9,7 @@ const LIFECYCLE_BATCH = 200;
 const OPERATION_BATCH = 200;
 const MAX_BATCHES_PER_RUN = 10;
 const INGEST_CONCURRENCY = 10;
+const OPERATION_LAG_MS = 30_000;
 
 const LIFECYCLE_TYPES: Readonly<Record<string, WebhookEventType>> = {
   created: "database.created",
@@ -167,14 +168,16 @@ async function operationCandidates(
      FROM operations
      WHERE completed_at IS NOT NULL AND status IN('succeeded','failed') AND database_id IS NOT NULL
        AND kind NOT IN(SELECT value FROM json_each(?))
-       AND (completed_at > ? OR (completed_at = ? AND id > ?))
+       AND (completed_at, id) > (?, ?) AND completed_at <= ?
      ORDER BY completed_at, id LIMIT ?`,
   )
     .bind(
       JSON.stringify(INTERNAL_OPERATION_KINDS),
       completedAfter,
-      completedAfter,
       idAfter,
+      // A row is stamped by the Worker that finished it and committed a moment later; reading only
+      // what is older than the lag keeps one that commits late from falling behind the cursor.
+      new Date(Date.now() - OPERATION_LAG_MS).toISOString(),
       OPERATION_BATCH,
     )
     .all<{
@@ -256,7 +259,18 @@ async function handOver(
       }),
     );
     for (const [index, outcome] of outcomes.entries()) {
-      if (outcome.status === "rejected") return reached;
+      if (outcome.status === "rejected") {
+        // The cursor stays before this event, so the next minute reads it again.
+        console.error(
+          JSON.stringify({
+            event: "webhook_event_handover_failed",
+            type: chunk[index]?.type ?? null,
+            error_class:
+              outcome.reason instanceof Error ? outcome.reason.name : "unknown",
+          }),
+        );
+        return reached;
+      }
       const candidate = chunk[index]!;
       reached = candidate.cursor;
       if (outcome.value > 0) {

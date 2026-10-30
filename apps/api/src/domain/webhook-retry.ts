@@ -7,8 +7,6 @@ export const WEBHOOK_MAX_AGE_MS = 86_400_000;
 export const WEBHOOK_RETRY_AFTER_CAP_MS = 3_600_000;
 export const WEBHOOK_ATTEMPT_TIMEOUT_MS = 5_000;
 
-const RETRY_AFTER_FLOOR_MS = 1_000;
-
 export type RetryDecision =
   | { state: "retry"; at: number }
   | { state: "dead_letter"; reason: "expired" | "permanent" };
@@ -45,15 +43,18 @@ export function decideRetry(input: {
     return { state: "dead_letter", reason: "permanent" };
   }
   const requested = input.retryAfterSeconds;
+  const scheduled = scheduledDelayMs(input.attempts);
+  // A receiver may ask for more time, never for less than the schedule gives: Retry-After 0 or 1
+  // would otherwise be one attempt a second for a day.
   const delay =
     typeof requested === "number" &&
     Number.isFinite(requested) &&
     requested >= 0
-      ? Math.min(
-          Math.max(requested * 1000, RETRY_AFTER_FLOOR_MS),
-          WEBHOOK_RETRY_AFTER_CAP_MS,
+      ? Math.max(
+          scheduled,
+          Math.min(requested * 1000, WEBHOOK_RETRY_AFTER_CAP_MS),
         )
-      : scheduledDelayMs(input.attempts);
+      : scheduled;
   const at = input.nowMs + delay;
   if (at - input.createdAtMs > WEBHOOK_MAX_AGE_MS) {
     return { state: "dead_letter", reason: "expired" };

@@ -64,15 +64,21 @@ export async function runScheduleJob(env: Env, job: JobSpec): Promise<JobRun> {
   const host = env.DB_ENDPOINT_HOST;
   if (!env.EDGE || !HOST.test(host) || host.includes(".."))
     return classified("rejected", "edge_unconfigured");
-  const password = await keyring(env.CREDENTIAL_KEYS).decrypt(
-    job.databaseId,
-    job.role,
-    {
-      ciphertext: role.password_ciphertext,
-      iv: role.password_iv,
-      kid: role.password_kid,
-    },
-  );
+  let password: string;
+  try {
+    password = await keyring(env.CREDENTIAL_KEYS).decrypt(
+      job.databaseId,
+      job.role,
+      {
+        ciphertext: role.password_ciphertext,
+        iv: role.password_iv,
+        kid: role.password_kid,
+      },
+    );
+  } catch {
+    // A key that no longer opens the role's password is a fault of the configuration, not a retry.
+    return classified("rejected", "credential_unreadable");
+  }
   const request = buildJobRequest({
     connectionString: `postgres://${encodeURIComponent(job.role)}:${encodeURIComponent(password)}@${host}/${job.databaseId}`,
     statements: job.statements,

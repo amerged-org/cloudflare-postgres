@@ -126,7 +126,7 @@ export function registerSchedules(app: ApiApp): void {
       request: { params },
       responses: {
         204: { description: "Deleted" },
-        ...errors(E400, E401, E403, E404, E409, E500),
+        ...errors(E400, E401, E403, E404, E500),
       },
     },
     async (c) =>

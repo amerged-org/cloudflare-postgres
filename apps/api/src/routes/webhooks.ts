@@ -91,7 +91,7 @@ export function registerWebhooks(app: ApiApp): void {
           description: "Webhooks, newest first",
           content: json(listEnvelope(Webhook)),
         },
-        ...errors(E400, E401, E500),
+        ...errors(E400, E401, E404, E500),
       },
     },
     async (c) => listWebhooks(c, WebhookListQuery.parse(c.req.query())),
@@ -123,7 +123,7 @@ export function registerWebhooks(app: ApiApp): void {
       request: { params: z.object({ id: WebhookId }) },
       responses: {
         204: { description: "Deleted" },
-        ...errors(E400, E401, [403, "Insufficient scope"], E404, E409, E500),
+        ...errors(E400, E401, [403, "Insufficient scope"], E404, E500),
       },
     },
     async (c) => deleteWebhook(c, WebhookId.parse(c.req.param("id"))),

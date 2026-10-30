@@ -412,3 +412,209 @@ it("runs one run at a time and keeps only the last fifty", async () => {
   );
   expect(total).toBe(50);
 });
+
+it("lets an administrator read schedules but neither create nor run them", async () => {
+  const f = await fixture();
+  const { id } = await served(f);
+  await put(f, id, "job", {});
+  expect((await put(f, id, "other", {}, f.admin)).status).toBe(403);
+  expect(
+    (await request(`/v1/databases/${id}/schedules/job/run`, f.admin, "POST"))
+      .status,
+  ).toBe(403);
+  expect(
+    (await request(`/v1/databases/${id}/schedules/job`, f.admin)).status,
+  ).toBe(200);
+  expect((await request(`/v1/databases/${id}/schedules`, f.admin)).status).toBe(
+    200,
+  );
+});
+
+it("refuses a manual run of a disabled schedule instead of queueing one that never starts", async () => {
+  const f = await fixture();
+  const { id } = await served(f);
+  await put(f, id, "job", { enabled: false });
+  expect(
+    await refusal(
+      await request(
+        `/v1/databases/${id}/schedules/job/run`,
+        f.integrator,
+        "POST",
+      ),
+    ),
+  ).toMatchObject({
+    status: 409,
+    code: "conflict",
+  });
+  expect((await stored(id, "job"))!.manual_pending).toBe(0);
+});
+
+it("ends a run whose credential cannot be opened as rejected, once, without spinning", async () => {
+  const f = await fixture();
+  const { id } = await served(f);
+  await withEdge(id, () => new Response(null, { status: 200 }));
+  await put(f, id, "job", {});
+  await env.DB.prepare(
+    "UPDATE roles SET password_ciphertext='AAAA' WHERE database_id=? AND name='app'",
+  )
+    .bind(id)
+    .run();
+  const run = await runByHand(f, id, "job");
+  expect(run).toMatchObject({
+    outcome: "rejected",
+    sqlstate: "credential_unreadable",
+    manual: true,
+  });
+  expect(edge).not.toHaveBeenCalled();
+  const row = (await stored(id, "job"))!;
+  expect(row).toMatchObject({
+    manual_pending: 0,
+    inflight_ms: null,
+    attempts: 1,
+  });
+});
+
+it("records a failure before the request was sent and leaves the regular times alone", async () => {
+  const f = await fixture();
+  const { id } = await served(f);
+  await put(f, id, "job", { every_seconds: 3600 });
+  const down = {
+    prepare: () => {
+      throw new Error("D1 down");
+    },
+    batch: async () => {
+      throw new Error("D1 down");
+    },
+  };
+  await runInDurableObject(actor(id), (instance) => {
+    Reflect.set(instance, "env", {
+      ...env,
+      DB: down,
+      DB_ENDPOINT_HOST: "db.example.com",
+    });
+  });
+  const regular = (await stored(id, "job"))!;
+
+  // A manual run is recorded as failed to start and does not touch the regular occurrence.
+  const manual = await runByHand(f, id, "job");
+  expect(manual).toMatchObject({
+    outcome: "rejected",
+    sqlstate: "unavailable",
+    manual: true,
+  });
+  const after = (await stored(id, "job"))!;
+  expect(after).toMatchObject({
+    fire_ms: regular.fire_ms,
+    occurrence_ms: regular.occurrence_ms,
+    manual_pending: 0,
+  });
+
+  // A regular occurrence is tried again while it has its allowance, and given up when it has none.
+  const due = Date.now() - 1_000;
+  await sql(id, (exec) => {
+    exec(
+      "UPDATE schedules SET occurrence_ms=?1, fire_ms=?1, deadline_ms=?2",
+      due,
+      due + 600_000,
+    );
+  });
+  await runDurableObjectAlarm(actor(id));
+  await vi.waitFor(async () =>
+    expect((await stored(id, "job"))!.inflight_ms).toBeNull(),
+  );
+  const retrying = (await stored(id, "job"))!;
+  expect(retrying.fire_ms!).toBeGreaterThan(Date.now() + 30_000);
+  expect((await runs(f, id, "job")).filter((run) => !run.manual)).toEqual([]);
+  await sql(id, (exec) => {
+    exec("UPDATE schedules SET fire_ms=?1, deadline_ms=?1", Date.now() - 1);
+  });
+  await runDurableObjectAlarm(actor(id));
+  await vi.waitFor(async () =>
+    expect(
+      (await runs(f, id, "job")).filter((run) => !run.manual),
+    ).toHaveLength(1),
+  );
+  expect((await runs(f, id, "job")).find((run) => !run.manual)).toMatchObject({
+    outcome: "skipped_missed",
+    sqlstate: "unavailable",
+  });
+  expect((await stored(id, "job"))!.fire_ms!).toBeGreaterThan(Date.now());
+});
+
+it("moves what is there when a run ends, not the schedule it started from", async () => {
+  const f = await fixture();
+  const { id } = await served(f);
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await withEdge(id, async () => {
+    await held;
+    return new Response(null, { status: 200 });
+  });
+  await put(f, id, "job", { every_seconds: 3600 });
+  expect(
+    (
+      await request(
+        `/v1/databases/${id}/schedules/job/run`,
+        f.integrator,
+        "POST",
+      )
+    ).status,
+  ).toBe(202);
+  const alarm = runDurableObjectAlarm(actor(id));
+  await vi.waitFor(async () =>
+    expect((await stored(id, "job"))!.inflight_ms).not.toBeNull(),
+  );
+
+  // Replaced while the run goes: the end of the run keeps the new times.
+  expect((await put(f, id, "job", { every_seconds: 7200 })).status).toBe(200);
+  const replaced = (await stored(id, "job"))!;
+  release();
+  await alarm;
+  const after = (await stored(id, "job"))!;
+  expect(after).toMatchObject({
+    every_seconds: 7200,
+    inflight_ms: null,
+    occurrence_ms: replaced.occurrence_ms,
+  });
+
+  // Deleted while a run goes: nothing of it comes back.
+  let again: () => void = () => undefined;
+  const heldAgain = new Promise<void>((resolve) => {
+    again = resolve;
+  });
+  await withEdge(id, async () => {
+    await heldAgain;
+    return new Response(null, { status: 200 });
+  });
+  expect(
+    (
+      await request(
+        `/v1/databases/${id}/schedules/job/run`,
+        f.integrator,
+        "POST",
+      )
+    ).status,
+  ).toBe(202);
+  const second = runDurableObjectAlarm(actor(id));
+  await vi.waitFor(async () =>
+    expect((await stored(id, "job"))!.inflight_ms).not.toBeNull(),
+  );
+  expect(
+    (await request(`/v1/databases/${id}/schedules/job`, f.integrator, "DELETE"))
+      .status,
+  ).toBe(204);
+  again();
+  await second;
+  expect(await stored(id, "job")).toBeNull();
+  expect(
+    await runInDurableObject(
+      actor(id),
+      (_i, state) =>
+        state.storage.sql
+          .exec<{ n: number }>("SELECT count(*) AS n FROM runs")
+          .one().n,
+    ),
+  ).toBe(0);
+});

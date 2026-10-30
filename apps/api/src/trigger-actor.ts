@@ -72,6 +72,7 @@ export type StoredRun = {
   manual: number;
 };
 const HOUR_MS = 3_600_000;
+const PRUNE_INTERVAL_MS = 600_000;
 /** A closed hour is written to D1 this long after it ended; a failed write waits a minute. */
 const COUNTER_FLUSH_DELAY_MS = 60_000;
 export const TRIGGER_RUN_HISTORY = 50;
@@ -140,6 +141,7 @@ export class TriggerActor extends DurableObject<Env> {
         );
         CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(next_attempt_ms) WHERE state='pending';
         CREATE INDEX IF NOT EXISTS deliveries_listing ON deliveries(created_ms DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS deliveries_by_event ON deliveries(event_id);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS counters(hour_ms INTEGER NOT NULL, metric TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY(hour_ms, metric));
         CREATE TABLE IF NOT EXISTS schedules(
@@ -233,7 +235,8 @@ export class TriggerActor extends DurableObject<Env> {
         }
       });
     });
-    if (created > 0) await this.arm(now);
+    // Also when nothing is new: a first call may have stored the rows and failed before it armed.
+    await this.arm(now);
     return created;
   }
 
@@ -381,9 +384,10 @@ export class TriggerActor extends DurableObject<Env> {
   }
 
   /** Asks for one run now, besides the regular occurrences; it does not move them. */
-  runNow(name: string): "queued" | "not_found" | "busy" {
+  runNow(name: string): "queued" | "not_found" | "busy" | "disabled" {
     const row = this.getSchedule(name);
     if (!row) return "not_found";
+    if (row.enabled !== 1) return "disabled";
     if (row.manual_pending === 1 || row.inflight_ms !== null) return "busy";
     this.ctx.storage.sql.exec(
       "UPDATE schedules SET manual_pending=1 WHERE name=?",
@@ -423,7 +427,6 @@ export class TriggerActor extends DurableObject<Env> {
             started + ATTEMPT_LEASE_MS,
             row.id,
           );
-        this.count("webhook_attempts", due.length);
       });
       const { attemptDelivery } = await import("./domain/webhook-delivery.ts");
       const { decideRetry } = await import("./domain/webhook-retry.ts");
@@ -447,16 +450,43 @@ export class TriggerActor extends DurableObject<Env> {
                 row.id,
               );
             } catch (error) {
-              // Not the receiver's fault (D1 or the keys): the lease retries it, nothing is lost.
+              // Not the receiver's fault (D1 or the keys): no request was sent and none is counted.
+              // It follows the retry schedule and expires with it, like any other failure.
               console.error(
                 JSON.stringify({
                   event: "webhook_attempt_unavailable",
                   error_class: error instanceof Error ? error.name : "unknown",
                 }),
               );
+              const later = Date.now();
+              const decision = decideRetry({
+                attempts,
+                nowMs: later,
+                createdAtMs: row.window_start_ms,
+                status: null,
+                retryAfterSeconds: null,
+              });
+              if (decision.state === "retry")
+                this.ctx.storage.sql.exec(
+                  "UPDATE deliveries SET next_attempt_ms=? WHERE id=?",
+                  decision.at,
+                  row.id,
+                );
+              else {
+                this.ctx.storage.sql.exec(
+                  "UPDATE deliveries SET state='dead_lettered',dead_ms=?,next_attempt_ms=NULL,last_error=? WHERE id=?",
+                  later,
+                  decision.reason,
+                  row.id,
+                );
+                this.count("webhook_deliveries_dead_lettered");
+              }
               return;
             }
             const now = Date.now();
+            // A request was sent unless the delivery was refused before it (no URL, no subscription).
+            if (result.kind !== "permanent" || result.status !== null)
+              this.count("webhook_attempts");
             if (result.kind === "delivered") {
               this.ctx.storage.sql.exec(
                 "UPDATE deliveries SET state='delivered',delivered_ms=?,next_attempt_ms=NULL,last_status=?,last_error=NULL WHERE id=?",
@@ -500,11 +530,19 @@ export class TriggerActor extends DurableObject<Env> {
         );
       }
     }
-    await this.startSchedules(started);
+    // The runs are awaited here: a promise left running after the handler returns can be cut off
+    // when the object is evicted. A long run delays the deliveries due meanwhile until it ends.
+    const runs = await this.startSchedules(started);
     await this.flushCounters(started);
-    this.prune(started);
+    if (started - this.lastPruneAt >= PRUNE_INTERVAL_MS) {
+      this.lastPruneAt = started;
+      this.prune(started);
+    }
+    await Promise.allSettled(runs);
     await this.arm(Date.now());
   }
+
+  private lastPruneAt = 0;
 
   private prune(now: number): void {
     const sql = this.ctx.storage.sql;
@@ -546,6 +584,14 @@ export class TriggerActor extends DurableObject<Env> {
   }
 
   private flushRetryAt = 0;
+
+  /** Spreads the hourly flushes of many databases over five minutes instead of one D1 burst. */
+  private flushOffset(): number {
+    let hash = 0x811c9dc5;
+    for (const unit of this.meta("database_id") ?? "")
+      hash = Math.imul(hash ^ unit.charCodeAt(0), 0x01000193) >>> 0;
+    return hash % 300_000;
+  }
 
   /**
    * Writes the closed hours to D1 as absolute values and drops them here only after D1 took them. A
@@ -676,16 +722,17 @@ export class TriggerActor extends DurableObject<Env> {
     );
   }
 
-  /** Starts what is due. A run is not awaited: its claim keeps it from starting twice. */
-  private async startSchedules(now: number): Promise<void> {
+  /** Claims what is due and returns the runs; the claim keeps a run from starting twice. */
+  private async startSchedules(now: number): Promise<Promise<void>[]> {
     const sql = this.ctx.storage.sql;
     if (
       sql.exec<{ n: number }>("SELECT count(*) AS n FROM schedules").one().n ===
       0
     )
-      return;
+      return [];
     const t = await this.timing_();
     const { intervalAfter, lateLimitMs } = t;
+    const started: Promise<void>[] = [];
     // A claim that never reported was in flight when this object was lost: send nothing again.
     for (const stale of sql
       .exec<StoredSchedule>(
@@ -743,34 +790,47 @@ export class TriggerActor extends DurableObject<Env> {
         manual ? 1 : 0,
         row.name,
       );
-      this.ctx.waitUntil(
-        this.fire({ ...row, attempts: row.attempts + 1 }, manual),
-      );
+      started.push(this.fire({ ...row, attempts: row.attempts + 1 }, manual));
     }
+    return started;
   }
 
-  private async fire(row: StoredSchedule, manual: boolean): Promise<void> {
+  /**
+   * One run. The row the run started from is a snapshot: a PUT or a DELETE may have come while the
+   * run went, so the end of the run reads the schedule again and moves what is there now.
+   */
+  private async fire(snapshot: StoredSchedule, manual: boolean): Promise<void> {
     const sql = this.ctx.storage.sql;
     const t = await this.timing_();
     const started = Date.now();
-    const scheduled = manual ? started : (row.occurrence_ms ?? started);
+    const scheduled = manual ? started : (snapshot.occurrence_ms ?? started);
+    const finish = (outcome: string, sqlstate: string | null) => {
+      const current = this.getSchedule(snapshot.name);
+      // A schedule that was deleted meanwhile keeps nothing, not even this run.
+      if (!current) return;
+      this.record(
+        { ...current, attempts: snapshot.attempts },
+        scheduled,
+        started,
+        outcome,
+        sqlstate,
+        manual,
+      );
+      if (manual)
+        sql.exec(
+          "UPDATE schedules SET inflight_ms=NULL,inflight_manual=0 WHERE name=?",
+          snapshot.name,
+        );
+      else this.advance(current, Date.now(), t);
+    };
     try {
       const { runScheduleJob } = await import("./domain/schedule-job.ts");
       const run = await runScheduleJob(this.env, {
         databaseId: this.databaseId(),
-        role: row.role,
-        statements: JSON.parse(row.statements) as string[],
-        timeoutMs: row.timeout_ms,
+        role: snapshot.role,
+        statements: JSON.parse(snapshot.statements) as string[],
+        timeoutMs: snapshot.timeout_ms,
       });
-      const finish = (outcome: string, sqlstate: string | null) => {
-        this.record(row, scheduled, started, outcome, sqlstate, manual);
-        if (manual)
-          sql.exec(
-            "UPDATE schedules SET inflight_ms=NULL,inflight_manual=0 WHERE name=?",
-            row.name,
-          );
-        else this.advance(row, Date.now(), t);
-      };
       if (run.kind === "skipped") {
         finish(
           run.reason === "gone" ? "skipped_deleted" : "skipped_suspended",
@@ -780,7 +840,6 @@ export class TriggerActor extends DurableObject<Env> {
         if (run.reason === "gone")
           sql.exec("UPDATE schedules SET enabled=0,fire_ms=NULL WHERE 1=1");
       } else if (run.result.outcome === "capacity_refused") {
-        const { capacityBackoffMs } = t;
         const retryAt =
           Date.now() +
           (run.result.retryAfterSeconds !== null
@@ -788,30 +847,44 @@ export class TriggerActor extends DurableObject<Env> {
                 1_000,
                 Math.min(run.result.retryAfterSeconds * 1000, 300_000),
               )
-            : capacityBackoffMs(row.attempts));
-        if (!manual && row.deadline_ms !== null && retryAt <= row.deadline_ms) {
+            : t.capacityBackoffMs(snapshot.attempts));
+        const current = this.getSchedule(snapshot.name);
+        if (
+          !manual &&
+          current?.deadline_ms != null &&
+          retryAt <= current.deadline_ms
+        ) {
           // Nothing ran: try the same occurrence again, within its allowance.
           sql.exec(
             "UPDATE schedules SET fire_ms=?,inflight_ms=NULL,inflight_manual=0 WHERE name=?",
             retryAt,
-            row.name,
+            snapshot.name,
           );
         } else finish("skipped_capacity", run.result.sqlstate);
       } else finish(run.result.outcome, run.result.sqlstate);
     } catch (error) {
-      // Before the request was sent (D1 or the keys): release the claim and try again soon.
+      // The platform failed before a request was sent (D1 or the keys). A regular occurrence is
+      // tried again while it still has its allowance; after that, and for a manual run, which
+      // nobody waits for the regular times of, the failure is recorded and nothing is repeated.
       console.error(
         JSON.stringify({
           event: "schedule_attempt_unavailable",
           error_class: error instanceof Error ? error.name : "unknown",
         }),
       );
-      sql.exec(
-        "UPDATE schedules SET fire_ms=?,inflight_ms=NULL,inflight_manual=0,manual_pending=? WHERE name=?",
-        Date.now() + 60_000,
-        manual ? 1 : 0,
-        row.name,
-      );
+      const current = this.getSchedule(snapshot.name);
+      const again = Date.now() + 60_000;
+      if (
+        !manual &&
+        current?.deadline_ms != null &&
+        again <= current.deadline_ms
+      )
+        sql.exec(
+          "UPDATE schedules SET fire_ms=?,inflight_ms=NULL,inflight_manual=0 WHERE name=?",
+          again,
+          snapshot.name,
+        );
+      else finish(manual ? "rejected" : "skipped_missed", "unavailable");
     } finally {
       await this.arm(Date.now());
     }
@@ -841,7 +914,7 @@ export class TriggerActor extends DurableObject<Env> {
     if (counters !== null)
       times.push(
         Math.max(
-          counters + HOUR_MS + COUNTER_FLUSH_DELAY_MS,
+          counters + HOUR_MS + COUNTER_FLUSH_DELAY_MS + this.flushOffset(),
           this.flushRetryAt,
         ),
       );

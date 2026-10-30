@@ -148,7 +148,7 @@ Rules, all deliberately small:
 - **Unknown outcome (`08007`):** recorded as `outcome_unknown`, never sent again. The next tick is a
   new run. Jobs should be idempotent, as cron jobs always have to be.
 - **Missed run** (database suspended, node down, actor late): skipped and recorded, never made up.
-- **Overlap:** one fire per schedule at a time. A run still going makes the next `skipped_overlap`.
+- **Overlap:** one fire per schedule at a time. A run still going when the next is due leaves that occurrence recorded as `skipped_missed`.
 - **Activity:** a run is an ordinary request, so the idle clock restarts after it.
 - A manual `POST .../run` exists for tests and operations.
 
@@ -173,9 +173,10 @@ the strictly parsed `GET /v1/usage` does not change; rows are final two hours af
 
 | Metric | Counted when |
 | --- | --- |
-| `schedule_runs` with `succeeded`, `failed`, `timed_out`, `outcome_unknown`, `skipped` | The run reaches its terminal state, once per `{schedule, scheduled_time}` |
-| `events_emitted`, `event_bytes` | The actor stores the drained batch |
-| `webhook_deliveries` with `delivered`, `failed`, `dead_lettered`, plus `webhook_attempts` | The delivery reaches its terminal state; attempts are counted separately |
+| `schedule_runs_succeeded`, `_failed`, `_timed_out`, `_outcome_unknown`, `_rejected`, `_skipped` | The run is recorded with that outcome (the four `skipped_*` outcomes are summed) |
+| `events_emitted`, `event_bytes` | The actor stores a new event |
+| `webhook_attempts` | A request is sent to a receiver; a delivery that could not be prepared sends and counts none |
+| `webhook_deliveries_delivered`, `webhook_deliveries_dead_lettered` | The delivery reaches that terminal state; a replay counts again |
 
 The integrator decides what costs credits. A scheduled wake also appears in `awake_seconds`, as every
 wake does. A reference cost per million executions is measured in section 9, so integrators can set a
@@ -250,11 +251,11 @@ because there is no central tick.
 
 ## 6. API sketch (generic, versioned like the rest of `/v1`)
 
-- `POST/GET /v1/webhooks`, `GET/PATCH/DELETE /v1/webhooks/{id}`, `POST /v1/webhooks/{id}/test`,
-  `GET /v1/webhooks/{id}/deliveries`, `POST /v1/webhook-deliveries/{id}/replay`.
+- `POST/GET /v1/webhooks`, `GET/DELETE /v1/webhooks/{id}`, `POST /v1/webhooks/{id}/test`,
+  `GET /v1/databases/{id}/webhook-deliveries`, `POST /v1/databases/{id}/webhook-deliveries/{delivery_id}/replay`.
 - `PUT/GET/DELETE /v1/databases/{id}/schedules/{name}`, `GET .../schedules`,
   `GET .../schedules/{name}/runs`, `POST .../schedules/{name}/run`.
-- `GET /v1/usage` gains the metrics of 4.8. Writes take an `Idempotency-Key` as everywhere.
+- `GET /v1/execution-usage` carries the counts of 4.8 (a separate endpoint). `POST /v1/webhooks` takes an optional `Idempotency-Key`.
 - CLI: `pgcf webhook ...`, `pgcf schedule ...`. The OpenAPI document and the handover are updated in
   the same change as each task below.
 - An integrator exposes these calls through its own REST, CLI and MCP tools, scoped to its tenants, and

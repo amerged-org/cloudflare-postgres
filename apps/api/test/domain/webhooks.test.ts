@@ -3,7 +3,7 @@
 // reads the lifecycle log and the finished operations, and the TriggerActor that delivers from its
 // alarm. D1 and the Durable Objects are real; only the receiver is replaced, by a spy on fetch.
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import {
   WebhookCreated,
   WebhookDelivery,
@@ -295,7 +295,14 @@ it("announces finished operations but not the operations PGCF starts for itself"
   const f = await fixture();
   const { id, operation } = await served(f);
   await created(await subscribe(f, { event_types: ["operation.*"] }));
-  const now = new Date().toISOString();
+  // The producer reads operations a little after they finished (a row can commit late), and a new
+  // installation starts its cursor at the present: put it before this operation.
+  await env.DB.prepare(
+    "UPDATE webhook_cursors SET cursor=? WHERE name='operations'",
+  )
+    .bind(`${new Date(Date.now() - 600_000).toISOString()}|`)
+    .run();
+  const now = new Date(Date.now() - 120_000).toISOString();
   await env.DB.prepare(
     "UPDATE operations SET status='succeeded', completed_at=?, updated_at=? WHERE id=?",
   )
@@ -438,4 +445,56 @@ it("does not show another project's deliveries", async () => {
     (await request(`/v1/databases/${id}/webhook-deliveries`, f.otherKey))
       .status,
   ).toBe(404);
+});
+
+it("lets a delivery that cannot be prepared follow the retry schedule, uncounted, until it expires", async () => {
+  const f = await fixture();
+  const { id } = await served(f);
+  const webhook = await created(
+    await subscribe(f, { event_types: ["database.*"] }),
+  );
+  await env.DB.prepare(
+    "UPDATE webhook_subscriptions SET secret_ciphertext='AAAA' WHERE id=?",
+  )
+    .bind(webhook.id)
+    .run();
+  await lifecycle(id, "ready");
+  await runWebhookEvents(env);
+  const began = Date.now();
+  await runDurableObjectAlarm(actor(id));
+  const row = (await deliveries(f, id)).find(
+    (entry) => entry.event_type === "database.ready",
+  )!;
+  expect(row.state).toBe("pending");
+  const wait = Date.parse(row.next_attempt_at!) - began;
+  expect(wait).toBeGreaterThan(55_000);
+  expect(wait).toBeLessThan(65_000);
+  expect(receiver).not.toHaveBeenCalled();
+  const counted = await runInDurableObject(
+    actor(id),
+    (_i, state) =>
+      state.storage.sql
+        .exec<{ value: number }>(
+          "SELECT COALESCE(SUM(value),0) AS value FROM counters WHERE metric='webhook_attempts'",
+        )
+        .one().value,
+  );
+  expect(counted).toBe(0);
+
+  // Out of its 24 hours, it is dead-lettered like any other delivery.
+  await runInDurableObject(actor(id), (_i, state) => {
+    state.storage.sql.exec(
+      "UPDATE deliveries SET window_start_ms = window_start_ms - 90000000, next_attempt_ms = ?",
+      Date.now() - 1,
+    );
+  });
+  await runDurableObjectAlarm(actor(id));
+  expect(
+    (await deliveries(f, id)).find(
+      (entry) => entry.event_type === "database.ready",
+    ),
+  ).toMatchObject({
+    state: "dead_lettered",
+    last_error: "expired",
+  });
 });

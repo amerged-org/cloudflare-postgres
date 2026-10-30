@@ -41,9 +41,11 @@ describe("decideRetry", () => {
     });
   });
 
-  it("clamps Retry-After up to one second and down to one hour", () => {
-    expect(attempt(1, 429, 0)).toEqual({ state: "retry", at: NOW + 1_000 });
-    expect(attempt(1, 429, 5)).toEqual({ state: "retry", at: NOW + 5_000 });
+  it("lets a receiver ask for more time than the schedule gives, never for less", () => {
+    // The first delay of the schedule is a minute: Retry-After 0 or 5 s does not shorten it.
+    expect(attempt(1, 429, 0)).toEqual({ state: "retry", at: NOW + 60_000 });
+    expect(attempt(1, 429, 5)).toEqual({ state: "retry", at: NOW + 60_000 });
+    expect(attempt(1, 429, 600)).toEqual({ state: "retry", at: NOW + 600_000 });
     expect(attempt(1, 503, 99_999)).toEqual({
       state: "retry",
       at: NOW + 3_600_000,

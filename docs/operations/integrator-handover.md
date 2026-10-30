@@ -1092,6 +1092,10 @@ The October 23 restore failures listed in [8](#8-not-available-yet) are historic
 regional provider paths and bounded G9 queue/restart acceptance passed on October 25. A terminal
 failed `/restore` operation remains failed; reconcile its target before requesting another restore.
 
+The lists of the schedules (at most 20, by name) and of a schedule's runs (`limit` 1 to 50, newest first) take
+no `cursor`; the other new lists follow the usual `limit` and `cursor`. These routes are additive: the
+contract version stays 1.5.0.
+
 ### 2.8 Webhooks
 
 A webhook subscribes an HTTPS URL to the events of your project's databases, so that nothing has to
@@ -1102,7 +1106,7 @@ poll. These events exist now:
 | `database.created`, `database.ready` | the database was accepted, and it is ready to connect |
 | `database.woke`, `database.slept` | it started for a connection or `resume`, and it went to sleep when idle |
 | `database.suspended`, `database.resized`, `database.deleted` | a `suspend`, a resize and a delete finished |
-| `operation.succeeded`, `operation.failed` | an operation you started finished (`data.operation_id`, `kind`, `error_code`); the operations PGCF starts itself (`database.hibernate`, `database.wake`) are announced as `database.slept` and `database.woke` instead |
+| `operation.succeeded`, `operation.failed` | an operation you started finished (`data.operation_id`, `kind`, `error_code`); not the role removals (`database.role.delete`), which you read from the operation, and not the operations PGCF starts itself (`database.hibernate`, `database.wake`), which are announced as `database.slept` and `database.woke` instead |
 | `webhook.test` | only from `POST /v1/webhooks/{id}/test` |
 
 ```sh
@@ -1121,9 +1125,15 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
   administrator key names `project_id`. A project holds at most 20 webhooks.
 - **The secret** is shown in the creation answer only (and in an idempotent replay of it). The static
   `headers` are stored sealed and never shown again (only their names). Many automation tools cannot
-  verify a signature but can check a header or keep the URL secret; use `headers` for them.
-- **The URL** must be `https`, on port 443 or 8443, with a DNS name (no IP address, `localhost`,
-  user information or fragment). Redirects are not followed.
+  verify a signature but can check a header; use `headers` for them. The URL itself is stored and shown in
+  clear to every key of the project, so it is not a secret.
+- **The URL** must be `https`, on port 443 or 8443, with a DNS name (no IP address, `localhost`, a single-label
+  name, `.local`, `.internal`, `.lan`, `.corp` and similar suffixes, user information or fragment). Redirects are
+  not followed. A name that resolves to a private address is not detected here; such an address is not reachable
+  from Cloudflare's network. `headers`: at most 8; a name must not be `host`, `content-length`, `content-type`,
+  `connection`, `transfer-encoding`, `user-agent`, `te`, `upgrade` or `expect`, or start with `pgcf-`, `cf-` or
+  `x-forwarded-`; a value is 1 to 512 visible ASCII characters. An event pattern that matches no type is
+  accepted and never fires: check the spelling against the table.
 - **A delivery** is a POST of `{"id","type","occurred_at","project_id","database_id","data"}` with the
   headers `PGCF-Signature: t=<unix seconds>,v1=<hex>`, `PGCF-Event-Id` and `PGCF-Delivery-Id`. The
   signature is the hex HMAC-SHA256, keyed with the secret, of the string `<t>.<raw body>`; reject a
@@ -1138,14 +1148,17 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
   }
   ```
 - **At least once.** Answer 2xx within 5 seconds; deduplicate by the event `id`. A failure is retried after
-  1 min, 5 min, 30 min, 2 h, 6 h and then every 12 h, for 24 hours in all; `Retry-After` (at most one
-  hour) replaces the delay. A 4xx other than 408, 425 and 429, and any redirect, end the retries at once.
+  1 min, 5 min, 30 min, 2 h, 6 h and then every 12 h until 24 hours have passed since the event (seven
+  attempts over about 20.6 hours, then it is dead-lettered); `Retry-After` can lengthen a delay (up to one
+  hour) but never shorten the schedule's own. A 4xx other than 408, 425 and 429, and any redirect, end the retries at once.
   A delivery that is out of retries is dead-lettered: `GET /v1/databases/{id}/webhook-deliveries` shows it
   (delivered ones for 24 hours, dead-lettered ones for seven days), and `POST …/{delivery_id}/replay`
   delivers it again with a fresh window. Deleting a webhook dead-letters its waiting deliveries.
-- **Timing.** Events leave within about a minute of the change: they are read from the lifecycle log by the
-  minute cron, so an event is not a real-time signal for a connection.
-- **History is not announced.** A webhook sees events from its creation on. Events of a restored copy
+- **Timing.** Events leave within about a minute of the change, operation events within about two: they are
+  read from the lifecycle log and the finished operations by the minute cron (the operations a little after
+  they finished), so an event is not a real-time signal for a connection.
+- **History is not announced.** A webhook sees events from about its creation on: an event of the minute
+  before, or of a backlog after a cron outage, may still arrive. Events of a restored copy
   belong to the new database.
 
 ### 2.9 Schedules
@@ -1175,15 +1188,20 @@ curl -sS -X PUT https://api.example.org/v1/databases/$DB/schedules/cleanup -H "A
   up to a quarter of the interval and at most one minute, so that databases that share an expression
   do not wake together. `next_run_at` is the instant, not the start.
 - **The statements** are one transaction (at most 20 statements, 64 KiB together) sent with a `SET LOCAL
-  statement_timeout` of `timeout_ms` (default 60,000, at most 900,000). The role must exist and needs
-  only the rights the statements use. A database holds at most 20 schedules.
+  statement_timeout` of `timeout_ms` (default 1,000 to 900,000, default 60,000). The role must exist and
+  needs only the rights the statements use. A database holds at most 20 schedules. `enabled` (default
+  `true`; a replace without it enables the schedule again) pauses a schedule when `false`, and a manual run
+  of a disabled schedule answers 409. Only a project key creates, replaces or runs schedules: an
+  administrator key can read them, because a run executes statements as a customer's role.
 - **Outcomes** are listed by `GET …/runs` (the last 50): `succeeded`, `failed` (PostgreSQL refused a
   statement; `sqlstate` tells which), `timed_out`, `rejected` (the role, its password or the endpoint
-  is unusable), `outcome_unknown` (the answer was lost: **the run is never sent again**, and the next
+  is unusable, or its stored password cannot be opened: `sqlstate` `credential_unreadable`), `outcome_unknown` (the answer was lost: **the run is never sent again**, and the next
   occurrence is a new run, so write idempotent statements), `skipped_capacity` (the node refused to
   wake the database; the run is tried again with backoff until half the interval has passed, at most
   ten minutes), `skipped_suspended`, `skipped_deleted` and `skipped_missed` (the run could not start
-  within half the interval; it is not made up).
+  within half the interval, at most ten minutes, after its time, or the platform could not start it
+  (`sqlstate` `unavailable`); it is not made up). A manual run that the platform could not start is
+  recorded as `rejected` with `sqlstate` `unavailable`.
 - **A suspended database is not woken** by a schedule; resume it and the next occurrence runs.
 - **A restored copy has no schedules**, because it is a new database; schedules are not part of the data.
 - **Cost.** Every run that starts the database adds to its `awake_seconds`. A schedule that runs more
@@ -1838,7 +1856,7 @@ scope; aligned UTC boundaries, at most 31 days; the usual `limit` and `cursor`).
 | `schedule_runs_succeeded`, `_failed`, `_timed_out`, `_outcome_unknown`, `_rejected` | the schedule runs that ended with that outcome |
 | `schedule_runs_skipped` | the runs recorded as `skipped_capacity`, `skipped_suspended`, `skipped_deleted` or `skipped_missed` |
 | `events_emitted`, `event_bytes` | events stored for the database (the JSON of `data`), once per event |
-| `webhook_attempts` | every request sent to a receiver, retries included |
+| `webhook_attempts` | every request that was sent to a receiver, retries included; a delivery that could not be prepared (the subscription is gone or cannot be opened) sends none and counts none |
 | `webhook_deliveries_delivered`, `webhook_deliveries_dead_lettered` | deliveries that ended, a replay counted again |
 
 A period without a row had no executions; in a row, a metric that is absent from the database is 0. A
