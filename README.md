@@ -290,6 +290,13 @@ as equivalent. Passing this guard establishes toolchain compatibility, not a pas
 native/live acceptance. The single CI workflow contains the subsequent check/build commands.
 Unit tests do not replace the live acceptance recorded in the ULTRA plan.
 
+## Used by
+
+[ohmyho.st](https://ohmyho.st), hosting that a coding agent operates through MCP, runs its customer
+PostgreSQL databases on PGCF. Its [documentation](https://docs.ohmyho.st), [MCP server](https://github.com/amerged-org/ohmyhost-mcp)
+and [Claude plugin](https://github.com/amerged-org/ohmyhost-plugin) are open source. The hosting
+platform is a separate adopter, and PGCF does not depend on it.
+
 ## Documents
 
 - [PLAN.md](PLAN.md): entry point to the ULTRA plan: scope, delivery architecture, Done and Open
