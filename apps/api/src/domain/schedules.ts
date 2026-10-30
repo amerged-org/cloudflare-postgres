@@ -90,6 +90,7 @@ export async function putSchedule(
   };
   const result = await actor(c, databaseId).putSchedule(
     databaseId,
+    database.project_id,
     name,
     input,
     SCHEDULE_MAX_PER_DATABASE,

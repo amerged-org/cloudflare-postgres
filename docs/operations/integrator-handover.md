@@ -593,6 +593,7 @@ operation}`) and `Location: /v1/operations/{id}`.
 | `createWebhook`, `listWebhooks`, `getWebhook`, `deleteWebhook`   | `/v1/webhooks`, `/v1/webhooks/{id}`                   | [2.8](#28-webhooks); `createWebhook` shows the signing secret once
 | `putSchedule`, `listSchedules`, `getSchedule`, `deleteSchedule` | `PUT`, `GET`, `DELETE /v1/databases/{id}/schedules/{name}`, `GET …/schedules` | [2.9](#29-schedules); `PUT` creates (201) or replaces (200)
 | `listScheduleRuns`, `runScheduleNow`                          | `GET …/schedules/{name}/runs`, `POST …/schedules/{name}/run` | the last 50 runs; a manual run, queued (202)
+| `getExecutionUsage`                                           | `GET /v1/execution-usage`                             | [5.1](#51-executions)
 | `testWebhook`                                                 | `POST /v1/webhooks/{id}/test`                         | one `webhook.test` event, sent now, not retried
 | `listWebhookDeliveries`, `replayWebhookDelivery`              | `GET /v1/databases/{id}/webhook-deliveries`, `POST …/{delivery_id}/replay` | the deliveries of a database's events
 | `listSizeClasses`                                             | `GET /v1/size-classes`                                |                                                                                                                                                                                                                         |
@@ -1824,6 +1825,26 @@ gap. It is not attributed to databases. Ask the operator to export it for you.
 query counts and latencies, node RAM, CPU and disk time series (the plan records that node samples
 live minutes and only current values are readable), per-connection or per-statement data, and
 any price.
+
+### 5.1 Executions
+
+`GET /v1/usage` measures the databases themselves. What the schedules ([2.9](#29-schedules)), events
+and webhooks ([2.8](#28-webhooks)) did is counted separately, so that the usage contract stays as it
+is: `GET /v1/execution-usage?project_id=…|database_id=…&from=…&to=…&granularity=hour|day` (exactly one
+scope; aligned UTC boundaries, at most 31 days; the usual `limit` and `cursor`).
+
+| Metric | Counts |
+| --- | --- |
+| `schedule_runs_succeeded`, `_failed`, `_timed_out`, `_outcome_unknown`, `_rejected` | the schedule runs that ended with that outcome |
+| `schedule_runs_skipped` | the runs recorded as `skipped_capacity`, `skipped_suspended`, `skipped_deleted` or `skipped_missed` |
+| `events_emitted`, `event_bytes` | events stored for the database (the JSON of `data`), once per event |
+| `webhook_attempts` | every request sent to a receiver, retries included |
+| `webhook_deliveries_delivered`, `webhook_deliveries_dead_lettered` | deliveries that ended, a replay counted again |
+
+A period without a row had no executions; in a row, a metric that is absent from the database is 0. A
+database writes each hour a minute after it ended, and a row is `final` two hours after its period
+ended: bill only final rows. PGCF counts; what an execution costs is yours to decide. A scheduled run
+that starts the database also shows in its `awake_seconds`.
 
 ## 6. Alerts and operations
 

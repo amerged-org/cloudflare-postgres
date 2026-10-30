@@ -13,6 +13,7 @@
     "./edge-policy": "./src/edge-policy.ts",
     "./edge-sql": "./src/edge-sql.ts",
     "./usage": "./src/usage.ts",
+    "./execution-usage": "./src/execution-usage.ts",
     "./schedules": "./src/schedules.ts",
     "./webhooks": "./src/webhooks.ts",
     "./route-token": "./src/route-token.ts",

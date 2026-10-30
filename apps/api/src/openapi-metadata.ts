@@ -181,6 +181,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "project",
   ),
   "GET /v1/usage": route("getUsage", "Read measured usage rollups", "project"),
+  "GET /v1/execution-usage": route(
+    "getExecutionUsage",
+    "Read the counted executions of schedules, events and webhooks",
+    "project",
+  ),
   "PUT /v1/databases/{id}/schedules/{name}": route(
     "putSchedule",
     "Create or replace a schedule of SQL statements",

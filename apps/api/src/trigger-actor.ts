@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DurableObject } from "cloudflare:workers";
+import type { ExecutionMetric } from "@pgcf/contracts/execution-usage";
 import type { WebhookEnvelope } from "@pgcf/contracts/webhooks";
 import type { Env } from "./env.ts";
 import {
@@ -76,6 +77,9 @@ export type StoredRun = {
   attempts: number;
   manual: number;
 };
+const HOUR_MS = 3_600_000;
+/** A closed hour is written to D1 this long after it ended; a failed write waits a minute. */
+const COUNTER_FLUSH_DELAY_MS = 60_000;
 export const TRIGGER_RUN_HISTORY = 50;
 /** An in-flight claim older than this never reported (a crash): its outcome is unknown. */
 export const TRIGGER_INFLIGHT_STALE_MS = 20 * 60_000;
@@ -141,6 +145,7 @@ export class TriggerActor extends DurableObject<Env> {
         CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(next_attempt_ms) WHERE state='pending';
         CREATE INDEX IF NOT EXISTS deliveries_listing ON deliveries(created_ms DESC, id DESC);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS counters(hour_ms INTEGER NOT NULL, metric TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY(hour_ms, metric));
         CREATE TABLE IF NOT EXISTS schedules(
           name TEXT PRIMARY KEY,
           cron TEXT,
@@ -190,15 +195,21 @@ export class TriggerActor extends DurableObject<Env> {
     let created = 0;
     this.ctx.storage.transactionSync(() => {
       const sql = this.ctx.storage.sql;
-      sql.exec(
+      this.remember(event.database_id, event.project_id);
+      const data = JSON.stringify(event.data);
+      const stored = sql.exec(
         "INSERT OR IGNORE INTO events(id,type,occurred_at,project_id,database_id,data) VALUES(?,?,?,?,?,?)",
         event.id,
         event.type,
         event.occurred_at,
         event.project_id,
         event.database_id,
-        JSON.stringify(event.data),
+        data,
       );
+      if (stored.rowsWritten > 0) {
+        this.count("events_emitted");
+        this.count("event_bytes", new TextEncoder().encode(data).length);
+      }
       let pending = sql
         .exec<{ n: number }>(
           "SELECT count(*) AS n FROM deliveries WHERE state='pending'",
@@ -221,7 +232,8 @@ export class TriggerActor extends DurableObject<Env> {
         );
         if (result.rowsWritten > 0) {
           created += 1;
-          if (!full) pending += 1;
+          if (full) this.count("webhook_deliveries_dead_lettered");
+          else pending += 1;
         }
       });
     });
@@ -275,6 +287,7 @@ export class TriggerActor extends DurableObject<Env> {
   /** Creates or replaces a schedule; the first occurrence is the next one after now. */
   putSchedule(
     databaseId: string,
+    projectId: string,
     name: string,
     input: ScheduleInput,
     limit: number,
@@ -290,10 +303,7 @@ export class TriggerActor extends DurableObject<Env> {
     )
       return "limit";
     const now = Date.now();
-    sql.exec(
-      "INSERT INTO meta(key,value) VALUES('database_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-      databaseId,
-    );
+    this.remember(databaseId, projectId);
     const anchor =
       existing && existing.every_seconds === input.every_seconds
         ? existing.anchor_ms
@@ -408,6 +418,7 @@ export class TriggerActor extends DurableObject<Env> {
             started + ATTEMPT_LEASE_MS,
             row.id,
           );
+        this.count("webhook_attempts", due.length);
       });
       const { attemptDelivery } = await import("./domain/webhook-delivery.ts");
       const { decideRetry } = await import("./domain/webhook-retry.ts");
@@ -448,6 +459,7 @@ export class TriggerActor extends DurableObject<Env> {
                 result.status,
                 row.id,
               );
+              this.count("webhook_deliveries_delivered");
               return;
             }
             const decision =
@@ -477,12 +489,14 @@ export class TriggerActor extends DurableObject<Env> {
                 decision.reason,
                 row.id,
               );
+              this.count("webhook_deliveries_dead_lettered");
             }
           }),
         );
       }
     }
     await this.startSchedules(started);
+    await this.flushCounters(started);
     this.prune(started);
     await this.arm(Date.now());
   }
@@ -499,12 +513,89 @@ export class TriggerActor extends DurableObject<Env> {
     );
   }
 
+  private meta(key: string): string | null {
+    return (
+      this.ctx.storage.sql
+        .exec<{ value: string }>("SELECT value FROM meta WHERE key=?", key)
+        .toArray()[0]?.value ?? null
+    );
+  }
+
+  private remember(databaseId: string, projectId: string): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO meta(key,value) VALUES('database_id',?1),('project_id',?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      databaseId,
+      projectId,
+    );
+  }
+
+  /** Counts in the same synchronous step as the state change it describes. */
+  private count(metric: ExecutionMetric, amount = 1): void {
+    if (amount === 0) return;
+    this.ctx.storage.sql.exec(
+      "INSERT INTO counters(hour_ms,metric,value) VALUES(?,?,?) ON CONFLICT(hour_ms,metric) DO UPDATE SET value=value+excluded.value",
+      Math.floor(Date.now() / HOUR_MS) * HOUR_MS,
+      metric,
+      amount,
+    );
+  }
+
+  private flushRetryAt = 0;
+
+  /**
+   * Writes the closed hours to D1 as absolute values and drops them here only after D1 took them. A
+   * closed hour never changes again, so writing it twice is harmless.
+   */
+  private async flushCounters(now: number): Promise<void> {
+    if (now < this.flushRetryAt) return;
+    const sql = this.ctx.storage.sql;
+    const rows = sql
+      .exec<{ hour_ms: number; metric: string; value: number }>(
+        "SELECT hour_ms, metric, value FROM counters WHERE hour_ms<? ORDER BY hour_ms LIMIT 100",
+        Math.floor(now / HOUR_MS) * HOUR_MS,
+      )
+      .toArray();
+    if (rows.length === 0) return;
+    const databaseId = this.meta("database_id"),
+      projectId = this.meta("project_id");
+    if (!databaseId || !projectId) return;
+    try {
+      await this.env.DB.batch(
+        rows.map((row) =>
+          this.env.DB.prepare(
+            `INSERT INTO execution_usage(database_id,project_id,hour_start,metric,value) VALUES(?,?,?,?,?)
+             ON CONFLICT(database_id,hour_start,metric) DO UPDATE SET value=excluded.value`,
+          ).bind(
+            databaseId,
+            projectId,
+            new Date(row.hour_ms).toISOString(),
+            row.metric,
+            row.value,
+          ),
+        ),
+      );
+    } catch (error) {
+      this.flushRetryAt = now + COUNTER_FLUSH_DELAY_MS;
+      console.error(
+        JSON.stringify({
+          event: "execution_usage_flush_failed",
+          error_class: error instanceof Error ? error.name : "unknown",
+        }),
+      );
+      return;
+    }
+    for (const row of rows)
+      sql.exec(
+        "DELETE FROM counters WHERE hour_ms=? AND metric=?",
+        row.hour_ms,
+        row.metric,
+      );
+  }
+
   private databaseId(): string {
-    const row = this.ctx.storage.sql
-      .exec<{ value: string }>("SELECT value FROM meta WHERE key='database_id'")
-      .toArray()[0];
-    if (!row) throw new Error("schedule_database_unknown");
-    return row.value;
+    const id = this.meta("database_id");
+    if (!id) throw new Error("schedule_database_unknown");
+    return id;
   }
 
   private timing(row: StoredSchedule) {
@@ -540,6 +631,11 @@ export class TriggerActor extends DurableObject<Env> {
       "DELETE FROM runs WHERE schedule=?1 AND id NOT IN(SELECT id FROM runs WHERE schedule=?1 ORDER BY id DESC LIMIT ?2)",
       row.name,
       TRIGGER_RUN_HISTORY,
+    );
+    this.count(
+      outcome.startsWith("skipped")
+        ? "schedule_runs_skipped"
+        : (`schedule_runs_${outcome}` as ExecutionMetric),
     );
   }
 
@@ -726,6 +822,16 @@ export class TriggerActor extends DurableObject<Env> {
       )
       .one().at;
     if (schedule !== null) times.push(schedule);
+    const counters = sql
+      .exec<{ at: number | null }>("SELECT MIN(hour_ms) AS at FROM counters")
+      .one().at;
+    if (counters !== null)
+      times.push(
+        Math.max(
+          counters + HOUR_MS + COUNTER_FLUSH_DELAY_MS,
+          this.flushRetryAt,
+        ),
+      );
     const inflight = sql
       .exec<{ at: number | null }>(
         "SELECT MIN(inflight_ms) AS at FROM schedules WHERE inflight_ms IS NOT NULL",

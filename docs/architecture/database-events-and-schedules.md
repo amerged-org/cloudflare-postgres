@@ -168,8 +168,8 @@ A Cloudflare-side pull queue API is not proposed.
 
 ### 4.8 Metering and the credit boundary
 
-New hourly and daily usage metrics per database, in the existing usage contract (unknown is `null`,
-never zero, listed in `gaps`; rows final two hours after the hour):
+New hourly and daily counts per database, in a separate endpoint (`GET /v1/execution-usage`) so that
+the strictly parsed `GET /v1/usage` does not change; rows are final two hours after the period:
 
 | Metric | Counted when |
 | --- | --- |
@@ -212,7 +212,7 @@ The use case is: "give my agent the SQL address" and "notify my agent, Make, Zap
 
 | Need | Path | Note |
 | --- | --- | --- |
-| An agent or tool sends SQL | HTTP `POST /sql` | Any HTTP client works. `GET .../connection-uri` gains `sql_url`, so the address is explicit and a client need not guess it from a `postgres://` URI. |
+| An agent or tool sends SQL | HTTP `POST /sql` | Any HTTP client works. The address is `https://<host>/sql` with the host of the `postgres://` URI. |
 | A PostgreSQL node or desktop client connects | Not possible | No TCP endpoint. The tool uses its HTTP module, or calls an integrator-hosted endpoint. |
 | A long-running automation needs a credential | An ordinary role with `valid_until` | PGCF has no lifetime limit of its own. Whether a tool gets a lasting credential, or calls a stable endpoint of the integrator instead, is the integrator's policy. |
 | A tool is notified of a row change | Data event and subscription | Its catch-hook URL is the subscription target. It should answer at once, because a slow answer is a failed attempt and causes a duplicate. |
@@ -252,7 +252,6 @@ because there is no central tick.
 
 - `POST/GET /v1/webhooks`, `GET/PATCH/DELETE /v1/webhooks/{id}`, `POST /v1/webhooks/{id}/test`,
   `GET /v1/webhooks/{id}/deliveries`, `POST /v1/webhook-deliveries/{id}/replay`.
-- `GET /v1/databases/{id}/roles/{name}/connection-uri` gains `sql_url`.
 - `PUT/GET/DELETE /v1/databases/{id}/schedules/{name}`, `GET .../schedules`,
   `GET .../schedules/{name}/runs`, `POST .../schedules/{name}/run`.
 - `GET /v1/usage` gains the metrics of 4.8. Writes take an `Idempotency-Key` as everywhere.
@@ -335,4 +334,4 @@ proposal when an integrator asks.
 | E8 | Extension policy | Add only on request |
 | E9 | Access paths | `/sql` is the path for agents and automation and for this plan. Keep WebSocket `/v2`: integrators use it for psql bridges and session runtimes, and interactive transactions, `COPY`, `LISTEN` and session state need it |
 | E10 | Static headers on subscriptions | Yes, beside the HMAC signature |
-| E11 | Explicit `sql_url` in the connection answer | Yes |
+| E11 | Explicit `sql_url` in the connection answer | No (decided while building): the address is `https://<host>/sql`, derived from the host that every credential already carries; a new field would break the integrator's strict parser before it is updated |
