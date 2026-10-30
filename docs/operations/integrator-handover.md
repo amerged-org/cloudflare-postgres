@@ -591,6 +591,8 @@ operation}`) and `Location: /v1/operations/{id}`.
 | `getDatabaseBackups`                                          | `GET /v1/databases/{id}/backups`                      | the restorable window and the restorable base backups ([2.7](#27-backups-restorable-window-and-restore))                                                                                                                |
 | `getUsage`                                                    | `GET /v1/usage`                                       | [5](#5-metering)                                                                                                                                                                                                        |
 | `createWebhook`, `listWebhooks`, `getWebhook`, `deleteWebhook`   | `/v1/webhooks`, `/v1/webhooks/{id}`                   | [2.8](#28-webhooks); `createWebhook` shows the signing secret once
+| `putSchedule`, `listSchedules`, `getSchedule`, `deleteSchedule` | `PUT`, `GET`, `DELETE /v1/databases/{id}/schedules/{name}`, `GET …/schedules` | [2.9](#29-schedules); `PUT` creates (201) or replaces (200)
+| `listScheduleRuns`, `runScheduleNow`                          | `GET …/schedules/{name}/runs`, `POST …/schedules/{name}/run` | the last 50 runs; a manual run, queued (202)
 | `testWebhook`                                                 | `POST /v1/webhooks/{id}/test`                         | one `webhook.test` event, sent now, not retried
 | `listWebhookDeliveries`, `replayWebhookDelivery`              | `GET /v1/databases/{id}/webhook-deliveries`, `POST …/{delivery_id}/replay` | the deliveries of a database's events
 | `listSizeClasses`                                             | `GET /v1/size-classes`                                |                                                                                                                                                                                                                         |
@@ -1144,6 +1146,48 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
   minute cron, so an event is not a real-time signal for a connection.
 - **History is not announced.** A webhook sees events from its creation on. Events of a restored copy
   belong to the new database.
+
+### 2.9 Schedules
+
+A schedule runs SQL statements on a database at fixed times, without a connection of yours. The run is
+an ordinary request to `/sql` that PGCF sends as one of the database's roles, so it wakes a sleeping
+database exactly as your own request does and the database goes back to sleep after its idle time.
+
+```sh
+curl -sS -X PUT https://api.example.org/v1/databases/$DB/schedules/cleanup -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "cron": "30 3 * * *",
+    "role": "app",
+    "statements": ["delete from sessions where expires_at < now()"],
+    "timeout_ms": 60000
+  }'
+# 201 {"name":"cleanup","cron":"30 3 * * *","every_seconds":null,"statements":[...],"role":"app",
+#      "timeout_ms":60000,"enabled":true,"next_run_at":"2026-10-31T03:30:00.000Z","created_at":"..."}
+```
+
+- **Times.** `cron` is a UTC five-field expression (`*`, numbers, ranges, steps, lists, month and weekday
+  names; a day that is restricted in both the day-of-month and weekday field matches either, as in Vixie
+  cron). `every_seconds` (60 to 2,678,400) counts from the moment you create the schedule. Give exactly
+  one. There is no finer resolution than a minute: a database that must run something more often than
+  that has to stay warm and run it itself.
+- **Start offset.** A run starts a fixed time after its instant, different for each database and schedule,
+  up to a quarter of the interval and at most one minute, so that databases that share an expression
+  do not wake together. `next_run_at` is the instant, not the start.
+- **The statements** are one transaction (at most 20 statements, 64 KiB together) sent with a `SET LOCAL
+  statement_timeout` of `timeout_ms` (default 60,000, at most 900,000). The role must exist and needs
+  only the rights the statements use. A database holds at most 20 schedules.
+- **Outcomes** are listed by `GET …/runs` (the last 50): `succeeded`, `failed` (PostgreSQL refused a
+  statement; `sqlstate` tells which), `timed_out`, `rejected` (the role, its password or the endpoint
+  is unusable), `outcome_unknown` (the answer was lost: **the run is never sent again**, and the next
+  occurrence is a new run, so write idempotent statements), `skipped_capacity` (the node refused to
+  wake the database; the run is tried again with backoff until half the interval has passed, at most
+  ten minutes), `skipped_suspended`, `skipped_deleted` and `skipped_missed` (the run could not start
+  within half the interval; it is not made up).
+- **A suspended database is not woken** by a schedule; resume it and the next occurrence runs.
+- **A restored copy has no schedules**, because it is a new database; schedules are not part of the data.
+- **Cost.** Every run that starts the database adds to its `awake_seconds`. A schedule that runs more
+  often than the idle time keeps the database awake.
+- `POST …/schedules/{name}/run` queues one run now, besides the regular ones (`manual: true`).
 
 ## 3. Connecting
 

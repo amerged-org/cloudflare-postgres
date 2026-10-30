@@ -3,6 +3,12 @@ import { DurableObject } from "cloudflare:workers";
 import type { WebhookEnvelope } from "@pgcf/contracts/webhooks";
 import type { Env } from "./env.ts";
 import {
+  fireTime,
+  intervalAfter,
+  lateLimitMs,
+  nextOccurrence,
+} from "./domain/schedule-timing.ts";
+import {
   CONTROL_MAINTENANCE_RETRY_MS,
   controlProducerPaused,
   maintenanceEnvironment,
@@ -31,6 +37,49 @@ export type StoredDelivery = {
   last_status: number | null;
   last_error: string | null;
 };
+
+/** What a schedule is made of, as the route validated it. */
+export interface ScheduleInput {
+  cron: string | null;
+  every_seconds: number | null;
+  statements: string[];
+  role: string;
+  timeout_ms: number;
+  enabled: boolean;
+}
+export type StoredSchedule = {
+  name: string;
+  cron: string | null;
+  every_seconds: number | null;
+  anchor_ms: number;
+  statements: string;
+  role: string;
+  timeout_ms: number;
+  enabled: number;
+  created_ms: number;
+  occurrence_ms: number | null;
+  fire_ms: number | null;
+  deadline_ms: number | null;
+  attempts: number;
+  manual_pending: number;
+  inflight_ms: number | null;
+  inflight_manual: number;
+};
+export type StoredRun = {
+  id: number;
+  schedule: string;
+  scheduled_ms: number;
+  started_ms: number | null;
+  finished_ms: number;
+  outcome: string;
+  sqlstate: string | null;
+  attempts: number;
+  manual: number;
+};
+export const TRIGGER_RUN_HISTORY = 50;
+/** An in-flight claim older than this never reported (a crash): its outcome is unknown. */
+export const TRIGGER_INFLIGHT_STALE_MS = 20 * 60_000;
+const SCHEDULE_START_BATCH = 5;
 
 /** Pending deliveries one database can hold; beyond it a new delivery is dead-lettered at once. */
 export const TRIGGER_MAX_PENDING = 10_000;
@@ -91,6 +140,37 @@ export class TriggerActor extends DurableObject<Env> {
         );
         CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(next_attempt_ms) WHERE state='pending';
         CREATE INDEX IF NOT EXISTS deliveries_listing ON deliveries(created_ms DESC, id DESC);
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS schedules(
+          name TEXT PRIMARY KEY,
+          cron TEXT,
+          every_seconds INTEGER,
+          anchor_ms INTEGER NOT NULL,
+          statements TEXT NOT NULL,
+          role TEXT NOT NULL,
+          timeout_ms INTEGER NOT NULL,
+          enabled INTEGER NOT NULL,
+          created_ms INTEGER NOT NULL,
+          occurrence_ms INTEGER,
+          fire_ms INTEGER,
+          deadline_ms INTEGER,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          manual_pending INTEGER NOT NULL DEFAULT 0,
+          inflight_ms INTEGER,
+          inflight_manual INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS runs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          schedule TEXT NOT NULL,
+          scheduled_ms INTEGER NOT NULL,
+          started_ms INTEGER,
+          finished_ms INTEGER NOT NULL,
+          outcome TEXT NOT NULL,
+          sqlstate TEXT,
+          attempts INTEGER NOT NULL,
+          manual INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS runs_by_schedule ON runs(schedule, id DESC);
       `);
     });
   }
@@ -190,6 +270,112 @@ export class TriggerActor extends DurableObject<Env> {
     );
     await this.arm(now);
     return "replayed";
+  }
+
+  /** Creates or replaces a schedule; the first occurrence is the next one after now. */
+  putSchedule(
+    databaseId: string,
+    name: string,
+    input: ScheduleInput,
+    limit: number,
+  ): "created" | "updated" | "limit" {
+    const sql = this.ctx.storage.sql;
+    const existing = sql
+      .exec<StoredSchedule>("SELECT * FROM schedules WHERE name=?", name)
+      .toArray()[0];
+    if (
+      !existing &&
+      sql.exec<{ n: number }>("SELECT count(*) AS n FROM schedules").one().n >=
+        limit
+    )
+      return "limit";
+    const now = Date.now();
+    sql.exec(
+      "INSERT INTO meta(key,value) VALUES('database_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      databaseId,
+    );
+    const anchor =
+      existing && existing.every_seconds === input.every_seconds
+        ? existing.anchor_ms
+        : now;
+    const timing = {
+      cron: input.cron,
+      everySeconds: input.every_seconds,
+      anchorMs: anchor,
+    };
+    const occurrence = input.enabled ? nextOccurrence(timing, now) : null;
+    const fire =
+      occurrence === null
+        ? null
+        : fireTime(timing, databaseId, name, occurrence);
+    const deadline =
+      occurrence === null
+        ? null
+        : fire! + lateLimitMs(intervalAfter(timing, occurrence));
+    sql.exec(
+      `INSERT INTO schedules(name,cron,every_seconds,anchor_ms,statements,role,timeout_ms,enabled,created_ms,occurrence_ms,fire_ms,deadline_ms)
+       VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+       ON CONFLICT(name) DO UPDATE SET cron=?2,every_seconds=?3,anchor_ms=?4,statements=?5,role=?6,timeout_ms=?7,
+         enabled=?8,occurrence_ms=?10,fire_ms=?11,deadline_ms=?12,attempts=0`,
+      name,
+      input.cron,
+      input.every_seconds,
+      anchor,
+      JSON.stringify(input.statements),
+      input.role,
+      input.timeout_ms,
+      input.enabled ? 1 : 0,
+      existing?.created_ms ?? now,
+      occurrence,
+      fire,
+      deadline,
+    );
+    void this.arm(now);
+    return existing ? "updated" : "created";
+  }
+
+  getSchedule(name: string): StoredSchedule | null {
+    return (
+      this.ctx.storage.sql
+        .exec<StoredSchedule>("SELECT * FROM schedules WHERE name=?", name)
+        .toArray()[0] ?? null
+    );
+  }
+
+  listSchedules(): StoredSchedule[] {
+    return this.ctx.storage.sql
+      .exec<StoredSchedule>("SELECT * FROM schedules ORDER BY name")
+      .toArray();
+  }
+
+  deleteSchedule(name: string): boolean {
+    const sql = this.ctx.storage.sql;
+    const result = sql.exec("DELETE FROM schedules WHERE name=?", name);
+    sql.exec("DELETE FROM runs WHERE schedule=?", name);
+    return result.rowsWritten > 0;
+  }
+
+  listRuns(name: string, limit: number): StoredRun[] {
+    return this.ctx.storage.sql
+      .exec<StoredRun>(
+        "SELECT * FROM runs WHERE schedule=? ORDER BY id DESC LIMIT ?",
+        name,
+        limit,
+      )
+      .toArray();
+  }
+
+  /** Asks for one run now, besides the regular occurrences; it does not move them. */
+  runNow(name: string): "queued" | "not_found" | "busy" {
+    const row = this.getSchedule(name);
+    if (!row) return "not_found";
+    if (row.manual_pending === 1 || row.inflight_ms !== null) return "busy";
+    this.ctx.storage.sql.exec(
+      "UPDATE schedules SET manual_pending=1 WHERE name=?",
+      name,
+    );
+    void this.arm(Date.now());
+    return "queued";
   }
 
   override async alarm(): Promise<void> {
@@ -296,6 +482,7 @@ export class TriggerActor extends DurableObject<Env> {
         );
       }
     }
+    await this.startSchedules(started);
     this.prune(started);
     await this.arm(Date.now());
   }
@@ -312,22 +499,250 @@ export class TriggerActor extends DurableObject<Env> {
     );
   }
 
-  /** The next alarm is the earliest due delivery; with none pending, a daily visit prunes. */
+  private databaseId(): string {
+    const row = this.ctx.storage.sql
+      .exec<{ value: string }>("SELECT value FROM meta WHERE key='database_id'")
+      .toArray()[0];
+    if (!row) throw new Error("schedule_database_unknown");
+    return row.value;
+  }
+
+  private timing(row: StoredSchedule) {
+    return {
+      cron: row.cron,
+      everySeconds: row.every_seconds,
+      anchorMs: row.anchor_ms,
+    };
+  }
+
+  private record(
+    row: StoredSchedule,
+    scheduledMs: number,
+    startedMs: number | null,
+    outcome: string,
+    sqlstate: string | null,
+    manual: boolean,
+  ): void {
+    const sql = this.ctx.storage.sql;
+    sql.exec(
+      `INSERT INTO runs(schedule,scheduled_ms,started_ms,finished_ms,outcome,sqlstate,attempts,manual)
+       VALUES(?,?,?,?,?,?,?,?)`,
+      row.name,
+      scheduledMs,
+      startedMs,
+      Date.now(),
+      outcome,
+      sqlstate,
+      row.attempts,
+      manual ? 1 : 0,
+    );
+    sql.exec(
+      "DELETE FROM runs WHERE schedule=?1 AND id NOT IN(SELECT id FROM runs WHERE schedule=?1 ORDER BY id DESC LIMIT ?2)",
+      row.name,
+      TRIGGER_RUN_HISTORY,
+    );
+  }
+
+  /**
+   * Moves a schedule to its next occurrence after now. An occurrence that came and went while
+   * the previous run was still going is recorded as missed, never made up.
+   */
+  private advance(row: StoredSchedule, now: number): void {
+    const timing = this.timing(row);
+    const databaseId = this.databaseId();
+    if (row.occurrence_ms !== null) {
+      const following = nextOccurrence(timing, row.occurrence_ms);
+      if (
+        following !== null &&
+        fireTime(timing, databaseId, row.name, following) < now
+      )
+        this.record(row, following, null, "skipped_missed", null, false);
+    }
+    const occurrence = nextOccurrence(timing, now);
+    const fire =
+      occurrence === null
+        ? null
+        : fireTime(timing, databaseId, row.name, occurrence);
+    this.ctx.storage.sql.exec(
+      `UPDATE schedules SET occurrence_ms=?,fire_ms=?,deadline_ms=?,attempts=0,inflight_ms=NULL,inflight_manual=0 WHERE name=?`,
+      occurrence,
+      fire,
+      occurrence === null
+        ? null
+        : fire! + lateLimitMs(intervalAfter(timing, occurrence)),
+      row.name,
+    );
+  }
+
+  /** Starts what is due. A run is not awaited: its claim keeps it from starting twice. */
+  private async startSchedules(now: number): Promise<void> {
+    const sql = this.ctx.storage.sql;
+    // A claim that never reported was in flight when this object was lost: send nothing again.
+    for (const stale of sql
+      .exec<StoredSchedule>(
+        "SELECT * FROM schedules WHERE inflight_ms IS NOT NULL AND inflight_ms<?",
+        now - TRIGGER_INFLIGHT_STALE_MS,
+      )
+      .toArray()) {
+      this.record(
+        stale,
+        stale.occurrence_ms ?? now,
+        stale.inflight_ms,
+        "outcome_unknown",
+        null,
+        stale.inflight_manual === 1,
+      );
+      if (stale.inflight_manual === 1)
+        sql.exec(
+          "UPDATE schedules SET inflight_ms=NULL,inflight_manual=0 WHERE name=?",
+          stale.name,
+        );
+      else this.advance(stale, now);
+    }
+    const due = sql
+      .exec<StoredSchedule>(
+        `SELECT * FROM schedules WHERE inflight_ms IS NULL AND enabled=1
+           AND (manual_pending=1 OR (fire_ms IS NOT NULL AND fire_ms<=?))
+         ORDER BY manual_pending DESC, fire_ms LIMIT ?`,
+        now,
+        SCHEDULE_START_BATCH,
+      )
+      .toArray();
+    for (const row of due) {
+      const manual = row.manual_pending === 1;
+      if (!manual && row.fire_ms !== null) {
+        const interval = intervalAfter(
+          this.timing(row),
+          row.occurrence_ms ?? row.fire_ms,
+        );
+        if (now - row.fire_ms > lateLimitMs(interval)) {
+          this.record(
+            row,
+            row.occurrence_ms ?? row.fire_ms,
+            null,
+            "skipped_missed",
+            null,
+            false,
+          );
+          this.advance(row, now);
+          continue;
+        }
+      }
+      sql.exec(
+        "UPDATE schedules SET inflight_ms=?,inflight_manual=?,attempts=attempts+1,manual_pending=0 WHERE name=?",
+        now,
+        manual ? 1 : 0,
+        row.name,
+      );
+      this.ctx.waitUntil(
+        this.fire({ ...row, attempts: row.attempts + 1 }, manual),
+      );
+    }
+  }
+
+  private async fire(row: StoredSchedule, manual: boolean): Promise<void> {
+    const sql = this.ctx.storage.sql;
+    const started = Date.now();
+    const scheduled = manual ? started : (row.occurrence_ms ?? started);
+    try {
+      const { runScheduleJob } = await import("./domain/schedule-job.ts");
+      const run = await runScheduleJob(this.env, {
+        databaseId: this.databaseId(),
+        role: row.role,
+        statements: JSON.parse(row.statements) as string[],
+        timeoutMs: row.timeout_ms,
+      });
+      const finish = (outcome: string, sqlstate: string | null) => {
+        this.record(row, scheduled, started, outcome, sqlstate, manual);
+        if (manual)
+          sql.exec(
+            "UPDATE schedules SET inflight_ms=NULL,inflight_manual=0 WHERE name=?",
+            row.name,
+          );
+        else this.advance(row, Date.now());
+      };
+      if (run.kind === "skipped") {
+        finish(
+          run.reason === "gone" ? "skipped_deleted" : "skipped_suspended",
+          null,
+        );
+        // A deleted database has no more runs.
+        if (run.reason === "gone")
+          sql.exec("UPDATE schedules SET enabled=0,fire_ms=NULL WHERE 1=1");
+      } else if (run.result.outcome === "capacity_refused") {
+        const { capacityBackoffMs } =
+          await import("./domain/schedule-timing.ts");
+        const retryAt =
+          Date.now() +
+          (run.result.retryAfterSeconds !== null
+            ? Math.max(
+                1_000,
+                Math.min(run.result.retryAfterSeconds * 1000, 300_000),
+              )
+            : capacityBackoffMs(row.attempts));
+        if (!manual && row.deadline_ms !== null && retryAt <= row.deadline_ms) {
+          // Nothing ran: try the same occurrence again, within its allowance.
+          sql.exec(
+            "UPDATE schedules SET fire_ms=?,inflight_ms=NULL,inflight_manual=0 WHERE name=?",
+            retryAt,
+            row.name,
+          );
+        } else finish("skipped_capacity", run.result.sqlstate);
+      } else finish(run.result.outcome, run.result.sqlstate);
+    } catch (error) {
+      // Before the request was sent (D1 or the keys): release the claim and try again soon.
+      console.error(
+        JSON.stringify({
+          event: "schedule_attempt_unavailable",
+          error_class: error instanceof Error ? error.name : "unknown",
+        }),
+      );
+      sql.exec(
+        "UPDATE schedules SET fire_ms=?,inflight_ms=NULL,inflight_manual=0,manual_pending=? WHERE name=?",
+        Date.now() + 60_000,
+        manual ? 1 : 0,
+        row.name,
+      );
+    } finally {
+      await this.arm(Date.now());
+    }
+  }
+
+  /** The next alarm is the earliest thing due; with nothing pending, a daily visit prunes. */
   private async arm(now: number): Promise<void> {
-    const next = this.ctx.storage.sql
+    const sql = this.ctx.storage.sql;
+    const times: number[] = [];
+    const delivery = sql
       .exec<{ at: number | null }>(
         "SELECT MIN(next_attempt_ms) AS at FROM deliveries WHERE state='pending'",
       )
       .one().at;
-    const any = this.ctx.storage.sql
+    if (delivery !== null) times.push(delivery);
+    const schedule = sql
+      .exec<{ at: number | null }>(
+        `SELECT MIN(CASE WHEN manual_pending=1 THEN ?1 ELSE fire_ms END) AS at FROM schedules
+         WHERE enabled=1 AND inflight_ms IS NULL AND (manual_pending=1 OR fire_ms IS NOT NULL)`,
+        now,
+      )
+      .one().at;
+    if (schedule !== null) times.push(schedule);
+    const inflight = sql
+      .exec<{ at: number | null }>(
+        "SELECT MIN(inflight_ms) AS at FROM schedules WHERE inflight_ms IS NOT NULL",
+      )
+      .one().at;
+    if (inflight !== null)
+      times.push(inflight + TRIGGER_INFLIGHT_STALE_MS + 1_000);
+    if (times.length > 0) {
+      await this.ctx.storage.setAlarm(
+        Math.max(Math.min(...times), now + MIN_ALARM_GAP_MS),
+      );
+      return;
+    }
+    const any = sql
       .exec<{ n: number }>("SELECT count(*) AS n FROM deliveries")
       .one().n;
-    if (next !== null) {
-      await this.ctx.storage.setAlarm(Math.max(next, now + MIN_ALARM_GAP_MS));
-    } else if (any > 0) {
-      await this.ctx.storage.setAlarm(now + 86_400_000);
-    } else {
-      await this.ctx.storage.deleteAlarm();
-    }
+    if (any > 0) await this.ctx.storage.setAlarm(now + 86_400_000);
+    else await this.ctx.storage.deleteAlarm();
   }
 }

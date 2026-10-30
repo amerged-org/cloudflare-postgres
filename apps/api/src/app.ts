@@ -16,6 +16,7 @@ import { registerDomain } from "./routes/domain.ts";
 import { registerDatabaseResources } from "./routes/database-resources.ts";
 import { registerPlatform } from "./routes/platform.ts";
 import { registerUsage } from "./routes/usage.ts";
+import { registerSchedules } from "./routes/schedules.ts";
 import { registerWebhooks } from "./routes/webhooks.ts";
 import { registerCosts } from "./routes/costs.ts";
 import { registerOperationalHealth } from "./routes/health.ts";
@@ -107,6 +108,10 @@ export const DIAGNOSTIC_ROUTES = new Set([
   "/v1/operations/:id",
   "/v1/databases/:id/operations",
   "/v1/usage",
+  "/v1/databases/:id/schedules",
+  "/v1/databases/:id/schedules/:name",
+  "/v1/databases/:id/schedules/:name/runs",
+  "/v1/databases/:id/schedules/:name/run",
   "/v1/webhooks",
   "/v1/webhooks/:id",
   "/v1/webhooks/:id/test",
@@ -349,6 +354,7 @@ export function createApp(): ApiApp {
   registerDatabaseResources(app);
   registerUsage(app);
   registerWebhooks(app);
+  registerSchedules(app);
   registerCosts(app);
   registerNodes(app);
   registerNodeLink(app);
