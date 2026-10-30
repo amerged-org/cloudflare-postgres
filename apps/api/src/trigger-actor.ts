@@ -4,12 +4,6 @@ import type { ExecutionMetric } from "@pgcf/contracts/execution-usage";
 import type { WebhookEnvelope } from "@pgcf/contracts/webhooks";
 import type { Env } from "./env.ts";
 import {
-  fireTime,
-  intervalAfter,
-  lateLimitMs,
-  nextOccurrence,
-} from "./domain/schedule-timing.ts";
-import {
   CONTROL_MAINTENANCE_RETRY_MS,
   controlProducerPaused,
   maintenanceEnvironment,
@@ -94,6 +88,8 @@ const ALARM_CONCURRENCY = 5;
 /** A claimed attempt that never reports is tried again after this long (a crash mid-request). */
 const ATTEMPT_LEASE_MS = 30_000;
 const MIN_ALARM_GAP_MS = 250;
+
+type Timing = typeof import("./domain/schedule-timing.ts");
 
 type DeliveryRow = {
   id: string;
@@ -284,14 +280,23 @@ export class TriggerActor extends DurableObject<Env> {
     return "replayed";
   }
 
+  private timingLibrary: Timing | undefined;
+
+  /** Loaded when a schedule needs it: a cold object that has none never evaluates it. */
+  private async timing_(): Promise<Timing> {
+    return (this.timingLibrary ??= await import("./domain/schedule-timing.ts"));
+  }
+
   /** Creates or replaces a schedule; the first occurrence is the next one after now. */
-  putSchedule(
+  async putSchedule(
     databaseId: string,
     projectId: string,
     name: string,
     input: ScheduleInput,
     limit: number,
-  ): "created" | "updated" | "limit" {
+  ): Promise<"created" | "updated" | "limit"> {
+    const { fireTime, intervalAfter, lateLimitMs, nextOccurrence } =
+      await this.timing_();
     const sql = this.ctx.storage.sql;
     const existing = sql
       .exec<StoredSchedule>("SELECT * FROM schedules WHERE name=?", name)
@@ -643,7 +648,8 @@ export class TriggerActor extends DurableObject<Env> {
    * Moves a schedule to its next occurrence after now. An occurrence that came and went while
    * the previous run was still going is recorded as missed, never made up.
    */
-  private advance(row: StoredSchedule, now: number): void {
+  private advance(row: StoredSchedule, now: number, t: Timing): void {
+    const { fireTime, intervalAfter, lateLimitMs, nextOccurrence } = t;
     const timing = this.timing(row);
     const databaseId = this.databaseId();
     if (row.occurrence_ms !== null) {
@@ -673,6 +679,13 @@ export class TriggerActor extends DurableObject<Env> {
   /** Starts what is due. A run is not awaited: its claim keeps it from starting twice. */
   private async startSchedules(now: number): Promise<void> {
     const sql = this.ctx.storage.sql;
+    if (
+      sql.exec<{ n: number }>("SELECT count(*) AS n FROM schedules").one().n ===
+      0
+    )
+      return;
+    const t = await this.timing_();
+    const { intervalAfter, lateLimitMs } = t;
     // A claim that never reported was in flight when this object was lost: send nothing again.
     for (const stale of sql
       .exec<StoredSchedule>(
@@ -693,7 +706,7 @@ export class TriggerActor extends DurableObject<Env> {
           "UPDATE schedules SET inflight_ms=NULL,inflight_manual=0 WHERE name=?",
           stale.name,
         );
-      else this.advance(stale, now);
+      else this.advance(stale, now, t);
     }
     const due = sql
       .exec<StoredSchedule>(
@@ -720,7 +733,7 @@ export class TriggerActor extends DurableObject<Env> {
             null,
             false,
           );
-          this.advance(row, now);
+          this.advance(row, now, t);
           continue;
         }
       }
@@ -738,6 +751,7 @@ export class TriggerActor extends DurableObject<Env> {
 
   private async fire(row: StoredSchedule, manual: boolean): Promise<void> {
     const sql = this.ctx.storage.sql;
+    const t = await this.timing_();
     const started = Date.now();
     const scheduled = manual ? started : (row.occurrence_ms ?? started);
     try {
@@ -755,7 +769,7 @@ export class TriggerActor extends DurableObject<Env> {
             "UPDATE schedules SET inflight_ms=NULL,inflight_manual=0 WHERE name=?",
             row.name,
           );
-        else this.advance(row, Date.now());
+        else this.advance(row, Date.now(), t);
       };
       if (run.kind === "skipped") {
         finish(
@@ -766,8 +780,7 @@ export class TriggerActor extends DurableObject<Env> {
         if (run.reason === "gone")
           sql.exec("UPDATE schedules SET enabled=0,fire_ms=NULL WHERE 1=1");
       } else if (run.result.outcome === "capacity_refused") {
-        const { capacityBackoffMs } =
-          await import("./domain/schedule-timing.ts");
+        const { capacityBackoffMs } = t;
         const retryAt =
           Date.now() +
           (run.result.retryAfterSeconds !== null
