@@ -1,21 +1,19 @@
 # cloudflare-postgres
 
 Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare account** and **your
-Contabo VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
+VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
 Each VPS is a self-contained Debian node installed from one image: real, unmodified PostgreSQL
 runs as one sandboxed systemd service per database on its own thin LVM volume, next to one Rust
-node agent. There is no Kubernetes and no control server. The deployment has two regions: EU with
-the customer node **EU1** and US with **US1**, each a Contabo Cloud VPS with **6 vCPU and 12 GB
-RAM** that Cloudflare installed from the node image. Server loss is recovered from R2.
+node agent. There is no Kubernetes and no control server. Server loss is recovered from R2.
 
 - Create, resize, suspend, restore and delete databases through a versioned API.
 - Connect through Cloudflare: PostgreSQL over WebSocket. The VPS expose no database port.
 - Databases sleep when idle and wake on the next connection.
 - Continuous backups to R2 with point-in-time recovery.
 - Usage and infrastructure-cost metrics per database. You put your own pricing on top.
-- Cloudflare installs a node from the image through the Contabo rescue system, with no inbound port
-  and no SSH ([plan 9.2](docs/architecture/cloudflare-convergence-and-serverless-plan.md#92-installing-a-node-on-contabo-no-relay-no-ssh)).
-  Capacity placement and Contabo purchases are implemented; purchases stay off until the operator
+- Cloudflare installs a node from the image through the VPS provider's rescue system, with no
+  inbound port and no SSH ([plan 9.2](docs/architecture/cloudflare-convergence-and-serverless-plan.md#92-installing-a-node-on-contabo-no-relay-no-ssh)).
+  Capacity placement and VPS purchases are implemented; purchases stay off until the operator
   enables them.
 
 Integrators keep their adapters and any tooling that moves their existing databases in their own
@@ -163,7 +161,7 @@ licenses.
 
 - A Cloudflare account on the Workers Paid plan, with a zone that hosts one endpoint hostname
   (`db.example.com`): Workers, D1, Durable Objects, Workflows, R2, Tunnel and Access.
-- A Contabo account with API credentials. EU1 is a Cloud VPS with 6 vCPU and 12 GB RAM.
+- A VPS account with API credentials for the node installer.
 
 The current target is the operator deployment on existing accounts with the customer nodes EU1 and
 US1.
