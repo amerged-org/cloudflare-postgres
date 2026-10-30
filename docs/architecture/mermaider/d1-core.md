@@ -158,5 +158,6 @@ erDiagram
 - [apps/api/migrations/0092_independent_alert_delivery.sql:1](../../../apps/api/migrations/0092_independent_alert_delivery.sql#L1)
 - [apps/api/migrations/0093_native_protocol_floor.sql:1](../../../apps/api/migrations/0093_native_protocol_floor.sql#L1)
 - [apps/api/migrations/0094_alert_recoveries.sql:1](../../../apps/api/migrations/0094_alert_recoveries.sql#L1)
+- [apps/api/migrations/0095_webhooks.sql:1](../../../apps/api/migrations/0095_webhooks.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

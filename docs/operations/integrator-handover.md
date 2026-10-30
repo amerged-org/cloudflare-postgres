@@ -590,6 +590,9 @@ operation}`) and `Location: /v1/operations/{id}`.
 | `getDatabaseArchive`                                          | `GET /v1/databases/{id}/archive`                      | counts only                                                                                                                                                                                                             |
 | `getDatabaseBackups`                                          | `GET /v1/databases/{id}/backups`                      | the restorable window and the restorable base backups ([2.7](#27-backups-restorable-window-and-restore))                                                                                                                |
 | `getUsage`                                                    | `GET /v1/usage`                                       | [5](#5-metering)                                                                                                                                                                                                        |
+| `createWebhook`, `listWebhooks`, `getWebhook`, `deleteWebhook`   | `/v1/webhooks`, `/v1/webhooks/{id}`                   | [2.8](#28-webhooks); `createWebhook` shows the signing secret once
+| `testWebhook`                                                 | `POST /v1/webhooks/{id}/test`                         | one `webhook.test` event, sent now, not retried
+| `listWebhookDeliveries`, `replayWebhookDelivery`              | `GET /v1/databases/{id}/webhook-deliveries`, `POST …/{delivery_id}/replay` | the deliveries of a database's events
 | `listSizeClasses`                                             | `GET /v1/size-classes`                                |                                                                                                                                                                                                                         |
 | `listProjects`, `getProject`, `deleteProject`                 | `/v1/projects`, `/v1/projects/{id}`                   |                                                                                                                                                                                                                         |
 | `getDatabaseResourceProfile`, `assignDatabaseResourceProfile` | `GET`, `PUT /v1/databases/{id}/resource-profile`      | operator-defined profile revisions; an assignment is a resize                                                                                                                                                           |
@@ -666,8 +669,8 @@ is DONE, so it is never writable before it is restorable. The idle time
 | `succeeded`          | the observed state matches the intent                                          |
 | `failed`             | `error.code` and `error.message` say why; see [A.3](#a3-operation-error-codes) |
 
-Poll with a short interval at first and a longer one afterwards; there is no event stream or
-webhook (open work). Kinds you start: `database.create`, `database.restore` (it belongs to the new
+Poll with a short interval at first and a longer one afterwards, or subscribe to
+`operation.succeeded` and `operation.failed` webhooks ([2.8](#28-webhooks)). Kinds you start: `database.create`, `database.restore` (it belongs to the new
 database), `database.delete`, `database.resize`, `database.suspend`, `database.resume`,
 `database.role.delete`. PGCF starts `database.hibernate` (idle sleep) and `database.wake` (a
 connection) itself; they appear in `GET /v1/databases/{id}/operations` like any other.
@@ -1085,6 +1088,62 @@ in [7.3](#73-recovery-time).
 The October 23 restore failures listed in [8](#8-not-available-yet) are historical. The corrected
 regional provider paths and bounded G9 queue/restart acceptance passed on October 25. A terminal
 failed `/restore` operation remains failed; reconcile its target before requesting another restore.
+
+### 2.8 Webhooks
+
+A webhook subscribes an HTTPS URL to the events of your project's databases, so that nothing has to
+poll. These events exist now:
+
+| Type | When |
+| --- | --- |
+| `database.created`, `database.ready` | the database was accepted, and it is ready to connect |
+| `database.woke`, `database.slept` | it started for a connection or `resume`, and it went to sleep when idle |
+| `database.suspended`, `database.resized`, `database.deleted` | a `suspend`, a resize and a delete finished |
+| `operation.succeeded`, `operation.failed` | an operation you started finished (`data.operation_id`, `kind`, `error_code`); the operations PGCF starts itself (`database.hibernate`, `database.wake`) are announced as `database.slept` and `database.woke` instead |
+| `webhook.test` | only from `POST /v1/webhooks/{id}/test` |
+
+```sh
+curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "url": "https://hooks.example.com/pgcf",
+    "event_types": ["database.*", "operation.*"],
+    "database_ids": ["<optional: only these databases>"],
+    "headers": {"Authorization": "Bearer <your receiver token>"}
+  }'
+# 201 {"id":"whk_...","project_id":"prj_...","url":"...","event_types":[...],"database_ids":null,
+#      "header_names":["Authorization"],"created_at":"...","secret":"whsec_..."}
+```
+
+- **Patterns:** `*`, `<group>.*` or one exact type. An integrator key subscribes its own project; an
+  administrator key names `project_id`. A project holds at most 20 webhooks.
+- **The secret** is shown in the creation answer only (and in an idempotent replay of it). The static
+  `headers` are stored sealed and never shown again (only their names). Many automation tools cannot
+  verify a signature but can check a header or keep the URL secret; use `headers` for them.
+- **The URL** must be `https`, on port 443 or 8443, with a DNS name (no IP address, `localhost`,
+  user information or fragment). Redirects are not followed.
+- **A delivery** is a POST of `{"id","type","occurred_at","project_id","database_id","data"}` with the
+  headers `PGCF-Signature: t=<unix seconds>,v1=<hex>`, `PGCF-Event-Id` and `PGCF-Delivery-Id`. The
+  signature is the hex HMAC-SHA256, keyed with the secret, of the string `<t>.<raw body>`; reject a
+  `t` more than five minutes from your clock.
+  ```ts
+  import { createHmac, timingSafeEqual } from "node:crypto";
+  function verify(secret: string, header: string, rawBody: string, nowSeconds: number): boolean {
+    const m = /^t=(\d{1,12}),v1=([0-9a-f]{64})$/.exec(header);
+    if (!m || Math.abs(nowSeconds - Number(m[1])) > 300) return false;
+    const mac = createHmac("sha256", secret).update(`${m[1]}.${rawBody}`).digest();
+    return timingSafeEqual(mac, Buffer.from(m[2]!, "hex"));
+  }
+  ```
+- **At least once.** Answer 2xx within 5 seconds; deduplicate by the event `id`. A failure is retried after
+  1 min, 5 min, 30 min, 2 h, 6 h and then every 12 h, for 24 hours in all; `Retry-After` (at most one
+  hour) replaces the delay. A 4xx other than 408, 425 and 429, and any redirect, end the retries at once.
+  A delivery that is out of retries is dead-lettered: `GET /v1/databases/{id}/webhook-deliveries` shows it
+  (delivered ones for 24 hours, dead-lettered ones for seven days), and `POST …/{delivery_id}/replay`
+  delivers it again with a fresh window. Deleting a webhook dead-letters its waiting deliveries.
+- **Timing.** Events leave within about a minute of the change: they are read from the lifecycle log by the
+  minute cron, so an event is not a real-time signal for a connection.
+- **History is not announced.** A webhook sees events from its creation on. Events of a restored copy
+  belong to the new database.
 
 ## 3. Connecting
 
@@ -1726,7 +1785,7 @@ any price.
 
 Alerts are infrastructure alerts for the **operator**. The candidate independently sends them
 to the authenticated operator webhook and configured email recipients. Integrator alert
-subscriptions are not introduced. The owner confirmed the recipient on 2026-10-19 and, on the evening of
+subscriptions are not introduced; the events of your own databases are webhooks ([2.8](#28-webhooks)). The owner confirmed the recipient on 2026-10-19 and, on the evening of
 2026-10-20, that the alerts arrive; the control database held delivered episodes of several kinds,
 go-live gate G5 is met and every kind carries its runbook action ("G5 met: the alerts reach the
 owner's webhook"). The operator reads the alerts' state in
@@ -1953,7 +2012,7 @@ When reporting an incident, send:
   are accepted in the dated ULTRA update; dependent test-population cleanup remains open.
 - Alerts for integrators (alerts go to the operator); operator acknowledgement and test send. Operational health exposes delivery/recovery receipts, not a complete event-history API.
 - Finding deleted databases: the lists exclude them, so keep the IDs you were given.
-- An event stream or webhooks, an audit log of integrator keys (the administrator keys have one).
+- An event stream beyond the webhooks of [2.8](#28-webhooks) (no ordering guarantee, no data-change events), an audit log of integrator keys (the administrator keys have one).
 - Last-use display and key rotation as a feature; an API domain with rate limiting.
 - Infrastructure metrics history and measured CPU and RAM per database.
 - Changing a role after creation (expiry, limit, membership), user-chosen passwords, a grants API,

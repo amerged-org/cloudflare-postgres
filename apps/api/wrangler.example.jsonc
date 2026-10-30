@@ -94,6 +94,9 @@
       // Visits every DatabaseActor every DATABASE_ACTOR_WARM_INTERVAL_MS from its alarm; the minute
       // cron arms it. Keep the binding and the v7 migration while the interval is not 0.
       { "name": "ACTOR_WARMER", "class_name": "ActorWarmer" },
+      // Stores each database's webhook events and delivers them from its alarm. Keep the binding
+      // and the v8 migration: without them no webhook is delivered.
+      { "name": "TRIGGER_ACTOR", "class_name": "TriggerActor" },
     ],
   },
   "migrations": [
@@ -109,6 +112,7 @@
       "deleted_classes": ["RegionLink"],
     },
     { "tag": "v7", "new_sqlite_classes": ["ActorWarmer"] },
+    { "tag": "v8", "new_sqlite_classes": ["TriggerActor"] },
   ],
   "workflows": [
     {

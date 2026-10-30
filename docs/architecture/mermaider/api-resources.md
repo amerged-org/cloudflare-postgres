@@ -15,10 +15,12 @@ flowchart LR
     n_36ffcdc5f79f["Workflow<br/>INFRASTRUCTURE_BACKUP<br/>name: pgcf-infrastructure-backup<br/>class_name: InfrastructureBackup"]
     n_85c654928d8c["version_metadata<br/>CF_VERSION_METADATA"]
     n_71083a5197e9["R2 bucket<br/>ARCHIVE<br/>bucket_name:<br/>replace-r2-backup-bucket"]
+    n_fb34ec2acd36["Durable Object<br/>TRIGGER_ACTOR<br/>class_name: TriggerActor"]
     n_056b63fe76be["Durable Object<br/>DATABASE_ACTOR<br/>class_name: DatabaseActor"]
     n_d0efe52f1f47["Durable Object<br/>CRON_WATCHDOG<br/>class_name: CronWatchdog"]
     n_7a30182df25a["pgcf-api-dev<br/>configuration template"]
     n_260ca5b8b289["Durable Object<br/>NODE_ACTOR<br/>class_name: NodeActor"]
+    n_7a30182df25a --> n_fb34ec2acd36
     n_7a30182df25a --> n_f305dbc12c79
     n_7a30182df25a --> n_260ca5b8b289
     n_839713e89618 -->|"scheduled event"| n_7a30182df25a
@@ -41,8 +43,9 @@ flowchart LR
 - [apps/api/wrangler.example.jsonc:89](../../../apps/api/wrangler.example.jsonc#L89)
 - [apps/api/wrangler.example.jsonc:93](../../../apps/api/wrangler.example.jsonc#L93)
 - [apps/api/wrangler.example.jsonc:96](../../../apps/api/wrangler.example.jsonc#L96)
-- [apps/api/wrangler.example.jsonc:114](../../../apps/api/wrangler.example.jsonc#L114)
-- [apps/api/wrangler.example.jsonc:119](../../../apps/api/wrangler.example.jsonc#L119)
-- [apps/api/wrangler.example.jsonc:121](../../../apps/api/wrangler.example.jsonc#L121)
+- [apps/api/wrangler.example.jsonc:99](../../../apps/api/wrangler.example.jsonc#L99)
+- [apps/api/wrangler.example.jsonc:118](../../../apps/api/wrangler.example.jsonc#L118)
+- [apps/api/wrangler.example.jsonc:123](../../../apps/api/wrangler.example.jsonc#L123)
+- [apps/api/wrangler.example.jsonc:125](../../../apps/api/wrangler.example.jsonc#L125)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

@@ -25,6 +25,7 @@ export const CRON_STEPS = [
   "node_capacity",
   "retained_archives",
   "backup_retention",
+  "webhook_events",
 ] as const;
 export type CronStep = (typeof CRON_STEPS)[number];
 export interface CronStepFailure {

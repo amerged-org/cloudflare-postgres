@@ -25,6 +25,7 @@ export const ID_PREFIXES = {
   operation: "op_",
   apiKey: "key_",
   node: "nod_",
+  webhook: "whk_",
 } as const;
 export type IdPrefix = (typeof ID_PREFIXES)[keyof typeof ID_PREFIXES];
 

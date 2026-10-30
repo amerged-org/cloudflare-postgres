@@ -37,6 +37,7 @@
       { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
       { "name": "CRON_WATCHDOG", "class_name": "CronWatchdog" },
       { "name": "ACTOR_WARMER", "class_name": "ActorWarmer" },
+      { "name": "TRIGGER_ACTOR", "class_name": "TriggerActor" },
     ],
   },
   "migrations": [
@@ -52,6 +53,7 @@
       "deleted_classes": ["RegionLink"],
     },
     { "tag": "v7", "new_sqlite_classes": ["ActorWarmer"] },
+    { "tag": "v8", "new_sqlite_classes": ["TriggerActor"] },
   ],
   "workflows": [
     {

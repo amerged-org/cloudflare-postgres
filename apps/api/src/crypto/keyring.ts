@@ -42,7 +42,7 @@ function aad(databaseId: string, role: string, kid: string): Uint8Array {
   return encoder.encode(`${databaseId}|${role}|${kid}`);
 }
 
-export function keyring(secret: string): CredentialKeyring {
+function loadKeys(secret: string) {
   let json: unknown;
   try {
     json = JSON.parse(secret);
@@ -77,12 +77,17 @@ export function keyring(secret: string): CredentialKeyring {
       [usage],
     );
   };
+  return { active: config.data.active, get };
+}
+
+export function keyring(secret: string): CredentialKeyring {
+  const { active, get } = loadKeys(secret);
   return {
-    active: config.data.active,
+    active,
     async encrypt(databaseId, role, password) {
       if (!RolePassword.safeParse(password).success)
         throw new TypeError("Invalid role password");
-      const kid = config.data.active;
+      const kid = active;
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const ciphertext = await crypto.subtle.encrypt(
         {
@@ -128,6 +133,77 @@ export function keyring(secret: string): CredentialKeyring {
       if (!RolePassword.safeParse(password).success)
         throw new Error("Invalid decrypted credential");
       return password;
+    },
+  };
+}
+
+const SEAL_CONTEXT = /^[A-Za-z0-9._|-]{1,128}$/;
+const SEAL_MAX_BYTES = 16 * 1024;
+
+/**
+ * Seals short texts that are not role passwords (a webhook's signing secret and its static
+ * headers) with the same keys. `context` names what the text belongs to and is authenticated with
+ * it, so a sealed text cannot be moved to another row.
+ */
+export interface TextSealer {
+  seal(context: string, text: string): Promise<EncryptedPassword>;
+  open(context: string, sealed: EncryptedPassword): Promise<string>;
+}
+
+export function sealer(secret: string): TextSealer {
+  const { active, get } = loadKeys(secret);
+  const sealedAad = (context: string, kid: string): Uint8Array => {
+    if (!SEAL_CONTEXT.test(context) || !KeyId.safeParse(kid).success)
+      throw new TypeError("Invalid seal identity");
+    return encoder.encode(`seal|${context}|${kid}`);
+  };
+  return {
+    async seal(context, text) {
+      const plaintext = encoder.encode(text);
+      if (plaintext.length === 0 || plaintext.length > SEAL_MAX_BYTES)
+        throw new RangeError("Sealed text must be 1 to 16384 bytes");
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ciphertext = await crypto.subtle.encrypt(
+        {
+          name: "AES-GCM",
+          iv,
+          additionalData: Uint8Array.from(sealedAad(context, active)),
+          tagLength: 128,
+        },
+        await get(active, "encrypt"),
+        plaintext,
+      );
+      return {
+        ciphertext: bytesToBase64url(new Uint8Array(ciphertext)),
+        iv: bytesToBase64url(iv),
+        kid: active,
+      };
+    },
+    async open(context, sealed) {
+      const iv = base64urlToBytes(sealed.iv);
+      const ciphertext = base64urlToBytes(sealed.ciphertext);
+      if (
+        !iv ||
+        iv.length !== 12 ||
+        !ciphertext ||
+        ciphertext.length < 17 ||
+        ciphertext.length > SEAL_MAX_BYTES + 16
+      )
+        throw new Error("Invalid sealed text");
+      const plaintext = await crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: Uint8Array.from(iv),
+          additionalData: Uint8Array.from(sealedAad(context, sealed.kid)),
+          tagLength: 128,
+        },
+        await get(sealed.kid, "decrypt"),
+        Uint8Array.from(ciphertext),
+      );
+      return new TextDecoder("utf-8", {
+        fatal: true,
+        ignoreBOM: false,
+      }).decode(plaintext);
     },
   };
 }
