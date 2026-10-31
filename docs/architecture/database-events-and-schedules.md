@@ -52,7 +52,8 @@ into its own prices and credits.
 4. **Never replay an uncertain write.** An unknown outcome (`08007`) is recorded and never sent again.
    A schedule's next tick is a new run, not a replay.
 5. **Metrics only.** PGCF counts executions. It has no prices, credits or budgets. An integrator that
-   runs out of credits uses the existing suspend call; a suspended database is not woken by a schedule.
+   runs out of credits uses the existing suspend call; a database suspended on purpose is not woken by a schedule, one that
+   sleeps only because it was idle is.
 6. **Simple and scalable.** One new Durable Object class, one actor per database, everything driven by
    its own alarm. No Queues, no central pump, no job protocol on the nodes, no Rust. Add any of them
    only for a measured bottleneck (section 9).
@@ -147,7 +148,7 @@ Rules, all deliberately small:
   the interval has passed, then records `skipped_capacity`.
 - **Unknown outcome (`08007`):** recorded as `outcome_unknown`, never sent again. The next tick is a
   new run. Jobs should be idempotent, as cron jobs always have to be.
-- **Missed run** (database suspended, node down, actor late): skipped and recorded, never made up.
+- **Missed run** (database suspended on purpose, node down, actor late): skipped and recorded, never made up.
 - **Overlap:** one fire per schedule at a time. A run still going when the next is due leaves that occurrence recorded as `skipped_missed`.
 - **Activity:** a run is an ordinary request, so the idle clock restarts after it.
 - A manual `POST .../run` exists for tests and operations.
@@ -292,7 +293,7 @@ bucket), contracts, CLI.
 Depends on: T1.
 Live acceptance: a cold database wakes at the due time with jitter, runs the job once and sleeps
 afterwards; a forced lost answer (`08007`) ends as `outcome_unknown` and is not sent again, and the
-next tick runs normally; a suspended database is skipped; a capacity refusal re-arms and ends as
+next tick runs normally; a database suspended on purpose is skipped and an idle one is woken; a capacity refusal re-arms and ends as
 `skipped_capacity` after half the interval; many databases with the same expression do not delay user
 requests (measurement 3); a restored copy has no schedules.
 
