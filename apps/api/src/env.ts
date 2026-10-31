@@ -45,6 +45,11 @@ export type Env = Cloudflare.Env & {
    * not at all when the line is not valid, so a mistake leaves the shell without a login.
    */
   NODE_SSH_USER_CA_PUBLIC_KEY?: string;
+  /**
+   * Webhooks one project may hold (default 20, at most 100000). An integrator that serves many customers
+   * from one project raises it and limits its customers itself.
+   */
+  WEBHOOKS_MAX_PER_PROJECT?: string;
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
   DATABASE_ACTOR_LOCATION_HINT?: string;
   /**

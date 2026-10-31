@@ -553,3 +553,33 @@ it("tests a webhook at most once every five seconds", async () => {
       .status,
   ).toBe(200);
 });
+
+it("takes the webhook limit of a project from the installation", async () => {
+  const f = await fixture();
+  const withLimit = (url: string) =>
+    request(
+      "/v1/webhooks",
+      f.integrator,
+      "POST",
+      { url, event_types: ["database.*"] },
+      undefined,
+      undefined,
+      { WEBHOOKS_MAX_PER_PROJECT: "2" },
+    );
+  expect((await withLimit("https://a.example.com/h")).status).toBe(201);
+  expect((await withLimit("https://b.example.com/h")).status).toBe(201);
+  expect(
+    await refusal(await withLimit("https://c.example.com/h")),
+  ).toMatchObject({ status: 409, code: "conflict" });
+  // An unusable value falls back to the default of 20.
+  const fallback = await request(
+    "/v1/webhooks",
+    f.integrator,
+    "POST",
+    { url: "https://d.example.com/h", event_types: ["database.*"] },
+    undefined,
+    undefined,
+    { WEBHOOKS_MAX_PER_PROJECT: "many" },
+  );
+  expect(fallback.status).toBe(201);
+});

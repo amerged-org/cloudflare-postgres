@@ -34,6 +34,19 @@ import { checkWebhookUrl } from "./webhook-url.ts";
 import { newWebhookSecret } from "./webhook-signing.ts";
 
 const WEBHOOK_TEST_INTERVAL_MS = 5_000;
+const WEBHOOK_LIMIT_CEILING = 100_000;
+
+/** The installation's limit, or the default when the variable is unset or not a whole number in range. */
+export function webhookLimit(env: {
+  WEBHOOKS_MAX_PER_PROJECT?: string;
+}): number {
+  const configured = Number(env.WEBHOOKS_MAX_PER_PROJECT);
+  return Number.isInteger(configured) &&
+    configured >= 1 &&
+    configured <= WEBHOOK_LIMIT_CEILING
+    ? configured
+    : WEBHOOK_MAX_SUBSCRIPTIONS_PER_PROJECT;
+}
 
 type WebhookRow = {
   id: string;
@@ -134,6 +147,7 @@ export async function createWebhook(
       status as 201,
     );
   };
+  const limit = webhookLimit(c.env);
   return withIdempotency(c, {
     replay,
     execute: async (lease) => {
@@ -168,7 +182,7 @@ export async function createWebhook(
           now,
           ...lease.guard.bindings,
           projectId,
-          WEBHOOK_MAX_SUBSCRIPTIONS_PER_PROJECT,
+          limit,
         ),
         // The key completes only for a webhook that exists.
         lease.completeStatement(id, 201, {
@@ -183,10 +197,10 @@ export async function createWebhook(
         )
           .bind(projectId)
           .first<{ n: number }>();
-        if ((live?.n ?? 0) >= WEBHOOK_MAX_SUBSCRIPTIONS_PER_PROJECT)
+        if ((live?.n ?? 0) >= limit)
           throw new ApiError(
             "conflict",
-            `A project holds at most ${WEBHOOK_MAX_SUBSCRIPTIONS_PER_PROJECT} webhooks`,
+            `A project holds at most ${limit} webhooks`,
           );
         throw new ApiError("idempotency_in_progress", "Retry the request");
       }

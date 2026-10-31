@@ -1122,7 +1122,7 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
 ```
 
 - **Patterns:** `*`, `<group>.*` or one exact type. An integrator key subscribes its own project; an
-  administrator key names `project_id`. A project holds at most 20 webhooks, also when creates race.
+  administrator key names `project_id`. A project holds at most 20 webhooks, also when creates race; the operator can raise the limit with the Worker variable `WEBHOOKS_MAX_PER_PROJECT` (an integrator that serves many customers from one project then limits its customers itself).
 - **The secret** is shown in the creation answer only (and in an idempotent replay of it). The static
   `headers` are stored sealed and never shown again (only their names). Many automation tools cannot
   verify a signature but can check a header; use `headers` for them. The URL itself is stored and shown in
