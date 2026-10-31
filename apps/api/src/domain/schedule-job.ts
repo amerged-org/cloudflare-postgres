@@ -33,23 +33,32 @@ const classified = (
 
 /**
  * One run of a schedule: the statements go as one transaction through the Edge's `/sql`, as the
- * schedule's role, so the Edge admits and wakes the database as for any request. A suspended or
- * deleted database is not woken. The request is sent once; an answer that is lost is an unknown
+ * schedule's role, so the Edge admits and wakes the database as for any request. A database that
+ * was suspended on purpose, or deleted, is not woken. The request is sent once; an answer that is lost is an unknown
  * outcome and the caller never sends it again.
  */
 export async function runScheduleJob(env: Env, job: JobSpec): Promise<JobRun> {
   const database = await env.DB.prepare(
-    "SELECT desired_state, deleted_at FROM databases WHERE id = ?",
+    "SELECT desired_state, suspension_reason, deleted_at FROM databases WHERE id = ?",
   )
     .bind(job.databaseId)
-    .first<{ desired_state: string; deleted_at: string | null }>();
+    .first<{
+      desired_state: string;
+      suspension_reason: string | null;
+      deleted_at: string | null;
+    }>();
   if (
     !database ||
     database.deleted_at !== null ||
     database.desired_state === "deleted"
   )
     return { kind: "skipped", reason: "gone" };
-  if (database.desired_state === "suspended")
+  // An idle database is suspended too, and the Edge wakes it like for any request; only a suspension
+  // that someone asked for keeps a schedule from running.
+  if (
+    database.desired_state === "suspended" &&
+    database.suspension_reason !== "idle"
+  )
     return { kind: "skipped", reason: "suspended" };
   const role = await env.DB.prepare(
     "SELECT password_ciphertext, password_iv, password_kid FROM roles WHERE database_id = ? AND name = ? AND deleted_at IS NULL",

@@ -249,13 +249,13 @@ it("records each kind of answer and sends nothing twice", async () => {
   }
 });
 
-it("does not wake a suspended database", async () => {
+it("does not wake a database that was suspended on purpose", async () => {
   const f = await fixture();
   const { id } = await served(f);
   await withEdge(id, () => new Response(null, { status: 200 }));
   await put(f, id, "job", {});
   await env.DB.prepare(
-    "UPDATE databases SET desired_state='suspended' WHERE id=?",
+    "UPDATE databases SET desired_state='suspended', suspension_reason='manual' WHERE id=?",
   )
     .bind(id)
     .run();
@@ -263,6 +263,22 @@ it("does not wake a suspended database", async () => {
     outcome: "skipped_suspended",
   });
   expect(edge).not.toHaveBeenCalled();
+});
+
+it("wakes a database that sleeps only because it was idle", async () => {
+  const f = await fixture();
+  const { id } = await served(f);
+  await withEdge(id, () => new Response(null, { status: 200 }));
+  await put(f, id, "job", {});
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='suspended', suspension_reason='idle' WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  expect(await runByHand(f, id, "job")).toMatchObject({
+    outcome: "succeeded",
+  });
+  expect(edge).toHaveBeenCalledOnce();
 });
 
 it("tries a refused occurrence again within its allowance and then gives it up", async () => {
