@@ -63,6 +63,12 @@ export async function cleanupFixtures(): Promise<void> {
       env.DB.prepare(
         "DELETE FROM node_region_policies WHERE region_id IN(?,?)",
       ).bind(region, foreign),
+      env.DB.prepare(
+        "DELETE FROM webhook_subscriptions WHERE project_id IN(?,?)",
+      ).bind(project, other),
+      env.DB.prepare(
+        "DELETE FROM execution_usage WHERE project_id IN(?,?)",
+      ).bind(project, other),
       env.DB.prepare(`DELETE FROM role_deletions WHERE ${databaseScope}`).bind(
         project,
         other,

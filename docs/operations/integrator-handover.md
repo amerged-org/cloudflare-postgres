@@ -590,6 +590,12 @@ operation}`) and `Location: /v1/operations/{id}`.
 | `getDatabaseArchive`                                          | `GET /v1/databases/{id}/archive`                      | counts only                                                                                                                                                                                                             |
 | `getDatabaseBackups`                                          | `GET /v1/databases/{id}/backups`                      | the restorable window and the restorable base backups ([2.7](#27-backups-restorable-window-and-restore))                                                                                                                |
 | `getUsage`                                                    | `GET /v1/usage`                                       | [5](#5-metering)                                                                                                                                                                                                        |
+| `createWebhook`, `listWebhooks`, `getWebhook`, `deleteWebhook`   | `/v1/webhooks`, `/v1/webhooks/{id}`                   | [2.8](#28-webhooks); `createWebhook` shows the signing secret once
+| `putSchedule`, `listSchedules`, `getSchedule`, `deleteSchedule` | `PUT`, `GET`, `DELETE /v1/databases/{id}/schedules/{name}`, `GET …/schedules` | [2.9](#29-schedules); `PUT` creates (201) or replaces (200)
+| `listScheduleRuns`, `runScheduleNow`                          | `GET …/schedules/{name}/runs`, `POST …/schedules/{name}/run` | the last 50 runs; a manual run, queued (202)
+| `getExecutionUsage`                                           | `GET /v1/execution-usage`                             | [5.1](#51-executions)
+| `testWebhook`                                                 | `POST /v1/webhooks/{id}/test`                         | one `webhook.test` event, sent now, not retried
+| `listWebhookDeliveries`, `replayWebhookDelivery`              | `GET /v1/databases/{id}/webhook-deliveries`, `POST …/{delivery_id}/replay` | the deliveries of a database's events
 | `listSizeClasses`                                             | `GET /v1/size-classes`                                |                                                                                                                                                                                                                         |
 | `listProjects`, `getProject`, `deleteProject`                 | `/v1/projects`, `/v1/projects/{id}`                   |                                                                                                                                                                                                                         |
 | `getDatabaseResourceProfile`, `assignDatabaseResourceProfile` | `GET`, `PUT /v1/databases/{id}/resource-profile`      | operator-defined profile revisions; an assignment is a resize                                                                                                                                                           |
@@ -666,8 +672,8 @@ is DONE, so it is never writable before it is restorable. The idle time
 | `succeeded`          | the observed state matches the intent                                          |
 | `failed`             | `error.code` and `error.message` say why; see [A.3](#a3-operation-error-codes) |
 
-Poll with a short interval at first and a longer one afterwards; there is no event stream or
-webhook (open work). Kinds you start: `database.create`, `database.restore` (it belongs to the new
+Poll with a short interval at first and a longer one afterwards, or subscribe to
+`operation.succeeded` and `operation.failed` webhooks ([2.8](#28-webhooks)). Kinds you start: `database.create`, `database.restore` (it belongs to the new
 database), `database.delete`, `database.resize`, `database.suspend`, `database.resume`,
 `database.role.delete`. PGCF starts `database.hibernate` (idle sleep) and `database.wake` (a
 connection) itself; they appear in `GET /v1/databases/{id}/operations` like any other.
@@ -1085,6 +1091,122 @@ in [7.3](#73-recovery-time).
 The October 23 restore failures listed in [8](#8-not-available-yet) are historical. The corrected
 regional provider paths and bounded G9 queue/restart acceptance passed on October 25. A terminal
 failed `/restore` operation remains failed; reconcile its target before requesting another restore.
+
+The lists of the schedules (at most 20, by name) and of a schedule's runs (`limit` 1 to 50, newest first) take
+no `cursor`; the other new lists follow the usual `limit` and `cursor`. These routes are additive: the
+contract version stays 1.5.0.
+
+### 2.8 Webhooks
+
+A webhook subscribes an HTTPS URL to the events of your project's databases, so that nothing has to
+poll. These events exist now:
+
+| Type | When |
+| --- | --- |
+| `database.created`, `database.ready` | the database was accepted, and it is ready to connect |
+| `database.woke`, `database.slept` | it started for a connection or `resume`, and it went to sleep when idle |
+| `database.suspended`, `database.resized`, `database.deleted` | a `suspend`, a resize and a delete finished |
+| `operation.succeeded`, `operation.failed` | an operation you started finished (`data.operation_id`, `kind`, `error_code`); not the role removals (`database.role.delete`), which you read from the operation, and not the operations PGCF starts itself (`database.hibernate`, `database.wake`), which are announced as `database.slept` and `database.woke` instead |
+| `webhook.test` | only from `POST /v1/webhooks/{id}/test` |
+
+```sh
+curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "url": "https://hooks.example.com/pgcf",
+    "event_types": ["database.*", "operation.*"],
+    "database_ids": ["<optional: only these databases>"],
+    "headers": {"Authorization": "Bearer <your receiver token>"}
+  }'
+# 201 {"id":"whk_...","project_id":"prj_...","url":"...","event_types":[...],"database_ids":null,
+#      "header_names":["Authorization"],"created_at":"...","secret":"whsec_..."}
+```
+
+- **Patterns:** `*`, `<group>.*` or one exact type. An integrator key subscribes its own project; an
+  administrator key names `project_id`. A project holds at most 20 webhooks.
+- **The secret** is shown in the creation answer only (and in an idempotent replay of it). The static
+  `headers` are stored sealed and never shown again (only their names). Many automation tools cannot
+  verify a signature but can check a header; use `headers` for them. The URL itself is stored and shown in
+  clear to every key of the project, so it is not a secret.
+- **The URL** must be `https`, on port 443 or 8443, with a DNS name (no IP address, `localhost`, a single-label
+  name, `.local`, `.internal`, `.lan`, `.corp` and similar suffixes, user information or fragment). Redirects are
+  not followed. A name that resolves to a private address is not detected here; such an address is not reachable
+  from Cloudflare's network. `headers`: at most 8; a name must not be `host`, `content-length`, `content-type`,
+  `connection`, `transfer-encoding`, `user-agent`, `te`, `upgrade` or `expect`, or start with `pgcf-`, `cf-` or
+  `x-forwarded-`; a value is 1 to 512 visible ASCII characters. An event pattern that matches no type is
+  accepted and never fires: check the spelling against the table.
+- **A delivery** is a POST of `{"id","type","occurred_at","project_id","database_id","data"}` with the
+  headers `PGCF-Signature: t=<unix seconds>,v1=<hex>`, `PGCF-Event-Id` and `PGCF-Delivery-Id`. The
+  signature is the hex HMAC-SHA256, keyed with the secret, of the string `<t>.<raw body>`; reject a
+  `t` more than five minutes from your clock.
+  ```ts
+  import { createHmac, timingSafeEqual } from "node:crypto";
+  function verify(secret: string, header: string, rawBody: string, nowSeconds: number): boolean {
+    const m = /^t=(\d{1,12}),v1=([0-9a-f]{64})$/.exec(header);
+    if (!m || Math.abs(nowSeconds - Number(m[1])) > 300) return false;
+    const mac = createHmac("sha256", secret).update(`${m[1]}.${rawBody}`).digest();
+    return timingSafeEqual(mac, Buffer.from(m[2]!, "hex"));
+  }
+  ```
+- **At least once.** Answer 2xx within 5 seconds; deduplicate by the event `id`. A failure is retried after
+  1 min, 5 min, 30 min, 2 h, 6 h and then every 12 h until 24 hours have passed since the event (seven
+  attempts over about 20.6 hours, then it is dead-lettered); `Retry-After` can lengthen a delay (up to one
+  hour) but never shorten the schedule's own. A 4xx other than 408, 425 and 429, and any redirect, end the retries at once.
+  A delivery that is out of retries is dead-lettered: `GET /v1/databases/{id}/webhook-deliveries` shows it
+  (delivered ones for 24 hours, dead-lettered ones for seven days), and `POST …/{delivery_id}/replay`
+  delivers it again with a fresh window. Deleting a webhook dead-letters its waiting deliveries.
+- **Timing.** Events leave within about a minute of the change, operation events within about two: they are
+  read from the lifecycle log and the finished operations by the minute cron (the operations a little after
+  they finished), so an event is not a real-time signal for a connection.
+- **History is not announced.** A webhook sees events from about its creation on: an event of the minute
+  before, or of a backlog after a cron outage, may still arrive. Events of a restored copy
+  belong to the new database.
+
+### 2.9 Schedules
+
+A schedule runs SQL statements on a database at fixed times, without a connection of yours. The run is
+an ordinary request to `/sql` that PGCF sends as one of the database's roles, so it wakes a sleeping
+database exactly as your own request does and the database goes back to sleep after its idle time.
+
+```sh
+curl -sS -X PUT https://api.example.org/v1/databases/$DB/schedules/cleanup -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "cron": "30 3 * * *",
+    "role": "app",
+    "statements": ["delete from sessions where expires_at < now()"],
+    "timeout_ms": 60000
+  }'
+# 201 {"name":"cleanup","cron":"30 3 * * *","every_seconds":null,"statements":[...],"role":"app",
+#      "timeout_ms":60000,"enabled":true,"next_run_at":"2026-10-31T03:30:00.000Z","created_at":"..."}
+```
+
+- **Times.** `cron` is a UTC five-field expression (`*`, numbers, ranges, steps, lists, month and weekday
+  names; a day that is restricted in both the day-of-month and weekday field matches either, as in Vixie
+  cron). `every_seconds` (60 to 2,678,400) counts from the moment you create the schedule. Give exactly
+  one. There is no finer resolution than a minute: a database that must run something more often than
+  that has to stay warm and run it itself.
+- **Start offset.** A run starts a fixed time after its instant, different for each database and schedule,
+  up to a quarter of the interval and at most one minute, so that databases that share an expression
+  do not wake together. `next_run_at` is the instant, not the start.
+- **The statements** are one transaction (at most 20 statements, 64 KiB together) sent with a `SET LOCAL
+  statement_timeout` of `timeout_ms` (default 1,000 to 900,000, default 60,000). The role must exist and
+  needs only the rights the statements use. A database holds at most 20 schedules. `enabled` (default
+  `true`; a replace without it enables the schedule again) pauses a schedule when `false`, and a manual run
+  of a disabled schedule answers 409. Only a project key creates, replaces or runs schedules: an
+  administrator key can read them, because a run executes statements as a customer's role.
+- **Outcomes** are listed by `GET …/runs` (the last 50): `succeeded`, `failed` (PostgreSQL refused a
+  statement; `sqlstate` tells which), `timed_out`, `rejected` (the role, its password or the endpoint
+  is unusable, or its stored password cannot be opened: `sqlstate` `credential_unreadable`), `outcome_unknown` (the answer was lost: **the run is never sent again**, and the next
+  occurrence is a new run, so write idempotent statements), `skipped_capacity` (the node refused to
+  wake the database; the run is tried again with backoff until half the interval has passed, at most
+  ten minutes), `skipped_suspended`, `skipped_deleted` and `skipped_missed` (the run could not start
+  within half the interval, at most ten minutes, after its time, or the platform could not start it
+  (`sqlstate` `unavailable`); it is not made up). A manual run that the platform could not start is
+  recorded as `rejected` with `sqlstate` `unavailable`.
+- **A suspended database is not woken** by a schedule; resume it and the next occurrence runs.
+- **A restored copy has no schedules**, because it is a new database; schedules are not part of the data.
+- **Cost.** Every run that starts the database adds to its `awake_seconds`. A schedule that runs more
+  often than the idle time keeps the database awake.
+- `POST …/schedules/{name}/run` queues one run now, besides the regular ones (`manual: true`).
 
 ## 3. Connecting
 
@@ -1722,11 +1844,31 @@ query counts and latencies, node RAM, CPU and disk time series (the plan records
 live minutes and only current values are readable), per-connection or per-statement data, and
 any price.
 
+### 5.1 Executions
+
+`GET /v1/usage` measures the databases themselves. What the schedules ([2.9](#29-schedules)), events
+and webhooks ([2.8](#28-webhooks)) did is counted separately, so that the usage contract stays as it
+is: `GET /v1/execution-usage?project_id=…|database_id=…&from=…&to=…&granularity=hour|day` (exactly one
+scope; aligned UTC boundaries, at most 31 days; the usual `limit` and `cursor`).
+
+| Metric | Counts |
+| --- | --- |
+| `schedule_runs_succeeded`, `_failed`, `_timed_out`, `_outcome_unknown`, `_rejected` | the schedule runs that ended with that outcome |
+| `schedule_runs_skipped` | the runs recorded as `skipped_capacity`, `skipped_suspended`, `skipped_deleted` or `skipped_missed` |
+| `events_emitted`, `event_bytes` | events stored for the database (the JSON of `data`), once per event |
+| `webhook_attempts` | every request that was sent to a receiver, retries included; a delivery that could not be prepared (the subscription is gone or cannot be opened) sends none and counts none |
+| `webhook_deliveries_delivered`, `webhook_deliveries_dead_lettered` | deliveries that ended, a replay counted again |
+
+A period without a row had no executions; in a row, a metric that is absent from the database is 0. A
+database writes each hour a minute after it ended, and a row is `final` two hours after its period
+ended: bill only final rows. PGCF counts; what an execution costs is yours to decide. A scheduled run
+that starts the database also shows in its `awake_seconds`.
+
 ## 6. Alerts and operations
 
 Alerts are infrastructure alerts for the **operator**. The candidate independently sends them
 to the authenticated operator webhook and configured email recipients. Integrator alert
-subscriptions are not introduced. The owner confirmed the recipient on 2026-10-19 and, on the evening of
+subscriptions are not introduced; the events of your own databases are webhooks ([2.8](#28-webhooks)). The owner confirmed the recipient on 2026-10-19 and, on the evening of
 2026-10-20, that the alerts arrive; the control database held delivered episodes of several kinds,
 go-live gate G5 is met and every kind carries its runbook action ("G5 met: the alerts reach the
 owner's webhook"). The operator reads the alerts' state in
@@ -1953,7 +2095,7 @@ When reporting an incident, send:
   are accepted in the dated ULTRA update; dependent test-population cleanup remains open.
 - Alerts for integrators (alerts go to the operator); operator acknowledgement and test send. Operational health exposes delivery/recovery receipts, not a complete event-history API.
 - Finding deleted databases: the lists exclude them, so keep the IDs you were given.
-- An event stream or webhooks, an audit log of integrator keys (the administrator keys have one).
+- An event stream beyond the webhooks of [2.8](#28-webhooks) (no ordering guarantee, no data-change events), an audit log of integrator keys (the administrator keys have one).
 - Last-use display and key rotation as a feature; an API domain with rate limiting.
 - Infrastructure metrics history and measured CPU and RAM per database.
 - Changing a role after creation (expiry, limit, membership), user-chosen passwords, a grants API,

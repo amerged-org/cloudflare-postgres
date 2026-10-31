@@ -181,6 +181,68 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "project",
   ),
   "GET /v1/usage": route("getUsage", "Read measured usage rollups", "project"),
+  "GET /v1/execution-usage": route(
+    "getExecutionUsage",
+    "Read the counted executions of schedules, events and webhooks",
+    "project",
+  ),
+  "PUT /v1/databases/{id}/schedules/{name}": route(
+    "putSchedule",
+    "Create or replace a schedule of SQL statements",
+    "project",
+  ),
+  "GET /v1/databases/{id}/schedules": route(
+    "listSchedules",
+    "List the schedules of a database",
+    "project",
+  ),
+  "GET /v1/databases/{id}/schedules/{name}": route(
+    "getSchedule",
+    "Read a schedule",
+    "project",
+  ),
+  "DELETE /v1/databases/{id}/schedules/{name}": route(
+    "deleteSchedule",
+    "Delete a schedule",
+    "project",
+  ),
+  "GET /v1/databases/{id}/schedules/{name}/runs": route(
+    "listScheduleRuns",
+    "List the runs of a schedule",
+    "project",
+  ),
+  "POST /v1/databases/{id}/schedules/{name}/run": route(
+    "runScheduleNow",
+    "Run a schedule now",
+    "project",
+  ),
+  "POST /v1/webhooks": route(
+    "createWebhook",
+    "Subscribe an HTTPS URL to events",
+    "project",
+  ),
+  "GET /v1/webhooks": route("listWebhooks", "List webhooks", "project"),
+  "GET /v1/webhooks/{id}": route("getWebhook", "Read a webhook", "project"),
+  "DELETE /v1/webhooks/{id}": route(
+    "deleteWebhook",
+    "Delete a webhook",
+    "project",
+  ),
+  "POST /v1/webhooks/{id}/test": route(
+    "testWebhook",
+    "Send a test event to a webhook",
+    "project",
+  ),
+  "GET /v1/databases/{id}/webhook-deliveries": route(
+    "listWebhookDeliveries",
+    "List the webhook deliveries of a database",
+    "project",
+  ),
+  "POST /v1/databases/{id}/webhook-deliveries/{delivery_id}/replay": route(
+    "replayWebhookDelivery",
+    "Deliver a webhook delivery again",
+    "project",
+  ),
   "GET /v1/costs": route(
     "getInfrastructureCosts",
     "Read measured infrastructure costs",

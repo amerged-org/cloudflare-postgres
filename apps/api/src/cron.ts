@@ -9,6 +9,7 @@ import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
 import { hintNode } from "./domain/node-hints.ts";
 import { runBackupRetention } from "./domain/backup-retention.ts";
+import { runWebhookEvents } from "./domain/webhook-events.ts";
 import { runNodeFencingCron } from "./domain/node-loss.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
 import { runInfrastructureBackupCron } from "./domain/infrastructure-backups.ts";
@@ -365,6 +366,8 @@ export async function runCron(
   await attempt("backup_retention", undefined, () =>
     runBackupRetention(env, now),
   );
+  // After the steps that finish operations, so that one minute's events leave in that minute.
+  await attempt("webhook_events", undefined, () => runWebhookEvents(env));
 
   if (previous !== null)
     try {

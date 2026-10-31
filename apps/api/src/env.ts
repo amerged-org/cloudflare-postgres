@@ -58,6 +58,8 @@ export type Env = Cloudflare.Env & {
    * 8000, 0 turns the keep-warm off, any other value is 1000 to 300000 (`domain/actor-warm.ts`).
    */
   DATABASE_ACTOR_WARM_INTERVAL_MS?: string;
+  /** The Edge Worker, through which a schedule's statements run as a request to `/sql` (`domain/schedule-job.ts`). */
+  EDGE?: Fetcher;
   INFRASTRUCTURE_ALERT_WEBHOOK?: Fetcher;
   INFRASTRUCTURE_ALERT_WEBHOOK_URL?: string;
   INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN?: string;

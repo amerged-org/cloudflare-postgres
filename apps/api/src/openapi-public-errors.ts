@@ -55,6 +55,24 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/databases/{id}/archive": [400, 401, 404, 500],
   "GET /v1/databases/{id}/backups": [400, 401, 404, 500],
   "GET /v1/usage": [400, 401, 404, 500],
+  "GET /v1/execution-usage": [400, 401, 404, 500],
+  "PUT /v1/databases/{id}/schedules/{name}": [400, 401, 403, 404, 409, 500],
+  "GET /v1/databases/{id}/schedules": [400, 401, 404, 500],
+  "GET /v1/databases/{id}/schedules/{name}": [400, 401, 404, 500],
+  "DELETE /v1/databases/{id}/schedules/{name}": [400, 401, 403, 404, 500],
+  "GET /v1/databases/{id}/schedules/{name}/runs": [400, 401, 404, 500],
+  "POST /v1/databases/{id}/schedules/{name}/run": [
+    400, 401, 403, 404, 409, 500,
+  ],
+  "POST /v1/webhooks": [400, 401, 403, 404, 409, 500],
+  "GET /v1/webhooks": [400, 401, 404, 500],
+  "GET /v1/webhooks/{id}": [400, 401, 404, 500],
+  "DELETE /v1/webhooks/{id}": [400, 401, 403, 404, 500],
+  "POST /v1/webhooks/{id}/test": [400, 401, 403, 404, 500],
+  "GET /v1/databases/{id}/webhook-deliveries": [400, 401, 404, 500],
+  "POST /v1/databases/{id}/webhook-deliveries/{delivery_id}/replay": [
+    400, 401, 403, 404, 409, 500,
+  ],
   "GET /v1/costs": [400, 401, 403, 404, 500],
   "POST /v1/costs/node-facts": [400, 401, 403, 404, 409, 500],
 
@@ -144,6 +162,7 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "PUT /v1/resource-profiles/{id}/rollout",
   "PUT /v1/resource-profiles/{id}",
   "PUT /v1/databases/{id}/resource-profile",
+  "POST /v1/webhooks",
 ]);
 
 /** withIdempotency refuses an omitted key on these routes (400) before submitting durable work, and
@@ -178,6 +197,10 @@ export const locationResponses: Readonly<
   "POST /v1/projects": {
     "201":
       "Created project resource path, also returned on a completed idempotency replay.",
+  },
+  "POST /v1/webhooks": {
+    "201":
+      "Created webhook resource path, also returned on a completed idempotency replay.",
   },
   "POST /v1/regions": {
     "201":

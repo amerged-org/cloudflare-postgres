@@ -11,6 +11,7 @@ export { ActorWarmer } from "./actor-warmer.ts";
 export { CronWatchdog } from "./cron-watchdog.ts";
 export { DatabaseActor } from "./database-actor.ts";
 export { NodeActor } from "./node-actor.ts";
+export { TriggerActor } from "./trigger-actor.ts";
 export { AddNode, InfrastructureBackup } from "./workflows/entrypoints.ts";
 
 let app: Promise<{ fetch: ExportedHandlerFetchHandler<Env> }> | undefined;
