@@ -303,6 +303,21 @@ window test below found no failed wake; its record has 37 wakes but 32 ticket cl
 say how the other five were admitted, and whether a wake that fell inside the export was slower than
 the others was not measured.
 
+**Measured from the Worker logs, 2026-10-26 to 2026-10-31.** The window of a daily export is the
+time from the first to the last D1 error of the Worker (`D1_ERROR: Currently processing a
+long-running export`, failed node posts, failed cron steps), a lower bound: 8.5, 4.6, 7.4, 7.0, at
+least 4.3 and 7.3 s on six runs, and 14.7 s on the failed attempt of 2026-10-31, which ended the
+second the lock lifted. It starts 6 to 11 s after the run was created and does not follow the size
+(6.1 s at 37 MB, 7.3 s at 104 MB). Paths during the window: the management API, the node
+endpoints (observations, volumes, desired page, events), the cron steps and the alerts read D1 and
+fail with a 500 or `d1_error`; the node keeps and resends what it could not post. A connection to
+an awake database (snapshot path) and a wake of an idle sleeper (ticket path) are answered from the
+DatabaseActor's own state with `handler_ms` 0 and no refusal; the ticket's D1 claim fails and the
+ticket stays pending until the next connect. The `ensure_awake` path reads D1 and is refused with
+`08006` inside the window. An Actor whose publish waits on the locked D1 holds its gate, which
+queues every other call to that Actor: `actor_gate_held` 6.1 to 6.5 s on three Actors on
+2026-10-31 and 2026-10-26.
+
 **Window test (go-live gate G6), passed 2026-10-22.** The test does not wait for the nightly run: a
 private operator tool starts the same raw D1 export of the control database that the nightly backup
 makes (`output_format: polling`, the nightly dump options; no Workflow, no backup row, and the signed
