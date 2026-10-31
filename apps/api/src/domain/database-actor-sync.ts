@@ -82,6 +82,16 @@ export const ACTOR_RECONCILE_BUDGET_MS = 20_000;
  * bound the page waited for them, the step ran into its 240 s limit and the cursor stayed.
  */
 export const ACTOR_PUBLISH_TIMEOUT_MS = 15_000;
+/**
+ * A database whose deletion the node confirmed, and whose row has not changed for this long, is no
+ * longer reconciled: its Actor holds the deleted presence and snapshot (published at the delete,
+ * at the confirmation and by every cycle since, a cycle takes minutes), every admission answers
+ * 3D000 from it, and a publish would only rewrite the same state. Live on 2026-10-31, 1,295 of
+ * 1,517 rows were such, and about 85 percent of every pass went to their cold Actors, which hung
+ * from 2026-10-30 19:53 to 2026-10-31 01:15 UTC. Anything not confirmed, with a volume left, or
+ * changed within the retention is still reconciled.
+ */
+export const ACTOR_DELETED_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
 /**
  * One bounded keyset page; the cron and trusted callers decide when to read the next. The
@@ -91,7 +101,7 @@ export const ACTOR_PUBLISH_TIMEOUT_MS = 15_000;
  * fails, or does not return within `publishTimeoutMs`, is named in `failed` and does not stop the
  * others: one Actor that cannot publish must not hold the cursor and with it the reconciliation
  * of every database behind it. The cursor moves on and the failed one is tried again when the
- * cursor comes round.
+ * cursor comes round. A page lists only databases that are not retired (`ACTOR_DELETED_RETENTION_MS`).
  */
 export interface ActorPublishFailure {
   readonly database_id: string;
@@ -117,10 +127,13 @@ export async function reconcileDatabaseActors(
   // how little else it loads), and only the cron reads a page.
   const { eachBounded } = await import("./bounded.ts");
   const { cronErrorMessage, runWithin } = await import("./cron-health.ts");
+  const retired = new Date(
+    Date.now() - ACTOR_DELETED_RETENTION_MS,
+  ).toISOString();
   const page = await env.DB.prepare(
-    `SELECT id FROM databases ${after ? "WHERE id>?" : ""} ORDER BY id LIMIT ?`,
+    `SELECT d.id FROM databases d WHERE ${after ? "d.id>? AND " : ""}NOT (d.deleted_at IS NOT NULL AND d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation AND d.updated_at<? AND NOT EXISTS(SELECT 1 FROM node_volumes v WHERE v.database_id=d.id)) ORDER BY d.id LIMIT ?`,
   )
-    .bind(...(after ? [after, limit] : [limit]))
+    .bind(...(after ? [after, retired, limit] : [retired, limit]))
     .all<{ id: string }>();
   const found = page.results.map((row) => row.id);
   const failed: ActorPublishFailure[] = [];
