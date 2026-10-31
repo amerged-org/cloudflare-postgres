@@ -70,6 +70,12 @@ const lifecycle = (databaseId: string, kind: string) =>
   )
     .bind(kind, new Date().toISOString(), databaseId)
     .run();
+const unthrottle = (webhookId: string) =>
+  env.DB.prepare(
+    "UPDATE webhook_subscriptions SET last_tested_at = NULL WHERE id = ?",
+  )
+    .bind(webhookId)
+    .run();
 const actor = (databaseId: string) =>
   env.TRIGGER_ACTOR.get(env.TRIGGER_ACTOR.idFromName(databaseId));
 const deliveries = async (f: Fixture, databaseId: string) =>
@@ -213,6 +219,7 @@ it("sends a signed test event with the static headers and reports the receiver's
     database_id: null,
   });
 
+  await unthrottle(webhook.id);
   answer(500);
   const failed = WebhookTestResult.parse(
     await (
@@ -224,6 +231,7 @@ it("sends a signed test event with the static headers and reports the receiver's
     status: 500,
     error: "http",
   });
+  await unthrottle(webhook.id);
   receiver.mockRejectedValue(
     Object.assign(new Error("x"), { name: "TimeoutError" }),
   );
@@ -497,4 +505,81 @@ it("lets a delivery that cannot be prepared follow the retry schedule, uncounted
     state: "dead_lettered",
     last_error: "expired",
   });
+});
+
+it("holds a project to twenty webhooks even when creates race", async () => {
+  const f = await fixture();
+  for (let i = 0; i < 19; i += 1)
+    expect(
+      (await subscribe(f, { url: `https://hooks.example.com/${i}` })).status,
+    ).toBe(201);
+  const results = await Promise.all(
+    [0, 1, 2].map((i) =>
+      subscribe(f, { url: `https://race.example.com/${i}` }),
+    ),
+  );
+  expect(results.map((response) => response.status).sort()).toEqual([
+    201, 409, 409,
+  ]);
+  const listed = (await (
+    await request("/v1/webhooks?limit=100", f.integrator)
+  ).json()) as { data: unknown[] };
+  expect(listed.data).toHaveLength(20);
+});
+
+it("tests a webhook at most once every five seconds", async () => {
+  const f = await fixture();
+  const webhook = await created(await subscribe(f));
+  expect(
+    (await request(`/v1/webhooks/${webhook.id}/test`, f.integrator, "POST"))
+      .status,
+  ).toBe(200);
+  expect(
+    await refusal(
+      await request(`/v1/webhooks/${webhook.id}/test`, f.integrator, "POST"),
+    ),
+  ).toMatchObject({
+    status: 429,
+    code: "rate_limited",
+  });
+  expect(sentTo(RECEIVER)).toHaveLength(1);
+  await env.DB.prepare(
+    "UPDATE webhook_subscriptions SET last_tested_at = ? WHERE id = ?",
+  )
+    .bind(new Date(Date.now() - 6_000).toISOString(), webhook.id)
+    .run();
+  expect(
+    (await request(`/v1/webhooks/${webhook.id}/test`, f.integrator, "POST"))
+      .status,
+  ).toBe(200);
+});
+
+it("takes the webhook limit of a project from the installation", async () => {
+  const f = await fixture();
+  const withLimit = (url: string) =>
+    request(
+      "/v1/webhooks",
+      f.integrator,
+      "POST",
+      { url, event_types: ["database.*"] },
+      undefined,
+      undefined,
+      { WEBHOOKS_MAX_PER_PROJECT: "2" },
+    );
+  expect((await withLimit("https://a.example.com/h")).status).toBe(201);
+  expect((await withLimit("https://b.example.com/h")).status).toBe(201);
+  expect(
+    await refusal(await withLimit("https://c.example.com/h")),
+  ).toMatchObject({ status: 409, code: "conflict" });
+  // An unusable value falls back to the default of 20.
+  const fallback = await request(
+    "/v1/webhooks",
+    f.integrator,
+    "POST",
+    { url: "https://d.example.com/h", event_types: ["database.*"] },
+    undefined,
+    undefined,
+    { WEBHOOKS_MAX_PER_PROJECT: "many" },
+  );
+  expect(fallback.status).toBe(201);
 });

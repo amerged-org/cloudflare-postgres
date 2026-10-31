@@ -33,6 +33,21 @@ import { derivedId } from "./webhook-events.ts";
 import { checkWebhookUrl } from "./webhook-url.ts";
 import { newWebhookSecret } from "./webhook-signing.ts";
 
+const WEBHOOK_TEST_INTERVAL_MS = 5_000;
+const WEBHOOK_LIMIT_CEILING = 100_000;
+
+/** The installation's limit, or the default when the variable is unset or not a whole number in range. */
+export function webhookLimit(env: {
+  WEBHOOKS_MAX_PER_PROJECT?: string;
+}): number {
+  const configured = Number(env.WEBHOOKS_MAX_PER_PROJECT);
+  return Number.isInteger(configured) &&
+    configured >= 1 &&
+    configured <= WEBHOOK_LIMIT_CEILING
+    ? configured
+    : WEBHOOK_MAX_SUBSCRIPTIONS_PER_PROJECT;
+}
+
 type WebhookRow = {
   id: string;
   project_id: string;
@@ -132,19 +147,10 @@ export async function createWebhook(
       status as 201,
     );
   };
+  const limit = webhookLimit(c.env);
   return withIdempotency(c, {
     replay,
     execute: async (lease) => {
-      const live = await c.env.DB.prepare(
-        "SELECT count(*) AS n FROM webhook_subscriptions WHERE project_id = ? AND deleted_at IS NULL",
-      )
-        .bind(projectId)
-        .first<{ n: number }>();
-      if ((live?.n ?? 0) >= WEBHOOK_MAX_SUBSCRIPTIONS_PER_PROJECT)
-        throw new ApiError(
-          "conflict",
-          `A project holds at most ${WEBHOOK_MAX_SUBSCRIPTIONS_PER_PROJECT} webhooks`,
-        );
       const id = newWebhookId();
       const seal = sealer(c.env.CREDENTIAL_KEYS);
       const secret = await seal.seal(secretSealContext(id), newWebhookSecret());
@@ -157,7 +163,9 @@ export async function createWebhook(
           `INSERT INTO webhook_subscriptions(id, project_id, url, event_types, database_ids,
              secret_ciphertext, secret_iv, secret_kid, headers_ciphertext, headers_iv, headers_kid,
              header_names, created_at)
-           SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${lease.guard.sql}`,
+           SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${lease.guard.sql}
+             AND (SELECT count(*) FROM webhook_subscriptions
+                  WHERE project_id = ? AND deleted_at IS NULL) < ?`,
         ).bind(
           id,
           projectId,
@@ -173,11 +181,29 @@ export async function createWebhook(
           JSON.stringify(Object.keys(body.headers ?? {})),
           now,
           ...lease.guard.bindings,
+          projectId,
+          limit,
         ),
-        lease.completeStatement(id, 201),
+        // The key completes only for a webhook that exists.
+        lease.completeStatement(id, 201, {
+          sql: "EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = ?)",
+          bindings: [id],
+        }),
       ]);
-      if (inserted[0]?.meta.changes !== 1)
+      if (inserted[0]?.meta.changes !== 1) {
+        // The limit is part of the insert, so concurrent creates cannot pass it together.
+        const live = await c.env.DB.prepare(
+          "SELECT count(*) AS n FROM webhook_subscriptions WHERE project_id = ? AND deleted_at IS NULL",
+        )
+          .bind(projectId)
+          .first<{ n: number }>();
+        if ((live?.n ?? 0) >= limit)
+          throw new ApiError(
+            "conflict",
+            `A project holds at most ${limit} webhooks`,
+          );
         throw new ApiError("idempotency_in_progress", "Retry the request");
+      }
       return replay(id, 201);
     },
   });
@@ -228,9 +254,22 @@ export async function testWebhook(
   id: string,
 ): Promise<Response> {
   const row = await webhookForRequest(c, id);
+  const now = new Date();
+  // A test sends a real request to a third party: one every five seconds per webhook.
+  const claimed = await c.env.DB.prepare(
+    `UPDATE webhook_subscriptions SET last_tested_at = ?
+     WHERE id = ? AND deleted_at IS NULL AND (last_tested_at IS NULL OR last_tested_at < ?)`,
+  )
+    .bind(
+      now.toISOString(),
+      id,
+      new Date(now.getTime() - WEBHOOK_TEST_INTERVAL_MS).toISOString(),
+    )
+    .run();
+  if (claimed.meta.changes !== 1)
+    throw new ApiError("rate_limited", "Wait a few seconds between tests");
   const subscription = await loadSubscription(c.env, id);
   if (!subscription) throw new ApiError("not_found", "Webhook not found");
-  const now = new Date();
   const eventId = await derivedId(
     "evt",
     `test|${id}|${now.getTime()}|${crypto.randomUUID()}`,

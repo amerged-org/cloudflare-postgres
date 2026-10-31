@@ -594,7 +594,7 @@ operation}`) and `Location: /v1/operations/{id}`.
 | `putSchedule`, `listSchedules`, `getSchedule`, `deleteSchedule` | `PUT`, `GET`, `DELETE /v1/databases/{id}/schedules/{name}`, `GET …/schedules` | [2.9](#29-schedules); `PUT` creates (201) or replaces (200)
 | `listScheduleRuns`, `runScheduleNow`                          | `GET …/schedules/{name}/runs`, `POST …/schedules/{name}/run` | the last 50 runs; a manual run, queued (202)
 | `getExecutionUsage`                                           | `GET /v1/execution-usage`                             | [5.1](#51-executions)
-| `testWebhook`                                                 | `POST /v1/webhooks/{id}/test`                         | one `webhook.test` event, sent now, not retried
+| `testWebhook`                                                 | `POST /v1/webhooks/{id}/test`                         | one `webhook.test` event, sent now, not retried; at most one every 5 seconds per webhook (429)
 | `listWebhookDeliveries`, `replayWebhookDelivery`              | `GET /v1/databases/{id}/webhook-deliveries`, `POST …/{delivery_id}/replay` | the deliveries of a database's events
 | `listSizeClasses`                                             | `GET /v1/size-classes`                                |                                                                                                                                                                                                                         |
 | `listProjects`, `getProject`, `deleteProject`                 | `/v1/projects`, `/v1/projects/{id}`                   |                                                                                                                                                                                                                         |
@@ -1122,7 +1122,7 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
 ```
 
 - **Patterns:** `*`, `<group>.*` or one exact type. An integrator key subscribes its own project; an
-  administrator key names `project_id`. A project holds at most 20 webhooks.
+  administrator key names `project_id`. A project holds at most 20 webhooks, also when creates race; the operator can raise the limit with the Worker variable `WEBHOOKS_MAX_PER_PROJECT` (an integrator that serves many customers from one project then limits its customers itself).
 - **The secret** is shown in the creation answer only (and in an idempotent replay of it). The static
   `headers` are stored sealed and never shown again (only their names). Many automation tools cannot
   verify a signature but can check a header; use `headers` for them. The URL itself is stored and shown in

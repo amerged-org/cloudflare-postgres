@@ -256,8 +256,9 @@ because there is no central tick.
 - `PUT/GET/DELETE /v1/databases/{id}/schedules/{name}`, `GET .../schedules`,
   `GET .../schedules/{name}/runs`, `POST .../schedules/{name}/run`.
 - `GET /v1/execution-usage` carries the counts of 4.8 (a separate endpoint). `POST /v1/webhooks` takes an optional `Idempotency-Key`.
-- CLI: `pgcf webhook ...`, `pgcf schedule ...`. The OpenAPI document and the handover are updated in
-  the same change as each task below.
+- No `pgcf webhook` or `pgcf schedule` command (decided while building, 2026-10-31): the `pgcf` command is only the
+  connection bridge for psql and migration tools and has no API client at all, so a command set for the API would be a
+  new surface for no observed need. Integrators call the REST API, which the OpenAPI document and the handover describe.
 - An integrator exposes these calls through its own REST, CLI and MCP tools, scoped to its tenants, and
   prices them from the metrics of 4.8.
 

@@ -68,7 +68,7 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/webhooks": [400, 401, 404, 500],
   "GET /v1/webhooks/{id}": [400, 401, 404, 500],
   "DELETE /v1/webhooks/{id}": [400, 401, 403, 404, 500],
-  "POST /v1/webhooks/{id}/test": [400, 401, 403, 404, 500],
+  "POST /v1/webhooks/{id}/test": [400, 401, 403, 404, 429, 500],
   "GET /v1/databases/{id}/webhook-deliveries": [400, 401, 404, 500],
   "POST /v1/databases/{id}/webhook-deliveries/{delivery_id}/replay": [
     400, 401, 403, 404, 409, 500,

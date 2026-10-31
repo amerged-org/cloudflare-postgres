@@ -136,14 +136,21 @@ export function registerWebhooks(app: ApiApp): void {
       security,
       tags,
       description:
-        "Sends one `webhook.test` event to the URL now, once, and reports the receiver's answer. Nothing is stored or retried.",
+        "Sends one `webhook.test` event to the URL now, once, and reports the receiver's answer. Nothing is stored or retried. At most one test every five seconds per webhook (429 otherwise).",
       request: { params: z.object({ id: WebhookId }) },
       responses: {
         200: {
           description: "The receiver's answer",
           content: json(WebhookTestResult),
         },
-        ...errors(E400, E401, [403, "Insufficient scope"], E404, E500),
+        ...errors(
+          E400,
+          E401,
+          [403, "Insufficient scope"],
+          E404,
+          [429, "A test was sent a moment ago"],
+          E500,
+        ),
       },
     },
     async (c) => testWebhook(c, WebhookId.parse(c.req.param("id"))),
