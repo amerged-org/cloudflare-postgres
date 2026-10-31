@@ -75,15 +75,23 @@ export const ACTOR_RECONCILE_CONCURRENCY = 8;
  * published, in the next minute.
  */
 export const ACTOR_RECONCILE_BUDGET_MS = 20_000;
+/**
+ * How long one publish may take before it counts as failed. A cold publish takes 250-1100 ms and
+ * one that waits for a locked D1 about 6-14 s (the daily export). Live, calls to the Actors of
+ * deleted databases hung for minutes (2026-10-30 19:53 to 2026-10-31 01:15 UTC); without this
+ * bound the page waited for them, the step ran into its 240 s limit and the cursor stayed.
+ */
+export const ACTOR_PUBLISH_TIMEOUT_MS = 15_000;
 
 /**
  * One bounded keyset page; the cron and trusted callers decide when to read the next. The
  * publishes of the page overlap (`ACTOR_RECONCILE_CONCURRENCY`) and start only until the budget is
  * spent: `ids` are the databases whose publish was attempted, the head of the page, and `next` the
  * cursor after them (the page's last, or `null` after the last page of the table). A publish that
- * fails is named in `failed` and does not stop the others: one Actor that cannot publish must not
- * hold the cursor and with it the reconciliation of every database behind it. The cursor moves on
- * and the failed one is tried again when the cursor comes round.
+ * fails, or does not return within `publishTimeoutMs`, is named in `failed` and does not stop the
+ * others: one Actor that cannot publish must not hold the cursor and with it the reconciliation
+ * of every database behind it. The cursor moves on and the failed one is tried again when the
+ * cursor comes round.
  */
 export interface ActorPublishFailure {
   readonly database_id: string;
@@ -95,6 +103,7 @@ export async function reconcileDatabaseActors(
   after?: string,
   limit = 200,
   budgetMs = ACTOR_RECONCILE_BUDGET_MS,
+  publishTimeoutMs = ACTOR_PUBLISH_TIMEOUT_MS,
 ): Promise<{
   ids: string[];
   next: string | null;
@@ -107,7 +116,7 @@ export async function reconcileDatabaseActors(
   // Not a static import: a ticket claim loads this module (`actor-admission-imports.test.ts` pins
   // how little else it loads), and only the cron reads a page.
   const { eachBounded } = await import("./bounded.ts");
-  const { cronErrorMessage } = await import("./cron-health.ts");
+  const { cronErrorMessage, runWithin } = await import("./cron-health.ts");
   const page = await env.DB.prepare(
     `SELECT id FROM databases ${after ? "WHERE id>?" : ""} ORDER BY id LIMIT ?`,
   )
@@ -121,7 +130,9 @@ export async function reconcileDatabaseActors(
     until,
     async (id) => {
       try {
-        await sync(env, DatabaseId.parse(id));
+        await runWithin(publishTimeoutMs, "actor_publish_timeout", () =>
+          sync(env, DatabaseId.parse(id)),
+        );
       } catch (error) {
         failed.push({ database_id: id, message: cronErrorMessage(error) });
       }

@@ -260,6 +260,12 @@ failed run; it does not repeat an uncertain write or regenerate a different arch
 under the same object identity. A same-day retry or the next UTC day creates a fresh
 run with its own UUID and object keys.
 
+A failed run keeps only its generic `error_code`. When the provider's export call itself failed
+(`infrastructure_backup_d1_export_failed`), the `infrastructure_backup_failed` log line of the
+Worker also carries `provider_status` (the HTTP status), `provider_code` (the first Cloudflare error
+code) and `provider_message` (its message, URLs replaced and cut to 200 characters); no signed URL,
+token or header is logged.
+
 Backups become stale after 36 hours without an artifact of a complete attempt. The
 first failed run is failing even when no earlier backup exists; it stays failing
 while a retry runs, even after that retry completes some artifacts, and only a later
@@ -296,6 +302,21 @@ which path answered a connection (`snapshot`, `ticket`, `ensure_awake` or `refus
 window test below found no failed wake; its record has 37 wakes but 32 ticket claims and does not
 say how the other five were admitted, and whether a wake that fell inside the export was slower than
 the others was not measured.
+
+**Measured from the Worker logs, 2026-10-26 to 2026-10-31.** The window of a daily export is the
+time from the first to the last D1 error of the Worker (`D1_ERROR: Currently processing a
+long-running export`, failed node posts, failed cron steps), a lower bound: 8.5, 4.6, 7.4, 7.0, at
+least 4.3 and 7.3 s on six runs, and 14.7 s on the failed attempt of 2026-10-31, which ended the
+second the lock lifted. It starts 6 to 11 s after the run was created and does not follow the size
+(6.1 s at 37 MB, 7.3 s at 104 MB). Paths during the window: the management API, the node
+endpoints (observations, volumes, desired page, events), the cron steps and the alerts read D1 and
+fail with a 500 or `d1_error`; the node keeps and resends what it could not post. A connection to
+an awake database (snapshot path) and a wake of an idle sleeper (ticket path) are answered from the
+DatabaseActor's own state with `handler_ms` 0 and no refusal; the ticket's D1 claim fails and the
+ticket stays pending until the next connect. The `ensure_awake` path reads D1 and is refused with
+`08006` inside the window. An Actor whose publish waits on the locked D1 holds its gate, which
+queues every other call to that Actor: `actor_gate_held` 6.1 to 6.5 s on three Actors on
+2026-10-31 and 2026-10-26.
 
 **Window test (go-live gate G6), passed 2026-10-22.** The test does not wait for the nightly run: a
 private operator tool starts the same raw D1 export of the control database that the nightly backup

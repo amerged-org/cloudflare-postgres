@@ -210,6 +210,33 @@ describe("the actors of a page", () => {
     ]);
   });
 
+  it("name a publish that never returns, and neither stop the others nor hold the cursor", async () => {
+    // Live, 2026-10-30 19:53 to 2026-10-31 01:15 UTC: calls to the Actors of deleted databases hung
+    // for minutes, the step ran into its 240 s bound every minute and the cursor, which moves only
+    // after the page returns, stayed on the page with the hung Actors.
+    const ids = await databases(6);
+    const publish = admission.publishDatabaseAdmission;
+    const spy = vi
+      .spyOn(admission, "publishDatabaseAdmission")
+      .mockImplementation(async (...args) => {
+        if (args[1] === ids[2]) return new Promise<boolean>(() => {});
+        return publish(...args);
+      });
+    const page = await reconcileDatabaseActors(
+      env,
+      undefined,
+      6,
+      Infinity,
+      200,
+    );
+    expect(spy).toHaveBeenCalledTimes(6);
+    expect(page.ids).toEqual(ids);
+    expect(page.next).toBe(ids[5]);
+    expect(page.failed).toEqual([
+      { database_id: ids[2], message: "actor_publish_timeout" },
+    ]);
+  }, 5_000);
+
   it("keep the cursor where it was when the budget is spent before the first publish", async () => {
     const ids = await databases(3);
     const actors = slowActors();
