@@ -1,8 +1,8 @@
 # Database events, schedules and webhooks (proposal)
 
 Status: accepted by the owner on 2026-10-30 with the defaults of section 10 (cron-to-webhook is out of
-PGCF). Implementation follows the tasks of section 8; the ULTRA plan (11.1) records what is built and
-accepted. Based on `origin/main` at `5a9aaf27`.
+PGCF). Implementation follows the tasks of section 8; T1, T2 and T4 are deployed (2026-10-31) and T3 is not started; the
+ULTRA plan (11.1) records what is built and accepted. Based on `origin/main` at `5a9aaf27`.
 
 ## 1. Goal
 
