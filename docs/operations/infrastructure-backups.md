@@ -260,6 +260,12 @@ failed run; it does not repeat an uncertain write or regenerate a different arch
 under the same object identity. A same-day retry or the next UTC day creates a fresh
 run with its own UUID and object keys.
 
+A failed run keeps only its generic `error_code`. When the provider's export call itself failed
+(`infrastructure_backup_d1_export_failed`), the `infrastructure_backup_failed` log line of the
+Worker also carries `provider_status` (the HTTP status), `provider_code` (the first Cloudflare error
+code) and `provider_message` (its message, URLs replaced and cut to 200 characters); no signed URL,
+token or header is logged.
+
 Backups become stale after 36 hours without an artifact of a complete attempt. The
 first failed run is failing even when no earlier backup exists; it stays failing
 while a retry runs, even after that retry completes some artifacts, and only a later

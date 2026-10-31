@@ -363,6 +363,43 @@ export async function infrastructureBackupKey(secret: string, kid?: string) {
   );
   return { kid: selected, key: bytesToBase64url(new Uint8Array(bits)) };
 }
+/**
+ * The stored code of a failed export stays generic; the log line also gets what Cloudflare said:
+ * the HTTP status, its first error code and a bounded message without any URL.
+ */
+class InfrastructureBackupExportFailed extends Error {
+  readonly provider: {
+    provider_status: number;
+    provider_code?: number;
+    provider_message?: string;
+  };
+  constructor(status: number, body: unknown) {
+    super("infrastructure_backup_d1_export_failed");
+    const parsed = z
+      .object({
+        errors: z
+          .array(z.object({ code: z.unknown(), message: z.unknown() }))
+          .optional(),
+        result: z.object({ error: z.unknown() }).nullish(),
+      })
+      .safeParse(body);
+    const first = parsed.success ? parsed.data.errors?.[0] : undefined,
+      message = first?.message ?? (parsed.success && parsed.data.result?.error);
+    this.provider = {
+      provider_status: status,
+      ...(Number.isInteger(first?.code)
+        ? { provider_code: first?.code as number }
+        : {}),
+      ...(typeof message === "string" && message
+        ? {
+            provider_message: message
+              .replace(/https?:\/\/\S+/g, "[url]")
+              .slice(0, 200),
+          }
+        : {}),
+    };
+  }
+}
 /** The export endpoint only reads the existing D1 database; signed URLs never enter status or logs. */
 export async function exportControlD1(
   env: Env,
@@ -393,10 +430,11 @@ export async function exportControlD1(
       redirect: "manual",
       signal: AbortSignal.timeout(10000),
     });
-    if (response.status !== 200) {
-      await response.body?.cancel();
-      throw new Error("infrastructure_backup_d1_export_failed");
-    }
+    if (response.status !== 200)
+      throw new InfrastructureBackupExportFailed(
+        response.status,
+        await response.json().catch(() => undefined),
+      );
     const result = (await response.json()) as {
       success?: boolean;
       result?: {
@@ -414,7 +452,7 @@ export async function exportControlD1(
       result.result.success === false ||
       result.result.status === "error"
     )
-      throw new Error("infrastructure_backup_d1_export_failed");
+      throw new InfrastructureBackupExportFailed(response.status, result);
     if (result.result.status === "complete") {
       const signed =
         result.result.result?.signed_url ?? result.result.signed_url;
@@ -657,6 +695,9 @@ export async function finishInfrastructureBackup(
         error_name: /^[A-Za-z0-9_]{1,64}$/.test(name) ? name : "other",
         ...(/^[A-Za-z0-9 _.,:;'()-]{1,160}$/.test(text)
           ? { detail: text }
+          : {}),
+        ...(error instanceof InfrastructureBackupExportFailed
+          ? error.provider
           : {}),
       }),
     );

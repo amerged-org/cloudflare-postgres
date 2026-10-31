@@ -389,6 +389,68 @@ it("polls a real D1 export's at_bookmark and stops on the provider's error witho
   ).rejects.toThrow("infrastructure_backup_d1_export_failed");
   expect(redirects).toBe(1);
 });
+it("logs the provider's HTTP status, first error code and a bounded message when the D1 export fails, and keeps the stored code", async () => {
+  // Live, one daily export failed with only the generic code in the log: the status and the
+  // Cloudflare error that said why were dropped.
+  const f = await fixture(),
+    at = Date.now(),
+    run = crypto.randomUUID(),
+    binding = enabled(),
+    c = await configureInfrastructureBackups(binding, config(f.region), at);
+  await env.DB.prepare(
+    "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) VALUES(?,?,1,?,'running',?,?)",
+  )
+    .bind(
+      run,
+      new Date(at).toISOString().slice(0, 10),
+      c.revision,
+      new Date(at).toISOString(),
+      new Date(at + 3600000).toISOString(),
+    )
+    .run();
+  const signed =
+    "https://export.example.com/control.sql?X-Amz-Signature=sekret";
+  const failure = await exportControlD1(binding, run, async () =>
+    Response.json(
+      {
+        success: false,
+        errors: [
+          {
+            code: 7500,
+            message: `Currently processing ${signed} ${"x".repeat(300)}`,
+          },
+          { code: 7501, message: "second error" },
+        ],
+        result: null,
+      },
+      { status: 429, headers: { "set-cookie": "session=sekret" } },
+    ),
+  ).catch((error: unknown) => error);
+  const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await finishInfrastructureBackup(binding, run, failure);
+    const line = JSON.parse(String(logs.mock.calls[0]![0]));
+    expect(line).toMatchObject({
+      event: "infrastructure_backup_failed",
+      code: "infrastructure_backup_d1_export_failed",
+      provider_status: 429,
+      provider_code: 7500,
+    });
+    expect(line.provider_message).toHaveLength(200);
+    expect(line.provider_message).toMatch(/^Currently processing /);
+    expect(JSON.stringify(line)).not.toContain("sekret");
+    expect(JSON.stringify(line)).not.toContain("private-test-export-token");
+    expect(
+      await env.DB.prepare(
+        "SELECT error_code FROM infrastructure_backup_runs WHERE id=?",
+      )
+        .bind(run)
+        .first<string>("error_code"),
+    ).toBe("infrastructure_backup_d1_export_failed");
+  } finally {
+    logs.mockRestore();
+  }
+});
 it("polls the same export while D1 queries are locked and rechecks authority after completion", async () => {
   const f = await fixture(),
     at = Date.now(),
