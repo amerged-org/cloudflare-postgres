@@ -8,8 +8,9 @@ use super::{Core, Db, Desired, Entry, Retry, build::Refresh, entry::EventLimits,
 use crate::{
     drain::{self, State, Tuning},
     machine::Machine,
-    pgcf::{self, EventsRecord},
+    pgcf::EventsRecord,
 };
+use futures_util::StreamExt;
 use std::{
     collections::HashMap,
     sync::{
@@ -19,6 +20,10 @@ use std::{
     time::Duration,
 };
 use tokio::task::JoinHandle;
+
+/// How many databases a drain pass looks at once. A database whose platform schema waits for a
+/// lock holds up its own pass only, and the others get their drains while it waits.
+const DATABASES_AT_ONCE: usize = 16;
 
 /// The drains of the node's databases, one task for each, and the waits of the databases whose
 /// platform schema could not be made.
@@ -110,16 +115,21 @@ impl<M: Machine> Core<M> {
             return;
         }
         let events = self.policy().events;
-        for db in self.all() {
-            let Some(entry) = served_entry(&db) else {
-                self.drains.stop(&db.id);
-                continue;
-            };
-            if self.drains.running(&db.id) {
-                self.retune(&db, &entry, events).await;
-            } else {
-                self.start_drain(&db, events).await;
-            }
+        futures_util::stream::iter(self.all())
+            .for_each_concurrent(DATABASES_AT_ONCE, |db| self.drain_database(db, events))
+            .await;
+    }
+
+    /// The drain of one database in a pass: attached when it is served, detached when it is not.
+    async fn drain_database(&self, db: Arc<Db>, events: EventLimits) {
+        let Some(entry) = served_entry(&db) else {
+            self.drains.stop(&db.id);
+            return;
+        };
+        if self.drains.running(&db.id) {
+            self.retune(&db, &entry, events).await;
+        } else {
+            self.start_drain(&db, events).await;
         }
     }
 
@@ -143,6 +153,8 @@ impl<M: Machine> Core<M> {
         let Some(entry) = served_entry(db) else {
             return;
         };
+        // Taken before the refresh: a policy change during the install is then seen by the next pass.
+        let applied = EventsRecord::of(&self.event_settings(&entry), false);
         if !matches!(
             self.refresh_for_drain(db, &entry).await,
             Some(Refresh::Unchanged | Refresh::Installed)
@@ -169,7 +181,6 @@ impl<M: Machine> Core<M> {
             },
             state.clone(),
         ));
-        let applied = EventsRecord::of(&settings(&entry, events), false);
         self.drains.tasks().insert(
             db.id.clone(),
             Attached {
@@ -195,7 +206,7 @@ impl<M: Machine> Core<M> {
                 .max_payload_bytes
                 .store(events.max_payload_bytes, Ordering::Relaxed);
         });
-        let wanted = EventsRecord::of(&settings(entry, events), false);
+        let wanted = EventsRecord::of(&self.event_settings(entry), false);
         let applied = self
             .drains
             .with(&db.id, |attached| attached.applied.clone());
@@ -244,15 +255,6 @@ fn served_entry(db: &Db) -> Option<Entry> {
     }
     let entry = view.entry.clone();
     entry.filter(|entry| entry.desired != Desired::Deleted)
-}
-
-/// The platform schema's settings that `entry` wants under `events` (`Core::event_settings`).
-fn settings(entry: &Entry, events: EventLimits) -> pgcf::Settings {
-    pgcf::Settings {
-        epoch: entry.storage_generation,
-        max_payload_bytes: events.max_payload_bytes,
-        max_outbox_rows: events.max_outbox_rows,
-    }
 }
 
 #[cfg(test)]
@@ -594,5 +596,86 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1600)).await;
         rig.core.drain_pass().await;
         assert!(rig.core.drains.running(&entry.id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failing_schema_waits_alone_and_does_not_hold_back_the_other_databases() {
+        let Some(rig) = Rig::with_timing(
+            "drain-backoff-two",
+            Timing {
+                data_retry: Duration::from_millis(1500),
+                ..timing()
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let (blocked, _db) = rig.create().await;
+        let (free, _db) = rig.create().await;
+        for id in [&blocked.id, &free.id] {
+            tenant(&rig, id)
+                .await
+                .batch("DROP SCHEMA pgcf CASCADE")
+                .await
+                .unwrap();
+            std::fs::remove_file(rig.core.files(id).directory().join("events.json")).unwrap();
+        }
+        let blocker = tenant(&rig, &blocked.id).await;
+        blocker.batch("BEGIN; CREATE SCHEMA pgcf").await.unwrap();
+        // The pass waits for the blocked install (its lock timeout is 2 s); the other database
+        // gets its drain while it waits.
+        let core = rig.core.clone();
+        let pass = tokio::spawn(async move { core.drain_pass().await });
+        eventually(1, "the other database to get its drain", || {
+            rig.core.drains.running(&free.id)
+        })
+        .await;
+        pass.await.unwrap();
+        assert!(!rig.core.drains.running(&blocked.id));
+        // Inside the wait a pass makes no attempt, so it does not wait for the lock again.
+        let began = std::time::Instant::now();
+        rig.core.drain_pass().await;
+        assert!(began.elapsed() < Duration::from_secs(1));
+        assert!(!rig.core.drains.running(&blocked.id));
+        assert!(rig.core.drains.running(&free.id));
+        blocker.batch("ROLLBACK").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        rig.core.drain_pass().await;
+        assert!(rig.core.drains.running(&blocked.id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_policy_change_during_the_install_is_applied_by_the_next_pass() {
+        let Some(rig) = Rig::with_timing("drain-policy-install", timing()).await else {
+            return;
+        };
+        let (entry, _db) = rig.create().await;
+        tenant(&rig, &entry.id)
+            .await
+            .batch("DROP SCHEMA pgcf CASCADE")
+            .await
+            .unwrap();
+        std::fs::remove_file(rig.core.files(&entry.id).directory().join("events.json")).unwrap();
+        // A tenant's open transaction holds the name, so the install waits for the lock.
+        let blocker = tenant(&rig, &entry.id).await;
+        blocker.batch("BEGIN; CREATE SCHEMA pgcf").await.unwrap();
+        let core = rig.core.clone();
+        let pass = tokio::spawn(async move { core.drain_pass().await });
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let mut limits = policy();
+        limits.events.max_outbox_rows = 100;
+        rig.core.set_policy(limits);
+        blocker.batch("ROLLBACK").await.unwrap();
+        pass.await.unwrap();
+        assert!(rig.core.drains.running(&entry.id));
+        rig.core.drain_pass().await;
+        let rows: i64 = tenant(&rig, &entry.id)
+            .await
+            .query("SELECT max_outbox_rows FROM pgcf.settings", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(rows, 100);
     }
 }

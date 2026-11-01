@@ -15,7 +15,7 @@ use crate::{
     },
     credentials::Credentials,
     diagnostics::probe,
-    drain::{Post, SendError},
+    drain::{self, Post, SendError},
     fence::Fences,
     gateway::{Feed, bind as bind_gateway},
     hostfiles,
@@ -194,7 +194,7 @@ fn data_event_post(link: Link) -> Post {
                     if error.is::<crate::link::Fenced>() {
                         SendError::Fenced
                     } else if let Some(refusal) = error.downcast_ref::<Refusal>() {
-                        SendError::Failed(format!("http_{}", refusal.status))
+                        drain::refused(refusal.status)
                     } else {
                         SendError::Failed("transport".into())
                     }
@@ -1776,6 +1776,11 @@ mod tests {
         assert_eq!(
             post(report.clone()).await,
             Err(SendError::Failed("http_503".into()))
+        );
+        cloud.fail_next([crate::link::test_server::Failure::Status(400)]);
+        assert_eq!(
+            post(report.clone()).await,
+            Err(SendError::Rejected("http_400".into()))
         );
         cloud.with(|inner| inner.fenced = true);
         assert_eq!(post(report.clone()).await, Err(SendError::Fenced));

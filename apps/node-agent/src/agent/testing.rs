@@ -13,7 +13,7 @@ use crate::{
         test_support::{CREDENTIAL_CHECK, Fixture},
     },
     credentials::Credentials,
-    drain::{Post, SendError},
+    drain::{self, Post, SendError},
     fence::Fences,
     gateway::Feed,
     link::test_server::{database, vector},
@@ -62,10 +62,10 @@ impl Sink {
                 let sink = sink.clone();
                 Box::pin(async move {
                     if !contract_valid("NodeDataEventReport", &body) {
-                        return Err(SendError::Failed("http_400".into()));
+                        return Err(drain::refused(400));
                     }
                     if sink.refuse.load(Ordering::SeqCst) {
-                        return Err(SendError::Failed("http_503".into()));
+                        return Err(drain::refused(503));
                     }
                     sink.posted.lock().unwrap().push(body);
                     Ok(())

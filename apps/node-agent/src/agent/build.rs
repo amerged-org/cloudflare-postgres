@@ -343,7 +343,7 @@ impl<M: Machine> Core<M> {
     }
 
     /// The limits and the storage generation that the platform schema of `entry` is made with.
-    fn event_settings(&self, entry: &Entry) -> pgcf::Settings {
+    pub(crate) fn event_settings(&self, entry: &Entry) -> pgcf::Settings {
         let limits = self.policy().events;
         pgcf::Settings {
             epoch: entry.storage_generation,
@@ -379,13 +379,27 @@ impl<M: Machine> Core<M> {
         Ok(installed)
     }
 
-    /// Sets the limits and the epoch of a platform schema that is installed, and records them.
-    async fn configure_events(&self, id: &str, settings: &pgcf::Settings) -> Result<(), Error> {
+    /// Sets the limits and the epoch of a platform schema that is installed, and records them. A
+    /// schema `pgcf` that no superuser owns any more (a tenant took the name) is a conflict, which
+    /// is recorded the same way as at an install: it is not configured and never drained.
+    async fn configure_events(
+        &self,
+        id: &str,
+        settings: &pgcf::Settings,
+    ) -> Result<pgcf::Installed, Error> {
         let session = pgcf::connect(&self.layout().socket_directory(id), id, None).await?;
+        if pgcf::conflict(&session).await? {
+            self.files(id)
+                .save_events(&pgcf::EventsRecord::of(settings, true))?;
+            crate::timing::emit_event(serde_json::json!({
+                "event": "events_schema_conflict", "database_id": id,
+            }));
+            return Ok(pgcf::Installed::Conflict);
+        }
         pgcf::configure(&session, settings).await?;
         self.files(id)
             .save_events(&pgcf::EventsRecord::of(settings, false))?;
-        Ok(())
+        Ok(pgcf::Installed::Done)
     }
 
     /// Makes the platform schema of the database what `entry` wants, at a wake or a refresh (plan
@@ -415,7 +429,8 @@ impl<M: Machine> Core<M> {
             .is_some_and(|record| record.schema == pgcf::SCHEMA_REVISION && !record.conflict);
         if installed {
             return match self.configure_events(&db.id, &wanted).await {
-                Ok(()) => Refresh::Installed,
+                Ok(pgcf::Installed::Done) => Refresh::Installed,
+                Ok(pgcf::Installed::Conflict) => Refresh::Conflict,
                 Err(error) => events_not_installed(&db.id, &error),
             };
         }
