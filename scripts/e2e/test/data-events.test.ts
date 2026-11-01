@@ -5,6 +5,7 @@ import test from "node:test";
 import worker, { type Env, verifySignature } from "../receiver/worker.ts";
 import {
   idempotencyHeaders,
+  arrivalInversions,
   isInSeqOrder,
   latencySummary,
   sameEventIds,
@@ -141,4 +142,19 @@ test("latencySummary gives nearest-rank p50 and p95, and null for none", () => {
   assert.deepEqual(latencySummary(values), { n: 100, p50: 50, p95: 95 });
   assert.deepEqual(latencySummary([7]), { n: 1, p50: 7, p95: 7 });
   assert.deepEqual(latencySummary([]), { n: 0, p50: null, p95: null });
+});
+
+test("arrivalInversions counts the pairs that arrived against their (epoch, seq) order", () => {
+  const at = (...seqs: number[]) => seqs.map((seq) => ({ epoch: 1, seq }));
+  assert.equal(arrivalInversions(at(1, 3, 4, 5, 6, 7)), 0);
+  assert.equal(arrivalInversions(at(1, 3, 4, 5, 7, 6)), 1);
+  assert.equal(arrivalInversions(at(3, 2, 1)), 3);
+  assert.equal(
+    arrivalInversions([
+      { epoch: 2, seq: 1 },
+      { epoch: 1, seq: 9 },
+    ]),
+    1,
+  );
+  assert.equal(arrivalInversions([]), 0);
 });
