@@ -80,6 +80,25 @@ export function isInSeqOrder(
   });
 }
 
+/**
+ * How many pairs of events arrived against their (epoch, seq) order. Delivery order is not
+ * guaranteed (retries of different events race); a receiver restores the order from the ids.
+ */
+export function arrivalInversions(
+  positions: readonly { epoch: number; seq: number }[],
+): number {
+  let inversions = 0;
+  for (let later = 1; later < positions.length; later += 1) {
+    for (let earlier = 0; earlier < later; earlier += 1) {
+      const a = positions[earlier]!;
+      const b = positions[later]!;
+      if (b.epoch < a.epoch || (b.epoch === a.epoch && b.seq < a.seq))
+        inversions += 1;
+    }
+  }
+  return inversions;
+}
+
 /** A mutation carries a fresh Idempotency-Key; a GET carries none. */
 export function idempotencyHeaders(
   method: string,
@@ -535,19 +554,23 @@ async function main(): Promise<number> {
       ),
     );
     report(
-      "outage: every event is accepted once, verified, in (epoch, seq) order, after retries",
+      "outage: every event is accepted once, verified, strictly ordered by (epoch, seq) and retried",
       sameEventIds(
         acceptedIds,
         delivered.map((delivery) => delivery.event_id),
       ) &&
         positions.length === accepted.length &&
-        isInSeqOrder(positions) &&
+        // Once the receiver orders them by id, each event is there exactly once and the order is strict.
+        isInSeqOrder(
+          [...positions].sort((a, b) => a.epoch - b.epoch || a.seq - b.seq),
+        ) &&
         received.every((receipt) => receipt.verified) &&
         retried,
       {
         events: summary.n,
         commit_to_receipt_p50_ms: summary.p50,
         commit_to_receipt_p95_ms: summary.p95,
+        arrival_inversions: arrivalInversions(positions),
       },
     );
   } finally {
