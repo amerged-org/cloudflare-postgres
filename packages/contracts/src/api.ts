@@ -30,7 +30,7 @@ export { Timestamp, roleExpiryInstant } from "./timestamp.ts";
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.5.0";
+export const API_CONTRACT_VERSION = "1.6.0";
 
 /** The pattern of `Timestamp` in the contract's own JSON Schema, which the OpenAPI generator drops. */
 export const TIMESTAMP_PATTERN: string = (() => {
@@ -743,7 +743,7 @@ export const Operation = z
           .min(1)
           .max(64)
           .describe(
-            "Machine-readable reason of a failed operation, for example `operation_timeout`, `superseded`, `power_busy`, for database.resize `filesystem_not_grown` (the filesystem did not reach the storage within 20 minutes of the node's report) or, for database.role.delete, `role_not_droppable`.",
+            "Machine-readable reason of a failed operation, for example `operation_timeout`, `superseded`, `power_busy`, `power_outbox` (a suspend or hibernation was refused because pending data events could not be delivered), for database.resize `filesystem_not_grown` (the filesystem did not reach the storage within 20 minutes of the node's report) or, for database.role.delete, `role_not_droppable`.",
           ),
         message: z.string().max(TEXT_MAX_LENGTH),
       })

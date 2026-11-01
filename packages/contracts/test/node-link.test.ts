@@ -3,9 +3,14 @@ import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import {
   ArchiveCredential,
+  DATA_EVENT_LIMITS,
+  DATA_EVENT_VOLUME_BYTES_MAX,
   NODE_API_PATHS,
   NODE_AWAKE_LIMIT,
   NODE_BOOT_REPORT_MAX_BYTES,
+  NODE_DATA_EVENT_BATCH_MAX,
+  NODE_DATA_EVENT_BODY_MAX_BYTES,
+  NODE_DATA_EVENT_PAYLOAD_MAX_BYTES,
   NODE_DESIRED_PAGE_LIMIT_MAX,
   NODE_DIAGNOSTIC_ROW_MAX_BYTES,
   NODE_FENCED_PATHS,
@@ -17,6 +22,7 @@ import {
   NodeDatabaseObservation,
   FILESYSTEM_END_GAP_BYTES,
   NodeDesiredPage,
+  NodeDataEventReport,
   NodeDiagnostic,
   NodeDesiredQuery,
   NodeEnrollmentRequest,
@@ -24,6 +30,7 @@ import {
   NodeEventReport,
   NodeFencedResponse,
   NodeObservationReport,
+  NodePolicy,
   NodeProbeDiagnostic,
   NodeProbeRequest,
   NodeProbeResult,
@@ -1128,6 +1135,25 @@ describe("what a node reports", () => {
       }).success,
     ).toBe(false);
   });
+  it("names why a ready database refuses to sleep, and no other name", () => {
+    const observed = (database: object) =>
+      NodeObservationReport.safeParse({
+        observed_at: now,
+        databases: [database],
+        orders: [],
+      }).success;
+    const ready = (refusal: string) => ({
+      ...observation,
+      state: "ready",
+      instance,
+      proven_sleep: null,
+      refusal,
+    });
+    for (const refusal of ["power_busy", "power_archive", "power_outbox"])
+      expect(observed(ready(refusal)), refusal).toBe(true);
+    expect(observed(ready("power_other"))).toBe(false);
+    expect(observed({ ...observation, refusal: "power_outbox" })).toBe(false);
+  });
 });
 
 describe("usage", () => {
@@ -1197,6 +1223,184 @@ describe("usage", () => {
     }));
     expect(report(...rows).success).toBe(true);
     expect(report(...rows, { ...row, database: id }).success).toBe(false);
+  });
+});
+
+describe("data events", () => {
+  const event = (seq: number, payload: unknown = { table: "orders" }) => ({
+    epoch: 1,
+    seq,
+    at: now,
+    topic: "orders",
+    payload,
+  });
+  const report = (...events: object[]) => ({ database: id, events });
+  const payloadOf = (bytes: number) => ({ text: "x".repeat(bytes - 11) });
+  const ascending = (count: number) =>
+    Array.from({ length: count }, (_, index) => event(index + 1));
+  const bytes = (value: unknown) =>
+    new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+  it("posts to a path of its own, which a fenced node never reaches", () => {
+    expect(NODE_API_PATHS.dataEvents).toBe("/node/v1/data-events");
+  });
+
+  it("takes one event, a full batch in ascending order, and payloads up to the ceiling", () => {
+    const accepted = (value: object) =>
+      NodeDataEventReport.safeParse(value).success;
+    expect(accepted(report(event(1)))).toBe(true);
+    expect(accepted(report(...ascending(NODE_DATA_EVENT_BATCH_MAX)))).toBe(
+      true,
+    );
+    expect(
+      accepted(report(event(1, payloadOf(NODE_DATA_EVENT_PAYLOAD_MAX_BYTES)))),
+    ).toBe(true);
+    expect(
+      accepted(
+        report(
+          event(1, {
+            schema: "public",
+            table: "orders",
+            op: "update",
+            record: { id: 7, status: "paid" },
+            old_record: null,
+          }),
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("refuses what the contract does not allow, one rule at a time", () => {
+    const issuePaths = (value: unknown) =>
+      NodeDataEventReport.safeParse(value).error?.issues.map((issue) =>
+        JSON.stringify(issue.path),
+      ) ?? [];
+    const broken: [string, unknown, (string | number)[]][] = [
+      ["no events", report(), ["events"]],
+      [
+        "101 events",
+        report(...ascending(NODE_DATA_EVENT_BATCH_MAX + 1)),
+        ["events"],
+      ],
+      ["seq descending", report(event(2), event(1)), ["events", 1, "seq"]],
+      ["seq duplicate", report(event(1), event(1)), ["events", 1, "seq"]],
+      [
+        "topic upper case",
+        report({ ...event(1), topic: "Orders" }),
+        ["events", 0, "topic"],
+      ],
+      [
+        "topic of 49 characters",
+        report({ ...event(1), topic: "a".repeat(49) }),
+        ["events", 0, "topic"],
+      ],
+      [
+        "topic starting with a digit",
+        report({ ...event(1), topic: "1orders" }),
+        ["events", 0, "topic"],
+      ],
+      [
+        "topic empty",
+        report({ ...event(1), topic: "" }),
+        ["events", 0, "topic"],
+      ],
+      ["payload array", report(event(1, [])), ["events", 0, "payload"]],
+      ["payload string", report(event(1, "x")), ["events", 0, "payload"]],
+      ["payload null", report(event(1, null)), ["events", 0, "payload"]],
+      [
+        "payload one byte over the ceiling",
+        report(event(1, payloadOf(NODE_DATA_EVENT_PAYLOAD_MAX_BYTES + 1))),
+        ["events", 0, "payload"],
+      ],
+      [
+        "body over 1 MiB, each payload legal",
+        report(...[1, 2, 3, 4, 5].map((seq) => event(seq, payloadOf(262_011)))),
+        [],
+      ],
+      ["extra property on the report", { ...report(event(1)), later: 1 }, []],
+      [
+        "extra property on an event",
+        report({ ...event(1), later: 1 }),
+        ["events", 0],
+      ],
+      ["epoch 0", report({ ...event(1), epoch: 0 }), ["events", 0, "epoch"]],
+      [
+        "epoch 1.5",
+        report({ ...event(1), epoch: 1.5 }),
+        ["events", 0, "epoch"],
+      ],
+      ["epoch -1", report({ ...event(1), epoch: -1 }), ["events", 0, "epoch"]],
+      ["seq 0", report(event(0)), ["events", 0, "seq"]],
+      ["seq 2 ** 53", report(event(2 ** 53)), ["events", 0, "seq"]],
+      [
+        "at without milliseconds",
+        report({ ...event(1), at: "2026-10-17T12:00:00Z" }),
+        ["events", 0, "at"],
+      ],
+      [
+        "at not a timestamp",
+        report({ ...event(1), at: "yesterday" }),
+        ["events", 0, "at"],
+      ],
+      ["report without a database", { events: [event(1)] }, ["database"]],
+      ["report without events", { database: id }, ["events"]],
+      [
+        "a database id that is not one",
+        { ...report(event(1)), database: "not-an-id" },
+        ["database"],
+      ],
+    ];
+    for (const [name, value, path] of broken) {
+      expect(NodeDataEventReport.safeParse(value).success, name).toBe(false);
+      expect(issuePaths(value), name).toContain(JSON.stringify(path));
+    }
+    expect(NodeDataEventReport.safeParse(report(event(1))).success).toBe(true);
+    for (const field of ["epoch", "seq", "at", "topic", "payload"]) {
+      const without = Object.fromEntries(
+        Object.entries(event(1)).filter(([key]) => key !== field),
+      );
+      expect(
+        NodeDataEventReport.safeParse(report(without)).success,
+        field,
+      ).toBe(false);
+    }
+  });
+
+  it("counts payload and body bytes in UTF-8, not in UTF-16 units", () => {
+    const accepted = (value: object) =>
+      NodeDataEventReport.safeParse(value).success;
+    expect(
+      accepted(report(event(1, { text: "é".repeat(131_066) + "x" }))),
+    ).toBe(true);
+    expect(accepted(report(event(1, { text: "é".repeat(131_067) })))).toBe(
+      false,
+    );
+    const euros = (seq: number) => event(seq, { text: "€".repeat(80_000) });
+    expect(accepted(report(...[1, 2, 3, 4, 5].map(euros)))).toBe(false);
+  });
+
+  it("measures a number as JavaScript writes it: 1e21 is five bytes, 1e+21", () => {
+    const numbers = (count: number) => ({
+      n: Array.from({ length: count }, () => 1e21),
+    });
+    expect(bytes(numbers(43_689))).toBe(262_141);
+    expect(bytes(numbers(43_690))).toBe(262_147);
+    const accepted = (value: object) =>
+      NodeDataEventReport.safeParse(value).success;
+    expect(accepted(report(event(1, numbers(43_689))))).toBe(true);
+    expect(accepted(report(event(1, numbers(43_690))))).toBe(false);
+  });
+
+  it("holds the body at 1 MiB exactly, and refuses one byte more", () => {
+    const sized = (last: number) =>
+      report(
+        ...[1, 2, 3, 4].map((seq) => event(seq, payloadOf(262_000 + 11))),
+        event(5, payloadOf(last + 11)),
+      );
+    const exact = NODE_DATA_EVENT_BODY_MAX_BYTES - bytes(sized(0));
+    expect(bytes(sized(exact))).toBe(NODE_DATA_EVENT_BODY_MAX_BYTES);
+    expect(NodeDataEventReport.safeParse(sized(exact)).success).toBe(true);
+    expect(NodeDataEventReport.safeParse(sized(exact + 1)).success).toBe(false);
   });
 });
 
@@ -1436,6 +1640,84 @@ describe("credentials and the node's policy", () => {
     expect(NodeDesiredPage.safeParse(withBoost(undefined)).success).toBe(true);
     for (const broken of [-1, 0.5, 60_001, "5000", null])
       expect(NodeDesiredPage.safeParse(withBoost(broken)).success).toBe(false);
+  });
+  it("carries the data event limits, which default when a policy or a page leaves them out", () => {
+    const defaults = {
+      max_payload_bytes: 16_384,
+      max_outbox_rows: 10_000,
+      emits_per_second: 20,
+    };
+    expect(NodePolicy.parse(page.policy).events).toEqual(defaults);
+    expect(NodePolicy.parse({ ...page.policy, events: {} }).events).toEqual(
+      defaults,
+    );
+    expect(
+      NodePolicy.parse({
+        ...page.policy,
+        events: { emits_per_second: 5 },
+      }).events,
+    ).toEqual({ ...defaults, emits_per_second: 5 });
+    for (const events of [undefined, defaults])
+      expect(
+        NodeDesiredPage.safeParse({
+          ...page,
+          policy: { ...page.policy, events },
+        }).success,
+      ).toBe(true);
+    const withEvents = (events: object) =>
+      NodePolicy.safeParse({ ...page.policy, events }).success;
+    // The values one field at a time, the others small enough for the volume rule. The largest
+    // row count fits no payload above the minimum, so the rule allows it only at a smaller
+    // payload; the bound itself is still refused above.
+    const small = {
+      max_payload_bytes: 1024,
+      max_outbox_rows: 100,
+      emits_per_second: 1,
+    };
+    for (const [field, { min, max }] of Object.entries(DATA_EVENT_LIMITS)) {
+      const at = (value: unknown) => ({ ...small, [field]: value });
+      expect(withEvents(at(min)), field).toBe(true);
+      expect(withEvents(at(max + 1)), field).toBe(false);
+      expect(withEvents(at(min - 1)), field).toBe(false);
+      for (const value of [0.5, "20", null])
+        expect(withEvents(at(value)), `${field}=${String(value)}`).toBe(false);
+    }
+    expect(
+      withEvents({
+        ...small,
+        max_payload_bytes: DATA_EVENT_LIMITS.max_payload_bytes.max,
+      }),
+    ).toBe(true);
+    expect(
+      withEvents({
+        ...small,
+        emits_per_second: DATA_EVENT_LIMITS.emits_per_second.max,
+      }),
+    ).toBe(true);
+    expect(withEvents({ ...small, later: 1 })).toBe(false);
+    // The volume rule: a full outbox must fit 256 MiB.
+    expect(1024 * 262_144).toBe(DATA_EVENT_VOLUME_BYTES_MAX);
+    expect(
+      withEvents({
+        max_payload_bytes: 262_144,
+        max_outbox_rows: 1_000_000,
+        emits_per_second: 20,
+      }),
+    ).toBe(false);
+    expect(
+      withEvents({
+        max_payload_bytes: 262_144,
+        max_outbox_rows: 1024,
+        emits_per_second: 20,
+      }),
+    ).toBe(true);
+    expect(
+      withEvents({
+        max_payload_bytes: 262_144,
+        max_outbox_rows: 1025,
+        emits_per_second: 20,
+      }),
+    ).toBe(false);
   });
 });
 

@@ -1038,7 +1038,11 @@ impl<M: Machine> Core<M> {
                 })),
             }
         }
-        let proof = self.proof(&entry);
+        let outbox = Some(match why {
+            Why::Order => self.timing.outbox_wait,
+            Why::Idle | Why::Early { .. } => Duration::ZERO,
+        });
+        let proof = self.proof(&entry, outbox);
         let steps = Quiet {
             core: self.clone(),
             db: db.clone(),
@@ -1121,12 +1125,14 @@ impl<M: Machine> Core<M> {
         }
     }
 
-    pub(crate) fn proof(&self, entry: &Entry) -> Proof {
+    pub(crate) fn proof(&self, entry: &Entry, outbox: Option<Duration>) -> Proof {
         Proof {
             socket_directory: self.layout().socket_directory(&entry.id),
             volume: self.layout().volume(&entry.id),
             upload_log: self.files(&entry.id).upload_log(entry.storage_generation),
             archive_wait: self.timing.archive_wait,
+            database: entry.id.clone(),
+            outbox,
         }
     }
 
@@ -1272,7 +1278,9 @@ impl<M: Machine> Core<M> {
         if self.refresh_roles(db, &entry).await.is_err() {
             return Recovered::Retry;
         }
-        let proof = self.proof(&entry);
+        // A crashed database is proven even when a customer's receiver is dead: its rows are
+        // delivered at its next wake.
+        let proof = self.proof(&entry, None);
         match proof::run(
             &proof,
             &Alone {
@@ -2893,6 +2901,84 @@ mod tests {
         drop(session);
         assert_eq!(rig.core.sleep(&db, Why::Order).await, Slept::Proven);
         assert_eq!(db.view().refusal, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_events_refuse_an_idle_sleep_at_once_and_an_order_waits_for_them() {
+        let Some(rig) = Rig::new("sleep-outbox").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let data = tenant(&rig, &entry.id).await;
+        data.batch("SELECT pgcf.emit('orders', '{\"n\": 1}')")
+            .await
+            .unwrap();
+        let began = std::time::Instant::now();
+        assert_eq!(
+            rig.core.sleep(&db, Why::Idle).await,
+            Slept::Refused(Refusal::Outbox)
+        );
+        assert!(
+            began.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            began.elapsed()
+        );
+        // An idle refusal is not an order's refusal: nothing is reported to Cloudflare.
+        assert_eq!(db.view().refusal, None);
+        let began = std::time::Instant::now();
+        assert_eq!(
+            rig.core.sleep(&db, Why::Order).await,
+            Slept::Refused(Refusal::Outbox)
+        );
+        assert!(
+            began.elapsed() >= Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
+        let observation = rig.observation(&entry.id);
+        assert_eq!(observation["refusal"].as_str(), Some("power_outbox"));
+        assert!(contract_valid(
+            "NodeObservationReport",
+            &report(observation)
+        ));
+        // The events are delivered while the order waits, so the order proves the sleep.
+        let delivery = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            data.batch("DELETE FROM pgcf.outbox").await.unwrap();
+        });
+        assert_eq!(rig.core.sleep(&db, Why::Order).await, Slept::Proven);
+        delivery.await.unwrap();
+        assert_eq!(db.view().refusal, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_crashed_database_with_pending_events_is_recovered_and_proven_and_keeps_them() {
+        let Some(rig) = Rig::new("recover-outbox").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let data = tenant(&rig, &entry.id).await;
+        data.batch("SELECT pgcf.emit('orders', '{\"n\": 1}')")
+            .await
+            .unwrap();
+        drop(data);
+        rig.machine.crash(&entry.id);
+        rig.core.watch_pass().await;
+        assert_eq!(db.phase(), Phase::Unproven);
+        // Recovery does not wait for the outbox: a dead receiver must not keep a crashed database.
+        eventually(30, "the recovery to prove the sleep", || {
+            db.phase() == Phase::Asleep && db.state().as_ref().is_some_and(|s| s.record.is_some())
+        })
+        .await;
+        // The rows are drained at the next wake, not discarded by the recovery.
+        let woke = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(woke.outcome, WakeOutcome::Started, "{woke:?}");
+        let data = tenant(&rig, &entry.id).await;
+        let rows = data
+            .query("SELECT count(*) FROM pgcf.outbox", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

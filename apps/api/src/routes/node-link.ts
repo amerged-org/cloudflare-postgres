@@ -9,6 +9,7 @@ import {
   INSTALLER_PROGRESS_PATH,
   NodeBootReport,
   NodeCredentials,
+  NodeDataEventReport,
   NodeDesiredPage,
   NodeDesiredQuery,
   NodeEnrollmentRequest,
@@ -29,6 +30,7 @@ import { archiveCredentialResponse } from "../domain/archive-credentials.ts";
 import { callingNode, nodeAuthentication } from "../domain/node-auth.ts";
 import { nodeCredentials } from "../domain/node-credentials.ts";
 import { desiredResponse } from "../domain/node-desired.ts";
+import { nodeDataEvents } from "../domain/data-events.ts";
 import { nodeDiagnosticUpload } from "../domain/node-diagnostics.ts";
 import { enrollNode, recordInstallerProgress } from "../domain/node-install.ts";
 import { nodeEvents, nodeUsage, nodeVolumes } from "../domain/node-intake.ts";
@@ -237,6 +239,25 @@ export function registerNodeLink(app: ApiApp): void {
       ),
     },
     async (c) => nodeUsage(c, callingNode(c), await c.req.json()),
+  );
+  register(
+    app,
+    {
+      method: "post",
+      path: NODE_API_PATHS.dataEvents,
+      tags,
+      security: node,
+      description:
+        "Reports the data events of one database from its outbox, all or nothing. Any 2xx means every event is stored in the database's event buffer or is wanted by no subscription of its project, and the node drops them; any other answer keeps the batch, which is sent again unchanged. The project comes from the database the node serves. 409 with reason generation_changed: the database is unknown, deleted or not served by this node. 503 capacity_exhausted with a Retry-After header: the buffer is full, and nothing of the batch is stored.",
+      request: { body: body(NodeDataEventReport) },
+      responses: nodeResponses(
+        z.strictObject({
+          stored: z.number().int().nonnegative(),
+          ignored: z.number().int().nonnegative(),
+        }),
+      ),
+    },
+    async (c) => nodeDataEvents(c, callingNode(c), await c.req.json()),
   );
   register(
     app,

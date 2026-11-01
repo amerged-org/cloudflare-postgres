@@ -6,7 +6,8 @@
 use crate::{
     Error,
     admission::Running,
-    agent::{Core, Entry, Origin, Parts, Policy, Timing},
+    agent::{Core, Entry, Origin, Parts, Policy, Retry, Timing},
+    api::Refusal,
     archive::{
         facts,
         job::{Jobs, Runner},
@@ -14,6 +15,7 @@ use crate::{
     },
     credentials::Credentials,
     diagnostics::probe,
+    drain::{Post, SendError},
     fence::Fences,
     gateway::{Feed, bind as bind_gateway},
     hostfiles,
@@ -26,6 +28,8 @@ use pgcf_native_protocol::wake::WakeRequest;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -33,7 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{Notify, mpsc},
+    sync::{Notify, Semaphore, mpsc},
     task::JoinSet,
 };
 
@@ -43,6 +47,9 @@ use tokio::{
 /// the first page was applied (`kill -9`, 2026-10-23). 32 at once are 10 rounds; the plan's Open
 /// row has the live figure to read.
 const CREDENTIALS_AT_ONCE: usize = 32;
+
+/// How many data event batches the node posts at once, over all its databases' drains.
+const DATA_EVENT_POSTS_AT_ONCE: usize = 8;
 
 /// How often each loop runs. The defaults are the plan's (4.3, 4.9); tests shorten them.
 #[derive(Clone, Debug)]
@@ -115,26 +122,6 @@ fn gateway_secrets(credentials: &Value) -> [u8; 32] {
     Sha256::digest(secrets.to_string().as_bytes()).into()
 }
 
-/// The wait before the next try of what failed, which doubles up to a longest wait.
-#[derive(Default)]
-struct Retry {
-    wait: Option<Duration>,
-    until: Option<Instant>,
-}
-impl Retry {
-    fn due(&self) -> bool {
-        self.until.is_none_or(|until| Instant::now() >= until)
-    }
-    fn failed(&mut self, first: Duration, longest: Duration) {
-        let wait = self.wait.map_or(first, |wait| (wait * 2).min(longest));
-        self.wait = Some(wait);
-        self.until = Some(Instant::now() + wait);
-    }
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
 pub struct Service<M: Machine> {
     core: Arc<Core<M>>,
     link: Link,
@@ -191,6 +178,31 @@ const FIRST_POOL_SAMPLE_BOUND: Duration = Duration::from_secs(1);
 /// came.
 const PAGE_RETRY: Duration = Duration::from_secs(1);
 const PAGE_POLL: Duration = Duration::from_millis(10);
+
+/// How the node's drains post a batch of data events: one signed `NodeDataEventReport` through the
+/// link, at most `DATA_EVENT_POSTS_AT_ONCE` at a time, and Cloudflare's answer as the drain needs it.
+fn data_event_post(link: Link) -> Post {
+    let permits = Arc::new(Semaphore::new(DATA_EVENT_POSTS_AT_ONCE));
+    Arc::new(
+        move |body: Value| -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send>> {
+            let (link, permits) = (link.clone(), permits.clone());
+            Box::pin(async move {
+                let Ok(_permit) = permits.acquire_owned().await else {
+                    return Err(SendError::Failed("transport".into()));
+                };
+                link.post_data_events(&body).await.map_err(|error| {
+                    if error.is::<crate::link::Fenced>() {
+                        SendError::Fenced
+                    } else if let Some(refusal) = error.downcast_ref::<Refusal>() {
+                        SendError::Failed(format!("http_{}", refusal.status))
+                    } else {
+                        SendError::Failed("transport".into())
+                    }
+                })
+            })
+        },
+    )
+}
 
 /// Which startup measurement a wake result completes.
 fn wake_phase(result: &pgcf_native_protocol::wake::WakeResult) -> Option<&'static str> {
@@ -356,6 +368,7 @@ impl<M: Machine> Service<M> {
                 policy,
                 timing: config.timing.clone(),
                 prefetch: crate::agent::PREFETCH,
+                data_events: data_event_post(link.clone()),
             },
             running,
         );
@@ -456,6 +469,8 @@ impl<M: Machine> Service<M> {
         service.spawn(async move { s.full_pulls().await });
         let s = service.clone();
         service.spawn(async move { s.watches().await });
+        let s = service.clone();
+        service.spawn(async move { s.drains().await });
         let s = service.clone();
         service.spawn(async move { s.idle().await });
         let s = service.clone();
@@ -1491,6 +1506,15 @@ impl<M: Machine> Service<M> {
         }
     }
 
+    /// The outbox drains of the served databases, once per watch (`Core::drain_pass`).
+    async fn drains(&self) {
+        let mut tick = tokio::time::interval(self.core.timing.watch);
+        loop {
+            tick.tick().await;
+            self.core.drain_pass().await;
+        }
+    }
+
     /// The databases nobody uses.
     async fn idle(&self) {
         let mut tick = tokio::time::interval(self.core.timing.idle_poll);
@@ -1534,6 +1558,7 @@ mod tests {
             test_server::{Cloud, database, database_id, tempdir},
         },
         node_link::contract_valid,
+        postgres,
         units::ActiveState,
     };
     use pgcf_native_protocol::{
@@ -1716,6 +1741,136 @@ mod tests {
             "the next successful pool sample to open admission",
             || machine.room(&service.core.policy().storage).is_ok(),
         )
+        .await;
+        service.stop();
+    }
+
+    /// A data event post answers the drains as Cloudflare did: a stored report is `Ok`, a refusal
+    /// keeps its status, a fence is `Fenced`, and a body that breaks the contract is a failure of
+    /// the transport, which never reaches Cloudflare.
+    #[tokio::test]
+    async fn a_data_event_post_answers_the_drains_as_cloudflare_did() {
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let (link, mut events) = Link::start(
+            LinkConfig {
+                paths: crate::link::Paths::new(&base),
+                image_version: "25".into(),
+                agent_version: "0.1.0".into(),
+                release_id: None,
+                os: crate::link::test_server::vector("AgentLinkMessage", "hello")["os"].clone(),
+                timing: LinkTiming::default(),
+            },
+            Transport::new(cloud.roots()).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), events.next())
+            .await
+            .expect("no link event came");
+        let post = data_event_post(link);
+        let report = crate::link::test_server::vector("NodeDataEventReport", "one-event");
+        assert_eq!(post(report.clone()).await, Ok(()));
+        cloud.fail_next([crate::link::test_server::Failure::Status(503)]);
+        assert_eq!(
+            post(report.clone()).await,
+            Err(SendError::Failed("http_503".into()))
+        );
+        cloud.with(|inner| inner.fenced = true);
+        assert_eq!(post(report.clone()).await, Err(SendError::Fenced));
+        assert_eq!(
+            post(json!({})).await,
+            Err(SendError::Failed("transport".into()))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_row_emitted_in_a_running_database_reaches_the_cloud_and_is_deleted() {
+        let Some((machine, _fixture, _root)) =
+            site("data-events", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let (link, events) = Link::start(
+            LinkConfig {
+                paths: crate::link::Paths::new(&base),
+                image_version: "25".into(),
+                agent_version: "0.1.0".into(),
+                release_id: None,
+                os: crate::machine::os_report(&*machine).await.unwrap(),
+                timing: LinkTiming {
+                    interval: Duration::from_millis(300),
+                    ..LinkTiming::default()
+                },
+            },
+            Transport::new(cloud.roots()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let db = new_entry_json();
+        let id = db["id"].as_str().unwrap().to_string();
+        let credential = db["archive"]["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        cloud.with(|inner| {
+            inner.databases = vec![db.clone()];
+            inner.credential_paths.insert(credential, path);
+        });
+        let service = Service::start(
+            machine.clone(),
+            link,
+            events,
+            ServiceConfig {
+                intervals: quick(),
+                timing: timing(),
+                gateway: None,
+                release_key: test_release_key(),
+            },
+        )
+        .await
+        .unwrap();
+        eventually(90, "the cloud to be told the database is ready", || {
+            observed(&cloud, &id, "ready")
+        })
+        .await;
+        let data = postgres::connect(&machine.layout().socket_directory(&id), "postgres", &id)
+            .await
+            .unwrap();
+        data.batch("SELECT pgcf.emit('orders', '{\"n\": 1}')")
+            .await
+            .unwrap();
+        eventually(30, "the event to reach the cloud", || {
+            cloud
+                .acknowledged("/node/v1/data-events")
+                .iter()
+                .flat_map(|report| report["events"].as_array().cloned().unwrap_or_default())
+                .any(|event| event["topic"] == "orders" && event["payload"] == json!({"n": 1}))
+        })
+        .await;
+        assert!(
+            cloud
+                .acknowledged("/node/v1/data-events")
+                .iter()
+                .all(|report| contract_valid("NodeDataEventReport", report))
+        );
+        within(10, "the outbox to be emptied", async {
+            loop {
+                let rows = data
+                    .query("SELECT count(*) FROM pgcf.outbox", &[])
+                    .await
+                    .unwrap();
+                if rows[0].get::<_, i64>(0) == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
         .await;
         service.stop();
     }

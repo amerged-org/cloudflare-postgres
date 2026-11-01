@@ -18,7 +18,7 @@ use crate::{
     },
     credentials::Access,
     machine::{Account, Machine},
-    pg_control, postgres, roles,
+    pg_control, pgcf, postgres, roles,
     settings::{self, Settings},
     sleep,
     state::{self, DatabaseState},
@@ -191,6 +191,28 @@ pub(super) fn write_owned(
     file.sync_all()
 }
 
+/// What `refresh_events` found and did about a database's platform schema.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Refresh {
+    /// The schema is as its record says: nothing was done.
+    Unchanged,
+    /// The schema was made, or its limits and epoch were set.
+    Installed,
+    /// The database has a schema named `pgcf` that is not the platform's: its events stay off.
+    Conflict,
+    /// The schema could not be made; the class of the failure is in the node's events.
+    Failed,
+}
+
+/// The node's event for a platform schema that could not be made: its class, never its message.
+fn events_not_installed(id: &str, error: &Error) -> Refresh {
+    crate::timing::emit_event(serde_json::json!({
+        "event": "events_schema_not_installed", "database_id": id,
+        "class": crate::diagnostics::error_code(error),
+    }));
+    Refresh::Failed
+}
+
 impl<M: Machine> Core<M> {
     /// The three files of the cluster's configuration (`settings`) for `entry`, and their hash.
     fn configuration(
@@ -318,6 +340,90 @@ impl<M: Machine> Core<M> {
             view.roles_blocked = report.blocked;
         });
         Ok(())
+    }
+
+    /// The limits and the storage generation that the platform schema of `entry` is made with.
+    fn event_settings(&self, entry: &Entry) -> pgcf::Settings {
+        let limits = self.policy().events;
+        pgcf::Settings {
+            epoch: entry.storage_generation,
+            max_payload_bytes: limits.max_payload_bytes,
+            max_outbox_rows: limits.max_outbox_rows,
+        }
+    }
+
+    /// Makes the platform schema of the database and records it in `events.json`. `truncate`
+    /// empties the outbox, which a restore or a replacement starts without the rows of its source.
+    /// A conflict is recorded and reported, and is an outcome, not an error.
+    async fn install_events(
+        &self,
+        id: &str,
+        settings: &pgcf::Settings,
+        truncate: bool,
+    ) -> Result<pgcf::Installed, Error> {
+        let session = pgcf::connect(&self.layout().socket_directory(id), id, None).await?;
+        let installed = pgcf::install(&session, settings, truncate).await?;
+        let conflict = installed == pgcf::Installed::Conflict;
+        self.files(id)
+            .save_events(&pgcf::EventsRecord::of(settings, conflict))?;
+        if conflict {
+            crate::timing::emit_event(serde_json::json!({
+                "event": "events_schema_conflict", "database_id": id,
+            }));
+        } else {
+            crate::timing::emit_event(serde_json::json!({
+                "event": "events_schema_installed", "database_id": id,
+                "revision": pgcf::SCHEMA_REVISION,
+            }));
+        }
+        Ok(installed)
+    }
+
+    /// Sets the limits and the epoch of a platform schema that is installed, and records them.
+    async fn configure_events(&self, id: &str, settings: &pgcf::Settings) -> Result<(), Error> {
+        let session = pgcf::connect(&self.layout().socket_directory(id), id, None).await?;
+        pgcf::configure(&session, settings).await?;
+        self.files(id)
+            .save_events(&pgcf::EventsRecord::of(settings, false))?;
+        Ok(())
+    }
+
+    /// Makes the platform schema of the database what `entry` wants, at a wake or a refresh (plan
+    /// database-events-and-schedules 4.5, D17). A record that matches needs no session, and a
+    /// recorded conflict is kept unless `retry_conflict` asks for another check. Never an error:
+    /// a database without events must not lose a wake to this.
+    pub(crate) async fn refresh_events(
+        &self,
+        db: &Db,
+        entry: &Entry,
+        retry_conflict: bool,
+    ) -> Refresh {
+        let wanted = self.event_settings(entry);
+        let held = match self.files(&db.id).load_events() {
+            Ok(held) => held,
+            Err(error) => return events_not_installed(&db.id, &error.into()),
+        };
+        if held.as_ref() == Some(&pgcf::EventsRecord::of(&wanted, false)) {
+            return Refresh::Unchanged;
+        }
+        if held.as_ref() == Some(&pgcf::EventsRecord::of(&wanted, true)) && !retry_conflict {
+            return Refresh::Conflict;
+        }
+        // The schema of this revision is there, not a conflict: only its epoch and limits differ.
+        let installed = held
+            .as_ref()
+            .is_some_and(|record| record.schema == pgcf::SCHEMA_REVISION && !record.conflict);
+        if installed {
+            return match self.configure_events(&db.id, &wanted).await {
+                Ok(()) => Refresh::Installed,
+                Err(error) => events_not_installed(&db.id, &error),
+            };
+        }
+        match self.install_events(&db.id, &wanted, false).await {
+            Ok(pgcf::Installed::Done) => Refresh::Installed,
+            Ok(pgcf::Installed::Conflict) => Refresh::Conflict,
+            Err(error) => events_not_installed(&db.id, &error),
+        }
     }
 
     /// A base backup of the running database into its archive, and its newest DONE backup of the
@@ -804,6 +910,25 @@ impl<M: Machine> Core<M> {
         roles::ensure_database(&session, id, roles::OWNER_ROLE)
             .await
             .map_err(|_| build_failed!())?;
+        // The platform schema is in place before the first base backup, which must hold it.
+        let events = self
+            .install_events(id, &self.event_settings(entry), false)
+            .await
+            .map_err(|_| build_failed!())?;
+        if events != pgcf::Installed::Done {
+            return Err(build_failed!());
+        }
+        // The schema's tuples have no hint bits yet. Their first reads after the first base backup's
+        // checkpoint would write them as WAL, a segment the sleep proof then finds unarchived. The
+        // database is new and empty of tenant data, so the VACUUM is cheap.
+        let tenant = pgcf::connect(&self.layout().socket_directory(id), id, None)
+            .await
+            .map_err(|_| build_failed!())?;
+        tenant
+            .batch_long("VACUUM")
+            .await
+            .map_err(|_| build_failed!())?;
+        drop(tenant);
         let identity = sleep::system(&session)
             .await
             .ok_or_else(|| build_failed!())?;
@@ -1070,6 +1195,16 @@ impl<M: Machine> Host for Rebuild<M> {
             .applied
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(applied);
+        // The platform schema, before the promoted database's first backup. A restore or a
+        // replacement starts its outbox empty, as its rows belong to its source; a move or a
+        // rollback keeps them.
+        let truncate = matches!(
+            self.entry.origin,
+            Some(Origin::Restore(..) | Origin::Replace(..))
+        );
+        core.install_events(&self.entry.id, &core.event_settings(&self.entry), truncate)
+            .await
+            .map_err(|_| Failed)?;
         // The timeline of the promotion is in the control file once its checkpoint is done.
         session.batch_long("CHECKPOINT").await.map_err(|_| Failed)?;
         let identity = sleep::system(&session).await.ok_or(Failed)?;
@@ -1088,7 +1223,11 @@ impl<M: Machine> Host for Rebuild<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{agent::testing::Rig, node_link::contract_valid, pg_control};
+    use crate::{
+        agent::testing::{Rig, eventually},
+        node_link::contract_valid,
+        pg_control,
+    };
     use pgcf_native_protocol::agent::Mode;
     use serde_json::{Value, json};
     use std::num::NonZeroU32;
@@ -1491,5 +1630,297 @@ mod tests {
         assert_eq!(rig.observation(&entry.id)["error"], "start_failed");
         assert!(rig.machine.volumes().is_empty());
         assert!(!rig.machine.has_account(&entry.id));
+    }
+
+    /// The database's platform schema as the superuser sees it, in the database itself.
+    async fn in_database(rig: &Rig, id: &str) -> postgres::Session {
+        postgres::connect(&rig.machine.layout().socket_directory(id), "postgres", id)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_created_database_has_the_pgcf_schema_and_its_record() {
+        let Some(rig) = Rig::new("events-create").await else {
+            return;
+        };
+        let (entry, _db) = rig.create().await;
+        let limits = rig.core.policy().events;
+        let session = in_database(&rig, &entry.id).await;
+        let stored = session
+            .query(
+                "SELECT epoch, max_payload_bytes, max_outbox_rows FROM pgcf.settings",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                stored[0].get::<_, i64>(0),
+                stored[0].get::<_, i64>(1),
+                stored[0].get::<_, i64>(2)
+            ),
+            (
+                i64::try_from(entry.storage_generation).unwrap(),
+                i64::try_from(limits.max_payload_bytes).unwrap(),
+                i64::try_from(limits.max_outbox_rows).unwrap()
+            )
+        );
+        let settings = pgcf::Settings {
+            epoch: entry.storage_generation,
+            max_payload_bytes: limits.max_payload_bytes,
+            max_outbox_rows: limits.max_outbox_rows,
+        };
+        assert_eq!(
+            rig.core.files(&entry.id).load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, false))
+        );
+        // A row emitted by the database's own transaction waits in its outbox.
+        session
+            .batch("SELECT pgcf.emit('orders', '{\"n\": 1}')")
+            .await
+            .unwrap();
+        let rows = session
+            .query("SELECT seq, epoch FROM pgcf.outbox ORDER BY seq", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<_, i64>(0), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restore_into_a_new_database_truncates_the_pending_rows_of_the_source_and_keeps_the_schema()
+     {
+        use pgcf_native_protocol::wake::Outcome;
+
+        let Some(rig) = Rig::new("events-restore").await else {
+            return;
+        };
+        let (source, source_db) = rig.create().await;
+        let data = in_database(&rig, &source.id).await;
+        data.batch("SELECT pgcf.emit('orders', '{\"n\": 1}')")
+            .await
+            .unwrap();
+        drop(data);
+        // A sleep refuses a pending outbox row: the source is recovered from a crash instead.
+        rig.machine.crash(&source.id);
+        rig.core.watch_pass().await;
+        eventually(60, "the recovery to prove the sleep", || {
+            source_db.phase() == Phase::Asleep
+                && source_db
+                    .state()
+                    .as_ref()
+                    .is_some_and(|s| s.record.is_some())
+        })
+        .await;
+        let backup = source_db.state().unwrap().backup.unwrap();
+        rig.deliver(&source.archive_path, "read_only");
+        let mut restored = rig.entry_json();
+        restored["origin"] = json!({"kind": "restore", "source": {
+            "database_id": source.id, "path": source.archive_path, "backup_id": backup.backup_id,
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"}}});
+        let (entry, _db) = rig.create_from(&restored).await;
+
+        // The copy's outbox starts empty, its sequence at 1, and its epoch is its own generation.
+        let copy = in_database(&rig, &entry.id).await;
+        let pending = copy
+            .query("SELECT count(*) FROM pgcf.outbox", &[])
+            .await
+            .unwrap();
+        assert_eq!(pending[0].get::<_, i64>(0), 0);
+        let seq = copy
+            .query("SELECT pgcf.emit('orders', '{\"n\": 2}')", &[])
+            .await
+            .unwrap();
+        assert_eq!(seq[0].get::<_, i64>(0), 1);
+        let epoch: i64 = copy
+            .query("SELECT epoch FROM pgcf.settings", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(epoch, i64::try_from(entry.storage_generation).unwrap());
+        drop(copy);
+
+        // The source keeps its row: the copy's truncation is the copy's alone.
+        assert_eq!(
+            rig.core.wake(&Rig::ticket(&source)).await.outcome,
+            Outcome::Started
+        );
+        let data = in_database(&rig, &source.id).await;
+        assert_eq!(
+            data.query("SELECT count(*) FROM pgcf.outbox", &[])
+                .await
+                .unwrap()[0]
+                .get::<_, i64>(0),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_events_installs_a_schema_that_has_no_record_and_then_opens_nothing() {
+        let Some(rig) = Rig::new("events-refresh").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        // A database that was built before the record existed: its schema is there, its record not.
+        std::fs::remove_file(rig.core.files(&entry.id).directory().join("events.json")).unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Installed
+        );
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Unchanged
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_events_configures_new_limits_and_leaves_the_outbox_alone() {
+        let Some(rig) = Rig::new("events-limits").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let data = in_database(&rig, &entry.id).await;
+        data.batch("SELECT pgcf.emit('orders', '{\"n\": 1}')")
+            .await
+            .unwrap();
+        // A full install would create the function again; a configure leaves the schema as it is.
+        data.batch("DROP FUNCTION pgcf.capture()").await.unwrap();
+        let mut policy = rig.core.policy();
+        policy.events.max_outbox_rows = 20_000;
+        rig.core.set_policy(policy.clone());
+
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Installed
+        );
+        let limit: i64 = data
+            .query("SELECT max_outbox_rows FROM pgcf.settings", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(limit, 20_000);
+        assert_eq!(
+            data.query(
+                "SELECT count(*) FROM pg_catalog.pg_proc WHERE proname = 'capture' AND pronamespace = 'pgcf'::regnamespace",
+                &[]
+            )
+            .await
+            .unwrap()[0]
+            .get::<_, i64>(0),
+            0
+        );
+        assert_eq!(
+            data.query("SELECT count(*) FROM pgcf.outbox", &[])
+                .await
+                .unwrap()[0]
+                .get::<_, i64>(0),
+            1
+        );
+        let settings = pgcf::Settings {
+            epoch: entry.storage_generation,
+            max_payload_bytes: policy.events.max_payload_bytes,
+            max_outbox_rows: 20_000,
+        };
+        assert_eq!(
+            rig.core.files(&entry.id).load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, false))
+        );
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Unchanged
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_foreign_schema_named_pgcf_is_a_conflict_that_is_checked_again_only_on_request() {
+        let Some(rig) = Rig::new("events-conflict").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let files = rig.core.files(&entry.id);
+        let data = in_database(&rig, &entry.id).await;
+        // A schema named pgcf that a tenant role owns takes the platform's place: no superuser owns it.
+        data.batch("DROP SCHEMA pgcf CASCADE; CREATE SCHEMA pgcf AUTHORIZATION app")
+            .await
+            .unwrap();
+        std::fs::remove_file(files.directory().join("events.json")).unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Conflict
+        );
+        let settings = pgcf::Settings {
+            epoch: entry.storage_generation,
+            max_payload_bytes: rig.core.policy().events.max_payload_bytes,
+            max_outbox_rows: rig.core.policy().events.max_outbox_rows,
+        };
+        assert_eq!(
+            files.load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, true))
+        );
+        // The recorded conflict is kept without a session, and it is checked again on request.
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Conflict
+        );
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Conflict
+        );
+        // The tenant's schema is gone: the next check installs the platform's.
+        data.batch("DROP SCHEMA pgcf CASCADE").await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Installed
+        );
+        assert_eq!(
+            files.load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, false))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recorded_conflict_opens_no_session_unless_a_check_is_requested() {
+        let Some(rig) = Rig::new("events-conflict-stop").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let files = rig.core.files(&entry.id);
+        let data = in_database(&rig, &entry.id).await;
+        data.batch("DROP SCHEMA pgcf CASCADE; CREATE SCHEMA pgcf AUTHORIZATION app")
+            .await
+            .unwrap();
+        drop(data);
+        std::fs::remove_file(files.directory().join("events.json")).unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Conflict
+        );
+        // With the database stopped, a session cannot be opened: the recorded conflict answers
+        // without one, and only a requested check tries to open it.
+        rig.machine.stop(&entry.id).await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Conflict
+        );
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Failed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refresh_whose_database_cannot_be_reached_fails_without_an_error_or_a_record() {
+        let Some(rig) = Rig::new("events-unreachable").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        std::fs::remove_file(rig.core.files(&entry.id).directory().join("events.json")).unwrap();
+        rig.machine.stop(&entry.id).await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Failed
+        );
+        assert_eq!(rig.core.files(&entry.id).load_events().unwrap(), None);
     }
 }

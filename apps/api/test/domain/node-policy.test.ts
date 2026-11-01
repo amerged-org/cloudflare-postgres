@@ -158,3 +158,96 @@ it("reaches the node's page, and a policy stored before the field existed is rea
       .admission.cpu_boost_ms,
   ).toBe(0);
 });
+
+it("takes a policy without data event limits as the defaults, which the page then carries (a property starts optional, plan 9.3)", async () => {
+  const f = await fixture();
+  const defaults = {
+    max_payload_bytes: 16_384,
+    max_outbox_rows: 10_000,
+    emits_per_second: 20,
+  };
+  const without = nodePolicy();
+  delete (without as Partial<typeof without>).events;
+  const set = await request(path(f.region), f.admin, "PUT", without);
+  expect(set.status).toBe(200);
+  expect(((await set.json()) as { events: unknown }).events).toEqual(defaults);
+  expect(
+    (
+      (await (await request(path(f.region), f.admin)).json()) as {
+        events: unknown;
+      }
+    ).events,
+  ).toEqual(defaults);
+  expect(
+    await env.DB.prepare(
+      "SELECT node_policy_json FROM node_region_policies WHERE region_id=?",
+    )
+      .bind(f.region)
+      .first<string>("node_policy_json"),
+  ).toBe(JSON.stringify({ ...without, events: defaults }));
+  // A policy stored by the release before this one has no events group, and reads the same.
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET node_policy_json=? WHERE region_id=?",
+  )
+    .bind(JSON.stringify(without), f.region)
+    .run();
+  expect(
+    (
+      (await (await request(path(f.region), f.admin)).json()) as {
+        events: unknown;
+      }
+    ).events,
+  ).toEqual(defaults);
+  const page = await nodeRequest(f, "/node/v1/desired");
+  expect(page.status).toBe(200);
+  expect(
+    ((await page.json()) as { policy: { events: unknown } }).policy.events,
+  ).toEqual(defaults);
+});
+
+it("sets the data event limits as given, and refuses a value out of bound or a full outbox that would not fit the volume", async () => {
+  const f = await fixture();
+  const events = (value: object) => ({ ...nodePolicy(), events: value });
+  const read = async () =>
+    (
+      (await (await request(path(f.region), f.admin)).json()) as {
+        events: unknown;
+      }
+    ).events;
+  const small = {
+    max_payload_bytes: 1024,
+    max_outbox_rows: 100,
+    emits_per_second: 1,
+  };
+  expect(
+    (await request(path(f.region), f.admin, "PUT", events(small))).status,
+  ).toBe(200);
+  expect(await read()).toEqual(small);
+  const largest = {
+    max_payload_bytes: 262_144,
+    max_outbox_rows: 1024,
+    emits_per_second: 1000,
+  };
+  expect(
+    (await request(path(f.region), f.admin, "PUT", events(largest))).status,
+  ).toBe(200);
+  expect(await read()).toEqual(largest);
+  for (const broken of [
+    { max_payload_bytes: 262_144, max_outbox_rows: 1025, emits_per_second: 20 },
+    {
+      max_payload_bytes: 262_144,
+      max_outbox_rows: 1_000_000,
+      emits_per_second: 20,
+    },
+    { max_payload_bytes: 1024, max_outbox_rows: 100, emits_per_second: 0 },
+  ]) {
+    const refused = await request(
+      path(f.region),
+      f.admin,
+      "PUT",
+      events(broken),
+    );
+    expect((await refusal(refused)).status, JSON.stringify(broken)).toBe(400);
+  }
+  expect(await read()).toEqual(largest);
+});

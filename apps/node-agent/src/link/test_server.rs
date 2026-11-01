@@ -616,6 +616,8 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
         post("NodeEventReport")
     } else if is("usage") {
         post("NodeUsageReport")
+    } else if is("dataEvents") {
+        post("NodeDataEventReport")
     } else if is("diagnostics") {
         post(if body["kind"] == "probe" {
             "NodeProbeResult"

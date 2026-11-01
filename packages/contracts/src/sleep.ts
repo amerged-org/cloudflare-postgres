@@ -9,6 +9,7 @@ export const SLEEP_REFUSALS = [
   "switch_unknown",
   "archive_timeout",
   "aborted",
+  "outbox_pending",
 ] as const;
 export type SleepRefusal = (typeof SLEEP_REFUSALS)[number];
 const CLEAR = "SELECT pg_catalog.pg_stat_clear_snapshot()";
@@ -16,10 +17,16 @@ const CLEAR = "SELECT pg_catalog.pg_stat_clear_snapshot()";
 // database and with no state: it is not a session, and a database woken and put to sleep at once
 // must not be refused for it. Other background workers still count: an autovacuum worker that
 // runs keeps the database awake until it ends.
+// The node agent's own events session, a superuser session named pgcf-agent-events, is not a
+// tenant session and must not hold the database awake. A tenant cannot spoof it because it cannot
+// authenticate as postgres (pg_hba `local all postgres peer map=pgcf_agent`); a non-superuser role
+// with that application_name is still counted. The literal must equal postgres::EVENTS_APPLICATION
+// in the node agent.
 const GUARD = `SELECT
   (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_stat_activity
     WHERE datid IS NOT NULL AND pid <> pg_catalog.pg_backend_pid()
       AND backend_type <> 'autoprewarm worker'
+      AND NOT (usename = 'postgres' AND application_name = 'pgcf-agent-events')
       AND (state IS DISTINCT FROM 'idle' OR xact_start IS NOT NULL)) AS busy,
   (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_prepared_xacts) AS prepared`;
 const IDENTITY = `SELECT pg_catalog.current_database() AS database,

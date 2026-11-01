@@ -518,6 +518,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Report the node's metered usage of its databases",
     "node",
   ),
+  "POST /node/v1/data-events": route(
+    "reportNodeDataEvents",
+    "Report the data events of a database from its outbox",
+    "node",
+  ),
   "POST /node/v1/diagnostics": route(
     "reportNodeBoot",
     "Report the previous boot's journal after a reboot, or the result of a probe",

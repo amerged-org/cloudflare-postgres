@@ -4,6 +4,7 @@
 use crate::{
     admission,
     archive::{job::Limits as JobLimits, restore::End},
+    node_link::constant,
     roles::{self, Wanted},
     state::Resources,
     storage,
@@ -210,6 +211,7 @@ pub struct Policy {
     /// The write limits of a 256 MiB database: bytes per second and operations per second.
     pub write_bytes_per_second: u64,
     pub write_iops: u64,
+    pub events: EventLimits,
 }
 impl Policy {
     /// `None` for a policy that is not what the contract states.
@@ -220,8 +222,31 @@ impl Policy {
             backup: JobLimits::from_policy(&policy["backup"])?,
             write_bytes_per_second: number(&policy["io"], "write_bytes_per_second")?,
             write_iops: number(&policy["io"], "write_iops")?,
+            events: EventLimits {
+                max_payload_bytes: event_limit(policy, "max_payload_bytes"),
+                max_outbox_rows: event_limit(policy, "max_outbox_rows"),
+                emits_per_second: u32::try_from(event_limit(policy, "emits_per_second")).ok()?,
+            },
         })
     }
+}
+
+/// The limits of a database's data event outbox (`DATA_EVENT_LIMITS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventLimits {
+    pub max_payload_bytes: u64,
+    pub max_outbox_rows: u64,
+    pub emits_per_second: u32,
+}
+
+/// A limit of the policy's `events` group: its contract default when the group or the value is
+/// absent or not a number, otherwise the value kept within the contract's bounds.
+fn event_limit(policy: &Value, field: &str) -> u64 {
+    let limit = &constant("DATA_EVENT_LIMITS")[field];
+    let bound = |key: &str| limit[key].as_u64().expect("generated bound");
+    number(&policy["events"], field).map_or(bound("default"), |value| {
+        value.clamp(bound("min"), bound("max"))
+    })
 }
 
 #[cfg(test)]
@@ -381,5 +406,53 @@ mod tests {
             (16_000_000, 1000)
         );
         assert!(Policy::parse(&json!({"admission": {}})).is_none());
+    }
+
+    #[test]
+    fn the_data_event_limits_of_the_policy_are_the_contracts_defaults_when_absent() {
+        let page = vector("NodeDesiredPage", "full-page");
+        let limit = |field: &str, key: &str| constant("DATA_EVENT_LIMITS")[field][key].as_u64();
+        let defaults = EventLimits {
+            max_payload_bytes: limit("max_payload_bytes", "default").unwrap(),
+            max_outbox_rows: limit("max_outbox_rows", "default").unwrap(),
+            emits_per_second: limit("emits_per_second", "default").unwrap() as u32,
+        };
+        // A policy of an earlier release has no group, and a group may name one value alone.
+        let mut policy = page["policy"].clone();
+        policy.as_object_mut().unwrap().remove("events");
+        assert_eq!(Policy::parse(&policy).unwrap().events, defaults);
+        policy["events"] = json!({"emits_per_second": 50});
+        assert_eq!(
+            Policy::parse(&policy).unwrap().events,
+            EventLimits {
+                emits_per_second: 50,
+                ..defaults
+            }
+        );
+    }
+
+    #[test]
+    fn the_data_event_limits_of_the_policy_are_read_and_kept_within_their_bounds() {
+        let mut policy = vector("NodeDesiredPage", "full-page")["policy"].clone();
+        policy["events"] = json!({
+            "max_payload_bytes": 32_768,
+            "max_outbox_rows": 5_000_000,
+            "emits_per_second": 0,
+        });
+        assert_eq!(
+            Policy::parse(&policy).unwrap().events,
+            EventLimits {
+                max_payload_bytes: 32_768,
+                max_outbox_rows: 1_000_000,
+                emits_per_second: 1,
+            }
+        );
+        // A value that is not a number is the default, as an absent one is.
+        policy["events"] = json!({"max_payload_bytes": "16384", "max_outbox_rows": -1});
+        let read = Policy::parse(&policy).unwrap().events;
+        assert_eq!(
+            (read.max_payload_bytes, read.max_outbox_rows),
+            (16_384, 10_000)
+        );
     }
 }

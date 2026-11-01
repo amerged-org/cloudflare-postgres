@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from "vitest";
+import { EVENT_PATTERN } from "@pgcf/contracts/webhooks";
 import {
   EVENT_PATTERN_MAX_LENGTH,
   eventTypeMatches,
@@ -13,6 +14,8 @@ describe("isValidEventPattern", () => {
     expect(isValidEventPattern("database.*")).toBe(true);
     expect(isValidEventPattern("database.ready")).toBe(true);
     expect(isValidEventPattern("database_archive.failed_now")).toBe(true);
+    expect(isValidEventPattern("data.*")).toBe(true);
+    expect(isValidEventPattern("data.orders2")).toBe(true);
   });
 
   it("rejects empty, uppercase, digit, three-segment and whitespace patterns", () => {
@@ -20,6 +23,7 @@ describe("isValidEventPattern", () => {
     expect(isValidEventPattern("Database.ready")).toBe(false);
     expect(isValidEventPattern("database2.ready")).toBe(false);
     expect(isValidEventPattern("a.b.c")).toBe(false);
+    expect(isValidEventPattern("data.1orders")).toBe(false);
     expect(isValidEventPattern("*.ready")).toBe(false);
     expect(isValidEventPattern("a.*.b")).toBe(false);
     expect(isValidEventPattern("database. ready")).toBe(false);
@@ -47,9 +51,18 @@ describe("isValidEventPattern", () => {
 });
 
 describe("eventTypeMatches", () => {
-  it("matches every type with the wildcard", () => {
+  it("matches every platform type with the wildcard, but not data events", () => {
     expect(eventTypeMatches("*", "database.ready")).toBe(true);
     expect(eventTypeMatches("*", "anything")).toBe(true);
+    expect(eventTypeMatches("*", "data.orders")).toBe(false);
+    expect(eventTypeMatches("*", "data.orders2")).toBe(false);
+  });
+
+  it("matches data events with data.* and with their exact topic", () => {
+    expect(eventTypeMatches("data.*", "data.orders")).toBe(true);
+    expect(eventTypeMatches("data.*", "database.ready")).toBe(false);
+    expect(eventTypeMatches("data.orders", "data.orders")).toBe(true);
+    expect(eventTypeMatches("data.orders", "data.invoices")).toBe(false);
   });
 
   it("matches only the types one segment below a segment wildcard", () => {
@@ -134,5 +147,37 @@ describe("subscriptionWants", () => {
     expect(
       subscriptionWants({ event_types: [], database_ids: null }, event),
     ).toBe(false);
+  });
+});
+
+describe("the pattern grammar agrees with the contract", () => {
+  it("accepts and rejects the same twenty patterns", () => {
+    const patterns = [
+      "*",
+      "database.*",
+      "database.ready",
+      "data.*",
+      "data.orders",
+      "data.orders2",
+      "data_archive.a_b_9",
+      "database2.ready",
+      "a.1b",
+      "data.1orders",
+      "_a.b",
+      "a._b",
+      "a.",
+      ".b",
+      "a-b.c",
+      "Database.ready",
+      "*.ready",
+      "a.*.b",
+      "database. ready",
+      "a".repeat(40) + ".ok",
+    ];
+    expect(patterns).toHaveLength(20);
+    for (const pattern of patterns)
+      expect(isValidEventPattern(pattern), pattern).toBe(
+        EVENT_PATTERN.test(pattern),
+      );
   });
 });

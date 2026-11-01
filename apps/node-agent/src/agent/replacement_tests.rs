@@ -203,11 +203,22 @@ async fn an_unreachable_pitr_point_is_not_retried_as_a_temporary_fetch_failure()
 }
 
 async fn source(rig: &Rig) -> (Value, DatabaseState, String) {
+    source_with(rig, "").await
+}
+
+/// A source database with `extra` run in it before it sleeps.
+async fn source_with(rig: &Rig, extra: &str) -> (Value, DatabaseState, String) {
     let mut db = rig.entry_json();
     let (entry, handle) = rig.create_from(&db).await;
     db.as_object_mut().unwrap().remove("origin");
-    let session = tenant(rig, &entry.id).await;
-    session.batch("CREATE TABLE replacement_marker (id int PRIMARY KEY); INSERT INTO replacement_marker VALUES (1)").await.unwrap();
+    let id = entry.id.clone();
+    let session = tenant(rig, &id).await;
+    session
+        .batch(&format!(
+            "CREATE TABLE replacement_marker (id int PRIMARY KEY); INSERT INTO replacement_marker VALUES (1); {extra}"
+        ))
+        .await
+        .unwrap();
     // The selected time lies between two committed writes, on the database server's clock.
     session.batch("SELECT pg_sleep(0.005)").await.unwrap();
     let point: String = session.query("SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')", &[]).await.unwrap()[0].get(0);
@@ -216,8 +227,152 @@ async fn source(rig: &Rig) -> (Value, DatabaseState, String) {
         .await
         .unwrap();
     drop(session);
-    assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+    if extra.is_empty() {
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+    } else {
+        // A sleep refuses a pending outbox row: the source is recovered from a crash instead. The
+        // row stays in it, and recovery proves the sleep without draining the outbox.
+        rig.machine.crash(&id);
+        rig.core.watch_pass().await;
+        eventually(60, "the recovery to prove the sleep", || {
+            handle.phase() == Phase::Asleep
+                && handle.state().as_ref().is_some_and(|s| s.record.is_some())
+        })
+        .await;
+    }
     (db, handle.state().unwrap(), point)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_in_place_replacement_starts_its_outbox_empty_under_the_raised_epoch() {
+    let Some(rig) = Rig::new("replace-events").await else {
+        return;
+    };
+    let (source, state, point) =
+        source_with(&rig, "SELECT pgcf.emit('orders', '{\"n\": 1}')").await;
+    let target = replace(&rig, &source, &state, &point);
+    let id = target["id"].as_str().unwrap().to_string();
+    ready(&rig, &target).await;
+
+    // The source's row is not the replacement's, and the replacement's first row is stamped with
+    // its own generation: the id (epoch, seq) of the source's row never comes again.
+    let session = tenant(&rig, &id).await;
+    let pending = session
+        .query("SELECT count(*) FROM pgcf.outbox", &[])
+        .await
+        .unwrap();
+    assert_eq!(pending[0].get::<_, i64>(0), 0);
+    session
+        .batch("SELECT pgcf.emit('orders', '{\"n\": 2}')")
+        .await
+        .unwrap();
+    let rows = session
+        .query("SELECT seq, epoch FROM pgcf.outbox ORDER BY seq", &[])
+        .await
+        .unwrap();
+    let ids: Vec<(i64, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(ids, [(1, 2)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_keeps_its_rows_under_the_epoch_they_were_stamped_with() {
+    let Some(rig) = Rig::new("move-events").await else {
+        return;
+    };
+    let (source, state, _) = source_with(&rig, "SELECT pgcf.emit('orders', '{\"n\": 1}')").await;
+    let id = source["id"].as_str().unwrap().to_string();
+    let old_path = source["archive"]["path"].as_str().unwrap().to_string();
+    let new_path = format!("s3://pgcf-eu/eu-dev/{id}/g2-op_hhhhhhhhhhhhhhhhhhhh");
+    rig.deliver(&old_path, "read_only");
+    rig.deliver(&new_path, "read_write");
+    let mut moved = source.clone();
+    moved["storage_generation"] = json!(2);
+    moved["generation"] = json!(7);
+    moved["operation"] = json!("op_hhhhhhhhhhhhhhhhhhhh");
+    moved["archive"]["path"] = json!(new_path);
+    moved["origin"] = json!({"kind": "move", "source": {
+        "database_id": id, "path": old_path,
+        "backup_id": state.backup.as_ref().unwrap().backup_id,
+        "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"},
+        "end": state.record.clone().unwrap()}});
+    let handle = rig.core.db(&id);
+    rig.core.apply(&Rig::page(vec![moved], vec![])).await;
+    eventually(120, "the move", || {
+        handle
+            .state()
+            .as_ref()
+            .is_some_and(|s| s.storage_generation == 2)
+            && matches!(handle.phase(), Phase::Ready | Phase::Error)
+    })
+    .await;
+    assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+
+    // The move keeps the row of the source, stamped with the source's epoch; a new row carries
+    // the moved generation. The identity sequence is not restarted, so the new row's sequence
+    // does not depend on the sequence the recovered source reached.
+    let session = tenant(&rig, &id).await;
+    let query = "SELECT seq, epoch FROM pgcf.outbox ORDER BY seq";
+    let ids = |rows: Vec<tokio_postgres::Row>| -> Vec<(i64, i64)> {
+        rows.iter().map(|r| (r.get(0), r.get(1))).collect()
+    };
+    assert_eq!(ids(session.query(query, &[]).await.unwrap())[0], (1, 1));
+    session
+        .batch("SELECT pgcf.emit('orders', '{\"n\": 2}')")
+        .await
+        .unwrap();
+    let rows = ids(session.query(query, &[]).await.unwrap());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (1, 1));
+    assert_eq!(rows[1].1, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_rollback_keeps_the_rows_of_the_source_image() {
+    let Some(rig) = Rig::new("rollback-events").await else {
+        return;
+    };
+    let (source, state, point) =
+        source_with(&rig, "SELECT pgcf.emit('orders', '{\"n\": 1}')").await;
+    let target = replace(&rig, &source, &state, &point);
+    let id = target["id"].as_str().unwrap().to_string();
+    ready(&rig, &target).await;
+    let session = tenant(&rig, &id).await;
+    session
+        .batch("SELECT pgcf.emit('orders', '{\"n\": 2}')")
+        .await
+        .unwrap();
+    drop(session);
+
+    // A rollback is built from the source's backup and its history: the replacement's row is gone,
+    // the source's row keeps its epoch, and the epoch is raised to the rollback's generation.
+    let rollback = rollback(&source, &state, &target);
+    credentials(&rig, &rollback);
+    rig.core
+        .apply(&Rig::page(vec![rollback.clone()], vec![]))
+        .await;
+    let handle = rig.core.db(&id);
+    eventually(120, "the rollback to finish", || {
+        handle
+            .state()
+            .as_ref()
+            .is_some_and(|s| s.storage_generation == 3)
+            && matches!(handle.phase(), Phase::Ready | Phase::Error)
+    })
+    .await;
+    assert_eq!(handle.phase(), Phase::Ready, "{:?}", handle.view().error);
+    let session = tenant(&rig, &id).await;
+    let query = "SELECT seq, epoch FROM pgcf.outbox ORDER BY seq";
+    let ids = |rows: Vec<tokio_postgres::Row>| -> Vec<(i64, i64)> {
+        rows.iter().map(|r| (r.get(0), r.get(1))).collect()
+    };
+    assert_eq!(ids(session.query(query, &[]).await.unwrap()), [(1, 1)]);
+    session
+        .batch("SELECT pgcf.emit('orders', '{\"n\": 3}')")
+        .await
+        .unwrap();
+    let rows = ids(session.query(query, &[]).await.unwrap());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].1, 3);
 }
 
 fn replace(rig: &Rig, source: &Value, state: &DatabaseState, point: &str) -> Value {

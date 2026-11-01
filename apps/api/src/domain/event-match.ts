@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 export const EVENT_PATTERN_MAX_LENGTH = 64;
 
-const SEGMENT = /^[a-z][a-z_]*$/;
+// A data event's topic is a table name, which may hold digits after its first letter.
+const HEAD = /^[a-z][a-z_]*$/;
+const TAIL = /^[a-z][a-z0-9_]*$/;
 
 export function isValidEventPattern(pattern: string): boolean {
   if (pattern.length > EVENT_PATTERN_MAX_LENGTH) return false;
@@ -9,12 +11,13 @@ export function isValidEventPattern(pattern: string): boolean {
   const parts = pattern.split(".");
   if (parts.length !== 2) return false;
   const [head, tail] = parts as [string, string];
-  return SEGMENT.test(head) && (tail === "*" || SEGMENT.test(tail));
+  return HEAD.test(head) && (tail === "*" || TAIL.test(tail));
 }
 
 export function eventTypeMatches(pattern: string, type: string): boolean {
   if (!isValidEventPattern(pattern)) return false;
-  if (pattern === "*") return true;
+  // The wildcard is the platform's: a data event reaches only a subscriber that names data.
+  if (pattern === "*") return !type.startsWith("data.");
   const [head, tail] = pattern.split(".") as [string, string];
   if (tail === "*") {
     const parts = type.split(".");

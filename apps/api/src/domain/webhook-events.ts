@@ -24,11 +24,31 @@ const LIFECYCLE_TYPES: Readonly<Record<string, WebhookEventType>> = {
 /** The operations PGCF starts for itself are not events of the integrator's own requests. */
 const INTERNAL_OPERATION_KINDS = ["database.hibernate", "database.wake"];
 
-type Subscription = {
+export type Subscription = {
   id: string;
   event_types: string[];
   database_ids: string[] | null;
 };
+
+/** The live subscriptions of a project, with their type patterns and database limits decoded. */
+export async function projectSubscriptions(
+  env: Env,
+  projectId: string,
+): Promise<Subscription[]> {
+  const rows = await env.DB.prepare(
+    `SELECT id, event_types, database_ids FROM webhook_subscriptions
+     WHERE project_id = ? AND deleted_at IS NULL`,
+  )
+    .bind(projectId)
+    .all<{ id: string; event_types: string; database_ids: string | null }>();
+  return rows.results.map((row) => ({
+    id: row.id,
+    event_types: JSON.parse(row.event_types) as string[],
+    database_ids: row.database_ids
+      ? (JSON.parse(row.database_ids) as string[])
+      : null,
+  }));
+}
 
 /**
  * A stable identifier derived from the source row, so that the same lifecycle row or operation
@@ -78,19 +98,7 @@ export async function runWebhookEvents(env: Env): Promise<WebhookEventsResult> {
   const forProject = async (projectId: string): Promise<Subscription[]> => {
     const cached = subscriptions.get(projectId);
     if (cached) return cached;
-    const rows = await env.DB.prepare(
-      `SELECT id, event_types, database_ids FROM webhook_subscriptions
-       WHERE project_id = ? AND deleted_at IS NULL`,
-    )
-      .bind(projectId)
-      .all<{ id: string; event_types: string; database_ids: string | null }>();
-    const loaded = rows.results.map((row) => ({
-      id: row.id,
-      event_types: JSON.parse(row.event_types) as string[],
-      database_ids: row.database_ids
-        ? (JSON.parse(row.database_ids) as string[])
-        : null,
-    }));
+    const loaded = await projectSubscriptions(env, projectId);
     subscriptions.set(projectId, loaded);
     return loaded;
   };
@@ -207,6 +215,22 @@ async function operationCandidates(
   }));
 }
 
+function actorOf(env: Env, databaseId: string) {
+  return env.TRIGGER_ACTOR.get(env.TRIGGER_ACTOR.idFromName(databaseId));
+}
+
+/** A subscription reaches a database's data events when a pattern names data and it names the database. */
+function reachesDataOf(
+  subscription: Subscription,
+  databaseId: string,
+): boolean {
+  return (
+    subscription.event_types.some((pattern) => pattern.startsWith("data.")) &&
+    (subscription.database_ids === null ||
+      subscription.database_ids.includes(databaseId))
+  );
+}
+
 /**
  * Hands the candidates to their actors in order, a few at a time, and returns the cursor of the
  * last candidate before the first failure (the last one when none failed), or null when the first
@@ -225,12 +249,20 @@ async function handOver(
       chunk.map(async (candidate) => {
         const type = candidate.type;
         if (type === null) return 0;
-        const wanting = (await forProject(candidate.project_id)).filter(
-          (subscription) =>
-            subscriptionWants(subscription, {
-              type,
-              database_id: candidate.database_id,
-            }),
+        const subscriptions = await forProject(candidate.project_id);
+        // A deleted database's data is dropped whether or not anyone wants the event itself.
+        if (
+          type === "database.deleted" &&
+          subscriptions.some((subscription) =>
+            reachesDataOf(subscription, candidate.database_id),
+          )
+        )
+          await actorOf(env, candidate.database_id).purgeData();
+        const wanting = subscriptions.filter((subscription) =>
+          subscriptionWants(subscription, {
+            type,
+            database_id: candidate.database_id,
+          }),
         );
         if (wanting.length === 0) return 0;
         const eventId = await derivedId("evt", candidate.key);
@@ -247,10 +279,7 @@ async function handOver(
             derivedId("dlv", `${eventId}|${subscription.id}`),
           ),
         );
-        const actor = env.TRIGGER_ACTOR.get(
-          env.TRIGGER_ACTOR.idFromName(candidate.database_id),
-        );
-        await actor.ingest(
+        await actorOf(env, candidate.database_id).ingest(
           event,
           wanting.map((subscription) => subscription.id),
           deliveryIds,

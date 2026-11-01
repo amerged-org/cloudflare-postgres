@@ -195,6 +195,11 @@ const page = {
       memory_mib: { wal_upload: 128, wal_fetch: 128, base_backup: 256 },
     },
     io: { write_bytes_per_second: 16_000_000, write_iops: 1000 },
+    events: {
+      max_payload_bytes: 16_384,
+      max_outbox_rows: 10_000,
+      emits_per_second: 20,
+    },
   },
   credentials_revision: 3,
   orders: [
@@ -366,6 +371,33 @@ const usageRow = {
   connections: 3,
   connection_ms: 5000,
 };
+const dataEvent = {
+  epoch: 1,
+  seq: 1,
+  at: now,
+  topic: "orders",
+  payload: {
+    schema: "public",
+    table: "orders",
+    op: "insert",
+    record: { id: 7, status: "paid" },
+    old_record: null,
+  },
+};
+const dataEvents = (...events: object[]) => ({ database: id, events });
+/** A payload of exactly `bytes` serialised bytes: `{"text":""}` is 11 of them. */
+const payloadOf = (bytes: number) => ({ text: "x".repeat(bytes - 11) });
+/** JavaScript writes 1e21 as `1e+21`, five bytes: `count` of them make 6 x count + 7 bytes. */
+const numbersOf = (count: number) => ({
+  n: Array.from({ length: count }, () => 1e21),
+});
+const serialisedBytes = (value: unknown) =>
+  new TextEncoder().encode(JSON.stringify(value)).byteLength;
+if (
+  serialisedBytes(numbersOf(43_689)) !== 262_141 ||
+  serialisedBytes(numbersOf(43_690)) !== 262_147
+)
+  throw new Error("numbersOf: the sizes of the payload vectors moved");
 /** A key pair made for these vectors; its private half was deleted. */
 const shellCa =
   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNcY+bgo/xfpIZts7k+ekO/ruRsypcSnZW0qomRI8bp";
@@ -474,6 +506,7 @@ export const nodeSchemas = {
   NodeBootReport: link.NodeBootReport,
   NodeProbeResult: link.NodeProbeResult,
   NodeUsageReport: link.NodeUsageReport,
+  NodeDataEventReport: link.NodeDataEventReport,
   NodeFencedResponse: link.NodeFencedResponse,
   AgentLinkMessage: link.AgentLinkMessage,
   ServerLinkMessage: link.ServerLinkMessage,
@@ -852,6 +885,13 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       },
       true,
     ],
+    // The same for the data event limits: a page without them is a page, and the node reads the
+    // defaults (`NodePolicy`), so that an API before the limits sends the page it always did.
+    [
+      "page-policy-without-events",
+      { ...page, policy: { ...page.policy, events: undefined } },
+      true,
+    ],
     // The contract refuses a property it does not name (the API never sends one by accident); the
     // node ignores it wherever it stands, so that the API can send a property before the nodes know it.
     ["extra-property-on-the-page", { ...page, ...later }, false],
@@ -868,6 +908,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
           ...page.policy,
           admission: { ...page.policy.admission, ...later },
           early_sleep: { ...page.policy.early_sleep, ...later },
+          events: { ...page.policy.events, ...later },
         },
       },
       false,
@@ -1422,6 +1463,17 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
           { operation: op("s"), status: "failed", reason: "volume_missing" },
         ],
       },
+      true,
+    ],
+    [
+      "ready-database-refuses-sleep-for-the-outbox",
+      observations({
+        ...observation,
+        state: "ready",
+        instance,
+        proven_sleep: null,
+        refusal: "power_outbox",
+      }),
       true,
     ],
     [
@@ -2051,6 +2103,94 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     ["interval-twice", { rows: [usageRow, usageRow] }, false, true],
+  ],
+  NodeDataEventReport: [
+    ["one-event", dataEvents(dataEvent), true],
+    [
+      "hundred-events",
+      dataEvents(
+        ...Array.from(
+          { length: link.NODE_DATA_EVENT_BATCH_MAX },
+          (_, index) => ({
+            ...dataEvent,
+            seq: index + 1,
+          }),
+        ),
+      ),
+      true,
+    ],
+    ["empty-events", dataEvents(), false],
+    [
+      "events-101",
+      dataEvents(
+        ...Array.from(
+          { length: link.NODE_DATA_EVENT_BATCH_MAX + 1 },
+          (_, index) => ({ ...dataEvent, seq: index + 1 }),
+        ),
+      ),
+      false,
+    ],
+    ["topic-uppercase", dataEvents({ ...dataEvent, topic: "Orders" }), false],
+    [
+      "topic-49-characters",
+      dataEvents({ ...dataEvent, topic: "a".repeat(49) }),
+      false,
+    ],
+    [
+      "topic-starts-with-digit",
+      dataEvents({ ...dataEvent, topic: "1orders" }),
+      false,
+    ],
+    ["payload-array", dataEvents({ ...dataEvent, payload: [] }), false],
+    ["payload-string", dataEvents({ ...dataEvent, payload: "x" }), false],
+    ["extra-property", dataEvents({ ...dataEvent, ...later }), false],
+    ["epoch-zero", dataEvents({ ...dataEvent, epoch: 0 }), false],
+    [
+      "seq-above-safe-integer",
+      dataEvents({ ...dataEvent, seq: 2 ** 53 }),
+      false,
+    ],
+    [
+      "seq-descending",
+      dataEvents({ ...dataEvent, seq: 2 }, dataEvent),
+      false,
+      true,
+    ],
+    ["seq-duplicate", dataEvents(dataEvent, dataEvent), false, true],
+    [
+      "payload-over-ceiling",
+      dataEvents({
+        ...dataEvent,
+        payload: payloadOf(link.NODE_DATA_EVENT_PAYLOAD_MAX_BYTES + 1),
+      }),
+      false,
+      true,
+    ],
+    // Five payloads of 262,011 bytes each pass the ceiling and together pass the body bound.
+    [
+      "body-over-bound",
+      dataEvents(
+        ...[1, 2, 3, 4, 5].map((seq) => ({
+          ...dataEvent,
+          seq,
+          payload: { text: "x".repeat(262_000) },
+        })),
+      ),
+      false,
+      true,
+    ],
+    // The payload ceiling counts numbers as JavaScript writes them, not as they were read.
+    [
+      "payload-of-1e21-at-ceiling",
+      dataEvents({ ...dataEvent, payload: numbersOf(43_689) }),
+      true,
+    ],
+    [
+      "payload-of-1e21-over-ceiling",
+      dataEvents({ ...dataEvent, payload: numbersOf(43_690) }),
+      false,
+      true,
+    ],
   ],
   NodeFencedResponse: [
     ["fenced", { error: "node_fenced" }, true],

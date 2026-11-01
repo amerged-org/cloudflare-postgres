@@ -6,6 +6,7 @@ use crate::{
     archive::upload_log::UploadLog,
     link::file::{create_private_directory, sync_directory, write_private},
     pg_control::Lsn,
+    pgcf::EventsRecord,
     roles::timestamp,
     sleep::is_segment,
 };
@@ -21,6 +22,7 @@ pub(crate) mod replacement;
 
 const VERSION: u8 = 1;
 const STATE_FILE: &str = "state.json";
+const EVENTS_FILE: &str = "events.json";
 
 /// The record of a proven sleep (`ProvenSleepRecord` of the node contract): a database is cold and
 /// safe only with a record that its `pg_control` matches.
@@ -250,6 +252,24 @@ impl Files {
             &serde_json::to_vec(state)?,
         )
     }
+    /// The record of the database's platform schema (`events.json`), or `None` when there is none
+    /// or it does not parse: the schema is then installed again, which writes it.
+    pub fn load_events(&self) -> io::Result<Option<EventsRecord>> {
+        let bytes = match std::fs::read(self.directory.join(EVENTS_FILE)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(serde_json::from_slice(&bytes).ok())
+    }
+    /// Replaces the record of the database's platform schema.
+    pub fn save_events(&self, record: &EventsRecord) -> io::Result<()> {
+        create_private_directory(&self.directory)?;
+        write_private(
+            &self.directory.join(EVENTS_FILE),
+            &serde_json::to_vec(record)?,
+        )
+    }
     /// The upload log of a storage generation, which the sleep proof reads.
     pub fn upload_log(&self, storage_generation: u64) -> UploadLog {
         UploadLog::new(
@@ -431,6 +451,37 @@ mod tests {
             std::fs::write(files.directory().join("state.json"), text).unwrap();
             assert!(files.load().is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn the_events_record_is_a_file_of_its_own_and_a_file_that_does_not_parse_is_no_record() {
+        use crate::pgcf::Settings;
+        let base = directory("events");
+        let files = Files::new(base.join("databases/abcdefghij0123456789"));
+        assert_eq!(files.load_events().unwrap(), None);
+        let settings = Settings {
+            epoch: 2,
+            max_payload_bytes: 16_384,
+            max_outbox_rows: 10_000,
+        };
+        let record = EventsRecord::of(&settings, false);
+        files.save_events(&record).unwrap();
+        assert_eq!(files.load_events().unwrap(), Some(record));
+        // The record leaves the database's state alone: an older agent reads every state.
+        assert_eq!(files.load().unwrap(), None);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(files.directory().join("events.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // A record that does not parse is none: the schema is installed again and writes it.
+        std::fs::write(files.directory().join("events.json"), "{").unwrap();
+        assert_eq!(files.load_events().unwrap(), None);
+        // A directory that cannot be read is an error, not a database without a record.
+        let not_a_directory = base.join("a-file");
+        std::fs::write(&not_a_directory, "").unwrap();
+        assert!(Files::new(&not_a_directory).load_events().is_err());
     }
 
     #[test]

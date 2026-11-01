@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   NODE_FENCED_ERROR,
   NodeFencedResponse,
+  newDatabaseId,
   nodePublicKey,
   type NodeKey,
 } from "@pgcf/contracts";
@@ -56,6 +57,24 @@ describe("a request signed with a node's key", () => {
       .bind(f.node)
       .run();
     expect((await post(f)).status).toBe(401);
+  });
+
+  it("is required for the data events of a node, which an unsigned or foreign request cannot send", async () => {
+    const f = await fixture();
+    const path = "/node/v1/data-events";
+    const body = { database: newDatabaseId(), events: [] };
+    const unsigned = await rawRequest(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    expect(unsigned.status).toBe(401);
+    const unknown = await nodeRequest(f, path, {
+      method: "POST",
+      body,
+      node: `nod_${"z".repeat(20)}`,
+    });
+    expect(unknown.status).toBe(401);
   });
 
   it("is the only credential: a management key or none is refused", async () => {
@@ -172,6 +191,24 @@ describe("a node declared lost", () => {
       ],
       ["/node/v1/events", { method: "POST", body: { events: [] } }],
       ["/node/v1/usage", { method: "POST", body: { rows: [] } }],
+      [
+        "/node/v1/data-events",
+        {
+          method: "POST",
+          body: {
+            database: newDatabaseId(),
+            events: [
+              {
+                epoch: 1,
+                seq: 1,
+                at: new Date().toISOString(),
+                topic: "orders",
+                payload: {},
+              },
+            ],
+          },
+        },
+      ],
       ["/node/v1/link", {}],
     ] as const) {
       const response = await nodeRequest(f, path, init);

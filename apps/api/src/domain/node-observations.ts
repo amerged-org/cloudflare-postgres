@@ -67,6 +67,12 @@ interface Row extends DatabaseRow {
   restore_operation: string | null;
   restore_status: string | null;
 }
+/** The lifecycle reason a sleep the node refused ends with; the failed operation records `power_<reason>`. */
+const REFUSAL_RECOVERY = {
+  power_busy: "busy",
+  power_archive: "archive",
+  power_outbox: "outbox",
+} as const;
 /**
  * Whether the sleep's event of the database's generation is written. The first report applied to a
  * suspended database asleep at the generation writes it, in one batch with every other statement
@@ -941,7 +947,7 @@ async function takeObservation(
         operation: row.power_operation,
         revision: row.generation,
       },
-      observation.refusal === "power_busy" ? "busy" : "archive",
+      REFUSAL_RECOVERY[observation.refusal],
       new Date().toISOString(),
     );
     if (recovered) await hintDatabases(env, [row.id]).catch(() => 0);
