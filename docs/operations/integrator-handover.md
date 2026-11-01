@@ -34,6 +34,13 @@ operator procedures are in the other runbooks ([recovery](recovery.md),
 
 ## Integration contract 1.5.0 — delivered, 2026-10-26
 
+**Contract 1.6.0 (data events) is built.** It adds the `data.<topic>` webhook events
+([2.8](#28-webhooks)), the `events` group of the node policy and the `power_outbox` refusal of a sleep
+([2.4](#24-suspend-and-resume)). The API serves contract 1.6.0 (`info.version`) from its deployment on. A database
+emits and delivers data events once its node runs the release that drains the outbox (steps 2 to 5 of the
+[operator installation](operator-installation.md#data-events-release-order-and-rollback)); until the region is
+converged on that release, `data.*` webhooks can be created and nothing arrives.
+
 Contract 1.5.0 is live: signed native release `sha-6aee8263071e` runs on both nodes, migrations
 0090 to 0094 are applied and API version `c0d24652` has served the contract since 20:10:05 UTC
 (the control plane was in maintenance from 18:59:11, 1 h 10 min 54 s). The dated receipts, the
@@ -518,7 +525,7 @@ work.
 ## 2. Lifecycle API
 
 The machine-readable reference is `GET /v1/openapi.json` (no key needed). Its `info.version` is
-the version of the API contract (`1.5.0` for this candidate document): it changes when the contract changes
+the version of the API contract (`1.6.0` for this document; a deployment without data events serves `1.5.0`): it changes when the contract changes
 and not with a Worker release, which is named in `info.x-worker-version`. Rules a schema cannot
 state are in descriptions ([Appendix C](#appendix-c-what-the-served-openapi-document-states-in-words)).
 Its operation IDs are listed below. Examples assume:
@@ -816,7 +823,10 @@ runs the sleep proof: it stops new work, closes idle sessions, checkpoints, swit
 segment, waits until every committed segment is in R2 and only then stops PostgreSQL; the volume
 stays mounted. If sessions are busy, a prepared transaction exists or the
 archive does not drain, the operation fails with `power_busy` or `power_archive` and the database
-keeps running: drain your pools first. Suspending a database that is already manually suspended returns
+keeps running: drain your pools first. A database whose data events are still undelivered (1.6.0 and
+later, [2.8](#28-webhooks)) waits up to 10 seconds for them; if rows remain the operation fails with
+`power_outbox`. A bulk load that emits many events can keep the drain busy for longer than that, so
+send the suspend again after the backlog has drained. Suspending a database that is already manually suspended returns
 its existing operation.
 
 **Conditional power intent (1.5.0 candidate).** Both endpoints accept an optional JSON body
@@ -1093,8 +1103,8 @@ regional provider paths and bounded G9 queue/restart acceptance passed on Octobe
 failed `/restore` operation remains failed; reconcile its target before requesting another restore.
 
 The lists of the schedules (at most 20, by name) and of a schedule's runs (`limit` 1 to 50, newest first) take
-no `cursor`; the other new lists follow the usual `limit` and `cursor`. These routes are additive: the
-contract version stays 1.5.0.
+no `cursor`; the other new lists follow the usual `limit` and `cursor`. These routes are additive and
+did not change the contract version (1.5.0); the data events of [2.8](#28-webhooks) make it 1.6.0.
 
 ### 2.8 Webhooks
 
@@ -1108,6 +1118,7 @@ poll. These events exist now:
 | `database.suspended`, `database.resized`, `database.deleted` | a `suspend`, a resize and a delete finished |
 | `operation.succeeded`, `operation.failed` | an operation you started finished (`data.operation_id`, `kind`, `error_code`); not the role removals (`database.role.delete`), which you read from the operation, and not the operations PGCF starts itself (`database.hibernate`, `database.wake`), which are announced as `database.slept` and `database.woke` instead |
 | `webhook.test` | only from `POST /v1/webhooks/{id}/test` |
+| `data.<topic>` (1.6.0) | a transaction that wrote a data event committed; see "Data events" below |
 
 ```sh
 curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $KEY" \
@@ -1121,7 +1132,8 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
 #      "header_names":["Authorization"],"created_at":"...","secret":"whsec_..."}
 ```
 
-- **Patterns:** `*`, `<group>.*` or one exact type. An integrator key subscribes its own project; an
+- **Patterns:** `*`, `<group>.*` or one exact type. `*` does not include data events: a subscription
+  to them names `data.*` (every topic) or `data.<topic>`. An integrator key subscribes its own project; an
   administrator key names `project_id`. A project holds at most 20 webhooks, also when creates race; the operator can raise the limit with the Worker variable `WEBHOOKS_MAX_PER_PROJECT` (an integrator that serves many customers from one project then limits its customers itself).
 - **The secret** is shown in the creation answer only (and in an idempotent replay of it). The static
   `headers` are stored sealed and never shown again (only their names). Many automation tools cannot
@@ -1135,7 +1147,8 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
   `x-forwarded-`; a value is 1 to 512 visible ASCII characters. An event pattern that matches no type is
   accepted and never fires: check the spelling against the table.
 - **A delivery** is a POST of `{"id","type","occurred_at","project_id","database_id","data"}` with the
-  headers `PGCF-Signature: t=<unix seconds>,v1=<hex>`, `PGCF-Event-Id` and `PGCF-Delivery-Id`. The
+  headers `PGCF-Signature: t=<unix seconds>,v1=<hex>`, `PGCF-Event-Id` and `PGCF-Delivery-Id`. A data
+  delivery also carries `epoch` and `seq`, and its event id is `<database_id>:<epoch>:<seq>`. The
   signature is the hex HMAC-SHA256, keyed with the secret, of the string `<t>.<raw body>`; reject a
   `t` more than five minutes from your clock.
   ```ts
@@ -1156,7 +1169,56 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
   delivers it again with a fresh window. Deleting a webhook dead-letters its waiting deliveries.
 - **Timing.** Events leave within about a minute of the change, operation events within about two: they are
   read from the lifecycle log and the finished operations by the minute cron (the operations a little after
-  they finished), so an event is not a real-time signal for a connection.
+  they finished), so an event is not a real-time signal for a connection. A data event does not wait for the
+  minute cron: the node's drain wakes on the commit and reads the outbox at least every 5 seconds, so it is
+  posted within seconds of a commit unless a backlog is draining first.
+- **Data events (`data.<topic>`, contract 1.6.0).** A data event is written by your own transaction and
+  is sent only if that transaction commits: a rollback sends nothing. Two ways to write one:
+  - `pgcf.emit(topic, payload)` inside the transaction, where `topic` is a text and `payload` a JSON
+    object. It returns the event's `seq`. Example: `SELECT pgcf.emit('order_paid', '{"order": 42}');`
+    Only the owner role `app` can run it. Another role gets `42501` until `app` runs
+    `GRANT EXECUTE ON FUNCTION pgcf.emit(text, jsonb) TO <role>`.
+  - `pgcf.capture` as a row trigger, one statement per table, run by your migrations or your management role:
+    ```sql
+    CREATE TRIGGER orders_capture AFTER INSERT OR UPDATE OR DELETE ON public.orders
+      FOR EACH ROW EXECUTE FUNCTION pgcf.capture('id', 'status', 'total_cents');
+    ```
+    The payload is `{"schema", "table", "op", "record", "old_record"}`, with only the named columns in
+    `record` and `old_record`. `op` is `insert`, `update` or `delete`; `old_record` is null for an insert and
+    `record` is null for a delete. An update that changes none of the named columns sends nothing. The trigger
+    must be `AFTER ... FOR EACH ROW` and may not watch a temporary table; a column that does not exist is refused.
+    The trigger is the only watch there is: PGCF has no watch API. It runs as the platform role, so a role that
+    only writes to a watched table is published through it and needs no grant on `pgcf.emit`.
+  - **Topic.** `^[a-z][a-z0-9_]{0,47}$`. For `pgcf.capture` the topic is the table name in lower case, with
+    every character outside `a` to `z`, `0` to `9` and `_` written as `_`, a `t_` prefix when the name does not
+    start with a letter, and at most 48 characters.
+  - **Payload.** A JSON object of at most 16 KiB by default (the operator sets 1 KiB to 256 KiB) and at most
+    32 levels deep. A captured number that a double does not hold exactly, or that lies outside 1e-300 to 1e300,
+    arrives as a decimal string. A number you pass to `emit` is read as JSON by the agent and by the API, so it
+    arrives as a double (`1.10` as `1.1`, integers beyond 2^53 rounded). Send exact integers and exact decimals
+    as strings.
+  - **Errors you see in your transaction:** `22023` (a topic or payload that is not allowed), `54000` (the payload
+    is too large or too deep), `53400` (the outbox is full: it holds the operator's row limit, 10,000 by default,
+    until the drain has caught up), `39P01`, `42703`, `42501` (a trigger rule above, or no EXECUTE on `pgcf.emit`)
+    and `55000` (the platform's
+    settings row is missing from the database). Retry a `53400` after a pause; nothing is lost by it, but the
+    write is refused.
+  - **Delivery.** Each subscription gets its own delivery, at least once, and a retry can reorder events. Order
+    by (`epoch`, `seq`) and deduplicate by `id`. `epoch` is the database's storage generation, which a restore
+    raises. A restored copy sends none of its source's pending events.
+  - **Trust.** Any role that may call `pgcf.emit` (`app`, or a role it granted) can write any topic and payload, and
+    any role that writes a watched table fires `pgcf.capture`. So a `data.*` event shows that a transaction
+    committed an event, not that a row changed in the way its topic suggests. Check the row again
+    before you act on an event that matters.
+  - **Dumps.** A logical dump of your database needs `pg_dump --exclude-schema=pgcf`: the platform schema is
+    readable only by the platform, so a dump that includes it fails. The platform installs its schema again when
+    a database is created or restored.
+  - **Deletion.** Deleting a database dead-letters its waiting data deliveries once the API reads the `database.deleted`
+    event (within the minute cron). They can be replayed for seven days; platform events of the database keep
+    being delivered.
+  - **Retries after an outage.** The retries after a failure come at 1, 5 and 30 minutes, then 2, 6 and 12 hours,
+    until 24 hours have passed since the event. For an event written when the receiver went down, an outage of
+    8 minutes is caught up about 36 minutes later, and an outage of one hour about 2 hours and 36 minutes later.
 - **History is not announced.** A webhook sees events from about its creation on: an event of the minute
   before, or of a backlog after a cron outage, may still arrive. Events of a restored copy
   belong to the new database.
@@ -2095,7 +2157,7 @@ When reporting an incident, send:
   are accepted in the dated ULTRA update; dependent test-population cleanup remains open.
 - Alerts for integrators (alerts go to the operator); operator acknowledgement and test send. Operational health exposes delivery/recovery receipts, not a complete event-history API.
 - Finding deleted databases: the lists exclude them, so keep the IDs you were given.
-- An event stream beyond the webhooks of [2.8](#28-webhooks) (no ordering guarantee, no data-change events), an audit log of integrator keys (the administrator keys have one).
+- An event stream beyond the webhooks of [2.8](#28-webhooks) (retries can reorder data events, and there is no pull queue or Realtime), an audit log of integrator keys (the administrator keys have one).
 - Last-use display and key rotation as a feature; an API domain with rate limiting.
 - Infrastructure metrics history and measured CPU and RAM per database.
 - Changing a role after creation (expiry, limit, membership), user-chosen passwords, a grants API,
@@ -2234,7 +2296,7 @@ there is.
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `superseded`                                                    | a newer intent (resize, delete or power change) replaced it; not a platform fault                                                                                                                 |
 | `operation_timeout`                                             | except for accepted `database.delete`: no report for 20 minutes after placement or the node's last repeated `building` report ("Regional operation exceeded 20 minutes"); or a create or restore still building 24 hours after placement ("Build exceeded 24 hours after its placement") |
-| `power_busy`, `power_archive`, `power_unknown`, `power_timeout` | a suspend or hibernation was refused or timed out; the database returned to running                                                                                                               |
+| `power_busy`, `power_archive`, `power_outbox`, `power_unknown`, `power_timeout` | a suspend or hibernation was refused or timed out; the database returned to running. `power_outbox` (1.6.0): the data events of the database were not delivered within 10 seconds ([2.4](#24-suspend-and-resume))                                                                                                               |
 | `role_not_droppable`                                            | `database.role.delete`: the role owns objects or holds privileges, so PostgreSQL cannot drop it; it stays unable to log in until they are removed ([2.3](#23-roles-connection-uri-and-passwords)) |
 
 ### A.4 SQLSTATE at connect time

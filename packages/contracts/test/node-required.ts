@@ -132,6 +132,8 @@ export const NODE_REQUIRED: Record<string, string[]> = {
   ],
   NodeCredentials: ["revision", "route_keyring", "tunnel_token"],
   "NodeCredentials.route_keyring": ["active", "keys"],
+  NodeDataEventReport: ["database", "events"],
+  "NodeDataEventReport.events[]": ["at", "epoch", "payload", "seq", "topic"],
   NodeDesiredPage: [
     "credentials_revision",
     "databases",

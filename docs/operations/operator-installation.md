@@ -1341,6 +1341,7 @@ each is told to pull the new page, and admission uses the new values from then o
 | `storage`    | `reserve_bytes`, `metadata_no_room_percent`, `sample_max_age_seconds`                                                                                            | 6 GiB, 75, 10                              |
 | `backup`     | `wal_uploads`, `base_backups`, and `memory_mib` of a WAL upload, a WAL fetch and a base backup or restore                                                        | 2, 1, 128, 128, 256                        |
 | `io`         | `write_bytes_per_second` and `write_iops` of a 256 MiB database; a database of _m_ MiB gets _m_/256 times as much                                                | 16 MB/s, 1,000                             |
+| `events`     | `max_payload_bytes`, `max_outbox_rows` and `emits_per_second` of a database's data event outbox (1.6.0, [below](#data-events-release-order-and-rollback)): 1 KiB to 256 KiB, 100 to 1,000,000 rows, 1 to 1,000 events a second | 16 KiB, 10,000 rows, 20 a second (the contract defaults) |
 
 `cpu_boost_ms` is how long after a wake a database runs without the CPU quota of its class, counted
 from the release of its writer (`0`: the quota comes with the wake). It is optional for its first
@@ -1377,6 +1378,56 @@ backup jobs and the page-cache floor (plan 4.5). `awake_budget_mib` is also the 
 when it starts. After a change of `awake_budget_mib`, admission follows the new value at once while
 the slice keeps the old limit until the node's agent next starts (a release that changes the agent,
 or a reboot), so the two disagree until then.
+
+`events` is optional: a policy without the group, or without one of its values, takes the defaults. A
+`PUT` is refused when a value is out of its bounds, or when `max_outbox_rows` times `max_payload_bytes`
+exceeds 256 MiB, the volume a full outbox may take. A change reaches a served database within one pass of
+the node (about one second): the pacing and the payload limit at once, and the outbox's own limits when the
+drain writes them to the database's `pgcf.settings`. The outbox rows themselves are left alone.
+
+## Data events: release order and rollback
+
+Data events (contract 1.6.0: the platform schema `pgcf` of each database, the node's drain and the sleep
+guard `power_outbox`) change the API, the Edge Worker and the node agent. The node sends its batches to
+`POST /node/v1/data-events` and its refusal of a sleep is a `power_outbox` report, so the API goes first:
+the rule of [cloudflare-convergence 9.3](../architecture/cloudflare-convergence-and-serverless-plan.md#93-updates)
+for what a node sends.
+
+**Rollout.**
+
+1. Qualify the exact commit with the existing CI and the signed release workflow.
+2. Deploy the API Worker and the Edge Worker with the 1.6.0 contract, and assign no node release yet.
+3. Verify: `GET /v1/openapi.json` reports `info.version` 1.6.0, and `GET /v1/regions/{id}/node-policy` shows the
+   `events` group. The API serves 1.6.0 from this point, but no database emits or delivers data events until
+   step 5: `data.*` webhooks can be created and nothing arrives before then.
+4. Register the node release whose agent drains the outbox and assign it to the region
+   (`PUT /v1/regions/{id}/release`). Wait until `GET /v1/nodes/{id}/release` says `converged` on every node.
+5. A served database gets its platform schema on the next pass of its node; a sleeping one gets it at its next
+   wake, before anyone logs in. A database built before data events has no schema until then.
+
+**Rollback** runs in the reverse order: the node release first, then the API. The agent is the sender, so an
+API without the route refuses a node's batch with 404, which the drain keeps and posts again, and the outbox
+then fills up to its cap. A node that runs a release without the agent does not drain: its outboxes keep their
+rows in the database, unsent, and `emit` fails with `53400` once the outbox is full, until a release with the
+agent is assigned again. Then roll the API back and handle its stored `events` group as described under
+[If an agent cannot read the page](#if-an-agent-cannot-read-the-page).
+
+**A database held awake by its data events.** The symptom is a database that does not sleep, or a suspend that
+fails with `power_outbox`: its drain has rows it cannot deliver.
+
+1. Read the node's events and logs for the database (`database_id`). `data_events_refused` names the class of a
+   batch that Cloudflare did not take (`http_503`, `transport`, `http_404`), and it is repeated as a log line
+   while the failure lasts. `data_event_rejected` names the class and the count of rows the drain deleted
+   (`topic`, `not_object`, `too_large`, `unparsable`, `seq`, `api_400`, `api_413` or `api_422`). The events
+   never carry a payload.
+2. `http_404` means the API has no route for the node's batches: roll the API forward (the release order above).
+   `http_503` with `capacity_exhausted` means the database's event buffer is full, because its pending deliveries
+   are above the limit (the buffer is 2 GiB or 8,000 pending data deliveries). Its subscribers are not taking the
+   deliveries: look at `GET /v1/databases/{id}/webhook-deliveries`. The drain keeps the rows meanwhile.
+3. Once Cloudflare takes the batches, the backlog drains and the database sleeps at its next idle pass. A suspend
+   that fails with `power_outbox` is sent again after that.
+4. Leave the outbox rows alone. The drain deletes the rows it cannot send itself; a row deleted by hand is an
+   event that no receiver gets.
 
 ## Capacity policy, purchases and notifications
 
@@ -1618,6 +1669,10 @@ read. A rule of the table was broken, or the API sent a page that does not match
      without `cpu_boost_ms` through the older API (it replaces the stored policy without reading it);
      after rolling forward, `PUT` it with `cpu_boost_ms` `5000` again, because migration `0081` is
      applied once and does not run a second time.
+   - *A stored `events` group* (1.6.0). An API without data events parses the stored policy strictly and
+     does not know the group, so after a Worker-only rollback `GET /v1/regions/{id}/node-policy` and the pages
+     of the region fail, as above. With the rollback, `PUT` the policy without `events` through the older API;
+     the group's values come back with a `PUT` of the newer API.
    - *Open orders of a type the older API does not know.* It reads every open order that is neither a
      `move` nor `maintenance` as `superseded`, which retires the storage generation the row names (the
      node never starts or archives it again), or it fails the page when the row has none. List them

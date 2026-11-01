@@ -79,6 +79,30 @@ describe("the desired page of a node", () => {
     });
   });
 
+  it("carries the data event limits of the region's policy in the page", async () => {
+    const f = await fixture();
+    await setNodePolicy(f);
+    expect((await pull(f)).policy.events).toEqual({
+      max_payload_bytes: 16_384,
+      max_outbox_rows: 10_000,
+      emits_per_second: 20,
+    });
+    const custom = {
+      max_payload_bytes: 4096,
+      max_outbox_rows: 500,
+      emits_per_second: 5,
+    };
+    expect(
+      (
+        await request(`/v1/regions/${f.region}/node-policy`, f.admin, "PUT", {
+          ...nodePolicy(),
+          events: custom,
+        })
+      ).status,
+    ).toBe(200);
+    expect((await pull(f)).policy.events).toEqual(custom);
+  });
+
   it("raises the credentials revision once for every change of the operator shell's state, which is how a running node learns it", async () => {
     const f = await fixture();
     await setNodePolicy(f);

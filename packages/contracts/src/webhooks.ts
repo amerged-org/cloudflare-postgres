@@ -4,7 +4,10 @@ import { HttpsUrl, ListQuery, Timestamp } from "./api.ts";
 import { DatabaseId, ID_PREFIXES, newId, ProjectId } from "./ids.ts";
 
 export const WEBHOOK_ID_PATTERN = /^whk_[a-z0-9]{20}$/;
-export const EVENT_ID_PATTERN = /^evt_[0-9a-f]{20}$/;
+// A platform event is `evt_` plus 20 hex digits of a hash. A data event is the literal
+// `<database_id>:<epoch>:<seq>` (decimal, no leading zeros).
+export const EVENT_ID_PATTERN =
+  /^(evt_[0-9a-f]{20}|[a-z][a-z0-9]{19}:[1-9][0-9]{0,15}:[1-9][0-9]{0,15})$/;
 export const DELIVERY_ID_PATTERN = /^dlv_[0-9a-f]{20}$/;
 export const WebhookId = z
   .string()
@@ -22,7 +25,32 @@ export const DeliveryId = z
   .meta({ id: "DeliveryId" });
 export type DeliveryId = z.infer<typeof DeliveryId>;
 export const newWebhookId = (): WebhookId => newId(ID_PREFIXES.webhook);
+export const dataEventId = (
+  databaseId: string,
+  epoch: number,
+  seq: number,
+): string => `${databaseId}:${epoch}:${seq}`;
+export function parseDataEventId(
+  id: string,
+): { database_id: string; epoch: number; seq: number } | null {
+  if (!EVENT_ID_PATTERN.test(id)) return null;
+  const [databaseId, epochText, seqText] = id.split(":");
+  if (
+    databaseId === undefined ||
+    epochText === undefined ||
+    seqText === undefined
+  ) {
+    return null;
+  }
+  const epoch = Number(epochText);
+  const seq = Number(seqText);
+  return Number.isSafeInteger(epoch) && Number.isSafeInteger(seq)
+    ? { database_id: databaseId, epoch, seq }
+    : null;
+}
 
+// Platform events are the enum below. `data.<topic>` events are row changes captured in a
+// database, and `<topic>` follows the topic grammar of the node contract.
 export const WEBHOOK_EVENT_TYPES = [
   "database.created",
   "database.ready",
@@ -35,14 +63,21 @@ export const WEBHOOK_EVENT_TYPES = [
   "operation.failed",
   "webhook.test",
 ] as const;
-export const WebhookEventType = z.enum(WEBHOOK_EVENT_TYPES);
+export const DATA_EVENT_TYPE_PATTERN = /^data\.[a-z][a-z0-9_]{0,47}$/;
+export const DataEventType = z.string().regex(DATA_EVENT_TYPE_PATTERN);
+export const WebhookEventType = z
+  .union([z.enum(WEBHOOK_EVENT_TYPES), DataEventType])
+  .meta({ id: "WebhookEventType" });
 export type WebhookEventType = z.infer<typeof WebhookEventType>;
 
 export const WEBHOOK_MAX_SUBSCRIPTIONS_PER_PROJECT = 20;
 export const WEBHOOK_MAX_HEADERS = 8;
 
-/** `*`, `<group>.*` or one exact `<group>.<name>`. */
-export const EVENT_PATTERN = /^(\*|[a-z][a-z_]*\.(\*|[a-z][a-z_]*))$/;
+/**
+ * `*`, `<group>.*` or one exact `<group>.<name>`. Digits are allowed only in the tail, the
+ * head stays letters and underscore. `*` matches no data event (event-match.ts).
+ */
+export const EVENT_PATTERN = /^(\*|[a-z][a-z_]*\.(\*|[a-z][a-z0-9_]*))$/;
 const EventPattern = z.string().max(64).regex(EVENT_PATTERN);
 
 // Names the service sets itself, or that would change how the request is framed.
@@ -122,6 +157,7 @@ export const WebhookListQuery = ListQuery.extend({
 });
 export type WebhookListQuery = z.infer<typeof WebhookListQuery>;
 
+const EventCounter = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 /** The JSON body of every delivery. */
 export const WebhookEnvelope = z
   .strictObject({
@@ -130,6 +166,9 @@ export const WebhookEnvelope = z
     occurred_at: Timestamp,
     project_id: ProjectId,
     database_id: DatabaseId.nullable(),
+    // present only on data events
+    epoch: EventCounter.optional(),
+    seq: EventCounter.optional(),
     data: z.record(z.string(), z.unknown()),
   })
   .meta({ id: "WebhookEnvelope" });

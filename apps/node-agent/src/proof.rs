@@ -27,6 +27,8 @@ use std::{
 
 /// How often the proof looks at the upload log while the archive drains.
 const ARCHIVE_POLL: Duration = Duration::from_millis(100);
+/// How often the proof looks at the outbox while a sleep waits for it to empty.
+const OUTBOX_CHECK: Duration = Duration::from_millis(100);
 /// `pg_control` is one 8 KiB block; the agent reads that much and no more of a file the
 /// database's user can replace.
 const CONTROL_READ: u64 = 8192;
@@ -42,6 +44,11 @@ pub struct Proof {
     pub upload_log: UploadLog,
     /// How long the archive may take to hold the closed segment: 600 s (plan 7.9 step 5).
     pub archive_wait: Duration,
+    /// The database whose outbox of data events the proof concerns.
+    pub database: String,
+    /// How long pending data events may keep the database awake: `None` ignores the outbox, and
+    /// `Some(wait)` refuses the sleep unless the outbox is empty within `wait`.
+    pub outbox: Option<Duration>,
 }
 impl Proof {
     fn data(&self) -> PathBuf {
@@ -81,6 +88,28 @@ struct Running {
     segment_bytes: u64,
 }
 
+/// Waits until the outbox of the proof's database holds no row, for at most `wait`: a sleep does
+/// not stop a database with data events it has not delivered. A database without the platform's
+/// schema has none. A database whose outbox cannot be read is unknown, never empty.
+async fn wait_empty(proof: &Proof, wait: Duration) -> Result<(), Refusal> {
+    let session = crate::pgcf::connect(&proof.socket_directory, &proof.database, None)
+        .await
+        .map_err(|_| Refusal::Unknown)?;
+    let started = tokio::time::Instant::now();
+    loop {
+        if !crate::pgcf::outbox_pending(&session)
+            .await
+            .map_err(|_| Refusal::Unknown)?
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= wait {
+            return Err(Refusal::Outbox);
+        }
+        tokio::time::sleep(OUTBOX_CHECK).await;
+    }
+}
+
 /// Steps 2 to 6: the guard, a checkpoint, the switch, and the wait for the archive.
 async fn prepare(proof: &Proof) -> Result<Running, Refusal> {
     let session = postgres::agent(&proof.socket_directory)
@@ -88,6 +117,9 @@ async fn prepare(proof: &Proof) -> Result<Running, Refusal> {
         .map_err(|_| Refusal::Unknown)?;
     if let Some(refusal) = sleep::guard(&session).await.map_err(|_| Refusal::Unknown)? {
         return Err(refusal);
+    }
+    if let Some(wait) = proof.outbox {
+        wait_empty(proof, wait).await?;
     }
     let system = sleep::system(&session).await.ok_or(Refusal::Unknown)?;
     let segment_bytes = sleep::wal_segment_bytes(&session)
@@ -121,6 +153,9 @@ async fn prepare(proof: &Proof) -> Result<Running, Refusal> {
     // Work that began while the archive drained is work.
     if let Some(refusal) = sleep::guard(&session).await.map_err(|_| Refusal::Unknown)? {
         return Err(refusal);
+    }
+    if proof.outbox.is_some() {
+        wait_empty(proof, Duration::ZERO).await?;
     }
     Ok(Running {
         system,
@@ -381,6 +416,8 @@ mod tests {
                 volume: self.cluster.volume(),
                 upload_log: self.log.clone(),
                 archive_wait: Duration::from_secs(20),
+                database: "postgres".into(),
+                outbox: None,
             }
         }
         async fn write(&self, agent: &Session) {
@@ -630,6 +667,224 @@ mod tests {
         assert_eq!(steps.calls(), ["quiesce", "close", "stop"]);
     }
 
+    /// The outbox of a database: a pending data event refuses the sleep, unless the proof waits
+    /// for it or ignores the outbox. Real clusters, with the platform schema of a tenant.
+    mod outbox {
+        use super::*;
+        use crate::pgcf::{self, Installed, Settings};
+
+        const SETTINGS: Settings = Settings {
+            epoch: 1,
+            max_payload_bytes: 54_000,
+            max_outbox_rows: 1_000,
+        };
+
+        /// A tenant database owned by `app`, with the platform schema, and one event emitted in
+        /// it as the superuser.
+        async fn tenant_with_event(rig: &Rig) {
+            let agent = rig.cluster.agent().await;
+            agent.batch("CREATE ROLE app").await.unwrap();
+            agent
+                .batch_long("CREATE DATABASE tenant OWNER app")
+                .await
+                .unwrap();
+            drop(agent);
+            let session = pgcf::connect(&rig.cluster.socket_directory(), "tenant", None)
+                .await
+                .unwrap();
+            let installed = pgcf::install(&session, &SETTINGS, false).await.unwrap();
+            assert_eq!(installed, Installed::Done);
+            session
+                .batch("SELECT pgcf.emit('orders', '{\"x\": 1}')")
+                .await
+                .unwrap();
+        }
+        fn tenant(rig: &Rig, outbox: Option<Duration>) -> Proof {
+            Proof {
+                database: "tenant".into(),
+                outbox,
+                ..rig.proof()
+            }
+        }
+
+        #[tokio::test]
+        async fn a_pending_event_refuses_the_sleep_and_the_database_stays_awake() {
+            let Some(rig) = Rig::new("outbox-pending") else {
+                return;
+            };
+            rig.cluster.start();
+            tenant_with_event(&rig).await;
+            let steps = Recording::new(&rig.cluster);
+            let proof = tenant(&rig, Some(Duration::from_millis(300)));
+            assert_eq!(run(&proof, &steps).await, Outcome::Refused(Refusal::Outbox));
+            assert_eq!(steps.calls(), ["quiesce", "resume"]);
+            // Still running, with its data.
+            let agent = rig.cluster.agent().await;
+            agent.query("SELECT 1", &[]).await.unwrap();
+            // Once the event is gone the next proof stops the database.
+            let session = pgcf::connect(&rig.cluster.socket_directory(), "tenant", None)
+                .await
+                .unwrap();
+            session.batch("DELETE FROM pgcf.outbox").await.unwrap();
+            drop(session);
+            drop(agent);
+            assert!(matches!(
+                run(&proof, &Recording::new(&rig.cluster)).await,
+                Outcome::Proven(_)
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_proof_that_ignores_the_outbox_stops_with_a_pending_event() {
+            let Some(rig) = Rig::new("outbox-ignored") else {
+                return;
+            };
+            rig.cluster.start();
+            tenant_with_event(&rig).await;
+            let steps = Recording::new(&rig.cluster);
+            assert!(matches!(
+                run(&tenant(&rig, None), &steps).await,
+                Outcome::Proven(_)
+            ));
+            assert_eq!(steps.calls(), ["quiesce", "close", "stop"]);
+        }
+
+        #[tokio::test]
+        async fn an_event_delivered_while_the_sleep_waits_lets_it_prove() {
+            let Some(rig) = Rig::new("outbox-delivered") else {
+                return;
+            };
+            rig.cluster.start();
+            tenant_with_event(&rig).await;
+            let socket = rig.cluster.socket_directory();
+            let delivery = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let session = pgcf::connect(&socket, "tenant", None).await.unwrap();
+                session.batch("DELETE FROM pgcf.outbox").await.unwrap();
+            });
+            let proof = tenant(&rig, Some(Duration::from_secs(2)));
+            assert!(matches!(
+                run(&proof, &Recording::new(&rig.cluster)).await,
+                Outcome::Proven(_)
+            ));
+            delivery.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn without_a_wait_a_pending_event_refuses_at_once_and_an_unreadable_outbox_is_unknown()
+         {
+            let Some(rig) = Rig::new("outbox-no-wait") else {
+                return;
+            };
+            rig.cluster.start();
+            tenant_with_event(&rig).await;
+            let steps = Recording::new(&rig.cluster);
+            assert_eq!(
+                run(&tenant(&rig, Some(Duration::ZERO)), &steps).await,
+                Outcome::Refused(Refusal::Outbox)
+            );
+            assert_eq!(steps.calls(), ["quiesce", "resume"]);
+            // A database that does not exist cannot say whether its outbox is empty.
+            let mut missing = tenant(&rig, Some(Duration::ZERO));
+            missing.database = "missing".into();
+            assert_eq!(
+                run(&missing, &Recording::new(&rig.cluster)).await,
+                Outcome::Refused(Refusal::Unknown)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_database_without_the_platform_schema_has_an_empty_outbox() {
+            let Some(rig) = Rig::new("outbox-bare") else {
+                return;
+            };
+            rig.cluster.start();
+            let proof = Proof {
+                outbox: Some(Duration::ZERO),
+                ..rig.proof()
+            };
+            assert!(matches!(
+                run(&proof, &Recording::new(&rig.cluster)).await,
+                Outcome::Proven(_)
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_row_emitted_while_the_archive_drains_refuses_the_sleep() {
+            let Some(rig) = Rig::new("outbox-late") else {
+                return;
+            };
+            rig.cluster.start();
+            tenant_with_event(&rig).await;
+            let session = pgcf::connect(&rig.cluster.socket_directory(), "tenant", None)
+                .await
+                .unwrap();
+            session.batch("DELETE FROM pgcf.outbox").await.unwrap();
+            // The archive fails until the file is removed, so the proof waits for it.
+            std::fs::write(rig.directory.join("fail"), "").unwrap();
+            let directory = rig.directory.clone();
+            let emitter = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                session
+                    .batch("SELECT pgcf.emit('orders', '{\"late\": 1}')")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                std::fs::remove_file(directory.join("fail")).unwrap();
+            });
+            let steps = Recording::new(&rig.cluster);
+            let proof = tenant(&rig, Some(Duration::from_millis(100)));
+            assert_eq!(run(&proof, &steps).await, Outcome::Refused(Refusal::Outbox));
+            assert_eq!(steps.calls(), ["quiesce", "resume"]);
+            emitter.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn an_outbox_that_cannot_be_read_is_unknown_never_empty() {
+            let Some(rig) = Rig::new("outbox-locked") else {
+                return;
+            };
+            rig.cluster.start();
+            tenant_with_event(&rig).await;
+            // The lock holder is an events session, which the guard does not count as busy.
+            let locker =
+                crate::postgres::connect_events(&rig.cluster.socket_directory(), "tenant", None)
+                    .await
+                    .unwrap();
+            locker
+                .batch("BEGIN; LOCK TABLE pgcf.outbox IN ACCESS EXCLUSIVE MODE")
+                .await
+                .unwrap();
+            let steps = Recording::new(&rig.cluster);
+            assert_eq!(
+                run(&tenant(&rig, Some(Duration::ZERO)), &steps).await,
+                Outcome::Refused(Refusal::Unknown)
+            );
+            assert_eq!(steps.calls(), ["quiesce", "resume"]);
+        }
+
+        #[tokio::test]
+        async fn the_wait_for_the_outbox_is_bounded_by_its_argument() {
+            let Some(rig) = Rig::new("outbox-bounded") else {
+                return;
+            };
+            rig.cluster.start();
+            tenant_with_event(&rig).await;
+            let began = std::time::Instant::now();
+            assert_eq!(
+                run(
+                    &tenant(&rig, Some(Duration::from_secs(1))),
+                    &Recording::new(&rig.cluster)
+                )
+                .await,
+                Outcome::Refused(Refusal::Outbox)
+            );
+            let took = began.elapsed();
+            assert!(took >= Duration::from_secs(1), "{took:?}");
+            assert!(took < Duration::from_millis(2500), "{took:?}");
+        }
+    }
+
     /// A volume as a stopped database leaves it, for the checks that read files: `pg_control`, the
     /// segments in `pg_wal`, the files waiting for the archive and the upload log.
     mod stopped {
@@ -664,6 +919,8 @@ mod tests {
                         volume: root.clone(),
                         upload_log: UploadLog::new(root.join("uploads.log")),
                         archive_wait: Duration::from_secs(1),
+                        database: "postgres".into(),
+                        outbox: None,
                     },
                     root,
                 }

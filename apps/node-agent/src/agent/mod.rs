@@ -11,6 +11,7 @@
 mod apply;
 mod build;
 pub mod check;
+mod drains;
 mod entry;
 mod metering;
 mod power;
@@ -48,12 +49,34 @@ use pgcf_native_protocol::agent as protocol;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, atomic::AtomicBool},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::{Notify, Semaphore},
     task::AbortHandle,
 };
+
+/// The wait before the next try of what failed, which doubles up to a longest wait.
+#[derive(Default)]
+pub(crate) struct Retry {
+    wait: Option<Duration>,
+    until: Option<Instant>,
+}
+impl Retry {
+    /// Whether the next try may be made now.
+    pub(crate) fn due(&self) -> bool {
+        self.until.is_none_or(|until| Instant::now() >= until)
+    }
+    /// Records a failed try: the next one waits `first`, then twice the last wait up to `longest`.
+    pub(crate) fn failed(&mut self, first: Duration, longest: Duration) {
+        let wait = self.wait.map_or(first, |wait| (wait * 2).min(longest));
+        self.wait = Some(wait);
+        self.until = Some(Instant::now() + wait);
+    }
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
 
 /// How many databases the node decides on at once when it starts (`Core::apply` of the first
 /// page): each decision reads LVM, systemd and the disk, and mounts the database's volume.
@@ -86,6 +109,18 @@ pub struct Timing {
     /// 2026-10-23): this covers that, and stays well under the gateway's 25 s bound, so the start
     /// that follows still has its time.
     pub page_wait: Duration,
+    /// How long a sleep ordered by the platform (suspend, move, maintenance) waits for the
+    /// database's pending data events to be delivered before it is refused (`power_outbox`).
+    pub outbox_wait: Duration,
+    /// How often the drain looks at a database's outbox while no notification arrives: the table
+    /// is the truth, so a lost notification costs at most this.
+    pub outbox_poll: Duration,
+    /// The pause between two drain cycles while the outbox still holds rows.
+    pub outbox_gap: Duration,
+    /// The wait before the first retry of a data event batch that the API did not take, and the
+    /// longest wait.
+    pub data_retry: Duration,
+    pub data_retry_maximum: Duration,
     /// The wait before the first repeat of the boot report that Cloudflare could not take, and the
     /// longest wait.
     pub report_retry: Duration,
@@ -118,6 +153,11 @@ impl Default for Timing {
     fn default() -> Self {
         Self {
             archive_wait: Duration::from_secs(600),
+            outbox_wait: Duration::from_secs(10),
+            outbox_poll: Duration::from_secs(5),
+            outbox_gap: Duration::from_millis(100),
+            data_retry: Duration::from_secs(1),
+            data_retry_maximum: Duration::from_secs(60),
             wake_start: Duration::from_secs(20),
             idle_poll: Duration::from_secs(5),
             watch: Duration::from_secs(1),
@@ -150,6 +190,8 @@ pub struct Parts<M: Machine> {
     pub timing: Timing,
     /// What the agent reads ahead for a wake: the variant of the build (`PREFETCH`).
     pub prefetch: Prefetch,
+    /// How a drain posts a batch of data events to Cloudflare (`drain::Post`).
+    pub data_events: crate::drain::Post,
 }
 
 /// Where a database stands on the node.
@@ -412,6 +454,10 @@ pub struct Core<M: Machine> {
     /// check follow, which the service does, since it reaches the files.
     slept: Mutex<Vec<String>>,
     pub(crate) slept_signal: Notify,
+    /// The outbox drains of the served databases (`drains.rs`).
+    drains: drains::Drains,
+    /// How the drains post their batches (`Parts::data_events`).
+    data_events: crate::drain::Post,
 }
 
 impl<M: Machine> Core<M> {
@@ -480,6 +526,8 @@ impl<M: Machine> Core<M> {
             repairing: AtomicBool::new(false),
             slept: Mutex::new(Vec::new()),
             slept_signal: Notify::new(),
+            drains: drains::Drains::default(),
+            data_events: parts.data_events,
         });
         (core, early)
     }

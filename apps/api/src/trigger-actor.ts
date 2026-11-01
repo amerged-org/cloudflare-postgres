@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DurableObject } from "cloudflare:workers";
 import type { ExecutionMetric } from "@pgcf/contracts/execution-usage";
-import type { WebhookEnvelope } from "@pgcf/contracts/webhooks";
+import {
+  parseDataEventId,
+  type WebhookEnvelope,
+} from "@pgcf/contracts/webhooks";
 import type { Env } from "./env.ts";
 import {
   CONTROL_MAINTENANCE_RETRY_MS,
@@ -18,6 +21,19 @@ export interface IngestedEvent {
   database_id: string;
   data: Record<string, unknown>;
 }
+
+/** A data event of a batch, with the webhooks that want it and the delivery id of each. */
+interface BatchItem {
+  event: IngestedEvent;
+  webhookIds: readonly string[];
+  deliveryIds: readonly string[];
+}
+
+type BatchResult =
+  { ok: true; created: number } | { ok: false; reason: "buffer_full" };
+
+/** Thrown inside the batch's transaction, which then rolls back everything the batch stored. */
+class BufferFull extends Error {}
 
 export type StoredDelivery = {
   id: string;
@@ -82,6 +98,13 @@ const SCHEDULE_START_BATCH = 5;
 
 /** Pending deliveries one database can hold; beyond it a new delivery is dead-lettered at once. */
 export const TRIGGER_MAX_PENDING = 10_000;
+/**
+ * Pending deliveries a batch of data events may bring the database to, in total. Data events are
+ * held to the lower limit so that platform events keep room behind them.
+ */
+export const TRIGGER_MAX_PENDING_DATA = 8_000;
+/** The database file of one actor, in bytes, beyond which a batch of data events is refused. */
+export const TRIGGER_MAX_STORAGE_BYTES = 2 * 1024 ** 3;
 export const TRIGGER_DELIVERED_RETENTION_MS = 24 * 3_600_000;
 export const TRIGGER_DEAD_LETTER_RETENTION_MS = 7 * 86_400_000;
 const ALARM_BATCH = 25;
@@ -113,6 +136,9 @@ type DeliveryRow = {
  * code loads with the first alarm.
  */
 export class TriggerActor extends DurableObject<Env> {
+  /** Above this size a batch of data events is refused; a field so that a test can lower it. */
+  storageCap = TRIGGER_MAX_STORAGE_BYTES;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, maintenanceEnvironment(env));
     ctx.blockConcurrencyWhile(async () => {
@@ -192,43 +218,20 @@ export class TriggerActor extends DurableObject<Env> {
     const now = Date.now();
     let created = 0;
     this.ctx.storage.transactionSync(() => {
-      const sql = this.ctx.storage.sql;
       this.remember(event.database_id, event.project_id);
-      const data = JSON.stringify(event.data);
-      const stored = sql.exec(
-        "INSERT OR IGNORE INTO events(id,type,occurred_at,project_id,database_id,data) VALUES(?,?,?,?,?,?)",
-        event.id,
-        event.type,
-        event.occurred_at,
-        event.project_id,
-        event.database_id,
-        data,
-      );
-      if (stored.rowsWritten > 0) {
-        this.count("events_emitted");
-        this.count("event_bytes", new TextEncoder().encode(data).length);
-      }
-      let pending = sql
-        .exec<{ n: number }>(
-          "SELECT count(*) AS n FROM deliveries WHERE state='pending'",
-        )
-        .one().n;
+      this.insertEvent(event);
+      let pending = this.pendingCount();
       webhookIds.forEach((webhookId, index) => {
         const full = pending >= TRIGGER_MAX_PENDING;
-        const result = sql.exec(
-          `INSERT OR IGNORE INTO deliveries(id,event_id,webhook_id,state,attempts,created_ms,window_start_ms,next_attempt_ms,dead_ms,last_error)
-           VALUES(?,?,?,?,0,?,?,?,?,?)`,
-          deliveryIds[index],
-          event.id,
-          webhookId,
-          full ? "dead_lettered" : "pending",
-          now,
-          now,
-          full ? null : now,
-          full ? now : null,
-          full ? "expired" : null,
-        );
-        if (result.rowsWritten > 0) {
+        if (
+          this.insertDelivery(
+            deliveryIds[index]!,
+            event.id,
+            webhookId,
+            full,
+            now,
+          )
+        ) {
           created += 1;
           if (full) this.count("webhook_deliveries_dead_lettered");
           else pending += 1;
@@ -238,6 +241,107 @@ export class TriggerActor extends DurableObject<Env> {
     // Also when nothing is new: a first call may have stored the rows and failed before it armed.
     await this.arm(now);
     return created;
+  }
+
+  /**
+   * Stores a batch of data events from one database, all or nothing: when the batch would take the
+   * pending deliveries past TRIGGER_MAX_PENDING_DATA, or when the database file is above
+   * `storageCap`, nothing of it is stored and the caller keeps its rows. An event or delivery
+   * already here is left as it is, as with `ingest`.
+   */
+  async ingestBatch(items: readonly BatchItem[]): Promise<BatchResult> {
+    for (const item of items) {
+      if (
+        item.webhookIds.length !== item.deliveryIds.length ||
+        item.webhookIds.length === 0
+      )
+        throw new RangeError("One delivery id per webhook is required");
+    }
+    const first = items[0];
+    if (first === undefined) throw new RangeError("At least one event");
+    if (this.ctx.storage.sql.databaseSize > this.storageCap)
+      return { ok: false, reason: "buffer_full" };
+    const now = Date.now();
+    let created = 0;
+    try {
+      this.ctx.storage.transactionSync(() => {
+        this.remember(first.event.database_id, first.event.project_id);
+        let pending = this.pendingCount();
+        for (const item of items) {
+          this.insertEvent(item.event);
+          item.webhookIds.forEach((webhookId, index) => {
+            if (
+              this.insertDelivery(
+                item.deliveryIds[index]!,
+                item.event.id,
+                webhookId,
+                false,
+                now,
+              )
+            ) {
+              created += 1;
+              pending += 1;
+              if (pending > TRIGGER_MAX_PENDING_DATA) throw new BufferFull();
+            }
+          });
+        }
+      });
+    } catch (error) {
+      if (error instanceof BufferFull)
+        return { ok: false, reason: "buffer_full" };
+      throw error;
+    }
+    await this.arm(now);
+    return { ok: true, created };
+  }
+
+  private insertEvent(event: IngestedEvent): void {
+    const data = JSON.stringify(event.data);
+    const stored = this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO events(id,type,occurred_at,project_id,database_id,data) VALUES(?,?,?,?,?,?)",
+      event.id,
+      event.type,
+      event.occurred_at,
+      event.project_id,
+      event.database_id,
+      data,
+    );
+    if (stored.rowsWritten > 0) {
+      this.count("events_emitted");
+      this.count("event_bytes", new TextEncoder().encode(data).length);
+    }
+  }
+
+  /** True when the delivery was new; `full` stores it dead-lettered at once. */
+  private insertDelivery(
+    deliveryId: string,
+    eventId: string,
+    webhookId: string,
+    full: boolean,
+    now: number,
+  ): boolean {
+    const result = this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO deliveries(id,event_id,webhook_id,state,attempts,created_ms,window_start_ms,next_attempt_ms,dead_ms,last_error)
+       VALUES(?,?,?,?,0,?,?,?,?,?)`,
+      deliveryId,
+      eventId,
+      webhookId,
+      full ? "dead_lettered" : "pending",
+      now,
+      now,
+      full ? null : now,
+      full ? now : null,
+      full ? "expired" : null,
+    );
+    return result.rowsWritten > 0;
+  }
+
+  private pendingCount(): number {
+    return this.ctx.storage.sql
+      .exec<{ n: number }>(
+        "SELECT count(*) AS n FROM deliveries WHERE state='pending'",
+      )
+      .one().n;
   }
 
   /** Newest first. `before` is the (created_ms, id) of the last row of the previous page. */
@@ -281,6 +385,33 @@ export class TriggerActor extends DurableObject<Env> {
     );
     await this.arm(now);
     return "replayed";
+  }
+
+  /**
+   * Dead-letters the pending deliveries of data events when their database is deleted: no
+   * subscriber is owed them any more. The events, the platform deliveries and the counters stay,
+   * and a purged delivery can still be replayed. Returns the number of deliveries dead-lettered.
+   */
+  async purgeData(): Promise<number> {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+    const purged = this.ctx.storage.transactionSync(() => {
+      const pending = sql
+        .exec<{ n: number }>(
+          `SELECT count(*) AS n FROM deliveries d JOIN events e ON e.id = d.event_id
+           WHERE d.state='pending' AND substr(e.type,1,5)='data.'`,
+        )
+        .one().n;
+      sql.exec(
+        `UPDATE deliveries SET state='dead_lettered',dead_ms=?1,next_attempt_ms=NULL,last_error='expired'
+         WHERE state='pending' AND event_id IN(SELECT id FROM events WHERE substr(type,1,5)='data.')`,
+        now,
+      );
+      this.count("webhook_deliveries_dead_lettered", pending);
+      return pending;
+    });
+    await this.arm(now);
+    return purged;
   }
 
   private timingLibrary: Timing | undefined;
@@ -413,7 +544,7 @@ export class TriggerActor extends DurableObject<Env> {
                 e.type, e.occurred_at, e.project_id, e.database_id, e.data
          FROM deliveries d JOIN events e ON e.id = d.event_id
          WHERE d.state='pending' AND d.next_attempt_ms <= ?
-         ORDER BY d.next_attempt_ms LIMIT ?`,
+         ORDER BY d.next_attempt_ms, d.rowid LIMIT ?`,
         started,
         ALARM_BATCH,
       )
@@ -434,6 +565,8 @@ export class TriggerActor extends DurableObject<Env> {
         await Promise.all(
           due.slice(i, i + ALARM_CONCURRENCY).map(async (row) => {
             const attempts = row.attempts + 1;
+            // A data event's id carries its epoch and sequence; a platform event's id does not.
+            const parsed = parseDataEventId(row.event_id);
             let result;
             try {
               result = await attemptDelivery(
@@ -445,6 +578,7 @@ export class TriggerActor extends DurableObject<Env> {
                   occurred_at: row.occurred_at,
                   project_id: row.project_id,
                   database_id: row.database_id,
+                  ...(parsed && { epoch: parsed.epoch, seq: parsed.seq }),
                   data: JSON.parse(row.data) as Record<string, unknown>,
                 } as WebhookEnvelope,
                 row.id,

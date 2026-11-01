@@ -134,6 +134,7 @@ export const DIAGNOSTIC_ROUTES = new Set([
   "/node/v1/volumes",
   "/node/v1/events",
   "/node/v1/usage",
+  "/node/v1/data-events",
   "/node/v1/diagnostics",
   "/node/v1/archive-credentials/:id",
   "/node/v1/openapi.json",

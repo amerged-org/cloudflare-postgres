@@ -1,8 +1,11 @@
 # Database events, schedules and webhooks (proposal)
 
 Status: accepted by the owner on 2026-10-30 with the defaults of section 10 (cron-to-webhook is out of
-PGCF). Implementation follows the tasks of section 8; T1, T2 and T4 are deployed (2026-10-31) and T3 is not started; the
-ULTRA plan (11.1) records what is built and accepted. Based on `origin/main` at `5a9aaf27`.
+PGCF). Implementation follows the tasks of section 8; T1, T2 and T4 are deployed (2026-10-31). T3 (data
+events) is built in the checkout and is not deployed: it is deployed only after its live acceptance is
+recorded in the ULTRA plan (11.1), following the release order of
+[operator installation](../operations/operator-installation.md#data-events-release-order-and-rollback). The ULTRA plan
+records what is built and accepted. Based on `origin/main` at `5a9aaf27`.
 
 ## 1. Goal
 
@@ -106,26 +109,70 @@ touched. This removes operation polling and is the smallest first step.
 ### 4.5 Data events (the webhooks)
 
 - Every database gets a platform-owned schema `pgcf` at create and at restore, installed by the node
-  agent: an `outbox` table that tenant roles cannot read, `pgcf.emit(topic, payload)` that tenant
-  roles may execute, and an optional generic trigger function `pgcf.capture(columns)` that emits a flat
-  `{schema, table, op, record, old_record}`. `columns` is an allowlist, so password hashes and personal
-  data do not leave for a third-party tool by default.
+  agent as the cluster superuser (`postgres`): the `pgcf.outbox` table and `pgcf.settings` (the storage
+  generation and the payload and row limits), which tenant roles cannot read; `pgcf.emit(topic, payload)`, which
+  the tenant role `app` may execute and which returns the row's `seq`; and the optional generic trigger
+  function `pgcf.capture(columns)`, which emits a flat `{schema, table, op, record, old_record}`.
+  `columns` is an allowlist, so password hashes and personal data do not leave for a third-party tool
+  by default. The schema and its tables belong to the superuser; the role `pgcf-events` owns only the
+  two functions (4.9).
 - A trigger is one SQL statement. The integrator runs it through its migrations or through its own
   management role, and may wrap it in its own "watch this table" tool. An integrator whose migration
   policy refuses triggers on existing tables must admit this one form. PGCF adds no watch API.
-- The node agent drains the outbox over the local socket. An internal `LISTEN` session is the
-  wake-up call, the table is the truth. It sends a batch over the node link to the database's actor and
-  deletes the rows only after the actor has durably stored them. A dead receiver therefore never fills
-  the database's disk.
-- `event_id` is `{database_id}:{epoch}:{seq}`. The epoch is the database's restore generation, so an
-  in-place point-in-time restore cannot repeat an id.
-- The sleep proof (ULTRA 7.9) gets one more guard: the outbox must be empty. Otherwise the sleep is
-  refused with a reason like `power_outbox`, and the database stays awake and wakeable.
-- Limits: payload size, outbox rows and emits per second are operator settings. When the actor refuses
-  a batch because its buffer is full, the agent keeps the rows, the outbox reaches its cap and `emit`
-  raises an error, so the application sees it ("fail loudly"). Nothing is dropped silently.
+- **Topics.** `emit` accepts a topic that matches `^[a-z][a-z0-9_]{0,47}$`, otherwise it raises `22023`.
+  `pgcf.capture` derives the topic from the table name: lower case, every character outside `[a-z0-9_]`
+  becomes `_`, a `t_` prefix is added when the name does not start with a letter, and the result is cut
+  to 48 characters. The API delivers a data event with the type `data.<topic>`.
+- **Payloads.** A payload is a JSON object of at most the database's `max_payload_bytes` as text
+  (`54000` otherwise), nested at most 32 levels deep (`54000`). The schema also refuses any row above
+  262,144 bytes and deeper than 32 levels, whatever the limit says.
+- **Numbers.** `pgcf.capture` sends a number that JavaScript would round, and a non-zero number outside
+  1e-300 to 1e300, as a decimal string, because every value of a captured column is written as JSON.
+  A payload given to `emit` is sent as the agent parses it, so an integrator whose consumer needs exact
+  integers beyond 2^53 passes them as strings.
+- **Errors** that the application sees from the platform, all with their SQLSTATE: `22023` (a topic or a
+  payload that is not an object, or a capture without columns), `54000` (payload too large or too deep),
+  `53400` (the outbox holds `max_outbox_rows` rows, so `emit` fails until the drain catches up),
+  `39P01` (`pgcf.capture` is not `AFTER ... FOR EACH ROW`), `42703` (a captured column does not exist),
+  `42501` (`pgcf.capture` on a temporary table) and `55000` (the platform's settings row is missing).
+- **Capture skips no-op updates.** An `UPDATE` that changes none of the captured columns emits nothing.
+- The node agent drains the outbox over its own session as the superuser. An internal `LISTEN` session
+  is the wake-up call, the table is the truth; the drain also reads the outbox every 5 s without a
+  notification. It reads at most 100 rows and at most 1 MB of
+  payload text at once, posts them to the node link as one batch (`POST /node/v1/data-events`, a batch of
+  at most 100 events and 1 MiB of JSON body), and deletes the rows only after the API has stored them.
+  Rows wait in the outbox while Cloudflare does not take them, and the outbox has its cap (Limits below),
+  so a long outage ends in `53400` for the application rather than in an unbounded disk.
+- **How the drain answers.** Any answer that is neither a 2xx nor `400`, `413` or `422` (`503`, a
+  transport failure, any other status) keeps the batch, which is posted again unchanged after a wait that
+  starts at 1 s and doubles up to 60 s; the batch is never dropped for being late. A `400`, `413` or `422`
+  refuses the content: the batch is halved, and a single event that
+  is still refused is deleted. A row the agent cannot send at all (a topic, a sequence number or an
+  epoch outside the contract, a payload that is not valid JSON or not an object, or one too large) is
+  deleted too. Each deletion is announced by its class only (`api_400`, `topic`, `too_large`, ...) and
+  never with the payload. The announcements of one drain come at most once per 60 s; the others are log
+  lines.
+- **Pacing.** `emits_per_second` (the node's `events` policy) paces the drain: after `n` events it waits
+  `n` divided by the rate before it posts again. It applies to a served database within one second.
+- **Limits.** Payload size, outbox rows and emits per second are the node's `events` policy (operator
+  installation, "The region's node policy"): a payload up to 16 KiB by default, 10,000 rows by default and
+  20 events per second by default. A full outbox is the cap. When the platform refuses a batch because its
+  buffer is full, the agent keeps the rows, the outbox reaches its cap and `emit` raises `53400`, so the
+  application sees it ("fail loudly"). Nothing is dropped silently.
+- **Platform side.** The API stores a batch all or nothing. An event is stored only when a subscription of
+  its project wants its type and database; an event that none wants is counted as ignored and dropped.
+  The batch is refused with `503` (`capacity_exhausted`, with `Retry-After`) when the actor's database file
+  is above 2 GiB, or when it would take the pending data deliveries of that database past 8,000. A stored
+  event is delivered like any other event (4.3).
+- `event_id` is `{database_id}:{epoch}:{seq}`. The epoch is the database's storage generation, which a
+  restore or an in-place point-in-time restore increases, so an in-place restore cannot repeat an id.
+- The sleep proof (ULTRA 7.9) gets one more guard: the outbox must be empty. A sleep that the platform
+  orders (suspend, move, maintenance) waits up to 10 s for the drain; if rows remain it is refused with
+  `power_outbox`, and the database stays awake and wakeable. An early sleep for a waiting wake is refused
+  at once while rows are pending. An idle sleep does not start while the drain reports undelivered rows,
+  and a later pass asks again.
 - Delivery is at-least-once, ordered by `seq` where possible; retries can reorder, so the payload
-  carries `seq`.
+  carries `seq`. A receiver orders by (`epoch`, `seq`) and deduplicates by `id`.
 
 ### 4.6 Schedules
 
@@ -191,8 +238,23 @@ limits, not budget enforcement.
 
 - Subscription secrets are stored encrypted with a Worker secret and never logged. The signature is
   verifiable by the receiver without a callback.
-- Tenant roles cannot read or change the outbox. They can only call `emit`. A tenant that forges events
-  for its own database harms only itself.
+- Tenant roles cannot read or change the outbox or the settings. The owner role `app` (and any role it grants)
+  can call `emit`; every writer of a watched table fires `capture`. The functions run as `pgcf-events`, not as
+  the caller.
+- **The platform role is narrow, and code can still run as it.** `pgcf-events` is `NOLOGIN` and owns
+  only `pgcf.emit` and `pgcf.capture`; it holds `SELECT` on the settings and `SELECT` and `INSERT` on the
+  outbox. Code that runs as this role can therefore read the outbox, add rows and replace the two
+  functions. It cannot create a trigger, a rule or a function in the schema, and it cannot change a table.
+  Such code is reachable from the tenant: a cast on a captured column runs there, because `pgcf.capture`
+  converts the row with `to_jsonb`. The `CHECK`s on `pgcf.outbox` bound every row it can add (the ranges of
+  `seq` and `epoch`, the payload size and its depth), and the drain reads every row as hostile input.
+- **Payloads are tenant-controlled.** A `data.*` event carries what the tenant emitted or what its own
+  columns hold. An event that `emit` writes and an event that `pgcf.capture` writes for a table of the same
+  name cannot be told apart, so a receiver must not treat a data event as proof of a row change. A tenant
+  that forges events for its own database harms only itself and its own subscriptions.
+- The drain and the installer run as the cluster superuser in the tenant's database (`postgres`, the
+  agent's own role). A `pgcf` schema that is owned by anyone else is a conflict: the agent does not read
+  it, and it records the conflict instead of installing over it.
 - A job runs as the integrator's own role with its own grants. PGCF adds no privileged job identity and
   no new node surface.
 - All access still enters through Cloudflare, and nodes get no new inbound port.
@@ -201,12 +263,13 @@ limits, not budget enforcement.
 
 | Case | Behavior |
 | --- | --- |
-| Restore (new database id) | Schedules and subscriptions are keyed by database id, so the copy has none. The agent truncates the restored outbox on create, so the copy cannot resend the source's pending events. Needs its own live test. |
-| In-place point-in-time restore | Same id: schedules stay; the epoch increases; the outbox is truncated. |
-| Move to another node | Same id and data. Schedules continue; pending outbox rows move with the volume. |
-| Manual suspend | Schedules do not wake it; the run is `skipped`. |
-| Delete | The actor is removed. Undelivered events are dead-lettered for the retention period, not delivered after deletion. |
-| Node loss | Outbox rows not yet in R2 are lost together with their transactions, which stays consistent. |
+| Restore (new database id) | Schedules and subscriptions are keyed by database id, so the copy has none. The agent truncates the copy's outbox on create, so the copy cannot resend the source's pending events, and it emits nothing until its own writes. |
+| In-place point-in-time restore | Same id: schedules stay; the storage generation (the epoch) increases, so an id cannot repeat; the outbox is truncated. A clean sleep leaves no rows, so only the rows that a crash left are lost. |
+| Move to another node | Same id and data. Schedules continue. The move's sleep waits for the drain and is refused with `power_outbox` while rows remain, so the rows that come along with the volume are the ones a crash left. |
+| Manual suspend | Schedules do not wake it; the run is `skipped`. A suspend waits up to 10 s for the drain; if rows remain it fails with `power_outbox`, and the database keeps running until the suspend is sent again. |
+| Delete | The API's read of the `database.deleted` event (within the minute cron) dead-letters the pending data deliveries of that database. They are replayable for seven days, and platform events of the database keep delivering. The outbox goes with the volume. |
+| Node loss | A database is restored from R2, so its last archived commit is its last commit. An undelivered event whose commit was not archived is lost with that commit, which keeps the database consistent. A delivered event whose commit was not archived is a phantom: the receiver has it, the database does not. |
+| Crash | Recovery does not wait for the drain. The rows stay in the outbox, and the drain sends them once the database is served again. |
 
 ### 4.11 Agents and automation tools
 
@@ -301,8 +364,10 @@ requests (measurement 3); a restored copy has no schedules.
 Outcome: a commit produces exactly one signed delivery.
 Owned: `apps/node-agent` (`pgcf` schema install, drain, sleep guard), `apps/api`, contracts.
 Depends on: T1.
-Live acceptance: commit gives one delivery, rollback none; a receiver offline for one hour gets
-everything in `seq` order afterwards; a kill of PostgreSQL during a drain delivers at least once and
+Live acceptance: commit gives one delivery, rollback none; a receiver offline for 8 minutes gets
+everything in `seq` order afterwards. The retries after a failure come at +1, +5, +30 min, +2, +6 and
+then +12 h (4.3), so an outage of 8 minutes is caught up at about +36 min and one of an hour at about
++2 h 36 min; a kill of PostgreSQL during a drain delivers at least once and
 loses nothing; a sleep with a pending outbox is refused and the database stays wakeable; an in-place
 point-in-time restore does not repeat an `id`; a restored copy emits nothing; the cap makes `emit`
 fail loudly; a row inserted through `/sql` reaches a real n8n workflow with only the allowed columns.

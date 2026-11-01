@@ -109,6 +109,7 @@ describe("the node reads the documents Cloudflare sends and ignores the properti
       [],
       ["policy"],
       ["policy", "admission"],
+      ["policy", "events"],
       ["release"],
       ["release", "image"],
       ["release", "binaries", "pgcf-agent"],
@@ -166,7 +167,10 @@ describe("the node reads the documents Cloudflare sends and ignores the properti
 describe("a property of the page starts optional", () => {
   const policy = () =>
     structuredClone(vector("NodeDesiredPage", "full-page").value) as {
-      policy: { admission: Record<string, unknown> };
+      policy: {
+        admission: Record<string, unknown>;
+        events?: Record<string, unknown>;
+      };
     };
 
   it("lets the node and the API leave out the CPU burst, which then is 0", () => {
@@ -183,6 +187,28 @@ describe("a property of the page starts optional", () => {
       bad.admission.cpu_boost_ms = broken;
       expect(NodePolicy.safeParse(bad).success, String(broken)).toBe(false);
     }
+  });
+
+  it("lets the node and the API leave out the data event limits, which then are the defaults", () => {
+    const events =
+      schemas.NodeDesiredPage!.properties!.policy!.properties!.events!;
+    expect(schemas.NodeDesiredPage!.properties!.policy!.required).not.toContain(
+      "events",
+    );
+    expect(events.required).toBeUndefined();
+    const defaults = {
+      max_payload_bytes: 16384,
+      max_outbox_rows: 10000,
+      emits_per_second: 20,
+    };
+    expect(events.default).toEqual(defaults);
+    const without = policy().policy;
+    delete without.events;
+    expect(NodePolicy.parse(without).events).toEqual(defaults);
+    expect(NodePolicy.parse(policy().policy).events).toEqual(defaults);
+    const v = vector("NodeDesiredPage", "page-policy-without-events");
+    expect([v.valid, v.node_valid]).toEqual([true, true]);
+    expect(NodeDesiredPage.safeParse(v.value).success).toBe(true);
   });
 
   it("lists every property that is required, so that a new one is a decision", () => {

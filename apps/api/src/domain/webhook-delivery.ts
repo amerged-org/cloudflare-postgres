@@ -160,5 +160,8 @@ export async function attemptDelivery(
 ): Promise<AttemptResult> {
   const subscription = await loadSubscription(env, webhookId);
   if (!subscription) return { kind: "permanent", status: null };
+  // A delivery is stored for the project of its event; another project's subscription never gets it.
+  if (subscription.projectId !== envelope.project_id)
+    return { kind: "permanent", status: null };
   return postEnvelope(subscription, envelope, deliveryId);
 }

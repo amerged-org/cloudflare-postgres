@@ -14,7 +14,7 @@ static POWER_CONTRACT: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| 
     .expect("generated power constants")
 });
 /// The sessions the sleep guard counts as busy, for the refusal's log line only.
-pub(crate) const BUSY_SESSIONS: &str = "SELECT pg_catalog.left(pg_catalog.string_agg(pg_catalog.concat_ws('/', usename, application_name, state, backend_type), ','), 512) AS sessions FROM pg_catalog.pg_stat_activity WHERE datid IS NOT NULL AND pid <> pg_catalog.pg_backend_pid() AND backend_type <> 'autoprewarm worker' AND (state IS DISTINCT FROM 'idle' OR xact_start IS NOT NULL)";
+pub(crate) const BUSY_SESSIONS: &str = "SELECT pg_catalog.left(pg_catalog.string_agg(pg_catalog.concat_ws('/', usename, application_name, state, backend_type), ','), 512) AS sessions FROM pg_catalog.pg_stat_activity WHERE datid IS NOT NULL AND pid <> pg_catalog.pg_backend_pid() AND backend_type <> 'autoprewarm worker' AND NOT (usename = 'postgres' AND application_name = 'pgcf-agent-events') AND (state IS DISTINCT FROM 'idle' OR xact_start IS NOT NULL)";
 /// The size of a WAL segment of the cluster, in bytes.
 const SEGMENT_BYTES: &str = "SELECT pg_catalog.pg_size_bytes(pg_catalog.current_setting('wal_segment_size'))::pg_catalog.int8 AS bytes";
 pub(crate) fn sql(name: &str) -> &'static str {
@@ -36,6 +36,8 @@ pub enum Refusal {
     SwitchUnknown,
     /// The archive did not hold the closed segment in time (`archive_timeout`).
     ArchiveTimeout,
+    /// Pending data events could not be delivered in time (`outbox_pending`).
+    Outbox,
 }
 impl Refusal {
     /// The name in the contract's `SLEEP_REFUSALS`.
@@ -46,14 +48,16 @@ impl Refusal {
             Self::Unknown => "sql_unknown",
             Self::SwitchUnknown => "switch_unknown",
             Self::ArchiveTimeout => "archive_timeout",
+            Self::Outbox => "outbox_pending",
         }
     }
     /// The refusal an observation reports (`NodeDatabaseObservation.refusal`): the database was
-    /// busy, or its archive did not drain.
+    /// busy, its archive did not drain, or its data events were not delivered.
     pub fn observation(self) -> &'static str {
         match self {
             Self::Busy | Self::Prepared => "power_busy",
             Self::Unknown | Self::SwitchUnknown | Self::ArchiveTimeout => "power_archive",
+            Self::Outbox => "power_outbox",
         }
     }
 }
@@ -182,7 +186,83 @@ pub async fn switch(session: &postgres::Session) -> Result<Switched, Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{pg_control::Lsn, postgres, testpg::Cluster};
+    use crate::{
+        layout::PORT,
+        pg_control::Lsn,
+        postgres,
+        testpg::{self, Cluster},
+    };
+
+    #[test]
+    fn every_refusal_is_a_sleep_refusal_of_the_contract() {
+        let reasons: Vec<&str> = POWER_CONTRACT["constants"]["SLEEP_REFUSALS"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let ours = [
+            Refusal::Busy,
+            Refusal::Prepared,
+            Refusal::Unknown,
+            Refusal::SwitchUnknown,
+            Refusal::ArchiveTimeout,
+            Refusal::Outbox,
+        ];
+        for refusal in ours {
+            assert!(reasons.contains(&refusal.reason()), "{}", refusal.reason());
+        }
+        assert_eq!(Refusal::Outbox.reason(), "outbox_pending");
+        assert_eq!(Refusal::Outbox.observation(), "power_outbox");
+        assert_eq!(Refusal::Busy.observation(), "power_busy");
+    }
+
+    #[test]
+    fn the_guard_and_the_busy_sessions_leave_the_events_session_out() {
+        assert!(sql("GUARD").contains(postgres::EVENTS_APPLICATION));
+        assert!(BUSY_SESSIONS.contains(postgres::EVENTS_APPLICATION));
+    }
+
+    #[tokio::test]
+    async fn the_events_session_of_the_platform_does_not_keep_a_database_busy() {
+        let Some(cluster) = Cluster::create("guard-events") else {
+            return;
+        };
+        cluster.start();
+        let agent = cluster.agent().await;
+        agent
+            .batch(&format!(
+                "CREATE ROLE app LOGIN PASSWORD '{}'",
+                testpg::password(1)
+            ))
+            .await
+            .unwrap();
+
+        // The drain's session is the superuser's, and a statement that runs on it is not work.
+        let events = postgres::connect_events(&cluster.socket_directory(), "postgres", None)
+            .await
+            .unwrap();
+        let running = tokio::spawn(async move { events.batch_long("SELECT pg_sleep(2)").await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(guard(&agent).await.unwrap(), None);
+        running.await.unwrap().unwrap();
+
+        // Another role under the same application name is work: the exclusion is the superuser's.
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host_path(cluster.socket_directory())
+            .port(PORT)
+            .user("app")
+            .password(testpg::password(1))
+            .dbname("postgres")
+            .application_name(postgres::EVENTS_APPLICATION);
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(connection);
+        client.batch_execute("BEGIN").await.unwrap();
+        assert_eq!(guard(&agent).await.unwrap(), Some(Refusal::Busy));
+        client.batch_execute("COMMIT").await.unwrap();
+        assert_eq!(guard(&agent).await.unwrap(), None);
+    }
 
     async fn started(cluster: &Cluster) -> postgres::Session {
         cluster.start();

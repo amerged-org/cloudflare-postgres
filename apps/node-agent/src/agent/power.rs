@@ -529,11 +529,12 @@ impl<M: Machine> Core<M> {
         // The roles are the page's before anyone logs in, as at a wake that did not outlast its
         // deadline.
         let entry = db.view().entry.clone();
-        if let Some(entry) = entry
-            && self.refresh_roles(db, &entry).await.is_err()
-        {
-            self.stop_unproven(db).await;
-            return;
+        if let Some(entry) = entry {
+            if self.refresh_roles(db, &entry).await.is_err() {
+                self.stop_unproven(db).await;
+                return;
+            }
+            self.refresh_events(db, &entry, true).await;
         }
         let Some(writer) = writer_of(&started) else {
             self.stop_unproven(db).await;
@@ -915,6 +916,10 @@ impl<M: Machine> Core<M> {
             self.stop_unproven(&db).await;
             return refuse(reason);
         }
+        // The platform schema is made or checked again before anyone logs in: a database built
+        // before data events has none, and a tenant may have dropped the schema a conflict was
+        // recorded for.
+        self.refresh_events(&db, &entry, true).await;
         let Some(writer) = writer_of(&started) else {
             self.stop_unproven(&db).await;
             return refuse("release_failed");
@@ -1038,7 +1043,11 @@ impl<M: Machine> Core<M> {
                 })),
             }
         }
-        let proof = self.proof(&entry);
+        let outbox = Some(match why {
+            Why::Order => self.timing.outbox_wait,
+            Why::Idle | Why::Early { .. } => Duration::ZERO,
+        });
+        let proof = self.proof(&entry, outbox);
         let steps = Quiet {
             core: self.clone(),
             db: db.clone(),
@@ -1121,12 +1130,14 @@ impl<M: Machine> Core<M> {
         }
     }
 
-    pub(crate) fn proof(&self, entry: &Entry) -> Proof {
+    pub(crate) fn proof(&self, entry: &Entry, outbox: Option<Duration>) -> Proof {
         Proof {
             socket_directory: self.layout().socket_directory(&entry.id),
             volume: self.layout().volume(&entry.id),
             upload_log: self.files(&entry.id).upload_log(entry.storage_generation),
             archive_wait: self.timing.archive_wait,
+            database: entry.id.clone(),
+            outbox,
         }
     }
 
@@ -1272,7 +1283,9 @@ impl<M: Machine> Core<M> {
         if self.refresh_roles(db, &entry).await.is_err() {
             return Recovered::Retry;
         }
-        let proof = self.proof(&entry);
+        // A crashed database is proven even when a customer's receiver is dead: its rows are
+        // delivered at its next wake.
+        let proof = self.proof(&entry, None);
         match proof::run(
             &proof,
             &Alone {
@@ -1416,6 +1429,11 @@ impl<M: Machine> Core<M> {
         };
         let busy = activity.busy_connections > 0 || activity.pending_dials > 0;
         if !busy && age >= Duration::from_secs(idle) && entry.desired == Desired::Running {
+            // Undelivered data events keep the database awake: the drain delivers them, and a later
+            // pass asks again. The sleep's proof stays the authority over the outbox.
+            if self.outbox_backlog(&db.id) {
+                return;
+            }
             self.sleep(&db, Why::Idle).await;
         }
     }
@@ -2627,6 +2645,43 @@ mod tests {
         assert_eq!(db.phase(), Phase::Ready);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_built_before_data_events_gets_its_platform_schema_when_its_start_outlasts_the_wake()
+     {
+        let Some(rig) = Rig::new("late-start-events-pre-t3").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        tenant(&rig, &entry.id)
+            .await
+            .batch("DROP SCHEMA pgcf CASCADE")
+            .await
+            .unwrap();
+        std::fs::remove_file(rig.core.files(&entry.id).directory().join("events.json")).unwrap();
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+
+        rig.machine.delay_next_start(Duration::from_millis(1500));
+        let result = rig
+            .core
+            .wake_within(&Rig::ticket(&entry), Duration::from_millis(300))
+            .await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (WakeOutcome::Refused, Some("start_timeout"))
+        );
+
+        // The late start releases the database, and the schema is there before any tenant emits.
+        eventually(30, "the late start to release the database", || {
+            db.phase() == Phase::Ready
+        })
+        .await;
+        let data = tenant(&rig, &entry.id).await;
+        data.batch("SELECT pgcf.emit('t', '{}')").await.unwrap();
+        data.batch("DELETE FROM pgcf.outbox").await.unwrap();
+        drop(data);
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+    }
+
     /// A wake whose start returns an error after its unit is up, so the node never sees PostgreSQL
     /// released (EU1, 2026-10-20: a resume answered `release_failed` while its PostgreSQL ran for
     /// 83 s). The node may neither take the database for asleep nor leave it starting for ever:
@@ -2896,6 +2951,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_events_refuse_an_idle_sleep_at_once_and_an_order_waits_for_them() {
+        let Some(rig) = Rig::new("sleep-outbox").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let data = tenant(&rig, &entry.id).await;
+        data.batch("SELECT pgcf.emit('orders', '{\"n\": 1}')")
+            .await
+            .unwrap();
+        let began = std::time::Instant::now();
+        assert_eq!(
+            rig.core.sleep(&db, Why::Idle).await,
+            Slept::Refused(Refusal::Outbox)
+        );
+        assert!(
+            began.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            began.elapsed()
+        );
+        // An idle refusal is not an order's refusal: nothing is reported to Cloudflare.
+        assert_eq!(db.view().refusal, None);
+        let began = std::time::Instant::now();
+        assert_eq!(
+            rig.core.sleep(&db, Why::Order).await,
+            Slept::Refused(Refusal::Outbox)
+        );
+        assert!(
+            began.elapsed() >= Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
+        let observation = rig.observation(&entry.id);
+        assert_eq!(observation["refusal"].as_str(), Some("power_outbox"));
+        assert!(contract_valid(
+            "NodeObservationReport",
+            &report(observation)
+        ));
+        // The events are delivered while the order waits, so the order proves the sleep.
+        let delivery = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            data.batch("DELETE FROM pgcf.outbox").await.unwrap();
+        });
+        assert_eq!(rig.core.sleep(&db, Why::Order).await, Slept::Proven);
+        delivery.await.unwrap();
+        assert_eq!(db.view().refusal, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_crashed_database_with_pending_events_is_recovered_and_proven_and_keeps_them() {
+        let Some(rig) = Rig::new("recover-outbox").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let data = tenant(&rig, &entry.id).await;
+        data.batch("SELECT pgcf.emit('orders', '{\"n\": 1}')")
+            .await
+            .unwrap();
+        drop(data);
+        rig.machine.crash(&entry.id);
+        rig.core.watch_pass().await;
+        assert_eq!(db.phase(), Phase::Unproven);
+        // Recovery does not wait for the outbox: a dead receiver must not keep a crashed database.
+        eventually(30, "the recovery to prove the sleep", || {
+            db.phase() == Phase::Asleep && db.state().as_ref().is_some_and(|s| s.record.is_some())
+        })
+        .await;
+        // The rows are drained at the next wake, not discarded by the recovery.
+        let woke = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(woke.outcome, WakeOutcome::Started, "{woke:?}");
+        let data = tenant(&rig, &entry.id).await;
+        let rows = data
+            .query("SELECT count(*) FROM pgcf.outbox", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_gateways_busy_sessions_refuse_a_sleep_and_its_quiet_sessions_let_it_pass() {
         let Some(rig) = Rig::new("sleep-gateway").await else {
             return;
@@ -2989,6 +3122,118 @@ mod tests {
         rig.core.idle_pass().await;
         assert_eq!(db.phase(), Phase::Asleep);
         assert!(!rig.machine.running(&entry.id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_built_before_data_events_gets_its_platform_schema_at_its_wake() {
+        let Some(rig) = Rig::new("wake-events-pre-t3").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        // A database built before data events: no platform schema, and no record of one.
+        tenant(&rig, &entry.id)
+            .await
+            .batch("DROP SCHEMA pgcf CASCADE")
+            .await
+            .unwrap();
+        std::fs::remove_file(rig.core.files(&entry.id).directory().join("events.json")).unwrap();
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        assert_eq!(
+            rig.core.wake(&Rig::ticket(&entry)).await.outcome,
+            WakeOutcome::Started
+        );
+        // Nothing has drained yet: the wake alone makes the schema that the tenant emits into.
+        let data = tenant(&rig, &entry.id).await;
+        data.batch("SELECT pgcf.emit('t', '{}')").await.unwrap();
+        data.batch("DELETE FROM pgcf.outbox").await.unwrap();
+        drop(data);
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recorded_conflict_is_checked_again_at_the_wake_once_the_tenant_schema_is_gone() {
+        let Some(rig) = Rig::new("wake-events-conflict").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let files = rig.core.files(&entry.id);
+        let data = tenant(&rig, &entry.id).await;
+        // A schema named pgcf that a tenant role owns takes the platform's place, and is recorded.
+        data.batch("DROP SCHEMA pgcf CASCADE; CREATE SCHEMA pgcf AUTHORIZATION app")
+            .await
+            .unwrap();
+        std::fs::remove_file(files.directory().join("events.json")).unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            crate::agent::build::Refresh::Conflict
+        );
+        data.batch("DROP SCHEMA pgcf CASCADE").await.unwrap();
+        drop(data);
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        assert_eq!(
+            rig.core.wake(&Rig::ticket(&entry)).await.outcome,
+            WakeOutcome::Started
+        );
+        assert_eq!(
+            files.load_events().unwrap(),
+            Some(crate::pgcf::EventsRecord::of(
+                &rig.core.event_settings(&entry),
+                false
+            ))
+        );
+        tenant(&rig, &entry.id)
+            .await
+            .batch("SELECT pgcf.emit('t', '{}')")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_idle_database_with_events_the_sink_refuses_is_not_asked_to_sleep_until_they_are_delivered()
+     {
+        let Some(rig) = Rig::new("idle-outbox-backlog").await else {
+            return;
+        };
+        let gateway = rig.connect_gateway().await;
+        let (entry, db) = rig.create().await;
+        rig.core.drain_pass().await;
+        rig.sink.refuse.store(true, Ordering::SeqCst);
+        let data = tenant(&rig, &entry.id).await;
+        data.batch("SELECT pgcf.emit('orders', '{\"n\": 1}')")
+            .await
+            .unwrap();
+        drop(data);
+        eventually(10, "the drain to read the row", || {
+            rig.core.outbox_backlog(&entry.id)
+        })
+        .await;
+        // Idle for longer than its idle time: the idle sleep would be asked for on every pass.
+        gateway.sessions.lock().unwrap().last_activity_ms = Some(now_ms() - 61_000);
+        db.view().awake_since_ms = Some(now_ms() - 120_000);
+        let capture = crate::events::Capture::default();
+        capture
+            .scope(async {
+                for _ in 0..3 {
+                    rig.core.idle_pass().await;
+                    assert_eq!(db.phase(), Phase::Ready);
+                }
+            })
+            .await;
+        assert!(
+            capture
+                .seen()
+                .iter()
+                .all(|event| event["event"] != "sleep_refused"),
+            "{:?}",
+            capture.seen()
+        );
+        rig.sink.refuse.store(false, Ordering::SeqCst);
+        eventually(10, "the events to be delivered", || {
+            !rig.core.outbox_backlog(&entry.id)
+        })
+        .await;
+        rig.core.idle_pass().await;
+        assert_eq!(db.phase(), Phase::Asleep);
     }
 
     /// Makes the newest base backup of a database a day and an hour old.

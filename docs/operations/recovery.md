@@ -513,8 +513,9 @@ with the owner's go for a reboot. Starting a cycle requires an `admin` API key; 
    the shortage: `GET /v1/regions/{id}/capacity-decision` says `maintenance`. A `failed` cycle
    leaves placement closed and the cron buys again, as it does for any closed node.
 3. Poll `GET /v1/nodes/{id}/maintenance/{operation}`. `open` becomes `done` or `failed`; a
-   `failed` cycle names the class of the failure in `result_reason` (such as `power_busy` or
-   `power_archive` for a database that did not sleep with the proof, `release_missing`,
+   `failed` cycle names the class of the failure in `result_reason` (such as `power_busy`,
+   `power_archive` or `power_outbox` for a database that did not sleep with the proof; `power_outbox` means its
+   data events were not delivered within 10 seconds, see [data events](operator-installation.md#data-events-release-order-and-rollback); `release_missing`,
    `release_signature_missing` or `release_signature_invalid` for a release the node does not trust
    (its agent checks the release key's signature before it reads the lock and reports the event
    `release_refused`; [release-signing.md](release-signing.md)), `signature_not_read`,

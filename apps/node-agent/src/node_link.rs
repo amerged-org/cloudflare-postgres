@@ -112,6 +112,7 @@ pub fn contract_valid(name: &str, value: &Value) -> bool {
                 let events = array(&value["events"]);
                 events.iter().all(event_rules) && unique(events, |event| event["id"].as_str())
             }
+            "NodeDataEventReport" => data_event_rules(value),
             "NodeBootReport" => journal_rules(value, "NODE_BOOT_REPORT_MAX_BYTES"),
             "NodeProbeResult" => journal_rules(value, "NODE_PROBE_RESULT_MAX_BYTES"),
             _ => true,
@@ -283,6 +284,86 @@ fn journal_rules(report: &Value, body_max: &str) -> bool {
             message.len() as u64 <= bound("NODE_BOOT_REPORT_MESSAGE_MAX_BYTES")
         })
     }) && serde_json::to_vec(report).is_ok_and(|body| body.len() as u64 <= bound(body_max))
+}
+
+/// `NodeDataEventReport`: the sequence numbers of a request rise strictly, and a payload and the
+/// whole body stay within their bounds (`NODE_DATA_EVENT_PAYLOAD_MAX_BYTES` and
+/// `NODE_DATA_EVENT_BODY_MAX_BYTES`), each measured as its JSON text.
+fn data_event_rules(report: &Value) -> bool {
+    let bound = |name: &str| constant(name).as_u64().expect("generated bound");
+    let events = array(&report["events"]);
+    events
+        .windows(2)
+        .all(|pair| pair[0]["seq"].as_u64() < pair[1]["seq"].as_u64())
+        && events.iter().all(|event| {
+            js_json_len(&event["payload"])
+                .is_some_and(|payload| payload <= bound("NODE_DATA_EVENT_PAYLOAD_MAX_BYTES"))
+        })
+        && js_json_len(report).is_some_and(|body| body <= bound("NODE_DATA_EVENT_BODY_MAX_BYTES"))
+}
+
+/// The length in bytes of `value` as `JSON.stringify` writes it: the measure Cloudflare applies to
+/// a request it has parsed. The two writers agree on everything but numbers. serde_json keeps an
+/// integer beyond the range of a double, and a number with a fraction, as it was written, while
+/// JavaScript reads each number as a double and writes it in its own form (`1e+20` comes back as
+/// `100000000000000000000`). `None` for a value that is not a JSON number or text.
+fn js_json_len(value: &Value) -> Option<u64> {
+    Some(match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(number) => js_number_len(number.as_f64()?)?,
+        Value::String(text) => js_string_len(text)?,
+        Value::Array(items) => {
+            let mut total = 2 + items.len().saturating_sub(1) as u64;
+            for item in items {
+                total += js_json_len(item)?;
+            }
+            total
+        }
+        Value::Object(map) => {
+            let mut total = 2 + map.len().saturating_sub(1) as u64;
+            for (key, item) in map {
+                total += js_string_len(key)? + 1 + js_json_len(item)?;
+            }
+            total
+        }
+    })
+}
+
+/// The length of a string as a JSON text: serde_json and `JSON.stringify` escape the same
+/// characters in the same way.
+fn js_string_len(text: &str) -> Option<u64> {
+    u64::try_from(serde_json::to_string(text).ok()?.len()).ok()
+}
+
+/// The length of a double as `Number::toString` writes it: the shortest digits that read back as
+/// the double, in positional notation for 1e-7 < |x| < 1e21 and in exponent form (`1e+21`,
+/// `1e-7`) otherwise, with a minus sign for a negative number and `0` for both zeros.
+fn js_number_len(x: f64) -> Option<u64> {
+    if !x.is_finite() {
+        return None;
+    }
+    if x == 0.0 {
+        return Some(1);
+    }
+    // `{:e}` writes the shortest round-trip digits as `d.ddd` and `e` and an exponent `e`, so the
+    // decimal point of ECMAScript's `n` (the digits before it) is one place after the exponent.
+    let text = format!("{:e}", x.abs());
+    let (mantissa, exponent) = text.split_once('e')?;
+    let digits = mantissa.bytes().filter(u8::is_ascii_digit).count() as i64;
+    let n = exponent.parse::<i64>().ok()? + 1;
+    let length = if (digits..=21).contains(&n) {
+        n
+    } else if (1..=21).contains(&n) {
+        digits + 1
+    } else if (-5..=0).contains(&n) {
+        2 - n + digits
+    } else {
+        let exponent_digits = (n - 1).unsigned_abs().to_string().len() as i64;
+        digits + i64::from(digits > 1) + 2 + exponent_digits
+    };
+    u64::try_from(length + i64::from(x < 0.0)).ok()
 }
 
 /// A usage row alone, as a report of one row: what Cloudflare would accept of it. One invalid row
@@ -540,6 +621,7 @@ pub fn public_key(key: &Ed25519KeyPair) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     static VECTORS: LazyLock<Value> = LazyLock::new(|| {
         serde_json::from_str(include_str!(
             "../../../packages/contracts/native/node-vectors.generated.json"
@@ -645,5 +727,158 @@ mod tests {
             ("pgcf-eu", "eu-dev", 12)
         );
         assert!(archive_path("s3://pgcf-eu/eu-dev/a").is_none());
+    }
+
+    /// The contract's example of `NodeDataEventReport` named `name`.
+    fn data_event_vector(name: &str) -> Value {
+        VECTORS["schemas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["schema"] == "NodeDataEventReport" && v["name"] == name)
+            .unwrap()["value"]
+            .clone()
+    }
+
+    /// A report of four events whose payloads carry the text that is left over, so that its body
+    /// is exactly `bytes` long; no payload passes the ceiling.
+    fn data_events_of_body(bytes: usize) -> Value {
+        let example = data_event_vector("one-event");
+        let database = example["database"].clone();
+        let mut events: Vec<Value> = (1..=4)
+            .map(|seq| {
+                let mut event = example["events"][0].clone();
+                event["seq"] = seq.into();
+                event["payload"] = json!({"text": ""});
+                event
+            })
+            .collect();
+        let length = |events: &[Value]| {
+            serde_json::to_vec(&json!({"database": database, "events": events}))
+                .unwrap()
+                .len()
+        };
+        let mut extra = bytes - length(&events);
+        for event in &mut events {
+            let grow = extra.min(262_144 - 11);
+            event["payload"] = json!({"text": "x".repeat(grow)});
+            extra -= grow;
+        }
+        json!({"database": database, "events": events})
+    }
+
+    #[test]
+    fn data_event_reports_are_held_to_the_contract_rules() {
+        assert!(contract_valid(
+            "NodeDataEventReport",
+            &data_event_vector("hundred-events")
+        ));
+        // 1e21 is five bytes as JavaScript writes it, so the ceiling holds 43,689 of them.
+        assert!(contract_valid(
+            "NodeDataEventReport",
+            &data_event_vector("payload-of-1e21-at-ceiling")
+        ));
+        assert!(!contract_valid(
+            "NodeDataEventReport",
+            &data_event_vector("payload-of-1e21-over-ceiling")
+        ));
+        let example = data_event_vector("one-event");
+        let database = example["database"].clone();
+        let event = example["events"][0].clone();
+        let report = |events: Vec<Value>| json!({"database": database, "events": events});
+        let valid = |events: Vec<Value>| contract_valid("NodeDataEventReport", &report(events));
+        // Sequence numbers strictly rise within a request: no two events share one, and none is
+        // out of order.
+        assert!(!valid(vec![event.clone(), event.clone()]), "duplicate seq");
+        let mut second = event.clone();
+        second["seq"] = 2.into();
+        assert!(!valid(vec![second, event.clone()]), "descending seq");
+        // A payload is at most the ceiling in bytes, and the ceiling itself is accepted.
+        let payload = |bytes: usize| {
+            let mut sized = event.clone();
+            sized["payload"] = json!({"text": "x".repeat(bytes - 11)});
+            sized
+        };
+        assert!(valid(vec![payload(262_144)]), "payload at the ceiling");
+        assert!(!valid(vec![payload(262_145)]), "payload over the ceiling");
+        // A body is at most 1 MiB, and that bound is accepted.
+        assert_eq!(
+            serde_json::to_vec(&data_events_of_body(1_048_577))
+                .unwrap()
+                .len(),
+            1_048_577
+        );
+        assert!(contract_valid(
+            "NodeDataEventReport",
+            &data_events_of_body(1_048_576)
+        ));
+        assert!(!contract_valid(
+            "NodeDataEventReport",
+            &data_events_of_body(1_048_577)
+        ));
+    }
+
+    /// A report of one event whose payload is the array `numbers` of `text`, read from JSON text
+    /// as the request is, so that its numbers are as the agent holds them.
+    fn data_event_with_numbers(count: usize, text: &str) -> Value {
+        let payload: Value =
+            serde_json::from_str(&format!("{{\"n\":[{}]}}", vec![text; count].join(","))).unwrap();
+        let mut event = data_event_vector("one-event")["events"][0].clone();
+        event["payload"] = payload;
+        json!({"database": data_event_vector("one-event")["database"], "events": [event]})
+    }
+
+    #[test]
+    fn a_batch_is_measured_as_the_api_measures_its_numbers() {
+        // serde_json writes 1e20 in four bytes, and the API reads it as a double and writes it in
+        // 21: 100 events of 700 such numbers are under the body bound as the agent holds them and
+        // over it as the API measures them.
+        let example = data_event_vector("one-event");
+        let payload =
+            data_event_with_numbers(700, "100000000000000000000")["events"][0]["payload"].clone();
+        let events: Vec<Value> = (1..=100)
+            .map(|seq| {
+                let mut event = example["events"][0].clone();
+                event["seq"] = seq.into();
+                event["payload"] = payload.clone();
+                event
+            })
+            .collect();
+        let report = json!({"database": example["database"], "events": events});
+        let bound = constant("NODE_DATA_EVENT_BODY_MAX_BYTES").as_u64().unwrap();
+        assert!(serde_json::to_vec(&report).unwrap().len() as u64 <= bound);
+        assert!(!contract_valid("NodeDataEventReport", &report));
+    }
+
+    #[test]
+    fn a_payload_is_measured_as_the_api_measures_its_numbers() {
+        // 12,500 numbers of 1e20 are 62,500 bytes as the agent holds them and 262,500 as the API
+        // measures them, over the payload bound of 262,144.
+        let report = data_event_with_numbers(12_500, "100000000000000000000");
+        assert!(
+            serde_json::to_vec(&report["events"][0]["payload"])
+                .unwrap()
+                .len()
+                <= 262_144
+        );
+        assert!(!contract_valid("NodeDataEventReport", &report));
+    }
+
+    #[test]
+    fn a_number_is_measured_as_javascript_writes_it() {
+        // 9999999999999999999 is 19 bytes, and a double of 1e19 is 20 in JavaScript.
+        assert_eq!(js_json_len(&json!(9_999_999_999_999_999_999_u64)), Some(20));
+        assert_eq!(js_json_len(&json!(1e20)), Some(21));
+        assert_eq!(js_json_len(&json!(1e21)), Some(5));
+        assert_eq!(js_json_len(&json!(1e-7)), Some(4));
+        assert_eq!(js_json_len(&json!(0.000001)), Some(8));
+        assert_eq!(js_json_len(&json!(0.1)), Some(3));
+        assert_eq!(js_json_len(&json!(1.5)), Some(3));
+        assert_eq!(js_json_len(&json!(1.0)), Some(1));
+        assert_eq!(js_json_len(&json!(-1.5e-7)), Some(7));
+        assert_eq!(js_json_len(&json!(-0.0)), Some(1));
+        assert_eq!(js_json_len(&json!(123_456_789_012_345_680_000.0)), Some(21));
+        assert_eq!(js_json_len(&json!(true)), Some(4));
+        assert_eq!(js_json_len(&json!({"a": [null, "b\n"]})), Some(18));
     }
 }

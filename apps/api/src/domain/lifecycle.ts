@@ -198,7 +198,7 @@ export async function changePower(
 export async function recoverQuiescence(
   env: Env,
   expected: { databaseId: string; operation: string; revision: number },
-  reason: "busy" | "archive" | "unknown" | "timeout",
+  reason: "busy" | "archive" | "outbox" | "unknown" | "timeout",
   now = new Date().toISOString(),
 ): Promise<{
   operation: string;
@@ -212,7 +212,7 @@ export async function recoverQuiescence(
   if (
     !Number.isSafeInteger(expected.revision) ||
     expected.revision < 1 ||
-    !["busy", "archive", "unknown", "timeout"].includes(reason)
+    !["busy", "archive", "outbox", "unknown", "timeout"].includes(reason)
   )
     throw new Error("invalid_power_recovery");
   const row = await db

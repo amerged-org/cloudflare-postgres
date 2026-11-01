@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+{
+  // Copy to receiver/wrangler.jsonc (gitignored) before a run. The driver deploys it, sets its
+  // secrets and deletes it afterwards; the name must stay the one the driver expects.
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "pgcf-t3-receiver",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": false },
+  "durable_objects": {
+    "bindings": [{ "name": "RECEIVER", "class_name": "Receiver" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Receiver"] }],
+}

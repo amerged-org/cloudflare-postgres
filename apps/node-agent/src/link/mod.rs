@@ -332,6 +332,12 @@ impl Link {
         self.inner.outbox.queue_events(events)
     }
 
+    /// Posts a batch of data events (`NodeDataEventReport`) of one database. Any success means the
+    /// events are durable in the database's actor or deliberately dropped.
+    pub async fn post_data_events(&self, report: &Value) -> Result<(), Error> {
+        self.post("dataEvents", "NodeDataEventReport", report).await
+    }
+
     /// Delivers the queued rows and events now. The link also does so by itself.
     pub async fn flush(&self) -> Result<Flushed, Error> {
         self.inner.outbox.flush().await
@@ -714,5 +720,47 @@ mod tests {
                 .is::<Fenced>()
         );
         assert_eq!(next(&mut events).await, None, "the link does not come back");
+    }
+
+    /// A data event report is posted signed and acknowledged; one that breaks the contract is never
+    /// sent, and a refusal or a fence reaches the caller as it was answered.
+    #[tokio::test]
+    async fn a_data_event_report_is_posted_signed_and_a_refusal_or_a_fence_reaches_the_caller() {
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let (link, mut events) = start(&cloud, &base).await;
+        next(&mut events).await;
+        let report = vector("NodeDataEventReport", "one-event");
+        link.post_data_events(&report).await.unwrap();
+        assert_eq!(
+            cloud.acknowledged("/node/v1/data-events"),
+            vec![report.clone()]
+        );
+        assert!(
+            cloud
+                .requests()
+                .iter()
+                .filter(|seen| seen.path() == "/node/v1/data-events")
+                .all(|seen| seen.signed == Some(Ok(())))
+        );
+        // Nothing that breaks the contract leaves the node.
+        let before = cloud.requests().len();
+        let mut broken = report.clone();
+        broken["events"] = json!([]);
+        assert!(link.post_data_events(&broken).await.is_err());
+        assert_eq!(cloud.requests().len(), before);
+        // A refusal keeps its status, and the report is not taken.
+        cloud.fail_next([Failure::Status(503)]);
+        let refusal = link.post_data_events(&report).await.unwrap_err();
+        assert_eq!(refusal.downcast_ref::<Refusal>().unwrap().status, 503);
+        // A fenced node's report is refused by the API, which the caller sees as a fence.
+        cloud.with(|inner| inner.fenced = true);
+        assert!(
+            link.post_data_events(&report)
+                .await
+                .unwrap_err()
+                .is::<Fenced>()
+        );
     }
 }

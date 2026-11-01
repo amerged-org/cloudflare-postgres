@@ -13,10 +13,12 @@ use crate::{
         test_support::{CREDENTIAL_CHECK, Fixture},
     },
     credentials::Credentials,
+    drain::{self, Post, SendError},
     fence::Fences,
     gateway::Feed,
     link::test_server::{database, vector},
     machine::{Machine, local::Local},
+    node_link::contract_valid,
     postgres, testpg,
 };
 use pgcf_native_protocol::{
@@ -26,9 +28,14 @@ use pgcf_native_protocol::{
 use serde_json::{Value, json};
 use std::{
     fs,
+    future::Future,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    pin::Pin,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -39,6 +46,35 @@ use tokio::{
 
 pub(crate) const OPERATION: &str = "op_cccccccccccccccccccc";
 
+/// Where the drains post their data events: the API's answers, as far as the contract goes. A body
+/// that breaks the contract is refused as the API refuses it, and every post fails with 503 while
+/// `refuse` is set. The accepted bodies are kept in order.
+#[derive(Default)]
+pub(crate) struct Sink {
+    pub posted: Mutex<Vec<Value>>,
+    pub refuse: AtomicBool,
+}
+impl Sink {
+    pub(crate) fn post(self: &Arc<Self>) -> Post {
+        let sink = self.clone();
+        Arc::new(
+            move |body: Value| -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send>> {
+                let sink = sink.clone();
+                Box::pin(async move {
+                    if !contract_valid("NodeDataEventReport", &body) {
+                        return Err(drain::refused(400));
+                    }
+                    if sink.refuse.load(Ordering::SeqCst) {
+                        return Err(drain::refused(503));
+                    }
+                    sink.posted.lock().unwrap().push(body);
+                    Ok(())
+                })
+            },
+        )
+    }
+}
+
 /// A node with the core on it.
 pub(crate) struct Rig {
     pub core: Arc<Core<Local>>,
@@ -48,6 +84,8 @@ pub(crate) struct Rig {
     pub gateway: Arc<Feed>,
     pub early: UnboundedReceiver<EarlySleep>,
     pub root: PathBuf,
+    /// The data event posts of the node's drains.
+    pub sink: Arc<Sink>,
     /// The wakes the gateway sends; kept open so the feed has somewhere to put them.
     wakes: Option<UnboundedReceiver<WakeRequest>>,
     tasks: Vec<tokio::task::JoinHandle<std::convert::Infallible>>,
@@ -140,6 +178,11 @@ pub(crate) fn policy_with_start_concurrency(starts: Option<usize>) -> Policy {
 pub(crate) fn timing() -> Timing {
     Timing {
         archive_wait: Duration::from_secs(20),
+        outbox_wait: Duration::from_secs(2),
+        outbox_poll: Duration::from_millis(200),
+        outbox_gap: Duration::from_millis(10),
+        data_retry: Duration::from_millis(20),
+        data_retry_maximum: Duration::from_millis(100),
         wake_start: Duration::from_secs(20),
         idle_poll: Duration::from_millis(100),
         watch: Duration::from_millis(100),
@@ -272,6 +315,7 @@ impl Rig {
         let listener = crate::gateway::bind(&root.join("g.sock"), 0o600, None).unwrap();
         let feed = tokio::spawn(async move { feed.serve(listener, wake_sender, None).await });
         let fences = Fences::load(machine.layout().fences()).unwrap();
+        let sink = Arc::new(Sink::default());
         let (core, early) = Core::new(
             Parts {
                 machine: machine.clone(),
@@ -283,6 +327,7 @@ impl Rig {
                 policy: policy(),
                 timing,
                 prefetch,
+                data_events: sink.post(),
             },
             running,
         );
@@ -294,6 +339,7 @@ impl Rig {
             gateway,
             early,
             root,
+            sink,
             wakes: Some(wakes),
             tasks: vec![server, feed],
         }

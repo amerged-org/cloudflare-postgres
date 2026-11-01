@@ -598,6 +598,34 @@
                 }
               },
               "required": ["write_bytes_per_second", "write_iops"]
+            },
+            "events": {
+              "default": {
+                "max_payload_bytes": 16384,
+                "max_outbox_rows": 10000,
+                "emits_per_second": 20
+              },
+              "type": "object",
+              "properties": {
+                "max_payload_bytes": {
+                  "default": 16384,
+                  "type": "integer",
+                  "minimum": 1024,
+                  "maximum": 262144
+                },
+                "max_outbox_rows": {
+                  "default": 10000,
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 1000000
+                },
+                "emits_per_second": {
+                  "default": 20,
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000
+                }
+              }
             }
           },
           "required": ["admission", "early_sleep", "storage", "backup", "io"]
@@ -1342,7 +1370,7 @@
               },
               "refusal": {
                 "type": "string",
-                "enum": ["power_busy", "power_archive"]
+                "enum": ["power_busy", "power_archive", "power_outbox"]
               },
               "backup": {
                 "anyOf": [
@@ -2280,6 +2308,55 @@
         }
       }
     },
+    "NodeDataEventReport": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "database": { "$ref": "#/$defs/DatabaseId" },
+        "events": {
+          "minItems": 1,
+          "maxItems": 100,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "epoch": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "at": { "$ref": "#/$defs/Timestamp" },
+              "topic": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]{0,47}$"
+              },
+              "payload": {
+                "type": "object",
+                "propertyNames": { "type": "string" },
+                "additionalProperties": {}
+              }
+            },
+            "required": ["epoch", "seq", "at", "topic", "payload"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["database", "events"],
+      "additionalProperties": false,
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
     "NodeFencedResponse": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
@@ -2611,6 +2688,7 @@
       "volumes": "/node/v1/volumes",
       "events": "/node/v1/events",
       "usage": "/node/v1/usage",
+      "dataEvents": "/node/v1/data-events",
       "diagnostics": "/node/v1/diagnostics"
     },
     "NODE_ORDER_TYPES": ["wake", "move", "superseded", "fence", "maintenance"],
@@ -2622,6 +2700,15 @@
     "NODE_STALE_MS": 180000,
     "NODE_OBSERVATION_RESEND_MS": 900000,
     "NODE_EVENT_RETRY_SECONDS": 600,
+    "NODE_DATA_EVENT_BATCH_MAX": 100,
+    "NODE_DATA_EVENT_BODY_MAX_BYTES": 1048576,
+    "NODE_DATA_EVENT_PAYLOAD_MAX_BYTES": 262144,
+    "NODE_DATA_EVENT_DEPTH_MAX": 32,
+    "DATA_EVENT_LIMITS": {
+      "max_payload_bytes": { "default": 16384, "min": 1024, "max": 262144 },
+      "max_outbox_rows": { "default": 10000, "min": 100, "max": 1000000 },
+      "emits_per_second": { "default": 20, "min": 1, "max": 1000 }
+    },
     "NODE_FENCED_PATHS": ["/node/v1/desired", "/node/v1/observations"],
     "NODE_FENCED_ERROR": "node_fenced",
     "NODE_LINK_MESSAGE_MAX_BYTES": 65536,

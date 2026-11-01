@@ -588,6 +588,11 @@ export const nodePolicy = () => ({
     memory_mib: { wal_upload: 128, wal_fetch: 128, base_backup: 256 },
   },
   io: { write_bytes_per_second: 16 * 1024 ** 2, write_iops: 1000 },
+  events: {
+    max_payload_bytes: 16_384,
+    max_outbox_rows: 10_000,
+    emits_per_second: 20,
+  },
 });
 /** Sets the node policy of the fixture's region, through the administrator route. */
 export async function setNodePolicy(f: Pick<Fixture, "region" | "admin">) {

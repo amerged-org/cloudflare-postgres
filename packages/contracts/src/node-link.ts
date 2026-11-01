@@ -65,6 +65,7 @@ const Count = z.number().int().nonnegative().max(MAX_SAFE);
 const Positive = z.number().int().min(1).max(MAX_SAFE);
 const Bytes = Count;
 const Sha256 = z.string().regex(/^[0-9a-f]{64}$/);
+const utf8Bytes = (text: string) => new TextEncoder().encode(text).byteLength;
 /** The pattern carries the scheme into the JSON Schema, which drops the URL check. */
 const Https = HttpsUrl.regex(/^https:\/\//);
 /**
@@ -86,6 +87,7 @@ export const NODE_API_PATHS = {
   volumes: "/node/v1/volumes",
   events: "/node/v1/events",
   usage: "/node/v1/usage",
+  dataEvents: "/node/v1/data-events",
   diagnostics: "/node/v1/diagnostics",
 } as const;
 /**
@@ -159,6 +161,45 @@ export const NODE_USAGE_BATCH_MAX = 500;
  * remembers the ids of a batch for this long and the request lifetime beyond it.
  */
 export const NODE_EVENT_RETRY_SECONDS = 600;
+/**
+ * The data events of a database (`NodeDataEventReport`): the most in one batch, the most of one
+ * batch's JSON body and of one event's payload, and the deepest nesting of a payload. The
+ * contract checks the batch and payload bounds; `pgcf.emit` enforces the payload and depth bounds
+ * in the tenant's transaction, which is where a payload is made.
+ */
+export const NODE_DATA_EVENT_BATCH_MAX = 100;
+export const NODE_DATA_EVENT_BODY_MAX_BYTES = 1_048_576;
+export const NODE_DATA_EVENT_PAYLOAD_MAX_BYTES = 262_144;
+export const NODE_DATA_EVENT_DEPTH_MAX = 32;
+/** A topic names an event type: a letter, then letters, digits and underscores, 48 at most. */
+export const DATA_EVENT_TOPIC_PATTERN = /^[a-z][a-z0-9_]{0,47}$/;
+/** A full outbox of a database must fit this many bytes of payloads (`max_outbox_rows` x `max_payload_bytes`). */
+export const DATA_EVENT_VOLUME_BYTES_MAX = 268_435_456;
+/**
+ * The limits of a database's outbox, set per region by the operator in `NodePolicy.events`: the
+ * largest payload `pgcf.emit` accepts, the rows an outbox holds before an emit fails, and the
+ * events per second one database's drain delivers (a pause of n / rate after n events). A database
+ * that emits faster for long fills its outbox, and emit fails loudly. Their defaults are the values
+ * a policy without them takes.
+ */
+export const DATA_EVENT_LIMITS = {
+  max_payload_bytes: {
+    default: 16_384,
+    min: 1024,
+    max: NODE_DATA_EVENT_PAYLOAD_MAX_BYTES,
+  },
+  max_outbox_rows: { default: 10_000, min: 100, max: 1_000_000 },
+  emits_per_second: { default: 20, min: 1, max: 1000 },
+} as const;
+const eventLimit = ({
+  default: value,
+  min,
+  max,
+}: {
+  default: number;
+  min: number;
+  max: number;
+}) => z.number().int().min(min).max(max).default(value);
 
 // ---------- Identity and enrollment ----------
 
@@ -782,6 +823,33 @@ export const NodePolicy = z.strictObject({
     write_bytes_per_second: Positive,
     write_iops: z.number().int().min(1).max(10_000_000),
   }),
+  /**
+   * The data event limits of a database's outbox (plan 4.5, `DATA_EVENT_LIMITS`). They are
+   * optional for the release that adds them (plan 9.3, "Changing the page"): a policy and a page
+   * without them mean the defaults, 16,384 bytes a payload, 10,000 rows an outbox and 20 events a
+   * second. A full outbox must fit 256 MiB, which the API checks when it sets the policy.
+   */
+  events: z
+    .strictObject({
+      max_payload_bytes: eventLimit(DATA_EVENT_LIMITS.max_payload_bytes),
+      max_outbox_rows: eventLimit(DATA_EVENT_LIMITS.max_outbox_rows),
+      emits_per_second: eventLimit(DATA_EVENT_LIMITS.emits_per_second),
+    })
+    .refine(
+      (events) =>
+        events.max_outbox_rows * events.max_payload_bytes <=
+        DATA_EVENT_VOLUME_BYTES_MAX,
+      {
+        path: ["max_outbox_rows"],
+        message:
+          "A full outbox must fit 256 MiB: max_outbox_rows x max_payload_bytes",
+      },
+    )
+    .default({
+      max_payload_bytes: DATA_EVENT_LIMITS.max_payload_bytes.default,
+      max_outbox_rows: DATA_EVENT_LIMITS.max_outbox_rows.default,
+      emits_per_second: DATA_EVENT_LIMITS.emits_per_second.default,
+    }),
 });
 export type NodePolicy = z.infer<typeof NodePolicy>;
 
@@ -1226,9 +1294,12 @@ export const NodeDatabaseObservation = z
     /**
      * A sleep this generation asked for was refused; the database stays awake and wakeable. The
      * refusal is final for that generation: the node does not retry the proof, and the database
-     * suspends only when a new generation asks again.
+     * suspends only when a new generation asks again. Busy is a session or a prepared transaction,
+     * archive is an archive that did not drain, and outbox is a pending data event that was not
+     * delivered within the order wait. Only a ready database has one (plan 9.3: the API learns a
+     * value before a node sends it).
      */
-    refusal: z.enum(["power_busy", "power_archive"]).optional(),
+    refusal: z.enum(["power_busy", "power_archive", "power_outbox"]).optional(),
     /**
      * The newest DONE base backup of this storage generation. A ready database has one: the
      * agent reports ready only when its first base backup is DONE (plan 5.10, 7.8).
@@ -1726,13 +1797,64 @@ export const NodeEventReport = z
   );
 export type NodeEventReport = z.infer<typeof NodeEventReport>;
 
+// ---------- Data events (POST /node/v1/data-events) ----------
+
+/**
+ * One event of a database's outbox. The node names no project, no id and no type: the API builds
+ * the event id from the database, the `epoch` (the storage generation stamped at emit) and the
+ * `seq` (the identity of the row in the outbox).
+ */
+export const NodeDataEvent = z.strictObject({
+  epoch: Positive,
+  seq: Positive,
+  at: Timestamp,
+  topic: z.string().regex(DATA_EVENT_TOPIC_PATTERN),
+  payload: z.record(z.string(), z.unknown()),
+});
+export type NodeDataEvent = z.infer<typeof NodeDataEvent>;
+/**
+ * A batch of one database's events, in ascending `seq`, all or nothing: any 2xx means every event
+ * is stored or deliberately not wanted, and the node drops them; anything else keeps the batch.
+ * The route declares its answer; there is no answer schema here.
+ */
+export const NodeDataEventReport = z
+  .strictObject({
+    database: DatabaseId,
+    events: z.array(NodeDataEvent).min(1).max(NODE_DATA_EVENT_BATCH_MAX),
+  })
+  .superRefine((report, ctx) => {
+    report.events.forEach((event, index) => {
+      const previous = report.events[index - 1];
+      if (previous !== undefined && event.seq <= previous.seq)
+        ctx.addIssue({
+          code: "custom",
+          path: ["events", index, "seq"],
+          message: "Events are in ascending seq, each once",
+        });
+      if (
+        utf8Bytes(JSON.stringify(event.payload)) >
+        NODE_DATA_EVENT_PAYLOAD_MAX_BYTES
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["events", index, "payload"],
+          message: "A payload is at most NODE_DATA_EVENT_PAYLOAD_MAX_BYTES",
+        });
+    });
+    if (utf8Bytes(JSON.stringify(report)) > NODE_DATA_EVENT_BODY_MAX_BYTES)
+      ctx.addIssue({
+        code: "custom",
+        message: "A batch is at most NODE_DATA_EVENT_BODY_MAX_BYTES",
+      });
+  });
+export type NodeDataEventReport = z.infer<typeof NodeDataEventReport>;
+
 // ---------- Boot reports (POST /node/v1/diagnostics) ----------
 
 export const NODE_BOOT_REPORT_ENTRIES_MAX = 1000;
 export const NODE_BOOT_REPORT_MESSAGE_MAX_BYTES = 2048;
 /** The JSON body of a report: the agent drops the oldest entries until it fits. */
 export const NODE_BOOT_REPORT_MAX_BYTES = 1024 * 1024;
-const utf8Bytes = (text: string) => new TextEncoder().encode(text).byteLength;
 /**
  * The most a stored boot report or probe result may take as the `INSERT` statement that a dump of
  * the control database writes for its row (single quotes doubled, as a dump writes them). D1

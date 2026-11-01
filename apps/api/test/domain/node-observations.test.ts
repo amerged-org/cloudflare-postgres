@@ -432,6 +432,43 @@ describe("a database the node put to sleep", () => {
     expect(await events(db.id)).toEqual([created1]);
   });
 
+  it("ends a suspend that the node refuses for pending data events and leaves the database running", async () => {
+    const f = await fixture();
+    const db = await created(f);
+    await report(f, db.id, 1);
+    const suspended = DatabaseWithOperation.parse(
+      await (await suspend(f, db.id)).json(),
+    );
+    expect(
+      await verdicts(
+        await report(f, db.id, 2, "ready", { refusal: "power_outbox" }),
+      ),
+    ).toEqual(["accept"]);
+    expect(await row(db.id)).toMatchObject({
+      desired_state: "running",
+      generation: 3,
+    });
+    expect(await status(suspended.operation.id)).toEqual({
+      status: "failed",
+      error_code: "power_outbox",
+    });
+  });
+
+  it("refuses a power_outbox report for a database that is not being suspended", async () => {
+    const f = await fixture();
+    const db = await created(f);
+    await report(f, db.id, 1);
+    expect(
+      await verdicts(
+        await report(f, db.id, 1, "ready", { refusal: "power_outbox" }),
+      ),
+    ).toEqual(["conflict"]);
+    expect(await row(db.id)).toMatchObject({
+      desired_state: "running",
+      generation: 1,
+    });
+  });
+
   it("leaves the database awake and wakeable when the node refuses the sleep", async () => {
     const f = await fixture();
     const db = await created(f);
