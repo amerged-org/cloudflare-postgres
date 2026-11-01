@@ -115,6 +115,7 @@ kill for as long as the node lives.
 | Sleep proof and its record | `proof.rs`, `sleep.rs`, `pg_control.rs`, `state.rs`                                                                                                    |
 | Roles                      | `roles.rs`, `scram.rs`: PostgreSQL holds exactly the roles of the page, with verifiers, never passwords                                                |
 | Backups                    | `archive/`: the archive socket, the barman-cloud jobs, restore and PITR recovery, the upload log                                                       |
+| Data events (1.6.0)        | `drain.rs`: the drain of one database (LISTEN, read, post, delete, pacing, backoff); `agent/drains.rs`: the hub, one drain per served database and the retries of its schema; `pgcf.rs` and `pgcf/schema.sql`: the platform schema `pgcf` the superuser installs, and the outbox's reads and deletes; `agent/build.rs` (`refresh_events`): the schema's record in `events.json` |
 | Fencing                    | `fence.rs`                                                                                                                                             |
 | Gateway channel            | `gateway.rs`: the writer table, the wakes, quiesce, close, status and activity                                                                         |
 | Metrics and diagnostics    | `usage.rs`, `sample.rs`, `events.rs`, `diagnostics/`                                                                                       |
@@ -766,6 +767,12 @@ PostgreSQL's Unix socket path is limited to 103 bytes, so run them with a short 
 ```sh
 TMPDIR=/tmp PGCF_TEST_POSTGRES_BINDIR=/usr/lib/postgresql/18/bin cargo test -p pgcf-node-agent
 ```
+
+The data event tests (`drain::tests::`, `pgcf::tests::`, `agent::drains::tests::`, `agent::power::`) run the
+drain, the platform schema and the sleep guard against real PostgreSQL 18 as well. Their helpers return early
+when `PGCF_TEST_POSTGRES_BINDIR` is unset, so a green run without the variable proves nothing about them: run
+them with it set. Tenant roles in those tests are ordinary `LOGIN` roles, so the grants of `pgcf.emit` and
+`pgcf.capture` are tested as a tenant sees them.
 
 Tests that need the kernel are `#[ignore]`d. CI runs them from
 [kernel-test.Dockerfile](kernel-test.Dockerfile) in a container with no network and `CAP_SYS_ADMIN`
