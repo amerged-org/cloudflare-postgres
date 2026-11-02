@@ -178,11 +178,12 @@ Every step maps to a measured cost above. Each step ends with the audit of 1.5 a
 
 | Changed files of a pull request | `native` | `workers` |
 | --- | --- | --- |
-| Only documents: `docs/**` and top-level `*.md` | no | no |
+| Only documents: `docs/**`, top-level `*.md` and `.mermaider/**` (the diagrams' bookkeeping, which only `static` reads) | no | no |
 | Only documents and the Workers' TypeScript: `apps/api/**`, `apps/edge/**`, `apps/release-signer/**`, `packages/cli/**` | no | yes |
 | Anything else, a path no rule names, or no file at all | yes | yes |
 
 - **Only on `pull_request`.** A push to main, which `sign-release` signs, a dispatch and every other event run everything; the gate needs every job to have succeeded then.
+- **Replayed on history (*measured*).** The rules applied to the file lists of the last 40 commits of main: 21 would run everything, 12 would skip the native jobs and 7 would skip both parts. The first replay put none in the middle class, because every API change also regenerates `.mermaider/manifest.json`; the class was added after that. The replay is a check of the rules against real changes, not a prediction of time.
 - **How the rules were found.** By reading what the native and image jobs read: no Rust source, `Cargo.toml` or script of the image reads these TypeScript apps (the only hits are comments), and the one test of the image tooling that reads the API moved to `other-tests`. A nested `README.md` is not a document in the rule, because a test may read it; it runs everything.
 - **The gate** (`scope.ts gate`, tested in `scope.test.ts`) accepts a skipped job only when `changes` said its part was left out; a skipped job whose part is in scope, a failed or cancelled job and a missing answer fail it. `ci-jobs.test.ts` fails if the gate's `needs` or a job's condition drifts from the one table in `scope.ts`.
 

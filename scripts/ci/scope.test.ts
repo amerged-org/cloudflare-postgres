@@ -19,6 +19,7 @@ test("a pull request that changes only documents runs neither the native nor the
       "README.md",
       "docs/architecture/ci-speed.md",
       "docs/operations/release-signing.md",
+      ".mermaider/manifest.json",
     ]),
     { native: false, workers: false },
   );
@@ -33,6 +34,7 @@ test("a pull request that changes only the Workers' TypeScript skips the native 
       "apps/release-signer/src/index.ts",
       "packages/cli/src/main.ts",
       "docs/architecture/ci-speed.md",
+      ".mermaider/manifest.json",
     ]),
     { native: false, workers: true },
   );

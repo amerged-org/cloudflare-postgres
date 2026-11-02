@@ -30,8 +30,11 @@ export const gatedJobs: Readonly<Record<string, keyof Scope | null>> = {
   "api-tests": "workers",
 };
 
-/** Documents that no test of the native or Workers jobs reads: the top level's and `docs/`. */
-const documents = /^(?:docs\/|[^/]+\.md$)/;
+/**
+ * Files that no test of the native or Workers jobs reads: the documents of the top level and of
+ * `docs/`, and the diagrams' own bookkeeping in `.mermaider/`, which only `static` checks.
+ */
+const documents = /^(?:docs\/|\.mermaider\/|[^/]+\.md$)/;
 /** TypeScript apps that no Rust crate, no image build and no native test reads. */
 const workerApps = /^(?:apps\/(?:api|edge|release-signer)\/|packages\/cli\/)/;
 
