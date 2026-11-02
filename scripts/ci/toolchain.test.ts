@@ -258,7 +258,8 @@ test("every Linux build job validates the shared toolchain before dependencies a
       dependencies = job.indexOf("pnpm install"),
       build = job.indexOf("docker build");
     assert.ok(setup >= 0 && check > setup);
-    assert.ok(dependencies > check);
+    // A job that installs no packages (the scope, the Rust and the kernel jobs) has none to order.
+    assert.ok(dependencies === -1 || dependencies > check);
     assert.ok(build === -1 || build > check);
   }
 });

@@ -1,6 +1,6 @@
 # Proposal: a faster CI
 
-**Status:** plan for the owner, 2026-11-01. Nothing here is built. The owner pointed to a write-up on making a CI about 20 times faster ([Owen Gretzinger, "How I made our CI 20x faster", 2026-10-30](https://x.com/owengretzinger/status/2116291924219060319)). This document checks each of its levers against this repository's measured CI and orders the ones that apply. The status row is in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md), 11.2; completed steps and their measured numbers are recorded there, in 11.1, as they land.
+**Status:** plan for the owner, 2026-11-01. Steps 1, 2 and 5 are built on the branch `docs/ci-speed-plan` (below, "Built" in each step) and are measured only after they run on main; steps 3, 4 and 6 are not built. The owner pointed to a write-up on making a CI about 20 times faster ([Owen Gretzinger, "How I made our CI 20x faster", 2026-10-30](https://x.com/owengretzinger/status/2116291924219060319)). This document checks each of its levers against this repository's measured CI and orders the ones that apply. The status row is in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md), 11.2; completed steps and their measured numbers are recorded there, in 11.1, as they land.
 
 Each number carries its basis: *measured* (the GitHub Actions API, see section 1), *estimate* (not measured) or *target* (an acceptance threshold proposed here for the owner to confirm). Following AGENTS.md, the plan gives no effort or duration estimates for the work; each step names its scope and its acceptance instead.
 
@@ -13,7 +13,7 @@ Each number carries its basis: *measured* (the GitHub Actions API, see section 1
 - **Rust is compiled from nothing up to five times in a run** and no Rust cache exists. Only the pnpm store is cached (one entry, 143 MB, on `main`).
 - **The order of work:** (1) split `check` into jobs that run at the same time and measure each; (2) cache what Rust compiles, but only where the result is a verdict, never a shipped byte; (3) shard the TypeScript tests where the measurement says; (4) a pre-push hook for the cheap checks that fail runs today; (5) skip what a pull request cannot affect; (6) a bigger runner only if all that is not enough, and only with the owner's costed go.
 - **Not adopted, because the measurement says there is no problem:** a faster runner provider (queue 3 s), Oxlint (lint 8 s), a faster typechecker (typecheck 26 s). A runner provider would also widen the release-signing trust (2.1).
-- **Estimate after step 1 alone:** the longest job becomes the Rust job, about 11 minutes, from about 24. Target after the steps that apply: under 10 minutes for a successful pull request run, to be confirmed by the owner (section 5).
+- **Estimate after step 1 alone:** the longest job becomes the Rust job, about 10 minutes, from about 24. Target after the steps that apply: under 10 minutes for a successful pull request run, to be confirmed by the owner (section 5).
 
 ---
 
@@ -97,45 +97,50 @@ Every step maps to a measured cost above. Each step ends with the audit of 1.5 a
 
 ### Step 1: split `check` into jobs that run at the same time
 
-**Scope.** Replace the serial `check` by parallel jobs in `ci.yml`, one command per step so that the audit shows every command's time:
+**Built.** `check` is replaced by jobs that run at the same time in the one `ci.yml`; every command is its own step, so the audit shows its time:
 
-| Job | Holds | Steps it replaces (seconds) |
+| Job | Holds | Replaces (seconds, *measured*) |
 | --- | --- | --- |
-| `static` | diagrams, plan privacy, lint, format, typecheck of every tsconfig | 79 |
-| `rust` | pinned toolchain, generator checks, `cargo fmt`, `cargo test --workspace`, both `cargo clippy` runs | 145 + 501 |
-| `ts-tests` | the Worker build, the pinned PostgreSQL if the TypeScript tests need it, the package tests one package per matrix entry, the `scripts/` tests, the Rust Edge artifact binding and upload | 44 + 403 |
+| `changes` | decides the scope of the run (step 5) | new |
+| `static` | diagrams, plan privacy, lint, format, typecheck | 79 |
+| `rust` | pinned toolchain and PostgreSQL, `cargo fmt`, `cargo test --workspace`, both `cargo clippy` runs | 501 and part of 145 |
+| `edge-tests` | the pinned Worker build tools, the Rust Edge Worker build and its Workerd test, the artifact binding and upload | 44, part of 145 and part of 403 |
+| `api-tests` | the API package's tests (129 files) | most of 403 (not measured per package) |
+| `other-tests` | the image tooling and installer checks (moved from `node-image`), the tests of the contracts, the Edge, the release signer, the CLI and the end-to-end package, the `scripts/` tests | rest of 403 |
 | `kernel` | the node agent's kernel test | 239 |
-| `check` (kept) | only a gate: `needs` all of the above, `if: always()`, fails unless every one succeeded | 0 |
+| `check` (kept) | only the gate: `needs` all of the above and fails unless each has passed or was left out by the scope | 0 |
 
-- **Why `check` stays as the gate.** `sign-release` has `needs: [check, node-image]` and `scripts/ci/release-signing-workflow.test.ts` asserts exactly that line; `docs/operations/release-signing.md` states it. With the gate, a commit whose tests failed is still never signed and neither the test nor the runbook changes. No branch protection or ruleset requires a check by name today, so no required-check name moves.
-- **The Rust Edge artifact** (`pgcf-rust-edge-<sha>-<attempt>`) is built and tested in the same job, so the bytes that were tested are the bytes that are kept.
-- **Whatever reads `ci.yml`** changes in the same commit: the Mermaider CI diagram (`.mermaider/config.json` includes `.github/workflows/**`; run the pinned local `update` and `check` first), `scripts/ci/toolchain.test.ts` and `scripts/ci/release-signing-workflow.test.ts` if they name a step or job.
-- **Duplicate work seen on the way.** `packages/contracts` runs the generator checks again in its `test` script, after the contracts step ran them. They are seconds; one place keeps them.
+- **Why `check` stays as the gate.** `sign-release` has `needs: [check, node-image]` and `scripts/ci/release-signing-workflow.test.ts` asserts exactly that line; `docs/operations/release-signing.md` states it. A commit whose tests failed is still never signed and neither the test nor the runbook's rule changes (the runbook's description of what `check` holds is updated). No branch protection or ruleset requires a check by name (read from the API, 2026-11-01), so no required-check name moves.
+- **Where the old step went.** The 501 s step also ran four generator `--check` commands; the contracts package's own `test` script runs them (and two more), so they live there only. `pnpm test` ran the packages one after another; each package is now named in a step (`pnpm --filter <name> test`) and `scripts/ci/ci-jobs.test.ts` fails if a package with a `test` script is in no job or in two, which is the new way to lose a test.
+- **What the test `toolchain.test.ts` allows.** A job that installs no packages (the scope, `rust`, `kernel` and the gate) has no `pnpm install` to order after the toolchain check; the test accepts that and still requires the check before any install and any Docker build.
+- **Dependencies found while splitting** (each decided where a test lives): `apps/edge-rust/test` runs the API's `DatabaseActor` and reads the API's migrations, so `edge-tests` belongs to the Workers part of the scope; `infra/node-image/gateway-socket.test.ts` reads `apps/api/src/domain/node-tunnel.ts`, so the image tooling checks run in `other-tests` (they take 4 s) and `node-image` is left with the build, the boot and the release files; `scripts/e2e`'s local tests require PostgreSQL when `CI` is set, so `other-tests` installs it as `rust` does, through `scripts/ci/install-test-postgres.sh`.
+- **The Rust Edge artifact** (`pgcf-rust-edge-<sha>-<attempt>`) is built and tested in `edge-tests`, so the bytes that were tested are the bytes that are kept.
+- **Whatever reads `ci.yml`** changed in the same commit: the Mermaider CI diagram, `toolchain.test.ts` and the release-signing runbook.
 - **Cost.** Each job repeats checkout and `pnpm install` (about 20 s). The repository is public, so GitHub-hosted standard minutes are free; the added jobs buy no paid resource.
 
-**Acceptance.** Every successful job of a pull request run and of a push to main is green; `sign-release` still runs only on a push to main after the gate; the audit lists the time of every command that 1.2 lumps together (the split of the 145 s tool setup, of the 501 s Rust step and of the 403 s tests). Estimate: the longest job is `rust` at about 650 s, so the run takes about 11 minutes, from 24.
+**Acceptance.** Every job of a pull request run and of a push to main is green; `sign-release` still runs only on a push to main after the gate; the audit lists the time of every command that 1.2 lumps together (the split of the 145 s tool setup, of the 501 s Rust step and of the 403 s tests). Estimate: the longest job is `rust` at about 540 s, so the run takes about 10 minutes, from 24.
 
 ### Step 2: cache what Rust compiles, where the result is a verdict
 
-**Rule.** *A cache may feed a verdict, never a shipped byte.* The write-up's cache lesson was that PR runs missed a cache because nothing seeded one from `main`. GitHub lets a pull request read the caches of `main` and its own ref, not the other way round; this repository has the pnpm entry on `main` only, and no Rust cache at all.
+**Rule.** *A cache may feed a verdict, never a shipped byte.* The write-up's cache lesson was that PR runs missed a cache because nothing seeded one from `main`. GitHub lets a pull request read the caches of `main` and its own ref, not the other way round; this repository had the pnpm entry on `main` only, and no Rust cache at all.
 
-**Scope.**
-- `rust` and `kernel` jobs (verdicts: tests, clippy): restore `~/.cargo/registry`, `~/.cargo/git` and `target/` with `actions/cache/restore` (pinned by commit like the other actions), keyed on `Cargo.lock`, `rust-toolchain.toml` and `infra/platform/versions.lock.json`; save with `actions/cache/save` only on a push to `main`, so pull requests never write caches and the 10 GB budget holds. Separate keys for the test, clippy and `wasm32` profiles, which write different artifacts.
-- `node-image` (`cargo build --release` of the binaries that `sign-release` signs) and the Rust Edge build (the Worker bytes that are kept): no `target/` restore. At most the crate downloads (`~/.cargo/registry`), which Cargo checks against the checksums in `Cargo.lock`. A clean release build stays clean. `sign-release` restores no cache another job wrote, as the comment above that job states.
-- `worker-build`: measure first what the 145 s are made of (`rustup` or `cargo install`). Only if `cargo install worker-build` is most of it, keep the installed binary in the cache keyed on `rustVersion` and the `workerBuildVersion` of `infra/platform/versions.lock.json`, written only by `main`. It builds the kept Edge bytes, so the owner's rule above applies: the decision waits for the measurement.
-- Set `CARGO_INCREMENTAL=0` in CI, so the cache holds dependencies, not incremental state that one source change invalidates.
+**Built** in the `rust` job only: `actions/cache/restore` of `~/.cargo/registry/index`, `~/.cargo/registry/cache`, `~/.cargo/git/db` and `target`, keyed on `Cargo.lock`, `rust-toolchain.toml` and `infra/platform/versions.lock.json` with no fallback key (a changed lock compiles once cold on main and is then cached; the cache cannot grow by restoring an old one and adding to it); `actions/cache/save` only on a push to `main` and only after a miss, so pull requests write no cache and the 10 GB budget holds. `CARGO_INCREMENTAL=0`, so the cache holds dependencies and not incremental state that one source change invalidates. The workspace crates are rebuilt every run (their files are new); the dependencies are not.
 
-**Acceptance.** On pull requests, `cargo test`, `cargo clippy` and the kernel job build only the workspace crates, not their dependencies (visible in the step logs and in the audit); the cache size stays well under the 10 GB budget (read `actions/cache/usage`); a pull request run after a cache hit is shorter than before by the dependency build time.
+- **No cache in `node-image`, `edge-tests` and `sign-release`.** `node-image` compiles the binaries that `sign-release` signs and `edge-tests` builds the Worker bytes that are kept; both compile from nothing, and `scripts/ci/ci-jobs.test.ts` fails if a cache step appears in either. `sign-release` restores no cache another job wrote, as the comment above that job states.
+- **`worker-build`** (`cargo install` in `edge-tests`) is not cached: it builds the kept Edge bytes, and the 145 s of tool setup are not yet split into `rustup` and `cargo install`. The first runs of the new jobs give that split; a cache of the installed binary is decided on it and on the rule above.
+- **The kernel job is not cached, and cannot be by this step.** It compiles the agent's tests inside `docker build`, where a layer cache is dropped whenever a copied source file changes, so it would rebuild every dependency anyway; reusing compiled dependencies needs a different build (the test binary built on the runner against the cached `target/` and copied into the container, or a dependency layer). It is 239 s and not the longest job, so it is left until it is.
+
+**Acceptance.** After the first push to main saves the cache, `cargo test` and `cargo clippy` in a later pull request build only the workspace crates (visible in the step logs and in the audit); the cache stays well under the 10 GB budget (read `actions/cache/usage`); the `rust` job is shorter than before by the dependency build time. The pull request that adds the cache cannot show this, because it runs before main holds an entry.
 
 ### Step 3: the TypeScript tests (403 s)
 
-**Scope.** Decide from the matrix of step 1 which package dominates; the API package (129 files) is the expected one. Then, in this order, keeping each change only if all test files pass and the measured time falls:
+**Scope.** Step 1 already runs the API package in its own job (`api-tests`), so its time is known on its own; the other packages share `other-tests`, whose steps are timed one by one. Then, in this order, keeping each change only if all test files pass and the measured time falls:
 1. `vitest --shard=i/N` of the API package over N jobs (the API tests use local bindings, `remoteBindings: false`, so a shard needs no database of its own).
 2. `maxWorkers` of the API package (2 today) against the 4 vCPUs of the runner; the write-up's lesson was that cores mattered more than shards, because most CPU went to loading modules.
 3. Whether the Workers pool can reuse its isolate between test files (`isolate: false` in the write-up, which cut each shard from 100 to 35 s). Leaking state between files is the price: add a reset after every file, or drop the change.
 4. A larger runner for these jobs only through step 6.
 
-**Acceptance.** `ts-tests` is not the longest job after step 2; no test file passes only because of the order of the files (run once with a shuffled order).
+**Acceptance.** `api-tests` is not the longest job after step 2; no test file passes only because of the order of the files (run once with a shuffled order).
 
 ### Step 4: the cheap checks before every push
 
@@ -147,11 +152,21 @@ Every step maps to a measured cost above. Each step ends with the audit of 1.5 a
 
 ### Step 5: skip what a pull request cannot affect
 
-**Why.** Three docs-only pull requests ran the full 22 to 25 minutes (1.1).
+**Why.** Three docs-only pull requests ran the full 22 to 25 minutes (1.1), and most pull requests change only the Workers' TypeScript, which the Rust crates, the kernel test and the node image do not read.
 
-**Scope.** A `changes` job computes, from `git diff --name-only` against the base of the pull request, which of Rust, TypeScript and the node image a change touches, in a script under `scripts/ci/` with its own test. **Only on `pull_request`.** A push to main always runs everything, because `sign-release` signs that commit and the gate must have seen all of it. A path that no rule names runs everything (the safe default). The write-up's warning is the acceptance: a change that is hidden from the rules on purpose must fail the run, not report green.
+**Built.** The job `changes` runs `scripts/ci/scope.ts scope` and outputs two parts: `native` (the Rust crates, `kernel`, `node-image`) and `workers` (`api-tests`, `edge-tests`). `static`, `other-tests` and the gate run for every change.
 
-**Acceptance.** A docs-only pull request finishes in about the time of `static`, under 2 minutes (*estimate*); a test changes one path of each rule at a time and a hidden-change fixture fails the run; the push to main of the same commit still runs all jobs.
+| Changed files of a pull request | `native` | `workers` |
+| --- | --- | --- |
+| Only documents: `docs/**` and top-level `*.md` | no | no |
+| Only documents and the Workers' TypeScript: `apps/api/**`, `apps/edge/**`, `apps/release-signer/**`, `packages/cli/**` | no | yes |
+| Anything else, a path no rule names, or no file at all | yes | yes |
+
+- **Only on `pull_request`.** A push to main, which `sign-release` signs, a dispatch and every other event run everything; the gate needs every job to have succeeded then.
+- **How the rules were found.** By reading what the native and image jobs read: no Rust source, `Cargo.toml` or script of the image reads these TypeScript apps (the only hits are comments), and the one test of the image tooling that reads the API moved to `other-tests`. A nested `README.md` is not a document in the rule, because a test may read it; it runs everything.
+- **The gate** (`scope.ts gate`, tested in `scope.test.ts`) accepts a skipped job only when `changes` said its part was left out; a skipped job whose part is in scope, a failed or cancelled job and a missing answer fail it. `ci-jobs.test.ts` fails if the gate's `needs` or a job's condition drifts from the one table in `scope.ts`.
+
+**Acceptance.** A docs-only pull request finishes in about the time of `static`, under 2 minutes (*estimate*); a change to the Workers' TypeScript no longer waits for Rust or the image; a hidden-change test fails the run (`scope.test.ts`: one Rust path among 100 other files runs everything); the push to main of the same commit still runs every job.
 
 ### Step 6: a bigger runner, only if it is still needed
 
@@ -163,7 +178,7 @@ Every step maps to a measured cost above. Each step ends with the audit of 1.5 a
 
 ### 3.1 After step 1: where the time goes next
 
-Once `check` is parallel, the longest job is `rust` (about 650 s); with step 2 it falls, and `node-image` (536 s) becomes the longest. Its two big costs are the image build (267 s, mostly package downloads and the image assembly; not split yet) and the cold release build (180 s, which stays clean by the rule of step 2). The audit after step 2 decides whether the image build is worth its own step; none is planned now, since the problem is not yet observed.
+Once `check` is parallel, the longest job is `rust` (about 540 s: the toolchain, PostgreSQL and the 501 s of cargo); with step 2 it falls, and `node-image` (536 s) becomes the longest. Its two big costs are the image build (267 s, mostly package downloads and the image assembly; not split yet) and the cold release build (180 s, which stays clean by the rule of step 2). The audit after step 2 decides whether the image build is worth its own step; none is planned now, since the problem is not yet observed.
 
 ---
 
