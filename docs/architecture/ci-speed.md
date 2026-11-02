@@ -1,6 +1,6 @@
 # Proposal: a faster CI
 
-**Status:** plan for the owner, 2026-11-01. Steps 1, 2 and 5 are built on the branch `ci-parallel` (pull request 35, "Built" in each step); the first run on the pull request took 647 s (1.6), and the cache shows its effect only after main saves it; steps 3, 4 and 6 are not built. The owner pointed to a write-up on making a CI about 20 times faster ([Owen Gretzinger, "How I made our CI 20x faster", 2026-10-30](https://x.com/owengretzinger/status/2116291924219060319)). This document checks each of its levers against this repository's measured CI and orders the ones that apply. The status row is in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md), 11.2; completed steps and their measured numbers are recorded there, in 11.1, as they land.
+**Status:** plan for the owner, 2026-11-01. Steps 1, 2 and 5 are built on the branch `ci-parallel` (pull request 35, "Built" in each step); merged as `eb5df36a`; four runs took 606 to 739 s (1.7); steps 3, 4 and 6 are not built. The owner pointed to a write-up on making a CI about 20 times faster ([Owen Gretzinger, "How I made our CI 20x faster", 2026-10-30](https://x.com/owengretzinger/status/2116291924219060319)). This document checks each of its levers against this repository's measured CI and orders the ones that apply. The status row is in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md), 11.2; completed steps and their measured numbers are recorded there, in 11.1, as they land.
 
 Each number carries its basis: *measured* (the GitHub Actions API, see section 1), *estimate* (not measured) or *target* (an acceptance threshold proposed here for the owner to confirm). Following AGENTS.md, the plan gives no effort or duration estimates for the work; each step names its scope and its acceptance instead.
 
@@ -80,10 +80,24 @@ Run `41409201398` of the pull request that builds them (a change to `ci.yml`, so
 | `static` | 69 | typecheck 20, format 8 |
 | `changes`, `check` (gate) | 17, 18 | |
 
-- **The run took 647 s, against 1,439 s (median of pull requests before).** The longest job is `rust`, and 482 of its 587 s are the first `cargo test`, the part the cache is for.
+- **The run took 647 s, against 1,439 s (median of pull requests before).** The longest job is `rust`, and 482 of its 587 s are `cargo test`. The plan expected most of that to be compiling dependencies; 1.7 shows it is not.
 - **The 145 s "Rust and Worker tool setup" of 1.2 were almost all `cargo install worker-build`.** The pinned toolchain alone is 9 s in `rust`; the same step with `worker-build` is 150 s in `edge-tests`. That settles the split the plan left open.
 - **Two things show for the next steps.** For a pull request that skips the native jobs, the longest job is now `api-tests` (325 s), then `edge-tests` (303 s); the first needs shards (step 3), the second a cached `worker-build` (step 2, the decision named below).
 - **`changes` and the gate `check` cost 17 and 18 s** at the two ends of the critical path.
+
+### 1.7 After the merge (*measured*, runs on main)
+
+| Run | Wall | `rust` | `node-image` | `api-tests` | `edge-tests` | `kernel` | `other-tests` | `static` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Pull request `41409201398`, no cache | 647 | 587 | 461 | 325 | 303 | 199 | 126 | 69 |
+| Pull request `41410630564`, no cache (the merged tree) | 734 | 599 | 521 | 233 | 310 | 271 | 110 | 89 |
+| Push to main `41455586482`, saves the cache, `sign-release` 26 s | 739 | 622 | 676 | 246 | 249 | 278 | 110 | 72 |
+| Dispatch on main `41457457107`, restores the cache | 606 | 525 | 582 | 355 | 313 | 240 | 125 | 94 |
+
+- **Before:** 1,439 s (pull request) and 1,476 s (push), medians of 20 and 19 runs. **After:** 606 to 739 s in four runs, about half. Four runs are not a median: a job's time moves by 60 to 100 s between runs on the same code, so the number to quote is the median of at least 20 runs of each event, which is still to be taken.
+- **The cache works and was the smaller lever.** The restore takes 14 s and saves 780 MB; `cargo test` compiled only the seven workspace crates, in 57.75 s. But `cargo test` fell from 499 to 445 s and the workspace lint from 38 to 21 s, about 70 s together. The rest of `cargo test` is running tests: the node agent's library has 934 tests that take about 305 s (of the 387 s of test runs) and the other test binaries together about 80 s. The plan's expectation that the 482 s were mostly dependency compiling was wrong; the first build of the plan measured the step, not its parts.
+- **On a full run the longest job is now `node-image`** (582 to 676 s on main) and `rust` (525 to 622 s) is next; both are over 9 minutes. The image build (257 s) and the cold `cargo build --release` of the node binaries (120 s) are the two parts, and the cache rule keeps the second cold on purpose.
+- **A change that skips the native jobs is bounded by `api-tests`** (233 to 355 s) and `edge-tests` (249 to 313 s), as 1.6 said; 12 of the last 40 commits of main were of that kind and 7 were documents only.
 
 ---
 
@@ -150,6 +164,8 @@ Every step maps to a measured cost above. Each step ends with the audit of 1.5 a
 - **`worker-build`** (`cargo install` in `edge-tests`, about 140 of the job's 303 s, 1.6) is not cached: it builds the kept Edge bytes, so the rule above decides it. It is not on the critical path of a full run (`rust` 587 s, `node-image` 461 s); it is for a pull request that skips the native jobs. A cache of the installed binary, keyed on `rustVersion` and `workerBuildVersion` and written only by main, is the next candidate, and the owner's rule (CI-2) says whether a binary that builds kept bytes may come from a cache.
 - **The kernel job is not cached, and cannot be by this step.** It compiles the agent's tests inside `docker build`, where a layer cache is dropped whenever a copied source file changes, so it would rebuild every dependency anyway; reusing compiled dependencies needs a different build (the test binary built on the runner against the cached `target/` and copied into the container, or a dependency layer). It is 239 s and not the longest job, so it is left until it is.
 
+**Result (1.7).** The cache works (restore 14 s, 780 MB) and saves about 70 s in `rust`; it is not the lever the plan expected, because most of `cargo test` is test execution, not compiling.
+
 **Acceptance.** After the first push to main saves the cache, `cargo test` and `cargo clippy` in a later pull request build only the workspace crates (visible in the step logs and in the audit); the cache stays well under the 10 GB budget (read `actions/cache/usage`); the `rust` job is shorter than before by the dependency build time. The pull request that adds the cache cannot show this, because it runs before main holds an entry.
 
 ### Step 3: the TypeScript tests (403 s)
@@ -197,9 +213,13 @@ Every step maps to a measured cost above. Each step ends with the audit of 1.5 a
 
 **Acceptance.** The measured saving in seconds per run, against the price per run, goes to the owner before any switch.
 
-### 3.1 After step 1: where the time goes next
+### 3.1 Where the time goes next (*measured*, 1.7)
 
-Once `check` is parallel, the longest job is `rust` (about 540 s: the toolchain, PostgreSQL and the 501 s of cargo); with step 2 it falls, and `node-image` (536 s) becomes the longest. Its two big costs are the image build (267 s, mostly package downloads and the image assembly; not split yet) and the cold release build (180 s, which stays clean by the rule of step 2). The audit after step 2 decides whether the image build is worth its own step; none is planned now, since the problem is not yet observed.
+On a full run `node-image` (582 to 676 s) and `rust` (525 to 622 s) are the longest jobs. Neither is shortened by a cache under the rule of step 2. What the measurements name as candidates, each to be taken only against a problem still seen after the median over 20 runs:
+
+- **`rust`:** the node agent's library tests are about 305 s of its `cargo test`, and the other test binaries about 80 s. Running the agent's library tests as a job of their own would cut `rust` by about two thirds, but a full run would still wait for `node-image`. A test inside the agent's 934 that dominates would be found with the per-test times (`cargo test -- --report-time` needs nightly; `cargo nextest` prints them) before anything is split.
+- **`node-image`:** the image build is 257 s and not split yet (package download against assembly); the cold release build is 120 s.
+- **`api-tests` and `edge-tests`:** 233 to 355 s and 249 to 313 s; the shard of step 3 and the cached `worker-build` of step 2 (decision CI-2) are for the pull requests that skip the native jobs.
 
 ---
 
