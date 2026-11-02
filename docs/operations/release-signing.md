@@ -106,8 +106,10 @@ key still does not protect is under "What is and is not protected".
   artifacts stay downloadable for 7 days) keeps such a release from being installable. Trusting the digests is trusting the workflow file on `main`,
   which is the next point.
 - **Who asks.** The job `sign-release` of `.github/workflows/ci.yml`. It `needs: [check, node-image]`,
-  so a commit whose tests failed (`check` runs `cargo test`, which includes the agent's verification
-  tests) or whose image did not build and boot is never signed; it runs only on a push to `main` of this
+  so a commit whose tests failed (`check` is the gate of the jobs that test the code: `static`,
+  `rust`, which runs `cargo test` and with it the agent's verification tests, `edge-tests`,
+  `api-tests`, `other-tests` and `kernel`; a push to `main` runs all of them, only a pull request may
+  leave some out, `scripts/ci/scope.ts`) or whose image did not build and boot is never signed; it runs only on a push to `main` of this
   repository (not of a fork), has `id-token: write` and holds no secret and no environment, downloads
   the artifact of the release that `node-image` built, and runs `scripts/operations/sign-release.ts
   sign`: it asks GitHub for an identity token for the signer's address (the repository variable

@@ -25,11 +25,11 @@
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.md",
-      "sha256": "1000cd33a8a5b2e93196183b80aca92a1e56972ffae0386728d7eeaa5040a5b3"
+      "sha256": "dd18dd12db8dee678739acd875537e609e77ba9f0c2a280c34016d71c5ff5dd2"
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.mmd",
-      "sha256": "44b2dfd0ede0244ce2d8a8244072ffed6832910b9f41c0c9cdc75a3d30c0644d"
+      "sha256": "a449fbde1db6fd32f8d03529905033b6848c6bbb55fb008ddd22ef6ff39254bf"
     },
     {
       "path": "docs/architecture/mermaider/d1-core.md",
@@ -49,10 +49,10 @@
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "ddae2ad8df68960c53e6f35d9beb08866df3f64f94510a0054317e966bf5e0c7"
+      "sha256": "80429dbfae8d359748ba91ef14b11d2e9f43c481614439008c5bb691524853b9"
     }
   ],
-  "fingerprint": "295357f358f30c1da3b6b1edfb98c79092b925136f9d9c862e3366d47e003f44",
+  "fingerprint": "4d791189e7a9913f4e61ac7e02fd4376a9cd34e1f31c5833507f25e055f90c40",
   "toolVersion": "0.1.1",
   "version": 1
 }

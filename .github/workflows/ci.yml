@@ -26,10 +26,44 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  check:
+  # The checks of the code are jobs that run at the same time, so a run takes as long as the slowest
+  # one. `changes` says which of them a pull request needs; a push to main, the commit that
+  # `sign-release` signs, always runs all of them. `check` is the gate that `sign-release` waits for:
+  # it passes only when every job the change needs has passed (scripts/ci/scope.ts).
+  changes:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || !(inputs.external_probe || inputs.advisories))
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      native: ${{ steps.scope.outputs.native }}
+      workers: ${{ steps.scope.outputs.workers }}
+    steps:
+      - name: Check out the revision and its merge parent
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Set up pnpm at the version in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
+      - name: Decide which jobs the change needs
+        id: scope
+        run: node scripts/ci/scope.ts scope >> "$GITHUB_OUTPUT"
+
+  static:
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -72,6 +106,110 @@ jobs:
           npm --prefix .local/tools/mermaider ci --ignore-scripts
           npm --prefix .local/tools/mermaider run build
           node .local/tools/mermaider/dist/cli.js check --repo .
+      - name: Check public plan privacy
+        run: node scripts/ci/plan-privacy.ts
+      - name: Lint
+        run: pnpm lint
+      - name: Check formatting
+        run: pnpm format:check
+      - name: Typecheck
+        run: |
+          pnpm typecheck
+          pnpm exec tsc -p scripts/ci/tsconfig.json
+          pnpm exec tsc -p scripts/operations/tsconfig.json
+
+  rust:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pnpm at the version in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
+      - name: Set up the pinned Rust toolchain
+        run: |
+          PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
+          PGCF_RUST_TARGETS=$(node -p 'require("./infra/platform/versions.lock.json").ciToolchain.rustTargets.join(",")')
+          rustup toolchain install "$PGCF_RUST_VERSION" --profile minimal \
+            --component rustfmt --component clippy --target "$PGCF_RUST_TARGETS"
+          node scripts/ci/toolchain.mjs check-rust
+      - name: Install the pinned PostgreSQL for the tests
+        run: bash scripts/ci/install-test-postgres.sh
+      # The cache holds what the tests and the lints below compile for their verdicts, never a byte that
+      # ships: `node-image` and the Rust Edge build compile without it. A pull request reads the cache
+      # of main and writes none; only a push to main saves one.
+      - name: Restore the compiled Rust dependencies
+        id: rust_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: pgcf-rust-verdicts-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'infra/platform/versions.lock.json') }}
+      - name: Check the Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Test the Rust workspace
+        run: cargo test --workspace --locked
+      - name: Lint the Rust workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Lint the Rust Edge Worker for WebAssembly
+        run: cargo clippy -p pgcf-edge-rust --target wasm32-unknown-unknown --locked -- -D warnings
+      - name: Save the compiled Rust dependencies
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.rust_cache.outputs.cache-primary-key }}
+
+  edge-tests:
+    needs: changes
+    if: needs.changes.outputs.workers == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pnpm at the version in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+          cache: pnpm
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
       - name: Set up the pinned Rust and Worker build tools
         run: |
           PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
@@ -108,57 +246,10 @@ jobs:
             appendFileSync(process.env.GITHUB_ENV, `${tool.environmentVariable}=${executable}\n`);
           }
           JS
-      - name: Check public plan privacy
-        run: node scripts/ci/plan-privacy.ts
-      - name: Lint
-        run: pnpm lint
-      - name: Check formatting
-        run: pnpm format:check
-      - name: Typecheck
-        run: |
-          pnpm typecheck
-          pnpm exec tsc -p scripts/ci/tsconfig.json
-          pnpm exec tsc -p scripts/operations/tsconfig.json
-      - name: Install the pinned PostgreSQL for native tests
-        env:
-          PGCF_TEST_POSTGRESQL_VERSION: 18.6-1.pgdg24.04+2
-          PGCF_PGDG_KEY_FINGERPRINT: B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
-        run: |
-          PGCF_PGDG_DIR="$RUNNER_TEMP/pgcf-pgdg"
-          mkdir -m 700 "$PGCF_PGDG_DIR"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --connect-timeout 15 --max-time 60 --output "$PGCF_PGDG_DIR/key.asc" \
-            https://www.postgresql.org/media/keys/ACCC4CF8.asc
-          test "$(gpg --show-keys --with-colons "$PGCF_PGDG_DIR/key.asc" | awk -F: '$1 == "fpr" { print $10; exit }')" = "$PGCF_PGDG_KEY_FINGERPRINT"
-          gpg --dearmor < "$PGCF_PGDG_DIR/key.asc" > "$PGCF_PGDG_DIR/key.gpg"
-          sudo install -m 644 "$PGCF_PGDG_DIR/key.gpg" /usr/share/keyrings/pgcf-pgdg.gpg
-          grep -rl 'apt.postgresql.org' /etc/apt/sources.list.d/ | xargs -r sudo rm -f
-          echo "deb [signed-by=/usr/share/keyrings/pgcf-pgdg.gpg] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgcf-pgdg.list > /dev/null
-          sudo install -d /etc/postgresql-common/createcluster.d
-          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/pgcf.conf > /dev/null
-          sudo apt-get update --quiet
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-            "postgresql-18=$PGCF_TEST_POSTGRESQL_VERSION" "postgresql-client-18=$PGCF_TEST_POSTGRESQL_VERSION"
-          test "$(dpkg-query --show --showformat='${Version}' postgresql-18)" = "$PGCF_TEST_POSTGRESQL_VERSION"
-          rm -rf "$PGCF_PGDG_DIR"
-          printf 'PGCF_TEST_POSTGRES_BINDIR=%s\n' /usr/lib/postgresql/18/bin >> "$GITHUB_ENV"
-      - name: Check the native runtime and Worker contracts
-        run: |
-          node packages/contracts/native/generate.ts --check
-          node packages/contracts/native/generate-node.ts --check
-          node packages/contracts/native/generate-power.ts --check
-          node packages/contracts/native/generate-measurements.ts --check
-          cargo fmt --all -- --check
-          cargo test --workspace --locked
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo clippy -p pgcf-edge-rust --target wasm32-unknown-unknown --locked -- -D warnings
-      - name: Build the Worker once for actual Workerd tests
-        run: pnpm -r --if-present build
-      - name: Test
-        run: |
-          pnpm test
-          node --test scripts/ci/*.test.ts scripts/operations/*.test.ts
+      - name: Build the Rust Edge Worker once for the Workerd test
+        run: pnpm --filter @pgcf/edge-rust build
+      - name: Test the Rust Edge Worker in Workerd
+        run: pnpm --filter @pgcf/edge-rust test
       - name: Bind the already-tested Rust Edge artifact
         run: |
           node --input-type=module <<'JS'
@@ -194,6 +285,106 @@ jobs:
           if-no-files-found: error
           retention-days: 90
           overwrite: false
+
+  api-tests:
+    needs: changes
+    if: needs.changes.outputs.workers == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pnpm at the version in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+          cache: pnpm
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test the API
+        run: pnpm --filter @pgcf/api test
+
+  other-tests:
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pnpm at the version in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+          cache: pnpm
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install the pinned PostgreSQL for the tests
+        run: bash scripts/ci/install-test-postgres.sh
+      - name: Check and test the image tooling and the installer
+        run: |
+          pnpm exec tsc -p infra/node-image/tsconfig.json
+          bash -n infra/node-image/builder/build.sh infra/node-image/builder/normalize-modes.sh infra/node-image/installer/install.sh infra/node-image/boot-test/guest.sh
+          node --test infra/node-image/*.test.ts infra/node-image/installer/*.test.ts
+      - name: Build the CLI
+        run: pnpm --filter @pgcf/cli build
+      - name: Test the contracts
+        run: pnpm --filter @pgcf/contracts test
+      - name: Test the Edge
+        run: pnpm --filter @pgcf/edge test
+      - name: Test the release signer
+        run: pnpm --filter @pgcf/release-signer test
+      - name: Test the CLI
+        run: pnpm --filter @pgcf/cli test
+      - name: Test the end-to-end package's local tests
+        run: pnpm --filter @pgcf/e2e test
+      - name: Test the CI and operations scripts
+        run: node --test scripts/ci/*.test.ts scripts/operations/*.test.ts
+
+  kernel:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pnpm at the version in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
       - name: Check the node agent against the actual Linux kernel
         run: |
           PGCF_RUST_BUILDER=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.testBuilderImage')
@@ -210,6 +401,34 @@ jobs:
             --cap-drop ALL --cap-add SYS_ADMIN \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
             "$PGCF_AGENT_TEST_IMAGE"
+
+  check:
+    needs: [changes, static, rust, edge-tests, api-tests, other-tests, kernel]
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pnpm at the version in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
+      - name: Fail unless every job the change needs has passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: node scripts/ci/scope.ts gate
 
   external_probe:
     if: github.event_name == 'workflow_dispatch' && inputs.external_probe && github.ref == 'refs/heads/main' && github.event.repository.private == false
@@ -257,7 +476,8 @@ jobs:
         run: rm -f "$RUNNER_TEMP/pgcf-node-external-probe.json"
 
   node-image:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || !(inputs.external_probe || inputs.advisories))
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -289,11 +509,6 @@ jobs:
         run: node scripts/ci/toolchain.mjs check
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Check and test the image tooling and the installer
-        run: |
-          pnpm exec tsc -p infra/node-image/tsconfig.json
-          bash -n infra/node-image/builder/build.sh infra/node-image/builder/normalize-modes.sh infra/node-image/installer/install.sh infra/node-image/boot-test/guest.sh
-          node --test infra/node-image/*.test.ts infra/node-image/installer/*.test.ts
       - name: Build the node binaries with the pinned Rust toolchain
         run: |
           PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
