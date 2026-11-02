@@ -16,7 +16,8 @@ curl --fail --silent --show-error --location --proto '=https' --proto-redir '=ht
 test "$(gpg --show-keys --with-colons "$PGCF_PGDG_DIR/key.asc" | awk -F: '$1 == "fpr" { print $10; exit }')" = "$PGCF_PGDG_KEY_FINGERPRINT"
 gpg --dearmor < "$PGCF_PGDG_DIR/key.asc" > "$PGCF_PGDG_DIR/key.gpg"
 sudo install -m 644 "$PGCF_PGDG_DIR/key.gpg" /usr/share/keyrings/pgcf-pgdg.gpg
-grep -rl 'apt.postgresql.org' /etc/apt/sources.list.d/ | xargs -r sudo rm -f
+# No match is the common case on a fresh runner: grep's status 1 must not end the script under pipefail.
+{ grep -rl 'apt.postgresql.org' /etc/apt/sources.list.d/ || true; } | xargs -r sudo rm -f
 echo "deb [signed-by=/usr/share/keyrings/pgcf-pgdg.gpg] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
   | sudo tee /etc/apt/sources.list.d/pgcf-pgdg.list > /dev/null
 sudo install -d /etc/postgresql-common/createcluster.d
