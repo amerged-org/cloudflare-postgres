@@ -1,6 +1,6 @@
 # Proposal: a faster CI
 
-**Status:** plan for the owner, 2026-11-01. Steps 1, 2 and 5 are built on the branch `ci-parallel` (below, "Built" in each step) and are measured only after they run on main; steps 3, 4 and 6 are not built. The owner pointed to a write-up on making a CI about 20 times faster ([Owen Gretzinger, "How I made our CI 20x faster", 2026-10-30](https://x.com/owengretzinger/status/2116291924219060319)). This document checks each of its levers against this repository's measured CI and orders the ones that apply. The status row is in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md), 11.2; completed steps and their measured numbers are recorded there, in 11.1, as they land.
+**Status:** plan for the owner, 2026-11-01. Steps 1, 2 and 5 are built on the branch `ci-parallel` (pull request 35, "Built" in each step); the first run on the pull request took 647 s (1.6), and the cache shows its effect only after main saves it; steps 3, 4 and 6 are not built. The owner pointed to a write-up on making a CI about 20 times faster ([Owen Gretzinger, "How I made our CI 20x faster", 2026-10-30](https://x.com/owengretzinger/status/2116291924219060319)). This document checks each of its levers against this repository's measured CI and orders the ones that apply. The status row is in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md), 11.2; completed steps and their measured numbers are recorded there, in 11.1, as they land.
 
 Each number carries its basis: *measured* (the GitHub Actions API, see section 1), *estimate* (not measured) or *target* (an acceptance threshold proposed here for the owner to confirm). Following AGENTS.md, the plan gives no effort or duration estimates for the work; each step names its scope and its acceptance instead.
 
@@ -65,6 +65,26 @@ Source: the jobs API of the last 50 runs of `ci.yml` on the current job layout (
 
 For each run, `gh api repos/<repo>/actions/runs/<id>/jobs`; per job the time from `created_at` to `started_at` is the queue, per step `completed_at` minus `started_at` is the step. Only successful jobs count. Every step below is re-measured the same way over at least 20 runs of each event, and the result is written to 11.1 of the ULTRA plan.
 
+### 1.6 First measurement of steps 1, 2 and 5 (*measured*, one pull request run)
+
+Run `41409201398` of the pull request that builds them (a change to `ci.yml`, so the scope ran everything). One run is not the median over 20 that the audit requires (1.5); it shows where the time went. The cache step ran but found no entry, because main holds none yet.
+
+| Job | Seconds | Longest steps |
+| --- | --- | --- |
+| `rust` | 587 | `cargo test --workspace` 482 (dependencies compiled from nothing), `cargo clippy` 33 and 21, PostgreSQL 17, toolchain 9 |
+| `node-image` | 461 | image build 257, node binaries 120, boot test 55 |
+| `api-tests` | 325 | the API's tests 293 |
+| `edge-tests` | 303 | `cargo install worker-build` and the toolchain 150, Worker build 47, Workerd test 70 |
+| `kernel` | 199 | the kernel test 183 |
+| `other-tests` | 126 | contracts 21, Edge 28, end-to-end package 12, scripts 11, PostgreSQL 11, install 11 |
+| `static` | 69 | typecheck 20, format 8 |
+| `changes`, `check` (gate) | 17, 18 | |
+
+- **The run took 647 s, against 1,439 s (median of pull requests before).** The longest job is `rust`, and 482 of its 587 s are the first `cargo test`, the part the cache is for.
+- **The 145 s "Rust and Worker tool setup" of 1.2 were almost all `cargo install worker-build`.** The pinned toolchain alone is 9 s in `rust`; the same step with `worker-build` is 150 s in `edge-tests`. That settles the split the plan left open.
+- **Two things show for the next steps.** For a pull request that skips the native jobs, the longest job is now `api-tests` (325 s), then `edge-tests` (303 s); the first needs shards (step 3), the second a cached `worker-build` (step 2, the decision named below).
+- **`changes` and the gate `check` cost 17 and 18 s** at the two ends of the critical path.
+
 ---
 
 ## 2. The levers of the write-up against this repository
@@ -127,7 +147,7 @@ Every step maps to a measured cost above. Each step ends with the audit of 1.5 a
 **Built** in the `rust` job only: `actions/cache/restore` of `~/.cargo/registry/index`, `~/.cargo/registry/cache`, `~/.cargo/git/db` and `target`, keyed on `Cargo.lock`, `rust-toolchain.toml` and `infra/platform/versions.lock.json` with no fallback key (a changed lock compiles once cold on main and is then cached; the cache cannot grow by restoring an old one and adding to it); `actions/cache/save` only on a push to `main` and only after a miss, so pull requests write no cache and the 10 GB budget holds. `CARGO_INCREMENTAL=0`, so the cache holds dependencies and not incremental state that one source change invalidates. The workspace crates are rebuilt every run (their files are new); the dependencies are not.
 
 - **No cache in `node-image`, `edge-tests` and `sign-release`.** `node-image` compiles the binaries that `sign-release` signs and `edge-tests` builds the Worker bytes that are kept; both compile from nothing, and `scripts/ci/ci-jobs.test.ts` fails if a cache step appears in either. `sign-release` restores no cache another job wrote, as the comment above that job states.
-- **`worker-build`** (`cargo install` in `edge-tests`) is not cached: it builds the kept Edge bytes, and the 145 s of tool setup are not yet split into `rustup` and `cargo install`. The first runs of the new jobs give that split; a cache of the installed binary is decided on it and on the rule above.
+- **`worker-build`** (`cargo install` in `edge-tests`, about 140 of the job's 303 s, 1.6) is not cached: it builds the kept Edge bytes, so the rule above decides it. It is not on the critical path of a full run (`rust` 587 s, `node-image` 461 s); it is for a pull request that skips the native jobs. A cache of the installed binary, keyed on `rustVersion` and `workerBuildVersion` and written only by main, is the next candidate, and the owner's rule (CI-2) says whether a binary that builds kept bytes may come from a cache.
 - **The kernel job is not cached, and cannot be by this step.** It compiles the agent's tests inside `docker build`, where a layer cache is dropped whenever a copied source file changes, so it would rebuild every dependency anyway; reusing compiled dependencies needs a different build (the test binary built on the runner against the cached `target/` and copied into the container, or a dependency layer). It is 239 s and not the longest job, so it is left until it is.
 
 **Acceptance.** After the first push to main saves the cache, `cargo test` and `cargo clippy` in a later pull request build only the workspace crates (visible in the step logs and in the audit); the cache stays well under the 10 GB budget (read `actions/cache/usage`); the `rust` job is shorter than before by the dependency build time. The pull request that adds the cache cannot show this, because it runs before main holds an entry.
