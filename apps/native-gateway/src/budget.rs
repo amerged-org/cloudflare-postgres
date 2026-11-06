@@ -8,19 +8,75 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
+/// How often the gateway says that more databases hold memory than its reserve covers.
+const REPORT_WINDOW: Duration = Duration::from_secs(60);
 #[derive(Default)]
 struct Used {
     total: usize,
+    /// The databases that hold memory, and how much.
     databases: HashMap<String, usize>,
+    /// Whether more databases hold memory than the reserve covers.
+    outgrown: bool,
+    reported: Option<Instant>,
+}
+impl Used {
+    /// The number of holders, when the reserve no longer covers the guaranteed share of every
+    /// database that holds memory and that has not been said for [`REPORT_WINDOW`].
+    fn outgrown(&mut self, covered: usize, now: Instant) -> Option<usize> {
+        let holders = self.databases.len();
+        if holders <= covered {
+            self.outgrown = false;
+            return None;
+        }
+        if std::mem::replace(&mut self.outgrown, true) {
+            return None;
+        }
+        if self
+            .reported
+            .is_some_and(|at| now.duration_since(at) < REPORT_WINDOW)
+        {
+            return None;
+        }
+        self.reported = Some(now);
+        Some(holders)
+    }
+}
+/// Why a configuration of the byte budgets cannot be served, naming the variable to change.
+pub fn check_bounds(
+    maximum: usize,
+    database_maximum: usize,
+    reserve: usize,
+    guaranteed: usize,
+) -> Result<(), String> {
+    if database_maximum > maximum {
+        return Err(format!(
+            "PGCF_GATEWAY_DATABASE_MEMORY_BYTES ({database_maximum}) must not exceed PGCF_GATEWAY_MEMORY_BYTES ({maximum})"
+        ));
+    }
+    if reserve >= maximum {
+        return Err(format!(
+            "PGCF_GATEWAY_MEMORY_BYTES ({maximum}) must be at least {} (one byte more than PGCF_GATEWAY_RESERVE_BYTES, {reserve}), or lower PGCF_GATEWAY_RESERVE_BYTES",
+            reserve + 1
+        ));
+    }
+    if guaranteed > database_maximum {
+        return Err(format!(
+            "PGCF_GATEWAY_GUARANTEED_BYTES ({guaranteed}) must not exceed PGCF_GATEWAY_DATABASE_MEMORY_BYTES ({database_maximum})"
+        ));
+    }
+    Ok(())
 }
 /// The gateway's accounted buffer memory. `maximum` is the node total; `reserve` of it is kept
 /// for databases that hold less than `guaranteed` bytes, so a database that holds more can never
-/// take it, and `database_maximum` bounds one database.
+/// take it, and `database_maximum` bounds one database. The reserve covers the guaranteed share
+/// of `reserve / guaranteed` databases that hold memory; beyond that a database within its share
+/// still draws on what is free, but can be refused when the shared part is full.
 pub struct MemoryBudget {
     maximum: usize,
     database_maximum: usize,
@@ -35,8 +91,10 @@ impl MemoryBudget {
         reserve: usize,
         guaranteed: usize,
     ) -> Arc<Self> {
-        assert!(maximum > 0 && database_maximum > 0 && database_maximum <= maximum);
-        assert!(reserve < maximum && guaranteed <= database_maximum);
+        assert!(maximum > 0 && database_maximum > 0);
+        if let Err(message) = check_bounds(maximum, database_maximum, reserve, guaranteed) {
+            panic!("{message}");
+        }
         Arc::new(Self {
             maximum,
             database_maximum,
@@ -44,6 +102,12 @@ impl MemoryBudget {
             guaranteed,
             used: Mutex::new(Used::default()),
         })
+    }
+    /// How many databases that hold memory the reserve covers at their guaranteed share.
+    fn covered(&self) -> usize {
+        self.reserve
+            .checked_div(self.guaranteed)
+            .unwrap_or(usize::MAX)
     }
     pub fn lease(self: &Arc<Self>, database: &str) -> Lease {
         Lease {
@@ -72,6 +136,9 @@ pub struct Lease {
 }
 impl Lease {
     pub fn grow(&mut self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
         let mut used = self.budget.used.lock().unwrap();
         let current = *used.databases.get(&self.database).unwrap_or(&0);
         // A database that stays within its guaranteed share may use all of the total; beyond it, a
@@ -90,6 +157,20 @@ impl Lease {
         used.total += bytes;
         *used.databases.entry(self.database.clone()).or_default() += bytes;
         self.bytes += bytes;
+        // One line when a database starts to hold memory that the reserve cannot cover with
+        // everyone's guaranteed share; nothing else changes.
+        let holders = if current == 0 {
+            used.outgrown(self.budget.covered(), Instant::now())
+        } else {
+            None
+        };
+        drop(used);
+        if let Some(holders) = holders {
+            println!(
+                "{}",
+                serde_json::json!({"event":"memory_reserve_outgrown","holders":holders,"guaranteed_bytes":self.budget.guaranteed,"reserve_bytes":self.budget.reserve})
+            );
+        }
         true
     }
     pub fn split(&mut self, bytes: usize) -> Self {
@@ -112,6 +193,7 @@ impl Lease {
         *current -= bytes;
         if *current == 0 {
             used.databases.remove(&self.database);
+            used.outgrown(self.budget.covered(), Instant::now());
         }
         self.bytes -= bytes;
     }
@@ -418,13 +500,15 @@ mod tests {
         assert_eq!(memory.used(), 0);
     }
     #[test]
-    fn two_databases_at_their_cap_leave_every_other_database_its_guaranteed_share() {
-        let memory = MemoryBudget::new(384 << 20, 96 << 20, 192 << 20, 3 << 20);
+    fn databases_filling_the_shared_part_leave_every_other_database_its_guaranteed_share() {
+        let memory = MemoryBudget::new(192 << 20, 96 << 20, 96 << 20, 3 << 20);
         let (mut a, mut b) = (memory.lease("a"), memory.lease("b"));
         while a.grow(1 << 20) {}
         while b.grow(1 << 20) {}
+        // The first fills the shared part; the second gets its guaranteed share out of the reserve
+        // and no more.
         assert_eq!(memory.database_used("a"), 96 << 20);
-        assert_eq!(memory.database_used("b"), 96 << 20);
+        assert_eq!(memory.database_used("b"), 3 << 20);
         // A session and a masked frame of a third database are within its guaranteed share.
         let mut c = memory.lease("c");
         assert!(c.grow(crate::transport::SESSION_MEMORY_BYTES));
@@ -442,6 +526,45 @@ mod tests {
             !d.grow(1),
             "past the guaranteed share the reserve stays closed"
         );
+    }
+    #[test]
+    fn the_reserve_is_checked_against_the_configuration_and_reported_once_its_holders_outgrow_it() {
+        // The old default total stays valid; a total at or below the reserve names its variable
+        // and the smallest value.
+        assert!(check_bounds(192 << 20, 96 << 20, 96 << 20, 3 << 20).is_ok());
+        let message = check_bounds(96 << 20, 96 << 20, 96 << 20, 3 << 20).unwrap_err();
+        assert!(message.contains("PGCF_GATEWAY_MEMORY_BYTES (100663296)"));
+        assert!(message.contains("at least 100663297"));
+        assert!(check_bounds(100, 200, 10, 5).is_err_and(|m| m.contains("DATABASE_MEMORY")));
+        assert!(check_bounds(100, 50, 10, 60).is_err_and(|m| m.contains("GUARANTEED")));
+        // Three databases hold memory where the reserve covers two guaranteed shares.
+        let memory = MemoryBudget::new(1000, 500, 20, 10);
+        let mut leases: Vec<Lease> = ["a", "b", "c"]
+            .map(|database| {
+                let mut lease = memory.lease(database);
+                assert!(lease.grow(1));
+                lease
+            })
+            .into();
+        assert!(memory.used.lock().unwrap().outgrown);
+        drop(leases.pop());
+        assert!(!memory.used.lock().unwrap().outgrown);
+        // It is said once for a stretch above the reserve and at most once in the window.
+        let (mut used, start) = (Used::default(), Instant::now());
+        for database in ["a", "b", "c"] {
+            used.databases.insert(database.into(), 1);
+        }
+        assert_eq!(used.outgrown(2, start), Some(3));
+        assert_eq!(used.outgrown(2, start), None);
+        used.databases.remove("c");
+        assert_eq!(used.outgrown(2, start), None);
+        used.databases.insert("c".into(), 1);
+        assert_eq!(used.outgrown(2, start + REPORT_WINDOW / 2), None);
+        assert_eq!(used.outgrown(2, start + REPORT_WINDOW), None);
+        used.databases.remove("c");
+        used.outgrown(2, start + REPORT_WINDOW);
+        used.databases.insert("c".into(), 1);
+        assert_eq!(used.outgrown(2, start + REPORT_WINDOW), Some(3));
     }
     #[test]
     fn startup_fragments_cannot_evade_total_bound_and_relay_accepts_large_advertisement() {

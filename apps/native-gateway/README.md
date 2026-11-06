@@ -64,19 +64,30 @@ archive socket.
   charges remain owned until forwarding or closure. Startup buffering is bounded separately;
   ordinary messages support the existing 32 MiB limit and outbound frames are at most 64 KiB.
   Authenticated activity history preserves unknown/partial values and never invents zero usage.
-- The accounted buffer memory is 384 MiB in all and at most 96 MiB for one database, of which 192
-  MiB is a reserve. A database may hold its guaranteed share (3 MiB: twenty 144-KiB sessions) from
-  the whole budget; beyond that share it competes only for what the reserve leaves. So databases
-  that fill the shared 192 MiB, for example with HTTP SQL answers that PostgreSQL has not finished
-  (an answer's buffer is held until PostgreSQL ends the statement), cannot take a neighbour's
-  sessions or frames from it. A neighbour's answer above its guaranteed share is still refused
-  while the shared part is full: an HTTP SQL request answers `08007` (its statements were sent, so
-  the outcome is unknown) with the outcome `memory_capacity`, a WebSocket upgrade 503
-  `memory_capacity` (429 when the database itself is at its limit). The reserve has to cover every
-  awake database's guaranteed share and the held wake connections (144 KiB each, at most 512),
-  about 185 MiB for 37 awake databases; a node with more awake databases needs
-  `PGCF_GATEWAY_RESERVE_BYTES` raised. The budgets are accounted bytes, not a limit on the
-  process's memory.
+- The accounted buffer memory is 192 MiB in all and at most 96 MiB for one database. 96 MiB of the
+  total is a reserve. A database that stays within its guaranteed share (3 MiB: twenty 144-KiB
+  sessions) may draw on the whole budget; beyond that share it competes only for the other 96 MiB.
+  So databases that fill the shared part, for example with HTTP SQL answers that PostgreSQL has
+  not finished (an answer's buffer is held until PostgreSQL ends the statement), cannot take a
+  neighbour's guaranteed share. A neighbour's answer above its share is still refused while the
+  shared part is full: an HTTP SQL request answers `08007` (its statements were sent, so the
+  outcome is unknown) with the outcome `memory_capacity`, a WebSocket upgrade 503
+  `memory_capacity` (429 when the database itself is at its limit). A refusal does not stall: a
+  frame is charged twice its length plus 256 bytes and a refused charge closes the live
+  connection, so a database that holds its 3 MiB share with many sessions (twenty use 2.8 MiB)
+  can have a connection closed by its next large frame while the shared part is full.
+- The guarantee holds while at most 32 databases hold memory at once (the reserve divided by the
+  share, 96 MiB / 3 MiB). Beyond that it degrades gracefully: a database at its share still
+  draws on whatever is free, but can be refused when the shared part is full. Nothing else
+  limits the number of holders, so the gateway logs `memory_reserve_outgrown` (`holders`,
+  `guaranteed_bytes`, `reserve_bytes`; once per stretch above 32 and at most once a minute)
+  whenever the shares of the databases that hold memory add up to more than the reserve. Under
+  the `reserved` memory rule a 12 GB node holds about 37 awake databases of 256 MiB, which is
+  more than 32: where that rule is deployed, raise `PGCF_GATEWAY_RESERVE_BYTES` (and
+  `PGCF_GATEWAY_MEMORY_BYTES` above it, or the gateway refuses to start naming both). The
+  default rule, `measured`, does not cap the number of awake databases at all, so there the
+  count of holders is limited only by the node's available memory beyond its floor. The budgets
+  are accounted bytes, not a limit on the process's memory.
 - There is no PostgreSQL write retry, credential replay or query replay after transport handoff.
 
 ## Restart and drain

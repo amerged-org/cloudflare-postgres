@@ -397,9 +397,9 @@ impl Fixture {
                 active: "test".into(),
                 keys: HashMap::from([("test".into(), vec![7; 32])]),
             },
-            maximum_memory: 384 * 1024 * 1024,
+            maximum_memory: 192 * 1024 * 1024,
             database_memory: 96 * 1024 * 1024,
-            reserve_memory: 192 * 1024 * 1024,
+            reserve_memory: 96 * 1024 * 1024,
             guaranteed_memory: 3 * 1024 * 1024,
         }));
         gateway.table.write().await.replace(table(&unit));

@@ -511,7 +511,7 @@ impl Fixture {
     }
     /// The database `mode` at generation 1; a sleeping one has no unit.
     async fn with(mode: Mode) -> Self {
-        Self::sized(mode, [384 << 20, 96 << 20, 192 << 20, 3 << 20]).await
+        Self::sized(mode, [192 << 20, 96 << 20, 96 << 20, 3 << 20]).await
     }
     /// The gateway's byte budgets: the total, one database's, the reserve and the guaranteed share.
     async fn sized(mode: Mode, memory: [usize; 4]) -> Self {
@@ -953,7 +953,7 @@ async fn stall_until_refused(
     loop {
         *ids += 1;
         let route = route_in(database, *ids, 1, ROUTE_REVISION);
-        let request = body(PASSWORD, &[("stall", json!(["16384"]))], None).to_string();
+        let request = body(PASSWORD, &[("stall", json!(["163840"]))], None).to_string();
         let (port, before) = (fixture.port, fixture.journal.count("stalled"));
         let mut task = tokio::spawn(async move { post(port, &route, request.as_bytes()).await });
         timeout(Duration::from_secs(5), async {
@@ -966,7 +966,13 @@ async fn stall_until_refused(
         // Time for the gateway to take the row in, which it may refuse.
         match timeout(Duration::from_millis(25), &mut task).await {
             Ok(refused) => {
-                assert_eq!(refused.unwrap().0, 400);
+                // The session was there; the answer's memory was not, and the statement was sent.
+                let (status, answer) = refused.unwrap();
+                assert_eq!(
+                    (status, &answer["code"]),
+                    (400, &json!("08007")),
+                    "{answer}"
+                );
                 return held;
             }
             Err(_) => held.push(task),
@@ -975,9 +981,11 @@ async fn stall_until_refused(
 }
 #[tokio::test]
 async fn two_stalled_databases_leave_another_database_its_sessions() {
-    // Two databases hold answers that PostgreSQL never finishes, until the gateway's bytes are
-    // spent: each answer is a row of 16 KiB in a buffer of twice that, beside 144 KiB of session.
-    let fixture = Fixture::sized(Mode::Running, [4 << 20, 2 << 20, 3 << 19, 1 << 20]).await;
+    // Two databases hold answers that PostgreSQL never finishes until the shared part is spent:
+    // each is a row of 160 KiB in a buffer of twice that, beside 144 KiB of session. The budgets
+    // are the defaults in proportion: the database cap and the reserve are half of the total, and
+    // the guaranteed share is 1 MiB.
+    let fixture = Fixture::sized(Mode::Running, [4 << 20, 2 << 20, 2 << 20, 1 << 20]).await;
     let (second, third) = ("bbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccc");
     fixture.gateway.table.write().await.replace(
         [DATABASE, second, third]
@@ -987,7 +995,7 @@ async fn two_stalled_databases_leave_another_database_its_sessions() {
     let mut ids = 100;
     let mut held = stall_until_refused(&fixture, DATABASE, &mut ids).await;
     held.extend(stall_until_refused(&fixture, second, &mut ids).await);
-    assert!(held.len() > 10, "{} stalled", held.len());
+    assert!(held.len() > 3, "{} stalled", held.len());
     // The third database still gets a session and an answer of 128 KiB (its guaranteed share
     // is 1 MiB), and nobody's live request was cut for it.
     let wide = "c".repeat(128 * 1024);
