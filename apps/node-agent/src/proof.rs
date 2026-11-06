@@ -223,8 +223,11 @@ fn now_ms() -> i64 {
 
 /// Step 8 and the record of step 9, from what the stopped data directory and the archive show.
 fn verify_stopped(proof: &Proof, running: &Running) -> Result<ProvenSleepRecord, &'static str> {
-    if proof.data().join("postmaster.pid").exists() {
-        return Err("postmaster_pid");
+    // Anything at the path but nothing is a pid file: `exists` follows a link, and a link to
+    // nowhere is a file the database's user put there.
+    match std::fs::symlink_metadata(proof.data().join("postmaster.pid")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err("postmaster_pid"),
     }
     let bytes = read_control(&proof.volume).map_err(|_| "control_unreadable")?;
     let file = parse_control_file(&bytes)?;
@@ -1015,6 +1018,14 @@ mod tests {
             .unwrap();
             // The postmaster's pid file is still there.
             std::fs::write(volume.root.join("data/postmaster.pid"), "1\n").unwrap();
+            assert_eq!(check(), Err("postmaster_pid"));
+            // A link in its place is a file the user put there, whether or not it leads anywhere.
+            std::fs::remove_file(volume.root.join("data/postmaster.pid")).unwrap();
+            std::os::unix::fs::symlink(
+                volume.root.join("nowhere"),
+                volume.root.join("data/postmaster.pid"),
+            )
+            .unwrap();
             assert_eq!(check(), Err("postmaster_pid"));
         }
 

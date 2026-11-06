@@ -9,7 +9,7 @@
 //! wrapper, so it is called as a system call). It looks the pages up and reads nothing.
 use std::{
     fs::{DirEntry, File, OpenOptions},
-    io,
+    io::{self, Read},
     os::unix::fs::OpenOptionsExt,
     path::Path,
 };
@@ -86,6 +86,17 @@ pub(crate) fn open(path: &Path) -> io::Result<File> {
     } else {
         Err(io::ErrorKind::InvalidInput.into())
     }
+}
+
+/// The bytes of a small file of the data directory, opened as `open` does: an error for a file
+/// longer than `limit`, of which no more than one byte past it is read.
+pub(crate) fn read_small(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(bytes)
 }
 
 /// `cachestat(file, {offset, length}, &status, 0)`: the pages of a range of the file that the page

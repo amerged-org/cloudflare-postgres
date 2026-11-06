@@ -205,7 +205,10 @@ which takes one order, from root. Every start takes one path: the admission perm
 3. **Order** (`exec`): sent only after all of that succeeded, because an idle slot's memory ceiling
    is below `shared_buffers`. A failure before the order stops the slot, and the database stays
    asleep with its proof: no PostgreSQL ran.
-4. **Ready**: an `inotify` watch on `postmaster.pid` and the slot's pidfd, never a poll.
+4. **Ready**: an `inotify` watch on `postmaster.pid` and the slot's pidfd, never a poll. The
+   database's user can replace `data` and `postmaster.pid`, so the agent reads it as root only as
+   a regular file of 4 KiB at most, below a `data` that is no link (`units/ready.rs`, `cache.rs`),
+   and a pipe, a device or a link there is `postmaster_pid_unreadable`, never a wait.
 
 The wake's phases are `slot` (take or build), `bind` (properties, mounts, order) and `start`
 (order to ready), and its detail says `slot_from` (`pool` or `demand`), `slot_wait_us`, `bind_us`
