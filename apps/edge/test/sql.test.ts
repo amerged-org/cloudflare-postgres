@@ -100,6 +100,51 @@ async function post(
   return response;
 }
 
+/** A request body that counts how often it was read and whether it was cancelled. */
+function watched(next: () => Uint8Array | null) {
+  const state = { pulled: 0, cancelled: false };
+  const body = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        state.pulled++;
+        const chunk = next();
+        if (chunk === null) controller.close();
+        else controller.enqueue(chunk);
+      },
+      cancel() {
+        state.cancelled = true;
+      },
+    },
+    // No read ahead: only the handler's own read pulls.
+    { highWaterMark: 0 },
+  );
+  return { body, state };
+}
+
+async function postStream(
+  bindings: Env,
+  body: ReadableStream<Uint8Array>,
+  headers: Record<string, string> = {},
+): Promise<Response> {
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(
+    new Request(`${origin}/sql`, {
+      method: "POST",
+      headers: {
+        "CF-Connecting-IP": [192, 0, 2, 1].join("."),
+        ...neonHeaders(),
+        ...headers,
+      },
+      body,
+      duplex: "half",
+    } as RequestInit),
+    bindings,
+    ctx,
+  );
+  await waitOnExecutionContext(ctx);
+  return response;
+}
+
 async function refusal(response: Response): Promise<string> {
   expect(response.status).toBe(400);
   const body = await response.json<{ code: string; message: string }>();
@@ -246,6 +291,7 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     const bindings = admitting(awake());
     const upload = async (chunks: string[]) => {
       const encoder = new TextEncoder();
+      let sent = 0;
       const ctx = createExecutionContext();
       const response = await worker.fetch(
         new Request(`${origin}/sql`, {
@@ -255,13 +301,12 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
             ...neonHeaders(),
           },
           body: new ReadableStream({
-            async start(controller) {
-              for (const [index, chunk] of chunks.entries()) {
-                if (index > 0)
-                  await new Promise((done) => setTimeout(done, 300));
-                controller.enqueue(encoder.encode(chunk));
-              }
-              controller.close();
+            // Each pause after the first chunk starts when the Edge has taken the chunk before
+            // it, so that the Edge's own work ahead of the read (its limiters) is not part of it.
+            async pull(controller) {
+              if (sent === chunks.length) return controller.close();
+              if (sent > 0) await new Promise((done) => setTimeout(done, 300));
+              controller.enqueue(encoder.encode(chunks[sent++]));
             },
           }),
           duplex: "half",
@@ -520,6 +565,77 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     expect(perDatabase).toHaveBeenCalledExactlyOnceWith({
       key: JSON.stringify(["sql", database]),
     });
+  });
+
+  it("refuses a limited client's body at the limiter, before anything reads, parses or validates it", async () => {
+    const limited = { limit: async () => ({ success: false }) } as RateLimit;
+    const admission = vi.fn(async () => awake());
+    const bindings = admitting(admission, { CONNECTION_RATE_LIMITER: limited });
+    const encoder = new TextEncoder();
+    const once =
+      (...chunks: Uint8Array[]) =>
+      () =>
+        chunks.shift() ?? null;
+    const uploads: [Uint8Array[], Record<string, string>][] = [
+      // Malformed JSON, invalid UTF-8, a body past the cap, and one that declares it.
+      [[encoder.encode('{"queries":'), encoder.encode("7}")], {}],
+      [[new Uint8Array([0xff, 0xfe])], {}],
+      [[new Uint8Array(MAX_SQL_REQUEST_BYTES + 1)], {}],
+      [
+        [new Uint8Array(1)],
+        { "Content-Length": String(MAX_SQL_REQUEST_BYTES + 1) },
+      ],
+    ];
+    for (const [chunks, headers] of uploads) {
+      const upload = watched(once(...chunks));
+      const response = await postStream(bindings, upload.body, headers);
+      // The limiter's answer, not the parser's (08P01) or the cap's (54000)...
+      expect(await refusal(response)).toBe("53300");
+      // ...and the Edge never took a byte of the body, nor reached the Actor or the gateway.
+      expect(upload.state.pulled).toBe(0);
+      const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+      expect(log).toMatchObject({ event: "sql_admission", outcome: "53300" });
+      expect(log.body_ms).toBeUndefined();
+      expect(log.statements).toBeUndefined();
+    }
+    expect(admission).not.toHaveBeenCalled();
+    expect(await forwarded()).toHaveLength(0);
+  });
+
+  it("counts a body that turns out malformed against the limiters once, and refuses it before the Actor", async () => {
+    const connection = vi.fn(async () => ({ success: true }));
+    const perDatabase = vi.fn(async () => ({ success: true }));
+    const admission = vi.fn(async () => awake());
+    const response = await post(
+      admitting(admission, {
+        CONNECTION_RATE_LIMITER: { limit: connection } as unknown as RateLimit,
+        DATABASE_CONNECTION_RATE_LIMITER: {
+          limit: perDatabase,
+        } as unknown as RateLimit,
+      }),
+      { query: 1 },
+    );
+    expect(await refusal(response)).toBe("08P01");
+    expect(connection).toHaveBeenCalledExactlyOnceWith({
+      key: JSON.stringify(["sql", database, "app", "ipv4:192.0.2.1"]),
+    });
+    expect(perDatabase).toHaveBeenCalledExactlyOnceWith({
+      key: JSON.stringify(["sql", database]),
+    });
+    expect(admission).not.toHaveBeenCalled();
+    expect(await forwarded()).toHaveLength(0);
+  });
+
+  it("aborts a chunked body at the size cap instead of buffering it", async () => {
+    const mebibyte = new Uint8Array(1024 * 1024);
+    // A stream that never ends: only the cap stops the read.
+    const upload = watched(() => mebibyte);
+    const response = await postStream(admitting(awake()), upload.body);
+    expect(await refusal(response)).toBe("54000");
+    expect(upload.state.cancelled).toBe(true);
+    expect(upload.state.pulled).toBe(
+      MAX_SQL_REQUEST_BYTES / mebibyte.length + 1,
+    );
   });
 
   it("a caller without CF-Connecting-IP takes the binding limiter's own HTTP bucket, never a public one", async () => {
