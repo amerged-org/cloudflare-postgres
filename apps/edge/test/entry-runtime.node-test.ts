@@ -57,6 +57,11 @@ test("the actual pg default SCRAM client receives wrong-password failure from an
           migrations: [{ tag: "v1", new_sqlite_classes: ["DatabaseActor"] }],
           ratelimits: [
             {
+              name: "SOURCE_RATE_LIMITER",
+              namespace_id: "5",
+              simple: { limit: 1000, period: 60 },
+            },
+            {
               name: "CONNECTION_RATE_LIMITER",
               namespace_id: "1",
               simple: { limit: 1000, period: 60 },

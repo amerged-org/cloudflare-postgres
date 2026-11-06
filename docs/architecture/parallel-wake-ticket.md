@@ -17,7 +17,7 @@
 ### 1.1 The serial path today (code on main `c46d838c`)
 
 1. The client opens `GET /v2?database=<id>&user=<role>` on the Edge (`apps/edge/src/index.ts`).
-2. The Edge first counts the source network in `SOURCE_RATE_LIMITER`, before any DatabaseActor is got; it then runs the per-database and per-role rate limiters and `DatabaseActor.admitWake` together and awaits both (`apps/edge/src/admission.ts`, `admitRoute`). The Edge knows nothing about the database before the actor answers: not its region, its node, its gateway URL, its generation or whether it sleeps.
+2. The Edge runs the rate limiters and `DatabaseActor.admitWake` together and awaits both (`apps/edge/src/admission.ts`, `admitRoute`). The Edge knows nothing about the database before the actor answers: not its region, its node, its gateway URL, its generation or whether it sleeps.
 3. The actor answers from its own SQLite state (`apps/api/src/database-actor.ts`, `#admitWake`):
    - for an awake database, the verified target (generation, route revision, unit invocation ID): the Edge signs route **v6**;
    - for an idle sleeper, a wake ticket: a fresh random operation (`newOperationId()`), generation + 1, route revision and role revision hash. The actor stores it, so every connect of the same wake gets the same ticket. The Edge signs route **v5**. The D1 claim of the ticket runs after the answer, in the actor's `waitUntil`;
