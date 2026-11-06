@@ -931,7 +931,8 @@ async fn authenticate(
     Err(protocol())
 }
 /// Writes to PostgreSQL only while the agent's table still admits new work for the session's
-/// database on its writer, holding the table for the bounded write.
+/// database on its writer; the table is not held while the write waits for PostgreSQL
+/// (`Gateway::write_admitted`).
 async fn write_guarded(
     gateway: &Gateway,
     backend: &mut Backend,
