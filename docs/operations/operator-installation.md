@@ -990,9 +990,11 @@ The deployed Edge Worker is the TypeScript `apps/edge`; the management API and D
 in TypeScript. Start the private deployment configuration from `apps/edge/wrangler.example.jsonc`
 and preserve the existing Worker name, hostname, DatabaseActor binding, rate-limit namespaces,
 gateway service bindings (if a region uses one) and `ROUTE_MASTER_KEYS` secret.
-The example also sets `minify: true`, a `BINDING_CONNECTION_RATE_LIMITER` rate limit with a
-namespace of its own for same-account Workers on a service binding (without it every such caller
-is refused with `53300` "connection admission unavailable"), and `DATABASE_ACTOR_LOCATION_HINT`,
+The example also sets `minify: true`, a `SOURCE_RATE_LIMITER` rate limit with a namespace of its
+own that counts every route of one source network (600 per 60 s, a product default to adjust), a
+`BINDING_CONNECTION_RATE_LIMITER` rate limit with a namespace of its own for same-account Workers
+on a service binding (without it every such caller is refused with `53300` "connection admission
+unavailable"), and `DATABASE_ACTOR_LOCATION_HINT`,
 which must equal the API Worker's value; the hint places only DatabaseActor objects created after
 it is set.
 
