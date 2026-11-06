@@ -193,8 +193,9 @@ pub async fn run<S: Steps>(proof: &Proof, steps: &S) -> Outcome {
 
 /// `pg_control` of a database whose volume is mounted at `volume`. The database's user can
 /// replace what is below its mount point, and the agent reads as root: a directory on the way
-/// that is a link is refused, and the file is opened as `cache::open` does (no link, no pipe, no
-/// device) and read only up to the block.
+/// that is a link is refused (checked before the open, not pinned, see `cache::open`; nobody runs
+/// as the database's user while this reads), and the file is opened as `cache::open` does (no
+/// link, no pipe, no device) and read only up to the block.
 pub fn read_control(volume: &Path) -> std::io::Result<Vec<u8>> {
     let refuse = |path: &Path| -> std::io::Result<()> {
         if std::fs::symlink_metadata(path)?.file_type().is_symlink() {

@@ -207,8 +207,14 @@ which takes one order, from root. Every start takes one path: the admission perm
    asleep with its proof: no PostgreSQL ran.
 4. **Ready**: an `inotify` watch on `postmaster.pid` and the slot's pidfd, never a poll. The
    database's user can replace `data` and `postmaster.pid`, so the agent reads it as root only as
-   a regular file of 4 KiB at most, below a `data` that is no link (`units/ready.rs`, `cache.rs`),
-   and a pipe, a device or a link there is `postmaster_pid_unreadable`, never a wait.
+   a regular file of 4 KiB at most, after checking that `data` is no link (`units/ready.rs`,
+   `cache.rs`), and a pipe, a device or a link there is `postmaster_pid_unreadable`, never a wait.
+   The check is not a guarantee: a user who swaps `data` for a link between the check and the open
+   makes the agent read another path, which is harmless because the name is fixed, only a regular
+   file of at most 4 KiB is read, and the pid in it must be the unit's own main pid. A guarantee
+   would open the volume's directory once with `O_DIRECTORY | O_NOFOLLOW` (for `facts`,
+   `/proc/<pid>/root`) and resolve the rest with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`
+   (Linux 5.6).
 
 The wake's phases are `slot` (take or build), `bind` (properties, mounts, order) and `start`
 (order to ready), and its detail says `slot_from` (`pool` or `demand`), `slot_wait_us`, `bind_us`
