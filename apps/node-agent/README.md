@@ -813,3 +813,59 @@ disk that is slow to flush (its header says how to run it); the numbers it gave 
 
 The contract with Cloudflare is `packages/contracts/src/node-link.ts`. `node_link.rs` reads its
 generated JSON Schemas, and conformance tests hold the agent and the API to the same vectors.
+
+## Complete cold snapshots and R2-only storage
+
+`cold_storage_v2` captures a complete, cleanly stopped PostgreSQL 18 data directory, including
+`pg_wal` and UNLOGGED relation files. Barman remains the ordinary backup and PITR mechanism;
+Barman archive recovery is never used to rehydrate a cold snapshot, because it would reset
+UNLOGGED relations. Both scratch verification and the serving restore retain the snapshot's
+system identifier and timeline. Ordinary PostgreSQL crash recovery and PITR keep their normal
+UNLOGGED semantics.
+
+A `cold_snapshot_captures` task holds the source's flow and data-directory lock, checks the
+current proven sleep and stopped unit, and inventories every regular file and directory. A
+complete source-produced manifest binds each file's path, packed offset, length and SHA-256 and
+each global chunk's length and SHA-256. The source declares that immutable manifest before
+uploading chunks, rechecks the source, and seals only the complete set. Version one uses
+uncompressed four-MiB chunks and a manifest of at most four MiB, with at most 16,384 files, 4,096
+directories and 16,384 chunks (64 GiB of file contents). Unsupported layouts or limits leave the
+original database local. Symlinks, hard links, special files, online-backup labels and recovery
+signals are refused.
+
+Snapshot objects live outside the Barman credential namespace and move through the authenticated
+node API. Source and target nodes receive no general R2 snapshot credential. Uploads are immutable
+and operation scoped; a download is authorized only for its assigned verification or restore.
+Capture and transfer share the existing background big-job budget. Bounded file operations yield
+between chunks; no detached writer survives cancellation.
+
+An `archive_verifications` task extracts the exact manifest into an operation-owned scratch
+account, thin volume and private socket. Every expected chunk and complete file, the exact file
+namespace, and the clean control identity/checkpoint are verified before PostgreSQL starts.
+The scratch runtime never enters the served table, accepts a customer route, applies roles or
+dispatches an outbox, and its archiving is disabled. Configuration and `postgresql.auto.conf` are
+replaced only after the snapshot's full verification. The receipt binds the manifest hash and
+actual pre-start control facts; success also proves removal of the scratch runtime, volume and
+account. Only Cloudflare's subsequent exact-generation `superseded` order removes the source.
+
+Private journals precede resource creation and preserve receipts until Cloudflare acknowledges
+them. Completed-operation markers and explicit capture/verification cancellation tombstones
+prevent a delayed old page from recreating work after its pin has been released. Unknown cleanup
+blocks the next scratch runtime. Physical usage and admitted memory include scratch verification;
+`verification_runtime_ids` distinguishes it from customer databases in node samples.
+
+The same-ID `rehydrate` origin downloads the complete snapshot into a fresh storage generation,
+verifies all files before startup, applies current roles while preserving outbox contents, and
+completes the new Barman backup before reporting staged readiness. Copied archive-completion
+markers belong to the old prefix: the target rearchives required WAL and timeline history into
+its new prefix. A durable start intent prevents an interrupted attempt from rewinding that same
+prefix. Once PostgreSQL may have started, an uncertain unpublished attempt is retired and retried
+at a new storage generation.
+
+Cloudflare activates the verified target at a higher generation with no origin and
+`cold_snapshot_pending: true`. The node persists its serving intent before publishing readiness;
+only a matching serving-ready observation releases the waiting request. A fresh pending-false
+page records the committed handoff. That latch prevents stale pending pages or old origins from
+rewinding data that may already have been served. Pending targets stay awake through the
+handshake. Agent or PostgreSQL failures before authoritative completion follow the fenced retry
+path; completed databases retain normal PostgreSQL recovery behavior.

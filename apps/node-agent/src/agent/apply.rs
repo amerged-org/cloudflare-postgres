@@ -5,7 +5,7 @@
 //! desired state stops or removes what runs (plan 3.3, invariant 7): a page that does not name a
 //! database never does.
 use super::{
-    Core, Db, Desired, Entry, Phase, Policy, Reconcile, now_ms,
+    Core, Db, Desired, Entry, Origin, Phase, Policy, Reconcile, now_ms,
     power::{Slept, Why, writer_of},
 };
 use crate::{
@@ -43,6 +43,8 @@ pub(crate) enum Step {
     Nothing,
     /// Build the storage generation the entry's origin names.
     Build,
+    /// A higher-generation, no-origin activation grant after the staged snapshot was verified.
+    ActivateCold,
     Delete,
     /// The page suspends a database that runs.
     Suspend,
@@ -73,12 +75,48 @@ pub(crate) fn plan(f: &Facts) -> Step {
             Step::Delete
         };
     }
+    if entry.cold_snapshot_pending
+        && matches!(entry.origin, Some(Origin::Rehydrate(_)))
+        && !matches!(
+            f.phase,
+            Some(Phase::Building | Phase::Starting | Phase::Quiesce)
+        )
+        && f.state.is_some_and(|state| {
+            state.storage_generation == entry.storage_generation && state.cold_snapshot_start_intent
+        })
+        && (f.phase.is_none() || !f.unit_awake)
+    {
+        return Step::Fail("cold_snapshot_restart_required");
+    }
+    if entry.cold_snapshot_pending && entry.origin.is_none() {
+        if matches!(
+            f.phase,
+            Some(Phase::Building | Phase::Starting | Phase::Quiesce)
+        ) {
+            return Step::Nothing;
+        }
+        let granted = f.state.is_some_and(|state| {
+            state.storage_generation == entry.storage_generation && state.cold_snapshot_serving
+        });
+        return if !granted || f.phase.is_none() || !f.unit_awake {
+            Step::ActivateCold
+        } else {
+            Step::Nothing
+        };
+    }
     // The generation of the entry was built, with its first backup: from here a missing volume is
     // an error and never a fresh build.
     let built = f
         .state
         .is_some_and(|state| state.built && state.storage_generation == entry.storage_generation);
-    let build = !built && entry.origin.is_some();
+    let unconfirmed_cold = matches!(entry.origin, Some(Origin::Rehydrate(_)))
+        && f.state.is_none_or(|state| {
+            state.storage_generation != entry.storage_generation || !state.cold_snapshot_serving
+        });
+    // A process restart or a target PostgreSQL crash before Cloudflare cutover must recover the
+    // original clean snapshot, rather than replay WAL and lose its UNLOGGED main forks.
+    let build = (!built && entry.origin.is_some())
+        || (unconfirmed_cold && (f.phase.is_none() || !f.unit_awake));
     match f.phase {
         // A flow runs; it finishes before the next decision.
         Some(Phase::Building | Phase::Starting | Phase::Quiesce) => Step::Nothing,
@@ -362,13 +400,26 @@ impl<M: Machine> Core<M> {
         // A damaged state file must block starts, but must not strand an explicitly deleted DB.
         if entry.desired != Desired::Deleted && db.view().state.is_none() {
             match self.files(&db.id).load() {
-                Ok(state) => self.set(db, |view| view.state = state),
+                Ok(state) => self.set(db, |view| {
+                    // A concurrent acceptance may already have installed and fsynced a newer
+                    // cold serving/commit latch. Never overwrite it with this earlier read.
+                    if view.state.is_none() {
+                        view.state = state;
+                    }
+                }),
                 // A state that was read and cannot be trusted is not taken for a new database.
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     self.set(db, |view| {
+                        // This failed read must not overwrite a valid state/entry that a newer
+                        // page accepted while the filesystem read was in progress.
+                        if view.entry.as_ref() != Some(&entry) || view.state.is_some() {
+                            return;
+                        }
                         view.adopted = true;
+                        view.acceptance_pending = false;
                         view.phase = Phase::Error;
                         view.error = Some("volume_missing");
+                        view.writer = None;
                     });
                     return;
                 }
@@ -376,6 +427,12 @@ impl<M: Machine> Core<M> {
                 // about the database: like LVM and systemd, it is read again.
                 Err(error) => return Self::unread(db, "state", error.into()),
             }
+        }
+        // Acceptance may have retained an unread-state intent solely for this retry. Reapply
+        // its persisted-generation/serving guards before any lifecycle step or route exposure.
+        // A newer page can also have superseded this entry while its state was being read.
+        if !self.revalidate_entry(db, &entry) || db.view().acceptance_pending {
+            return;
         }
         if self.replacement_blocks(db, &entry) {
             self.set(db, |view| {
@@ -424,6 +481,19 @@ impl<M: Machine> Core<M> {
         }
         match step {
             Step::Nothing => {}
+            Step::ActivateCold => {
+                turn.take();
+                if has_volume && !self.attach(db, &entry).await {
+                    return;
+                }
+                if let Err(error) = self.activate_cold(db, &entry).await {
+                    self.set(db, |view| {
+                        view.phase = Phase::Error;
+                        view.error = Some(error);
+                        view.writer = None;
+                    });
+                }
+            }
             Step::Build => {
                 let built = self.build(db, &entry).await;
                 if built == Err(super::replacement::CLEANUP_PENDING)
@@ -1148,6 +1218,60 @@ mod tests {
             refused: false,
             abandoned: false,
         })
+    }
+
+    #[test]
+    fn pending_cold_targets_never_crash_recover_or_recopy_after_a_postgres_start() {
+        let mut target = entry(|db| {
+            let id = db["id"].as_str().unwrap().to_string();
+            db["storage_generation"] = json!(2);
+            db["archive"]["path"] = json!(format!(
+                "s3://pgcf-eu/eu-dev/{id}/g2-op_bbbbbbbbbbbbbbbbbbbb"
+            ));
+            db["cold_snapshot_pending"] = json!(true);
+            db["origin"] = json!({"kind":"rehydrate","source":{
+                "database_id":id,"snapshot_operation":format!("op_{}","a".repeat(20)),"source_generation":1,
+                "source_storage_generation":1,"manifest_sha256":"a".repeat(64),"manifest_bytes":100,
+                "end":{"system_identifier":"7431215993172011234","timeline":1,"checkpoint_lsn":"0/3000060",
+                "last_archived_segment":"000000010000000000000002","proven_at":"2026-11-06T09:00:00.000Z"}
+            }});
+        });
+        let before = state(false, 2);
+        assert_eq!(
+            decide(&target, None, Some(&before), true, false),
+            Step::Build
+        );
+        let mut started = state(true, 2);
+        started.cold_snapshot_start_intent = true;
+        assert_eq!(
+            decide(&target, None, Some(&started), true, true),
+            Step::Fail("cold_snapshot_restart_required")
+        );
+        assert_eq!(
+            decide(&target, Some(Phase::Ready), Some(&started), true, false),
+            Step::Fail("cold_snapshot_restart_required")
+        );
+        assert_eq!(
+            decide(&target, Some(Phase::Ready), Some(&started), true, true),
+            Step::Nothing
+        );
+        target.origin = None;
+        target.generation += 1;
+        assert_eq!(
+            decide(&target, Some(Phase::Ready), Some(&started), true, true),
+            Step::ActivateCold
+        );
+        assert_eq!(
+            decide(&target, None, None, false, false),
+            Step::ActivateCold
+        );
+        target.cold_snapshot_pending = false;
+        started.cold_snapshot_serving = true;
+        started.cold_snapshot_committed = true;
+        assert_eq!(
+            decide(&target, None, Some(&started), true, true),
+            Step::AdoptRunning
+        );
     }
 
     #[test]
@@ -2860,6 +2984,119 @@ mod tests {
         assert_eq!(handle.phase(), Phase::Error);
     }
 
+    /// A retry may discover a durable cold-serving latch. The previously unread desired entry
+    /// must pass the same acceptance guard before any plan, writer or observation can use it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unread_cold_state_is_revalidated_before_a_stale_stage_can_be_adopted() {
+        use crate::{agent::ColdSnapshotSource, state::ColdSnapshotRestore};
+        let Some(rig) = Rig::new("unread-cold-stage").await else {
+            return;
+        };
+        let mut current = rig.entry_json();
+        let id = id_of(&current);
+        let path = format!("s3://pgcf-eu/eu-dev/{id}/g2-op_cccccccccccccccccccc");
+        current["storage_generation"] = json!(2);
+        current["archive"]["path"] = json!(path);
+        rig.deliver(&path, "read_write");
+        let (_, handle) = rig.create_from(&current).await;
+        let data = tenant(&rig, &id).await;
+        data.batch("CREATE UNLOGGED TABLE committed_cold_data(value integer); INSERT INTO committed_cold_data VALUES(42)").await.unwrap();
+        drop(data);
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+        let mut state = handle.state().unwrap();
+        let end = state.record.clone().unwrap();
+        let source = ColdSnapshotSource {
+            database_id: id.clone(),
+            snapshot_operation: "op_ssssssssssssssssssss".into(),
+            source_generation: 1,
+            source_storage_generation: 1,
+            manifest_sha256: "a".repeat(64),
+            manifest_bytes: 1,
+            end: end.clone(),
+        };
+        state.cold_snapshot_restore = Some(ColdSnapshotRestore {
+            snapshot_operation: source.snapshot_operation.clone(),
+            manifest_sha256: source.manifest_sha256.clone(),
+            system_identifier: end.system_identifier.clone(),
+            timeline: end.timeline,
+            checkpoint_lsn: end.checkpoint_lsn.clone(),
+            verified_at: end.proven_at.clone(),
+        });
+        state.cold_snapshot_source = Some(source.clone());
+        state.cold_snapshot_target_operation = Some(current["operation"].as_str().unwrap().into());
+        state.cold_snapshot_start_intent = true;
+        state.cold_snapshot_serving = true;
+        state.cold_snapshot_committed = true;
+        rig.core.files(&id).save(&state).unwrap();
+        drop(handle);
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        let file = rig.core.files(&id).directory().join("state.json");
+        let kept = file.with_extension("kept");
+        std::fs::rename(&file, &kept).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let mut stale = current.clone();
+        stale["generation"] = json!(2);
+        stale["cold_snapshot_pending"] = true.into();
+        stale["origin"] = json!({"kind":"rehydrate","source":source});
+        rig.core.apply(&Rig::page(vec![stale], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(10, "unread cold entry waits for its state", || {
+            handle.view().retrying
+        })
+        .await;
+        assert!(!handle.view().adopted);
+        assert!(crate::agent::table_entry(&id, &handle.view()).is_none());
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::rename(&kept, &file).unwrap();
+        eventually(10, "committed cold state read by retry", || {
+            handle
+                .view()
+                .state
+                .as_ref()
+                .is_some_and(|state| state.cold_snapshot_committed)
+        })
+        .await;
+        assert!(
+            !handle.view().adopted,
+            "a recovered committed latch rejects the stale stage before planning"
+        );
+        assert!(crate::agent::table_entry(&id, &handle.view()).is_none());
+        assert!(rig.core.pending_observation(&id).is_none());
+        assert_eq!(rig.cold_store.reads(), 0);
+        assert!(!rig.machine.running(&id));
+        current.as_object_mut().unwrap().remove("origin");
+        current["generation"] = json!(3);
+        current["cold_snapshot_pending"] = false.into();
+        rig.core
+            .apply(&Rig::page(vec![current.clone()], vec![]))
+            .await;
+        eventually(30, "fresh current entry adopted", || handle.view().adopted).await;
+        assert_eq!(handle.phase(), Phase::Asleep);
+        assert!(handle.state().unwrap().cold_snapshot_committed);
+        // A newer same-generation route can arrive after the retry captured its entry.
+        // Revalidating that earlier clone must neither replace nor republish it.
+        let previous = rig.entry_for(&current);
+        current["route_revision"] = json!(current["route_revision"].as_u64().unwrap() + 1);
+        let newer = rig.entry_for(&current);
+        assert!(rig.core.accept(&handle, newer.clone()));
+        assert!(!rig.core.revalidate_entry(&handle, &previous));
+        assert_eq!(handle.view().entry.as_ref(), Some(&newer));
+        let result = rig.core.wake(&Rig::ticket(&rig.entry_for(&current))).await;
+        assert_eq!(result.outcome, Outcome::Started, "{result:?}");
+        let rows = tenant(&rig, &id)
+            .await
+            .query("SELECT value FROM committed_cold_data", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, i32>(0), 42);
+        assert_eq!(
+            rig.cold_store.reads(),
+            0,
+            "the recovered committed generation is never recopied"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_decision_that_could_not_read_says_so_only_until_the_database_is_adopted() {
         let Some(rig) = Rig::new("reconcile-unread").await else {
@@ -3495,7 +3732,12 @@ mod tests {
         rig.core.apply(&page()).await;
         eventually(30, "the build to fail", || handle.phase() == Phase::Error).await;
         assert_eq!(handle.view().error, Some("archive_unusable"));
-        assert_eq!(rig.observation(&id)["error"], "archive_unusable");
+        // The phase changes before Core::set publishes its observation. Await that separate
+        // boundary, keeping the exact error and physical-cleanup assertions unchanged.
+        assert_eq!(
+            rig.observed(&id, "error").await["error"],
+            "archive_unusable"
+        );
         assert!(rig.machine.volumes().is_empty());
         assert!(!rig.machine.has_account(&id));
     }

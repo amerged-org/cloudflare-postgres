@@ -55,12 +55,28 @@ async function roleResponse(
  * A guarded write whose request is answered after it: once it has committed, the publication of
  * the Actor's snapshot is waited for a bound and cannot fail the answer (`settleWithin`).
  */
-const mutateRole = <T>(
+const mutateRole = async <T>(
   c: ApiContext,
   id: string,
   execute: (mutation: AdmissionMutation) => Promise<T>,
-) =>
-  withAdmissionMutation(
+) => {
+  const current = await c.env.DB.prepare(
+    "SELECT storage_residency FROM databases WHERE id=?",
+  )
+    .bind(id)
+    .first<{ storage_residency: string }>();
+  if (
+    current?.storage_residency === "archiving" ||
+    current?.storage_residency === "restoring"
+  )
+    throw new ApiError(
+      "conflict",
+      "Database storage transition is in progress",
+      {
+        reason: "operation_in_progress",
+      },
+    );
+  return withAdmissionMutation(
     c.env,
     [id],
     execute,
@@ -68,6 +84,16 @@ const mutateRole = <T>(
     undefined,
     settleWithin(c.executionCtx, id),
   );
+};
+
+/** A role change must not invalidate a verified archival or staged restore after preflight. */
+function roleMutationGuard(mutation: AdmissionMutation, id: string) {
+  const guard = mutation.guard(id);
+  return {
+    sql: `(${guard.sql}) AND EXISTS(SELECT 1 FROM databases role_storage WHERE role_storage.id=? AND role_storage.storage_residency IN('local','archived'))`,
+    bindings: [...guard.bindings, id],
+  };
+}
 /**
  * The answer to a request the service answered before. Its first run may have lost the
  * publication of the Actor's snapshot, so the replay makes it again, with the same bound and
@@ -173,7 +199,7 @@ export async function createRole(
       let result: D1Result[];
       try {
         result = await mutateRole(c, id, async (mutation) => {
-          const guard = mutation.guard(id);
+          const guard = roleMutationGuard(mutation, id);
           return mutation.batch([
             c.env.DB.prepare(
               `INSERT INTO roles (database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at,valid_until,connection_limit,member_of_json,membership_options,bypass_rls,created_by_key_id)
@@ -269,7 +295,7 @@ export async function resetPassword(
           newRolePassword(),
         );
       const result = await mutateRole(c, id, async (mutation) => {
-        const guard = mutation.guard(id);
+        const guard = roleMutationGuard(mutation, id);
         return mutation.batch([
           c.env.DB.prepare(
             `UPDATE roles SET password_ciphertext=?,password_iv=?,password_kid=?,password_revision=password_revision+1,updated_at=?
@@ -382,7 +408,7 @@ export async function deleteRole(
         issuer = (await getAuth(c)).id,
         generation = db.generation + 1;
       const result = await mutateRole(c, id, async (mutation) => {
-        const guard = mutation.guard(id);
+        const guard = roleMutationGuard(mutation, id);
         const scope = `EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=roles.database_id AND d.project_id=? AND d.generation=? AND d.deleted_at IS NULL)`;
         return mutation.batch([
           c.env.DB.prepare(

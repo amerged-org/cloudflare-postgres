@@ -11,6 +11,8 @@
 mod apply;
 mod build;
 pub mod check;
+mod cold;
+mod cold_capture;
 mod drains;
 mod entry;
 mod metering;
@@ -27,6 +29,8 @@ pub(crate) mod report;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use cold::ColdSnapshotSource;
+pub(crate) use cold::VerificationCancellation;
 pub use entry::{Desired, Entry, Origin, Policy, Source};
 pub use readahead::{PREFETCH, Prefetch, Start};
 
@@ -229,6 +233,9 @@ pub(crate) struct Claim {
 pub(crate) struct View {
     /// The newest entry of the page the node accepted.
     pub entry: Option<Entry>,
+    /// Desired intent retained only for retry: persisted state has not passed acceptance yet.
+    /// No route, observation, wake or build may use it until reconcile revalidates that state.
+    pub acceptance_pending: bool,
     /// The archive path of the build that failed in this run and was abandoned. A path names one
     /// build (it holds the operation, and a generation never writes into another's), and the page
     /// keeps naming the build until the API has ended its operation: it is not begun again.
@@ -287,9 +294,22 @@ pub(crate) enum Reconcile {
     Again,
 }
 impl View {
+    /// Physical readiness is not a serving grant for a staged cold target. Keep the gateway,
+    /// event drains and serving-usage accounting on this same durable boundary.
+    pub(super) fn ungranted_cold(&self) -> bool {
+        self.entry.as_ref().is_some_and(|entry| {
+            entry.cold_snapshot_pending
+                && !self.state.as_ref().is_some_and(|state| {
+                    state.storage_generation == entry.storage_generation
+                        && state.cold_snapshot_serving
+                })
+        })
+    }
+
     fn new() -> Self {
         Self {
             entry: None,
+            acceptance_pending: false,
             abandoned_build: None,
             credential_missing_since_ms: None,
             phase: Phase::Asleep,
@@ -414,6 +434,8 @@ pub struct Core<M: Machine> {
     pub(crate) table: Arc<Table>,
     pub(crate) jobs: Arc<Jobs>,
     pub(crate) credentials: Arc<Credentials>,
+    /// Authenticated operation-scoped transport for complete clean-shutdown snapshots.
+    cold_snapshot_store: RwLock<Option<Arc<dyn crate::archive::cold_snapshot::Store>>>,
     pub(crate) gateway: Arc<Feed>,
     pub(crate) fences: Fences,
     pub(crate) timing: Timing,
@@ -500,6 +522,7 @@ impl<M: Machine> Core<M> {
             table: parts.table,
             jobs: parts.jobs,
             credentials: parts.credentials,
+            cold_snapshot_store: RwLock::new(None),
             gateway: parts.gateway,
             fences: parts.fences,
             timing: parts.timing,
@@ -530,6 +553,29 @@ impl<M: Machine> Core<M> {
             data_events: parts.data_events,
         });
         (core, early)
+    }
+
+    pub(crate) fn set_cold_snapshot_store(
+        &self,
+        store: Arc<dyn crate::archive::cold_snapshot::Store>,
+    ) {
+        *self
+            .cold_snapshot_store
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(store);
+    }
+
+    pub(crate) fn cold_snapshot_transport(
+        &self,
+        operation: &str,
+    ) -> Result<Arc<dyn crate::archive::cold_snapshot::Transport>, &'static str> {
+        let store = self
+            .cold_snapshot_store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or("snapshot_transport_unavailable")?;
+        Ok(store.operation(operation))
     }
 
     pub(crate) fn layout(&self) -> &Layout {
@@ -730,16 +776,23 @@ impl<M: Machine> Core<M> {
 
 /// The gateway's entry for a database: where its PostgreSQL stands for the clients.
 fn table_entry(id: &str, view: &View) -> Option<protocol::Database> {
+    if view.acceptance_pending {
+        return None;
+    }
     let entry = view.entry.as_ref()?;
     let (generation, operation) = match &view.claim {
         Some(claim) => (claim.generation, claim.operation.clone()),
         None => (entry.generation, entry.operation.clone()),
     };
-    let (mode, writer) = match (view.phase, &view.writer) {
-        (Phase::Ready, Some(writer)) => (protocol::Mode::Running, Some(writer.clone())),
-        (Phase::Quiesce, Some(writer)) => (protocol::Mode::Quiesce, Some(writer.clone())),
-        (Phase::Deleted | Phase::Retired, _) => (protocol::Mode::Retired, None),
-        _ => (protocol::Mode::Sleeping, None),
+    let (mode, writer) = if view.ungranted_cold() {
+        (protocol::Mode::Sleeping, None)
+    } else {
+        match (view.phase, &view.writer) {
+            (Phase::Ready, Some(writer)) => (protocol::Mode::Running, Some(writer.clone())),
+            (Phase::Quiesce, Some(writer)) => (protocol::Mode::Quiesce, Some(writer.clone())),
+            (Phase::Deleted | Phase::Retired, _) => (protocol::Mode::Retired, None),
+            _ => (protocol::Mode::Sleeping, None),
+        }
     };
     Some(protocol::Database {
         database: id.to_string(),
@@ -756,9 +809,9 @@ impl<M: Machine> Core<M> {
     pub(crate) fn set(&self, db: &Db, change: impl FnOnce(&mut View)) {
         let (entry, served) = {
             let mut view = db.view();
-            let before = metering::is_served(view.phase);
+            let before = metering::is_served(&view);
             change(&mut view);
-            let after = metering::is_served(view.phase);
+            let after = metering::is_served(&view);
             (
                 table_entry(&db.id, &view),
                 (before != after).then_some(after),
@@ -789,25 +842,118 @@ impl<M: Machine> Core<M> {
     /// it knows: an entry below it is stale and `false`; one at it with another operation wins;
     /// a wake claim the page has caught up with is done.
     pub(crate) fn accept(&self, db: &Db, entry: Entry) -> bool {
-        let known = db.view().entry.as_ref().map(|known| {
-            (
-                known.generation,
-                known.operation.clone(),
-                known.storage_generation,
-            )
-        });
-        if known.as_ref().is_some_and(|(generation, _, storage)| {
-            entry.generation < *generation || entry.storage_generation < *storage
-        }) {
-            return false;
+        self.accept_checked(db, entry, false)
+    }
+
+    /// Reconciliation never replaces a newer page with the entry it captured before reading
+    /// disk. A deferred intent is rechecked under the same view lock as normal acceptance.
+    pub(crate) fn revalidate_entry(&self, db: &Db, entry: &Entry) -> bool {
+        {
+            let view = db.view();
+            if view.entry.as_ref() != Some(entry) {
+                return false;
+            }
+            if !view.acceptance_pending {
+                return true;
+            }
         }
-        let changed = known.as_ref()
-            != Some(&(
-                entry.generation,
-                entry.operation.clone(),
-                entry.storage_generation,
-            ));
+        self.accept_checked(db, entry.clone(), true)
+    }
+
+    fn accept_checked(&self, db: &Db, entry: Entry, pending_only: bool) -> bool {
+        let mut accepted = false;
         self.set(db, |view| {
+            if pending_only {
+                if view.entry.as_ref() != Some(&entry) {
+                    return;
+                }
+                if !view.acceptance_pending {
+                    accepted = true;
+                    return;
+                }
+            }
+            let known = view.entry.as_ref().map(|known| {
+                (
+                    known.generation,
+                    known.operation.clone(),
+                    known.storage_generation,
+                )
+            });
+            if known.as_ref().is_some_and(|(generation, _, storage)| {
+                entry.generation < *generation || entry.storage_generation < *storage
+            }) {
+                return;
+            }
+            if entry.desired != Desired::Deleted
+                && (entry.origin.is_none() || matches!(entry.origin, Some(Origin::Rehydrate(_))))
+            {
+                let held = match view
+                    .state
+                    .clone()
+                    .map(Some)
+                    .map(Ok)
+                    .unwrap_or_else(|| self.files(&db.id).load())
+                {
+                    Ok(state) => state,
+                    Err(_) => {
+                        // Keep the desired intent so the existing reconciliation/backoff can
+                        // distinguish a temporary read failure from corrupt state. It remains
+                        // quarantined until the same acceptance guards run with readable state.
+                        view.entry = Some(entry.clone());
+                        view.acceptance_pending = true;
+                        view.adopted = false;
+                        view.phase = Phase::Unproven;
+                        view.writer = None;
+                        accepted = true;
+                        return;
+                    }
+                };
+                if let Some(mut state) = held {
+                    if entry.storage_generation < state.storage_generation {
+                        return;
+                    }
+                    if entry.storage_generation == state.storage_generation {
+                        if state.cold_snapshot_committed && entry.cold_snapshot_pending {
+                            return;
+                        }
+                        if state.cold_snapshot_serving
+                            && matches!(entry.origin, Some(Origin::Rehydrate(_)))
+                        {
+                            // A delayed staging page can never replace the serving generation.
+                            return;
+                        }
+                        if entry.origin.is_none()
+                            && !entry.cold_snapshot_pending
+                            && state.cold_snapshot_source.is_some()
+                        {
+                            if !state.built {
+                                return;
+                            }
+                            if !state.cold_snapshot_committed {
+                                state.cold_snapshot_serving = true;
+                                state.cold_snapshot_committed = true;
+                                // This fsync happens while the view is locked and BEFORE self.set
+                                // publishes the new route revision to the gateway. Lost Ready ACKs
+                                // recover from this authoritative no-origin desired entry.
+                                if self.files(&db.id).save(&state).is_err() {
+                                    return;
+                                }
+                                // A previously uncertain activation may have been committed by
+                                // Cloudflare before its reply was lost. Re-adopt the retained
+                                // process/volume under normal crash semantics; never recopy it.
+                                view.adopted = false;
+                            }
+                        }
+                    }
+                    view.state = Some(state);
+                }
+            }
+            let changed = known.as_ref()
+                != Some(&(
+                    entry.generation,
+                    entry.operation.clone(),
+                    entry.storage_generation,
+                ));
             if let Some(claim) = &view.claim
                 && (entry.generation > claim.generation
                     || (entry.generation == claim.generation && entry.operation == claim.operation))
@@ -818,8 +964,10 @@ impl<M: Machine> Core<M> {
                 view.refusal = None;
             }
             view.entry = Some(entry);
+            view.acceptance_pending = false;
+            accepted = true;
         });
-        true
+        accepted
     }
 }
 

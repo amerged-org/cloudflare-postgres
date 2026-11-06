@@ -477,8 +477,92 @@ impl Runner {
             }
             systemctl_output(&systemctl, &["stop", unit]).await?;
         }
+        // Cancellation can drop run() before its environment-file cleanup. Only directories of
+        // this exact database and kind are ours, and their services have now stopped.
+        let directories = match std::fs::read_dir(&self.scratch) {
+            Ok(directories) => Some(directories),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(Unstopped),
+        };
+        for directory in directories.into_iter().flatten() {
+            let directory = directory.map_err(|_| Unstopped)?;
+            let name = directory.file_name();
+            let Some(sequence) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+                continue;
+            };
+            if sequence.is_empty() || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            if !directory.file_type().map_err(|_| Unstopped)?.is_dir() {
+                return Err(Unstopped);
+            }
+            std::fs::remove_dir_all(directory.path()).map_err(|_| Unstopped)?;
+        }
         Ok(())
     }
+    /// Readback for a never-delivered cancellation: do not stop an unowned process merely
+    /// because its deterministic name resembles this operation's scratch runtime.
+    pub async fn absent(&self, database: &str) -> Result<bool, Unstopped> {
+        if !pgcf_native_protocol::valid_pattern("database", database) {
+            return Err(Unstopped);
+        }
+        let systemctl = self.systemd_run.with_file_name("systemctl");
+        for kind in [
+            Kind::BackupList,
+            Kind::Restore,
+            Kind::WalFetch,
+            Kind::WalArchive,
+            Kind::BaseBackup,
+        ] {
+            let prefix = format!("{UNIT_PREFIX}{}-{database}-", kind.label());
+            let listed = systemctl_output(
+                &systemctl,
+                &[
+                    "list-units",
+                    "--all",
+                    "--plain",
+                    "--no-legend",
+                    "--no-pager",
+                    &format!("{prefix}*.service"),
+                ],
+            )
+            .await?;
+            if listed
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .any(|unit| {
+                    unit.strip_prefix(&prefix)
+                        .and_then(|rest| rest.strip_suffix(".service"))
+                        .is_some_and(|sequence| {
+                            !sequence.is_empty()
+                                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                })
+            {
+                return Ok(false);
+            }
+            let directories = match std::fs::read_dir(&self.scratch) {
+                Ok(directories) => Some(directories),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return Err(Unstopped),
+            };
+            for directory in directories.into_iter().flatten() {
+                let directory = directory.map_err(|_| Unstopped)?;
+                if directory
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(&prefix))
+                    .is_some_and(|sequence| {
+                        !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Runs `job` as the database with `credential`, and returns when the unit has ended.
     pub async fn run(
         &self,
@@ -696,6 +780,15 @@ impl Jobs {
     /// Stops the jobs of `kind` of `database` that an earlier agent started and that still run.
     pub async fn stop_earlier(&self, database: &str, kind: Kind) -> Result<(), Unstopped> {
         self.runner.stop_earlier(database, kind).await
+    }
+    /// Rust snapshot transfers share the same background big-job budget as Barman.
+    pub async fn snapshot_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, Busy> {
+        self.big.acquire().await.map_err(|_| Busy)
+    }
+
+    /// Confirms that no transient job of this runtime remains, without mutating an unowned job.
+    pub async fn absent(&self, database: &str) -> Result<bool, Unstopped> {
+        self.runner.absent(database).await
     }
     /// Waits for a slot of the job's kind, then runs it. Both the wait and the run end at
     /// `deadline`, when there is one.

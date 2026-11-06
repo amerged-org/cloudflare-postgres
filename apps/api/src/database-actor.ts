@@ -33,6 +33,8 @@ import {
 import type { LocalAdmissionActor } from "./domain/admission-mutations.ts";
 /** The D1 side of the actor: the claim, the snapshot read and the hint. */
 const d1 = () => import("./database-actor-d1.ts");
+/** Recovery is loaded only for nonlocal storage; ordinary wake tickets keep their small graph. */
+const coldStorage = () => import("./domain/cold-storage.ts");
 const PersistedAdmissionMutationIntent = AdmissionMutationIntent.extend({
   started_at: z.number().int().nonnegative().default(0),
 });
@@ -125,8 +127,12 @@ export type { DatabaseAdmission } from "@pgcf/contracts/database-admission";
  */
 export const GATEWAY_COLUMNS = (region: string, node: string) =>
   `CASE WHEN ${node}.gateway_url IS NOT NULL THEN ${node}.gateway_url ELSE ${region}.gateway_url END gateway_url,CASE WHEN ${node}.gateway_url IS NOT NULL THEN NULL ELSE ${region}.gateway_binding END gateway_binding`;
-export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.storage_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
+export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.storage_generation,d.storage_residency,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
   d.runtime_json,COALESCE(e.route_revision,1) route_revision,r.name role_name,g.id,${GATEWAY_COLUMNS("g", "n")},n.id node_id,n.lost_at,
+  EXISTS(SELECT 1 FROM database_cold_storage cr JOIN cold_storage_operations co ON co.id=cr.operation
+    WHERE cr.operation=d.storage_operation_id AND cr.database_id=d.id AND cr.project_id=d.project_id
+      AND cr.manual_resume_requested=1 AND cr.wake_requested=1 AND co.status IN('pending','running')
+      AND cr.phase IN('cancelling','retiring','archived','waiting_capacity','restoring','activating')) cold_resume_authorized,
   CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL)
     AND NOT EXISTS(SELECT 1 FROM database_replacements p WHERE p.database_id=d.id AND p.phase IN('proving','restoring','rolling_back')) THEN 0 ELSE 1 END admission_blocked
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
@@ -139,6 +145,7 @@ interface AdmissionRow {
   generation: number;
   observed_generation: number;
   storage_generation: number;
+  storage_residency: "local" | "archiving" | "archived" | "restoring";
   observed_power: string;
   suspension_reason: string | null;
   power_operation: string | null;
@@ -154,6 +161,7 @@ interface AdmissionRow {
   node_id: string | null;
   lost_at: string | null;
   admission_blocked: number;
+  cold_resume_authorized: number;
 }
 
 function admittedRoute(
@@ -213,6 +221,23 @@ export class DatabaseActor extends DurableObject<Env> {
     { deadline: number; resolve: (ready: boolean) => void; owner: object }
   >();
   private polling = false;
+  /** A caller's cancellation removes only its waiter, never the durable recovery operation. */
+  private coldWaiters = new Map<
+    string,
+    {
+      deadline: number;
+      resolve: (outcome: "ready" | "local" | "failed") => void;
+      owner: object;
+      operation: string;
+    }
+  >();
+  private coldPolling = false;
+  private coldPushed = false;
+  private interruptColdPoll: (() => void) | undefined;
+  private admissionRequests = new Map<
+    string,
+    { owner: object; cancel: () => void }
+  >();
   private pushed = false;
   private wake: { operation: string; revision: number } | undefined;
   /** When the waiters of the current wake began to wait; only for the actor_release measurement. */
@@ -374,6 +399,7 @@ export class DatabaseActor extends DurableObject<Env> {
     const hash =
       !snapshot.deleted &&
       !snapshot.replacement_active &&
+      (snapshot.storage_residency ?? "local") === "local" &&
       snapshot.node !== null &&
       (snapshot.wakeable === true || this.storedTicket() !== undefined)
         ? await roleRevisionHash(snapshot.roles)
@@ -428,6 +454,7 @@ export class DatabaseActor extends DurableObject<Env> {
             };
     } else if (
       held &&
+      (snapshot.storage_residency ?? "local") === "local" &&
       held.state !== "refused" &&
       held.generation === snapshot.generation &&
       held.role_revision_hash === hash &&
@@ -455,6 +482,10 @@ export class DatabaseActor extends DurableObject<Env> {
     } catch (error) {
       this.tables = tables;
       throw error;
+    }
+    if (this.coldWaiters.size) {
+      this.coldPushed = true;
+      this.interruptColdPoll?.();
     }
     if (
       this.waiters.size &&
@@ -687,6 +718,7 @@ export class DatabaseActor extends DurableObject<Env> {
         return { ok: false, sqlstate: "3D000" };
       if (row.role_name !== role.data) return { ok: false, sqlstate: "28P01" };
       if (
+        row.storage_residency !== "local" ||
         row.node_id === null ||
         row.admission_blocked !== 0 ||
         row.lost_at !== null ||
@@ -757,10 +789,12 @@ export class DatabaseActor extends DurableObject<Env> {
           deleted: snapshot?.deleted ?? null,
           admissible: snapshot?.admissible ?? null,
           wakeable: snapshot?.wakeable ?? null,
+          storage_residency: snapshot?.storage_residency ?? "local",
           barrier: read.barrier !== undefined,
           ticket: this.storedTicket()?.state ?? null,
           wake: this.wake?.operation ?? null,
           waiters: this.waiters.size,
+          cold_waiters: this.coldWaiters.size,
         };
     } catch {
       // The refusal is logged without the state it could not read.
@@ -817,6 +851,10 @@ export class DatabaseActor extends DurableObject<Env> {
       if (current.deleted) return { ok: false, sqlstate: "3D000" };
       if (!current.roles.some((value) => value.name === role.data))
         return { ok: false, sqlstate: "28P01" };
+      if ((current.storage_residency ?? "local") !== "local") {
+        trace.path = "ensure_awake";
+        return await this.ensureAwake(id.data, role.data, options);
+      }
       let ticket = this.storedTicket();
       let reused =
         ticket !== undefined &&
@@ -1027,6 +1065,7 @@ export class DatabaseActor extends DurableObject<Env> {
         }
         const { sleeping_intent, ...row } = read;
         if (
+          (row.storage_residency ?? "local") !== "local" ||
           row.generation + 1 !== ticket.generation ||
           row.desired_state !== "suspended" ||
           row.suspension_reason !== "idle" ||
@@ -1172,8 +1211,8 @@ export class DatabaseActor extends DurableObject<Env> {
       return { ok: false, sqlstate: "3D000" };
     if (row.role_name !== user) return { ok: false, sqlstate: "28P01" };
     if (
-      row.node_id === null ||
-      row.lost_at !== null ||
+      (row.storage_residency === "local" &&
+        (row.node_id === null || row.lost_at !== null)) ||
       row.admission_blocked !== 0
     )
       return { ok: false, sqlstate: "57P03" };
@@ -1301,6 +1340,7 @@ export class DatabaseActor extends DurableObject<Env> {
           ]);
           if ("ok" in authorized) return undefined;
           if (!row) return undefined;
+          if ((row.storage_residency ?? "local") !== "local") return undefined;
           if (lost !== undefined && JSON.stringify(row) === lost)
             return undefined;
           if (
@@ -1433,10 +1473,32 @@ export class DatabaseActor extends DurableObject<Env> {
       return { ok: false, sqlstate: "08006" };
     }
     const waiterId = parsed.data.waiterId ?? crypto.randomUUID();
-    const owner = {};
+    if (this.admissionRequests.has(waiterId))
+      return { ok: false, sqlstate: "57P03" };
+    const owner: {
+      cancelled: boolean;
+      cancelledByClient?: boolean;
+      coldRequested?: boolean;
+      coldOperation?: string;
+    } = {
+      cancelled: false,
+    };
+    const waitStarted = Date.now();
+    const cancelled = new Promise<DatabaseAdmission>((resolve) =>
+      this.admissionRequests.set(waiterId, {
+        owner,
+        cancel: () => {
+          owner.cancelled = true;
+          owner.cancelledByClient = true;
+          resolve({ ok: false, sqlstate: "57P03" });
+        },
+      }),
+    );
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let result: DatabaseAdmission | undefined;
     try {
-      return await Promise.race([
+      result = await Promise.race([
+        cancelled,
         this.waitForAwake(databaseId, user, { deadline, waiterId }, owner),
         new Promise<DatabaseAdmission>((resolve) => {
           timer = setTimeout(
@@ -1445,7 +1507,28 @@ export class DatabaseActor extends DurableObject<Env> {
           );
         }),
       ]);
+      return result;
     } finally {
+      if (owner.coldRequested)
+        console.log(
+          JSON.stringify({
+            event: "cold_restore_wait",
+            database_id: databaseId,
+            operation: owner.coldOperation ?? null,
+            waiter_id: waiterId,
+            outcome: result?.ok
+              ? "ready"
+              : owner.cancelledByClient
+                ? "cancelled"
+                : Date.now() >= deadline
+                  ? "timeout"
+                  : "failed",
+            duration_ms: Math.max(0, Date.now() - waitStarted),
+          }),
+        );
+      owner.cancelled = true;
+      if (this.admissionRequests.get(waiterId)?.owner === owner)
+        this.admissionRequests.delete(waiterId);
       if (timer) clearTimeout(timer);
       const waiter = this.waiters.get(waiterId);
       if (waiter?.owner === owner) {
@@ -1453,6 +1536,100 @@ export class DatabaseActor extends DurableObject<Env> {
         waiter.resolve(false);
         this.interruptPoll?.();
       }
+      const cold = this.coldWaiters.get(waiterId);
+      if (cold?.owner === owner) {
+        this.coldWaiters.delete(waiterId);
+        cold.resolve("failed");
+        this.interruptColdPoll?.();
+      }
+    }
+  }
+  private startColdPolling(id: string): void {
+    if (this.coldPolling) {
+      this.coldPushed = true;
+      this.interruptColdPoll?.();
+      return;
+    }
+    this.coldPolling = true;
+    void this.pollColdStorage(id).finally(() => {
+      this.coldPolling = false;
+      if (this.coldWaiters.size) this.startColdPolling(id);
+    });
+  }
+  /** One observation loop per Actor; no request or SQL is replayed by this loop. */
+  private async pollColdStorage(id: string): Promise<void> {
+    try {
+      const { readColdStorageWake } = await coldStorage();
+      while (this.coldWaiters.size > 0) {
+        this.coldPushed = false;
+        for (const [key, waiter] of this.coldWaiters)
+          if (waiter.deadline <= Date.now()) {
+            this.coldWaiters.delete(key);
+            waiter.resolve("failed");
+          }
+        if (!this.coldWaiters.size) break;
+        const outcomes = new Map<
+          string,
+          "pending" | "ready" | "local" | "failed"
+        >();
+        for (const operation of new Set(
+          [...this.coldWaiters.values()].map((waiter) => waiter.operation),
+        )) {
+          try {
+            let outcome = await readColdStorageWake(this.env, id, operation);
+            if (outcome === "ready" || outcome === "local") {
+              const state = this.admissionState();
+              // The D1 cutover precedes publication. Hold the original request through that
+              // barrier instead of releasing it into a transient not-ready refusal.
+              if (
+                state?.barrier ||
+                !state?.snapshot ||
+                (outcome === "ready" && !state.snapshot.admissible) ||
+                (state.snapshot.storage_residency ?? "local") !== "local"
+              )
+                outcome = "pending";
+            }
+            outcomes.set(operation, outcome);
+          } catch {
+            // A lost metadata read is not a failed recovery. The deadline remains bounded,
+            // and a later read or ready push resolves the still-running operation.
+          }
+        }
+        for (const [key, waiter] of this.coldWaiters) {
+          const outcome = outcomes.get(waiter.operation);
+          if (
+            outcome === "ready" ||
+            outcome === "local" ||
+            outcome === "failed"
+          ) {
+            this.coldWaiters.delete(key);
+            waiter.resolve(waiter.deadline > Date.now() ? outcome : "failed");
+          }
+        }
+        if (!this.coldWaiters.size) break;
+        if (this.coldPushed) continue;
+        const delay = Math.max(
+          1,
+          Math.min(
+            WAKE_FALLBACK_READ_MS,
+            ...[...this.coldWaiters.values()].map(
+              (waiter) => waiter.deadline - Date.now(),
+            ),
+          ),
+        );
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => done(), delay);
+          const done = () => {
+            clearTimeout(timer);
+            this.interruptColdPoll = undefined;
+            resolve();
+          };
+          this.interruptColdPoll = done;
+        });
+      }
+    } catch {
+      for (const waiter of this.coldWaiters.values()) waiter.resolve("failed");
+      this.coldWaiters.clear();
     }
   }
   private startPolling(id: string): void {
@@ -1467,7 +1644,11 @@ export class DatabaseActor extends DurableObject<Env> {
     databaseId: unknown,
     user: unknown,
     options: { deadline: number; waiterId: string },
-    owner: object,
+    owner: {
+      cancelled: boolean;
+      coldRequested?: boolean;
+      coldOperation?: string;
+    },
   ): Promise<DatabaseAdmission> {
     const id = DatabaseId.safeParse(databaseId),
       role = RoleName.safeParse(user);
@@ -1485,10 +1666,64 @@ export class DatabaseActor extends DurableObject<Env> {
       parsed.data.deadline ?? Date.now() + ADMISSION_DEADLINE_MS,
       Date.now() + ADMISSION_DEADLINE_MS,
     );
-    if (deadline <= Date.now()) return { ok: false, sqlstate: "57P03" };
+    if (deadline <= Date.now() || owner.cancelled)
+      return { ok: false, sqlstate: "57P03" };
     try {
       const current = await this.known(id.data, role.data);
       if ("ok" in current) return current;
+      if (
+        current.desired_state === "suspended" &&
+        current.suspension_reason !== "idle" &&
+        !(
+          current.storage_residency !== "local" &&
+          current.cold_resume_authorized === 1
+        )
+      )
+        return { ok: false, sqlstate: "57P03" };
+      if (current.storage_residency !== "local") {
+        owner.coldRequested = true;
+        const { requestColdStorageWake } = await coldStorage();
+        const recovery = await this.gate("claimColdWake", () =>
+          requestColdStorageWake(this.env, id.data, {
+            role: role.data,
+            localActor: this.localAdmissionActor(id.data),
+          }),
+        );
+        if (!recovery.handled && !recovery.cancelledArchive) {
+          const latest = await this.known(id.data, role.data);
+          if ("ok" in latest) return latest;
+          if (latest.storage_residency !== "local")
+            return { ok: false, sqlstate: "57P03" };
+        }
+        if (recovery.cancelledArchive || !recovery.handled)
+          return this.waitForAwake(databaseId, user, options, owner);
+        if (!recovery.operationId || !recovery.waiting)
+          return this.admit(id.data, role.data);
+        owner.coldOperation = recovery.operationId;
+        if (
+          Date.now() >= deadline ||
+          owner.cancelled ||
+          this.waiters.size + this.coldWaiters.size >= 32 ||
+          this.waiters.has(options.waiterId) ||
+          this.coldWaiters.has(options.waiterId)
+        )
+          return { ok: false, sqlstate: "57P03" };
+        const pending = new Promise<"ready" | "local" | "failed">((resolve) =>
+          this.coldWaiters.set(options.waiterId, {
+            deadline,
+            resolve,
+            owner,
+            operation: recovery.operationId!,
+          }),
+        );
+        this.startColdPolling(id.data);
+        const outcome = await pending;
+        if (outcome === "local")
+          return this.waitForAwake(databaseId, user, options, owner);
+        return outcome === "ready"
+          ? this.admit(id.data, role.data)
+          : { ok: false, sqlstate: "57P03" };
+      }
       if (
         current.desired_state === "running" &&
         current.observed_state === "ready" &&
@@ -1517,7 +1752,12 @@ export class DatabaseActor extends DurableObject<Env> {
       if (wake && "failure" in wake)
         return { ok: false, sqlstate: wake.failure };
       if (!wake && deadline > Date.now()) return this.admit(id.data, role.data);
-      if (!wake || deadline <= Date.now() || this.waiters.size >= 32)
+      if (
+        !wake ||
+        owner.cancelled ||
+        deadline <= Date.now() ||
+        this.waiters.size + this.coldWaiters.size >= 32
+      )
         return { ok: false, sqlstate: "57P03" };
       const replaced =
         this.wake !== undefined &&
@@ -1551,13 +1791,20 @@ export class DatabaseActor extends DurableObject<Env> {
   ): Promise<boolean> {
     requireControlAvailable(this.env);
     this.identity(DatabaseId.parse(databaseId));
+    // A cold recovery may advance the storage generation or replace the initial archival
+    // operation. The shared cold loop validates that lineage in D1 before releasing callers.
+    const cold = this.coldWaiters.size > 0;
+    if (cold) {
+      this.coldPushed = true;
+      this.interruptColdPoll?.();
+    }
     if (
       !this.wake ||
       this.wake.revision !== revision ||
       this.wake.operation !== operation ||
       !this.waiters.size
     )
-      return false;
+      return cold;
     this.pushed = true;
     this.interruptPoll?.();
     return true;
@@ -1679,6 +1926,18 @@ export class DatabaseActor extends DurableObject<Env> {
     requireControlAvailable(this.env);
     this.identity(DatabaseId.parse(databaseId));
     if (!z.uuid().safeParse(waiterId).success) return false;
+    const active = this.admissionRequests.get(waiterId);
+    if (active) {
+      active.cancel();
+      return true;
+    }
+    const cold = this.coldWaiters.get(waiterId);
+    if (cold) {
+      this.coldWaiters.delete(waiterId);
+      cold.resolve("failed");
+      this.interruptColdPoll?.();
+      return true;
+    }
     const waiter = this.waiters.get(waiterId);
     if (!waiter) return false;
     this.waiters.delete(waiterId);

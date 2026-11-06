@@ -91,6 +91,12 @@ pub struct Desired {
     /// The probes an administrator asked for that Cloudflare has no result of (SEC-09), merged by
     /// identifier like the orders.
     pub diagnostics: Vec<Request>,
+    /// Isolated restore checks; they never become served databases.
+    pub archive_verifications: Vec<Value>,
+    /// Explicit cleanup authority also for work that never reached this node.
+    pub archive_verification_cancellations: Vec<Value>,
+    pub cold_snapshot_captures: Vec<Value>,
+    pub cold_snapshot_capture_cancellations: Vec<Value>,
     /// `NodeDesiredDatabase` entries, each once.
     pub databases: Vec<Value>,
     /// Every database of the node (a full pull) or only the ones asked for. A database that a full
@@ -105,6 +111,11 @@ impl std::fmt::Debug for Desired {
             .field("credentials_revision", &self.credentials_revision)
             .field("orders", &self.orders)
             .field("diagnostics", &self.diagnostics.len())
+            .field("archive_verifications", &self.archive_verifications.len())
+            .field(
+                "archive_verification_cancellations",
+                &self.archive_verification_cancellations.len(),
+            )
             .field("databases", &self.databases.len())
             .field("complete", &self.complete)
             .finish()
@@ -126,6 +137,42 @@ impl Desired {
         for request in later.diagnostics {
             if self.diagnostics.iter().all(|held| held.id != request.id) {
                 self.diagnostics.push(request);
+            }
+        }
+        for request in later.archive_verifications {
+            if self
+                .archive_verifications
+                .iter()
+                .all(|held| held["operation"] != request["operation"])
+            {
+                self.archive_verifications.push(request);
+            }
+        }
+        for cancellation in later.archive_verification_cancellations {
+            if self
+                .archive_verification_cancellations
+                .iter()
+                .all(|held| held["operation"] != cancellation["operation"])
+            {
+                self.archive_verification_cancellations.push(cancellation);
+            }
+        }
+        for capture in later.cold_snapshot_captures {
+            if self
+                .cold_snapshot_captures
+                .iter()
+                .all(|held| held["operation"] != capture["operation"])
+            {
+                self.cold_snapshot_captures.push(capture);
+            }
+        }
+        for cancellation in later.cold_snapshot_capture_cancellations {
+            if self
+                .cold_snapshot_capture_cancellations
+                .iter()
+                .all(|held| held["operation"] != cancellation["operation"])
+            {
+                self.cold_snapshot_capture_cancellations.push(cancellation);
             }
         }
         self.release = later.release;
@@ -171,6 +218,22 @@ async fn page(api: &Api, target: &str) -> Result<(Desired, Option<String>), Erro
             Some(requests) => serde_json::from_value(requests.clone())?,
             None => Vec::new(),
         },
+        cold_snapshot_captures: page["cold_snapshot_captures"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        cold_snapshot_capture_cancellations: page["cold_snapshot_capture_cancellations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        archive_verification_cancellations: page["archive_verification_cancellations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        archive_verifications: page["archive_verifications"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
         databases: page["databases"].as_array().cloned().unwrap_or_default(),
         complete: false,
     };

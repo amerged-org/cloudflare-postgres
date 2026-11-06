@@ -63,6 +63,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
     row.deleted_at !== null ||
     row.desired_state === "deleted" ||
     row.project_deleted_at !== null;
+  const storageResidency = row.storage_residency ?? "local";
   // What the node reported of the unit counts only for the generation and storage it names now.
   let runtime: DatabaseAdmissionSnapshot["runtime"] = null;
   try {
@@ -71,6 +72,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
     );
     if (
       parsed.success &&
+      storageResidency === "local" &&
       parsed.data.database_id === id &&
       parsed.data.node_id === row.node_id &&
       parsed.data.generation === row.generation &&
@@ -81,6 +83,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
     /* A malformed report closes admission; it cannot repair desired state. */
   }
   const admissible =
+    storageResidency === "local" &&
     row.replacement_active === 0 &&
     !deleted &&
     row.mutation_id === null &&
@@ -93,6 +96,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
     row.observed_generation === row.generation &&
     runtime !== null;
   const wakeable =
+    storageResidency === "local" &&
     row.replacement_active === 0 &&
     !deleted &&
     row.mutation_id === null &&
@@ -128,6 +132,7 @@ export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
       deleted,
       admissible,
       wakeable,
+      storage_residency: storageResidency,
       replacement_active: row.replacement_active === 1,
       region: {
         id: row.region_id,

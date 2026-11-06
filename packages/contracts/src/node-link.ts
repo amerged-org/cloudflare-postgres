@@ -18,6 +18,13 @@
 import { z } from "zod";
 import { DatabaseEffectiveResources } from "./database-resources.ts";
 import {
+  ColdSnapshotCaptureRequest,
+  ColdSnapshotSource,
+  COLD_SNAPSHOT_API_PREFIX,
+} from "./cold-snapshot.ts";
+import { ProvenSleepRecord, WAL_SEGMENT_PATTERN } from "./postgres-storage.ts";
+export { ProvenSleepRecord, WAL_SEGMENT_PATTERN } from "./postgres-storage.ts";
+import {
   BucketName,
   HttpsUrl,
   ROLE_CONNECTION_LIMIT_MAX,
@@ -89,6 +96,7 @@ export const NODE_API_PATHS = {
   usage: "/node/v1/usage",
   dataEvents: "/node/v1/data-events",
   diagnostics: "/node/v1/diagnostics",
+  coldSnapshots: COLD_SNAPSHOT_API_PREFIX,
 } as const;
 /**
  * A node declared lost (plan 9.4) is fenced: its Tunnel token is revoked, and its key still signs
@@ -853,21 +861,7 @@ export const NodePolicy = z.strictObject({
 });
 export type NodePolicy = z.infer<typeof NodePolicy>;
 
-export const WAL_SEGMENT_PATTERN = /^[0-9A-F]{24}$/;
 const WalSegment = z.string().regex(WAL_SEGMENT_PATTERN);
-
-/** The fsynced record of a proven sleep (plan 7.9); a database is cold and safe only with it. */
-export const ProvenSleepRecord = z.strictObject({
-  system_identifier: z
-    .string()
-    .regex(/^[1-9][0-9]{0,19}$/)
-    .refine((value) => BigInt(value) <= 0xffff_ffff_ffff_ffffn),
-  timeline: z.number().int().min(1).max(0xffff_ffff),
-  checkpoint_lsn: z.string().regex(/^[0-9A-F]{1,8}\/[0-9A-F]{1,8}$/),
-  last_archived_segment: WalSegment,
-  proven_at: Timestamp,
-});
-export type ProvenSleepRecord = z.infer<typeof ProvenSleepRecord>;
 
 const BACKUP_ID = /^[0-9]{8}T[0-9]{6}$/;
 /** The archive a restore reads: a backup of another database and, for a PITR, a target time. */
@@ -888,6 +882,102 @@ export const MoveSource = RestoreSource.omit({ target_time: true }).extend({
   end: ProvenSleepRecord,
 });
 export type MoveSource = z.infer<typeof MoveSource>;
+
+/** Isolated scratch recovery; this request never creates a serving database or a route. */
+export const ArchiveVerificationRequest = z
+  .strictObject({
+    operation: OperationId,
+    database_id: DatabaseId,
+    source_node_id: NodeId,
+    source_generation: Positive,
+    source_storage_generation: Positive,
+    source: ColdSnapshotSource,
+    resources: DatabaseEffectiveResources,
+    settings: z.strictObject({
+      max_connections: z.number().int().min(10).max(10_000),
+      archive_timeout_seconds: z.number().int().min(30).max(3600),
+    }),
+  })
+  .superRefine((request, ctx) => {
+    if (
+      request.source.database_id !== request.database_id ||
+      request.source.snapshot_operation !== request.operation ||
+      request.source.source_generation !== request.source_generation ||
+      request.source.source_storage_generation !==
+        request.source_storage_generation
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["source"],
+        message:
+          "Verification reads this operation's complete cold snapshot of the exact source generation",
+      });
+  });
+export type ArchiveVerificationRequest = z.infer<
+  typeof ArchiveVerificationRequest
+>;
+
+/** Cleanup authority for a previously dispatched scratch runtime; never authority to start one. */
+export const ArchiveVerificationCancellation = z.strictObject({
+  operation: OperationId,
+  database_id: DatabaseId,
+  source_generation: Positive,
+  source_storage_generation: Positive,
+});
+export type ArchiveVerificationCancellation = z.infer<
+  typeof ArchiveVerificationCancellation
+>;
+
+const ArchiveVerificationIdentity = z.strictObject({
+  operation: OperationId,
+  database_id: DatabaseId,
+  source_generation: Positive,
+  source_storage_generation: Positive,
+  observed_at: Timestamp,
+});
+/** Success proves recovery and absence of all operation-owned scratch resources. */
+export const ArchiveVerificationResult = z.discriminatedUnion("status", [
+  ArchiveVerificationIdentity.extend({
+    status: z.literal("verified"),
+    manifest_sha256: Sha256,
+    end: ProvenSleepRecord,
+    system_identifier: ProvenSleepRecord.shape.system_identifier,
+    timeline: ProvenSleepRecord.shape.timeline,
+    checkpoint_lsn: ProvenSleepRecord.shape.checkpoint_lsn,
+    cleaned_up: z.literal(true),
+  }),
+  ArchiveVerificationIdentity.extend({
+    status: z.literal("failed"),
+    manifest_sha256: Sha256.nullable().optional(),
+    reason: z.string().regex(/^[a-z0-9_]{1,64}$/),
+    cleaned_up: z.boolean(),
+  }),
+]);
+export type ArchiveVerificationResult = z.infer<
+  typeof ArchiveVerificationResult
+>;
+/** Source production is a different attestation from the isolated readback verification. */
+export const ColdSnapshotCaptureResult = z.discriminatedUnion("status", [
+  ArchiveVerificationIdentity.extend({
+    status: z.literal("captured"),
+    manifest_sha256: Sha256,
+    manifest_bytes: z
+      .number()
+      .int()
+      .positive()
+      .max(4 * 1024 * 1024),
+    end: ProvenSleepRecord,
+    cleaned_up: z.literal(true),
+  }),
+  ArchiveVerificationIdentity.extend({
+    status: z.literal("failed"),
+    reason: z.string().regex(/^[a-z0-9_]{1,64}$/),
+    cleaned_up: z.boolean(),
+  }),
+]);
+export type ColdSnapshotCaptureResult = z.infer<
+  typeof ColdSnapshotCaptureResult
+>;
 /**
  * How the node builds the storage generation: `create` (initdb, only onto an empty archive path),
  * `restore` (into a new database), `move` (this database's previous storage generation, to the
@@ -910,6 +1000,7 @@ export const DatabaseOrigin = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("create") }),
   z.strictObject({ kind: z.literal("restore"), source: RestoreSource }),
   z.strictObject({ kind: z.literal("move"), source: MoveSource }),
+  z.strictObject({ kind: z.literal("rehydrate"), source: ColdSnapshotSource }),
   z.strictObject({
     kind: z.literal("replace"),
     source: RestoreSource.extend({ target_time: Timestamp }),
@@ -950,6 +1041,8 @@ export const NodeDesiredDatabase = z
     route_revision: Positive,
     /** The generation of its storage and archive; each restore and move starts a new one. */
     storage_generation: Positive,
+    /** A cold target remains awake while Cloudflare completes its serving handoff. */
+    cold_snapshot_pending: z.boolean().optional(),
     pg_major: z.literal(18),
     /** The effective resources: the class's, or the database's own override. */
     resources: DatabaseEffectiveResources,
@@ -978,7 +1071,25 @@ export const NodeDesiredDatabase = z
         path: ["archive", "path"],
         message: "The archive is this database's own storage generation",
       });
-    if (db.origin && db.origin.kind !== "create") {
+    if (db.origin?.kind === "rehydrate") {
+      if (db.cold_snapshot_pending !== true)
+        ctx.addIssue({
+          code: "custom",
+          path: ["cold_snapshot_pending"],
+          message:
+            "A snapshot restore remains pending until Cloudflare completes its serving handoff",
+        });
+      if (
+        db.origin.source.database_id !== db.id ||
+        db.origin.source.source_storage_generation >= db.storage_generation
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["origin"],
+          message:
+            "Rehydration restores this database's earlier complete cold snapshot",
+        });
+    } else if (db.origin && db.origin.kind !== "create") {
       const { source } = db.origin,
         from = parseArchivePath(source.path);
       if (
@@ -1158,6 +1269,24 @@ export const NodeDesiredPage = z
     credentials_revision: Positive,
     /** Every open order, on every page. */
     orders: z.array(NodeOrder).max(NODE_ORDER_LIMIT),
+    /** Only qualified cold_storage_v2 releases receive complete stopped-source snapshot work. */
+    cold_snapshot_captures: z
+      .array(ColdSnapshotCaptureRequest)
+      .max(1)
+      .optional(),
+    cold_snapshot_capture_cancellations: z
+      .array(ArchiveVerificationCancellation)
+      .max(1)
+      .optional(),
+    archive_verifications: z
+      .array(ArchiveVerificationRequest)
+      .max(1)
+      .optional(),
+    /** Cleanup-only commands remain deliverable even when the node is fenced. */
+    archive_verification_cancellations: z
+      .array(ArchiveVerificationCancellation)
+      .max(1)
+      .optional(),
     /**
      * The probes an administrator asked for that the node has not answered, at most
      * `NODE_PROBE_REQUESTS_MAX`, oldest first; left out when there are none. They are on the first
@@ -1192,6 +1321,8 @@ export const NodeDesiredPage = z
     if (
       page.orders.some((order) => order.type === "fence") &&
       (page.databases.length > 0 ||
+        (page.cold_snapshot_captures?.length ?? 0) > 0 ||
+        (page.archive_verifications?.length ?? 0) > 0 ||
         page.release !== null ||
         page.next !== null ||
         page.orders.some(
@@ -1205,6 +1336,13 @@ export const NodeDesiredPage = z
           "A fenced node's page holds no database and no release, and only fence and superseded orders",
       });
     const operations = new Set<string>();
+    for (const capture of page.cold_snapshot_captures ?? [])
+      if (capture.source_node_id !== page.node.id)
+        ctx.addIssue({
+          code: "custom",
+          path: ["cold_snapshot_captures"],
+          message: "Only the source node captures its stopped database",
+        });
     page.orders.forEach((order, index) => {
       if (operations.has(order.operation))
         ctx.addIssue({
@@ -1260,7 +1398,22 @@ export const NODE_DATABASE_ERRORS = [
   "archive_unusable",
   "build_failed",
   "start_failed",
+  "cold_snapshot_restart_required",
+  "cold_activation_uncertain",
 ] as const;
+
+/** The exact cold image verified on the target before its first PostgreSQL start. */
+export const ColdSnapshotRestoreAttestation = z.strictObject({
+  snapshot_operation: OperationId,
+  manifest_sha256: Sha256,
+  system_identifier: ProvenSleepRecord.shape.system_identifier,
+  timeline: ProvenSleepRecord.shape.timeline,
+  checkpoint_lsn: ProvenSleepRecord.shape.checkpoint_lsn,
+  verified_at: Timestamp,
+});
+export type ColdSnapshotRestoreAttestation = z.infer<
+  typeof ColdSnapshotRestoreAttestation
+>;
 
 export const NodeDatabaseObservation = z
   .strictObject({
@@ -1291,6 +1444,10 @@ export const NodeDatabaseObservation = z
      */
     storage_bytes: Positive.optional(),
     proven_sleep: ProvenSleepRecord.nullable(),
+    /** Bound to this report's target database/generation/storage generation/operation. */
+    cold_snapshot_restore: ColdSnapshotRestoreAttestation.optional(),
+    /** The target durably applied its newer serving generation before publishing its route. */
+    cold_snapshot_serving: z.boolean().optional(),
     /**
      * A sleep this generation asked for was refused; the database stays awake and wakeable. The
      * refusal is final for that generation: the node does not retry the proof, and the database
@@ -1473,6 +1630,11 @@ export const NodeObservationReport = z
       .array(NodeDatabaseObservation)
       .max(NODE_DESIRED_PAGE_LIMIT_MAX),
     orders: z.array(NodeOrderResult).max(NODE_ORDER_LIMIT),
+    archive_verifications: z.array(ArchiveVerificationResult).max(1).optional(),
+    cold_snapshot_captures: z
+      .array(ColdSnapshotCaptureResult)
+      .max(1)
+      .optional(),
     events: z.array(NodeReportEvent).max(NODE_REPORT_EVENTS_MAX).optional(),
   })
   .refine(
@@ -1551,6 +1713,8 @@ export const NodeSample = z
     }),
     /** Every database whose unit is active or starting. */
     awake: z.array(DatabaseId).max(NODE_AWAKE_LIMIT),
+    /** Awake isolated verification runtimes: physical usage counts, serving-database counts do not. */
+    verification_runtime_ids: z.array(DatabaseId).max(1).optional(),
     /** The memory sizes of the awake databases added up: their reservations. */
     awake_memory_mib: Count,
     /** How many of the awake databases are not ready yet. */
@@ -1560,13 +1724,24 @@ export const NodeSample = z
     /** The `NodeCredentials` revision the node applied; null before its first read. */
     credentials_revision: Positive.nullable(),
     /** Diagnostic copy of the binary capabilities; the connection hello is authoritative. */
-    capabilities: z.array(z.literal("restore_in_place_v1")).max(1).optional(),
+    capabilities: z
+      .array(z.enum(["restore_in_place_v1", "cold_storage_v2"]))
+      .max(2)
+      .optional(),
   })
   .superRefine((sample, ctx) => {
     const issue = (message: string) =>
       ctx.addIssue({ code: "custom", message });
     if (sample.memory.available_bytes > sample.memory.total_bytes)
       issue("Available memory cannot exceed the total");
+    if (
+      new Set(sample.verification_runtime_ids ?? []).size !==
+        (sample.verification_runtime_ids?.length ?? 0) ||
+      (sample.verification_runtime_ids ?? []).some(
+        (id) => !sample.awake.includes(id),
+      )
+    )
+      issue("Verification runtimes are unique members of the awake inventory");
     if (sample.cpu.busy_millicores > sample.cpu.cores * 1000)
       issue("Busy CPU cannot exceed the cores");
     if (
@@ -2038,7 +2213,10 @@ export const AgentLinkMessage = z.discriminatedUnion("type", [
     release_id: FleetReleaseId.nullable(),
     os: NodeOs,
     /** Authoritative capabilities of this binary/connection, accepted before new agents send them. */
-    capabilities: z.array(z.literal("restore_in_place_v1")).max(1).optional(),
+    capabilities: z
+      .array(z.enum(["restore_in_place_v1", "cold_storage_v2"]))
+      .max(2)
+      .optional(),
   }),
   z.strictObject({ type: z.literal("sample"), sample: NodeSample }),
 ]);

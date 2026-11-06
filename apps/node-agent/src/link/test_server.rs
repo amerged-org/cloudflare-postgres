@@ -116,6 +116,8 @@ pub struct Seen {
     pub method: String,
     pub target: String,
     pub body: Value,
+    pub body_bytes: Vec<u8>,
+    pub content_type: Option<String>,
     /// Whether its signature verified (`None` for the enrollment, which is unsigned).
     pub signed: Option<Result<(), &'static str>>,
     pub status: u16,
@@ -563,6 +565,16 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
     if inner.fenced && !(is("desired") || is("observations")) {
         return answer(403, json!({"error":"node_fenced"}));
     }
+    if method == "GET" && path.starts_with("/node/v1/cold-snapshots/") {
+        return match inner.files.get(target) {
+            Some(bytes) => Answer {
+                status: 200,
+                body: Value::Null,
+                raw: Some(bytes.clone()),
+            },
+            None => answer(404, error("not_found")),
+        };
+    }
     let post = |schema: &str| {
         if method != "POST" || !contract_valid(schema, body) {
             return answer(400, error("invalid_request"));
@@ -734,6 +746,8 @@ async fn serve(
             method: request.method.clone(),
             target: request.target.clone(),
             body: body.clone(),
+            body_bytes: request.body.clone(),
+            content_type: request.header("content-type").map(str::to_string),
             signed,
             status,
         });

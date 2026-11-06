@@ -54,15 +54,25 @@ const iso = (ms: number) => new Date(ms).toISOString();
 const stagedSql = `EXISTS(SELECT 1 FROM database_moves m WHERE m.database_id=d.id AND m.status='restoring'
     AND m.target_node_id=n.id AND m.target_archive_path=?) OR EXISTS(SELECT 1 FROM database_replacements p
     WHERE p.database_id=d.id AND p.node_id=n.id AND ((p.phase='restoring' AND p.target_archive_path=?)
-      OR (p.phase='rolling_back' AND p.rollback_archive_path=?)))`;
+      OR (p.phase='rolling_back' AND p.rollback_archive_path=?)))
+    OR EXISTS(SELECT 1 FROM database_cold_storage cs WHERE cs.database_id=d.id AND cs.phase IN('restoring','activating')
+      AND cs.target_node_id=n.id AND cs.target_archive_path=?)`;
+// The source still appears on its node's desired page while verification holds it asleep.
+// Permit credential recovery after a restart until the durable retirement boundary, when the
+// source disappears from ordinary desired state and must never receive another write grant.
+const sourceWritableSql = `(d.storage_residency='local' OR (d.storage_residency='archiving'
+  AND EXISTS(SELECT 1 FROM database_cold_storage cs WHERE cs.operation=d.storage_operation_id
+    AND cs.database_id=d.id AND cs.phase IN('capturing','verifying','cancelling') AND cs.source_node_id=d.node_id
+    AND cs.source_generation=d.generation AND cs.source_storage_generation=d.storage_generation AND cs.source_archive_path=d.archive_path)))`;
 const guardSql = `n.id=? AND n.region_id=? AND n.lost_at IS NULL
   AND NOT EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=n.id)
-  AND (?='read_only' OR (d.node_id=n.id AND d.archive_path=?) OR ${stagedSql})`;
+  AND (?='read_only' OR (d.node_id=n.id AND d.archive_path=? AND ${sourceWritableSql}) OR ${stagedSql})`;
 function guardBindings(scope: ArchiveCredentialScope, region: string) {
   return [
     scope.nodeId,
     region,
     scope.access,
+    scope.archivePath,
     scope.archivePath,
     scope.archivePath,
     scope.archivePath,
@@ -229,6 +239,7 @@ interface DeliveryRow {
   expires_at: string;
   database_node_id: string | null;
   database_archive_path: string;
+  source_writable: number;
   lost: number;
   /** The node is the target of a move that restores onto this path now. */
   staged: number;
@@ -250,13 +261,15 @@ export async function deliverArchiveCredential(
 ): Promise<ArchiveCredential | null> {
   const row = await env.DB.prepare(
     `SELECT c.id,c.node_id,c.archive_path,c.access,c.expires_at,
-      d.node_id database_node_id,d.archive_path database_archive_path,
+      d.node_id database_node_id,d.archive_path database_archive_path,CASE WHEN ${sourceWritableSql} THEN 1 ELSE 0 END source_writable,
       CASE WHEN n.lost_at IS NOT NULL OR EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=n.id) THEN 1 ELSE 0 END lost,
       CASE WHEN EXISTS(SELECT 1 FROM database_moves m WHERE m.database_id=c.database_id AND m.status='restoring'
         AND m.target_node_id=c.node_id AND m.target_archive_path=c.archive_path)
         OR EXISTS(SELECT 1 FROM database_replacements p WHERE p.database_id=c.database_id AND p.node_id=c.node_id
           AND ((p.phase='restoring' AND p.target_archive_path=c.archive_path)
-            OR (p.phase='rolling_back' AND p.rollback_archive_path=c.archive_path))) THEN 1 ELSE 0 END staged
+            OR (p.phase='rolling_back' AND p.rollback_archive_path=c.archive_path)))
+        OR EXISTS(SELECT 1 FROM database_cold_storage cs WHERE cs.database_id=c.database_id AND cs.phase IN('restoring','activating')
+          AND cs.target_node_id=c.node_id AND cs.target_archive_path=c.archive_path) THEN 1 ELSE 0 END staged
       FROM archive_credentials c JOIN nodes n ON n.id=c.node_id
       JOIN databases d ON d.id=c.database_id WHERE c.id=? AND c.node_id=?`,
   )
@@ -268,7 +281,8 @@ export async function deliverArchiveCredential(
     row.lost === 1 ||
     (row.access === "read_write" &&
       row.staged === 0 &&
-      (row.database_node_id !== row.node_id ||
+      (row.source_writable !== 1 ||
+        row.database_node_id !== row.node_id ||
         row.database_archive_path !== row.archive_path))
   )
     return null;

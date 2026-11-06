@@ -80,6 +80,7 @@ pub(crate) struct Rig {
     pub core: Arc<Core<Local>>,
     pub machine: Arc<Local>,
     pub fixture: Arc<Fixture>,
+    pub cold_store: Arc<crate::archive::cold_snapshot_test_store::MemoryStore>,
     pub table: Arc<Table>,
     pub gateway: Arc<Feed>,
     pub early: UnboundedReceiver<EarlySleep>,
@@ -331,8 +332,11 @@ impl Rig {
             },
             running,
         );
+        let cold_store = Arc::new(crate::archive::cold_snapshot_test_store::MemoryStore::default());
+        core.set_cold_snapshot_store(cold_store.clone());
         Self {
             core,
+            cold_store,
             machine,
             fixture,
             table,
@@ -375,6 +379,7 @@ impl Rig {
         );
         let timing = self.core.timing.clone();
         let prefetch = self.core.prefetch;
+        let cold_store = self.cold_store.clone();
         drop(self);
         // The agent's mount namespace ends with it: the volumes are mounted again by the next
         // one, which the units that run do not wait for. What it kept of the slots is gone too.
@@ -382,7 +387,10 @@ impl Rig {
         machine.adopt_slots().await.unwrap();
         // The old sockets close with the old tasks.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        Self::boot(machine, fixture, root, running, timing, prefetch).await
+        let mut rig = Self::boot(machine, fixture, root, running, timing, prefetch).await;
+        rig.core.set_cold_snapshot_store(cold_store.clone());
+        rig.cold_store = cold_store;
+        rig
     }
 
     /// A page entry for a new database with the roles `app` and `reader`; the archive credential
@@ -415,6 +423,10 @@ impl Rig {
             credentials_revision: 1,
             orders,
             diagnostics: Vec::new(),
+            archive_verifications: Vec::new(),
+            archive_verification_cancellations: Vec::new(),
+            cold_snapshot_captures: Vec::new(),
+            cold_snapshot_capture_cancellations: Vec::new(),
             databases,
             complete: true,
         }

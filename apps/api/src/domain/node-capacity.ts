@@ -53,7 +53,7 @@ export async function placePendingDatabases(
       `SELECT d.*,(SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.project_id=d.project_id
         AND o.kind IN('database.create','database.restore') AND o.status='pending' ORDER BY o.created_at,o.id LIMIT 1) startup_operation_id
       FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
-    WHERE d.region_id=? AND d.node_id IS NULL AND d.desired_state='running' AND d.deleted_at IS NULL
+    WHERE d.region_id=? AND d.node_id IS NULL AND d.storage_residency='local' AND d.desired_state='running' AND d.deleted_at IS NULL
     AND EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.project_id=d.project_id
       AND o.kind IN('database.create','database.restore') AND o.status='pending') ORDER BY d.created_at,d.id LIMIT ?`,
     )
@@ -103,7 +103,7 @@ export async function placePendingDatabases(
       db
         .prepare(
           `UPDATE databases SET node_id=?,placed_at=?,status_message=NULL,updated_at=?
-        WHERE (id=? AND project_id=? AND region_id=? AND node_id IS NULL AND generation=? AND updated_at=?)
+        WHERE (id=? AND project_id=? AND region_id=? AND node_id IS NULL AND storage_residency='local' AND generation=? AND updated_at=?)
         AND (desired_state='running' AND deleted_at IS NULL AND size_class_id=?)
         AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
         AND EXISTS(SELECT 1 FROM operations o WHERE o.id=? AND o.database_id=databases.id AND o.project_id=databases.project_id
@@ -227,7 +227,7 @@ export async function runNodeCapacity(
   }
   const waiting = await env.DB.prepare(
     `SELECT d.* FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
-    WHERE d.region_id=? AND d.node_id IS NULL AND d.desired_state='running' AND d.deleted_at IS NULL ORDER BY d.created_at,d.id LIMIT 1`,
+    WHERE d.region_id=? AND d.node_id IS NULL AND (d.storage_residency='local' OR (d.storage_residency='restoring' AND EXISTS(SELECT 1 FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase='waiting_capacity'))) AND d.desired_state='running' AND d.deleted_at IS NULL ORDER BY d.created_at,d.id LIMIT 1`,
   )
     .bind(regionId)
     .first<DatabaseRow>();

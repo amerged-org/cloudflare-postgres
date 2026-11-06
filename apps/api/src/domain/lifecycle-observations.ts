@@ -2,6 +2,10 @@
 import type { NodeObservationReport } from "@pgcf/contracts";
 import type { Env } from "../env.ts";
 import { progressMoves } from "./database-moves.ts";
+import {
+  progressColdStorage,
+  acknowledgeColdStorageCleanup,
+} from "./cold-storage.ts";
 import { progressReplacements } from "./database-replacements.ts";
 import { isNodeFenced, recordOrderResults } from "./lifecycle-orders.ts";
 import { hintNode } from "./node-hints.ts";
@@ -29,7 +33,11 @@ export async function applyLifecycleObservations(
   // The node refuses wakes until it pulls a whole page without the order; it would wait for its
   // next full pull.
   if (maintenanceEnded) await hintNode(env, nodeId).catch(() => 0);
-  if (await isNodeFenced(env.DB, nodeId)) return taken;
+  if (await isNodeFenced(env.DB, nodeId)) {
+    await acknowledgeColdStorageCleanup(env, nodeId, report, now);
+    return taken;
+  }
+  await progressColdStorage(env, nodeId, report, now);
   await progressReplacements(env, nodeId, report, now);
   await progressMoves(env, nodeId, report, now);
   await recordRecoveryPoints(env.DB, nodeId, report, now);

@@ -12,12 +12,8 @@
  * list only makes the new value a deliberate line: the node refuses a page with a value outside
  * these sets, and the API deploys before the nodes.
  */
+// Complete cold snapshots replace the undeployed Barman-only candidate; qualified with cold_storage_v2.
 export const NODE_CLOSED_SETS: Record<string, (string | number | boolean)[]> = {
-  "NodeDesiredPage.databases[].origin|kind=replace_rollback.kind": [
-    "replace_rollback",
-  ],
-  // Emitted only for an advertised restore_in_place_v1 capability.
-  "NodeDesiredPage.databases[].origin|kind=replace.kind": ["replace"],
   "ArchiveCredential.access": ["read_only", "read_write"],
   "NodeDesiredPage.release|0.os.host_files[]|kind=file.kind": ["file"],
   "NodeDesiredPage.release|0.os.host_files[]|kind=symlink-to-dev-null.kind": [
@@ -52,6 +48,11 @@ export const NODE_CLOSED_SETS: Record<string, (string | number | boolean)[]> = {
   "NodeDesiredPage.databases[].origin|kind=create.kind": ["create"],
   "NodeDesiredPage.databases[].origin|kind=restore.kind": ["restore"],
   "NodeDesiredPage.databases[].origin|kind=move.kind": ["move"],
+  "NodeDesiredPage.databases[].origin|kind=rehydrate.kind": ["rehydrate"],
+  "NodeDesiredPage.databases[].origin|kind=replace.kind": ["replace"],
+  "NodeDesiredPage.databases[].origin|kind=replace_rollback.kind": [
+    "replace_rollback",
+  ],
   "NodeObservationAnswer.databases[].verdict": ["accept", "conflict", "stale"],
   "NodeFencedResponse.error": ["node_fenced"],
   "ServerLinkMessage|type=welcome.type": ["welcome"],

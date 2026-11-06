@@ -100,6 +100,11 @@ pub fn contract_valid(name: &str, value: &Value) -> bool {
     schema_valid(name, value)
         && match name {
             "NodeDesiredPage" => page_rules(value),
+            "ArchiveVerificationRequest" => verification_request_rules(value),
+            "ColdSnapshotManifest" => {
+                serde_json::from_value::<crate::archive::cold_snapshot::Manifest>(value.clone())
+                    .is_ok_and(|manifest| manifest.validate().is_ok())
+            }
             "NodeEnrollmentRequest" => public_key_canonical(&value["public_key"]),
             "NodeObservationReport" => observation_rules(value),
             "AgentLinkMessage" => value["type"] != "sample" || sample_rules(&value["sample"]),
@@ -206,6 +211,10 @@ fn sample_rules(sample: &Value) -> bool {
                 && (archive["oldest_ready_seconds"].is_null()
                     || archive["ready_files"].as_u64().unwrap_or(0) > 0)
                 && unique(awake, Value::as_str)
+                && unique(array(&sample["verification_runtime_ids"]), Value::as_str)
+                && array(&sample["verification_runtime_ids"])
+                    .iter()
+                    .all(|runtime| awake.contains(runtime))
                 && usize::try_from(number(&sample["starting"])?).ok()? <= awake.len(),
         )
     };
@@ -376,8 +385,24 @@ pub fn event_valid(event: &Value) -> bool {
     contract_valid("NodeEventReport", &serde_json::json!({"events": [event]}))
 }
 
+fn verification_request_rules(request: &Value) -> bool {
+    let source = &request["source"];
+    source["database_id"] == request["database_id"]
+        && source["snapshot_operation"] == request["operation"]
+        && source["source_generation"] == request["source_generation"]
+        && source["source_storage_generation"] == request["source_storage_generation"]
+}
+
 fn page_rules(page: &Value) -> bool {
     let region = page["node"]["region_id"].as_str();
+    let verifications = array(&page["archive_verifications"]);
+    if !verifications.iter().all(verification_request_rules)
+        || array(&page["cold_snapshot_captures"])
+            .iter()
+            .any(|capture| capture["source_node_id"] != page["node"]["id"])
+    {
+        return false;
+    }
     let mut served: HashMap<&str, u64> = HashMap::new();
     for db in page["databases"].as_array().into_iter().flatten() {
         let (Some(id), Some(storage)) = (db["id"].as_str(), db["storage_generation"].as_u64())
@@ -394,6 +419,7 @@ fn page_rules(page: &Value) -> bool {
             || archive.generation != storage
             || Some(archive.region) != region
             || !origin_valid(&db["origin"], id, storage)
+            || (db["origin"]["kind"] == "rehydrate" && db["cold_snapshot_pending"] != true)
             || !roles_valid(db)
         {
             return false;
@@ -402,7 +428,9 @@ fn page_rules(page: &Value) -> bool {
     let orders = page["orders"].as_array().into_iter().flatten();
     // A fenced node's page holds no database and no release, and only fence and superseded orders.
     if orders.clone().any(|order| order["type"] == "fence")
-        && (!served.is_empty()
+        && (!array(&page["cold_snapshot_captures"]).is_empty()
+            || !verifications.is_empty()
+            || !served.is_empty()
             || !page["release"].is_null()
             || !page["next"].is_null()
             || orders
@@ -443,6 +471,15 @@ fn origin_valid(origin: &Value, id: &str, storage: u64) -> bool {
     let Some(source_id) = source["database_id"].as_str() else {
         return false;
     };
+    if kind == Some("rehydrate") {
+        return source_id == id
+            && source["source_storage_generation"]
+                .as_u64()
+                .is_some_and(|generation| generation < storage)
+            && source.get("path").is_none()
+            && source.get("target_time").is_none()
+            && source.get("credential").is_none();
+    }
     let Some(from) = source["path"].as_str().and_then(archive_path) else {
         return false;
     };

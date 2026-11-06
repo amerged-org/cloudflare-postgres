@@ -17,6 +17,7 @@ import { recoverFailedResume, recoverQuiescence } from "./lifecycle.ts";
 import { powerTransitionStatements } from "./power-transition.ts";
 import { hintDatabases } from "./node-hints.ts";
 import { applyLifecycleObservations } from "./lifecycle-observations.ts";
+import { coldStorageObservationAllowed } from "./cold-storage.ts";
 import { USAGE_SNAPSHOT_SQL } from "./resources.ts";
 import {
   ADMISSION_PUBLISH_ANSWER_MS,
@@ -79,7 +80,8 @@ const REFUSAL_RECOVERY = {
  * that report runs, and no other writer does.
  */
 const SLEEP_EVENT = `EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.generation=d.generation AND e.kind IN('suspended','hibernated'))`;
-const OPERATION_OF_GENERATION = `COALESCE((SELECT rp.operation FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase='proving'),
+const OPERATION_OF_GENERATION = `COALESCE((SELECT c.operation FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase IN('activating','succeeded') AND c.target_serving_generation=d.generation),
+  (SELECT rp.operation FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase='proving'),
   (SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
   ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1))`;
 
@@ -597,6 +599,7 @@ async function applyObservation(
              observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,
              runtime_json=CASE WHEN ?='ready' THEN ? ELSE NULL END,
              proven_sleep_json=CASE WHEN ?='asleep' THEN ? ELSE proven_sleep_json END,
+             sleep_since=CASE WHEN ?='ready' THEN NULL WHEN ?='asleep' THEN CASE WHEN proven_sleep_json IS ? THEN COALESCE(sleep_since,?) ELSE ? END ELSE sleep_since END,
              status_message=?,archiving_health=?,archiving_health_since=?,
              backup_observed_at=?,backup_health=?,backup_last_completed_at=?,
              observed_storage_bytes=COALESCE(?,observed_storage_bytes),updated_at=?
@@ -613,6 +616,11 @@ async function applyObservation(
           set.runtime,
           observation.state,
           JSON.stringify(observation.proven_sleep),
+          observation.state,
+          observation.state,
+          JSON.stringify(observation.proven_sleep),
+          observation.proven_sleep?.proven_at ?? null,
+          observation.proven_sleep?.proven_at ?? null,
           columns.message,
           columns.health,
           columns.since,
@@ -841,11 +849,14 @@ async function idleSleep(
       statements.list.push(
         env.DB.prepare(
           `UPDATE databases SET observed_state='provisioning',observed_power='hibernated',observed_generation=generation,
-             runtime_json=NULL,proven_sleep_json=?,status_message=?,archiving_health=?,archiving_health_since=?,
+             runtime_json=NULL,proven_sleep_json=?,sleep_since=CASE WHEN proven_sleep_json IS ? THEN COALESCE(sleep_since,?) ELSE ? END,status_message=?,archiving_health=?,archiving_health_since=?,
              backup_observed_at=?,backup_health=?,backup_last_completed_at=?
            WHERE id=? AND node_id=? AND generation=? AND updated_at=? AND power_operation=? AND desired_state='suspended'`,
         ).bind(
           JSON.stringify(observation.proven_sleep),
+          JSON.stringify(observation.proven_sleep),
+          observation.proven_sleep?.proven_at ?? null,
+          observation.proven_sleep?.proven_at ?? null,
           columns.message,
           columns.health,
           columns.since,
@@ -893,6 +904,11 @@ async function takeObservation(
   let row = await readRow(env, observation.id, node.id);
   // A database this node does not serve is not this node's to report.
   if (row === null) return "stale";
+  if (
+    row.storage_residency === "restoring" &&
+    !(await coldStorageObservationAllowed(env, node.id, observation))
+  )
+    return "conflict";
   const desired = () => ({
     generation: row!.generation,
     operation: row!.operation,

@@ -6,7 +6,7 @@
 use crate::{
     Error,
     admission::Running,
-    agent::{Core, Entry, Origin, Parts, Policy, Retry, Timing},
+    agent::{Core, Entry, Origin, Parts, Policy, Retry, Timing, VerificationCancellation},
     api::Refusal,
     archive::{
         facts,
@@ -155,6 +155,11 @@ pub struct Service<M: Machine> {
     verdict: Mutex<Option<(update::Release, Result<(), update::ReleaseRefusal>)>>,
     /// The probes an administrator asked for that the agent has answered or is running (SEC-09).
     probes: probe::Answered,
+    /// At most one scratch restore runs on this node. Complete desired pages cancel removed tasks.
+    archive_verifications: Mutex<HashMap<String, Arc<VerificationCancellation>>>,
+    archive_verification_slot: Semaphore,
+    desired_archive_verifications: Mutex<HashSet<String>>,
+    desired_cold_snapshot_captures: Mutex<HashSet<String>>,
     /// The databases whose page a wake waits for (`catch_up`), which `wanted_pulls` pulls together.
     wanted: Mutex<BTreeSet<String>>,
     wanted_signal: Notify,
@@ -220,7 +225,7 @@ fn credential_ids(entry: &Entry) -> Vec<String> {
             | Origin::Replace(source, _, _)
             | Origin::ReplaceRollback(source, _, _, _),
         ) => ids.push(source.credential_id.clone()),
-        Some(Origin::Create) | None => {}
+        Some(Origin::Create | Origin::Rehydrate(_)) | None => {}
     }
     ids
 }
@@ -372,6 +377,7 @@ impl<M: Machine> Service<M> {
             },
             running,
         );
+        core.set_cold_snapshot_store(Arc::new(link.clone()));
         let service = Arc::new(Self {
             core: core.clone(),
             link,
@@ -390,6 +396,10 @@ impl<M: Machine> Service<M> {
             release_key: config.release_key,
             verdict: Mutex::new(None),
             probes: probe::Answered::load(layout.agent().join("probes-done")),
+            archive_verifications: Mutex::new(HashMap::new()),
+            archive_verification_slot: Semaphore::new(1),
+            desired_archive_verifications: Mutex::new(HashSet::new()),
+            desired_cold_snapshot_captures: Mutex::new(HashSet::new()),
             wanted: Mutex::new(BTreeSet::new()),
             wanted_signal: Notify::new(),
             updating: AtomicBool::new(false),
@@ -612,21 +622,271 @@ impl<M: Machine> Service<M> {
     /// (`Core::deliver`), those first (`wanted_credentials`), and a build waits for its own and
     /// begins when it arrives (`Core::build`, `Core::deliver`).
     async fn pull_page(self: &Arc<Self>, page: Page, first: bool) {
+        self.cancel_archive_verifications(&page);
         if first {
             self.core.apply(&page).await;
             crate::timing::phase("apply");
             let (service, credentials_page) = (self.clone(), page.clone());
             self.spawn(async move {
                 service.read_credentials(&credentials_page).await;
+                service.answer_archive_verifications(&credentials_page);
                 // Beside the row: it ends when the reads do, whatever the start has reached.
                 crate::timing::phase_once("credentials");
             });
         } else {
             self.read_credentials(&page).await;
             self.core.apply(&page).await;
+            self.answer_archive_verifications(&page);
         }
         self.answer_probes(&page);
         self.consider_update(&page.release);
+    }
+
+    fn cancel_archive_verifications(&self, page: &Page) {
+        for cancellation in &page.cold_snapshot_capture_cancellations {
+            let _ = self.core.record_cold_capture_cancellation(cancellation);
+            if let Some(operation) = cancellation["operation"].as_str()
+                && let Some(running) = self
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&format!("capture:{operation}"))
+            {
+                running.cancel();
+            }
+        }
+        for cancellation in &page.archive_verification_cancellations {
+            let _ = self.core.record_archive_cancellation(cancellation);
+            if let Some(operation) = cancellation["operation"].as_str()
+                && let Some(running) = self
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(operation)
+            {
+                running.cancel();
+            }
+        }
+        if !page.complete {
+            return;
+        }
+        *self
+            .desired_cold_snapshot_captures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = page
+            .cold_snapshot_captures
+            .iter()
+            .filter_map(|value| value["operation"].as_str().map(str::to_string))
+            .collect();
+        let active: HashSet<&str> = page
+            .archive_verifications
+            .iter()
+            .filter_map(|v| v["operation"].as_str())
+            .collect();
+        *self
+            .desired_archive_verifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            active.iter().map(|value| (*value).to_string()).collect();
+        for (operation, cancellation) in self
+            .archive_verifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            // Capture disappearance can mean seal succeeded; only its explicit cancellation
+            // ends a running producer. Verification disappearance still cancels scratch work.
+            if !operation.starts_with("capture:") && !active.contains(operation.as_str()) {
+                cancellation.cancel();
+            }
+        }
+    }
+
+    fn answer_archive_verifications(self: &Arc<Self>, page: &Page) {
+        if page.complete {
+            let service = self.clone();
+            self.spawn(async move {
+                let Ok(_slot) = service.archive_verification_slot.acquire().await else {
+                    return;
+                };
+                let active = service
+                    .desired_archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let running = service
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .keys()
+                    .cloned()
+                    .collect();
+                service
+                    .core
+                    .cleanup_archive_verifications(&active, &running)
+                    .await;
+                let captures = service
+                    .desired_cold_snapshot_captures
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                service
+                    .core
+                    .resend_cold_capture_receipts(&captures, &running);
+            });
+        }
+        for cancellation in &page.cold_snapshot_capture_cancellations {
+            let Some(operation) = cancellation["operation"].as_str() else {
+                continue;
+            };
+            let key = format!("capture-cancel:{operation}");
+            {
+                let mut running = self
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if running.contains_key(&key) {
+                    continue;
+                }
+                running.insert(key.clone(), Arc::new(VerificationCancellation::default()));
+            }
+            let service = self.clone();
+            let cancellation = cancellation.clone();
+            self.spawn(async move {
+                let Ok(_slot) = service.archive_verification_slot.acquire().await else {
+                    return;
+                };
+                let result = service.core.cancel_cold_snapshot_capture(&cancellation);
+                service.core.report_cold_snapshot_capture(result);
+                service
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
+            });
+        }
+        for request in &page.cold_snapshot_captures {
+            let Some(operation) = request["operation"].as_str() else {
+                continue;
+            };
+            if !self
+                .desired_cold_snapshot_captures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(operation)
+            {
+                continue;
+            }
+            let key = format!("capture:{operation}");
+            let cancellation = Arc::new(VerificationCancellation::default());
+            {
+                let mut running = self
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if running.contains_key(&key) {
+                    continue;
+                }
+                running.insert(key.clone(), cancellation.clone());
+            }
+            let service = self.clone();
+            let request = request.clone();
+            self.spawn(async move {
+                let Ok(_slot) = service.archive_verification_slot.acquire().await else {
+                    return;
+                };
+                let result = service
+                    .core
+                    .capture_cold_snapshot(&request, &service.link.node().id, &cancellation)
+                    .await;
+                if !result.is_null() {
+                    service.core.report_cold_snapshot_capture(result);
+                }
+                service
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
+            });
+        }
+        for cancellation in &page.archive_verification_cancellations {
+            let Some(operation) = cancellation["operation"].as_str() else {
+                continue;
+            };
+            let key = format!("cancel:{operation}");
+            {
+                let mut running = self
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if running.contains_key(&key) {
+                    continue;
+                }
+                running.insert(key.clone(), Arc::new(VerificationCancellation::default()));
+            }
+            let service = self.clone();
+            let cancellation = cancellation.clone();
+            self.spawn(async move {
+                let Ok(_slot) = service.archive_verification_slot.acquire().await else {
+                    return;
+                };
+                let result = service
+                    .core
+                    .cancel_archive_verification(&cancellation)
+                    .await;
+                service.core.report_archive_verification(result);
+                service
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
+            });
+        }
+        for request in &page.archive_verifications {
+            let Some(operation) = request["operation"].as_str().map(str::to_string) else {
+                continue;
+            };
+            if !self
+                .desired_archive_verifications
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&operation)
+            {
+                continue;
+            }
+            let cancellation = Arc::new(VerificationCancellation::default());
+            {
+                let mut running = self
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if running.contains_key(&operation) {
+                    continue;
+                }
+                running.insert(operation.clone(), cancellation.clone());
+            }
+            let service = self.clone();
+            let request = request.clone();
+            self.spawn(async move {
+                let Ok(_slot) = service.archive_verification_slot.acquire().await else {
+                    return;
+                };
+                let local =
+                    request["source_node_id"].as_str() == Some(service.link.node().id.as_str());
+                let result = service
+                    .core
+                    .verify_archive(&request, local, &cancellation)
+                    .await;
+                if !result.is_null() {
+                    service.core.report_archive_verification(result);
+                }
+                service
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&operation);
+            });
+        }
     }
 
     /// The probes an administrator asked for (SEC-09): each request of the page that the agent has
@@ -1410,7 +1670,7 @@ impl<M: Machine> Service<M> {
                 inventory.volumes.iter().filter(|v| v.mounted()).count() as u64,
             )
         });
-        let sample = node_sample(&Inputs {
+        let mut sample = node_sample(&Inputs {
             now_ms: crate::agent::now_ms(),
             memory,
             busy_millicores: busy,
@@ -1431,6 +1691,10 @@ impl<M: Machine> Service<M> {
                 .as_ref()
                 .map(|applied| applied.revision),
         });
+        let verification_runtime_ids = self.core.verification_runtime_ids(&awake.awake);
+        if !verification_runtime_ids.is_empty() {
+            sample["verification_runtime_ids"] = json!(verification_runtime_ids);
+        }
         if let Err(error) = self.link.post_samples(&sample).await {
             crate::timing::emit_event(json!({
                 "event": "sample_not_posted", "class": crate::diagnostics::error_code(&error),

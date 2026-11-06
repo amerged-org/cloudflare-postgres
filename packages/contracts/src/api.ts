@@ -30,7 +30,7 @@ export { Timestamp, roleExpiryInstant } from "./timestamp.ts";
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.6.0";
+export const API_CONTRACT_VERSION = "1.7.0";
 
 /** The pattern of `Timestamp` in the contract's own JSON Schema, which the OpenAPI generator drops. */
 export const TIMESTAMP_PATTERN: string = (() => {
@@ -410,6 +410,45 @@ const DatabaseSleepAfter = z
     "The database's own idle time before it sleeps, 60 to 900 s; null when its size class's applies.",
   );
 
+export const STORAGE_RESIDENCIES = [
+  "local",
+  "archiving",
+  "archived",
+  "restoring",
+] as const;
+export const StorageResidency = z.enum(STORAGE_RESIDENCIES);
+export type StorageResidency = z.infer<typeof StorageResidency>;
+
+/** Equal for every integrator's billing tier; this is a physical storage policy. */
+export const COLD_STORAGE_SLEEP_SECONDS = 21 * 86_400;
+
+/** Ledger accounting of complete cold images and partial uploads; not a fresh R2 listing. */
+export const ColdSnapshotStorage = z
+  .strictObject({
+    payload_bytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER)
+      .nullable(),
+    retained_payload_bytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER)
+      .nullable(),
+    accounted_at: z
+      .union([Timestamp, z.null()])
+      .describe(
+        "Newest persisted fact used in this ledger total; null when no snapshot exists. This is not the time of an R2 inventory read.",
+      ),
+    gaps: z.array(
+      z.enum(["upload_pending", "retirement_pending", "metadata_incomplete"]),
+    ),
+  })
+  .meta({ id: "ColdSnapshotStorage" });
+export type ColdSnapshotStorage = z.infer<typeof ColdSnapshotStorage>;
+
 export const Database = z
   .strictObject({
     id: DatabaseId,
@@ -436,6 +475,19 @@ export const Database = z
     suspension_reason: z.enum(["manual", "idle"]).nullable().optional(),
     generation: z.number().int().min(1),
     storage_generation: z.number().int().positive().optional(),
+    storage_residency: StorageResidency.optional().describe(
+      "Where the durable database lives. Archived databases retain their identity and restore from R2 before serving requests.",
+    ),
+    sleep_since: Timestamp.nullable()
+      .optional()
+      .describe(
+        "Start of the current confirmed continuous sleep; unrelated metadata changes do not reset it.",
+      ),
+    // A union keeps the shared OperationId component non-nullable for every other use.
+    storage_operation_id: z.union([OperationId, z.null()]).optional(),
+    cold_snapshot_storage: ColdSnapshotStorage.optional().describe(
+      "Ledger-accounted cold-snapshot payload and manifest bytes, including current, retained and partial copies. Unknown totals are null with explicit gaps; zero-byte retirement fences count as zero. This is separate from local volume storage and normal Barman backup usage.",
+    ),
     observed_generation: z.number().int().min(0),
     status_message: z.string().max(TEXT_MAX_LENGTH).nullable(),
     health: DatabaseHealth,
@@ -711,6 +763,8 @@ export const OPERATION_KINDS = [
   "database.hibernate",
   "database.wake",
   "database.role.delete",
+  "database.archive",
+  "database.rehydrate",
 ] as const;
 export const OperationKind = z
   .enum(OPERATION_KINDS)

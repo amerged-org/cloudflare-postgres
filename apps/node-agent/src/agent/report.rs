@@ -84,6 +84,8 @@ pub(crate) struct Reports {
     held: HashMap<String, Held>,
     /// How the orders ended, until Cloudflare answered.
     orders: BTreeMap<String, Value>,
+    archive_verifications: BTreeMap<String, Value>,
+    cold_snapshot_captures: BTreeMap<String, Value>,
     /// Events not yet queued for delivery.
     events: Vec<Value>,
     /// How many databases the next report carries: `DATABASES_PER_REPORT`, halved by each post that
@@ -96,6 +98,8 @@ impl Default for Reports {
             observations: BTreeMap::new(),
             held: HashMap::new(),
             orders: BTreeMap::new(),
+            archive_verifications: BTreeMap::new(),
+            cold_snapshot_captures: BTreeMap::new(),
             events: Vec::new(),
             limit: DATABASES_PER_REPORT,
         }
@@ -201,8 +205,11 @@ impl<M: Machine> Core<M> {
     /// to give: the page has not named it, a wake is under way, the unit of a ready database is
     /// not known, or the size of the filesystem of a ready or sleeping one has not been read.
     fn observe(&self, db: &Db, view: &View) -> Option<Value> {
+        if view.acceptance_pending {
+            return None;
+        }
         let entry = view.entry.as_ref()?;
-        let (state, error) = match view.phase {
+        let (mut state, error) = match view.phase {
             Phase::Building => ("building", None),
             // A build the node has not begun, because it waits for a credential (the agent has
             // read the state file of the build that a restart cut off, and no more), has nothing
@@ -220,11 +227,24 @@ impl<M: Machine> Core<M> {
             // A wake under way and a retired generation have nothing to report.
             Phase::Starting | Phase::Retired => return None,
         };
+        if state == "ready"
+            && entry.cold_snapshot_pending
+            && entry.origin.is_none()
+            && !view
+                .state
+                .as_ref()
+                .is_some_and(|state| state.cold_snapshot_serving)
+        {
+            state = "building";
+        }
         let stored = view.state.as_ref();
         // A replacement refused before `begin_state` deliberately retains the source's state.
         // Its failure still concerns the target operation and must name that generation, or the
         // API cannot accept it and initiate the forward rollback.
-        let storage_generation = if state == "error" && entry.replaces_storage() {
+        let storage_generation = if state == "error"
+            && (entry.replaces_storage()
+                || matches!(entry.origin, Some(super::Origin::Rehydrate(_))))
+        {
             entry.storage_generation
         } else {
             stored.map_or(entry.storage_generation, |s| s.storage_generation)
@@ -256,6 +276,22 @@ impl<M: Machine> Core<M> {
             "backup": stored.and_then(|s| s.backup.as_ref()).map_or(Value::Null, |b| b.observation()),
             "archive": archive.observation(),
         });
+        if matches!(state, "ready" | "asleep")
+            && let Some(attestation) = stored
+                .filter(|state| {
+                    state.storage_generation == entry.storage_generation
+                        && (!matches!(entry.origin, Some(super::Origin::Rehydrate(_)))
+                            || state.cold_snapshot_target_operation.as_deref()
+                                == Some(entry.operation.as_str()))
+                })
+                .and_then(|state| state.cold_snapshot_restore.as_ref())
+        {
+            observation["cold_snapshot_restore"] =
+                serde_json::to_value(attestation).expect("snapshot attestation serializes");
+            observation["cold_snapshot_serving"] = stored
+                .is_some_and(|state| state.cold_snapshot_serving)
+                .into();
+        }
         if let Some(error) = error {
             observation["error"] = error.into();
         }
@@ -376,6 +412,31 @@ impl<M: Machine> Core<M> {
         self.changed.notify_one();
     }
 
+    /// A durable isolated verification receipt rides the ordinary observation channel.
+    pub(crate) fn report_archive_verification(&self, result: Value) {
+        let Some(operation) = result["operation"].as_str() else {
+            return;
+        };
+        self.reports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .archive_verifications
+            .insert(operation.to_string(), result);
+        self.changed.notify_one();
+    }
+
+    pub(crate) fn report_cold_snapshot_capture(&self, result: Value) {
+        let Some(operation) = result["operation"].as_str() else {
+            return;
+        };
+        self.reports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cold_snapshot_captures
+            .insert(operation.to_string(), result);
+        self.changed.notify_one();
+    }
+
     /// Queues an event (`NodeEvent`) for delivery.
     pub(crate) fn event(&self, event: Value) {
         self.reports
@@ -393,7 +454,10 @@ impl<M: Machine> Core<M> {
     pub(crate) fn take_report(&self, events: &Events) -> Option<Value> {
         let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
         reports.forget_held();
-        let alone = reports.observations.is_empty() && reports.orders.is_empty();
+        let alone = reports.observations.is_empty()
+            && reports.orders.is_empty()
+            && reports.archive_verifications.is_empty()
+            && reports.cold_snapshot_captures.is_empty();
         let databases = reports.take_databases();
         let orders: Vec<String> = reports
             .orders
@@ -409,6 +473,12 @@ impl<M: Machine> Core<M> {
                 .filter_map(|operation| reports.orders.remove(operation))
                 .collect::<Vec<_>>(),
         });
+        if let Some((_, result)) = reports.archive_verifications.pop_first() {
+            report["archive_verifications"] = json!([result]);
+        }
+        if let Some((_, result)) = reports.cold_snapshot_captures.pop_first() {
+            report["cold_snapshot_captures"] = json!([result]);
+        }
         // The agent's own log lines ride along, or leave alone.
         events.attach(&mut report, alone);
         (!alone || report.get("events").is_some()).then_some(report)
@@ -421,6 +491,21 @@ impl<M: Machine> Core<M> {
         let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
         reports.posted();
         reports.accepted(report, accepted, super::now_ms());
+        drop(reports);
+        for result in report["archive_verifications"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            self.archive_verification_posted(result);
+        }
+        for result in report["cold_snapshot_captures"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            self.cold_snapshot_capture_posted(result);
+        }
     }
     /// The post of a report failed with `error`: if for want of time (`too_big`), the next report
     /// is half as large.
@@ -452,6 +537,30 @@ impl<M: Machine> Core<M> {
             if let Some(operation) = result["operation"].as_str() {
                 reports
                     .orders
+                    .entry(operation.to_string())
+                    .or_insert_with(|| result.clone());
+            }
+        }
+        for result in report["archive_verifications"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(operation) = result["operation"].as_str() {
+                reports
+                    .archive_verifications
+                    .entry(operation.to_string())
+                    .or_insert_with(|| result.clone());
+            }
+        }
+        for result in report["cold_snapshot_captures"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(operation) = result["operation"].as_str() {
+                reports
+                    .cold_snapshot_captures
                     .entry(operation.to_string())
                     .or_insert_with(|| result.clone());
             }

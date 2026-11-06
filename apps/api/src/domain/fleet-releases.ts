@@ -29,7 +29,11 @@ import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
 import { hintNode } from "./node-hints.ts";
 import { releaseIsSigned } from "./release-signature.ts";
-import { extendedReleaseAssignmentGuard } from "./native-capabilities.ts";
+import {
+  coldStorageNativeReleaseIds,
+  combineNativeGuard,
+  extendedReleaseAssignmentGuard,
+} from "./native-capabilities.ts";
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -252,10 +256,14 @@ export async function assignFleetRegionRelease(
   return withIdempotency(c, {
     replay: read,
     execute: async (lease) => {
-      const native = extendedReleaseAssignmentGuard(
-        c.env,
-        regionId,
-        input.release_id,
+      const native = combineNativeGuard(
+        extendedReleaseAssignmentGuard(c.env, regionId, input.release_id),
+        coldStorageNativeReleaseIds(c.env).includes(input.release_id)
+          ? { sql: "1=1", bindings: [] }
+          : {
+              sql: "EXISTS(SELECT 1 FROM regions WHERE id=? AND native_cold_storage_required=0)",
+              bindings: [regionId],
+            },
       );
       if (
         !(await c.env.DB.prepare(`SELECT 1 WHERE ${native.sql}`)

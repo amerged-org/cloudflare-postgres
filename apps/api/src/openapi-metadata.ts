@@ -498,6 +498,36 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Read a temporary R2 credential the node's desired page names",
     "node",
   ),
+  "PUT /node/v1/cold-snapshots/{operation}/manifest": route(
+    "declareNodeColdSnapshot",
+    "Declare the complete clean-shutdown snapshot before uploading its chunks",
+    "node",
+    [400, 401, 403, 404, 409, 500],
+  ),
+  "PUT /node/v1/cold-snapshots/{operation}/chunks/{index}": route(
+    "uploadNodeColdSnapshotChunk",
+    "Store one signed immutable binary chunk of a declared snapshot",
+    "node",
+    [400, 401, 403, 404, 409, 500],
+  ),
+  "POST /node/v1/cold-snapshots/{operation}/seal": route(
+    "sealNodeColdSnapshot",
+    "Verify the expected chunk inventory and seal the complete snapshot",
+    "node",
+    [400, 401, 403, 404, 409, 500],
+  ),
+  "GET /node/v1/cold-snapshots/{operation}/manifest": route(
+    "getNodeColdSnapshotManifest",
+    "Read exact sealed manifest bytes for an authorized recovery operation",
+    "node",
+    [400, 401, 403, 404, 409, 500],
+  ),
+  "GET /node/v1/cold-snapshots/{operation}/chunks/{index}": route(
+    "getNodeColdSnapshotChunk",
+    "Read an immutable binary chunk by its authorized operation and index",
+    "node",
+    [400, 401, 403, 404, 409, 500],
+  ),
   "POST /node/v1/observations": route(
     "reportNodeObservations",
     "Report the node's databases that changed, each one again once in 15 minutes, and the results of its orders",

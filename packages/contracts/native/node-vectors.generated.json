@@ -1,6 +1,705 @@
 {
   "schemas": [
     {
+      "schema": "ColdSnapshotRestoreAttestation",
+      "name": "exact-clean-snapshot-before-start",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "snapshot_operation": "op_cccccccccccccccccccc",
+        "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "system_identifier": "7428512345678901234",
+        "timeline": 1,
+        "checkpoint_lsn": "0/3000028",
+        "verified_at": "2026-10-17T12:00:00.000Z"
+      }
+    },
+    {
+      "schema": "ColdSnapshotManifest",
+      "name": "later-timeline-without-history",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "version": 1,
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "pg_major": 18,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 2,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000020000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "total_bytes": 8195,
+        "directories": ["global", "pg_wal"],
+        "files": [
+          {
+            "path": "PG_VERSION",
+            "offset": 0,
+            "size_bytes": 3,
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "path": "global/pg_control",
+            "offset": 3,
+            "size_bytes": 8192,
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        ],
+        "chunks": [
+          {
+            "index": 0,
+            "size_bytes": 8195,
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "ColdSnapshotManifest",
+      "name": "later-timeline-complete-history",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "version": 1,
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "pg_major": 18,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 2,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000020000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "total_bytes": 8211,
+        "directories": ["global", "pg_wal"],
+        "files": [
+          {
+            "path": "PG_VERSION",
+            "offset": 0,
+            "size_bytes": 3,
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "path": "global/pg_control",
+            "offset": 3,
+            "size_bytes": 8192,
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          {
+            "path": "pg_wal/00000002.history",
+            "offset": 8195,
+            "size_bytes": 16,
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          }
+        ],
+        "chunks": [
+          {
+            "index": 0,
+            "size_bytes": 8211,
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "ColdSnapshotManifest",
+      "name": "complete-packed-snapshot",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "version": 1,
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "pg_major": 18,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "total_bytes": 8195,
+        "directories": ["global", "pg_wal"],
+        "files": [
+          {
+            "path": "PG_VERSION",
+            "offset": 0,
+            "size_bytes": 3,
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "path": "global/pg_control",
+            "offset": 3,
+            "size_bytes": 8192,
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        ],
+        "chunks": [
+          {
+            "index": 0,
+            "size_bytes": 8195,
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "ColdSnapshotManifest",
+      "name": "missing-file",
+      "valid": false,
+      "node_valid": false,
+      "refinement": false,
+      "value": {
+        "version": 1,
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "pg_major": 18,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "total_bytes": 8195,
+        "directories": ["global", "pg_wal"],
+        "files": [
+          {
+            "path": "PG_VERSION",
+            "offset": 0,
+            "size_bytes": 3,
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "chunks": [
+          {
+            "index": 0,
+            "size_bytes": 8195,
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "ColdSnapshotManifest",
+      "name": "packed-file-hole",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "version": 1,
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "pg_major": 18,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "total_bytes": 8195,
+        "directories": ["global", "pg_wal"],
+        "files": [
+          {
+            "path": "PG_VERSION",
+            "offset": 0,
+            "size_bytes": 3,
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "path": "global/pg_control",
+            "offset": 4,
+            "size_bytes": 8192,
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        ],
+        "chunks": [
+          {
+            "index": 0,
+            "size_bytes": 8195,
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "ColdSnapshotManifest",
+      "name": "packed-chunk-hole",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "version": 1,
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "pg_major": 18,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "total_bytes": 8195,
+        "directories": ["global", "pg_wal"],
+        "files": [
+          {
+            "path": "PG_VERSION",
+            "offset": 0,
+            "size_bytes": 3,
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "path": "global/pg_control",
+            "offset": 3,
+            "size_bytes": 8192,
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        ],
+        "chunks": [
+          {
+            "index": 1,
+            "size_bytes": 8195,
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "ColdSnapshotManifest",
+      "name": "path-traversal",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "version": 1,
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "pg_major": 18,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "total_bytes": 8195,
+        "directories": ["..", "global", "pg_wal"],
+        "files": [
+          {
+            "path": "PG_VERSION",
+            "offset": 0,
+            "size_bytes": 3,
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "path": "global/pg_control",
+            "offset": 3,
+            "size_bytes": 8192,
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        ],
+        "chunks": [
+          {
+            "index": 0,
+            "size_bytes": 8195,
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "ColdSnapshotSource",
+      "name": "sealed-snapshot-source",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "snapshot_operation": "op_cccccccccccccccccccc",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "manifest_bytes": 774,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        }
+      }
+    },
+    {
+      "schema": "ColdSnapshotSource",
+      "name": "source-without-manifest",
+      "valid": false,
+      "node_valid": false,
+      "refinement": false,
+      "value": {
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "snapshot_operation": "op_cccccccccccccccccccc",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "manifest_bytes": 774,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        }
+      }
+    },
+    {
+      "schema": "ColdSnapshotCaptureRequest",
+      "name": "capture-stopped-source",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        }
+      }
+    },
+    {
+      "schema": "ColdSnapshotCaptureResult",
+      "name": "captured-source-clean",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "status": "captured",
+        "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "manifest_bytes": 774,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "cleaned_up": true
+      }
+    },
+    {
+      "schema": "ColdSnapshotCaptureResult",
+      "name": "capture-not-clean",
+      "valid": false,
+      "node_valid": false,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "status": "captured",
+        "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "manifest_bytes": 774,
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "cleaned_up": false
+      }
+    },
+    {
+      "schema": "ArchiveVerificationCancellation",
+      "name": "cancel-exact-scratch",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3
+      }
+    },
+    {
+      "schema": "ArchiveVerificationCancellation",
+      "name": "cancel-without-source-generation",
+      "valid": false,
+      "node_valid": false,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_storage_generation": 3
+      }
+    },
+    {
+      "schema": "ArchiveVerificationRequest",
+      "name": "isolated-archive-verification",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "source": {
+          "database_id": "sbbbbbbbbbbbbbbbbbbb",
+          "snapshot_operation": "op_cccccccccccccccccccc",
+          "source_generation": 4,
+          "source_storage_generation": 3,
+          "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "manifest_bytes": 774,
+          "end": {
+            "system_identifier": "7428512345678901234",
+            "timeline": 1,
+            "checkpoint_lsn": "0/3000028",
+            "last_archived_segment": "000000010000000000000002",
+            "proven_at": "2026-10-17T12:00:00.000Z"
+          }
+        },
+        "resources": {
+          "memory_mib": 256,
+          "cpu_millicores": 250,
+          "storage_gib": 1
+        },
+        "settings": { "max_connections": 25, "archive_timeout_seconds": 60 }
+      }
+    },
+    {
+      "schema": "ArchiveVerificationRequest",
+      "name": "missing-manifest-binding",
+      "valid": false,
+      "node_valid": false,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "source": {
+          "database_id": "sbbbbbbbbbbbbbbbbbbb",
+          "snapshot_operation": "op_cccccccccccccccccccc",
+          "source_generation": 4,
+          "source_storage_generation": 3,
+          "manifest_bytes": 774,
+          "end": {
+            "system_identifier": "7428512345678901234",
+            "timeline": 1,
+            "checkpoint_lsn": "0/3000028",
+            "last_archived_segment": "000000010000000000000002",
+            "proven_at": "2026-10-17T12:00:00.000Z"
+          }
+        },
+        "resources": {
+          "memory_mib": 256,
+          "cpu_millicores": 250,
+          "storage_gib": 1
+        },
+        "settings": { "max_connections": 25, "archive_timeout_seconds": 60 }
+      }
+    },
+    {
+      "schema": "ArchiveVerificationRequest",
+      "name": "wrong-source-database",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "ebbbbbbbbbbbbbbbbbbb",
+        "source_node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "source": {
+          "database_id": "sbbbbbbbbbbbbbbbbbbb",
+          "snapshot_operation": "op_cccccccccccccccccccc",
+          "source_generation": 4,
+          "source_storage_generation": 3,
+          "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "manifest_bytes": 774,
+          "end": {
+            "system_identifier": "7428512345678901234",
+            "timeline": 1,
+            "checkpoint_lsn": "0/3000028",
+            "last_archived_segment": "000000010000000000000002",
+            "proven_at": "2026-10-17T12:00:00.000Z"
+          }
+        },
+        "resources": {
+          "memory_mib": 256,
+          "cpu_millicores": 250,
+          "storage_gib": 1
+        },
+        "settings": { "max_connections": 25, "archive_timeout_seconds": 60 }
+      }
+    },
+    {
+      "schema": "ArchiveVerificationRequest",
+      "name": "wrong-source-generation",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+        "source_generation": 4,
+        "source_storage_generation": 2,
+        "source": {
+          "database_id": "sbbbbbbbbbbbbbbbbbbb",
+          "snapshot_operation": "op_cccccccccccccccccccc",
+          "source_generation": 4,
+          "source_storage_generation": 3,
+          "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "manifest_bytes": 774,
+          "end": {
+            "system_identifier": "7428512345678901234",
+            "timeline": 1,
+            "checkpoint_lsn": "0/3000028",
+            "last_archived_segment": "000000010000000000000002",
+            "proven_at": "2026-10-17T12:00:00.000Z"
+          }
+        },
+        "resources": {
+          "memory_mib": 256,
+          "cpu_millicores": 250,
+          "storage_gib": 1
+        },
+        "settings": { "max_connections": 25, "archive_timeout_seconds": 60 }
+      }
+    },
+    {
+      "schema": "ArchiveVerificationResult",
+      "name": "verified-and-cleaned",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "status": "verified",
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "system_identifier": "7428512345678901234",
+        "timeline": 1,
+        "checkpoint_lsn": "0/3000028",
+        "cleaned_up": true
+      }
+    },
+    {
+      "schema": "ArchiveVerificationResult",
+      "name": "verified-with-scratch-left",
+      "valid": false,
+      "node_valid": false,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "status": "verified",
+        "end": {
+          "system_identifier": "7428512345678901234",
+          "timeline": 1,
+          "checkpoint_lsn": "0/3000028",
+          "last_archived_segment": "000000010000000000000002",
+          "proven_at": "2026-10-17T12:00:00.000Z"
+        },
+        "system_identifier": "7428512345678901234",
+        "timeline": 1,
+        "checkpoint_lsn": "0/3000028",
+        "cleaned_up": false
+      }
+    },
+    {
+      "schema": "ArchiveVerificationResult",
+      "name": "verified-without-end",
+      "valid": false,
+      "node_valid": false,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "status": "verified",
+        "system_identifier": "7428512345678901234",
+        "timeline": 1,
+        "checkpoint_lsn": "0/3000028",
+        "cleaned_up": true
+      }
+    },
+    {
+      "schema": "ArchiveVerificationResult",
+      "name": "failed-cleanup",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "operation": "op_cccccccccccccccccccc",
+        "database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_generation": 4,
+        "source_storage_generation": 3,
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "status": "failed",
+        "reason": "scratch_cleanup_failed",
+        "cleaned_up": false
+      }
+    },
+    {
       "schema": "NodeEnrollmentSeed",
       "name": "installer-seed",
       "valid": true,
@@ -513,6 +1212,1023 @@
         "secret_access_key": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
         "session_token": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
         "expires_at": "2026-10-24T12:00:00.000Z"
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
+      "name": "cold-target-without-pending-fence",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "node": {
+          "id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": {
+          "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
+          "binaries": {
+            "pgcf-agent": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-native-gateway": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-archive": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-wal-fetch": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            }
+          },
+          "os": {
+            "image_version": "25",
+            "debian_snapshot": "20261016T000000Z",
+            "package_lock": {
+              "url": "https://releases.example/packages.lock.json",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 2000
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
+          }
+        },
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 },
+          "events": {
+            "max_payload_bytes": 16384,
+            "max_outbox_rows": 10000,
+            "emits_per_second": 20
+          }
+        },
+        "credentials_revision": 3,
+        "orders": [],
+        "databases": [
+          {
+            "id": "sbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "desired_state": "suspended",
+            "route_revision": 2,
+            "storage_generation": 4,
+            "pg_major": 18,
+            "resources": {
+              "memory_mib": 256,
+              "cpu_millicores": 250,
+              "storage_gib": 1
+            },
+            "settings": {
+              "max_connections": 25,
+              "archive_timeout_seconds": 60
+            },
+            "sleep_after_seconds": null,
+            "roles": [
+              {
+                "name": "app",
+                "owner": true,
+                "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+                "revision": 1
+              }
+            ],
+            "archive": {
+              "path": "s3://pgcf-eu/eu-dev/sbbbbbbbbbbbbbbbbbbb/g4-op_mmmmmmmmmmmmmmmmmmmm",
+              "credential": {
+                "id": "crd_kkkkkkkkkkkkkkkkkkkk",
+                "expires_at": "2026-10-24T12:00:00.000Z"
+              }
+            },
+            "origin": {
+              "kind": "rehydrate",
+              "source": {
+                "database_id": "sbbbbbbbbbbbbbbbbbbb",
+                "snapshot_operation": "op_cccccccccccccccccccc",
+                "source_generation": 4,
+                "source_storage_generation": 3,
+                "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "manifest_bytes": 774,
+                "end": {
+                  "system_identifier": "7428512345678901234",
+                  "timeline": 1,
+                  "checkpoint_lsn": "0/3000028",
+                  "last_archived_segment": "000000010000000000000002",
+                  "proven_at": "2026-10-17T12:00:00.000Z"
+                }
+              }
+            }
+          }
+        ],
+        "next": null
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
+      "name": "cold-target-pending",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "node": {
+          "id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": {
+          "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
+          "binaries": {
+            "pgcf-agent": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-native-gateway": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-archive": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-wal-fetch": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            }
+          },
+          "os": {
+            "image_version": "25",
+            "debian_snapshot": "20261016T000000Z",
+            "package_lock": {
+              "url": "https://releases.example/packages.lock.json",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 2000
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
+          }
+        },
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 },
+          "events": {
+            "max_payload_bytes": 16384,
+            "max_outbox_rows": 10000,
+            "emits_per_second": 20
+          }
+        },
+        "credentials_revision": 3,
+        "orders": [],
+        "databases": [
+          {
+            "id": "sbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "desired_state": "suspended",
+            "route_revision": 2,
+            "storage_generation": 4,
+            "pg_major": 18,
+            "resources": {
+              "memory_mib": 256,
+              "cpu_millicores": 250,
+              "storage_gib": 1
+            },
+            "settings": {
+              "max_connections": 25,
+              "archive_timeout_seconds": 60
+            },
+            "sleep_after_seconds": null,
+            "roles": [
+              {
+                "name": "app",
+                "owner": true,
+                "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+                "revision": 1
+              }
+            ],
+            "archive": {
+              "path": "s3://pgcf-eu/eu-dev/sbbbbbbbbbbbbbbbbbbb/g4-op_mmmmmmmmmmmmmmmmmmmm",
+              "credential": {
+                "id": "crd_kkkkkkkkkkkkkkkkkkkk",
+                "expires_at": "2026-10-24T12:00:00.000Z"
+              }
+            },
+            "origin": {
+              "kind": "rehydrate",
+              "source": {
+                "database_id": "sbbbbbbbbbbbbbbbbbbb",
+                "snapshot_operation": "op_cccccccccccccccccccc",
+                "source_generation": 4,
+                "source_storage_generation": 3,
+                "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "manifest_bytes": 774,
+                "end": {
+                  "system_identifier": "7428512345678901234",
+                  "timeline": 1,
+                  "checkpoint_lsn": "0/3000028",
+                  "last_archived_segment": "000000010000000000000002",
+                  "proven_at": "2026-10-17T12:00:00.000Z"
+                }
+              }
+            },
+            "cold_snapshot_pending": true
+          }
+        ],
+        "next": null
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
+      "name": "cold-target-activating-without-origin",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "node": {
+          "id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": {
+          "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
+          "binaries": {
+            "pgcf-agent": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-native-gateway": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-archive": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-wal-fetch": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            }
+          },
+          "os": {
+            "image_version": "25",
+            "debian_snapshot": "20261016T000000Z",
+            "package_lock": {
+              "url": "https://releases.example/packages.lock.json",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 2000
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
+          }
+        },
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 },
+          "events": {
+            "max_payload_bytes": 16384,
+            "max_outbox_rows": 10000,
+            "emits_per_second": 20
+          }
+        },
+        "credentials_revision": 3,
+        "orders": [],
+        "databases": [
+          {
+            "id": "sbbbbbbbbbbbbbbbbbbb",
+            "generation": 6,
+            "operation": "op_cccccccccccccccccccc",
+            "desired_state": "suspended",
+            "route_revision": 2,
+            "storage_generation": 4,
+            "pg_major": 18,
+            "resources": {
+              "memory_mib": 256,
+              "cpu_millicores": 250,
+              "storage_gib": 1
+            },
+            "settings": {
+              "max_connections": 25,
+              "archive_timeout_seconds": 60
+            },
+            "sleep_after_seconds": null,
+            "roles": [
+              {
+                "name": "app",
+                "owner": true,
+                "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+                "revision": 1
+              }
+            ],
+            "archive": {
+              "path": "s3://pgcf-eu/eu-dev/sbbbbbbbbbbbbbbbbbbb/g4-op_mmmmmmmmmmmmmmmmmmmm",
+              "credential": {
+                "id": "crd_kkkkkkkkkkkkkkkkkkkk",
+                "expires_at": "2026-10-24T12:00:00.000Z"
+              }
+            },
+            "cold_snapshot_pending": true
+          }
+        ],
+        "next": null
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
+      "name": "fenced-verification-cleanup",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "node": {
+          "id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": null,
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 },
+          "events": {
+            "max_payload_bytes": 16384,
+            "max_outbox_rows": 10000,
+            "emits_per_second": 20
+          }
+        },
+        "credentials_revision": 3,
+        "orders": [
+          { "type": "fence", "operation": "op_ffffffffffffffffffff" },
+          {
+            "type": "superseded",
+            "operation": "op_ssssssssssssssssssss",
+            "database": "xbbbbbbbbbbbbbbbbbbb",
+            "storage_generation": 2,
+            "remove_volume": true
+          }
+        ],
+        "databases": [],
+        "next": null,
+        "archive_verification_cancellations": [
+          {
+            "operation": "op_cccccccccccccccccccc",
+            "database_id": "sbbbbbbbbbbbbbbbbbbb",
+            "source_generation": 4,
+            "source_storage_generation": 3
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
+      "name": "same-id-rehydrate",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "node": {
+          "id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": {
+          "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
+          "binaries": {
+            "pgcf-agent": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-native-gateway": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-archive": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-wal-fetch": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            }
+          },
+          "os": {
+            "image_version": "25",
+            "debian_snapshot": "20261016T000000Z",
+            "package_lock": {
+              "url": "https://releases.example/packages.lock.json",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 2000
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
+          }
+        },
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 },
+          "events": {
+            "max_payload_bytes": 16384,
+            "max_outbox_rows": 10000,
+            "emits_per_second": 20
+          }
+        },
+        "credentials_revision": 3,
+        "orders": [],
+        "databases": [
+          {
+            "id": "sbbbbbbbbbbbbbbbbbbb",
+            "generation": 5,
+            "operation": "op_cccccccccccccccccccc",
+            "desired_state": "suspended",
+            "route_revision": 2,
+            "storage_generation": 4,
+            "pg_major": 18,
+            "resources": {
+              "memory_mib": 256,
+              "cpu_millicores": 250,
+              "storage_gib": 1
+            },
+            "settings": {
+              "max_connections": 25,
+              "archive_timeout_seconds": 60
+            },
+            "sleep_after_seconds": null,
+            "roles": [
+              {
+                "name": "app",
+                "owner": true,
+                "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+                "revision": 1
+              }
+            ],
+            "archive": {
+              "path": "s3://pgcf-eu/eu-dev/sbbbbbbbbbbbbbbbbbbb/g4-op_mmmmmmmmmmmmmmmmmmmm",
+              "credential": {
+                "id": "crd_kkkkkkkkkkkkkkkkkkkk",
+                "expires_at": "2026-10-24T12:00:00.000Z"
+              }
+            },
+            "origin": {
+              "kind": "rehydrate",
+              "source": {
+                "database_id": "sbbbbbbbbbbbbbbbbbbb",
+                "snapshot_operation": "op_cccccccccccccccccccc",
+                "source_generation": 4,
+                "source_storage_generation": 3,
+                "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "manifest_bytes": 774,
+                "end": {
+                  "system_identifier": "7428512345678901234",
+                  "timeline": 1,
+                  "checkpoint_lsn": "0/3000028",
+                  "last_archived_segment": "000000010000000000000002",
+                  "proven_at": "2026-10-17T12:00:00.000Z"
+                }
+              }
+            },
+            "cold_snapshot_pending": true
+          }
+        ],
+        "next": "gbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
+      "name": "archive-verification-page",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "node": {
+          "id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": {
+          "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
+          "binaries": {
+            "pgcf-agent": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-native-gateway": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-archive": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-wal-fetch": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            }
+          },
+          "os": {
+            "image_version": "25",
+            "debian_snapshot": "20261016T000000Z",
+            "package_lock": {
+              "url": "https://releases.example/packages.lock.json",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 2000
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
+          }
+        },
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 },
+          "events": {
+            "max_payload_bytes": 16384,
+            "max_outbox_rows": 10000,
+            "emits_per_second": 20
+          }
+        },
+        "credentials_revision": 3,
+        "orders": [],
+        "databases": [],
+        "next": null,
+        "archive_verifications": [
+          {
+            "operation": "op_cccccccccccccccccccc",
+            "database_id": "sbbbbbbbbbbbbbbbbbbb",
+            "source_node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+            "source_generation": 4,
+            "source_storage_generation": 3,
+            "source": {
+              "database_id": "sbbbbbbbbbbbbbbbbbbb",
+              "snapshot_operation": "op_cccccccccccccccccccc",
+              "source_generation": 4,
+              "source_storage_generation": 3,
+              "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "manifest_bytes": 774,
+              "end": {
+                "system_identifier": "7428512345678901234",
+                "timeline": 1,
+                "checkpoint_lsn": "0/3000028",
+                "last_archived_segment": "000000010000000000000002",
+                "proven_at": "2026-10-17T12:00:00.000Z"
+              }
+            },
+            "resources": {
+              "memory_mib": 256,
+              "cpu_millicores": 250,
+              "storage_gib": 1
+            },
+            "settings": { "max_connections": 25, "archive_timeout_seconds": 60 }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
+      "name": "archive-verification-on-fenced-node",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "node": {
+          "id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": null,
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 },
+          "events": {
+            "max_payload_bytes": 16384,
+            "max_outbox_rows": 10000,
+            "emits_per_second": 20
+          }
+        },
+        "credentials_revision": 3,
+        "orders": [
+          { "type": "fence", "operation": "op_ffffffffffffffffffff" },
+          {
+            "type": "superseded",
+            "operation": "op_ssssssssssssssssssss",
+            "database": "xbbbbbbbbbbbbbbbbbbb",
+            "storage_generation": 2,
+            "remove_volume": true
+          }
+        ],
+        "databases": [],
+        "next": null,
+        "archive_verifications": [
+          {
+            "operation": "op_cccccccccccccccccccc",
+            "database_id": "sbbbbbbbbbbbbbbbbbbb",
+            "source_node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+            "source_generation": 4,
+            "source_storage_generation": 3,
+            "source": {
+              "database_id": "sbbbbbbbbbbbbbbbbbbb",
+              "snapshot_operation": "op_cccccccccccccccccccc",
+              "source_generation": 4,
+              "source_storage_generation": 3,
+              "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "manifest_bytes": 774,
+              "end": {
+                "system_identifier": "7428512345678901234",
+                "timeline": 1,
+                "checkpoint_lsn": "0/3000028",
+                "last_archived_segment": "000000010000000000000002",
+                "proven_at": "2026-10-17T12:00:00.000Z"
+              }
+            },
+            "resources": {
+              "memory_mib": 256,
+              "cpu_millicores": 250,
+              "storage_gib": 1
+            },
+            "settings": { "max_connections": 25, "archive_timeout_seconds": 60 }
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeDesiredPage",
+      "name": "cold-capture-wrong-source-node",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "node": {
+          "id": "nod_xxxxxxxxxxxxxxxxxxxx",
+          "uid": "01234567-89ab-4def-8123-0123456789ab",
+          "hostname": "eu1",
+          "region_id": "eu-dev"
+        },
+        "release": {
+          "id": "release-25",
+          "image": {
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size_bytes": 500000000,
+            "raw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "raw_bytes": 2147483648
+          },
+          "binaries": {
+            "pgcf-agent": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-native-gateway": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-archive": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            },
+            "pgcf-wal-fetch": {
+              "url": "https://releases.example/binary",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size_bytes": 1000
+            }
+          },
+          "os": {
+            "image_version": "25",
+            "debian_snapshot": "20261016T000000Z",
+            "package_lock": {
+              "url": "https://releases.example/packages.lock.json",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size_bytes": 2000
+            },
+            "host_files": [
+              {
+                "path": "/usr/lib/systemd/system/pgcf-agent.service",
+                "kind": "file",
+                "mode": "0644",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "size_bytes": 900,
+                "apply": "restart_unit:pgcf-agent.service"
+              }
+            ]
+          }
+        },
+        "policy": {
+          "admission": {
+            "memory_rule": "measured",
+            "memory_floor_mib": 600,
+            "awake_budget_mib": 9913,
+            "reservation_overhead_mib": 8,
+            "start_concurrency": 4,
+            "queue_wait_ms": 10000,
+            "retry_after_seconds": 5,
+            "cpu_boost_ms": 5000
+          },
+          "early_sleep": { "enabled": true, "min_idle_seconds": 30 },
+          "storage": {
+            "reserve_bytes": 6442450944,
+            "metadata_no_room_percent": 75,
+            "sample_max_age_seconds": 10
+          },
+          "backup": {
+            "wal_uploads": 2,
+            "base_backups": 1,
+            "memory_mib": {
+              "wal_upload": 128,
+              "wal_fetch": 128,
+              "base_backup": 256
+            }
+          },
+          "io": { "write_bytes_per_second": 16000000, "write_iops": 1000 },
+          "events": {
+            "max_payload_bytes": 16384,
+            "max_outbox_rows": 10000,
+            "emits_per_second": 20
+          }
+        },
+        "credentials_revision": 3,
+        "orders": [],
+        "databases": [],
+        "next": null,
+        "cold_snapshot_captures": [
+          {
+            "operation": "op_cccccccccccccccccccc",
+            "database_id": "sbbbbbbbbbbbbbbbbbbb",
+            "source_node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+            "source_generation": 4,
+            "source_storage_generation": 3,
+            "end": {
+              "system_identifier": "7428512345678901234",
+              "timeline": 1,
+              "checkpoint_lsn": "0/3000028",
+              "last_archived_segment": "000000010000000000000002",
+              "proven_at": "2026-10-17T12:00:00.000Z"
+            }
+          }
+        ]
       }
     },
     {
@@ -17179,6 +18895,96 @@
     },
     {
       "schema": "NodeObservationReport",
+      "name": "cold-target-requires-new-storage-generation",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "databases": [
+          {
+            "id": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 4,
+            "operation": "op_cccccccccccccccccccc",
+            "storage_generation": 1,
+            "state": "error",
+            "proven_sleep": null,
+            "backup": null,
+            "archive": {
+              "last_segment": "000000010000000000000002",
+              "ready_files": 0,
+              "failing_since": null
+            },
+            "error": "cold_snapshot_restart_required"
+          }
+        ],
+        "orders": []
+      }
+    },
+    {
+      "schema": "NodeObservationReport",
+      "name": "cold-target-activation-uncertain",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "databases": [
+          {
+            "id": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 4,
+            "operation": "op_cccccccccccccccccccc",
+            "storage_generation": 1,
+            "state": "error",
+            "proven_sleep": null,
+            "backup": null,
+            "archive": {
+              "last_segment": "000000010000000000000002",
+              "ready_files": 0,
+              "failing_since": null
+            },
+            "error": "cold_activation_uncertain"
+          }
+        ],
+        "orders": []
+      }
+    },
+    {
+      "schema": "NodeObservationReport",
+      "name": "archive-verification-result",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "databases": [],
+        "orders": [],
+        "archive_verifications": [
+          {
+            "operation": "op_cccccccccccccccccccc",
+            "database_id": "sbbbbbbbbbbbbbbbbbbb",
+            "source_generation": 4,
+            "source_storage_generation": 3,
+            "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-10-17T12:00:00.000Z",
+            "status": "verified",
+            "end": {
+              "system_identifier": "7428512345678901234",
+              "timeline": 1,
+              "checkpoint_lsn": "0/3000028",
+              "last_archived_segment": "000000010000000000000002",
+              "proven_at": "2026-10-17T12:00:00.000Z"
+            },
+            "system_identifier": "7428512345678901234",
+            "timeline": 1,
+            "checkpoint_lsn": "0/3000028",
+            "cleaned_up": true
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeObservationReport",
       "name": "asleep",
       "valid": true,
       "node_valid": true,
@@ -18053,6 +19859,125 @@
       "node_valid": true,
       "refinement": false,
       "value": { "databases": [], "orders": 0, "hint": true }
+    },
+    {
+      "schema": "NodeSample",
+      "name": "isolated-verification-runtime",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "memory": { "total_bytes": 12884901888, "available_bytes": 9663676416 },
+        "cpu": { "cores": 6, "busy_millicores": 1200 },
+        "pool": {
+          "observed_at": "2026-10-17T12:00:00.000Z",
+          "data_total_bytes": 134217728000,
+          "data_used_bytes": 42949672960,
+          "metadata_total_bytes": 1073741824,
+          "metadata_used_bytes": 1048576,
+          "nominal_bytes": 322122547200
+        },
+        "room": true,
+        "volumes": { "total": 300, "mounted": 280 },
+        "archive": { "ready_files": 3, "oldest_ready_seconds": 42 },
+        "awake": ["dbbbbbbbbbbbbbbbbbbb"],
+        "awake_memory_mib": 256,
+        "starting": 0,
+        "queued": 1,
+        "credentials_revision": 3,
+        "verification_runtime_ids": ["dbbbbbbbbbbbbbbbbbbb"]
+      }
+    },
+    {
+      "schema": "NodeSample",
+      "name": "verification-runtime-not-awake",
+      "valid": false,
+      "node_valid": false,
+      "refinement": true,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "memory": { "total_bytes": 12884901888, "available_bytes": 9663676416 },
+        "cpu": { "cores": 6, "busy_millicores": 1200 },
+        "pool": {
+          "observed_at": "2026-10-17T12:00:00.000Z",
+          "data_total_bytes": 134217728000,
+          "data_used_bytes": 42949672960,
+          "metadata_total_bytes": 1073741824,
+          "metadata_used_bytes": 1048576,
+          "nominal_bytes": 322122547200
+        },
+        "room": true,
+        "volumes": { "total": 300, "mounted": 280 },
+        "archive": { "ready_files": 3, "oldest_ready_seconds": 42 },
+        "awake": ["dbbbbbbbbbbbbbbbbbbb"],
+        "awake_memory_mib": 256,
+        "starting": 0,
+        "queued": 1,
+        "credentials_revision": 3,
+        "verification_runtime_ids": ["ebbbbbbbbbbbbbbbbbbb"]
+      }
+    },
+    {
+      "schema": "NodeSample",
+      "name": "more-than-one-verification-runtime",
+      "valid": false,
+      "node_valid": false,
+      "refinement": false,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "memory": { "total_bytes": 12884901888, "available_bytes": 9663676416 },
+        "cpu": { "cores": 6, "busy_millicores": 1200 },
+        "pool": {
+          "observed_at": "2026-10-17T12:00:00.000Z",
+          "data_total_bytes": 134217728000,
+          "data_used_bytes": 42949672960,
+          "metadata_total_bytes": 1073741824,
+          "metadata_used_bytes": 1048576,
+          "nominal_bytes": 322122547200
+        },
+        "room": true,
+        "volumes": { "total": 300, "mounted": 280 },
+        "archive": { "ready_files": 3, "oldest_ready_seconds": 42 },
+        "awake": ["dbbbbbbbbbbbbbbbbbbb", "ebbbbbbbbbbbbbbbbbbb"],
+        "awake_memory_mib": 256,
+        "starting": 0,
+        "queued": 1,
+        "credentials_revision": 3,
+        "verification_runtime_ids": [
+          "dbbbbbbbbbbbbbbbbbbb",
+          "ebbbbbbbbbbbbbbbbbbb"
+        ]
+      }
+    },
+    {
+      "schema": "NodeSample",
+      "name": "cold-storage-capability",
+      "valid": true,
+      "node_valid": true,
+      "refinement": false,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "memory": { "total_bytes": 12884901888, "available_bytes": 9663676416 },
+        "cpu": { "cores": 6, "busy_millicores": 1200 },
+        "pool": {
+          "observed_at": "2026-10-17T12:00:00.000Z",
+          "data_total_bytes": 134217728000,
+          "data_used_bytes": 42949672960,
+          "metadata_total_bytes": 1073741824,
+          "metadata_used_bytes": 1048576,
+          "nominal_bytes": 322122547200
+        },
+        "room": true,
+        "volumes": { "total": 300, "mounted": 280 },
+        "archive": { "ready_files": 3, "oldest_ready_seconds": 42 },
+        "awake": ["dbbbbbbbbbbbbbbbbbbb"],
+        "awake_memory_mib": 256,
+        "starting": 0,
+        "queued": 1,
+        "credentials_revision": 3,
+        "capabilities": ["restore_in_place_v1", "cold_storage_v2"]
+      }
     },
     {
       "schema": "NodeSample",

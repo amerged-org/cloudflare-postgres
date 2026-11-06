@@ -119,6 +119,7 @@ interface StartRow {
   id: string;
   node_id: string | null;
   region_id: string;
+  storage_residency: "local" | "archiving" | "archived" | "restoring";
   generation: number;
   storage_generation: number;
   desired_state: string;
@@ -211,11 +212,19 @@ export async function startDatabaseMove(
     targetNodeId = NodeId.parse(input.targetNodeId);
   const row = await db
     .prepare(
-      "SELECT id,node_id,region_id,generation,storage_generation,desired_state,observed_state,observed_generation,observed_power,deleted_at FROM databases WHERE id=?",
+      "SELECT id,node_id,region_id,generation,storage_generation,storage_residency,desired_state,observed_state,observed_generation,observed_power,deleted_at FROM databases WHERE id=?",
     )
     .bind(databaseId)
     .first<StartRow>();
   if (!row) throw new ApiError("not_found", "Database not found");
+  if (row.storage_residency !== "local")
+    throw new ApiError(
+      "conflict",
+      "Resume the archived database before moving its storage",
+      {
+        reason: "storage_not_local",
+      },
+    );
   if (
     await db
       .prepare(
@@ -288,7 +297,8 @@ export async function startDatabaseMove(
         .prepare(
           `INSERT INTO database_moves(operation,database_id,project_id,region_id,source_node_id,target_node_id,source_storage_generation,source_archive_path,status,created_at,updated_at)
           SELECT ?,d.id,d.project_id,d.region_id,d.node_id,?,d.storage_generation,d.archive_path,'proving',?,?
-          FROM databases d WHERE d.id=? AND d.generation=? AND d.storage_generation=? AND d.node_id=? AND d.deleted_at IS NULL
+          FROM databases d WHERE d.id=? AND d.generation=? AND d.storage_generation=? AND d.node_id=? AND d.deleted_at IS NULL AND d.storage_residency='local'
+          AND NOT EXISTS(SELECT 1 FROM archive_retention_claims WHERE archive_path=d.archive_path)
           AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase IN('proving','restoring','rolling_back'))
           AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=d.node_id AND ${liveNodeSql}) AND ${open.sql}`,
         )

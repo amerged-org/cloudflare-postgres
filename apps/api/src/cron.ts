@@ -9,6 +9,7 @@ import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
 import { hintNode } from "./domain/node-hints.ts";
 import { runBackupRetention } from "./domain/backup-retention.ts";
+import { runColdStorageCron } from "./domain/cold-storage.ts";
 import { runWebhookEvents } from "./domain/webhook-events.ts";
 import { runNodeFencingCron } from "./domain/node-loss.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
@@ -363,6 +364,9 @@ export async function runCron(
   await attempt("retained_archives", undefined, () =>
     cleanupRetainedArchives(env, now),
   );
+  await attempt("cold_storage", undefined, async () => {
+    await runColdStorageCron(env, now);
+  });
   await attempt("backup_retention", undefined, () =>
     runBackupRetention(env, now),
   );

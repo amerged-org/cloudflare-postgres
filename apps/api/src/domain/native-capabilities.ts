@@ -145,3 +145,31 @@ export function extendedReleaseAssignmentGuard(
     bindings: [regionId],
   };
 }
+
+/** Cold storage uses the same signed-release/OS/freshness proof as extended resources. */
+export function coldStorageNativeReleaseIds(
+  env: Pick<Env, "NATIVE_COLD_STORAGE_RELEASE_IDS" | "DB">,
+): string[] {
+  return extendedNativeReleaseIds({
+    DB: env.DB,
+    NATIVE_EXTENDED_RESOURCES_RELEASE_IDS: env.NATIVE_COLD_STORAGE_RELEASE_IDS,
+  });
+}
+export function coldStorageNativeGuard(
+  env: Pick<Env, "NATIVE_COLD_STORAGE_RELEASE_IDS" | "DB">,
+  scope: { regionId?: string; nodeId?: string },
+  now = Date.now(),
+  delivery = false,
+): NativeGuard {
+  return extendedNativeGuard(
+    {
+      DB: env.DB,
+      NATIVE_EXTENDED_RESOURCES_RELEASE_IDS:
+        env.NATIVE_COLD_STORAGE_RELEASE_IDS,
+    },
+    scope,
+    true,
+    now,
+    delivery,
+  );
+}

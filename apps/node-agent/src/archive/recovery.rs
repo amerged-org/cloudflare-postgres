@@ -467,6 +467,19 @@ mod tests {
         prepare(&data, &text, owner.uid(), owner.gid()).unwrap();
         target.start();
         let session = target.agent().await;
+        // Socket readiness includes hot standby: rows committed after the backup need not have
+        // replayed yet. Assert the recovered contents only after the same promotion boundary
+        // the restore executor requires, rather than racing the startup process.
+        let began_replay_wait = std::time::Instant::now();
+        while session
+            .query("SELECT pg_catalog.pg_is_in_recovery()", &[])
+            .await
+            .unwrap()[0]
+            .get::<_, bool>(0)
+        {
+            assert!(began_replay_wait.elapsed() < Duration::from_secs(30));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let rows = session.query("SELECT count(*) FROM t", &[]).await.unwrap();
         assert_eq!(rows[0].get::<_, i64>(0), 200);
         drop(session);

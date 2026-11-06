@@ -6,6 +6,7 @@
 // JSON Schema alone accepts.
 import type { z } from "zod";
 import * as link from "../src/node-link.ts";
+import * as cold from "../src/cold-snapshot.ts";
 import * as local from "../src/node-local.ts";
 import { bytesToBase64url } from "../src/encoding.ts";
 import {
@@ -105,6 +106,86 @@ const moved = {
       credential,
     },
   },
+};
+const coldManifest = {
+  version: 1,
+  operation,
+  database_id: source,
+  source_generation: 4,
+  source_storage_generation: 3,
+  pg_major: 18,
+  end: proof,
+  total_bytes: 8195,
+  directories: ["global", "pg_wal"],
+  files: [
+    { path: "PG_VERSION", offset: 0, size_bytes: 3, sha256: "a".repeat(64) },
+    {
+      path: "global/pg_control",
+      offset: 3,
+      size_bytes: 8192,
+      sha256: "b".repeat(64),
+    },
+  ],
+  chunks: [{ index: 0, size_bytes: 8195, sha256: "c".repeat(64) }],
+};
+const coldSource = {
+  database_id: source,
+  snapshot_operation: operation,
+  source_generation: 4,
+  source_storage_generation: 3,
+  manifest_sha256: "a".repeat(64),
+  manifest_bytes: JSON.stringify(coldManifest).length,
+  end: proof,
+};
+const coldCapture = {
+  operation,
+  database_id: source,
+  source_node_id: node.id,
+  source_generation: 4,
+  source_storage_generation: 3,
+  end: proof,
+};
+const coldCaptured = {
+  operation,
+  database_id: source,
+  source_generation: 4,
+  source_storage_generation: 3,
+  observed_at: now,
+  status: "captured",
+  manifest_sha256: coldSource.manifest_sha256,
+  manifest_bytes: coldSource.manifest_bytes,
+  end: proof,
+  cleaned_up: true,
+};
+const archiveVerification = {
+  operation,
+  database_id: source,
+  source_node_id: node.id,
+  source_generation: 4,
+  source_storage_generation: 3,
+  source: coldSource,
+  resources: database.resources,
+  settings: database.settings,
+};
+const archiveVerified = {
+  operation,
+  database_id: source,
+  source_generation: 4,
+  source_storage_generation: 3,
+  manifest_sha256: "a".repeat(64),
+  observed_at: now,
+  status: "verified",
+  end: proof,
+  system_identifier: proof.system_identifier,
+  timeline: 1,
+  checkpoint_lsn: proof.checkpoint_lsn,
+  cleaned_up: true,
+};
+const archiveCancellation = {
+  operation,
+  database_id: source,
+  source_generation: 4,
+  source_storage_generation: 3,
 };
 const replaced = {
   ...moved,
@@ -497,6 +578,14 @@ export const nodeSchemas = {
   NodeRequestClaims: link.NodeRequestClaims,
   NodeCredentials: link.NodeCredentials,
   ArchiveCredential: link.ArchiveCredential,
+  ColdSnapshotManifest: cold.ColdSnapshotManifest,
+  ColdSnapshotSource: cold.ColdSnapshotSource,
+  ColdSnapshotCaptureRequest: cold.ColdSnapshotCaptureRequest,
+  ColdSnapshotCaptureResult: link.ColdSnapshotCaptureResult,
+  ArchiveVerificationRequest: link.ArchiveVerificationRequest,
+  ArchiveVerificationCancellation: link.ArchiveVerificationCancellation,
+  ArchiveVerificationResult: link.ArchiveVerificationResult,
+  ColdSnapshotRestoreAttestation: link.ColdSnapshotRestoreAttestation,
   NodeDesiredPage: link.NodeDesiredPage,
   NodeObservationReport: link.NodeObservationReport,
   NodeObservationAnswer: link.NodeObservationAnswer,
@@ -524,10 +613,15 @@ export const nodeSchemas = {
  * number.
  */
 export const nodeReceives = [
+  // ColdSnapshotManifest is an immutable, versioned artifact and deliberately remains strict.
   "NodeEnrollmentSeed",
   "NodeEnrollmentResponse",
   "NodeCredentials",
   "ArchiveCredential",
+  "ColdSnapshotSource",
+  "ColdSnapshotCaptureRequest",
+  "ArchiveVerificationRequest",
+  "ArchiveVerificationCancellation",
   "NodeDesiredPage",
   "NodeObservationAnswer",
   "NodeFencedResponse",
@@ -535,6 +629,152 @@ export const nodeReceives = [
 ] as const satisfies readonly (keyof typeof nodeSchemas)[];
 
 const cases: Record<keyof typeof nodeSchemas, Case[]> = {
+  ColdSnapshotRestoreAttestation: [
+    [
+      "exact-clean-snapshot-before-start",
+      {
+        snapshot_operation: operation,
+        manifest_sha256: "a".repeat(64),
+        system_identifier: proof.system_identifier,
+        timeline: proof.timeline,
+        checkpoint_lsn: proof.checkpoint_lsn,
+        verified_at: now,
+      },
+      true,
+    ],
+  ],
+  ColdSnapshotManifest: [
+    [
+      "later-timeline-without-history",
+      {
+        ...coldManifest,
+        end: {
+          ...proof,
+          timeline: 2,
+          last_archived_segment: "000000020000000000000002",
+        },
+      },
+      false,
+      true,
+    ],
+    [
+      "later-timeline-complete-history",
+      {
+        ...coldManifest,
+        end: {
+          ...proof,
+          timeline: 2,
+          last_archived_segment: "000000020000000000000002",
+        },
+        total_bytes: 8211,
+        files: [
+          ...coldManifest.files,
+          {
+            path: "pg_wal/00000002.history",
+            offset: 8195,
+            size_bytes: 16,
+            sha256: "d".repeat(64),
+          },
+        ],
+        chunks: [{ index: 0, size_bytes: 8211, sha256: "c".repeat(64) }],
+      },
+      true,
+    ],
+    ["complete-packed-snapshot", coldManifest, true],
+    [
+      "missing-file",
+      { ...coldManifest, files: coldManifest.files.slice(0, 1) },
+      false,
+    ],
+    [
+      "packed-file-hole",
+      {
+        ...coldManifest,
+        files: [coldManifest.files[0], { ...coldManifest.files[1], offset: 4 }],
+      },
+      false,
+      true,
+    ],
+    [
+      "packed-chunk-hole",
+      { ...coldManifest, chunks: [{ ...coldManifest.chunks[0], index: 1 }] },
+      false,
+      true,
+    ],
+    [
+      "path-traversal",
+      { ...coldManifest, directories: ["..", "global", "pg_wal"] },
+      false,
+      true,
+    ],
+  ],
+  ColdSnapshotSource: [
+    ["sealed-snapshot-source", coldSource, true],
+    [
+      "source-without-manifest",
+      { ...coldSource, manifest_sha256: undefined },
+      false,
+    ],
+  ],
+  ColdSnapshotCaptureRequest: [["capture-stopped-source", coldCapture, true]],
+  ColdSnapshotCaptureResult: [
+    ["captured-source-clean", coldCaptured, true],
+    ["capture-not-clean", { ...coldCaptured, cleaned_up: false }, false],
+  ],
+  ArchiveVerificationCancellation: [
+    ["cancel-exact-scratch", archiveCancellation, true],
+    [
+      "cancel-without-source-generation",
+      { ...archiveCancellation, source_generation: undefined },
+      false,
+    ],
+  ],
+  ArchiveVerificationRequest: [
+    ["isolated-archive-verification", archiveVerification, true],
+    [
+      "missing-manifest-binding",
+      {
+        ...archiveVerification,
+        source: { ...coldSource, manifest_sha256: undefined },
+      },
+      false,
+    ],
+    [
+      "wrong-source-database",
+      { ...archiveVerification, database_id: other },
+      false,
+      true,
+    ],
+    [
+      "wrong-source-generation",
+      { ...archiveVerification, source_storage_generation: 2 },
+      false,
+      true,
+    ],
+  ],
+  ArchiveVerificationResult: [
+    ["verified-and-cleaned", archiveVerified, true],
+    [
+      "verified-with-scratch-left",
+      { ...archiveVerified, cleaned_up: false },
+      false,
+    ],
+    ["verified-without-end", { ...archiveVerified, end: undefined }, false],
+    [
+      "failed-cleanup",
+      {
+        operation,
+        database_id: source,
+        source_generation: 4,
+        source_storage_generation: 3,
+        observed_at: now,
+        status: "failed",
+        reason: "scratch_cleanup_failed",
+        cleaned_up: false,
+      },
+      true,
+    ],
+  ],
   NodeEnrollmentSeed: [
     [
       "installer-seed",
@@ -740,6 +980,93 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
   ],
   NodeDesiredPage: [
+    [
+      "cold-target-without-pending-fence",
+      {
+        ...bare,
+        databases: [
+          {
+            ...moved,
+            generation: 5,
+            origin: { kind: "rehydrate", source: coldSource },
+          },
+        ],
+      },
+      false,
+      true,
+    ],
+    [
+      "cold-target-pending",
+      {
+        ...bare,
+        databases: [
+          {
+            ...moved,
+            generation: 5,
+            cold_snapshot_pending: true,
+            origin: { kind: "rehydrate", source: coldSource },
+          },
+        ],
+      },
+      true,
+    ],
+    [
+      "cold-target-activating-without-origin",
+      {
+        ...bare,
+        databases: [
+          {
+            ...moved,
+            generation: 6,
+            cold_snapshot_pending: true,
+            origin: undefined,
+          },
+        ],
+      },
+      true,
+    ],
+    [
+      "fenced-verification-cleanup",
+      { ...fenced, archive_verification_cancellations: [archiveCancellation] },
+      true,
+    ],
+    [
+      "same-id-rehydrate",
+      {
+        ...page,
+        orders: [],
+        databases: [
+          {
+            ...moved,
+            generation: 5,
+            cold_snapshot_pending: true,
+            origin: { kind: "rehydrate", source: coldSource },
+          },
+        ],
+      },
+      true,
+    ],
+    [
+      "archive-verification-page",
+      { ...bare, archive_verifications: [archiveVerification] },
+      true,
+    ],
+    [
+      "archive-verification-on-fenced-node",
+      { ...fenced, archive_verifications: [archiveVerification] },
+      false,
+      true,
+    ],
+    [
+      "cold-capture-wrong-source-node",
+      {
+        ...bare,
+        node: { ...node, id: `nod_${"x".repeat(20)}` },
+        cold_snapshot_captures: [coldCapture],
+      },
+      false,
+      true,
+    ],
     [
       "same-id-forward-rollback",
       { ...page, orders: [], databases: [rolledBack] },
@@ -1447,6 +1774,38 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
   ],
   NodeObservationReport: [
+    [
+      "cold-target-requires-new-storage-generation",
+      observations({
+        ...observation,
+        state: "error",
+        error: "cold_snapshot_restart_required",
+        proven_sleep: null,
+        backup: null,
+      }),
+      true,
+    ],
+    [
+      "cold-target-activation-uncertain",
+      observations({
+        ...observation,
+        state: "error",
+        error: "cold_activation_uncertain",
+        proven_sleep: null,
+        backup: null,
+      }),
+      true,
+    ],
+    [
+      "archive-verification-result",
+      {
+        observed_at: now,
+        databases: [],
+        orders: [],
+        archive_verifications: [archiveVerified],
+      },
+      true,
+    ],
     ["asleep", observations(observation), true],
     [
       "ready-after-a-refused-sleep",
@@ -1699,6 +2058,27 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ["an-unknown-key", { databases: [], orders: 0, hint: true }, false],
   ],
   NodeSample: [
+    [
+      "isolated-verification-runtime",
+      { ...sample, verification_runtime_ids: [id] },
+      true,
+    ],
+    [
+      "verification-runtime-not-awake",
+      { ...sample, verification_runtime_ids: [other] },
+      false,
+      true,
+    ],
+    [
+      "more-than-one-verification-runtime",
+      { ...sample, awake: [id, other], verification_runtime_ids: [id, other] },
+      false,
+    ],
+    [
+      "cold-storage-capability",
+      { ...sample, capabilities: ["restore_in_place_v1", "cold_storage_v2"] },
+      true,
+    ],
     [
       "in-place-restore-capability",
       { ...sample, capabilities: ["restore_in_place_v1"] },

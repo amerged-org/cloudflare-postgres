@@ -34,7 +34,7 @@ export const keyedEnv = () => ({ ...env, ...PARENT_KEY });
 
 export const cleanup = async () => {
   await env.DB.exec(
-    "DELETE FROM node_reinstall_overrides; DELETE FROM node_losses; DELETE FROM lifecycle_orders; DELETE FROM database_moves; DELETE FROM archive_credentials; DELETE FROM database_recovery_points; DELETE FROM backup_retention_runs;",
+    "DELETE FROM archive_retention_claims; DELETE FROM archive_pins; DELETE FROM cold_snapshot_chunks; DELETE FROM database_cold_storage; DELETE FROM cold_storage_operations; DELETE FROM node_reinstall_overrides; DELETE FROM node_losses; DELETE FROM lifecycle_orders; DELETE FROM database_moves; DELETE FROM archive_credentials; DELETE FROM database_recovery_points; DELETE FROM backup_retention_runs;",
   );
   await cleanupFixtures();
 };

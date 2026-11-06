@@ -5,12 +5,13 @@
 //! restorable.
 use super::{
     Core, Db, Entry, Origin, Phase, Source,
+    cold::ColdSnapshotSource,
     power::{StartAs, StartFailure, writer_of},
 };
 use crate::{
     Error,
     archive::{
-        facts,
+        cold_snapshot, facts,
         job::{Job, Store},
         recovery::Restored,
         restore::{End, Failed, Host, Order, RECOVERY_FETCH_TIMEOUT, Restorer},
@@ -18,7 +19,7 @@ use crate::{
     },
     credentials::Access,
     machine::{Account, Machine},
-    pg_control, pgcf, postgres, roles,
+    pg_control, pgcf, postgres, proof, roles,
     settings::{self, Settings},
     sleep,
     state::{self, DatabaseState},
@@ -189,6 +190,44 @@ pub(super) fn write_owned(
     file.write_all(content.as_bytes())?;
     fchown(&file, Some(account.uid), Some(account.gid))?;
     file.sync_all()
+}
+
+/// Copied archive acknowledgements name the old prefix. Re-arm only complete files that
+/// still exist, plus every timeline history, before PostgreSQL uses the new archive prefix.
+fn rearm_snapshot_archive(data: &Path, account: &Account) -> io::Result<Vec<String>> {
+    let wal = data.join("pg_wal");
+    let status = wal.join("archive_status");
+    let mut names = std::collections::BTreeSet::new();
+    for item in std::fs::read_dir(&status)? {
+        let item = item?;
+        let name = item.file_name();
+        if let Some(name) = name.to_str().and_then(|value| value.strip_suffix(".done"))
+            && crate::archive::protocol::valid_name(name)
+            && wal.join(name).is_file()
+        {
+            names.insert(name.to_string());
+        }
+    }
+    for item in std::fs::read_dir(&wal)? {
+        let item = item?;
+        let name = item.file_name();
+        if let Some(name) = name.to_str()
+            && name.ends_with(".history")
+            && crate::archive::protocol::valid_name(name)
+            && item.file_type()?.is_file()
+        {
+            names.insert(name.to_string());
+        }
+    }
+    for name in &names {
+        match std::fs::remove_file(status.join(format!("{name}.done"))) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        write_owned(&status, &format!("{name}.ready"), "", account)?;
+    }
+    std::fs::File::open(&status)?.sync_all()?;
+    Ok(names.into_iter().collect())
 }
 
 /// What `refresh_events` found and did about a database's platform schema.
@@ -594,6 +633,15 @@ impl<M: Machine> Core<M> {
         entry: &Entry,
     ) -> Result<(), &'static str> {
         let origin = entry.origin.clone().ok_or_else(|| build_failed!())?;
+        if matches!(origin, Origin::Rehydrate(_))
+            && let Some(held) = self.files(&db.id).load().map_err(|_| build_failed!())?
+            && held.storage_generation == entry.storage_generation
+            && held.cold_snapshot_serving
+        {
+            // A stale staging page can never overwrite a generation that has served clients.
+            self.set(db, |view| view.state = Some(held));
+            return Ok(());
+        }
         if let Err(error) = self.prepare_replacement(entry).await {
             if error == super::replacement::CLEANUP_PENDING {
                 return Err(error);
@@ -636,6 +684,7 @@ impl<M: Machine> Core<M> {
                     Origin::Move(source, end) => {
                         self.build_restored(db, entry, &source, Some(end)).await
                     }
+                    Origin::Rehydrate(source) => self.build_rehydrated(db, entry, &source).await,
                     Origin::ReplaceRollback(source, _, record, _) => {
                         let end = End {
                             system_identifier: record.system_identifier,
@@ -672,6 +721,17 @@ impl<M: Machine> Core<M> {
         match built {
             Ok(()) => Ok(()),
             Err(error) => {
+                if matches!(origin, Origin::Rehydrate(_)) {
+                    // Preserve every cold target's journal until Cloudflare explicitly retires
+                    // it. A generic first-backup/start/archive error may occur AFTER PGstart;
+                    // forgetting that intent would let a restart rewind the same WAL prefix.
+                    self.set(db, |view| {
+                        view.phase = Phase::Error;
+                        view.error = Some(error);
+                        view.writer = None;
+                    });
+                    return Err(error);
+                }
                 let rollback = self.replacement_rollback(entry);
                 // Report a failure only after it survives a restart. Rollback failures remain
                 // retryable at this same forward generation; the source is never removed.
@@ -719,7 +779,7 @@ impl<M: Machine> Core<M> {
         };
         let delivered = usable(&entry.archive_path, Access::ReadWrite)
             && match origin {
-                Origin::Create => true,
+                Origin::Create | Origin::Rehydrate(_) => true,
                 Origin::Restore(source)
                 | Origin::Move(source, _)
                 | Origin::Replace(source, _, _)
@@ -972,6 +1032,311 @@ impl<M: Machine> Core<M> {
         Ok(())
     }
 
+    fn grant_cold_serving(
+        &self,
+        db: &Db,
+        entry: &Entry,
+        writer: pgcf_native_protocol::agent::Writer,
+    ) -> Result<(), &'static str> {
+        let mut result = Ok(());
+        self.set(db, |view| {
+            if view.entry.as_ref().is_none_or(|current| {
+                current.generation != entry.generation
+                    || current.operation != entry.operation
+                    || current.storage_generation != entry.storage_generation
+            }) {
+                return;
+            }
+            let Some(mut state) = view.state.clone() else {
+                result = Err("cold_activation_uncertain");
+                return;
+            };
+            if state.cold_snapshot_committed {
+                return;
+            }
+            if state.storage_generation != entry.storage_generation
+                || !state.built
+                || !state.cold_snapshot_start_intent
+                || state.cold_snapshot_target_operation.as_deref() != Some(entry.operation.as_str())
+                || state.cold_snapshot_restore.is_none()
+            {
+                result = Err("cold_activation_uncertain");
+                return;
+            }
+            state.cold_snapshot_serving = true;
+            if self.files(&db.id).save(&state).is_err() {
+                result = Err("cold_activation_uncertain");
+                return;
+            }
+            // The fsynced latch, the exact inspected invocation and readiness become visible
+            // together. There is no intermediate final-ready report naming the old writer.
+            view.state = Some(state);
+            view.phase = Phase::Ready;
+            view.error = None;
+            view.writer = Some(writer);
+            view.awake_since_ms = Some(super::now_ms());
+        });
+        result
+    }
+
+    /// A staged target may publish its higher-generation route only after the native process is
+    /// positively healthy. Once the durable serving latch was written, uncertainty must be fenced
+    /// and retried by Cloudflare on a NEW storage generation, never by recopying this one.
+    pub(crate) async fn activate_cold(
+        self: &Arc<Self>,
+        db: &Arc<Db>,
+        entry: &Entry,
+    ) -> Result<(), &'static str> {
+        let state = db
+            .view()
+            .state
+            .clone()
+            .filter(|state| state.storage_generation == entry.storage_generation)
+            .ok_or("cold_activation_uncertain")?;
+        if state.cold_snapshot_start_intent && !db.view().adopted {
+            return Err("cold_snapshot_restart_required");
+        }
+        let source = state
+            .cold_snapshot_source
+            .clone()
+            .ok_or("cold_activation_uncertain")?;
+        if state.cold_snapshot_target_operation.as_deref() != Some(entry.operation.as_str()) {
+            return Err("cold_activation_uncertain");
+        }
+        let unit = self
+            .machine
+            .unit(&entry.id)
+            .await
+            .map_err(|_| "cold_activation_uncertain")?;
+        let healthy = if state.built
+            && state.backup.is_some()
+            && state.cold_snapshot_restore.is_some()
+            && unit.active.awake()
+        {
+            match self.machine.wait_started(&entry.id).await {
+                Ok(started) => {
+                    let session = postgres::agent(&self.layout().socket_directory(&entry.id))
+                        .await
+                        .map_err(|_| "cold_activation_uncertain")?;
+                    let identity = sleep::system(&session)
+                        .await
+                        .ok_or("cold_activation_uncertain")?;
+                    let recovery = session
+                        .query("SELECT pg_catalog.pg_is_in_recovery()", &[])
+                        .await
+                        .map_err(|_| "cold_activation_uncertain")?;
+                    if identity.identifier != source.end.system_identifier
+                        || u32::try_from(identity.timeline).ok() != Some(source.end.timeline)
+                        || recovery[0]
+                            .try_get::<_, bool>(0)
+                            .map_err(|_| "cold_activation_uncertain")?
+                    {
+                        return Err("cold_activation_uncertain");
+                    }
+                    Some(started)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(started) = healthy {
+            if !self.ensure_archive(db, entry) {
+                return Err("archive_unusable");
+            }
+            let writer = writer_of(&started).ok_or("cold_activation_uncertain")?;
+            self.grant_cold_serving(db, entry, writer)
+        } else {
+            if state.cold_snapshot_start_intent || state.cold_snapshot_serving {
+                return Err("cold_snapshot_restart_required");
+            }
+            let mut staging = entry.clone();
+            staging.origin = Some(Origin::Rehydrate(source));
+            self.build(db, &staging).await?;
+            let writer = db
+                .view()
+                .writer
+                .clone()
+                .ok_or("cold_activation_uncertain")?;
+            self.grant_cold_serving(db, entry, writer)
+        }
+    }
+
+    /// Restore the complete clean PGDATA image. Archive recovery is deliberately never involved:
+    /// PostgreSQL would discard UNLOGGED relations before replaying the source WAL.
+    async fn build_rehydrated(
+        self: &Arc<Self>,
+        db: &Arc<Db>,
+        entry: &Entry,
+        source: &ColdSnapshotSource,
+    ) -> Result<(), &'static str> {
+        if source.database_id != entry.id
+            || source.source_storage_generation >= entry.storage_generation
+        {
+            return Err("identity_mismatch");
+        }
+        let store = self
+            .store(&entry.archive_path, Access::ReadWrite)
+            .ok_or("archive_unusable")?;
+        let resumed = self.begin_state(db, entry)?;
+        if db
+            .view()
+            .state
+            .as_ref()
+            .is_some_and(|state| state.cold_snapshot_start_intent)
+        {
+            return Err("cold_snapshot_restart_required");
+        }
+        let before = self
+            .machine
+            .unit(&entry.id)
+            .await
+            .map_err(|_| "cold_activation_uncertain")?;
+        if !matches!(
+            before.active,
+            crate::units::ActiveState::Inactive | crate::units::ActiveState::Failed
+        ) || before.main_pid.is_some()
+            || (resumed
+                && !self
+                    .jobs
+                    .absent(&entry.id)
+                    .await
+                    .map_err(|_| "cold_activation_uncertain")?)
+        {
+            return Err("cold_activation_uncertain");
+        }
+        let (account, volume) = self.provision(db, entry).await?;
+        let database = self.job_database(&volume, &account.name);
+        let data = database.data_directory();
+        // Fresh Cloudflare desired state still stages this target, and no PostgreSQL start was
+        // attempted. A partial download is safe to replace; a started attempt needs a new SG.
+        match std::fs::remove_dir_all(&data) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err("build_failed"),
+            _ => {}
+        }
+        self.save_state(db, |state| {
+            state.built = false;
+            state.record = None;
+            state.backup = None;
+            state.cold_snapshot_restore = None;
+            state.cold_snapshot_target_operation = Some(entry.operation.clone());
+            state.cold_snapshot_source = Some(source.clone());
+            state.cold_snapshot_serving = false;
+            state.cold_snapshot_committed = false;
+        })
+        .map_err(|_| build_failed!())?;
+        let transport = self
+            .cold_snapshot_transport(&source.snapshot_operation)
+            .map_err(|_| "archive_unusable")?;
+        let slot = self
+            .jobs
+            .snapshot_slot()
+            .await
+            .map_err(|_| "archive_unusable")?;
+        let manifest = cold_snapshot::restore_and_verify(
+            &data, &source.binding(), &source.manifest_sha256, transport.as_ref(), Some((account.uid, account.gid)),
+        ).await.map_err(|reason| {
+            crate::timing::emit_event(serde_json::json!({"event":"cold_snapshot_restore_failed","database_id":entry.id,"operation":entry.operation,"reason":reason}));
+            "archive_unusable"
+        })?;
+        if manifest.encode().map_err(|_| "archive_unusable")?.len() as u64 != source.manifest_bytes
+        {
+            return Err("archive_unusable");
+        }
+        let control = cold_snapshot::verify_data(&data, &manifest)
+            .await
+            .map_err(|_| "archive_unusable")?;
+        proof::wake_check(Some(&source.end), &database.volume).map_err(|_| "identity_mismatch")?;
+        let attestation = state::ColdSnapshotRestore {
+            snapshot_operation: source.snapshot_operation.clone(),
+            manifest_sha256: source.manifest_sha256.clone(),
+            system_identifier: control.control.system_identifier,
+            timeline: control.control.timeline,
+            checkpoint_lsn: pg_control::Lsn(control.checkpoint).to_string(),
+            verified_at: facts::timestamp(super::now_ms()),
+        };
+        self.save_state(db, |state| {
+            state.cold_snapshot_restore = Some(attestation);
+            state.cold_snapshot_target_operation = Some(entry.operation.clone());
+        })
+        .map_err(|_| build_failed!())?;
+        // Only after every captured byte and the original shutdown checkpoint are proven may
+        // node-owned configuration change. No recovery signal or restore command is introduced.
+        write_owned(&data, "postgresql.auto.conf", "", &account).map_err(|_| build_failed!())?;
+        write_owned(&data, "pgcf-recovery.conf", "", &account).map_err(|_| build_failed!())?;
+        let rearmed = rearm_snapshot_archive(&data, &account).map_err(|_| "archive_unusable")?;
+        drop(slot);
+        self.ensure_archive(db, entry);
+        let host = Rebuild {
+            core: self.clone(),
+            db: db.clone(),
+            entry: entry.clone(),
+            account,
+            source_database: entry.id.clone(),
+            started: std::sync::Mutex::new(None),
+            applied: std::sync::Mutex::new(None),
+        };
+        self.save_state(db, |state| state.cold_snapshot_start_intent = true)
+            .map_err(|_| build_failed!())?;
+        host.start().await.map_err(|_| "start_failed")?;
+        let restored = host.promoted().await.map_err(|_| "identity_mismatch")?;
+        if restored.in_recovery
+            || restored.system_identifier != source.end.system_identifier
+            || restored.timeline != source.end.timeline
+        {
+            return Err("identity_mismatch");
+        }
+        let upload_log = self.files(&entry.id).upload_log(entry.storage_generation);
+        tokio::time::timeout(self.timing.archive_wait, async {
+            loop {
+                let uploaded = upload_log.entries().map_err(|_| "archive_unusable")?;
+                if rearmed.iter().all(|name| {
+                    uploaded.contains(name)
+                        && data
+                            .join("pg_wal/archive_status")
+                            .join(format!("{name}.done"))
+                            .is_file()
+                }) {
+                    return Ok::<(), &'static str>(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| "archive_unusable")??;
+        let backup = self
+            .take_backup(&database, &store, restored.timeline)
+            .await?;
+        let applied = host
+            .applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| build_failed!())?;
+        self.save_state(db, |state| {
+            state.built = true;
+            state.roles = applied.revisions;
+            state.resources = Some(resources(entry));
+            state.backup = Some(backup);
+            state.record = None;
+        })
+        .map_err(|_| build_failed!())?;
+        let started = host
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| build_failed!())?;
+        let writer = writer_of(&started).ok_or_else(|| build_failed!())?;
+        self.set(db, |view| {
+            view.phase = Phase::Ready;
+            view.writer = Some(writer);
+            view.awake_since_ms = Some(super::now_ms());
+        });
+        self.after_ready(db).await;
+        Ok(())
+    }
+
     /// A restore, a point-in-time restore or a move target (plan 7.8, 9.5): the executor of the
     /// archive module over this database's unit and connection.
     async fn build_restored(
@@ -1086,7 +1451,10 @@ struct Rebuild<M: Machine> {
 }
 impl<M: Machine> Rebuild<M> {
     fn kind(&self) -> &'static str {
-        if matches!(self.entry.origin, Some(Origin::Move(..))) {
+        if matches!(
+            self.entry.origin,
+            Some(Origin::Move(..) | Origin::Rehydrate(..))
+        ) {
             "move"
         } else {
             "restore"
@@ -1249,6 +1617,224 @@ mod tests {
 
     fn report(observation: Value) -> Value {
         json!({"observed_at": "2026-10-18T10:11:12.345Z", "databases": [observation], "orders": []})
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_first_backup_failure_retains_the_cold_start_intent_across_restart() {
+        use crate::{agent::cold::tests::sleeping, link::Order};
+        let Some(rig) = Rig::new("cold-backup-failure-intent").await else {
+            return;
+        };
+        let gateway = rig.connect_gateway().await;
+        let (request, db, mut entry) = sleeping(&rig).await;
+        let id = db.id.clone();
+        let retired = "op_rrrrrrrrrrrrrrrrrrrr";
+        rig.core
+            .apply(&Rig::page(
+                vec![],
+                vec![Order::Superseded {
+                    operation: retired.into(),
+                    database: id.clone(),
+                    storage_generation: 1,
+                    remove_volume: true,
+                }],
+            ))
+            .await;
+        eventually(30, "source retired", || {
+            rig.core.pending_order(retired).is_some()
+        })
+        .await;
+        let operation = "op_nnnnnnnnnnnnnnnnnnnn";
+        let path = format!("s3://pgcf-eu/eu-dev/{id}/g2-{operation}");
+        entry["generation"] = json!(entry["generation"].as_u64().unwrap() + 1);
+        entry["storage_generation"] = json!(2);
+        entry["operation"] = json!(operation);
+        entry["archive"]["path"] = json!(path);
+        entry["origin"] = json!({"kind":"rehydrate","source":request["source"]});
+        entry["cold_snapshot_pending"] = true.into();
+        rig.deliver(&path, "read_write");
+        rig.fixture.set("backup-fail", "");
+        rig.core
+            .apply(&Rig::page(vec![entry.clone()], vec![]))
+            .await;
+        eventually(120, "target backup failure", || db.phase() == Phase::Error).await;
+        assert!(
+            rig.core.files(&id).load().unwrap().is_some_and(
+                |state| state.storage_generation == 2 && state.cold_snapshot_start_intent
+            ),
+            "any failure after PGstart must keep the durable no-recopy boundary"
+        );
+        let reads = rig.cold_store.reads();
+        let starts = rig
+            .machine
+            .calls()
+            .into_iter()
+            .filter(|call| call == &format!("start {id}"))
+            .count();
+        rig.fixture.clear("backup-fail");
+        drop(db);
+        drop(gateway);
+        let rig = rig.restart().await;
+        let _gateway = rig.connect_gateway().await;
+        rig.deliver(&path, "read_write");
+        rig.core.apply(&Rig::page(vec![entry], vec![])).await;
+        let db = rig.core.db(&id);
+        eventually(30, "same generation refused after restart", || {
+            db.phase() == Phase::Error
+        })
+        .await;
+        assert_eq!(db.view().error, Some("cold_snapshot_restart_required"));
+        assert_eq!(
+            rig.cold_store.reads(),
+            reads,
+            "never redownload into a used WAL prefix"
+        );
+        assert_eq!(
+            rig.machine
+                .calls()
+                .into_iter()
+                .filter(|call| call == &format!("start {id}"))
+                .count(),
+            starts
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_started_pending_cold_target_needs_retirement_and_a_new_storage_generation_after_crash()
+     {
+        use crate::{
+            agent::cold::{VerificationCancellation, tests::sleeping},
+            link::Order,
+        };
+        let Some(rig) = Rig::new("cold-target-retry-generation").await else {
+            return;
+        };
+        let _gateway = rig.connect_gateway().await;
+        let (request, db, mut entry) = sleeping(&rig).await;
+        let verified = rig
+            .core
+            .verify_archive(&request, true, &VerificationCancellation::default())
+            .await;
+        assert_eq!(verified["status"], "verified", "{verified}");
+        let id = db.id.clone();
+        let retire_source = "op_rrrrrrrrrrrrrrrrrrrr";
+        rig.core
+            .apply(&Rig::page(
+                vec![],
+                vec![Order::Superseded {
+                    operation: retire_source.into(),
+                    database: id.clone(),
+                    storage_generation: 1,
+                    remove_volume: true,
+                }],
+            ))
+            .await;
+        eventually(30, "source retired", || {
+            rig.core.pending_order(retire_source).is_some()
+        })
+        .await;
+        let target = "op_nnnnnnnnnnnnnnnnnnnn";
+        entry["generation"] = json!(entry["generation"].as_u64().unwrap() + 1);
+        entry["storage_generation"] = json!(2);
+        entry["operation"] = json!(target);
+        entry["route_revision"] = json!(entry["route_revision"].as_u64().unwrap() + 1);
+        let path = format!("s3://pgcf-eu/eu-dev/{id}/g2-{target}");
+        entry["archive"]["path"] = json!(path);
+        entry["origin"] = json!({"kind":"rehydrate","source":request["source"]});
+        entry["cold_snapshot_pending"] = json!(true);
+        rig.deliver(&path, "read_write");
+        rig.core
+            .apply(&Rig::page(vec![entry.clone()], vec![]))
+            .await;
+        eventually(120, "staged cold target", || {
+            matches!(db.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(db.phase(), Phase::Ready, "{:?}", db.view().error);
+        assert!(db.state().unwrap().cold_snapshot_start_intent);
+        assert!(!db.state().unwrap().cold_snapshot_serving);
+        let reads = rig.cold_store.reads();
+        let starts = rig
+            .machine
+            .calls()
+            .into_iter()
+            .filter(|call| call == &format!("start {id}"))
+            .count();
+        rig.machine.crash(&id);
+        rig.core.watch_pass().await;
+        eventually(30, "uncertain cold attempt refused", || {
+            db.phase() == Phase::Error
+        })
+        .await;
+        assert_eq!(db.view().error, Some("cold_snapshot_restart_required"));
+        assert_eq!(
+            rig.cold_store.reads(),
+            reads,
+            "a started generation is never rewound"
+        );
+        assert_eq!(
+            rig.machine
+                .calls()
+                .into_iter()
+                .filter(|call| call == &format!("start {id}"))
+                .count(),
+            starts,
+            "no archive crash recovery"
+        );
+        let retire_target = "op_ssssssssssssssssssss";
+        rig.core
+            .apply(&Rig::page(
+                vec![],
+                vec![Order::Superseded {
+                    operation: retire_target.into(),
+                    database: id.clone(),
+                    storage_generation: 2,
+                    remove_volume: true,
+                }],
+            ))
+            .await;
+        eventually(30, "failed target retired", || {
+            rig.core.pending_order(retire_target).is_some()
+        })
+        .await;
+        let retried = "op_tttttttttttttttttttt";
+        let next_path = format!("s3://pgcf-eu/eu-dev/{id}/g3-{retried}");
+        entry["storage_generation"] = json!(3);
+        entry["operation"] = json!(retried);
+        entry["route_revision"] = json!(entry["route_revision"].as_u64().unwrap() + 1);
+        entry["archive"]["path"] = json!(next_path);
+        rig.deliver(&next_path, "read_write");
+        rig.core.apply(&Rig::page(vec![entry], vec![])).await;
+        eventually(120, "fresh generation restored", || {
+            db.state().is_some_and(|s| s.storage_generation == 3)
+                && matches!(db.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(db.phase(), Phase::Ready, "{:?}", db.view().error);
+        assert!(rig.cold_store.reads() > reads);
+        let session = postgres::connect(
+            &rig.machine.layout().socket_directory(&id),
+            settings::AGENT_ROLE,
+            &id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session
+                .query("SELECT id FROM snapshot_unlogged", &[])
+                .await
+                .unwrap()[0]
+                .get::<_, i32>(0),
+            42
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM snapshot_logged", &[])
+                .await
+                .unwrap()[0]
+                .get::<_, i32>(0),
+            41
+        );
     }
 
     #[test]

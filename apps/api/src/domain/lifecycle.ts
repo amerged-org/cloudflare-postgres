@@ -48,7 +48,7 @@ export async function changePower(
   return withIdempotency(c, {
     replay: (op, status) => databaseOperationResponse(c, op, status),
     execute: async (lease) => {
-      const row = await databaseForRequest(c, id, true);
+      let row = await databaseForRequest(c, id, true);
       // Replays return their accepted operation before this new intent's precondition.
       if (
         body.expected_generation !== undefined &&
@@ -60,6 +60,111 @@ export async function changePower(
           reason: "database_deleted",
         });
       const sleeping = action === "suspend";
+      if ((row.storage_residency ?? "local") !== "local") {
+        if (!sleeping) {
+          const { requestColdStorageWake } = await import("./cold-storage.ts");
+          const recovery = await requestColdStorageWake(c.env, id, {
+            manualResume: true,
+            idempotency: lease,
+            expectedGeneration: body.expected_generation,
+          });
+          if (recovery.handled) {
+            if (!recovery.operationId || !recovery.waiting)
+              throw new ApiError(
+                "conflict",
+                "Recovery is not ready to resume",
+                {
+                  reason: "not_ready",
+                },
+              );
+            return databaseOperationResponse(c, recovery.operationId);
+          }
+          // Cancellation of a verification restored ordinary local sleep. Its updated row is
+          // the source of the normal resume CAS below, never the pre-cancellation snapshot.
+          row = await databaseForRequest(c, id, true);
+        } else if (row.storage_residency !== "archived") {
+          throw new ApiError("conflict", "Storage transition is in progress", {
+            reason: "operation_in_progress",
+          });
+        } else {
+          // There is no tenant runtime to stop for an archived database. Record the manual
+          // pause and its completed operation atomically; do not wait for an absent node.
+          const operation = newOperationId(),
+            at = new Date().toISOString();
+          const results = await withAdmissionMutation(
+            c.env,
+            [id],
+            async (mutation) => {
+              const admission = mutation.guard(id),
+                guard = {
+                  sql: `(${admission.sql}) AND (${lease.guard.sql})`,
+                  bindings: [...admission.bindings, ...lease.guard.bindings],
+                };
+              return mutation.batch([
+                c.env.DB.prepare(
+                  `UPDATE databases SET desired_state='suspended',suspension_reason='manual',power_operation=?,generation=generation+1,
+                  observed_generation=generation+1,observed_state='provisioning',observed_power='hibernated',updated_at=?
+                  WHERE id=? AND project_id=? AND generation=? AND updated_at=? AND storage_residency='archived'
+                  AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
+                  AND (${guard.sql})`,
+                ).bind(
+                  operation,
+                  at,
+                  id,
+                  row.project_id,
+                  row.generation,
+                  row.updated_at,
+                  ...guard.bindings,
+                ),
+                c.env.DB.prepare(
+                  `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at)
+                  SELECT ?,'database.suspend','succeeded',project_id,id,generation,?,?,? FROM databases
+                  WHERE changes()=1 AND id=? AND power_operation=? AND (${guard.sql})`,
+                ).bind(operation, at, at, at, id, operation, ...guard.bindings),
+                c.env.DB.prepare(
+                  `UPDATE database_cold_storage SET wake_requested=0,manual_resume_requested=0,updated_at=?
+                  WHERE kind='archive' AND phase='archived' AND database_id=?
+                    AND (operation=? OR operation=(SELECT source_operation FROM database_cold_storage WHERE operation=?))
+                    AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=?) AND (${guard.sql})`,
+                ).bind(
+                  at,
+                  id,
+                  row.storage_operation_id ?? null,
+                  row.storage_operation_id ?? null,
+                  operation,
+                  id,
+                  ...guard.bindings,
+                ),
+                c.env.DB.prepare(
+                  `UPDATE cold_storage_operations SET status='failed',error_code='superseded',
+                    error_message='Deferred recovery superseded by manual suspension',updated_at=?,completed_at=?
+                  WHERE database_id=? AND status IN('pending','running')
+                    AND id IN(SELECT operation FROM database_cold_storage WHERE database_id=? AND kind='archive' AND phase='archived'
+                      AND (operation=? OR operation=(SELECT source_operation FROM database_cold_storage WHERE operation=?)))
+                    AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=?) AND (${guard.sql})`,
+                ).bind(
+                  at,
+                  at,
+                  id,
+                  id,
+                  row.storage_operation_id ?? null,
+                  row.storage_operation_id ?? null,
+                  operation,
+                  id,
+                  ...guard.bindings,
+                ),
+                lease.completeStatement(operation, 202, {
+                  sql: `EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?) AND (${guard.sql})`,
+                  bindings: [operation, row.project_id, ...guard.bindings],
+                }),
+              ]);
+            },
+          );
+          if (results[0]!.meta.changes !== 1 || results[4]!.meta.changes !== 1)
+            throw generationChanged();
+          return databaseOperationResponse(c, operation);
+        }
+      }
       const same = sleeping
         ? row.desired_state === "suspended" &&
           row.suspension_reason === "manual"

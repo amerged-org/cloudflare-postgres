@@ -22,6 +22,7 @@
 //! recovery has ended. The credentials are what Cloudflare delivers: the Worker signs them and
 //! the node never holds the parent key. A database's `postgresql.conf` includes
 //! `pgcf-recovery.conf` if it exists.
+pub mod cold_snapshot;
 pub mod facts;
 pub mod job;
 #[cfg(test)]
@@ -33,3 +34,6 @@ pub mod server;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod upload_log;
+
+#[cfg(test)]
+pub(crate) mod cold_snapshot_test_store;
