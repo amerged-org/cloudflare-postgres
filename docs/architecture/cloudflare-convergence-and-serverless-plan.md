@@ -1,3 +1,61 @@
+# Production backend delivery and live acceptance — 2026-11-06
+
+**Delivered backend:** additive schema `0098`, API 1.7.0, matching TypeScript Edge and both existing
+VPS are deployed. Native release `sha-fd8a280756e8` remains ready, schedulable and OS-convergent
+on EU1 and US1, with actual running bytes verified on both. The API clock correction is on main
+`9e6c2a9b`; the pre-execution deadline correction passed every required PR check in workflow
+`42274535354` at `a93e47550067375cde33d5a93b33fcaa05388924` (only failed external-download/
+unchanged-test-timeout jobs were repeated). PR #42 merged as `dbed49804dfd2a48931d78e7713cca20ce4c1697`;
+its complete Git tree equals that qualified source (`567d517af0713372bdd0ecd685ce36152e2e2acd`).
+The qualified TypeScript source was deployed without installing the unaccepted Rust Edge target.
+Exact main workflow `42277888048` subsequently passed all jobs and signing as well; no further
+runtime change or native assignment was required.
+
+Production deployment readback: API version `47dd73b3-f4e3-4faf-8fe4-e33df0145424`, Edge version
+`f0fe6cd8-7ab3-48a1-bcf1-5eaeabec3d44`, each configured at 100%. Existing bindings, secret names,
+ingress and cron remain present. No VPS was purchased, reinstalled or rebooted.
+
+**Real EU1 acceptance passed:** the earlier records below retain all failed and successful
+attempts. Manual and idle fixtures each completed committed records → complete R2 snapshot →
+isolated verification → native-acknowledged local removal → same-ID/URI/credentials recovery.
+The initiating writes waited 28,349.421 and 27,550.840 ms respectively and each executed once;
+two concurrent joiners per fixture returned the preserved rows through the same one recovery.
+Logged row 41, UNLOGGED row 42, sequence 77 and outbox sequence continuity (1→2) were preserved.
+A normal request could not recover the manually suspended archive; its authorized resume could.
+One conservative initial source-state mismatch retained its local copy and was never retired;
+a real subsequent wake/sleep reset its timer before a new, successful injected-age trial.
+
+The live timeout case was repeated after the Edge correction. Only an owned archived fixture's
+CPU requirement was temporarily injected to 64,000 millicores; regional capacity, purchase and
+autoscale policies were unchanged. The request returned retryable **57P03 after 60,219.351 ms**,
+while its one durable operation remained `waiting_capacity` with no target node or storage
+generation. The inherited CPU setting was restored, the operation continued independently to
+storage generation 4, and a read verified that marker 119 had not executed. A separately issued
+retry then inserted it once. The earlier 08006 trial's marker 109 remained absent and was never
+replayed. There was no empty replacement, competing serving generation or automatic SQL replay.
+
+**Cleanup/readback:** both owned databases have successful delete operations; an operator LVM
+read proved zero remaining volumes of either ID across all generations. Their short-lived project
+key was revoked and their isolated project deleted. SQL against each deleted ID returned 28P01
+and created no new recovery. All original 224 active IDs remain, all local; all 220 original
+confirmed sleep dates still match the pre-rollout proof dates. No cold operation exists outside
+the owned project. Source snapshots and ordinary backups follow their normal retention; they
+were not forcibly purged. Exact attributed physical thin-pool bytes released remain unknown;
+confirmed volume removals and actual snapshot payload bytes are recorded separately.
+
+**Open activation gate:** general automatic archival is OFF and the database-ID scope is empty.
+`NATIVE_COLD_STORAGE_RELEASE_IDS` retains `sha-fd8a280756e8`, so recovery stays operational.
+The EU region's used-format floor remains monotonic even after test cleanup; future native
+rollouts must retain compatible, qualified release IDs. The adopter's Production database manager
+is still on the earlier 1.6 consumer. Its prepared compatibility commit also carries an unreleased
+W37 Native Auth deployment closure; it cannot be presented as an isolated PGCF release through
+its current profile. A separately reviewed source boundary or the normal qualified adopter
+release is required before general archival is enabled. No broader Native Auth/W38 release was
+inferred from this PGCF authorization. Same-region cross-VPS acceptance remains open until a
+future authorized second node exists. The measured small-fixture times are not a universal
+restoration-time guarantee. Incremental test spending was bounded by the owner's USD 10 go;
+no exact per-test invoice amount is asserted.
+
 # Production cold-storage rollout — 2026-11-06
 
 The owner authorized Production rollout and bounded Dev acceptance with at most USD 10 incremental
