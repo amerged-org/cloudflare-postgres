@@ -489,26 +489,6 @@ impl Client {
     async fn refused(&mut self) -> String {
         self.refusal().await.0
     }
-    /// Whether the gateway answers a ping within `bound`. Its relay reads the ping only after the
-    /// messages before it were written to PostgreSQL, so a ping that stays unanswered shows the
-    /// relay stuck in the write of the message sent last.
-    async fn answers_ping(&mut self, bound: Duration) -> bool {
-        self.socket
-            .send(Message::Ping(Vec::new().into()))
-            .await
-            .unwrap();
-        timeout(bound, async {
-            loop {
-                match self.socket.next().await {
-                    Some(Ok(Message::Pong(_))) => return,
-                    Some(Ok(_)) => {}
-                    other => panic!("the gateway ended the connection: {other:?}"),
-                }
-            }
-        })
-        .await
-        .is_ok()
-    }
     /// Nothing reaches the client within `bound`.
     async fn silent(&mut self, bound: Duration) {
         assert!(self.buffer.is_empty(), "{:?}", self.buffer);
@@ -532,10 +512,39 @@ impl Client {
         }
     }
 }
+/// How long a ping behind a write must stay unanswered before the relay counts as stuck in it. A
+/// relay, or a test runtime, that is only stalled by the machine's load answers late; one that
+/// waits for room in PostgreSQL's socket never does.
+#[cfg(target_os = "linux")]
+const STUCK_FOR: Duration = Duration::from_secs(4);
+#[cfg(target_os = "linux")]
+impl Client {
+    /// Whether the gateway's relay is stuck in the write of the message sent last. It reads a ping
+    /// only after the messages before it were written to PostgreSQL, so a ping that stays
+    /// unanswered for `STUCK_FOR` shows the relay stuck in that write.
+    async fn stuck_in_write(&mut self) -> bool {
+        self.socket
+            .send(Message::Ping(Vec::new().into()))
+            .await
+            .unwrap();
+        timeout(STUCK_FOR, async {
+            loop {
+                match self.socket.next().await {
+                    Some(Ok(Message::Pong(_))) => return,
+                    Some(Ok(_)) => {}
+                    other => panic!("the gateway ended the connection: {other:?}"),
+                }
+            }
+        })
+        .await
+        .is_err()
+    }
+}
 fn blocking<T>(work: impl FnOnce() -> T) -> T {
     tokio::task::block_in_place(work)
 }
 /// `sql` as the superuser in the tenant's database, `psql -At`.
+#[cfg(target_os = "linux")]
 fn tenant_sql(cluster: &Cluster, sql: &str) -> String {
     let output = cluster
         .client("psql")
@@ -1090,7 +1099,7 @@ async fn an_http_pipeline_whose_postgresql_stops_reading_holds_up_no_one_else_on
 /// The tenant's PostgreSQL runs `pg_sleep` and reads nothing, and the tenant sends messages of
 /// about 1 KiB, which a stream socket takes whole or not at all (on Linux), until one finds the
 /// socket full. The gateway's relay answers no ping while it is in that write, which shows where
-/// it stands. PostgreSQL counts the messages it runs in a sequence.
+/// it stands (`Client::stuck_in_write`). PostgreSQL counts the messages it runs in a sequence.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_that_waits_for_room_is_fenced_again_before_a_byte_of_it_crosses() {
@@ -1121,12 +1130,15 @@ async fn a_write_that_waits_for_room_is_fenced_again_before_a_byte_of_it_crosses
         "select nextval('trail') /* {} */",
         "x".repeat(1000)
     ));
-    let mut sent = 0;
+    let (mut sent, began) = (0, tokio::time::Instant::now());
     loop {
-        assert!(sent < 5000, "the socket to PostgreSQL never filled");
+        assert!(
+            sent < 5000 && began.elapsed() < Duration::from_secs(60),
+            "the socket to PostgreSQL never filled"
+        );
         tenant.send(filler.clone()).await;
         sent += 1;
-        if !tenant.answers_ping(Duration::from_millis(500)).await {
+        if tenant.stuck_in_write().await {
             break;
         }
     }
