@@ -70,10 +70,13 @@ archive socket.
   that fill the shared 192 MiB, for example with HTTP SQL answers that PostgreSQL has not finished
   (an answer's buffer is held until PostgreSQL ends the statement), cannot take a neighbour's
   sessions or frames from it. A neighbour's answer above its guaranteed share is still refused
-  while the shared part is full. The reserve has to cover every awake database's
-  guaranteed share and the held wake connections (144 KiB each, at most 512), about 185 MiB for 37
-  awake databases; a node with more awake databases needs `PGCF_GATEWAY_RESERVE_BYTES` raised. The
-  budgets are accounted bytes, not a limit on the process's memory.
+  while the shared part is full: an HTTP SQL request answers `08007` (its statements were sent, so
+  the outcome is unknown) with the outcome `memory_capacity`, a WebSocket upgrade 503
+  `memory_capacity` (429 when the database itself is at its limit). The reserve has to cover every
+  awake database's guaranteed share and the held wake connections (144 KiB each, at most 512),
+  about 185 MiB for 37 awake databases; a node with more awake databases needs
+  `PGCF_GATEWAY_RESERVE_BYTES` raised. The budgets are accounted bytes, not a limit on the
+  process's memory.
 - There is no PostgreSQL write retry, credential replay or query replay after transport handoff.
 
 ## Restart and drain
@@ -195,8 +198,9 @@ and 60 s in all, reused only for a password that derives its SCRAM StoredKey, on
 writer and at the generation of the route (a role change moves the generation, so the request
 logs in itself and PostgreSQL decides; the route revision does not matter), and closed by the
 agent's actions like any idle session. Statement bytes are never resent: a session lost after the
-write answers `08007`. Each request logs one `sql_stages` line with the database ID, a fixed
-`outcome`, `pooled`, `wake_path` (`warm`, `cold` or null, as for a connection), the statement
+write answers `08007`, as does an answer the gateway has no memory for (outcome `memory_capacity`;
+`54000` is only an answer over 10 MiB). Each request logs one `sql_stages` line with the database
+ID, a fixed `outcome`, `pooled`, `wake_path` (`warm`, `cold` or null, as for a connection), the statement
 count and `dial_ms`, `auth_ms`, `query_ms` and `request_ms`; roles, statements, parameters and
 passwords are never logged.
 
