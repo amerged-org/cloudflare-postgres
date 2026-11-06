@@ -69,9 +69,10 @@ API checks passed after that correction. A real PostgreSQL regression also prove
 seal response must still run the final source/control checks before it may reconcile. The bounded
 Dev rollout now has an optional database-ID scope; 19 focused checks cover fail-closed parsing,
 selection before pagination, the unchanged strict 21-day boundary and recovery with archival off.
-Exact-revision Linux/image checks remain pending. These
+The source qualification below adds Linux/image evidence. These
 numbers describe separate runs and must not be added as unique test coverage or called live VPS
-acceptance. The earlier 1,412-test API result and CI records below cover the superseded candidate.
+acceptance. The earlier 1,412-test API result and the first three CI attempts later in this section cover
+the superseded Barman-only candidate.
 
 **Serving-boundary regression:** a real staged cold target, while its gateway mode was still
 Sleeping and its durable serving grant was false, attached an outbox drain, delivered/deleted its
@@ -104,13 +105,26 @@ request failed without it and succeeded with it, and the exact pinned base verif
 signed repository indexes plus amd64/arm64 package indexes (20.1 MB). All 89 image/installer tests
 passed. No TLS/signature check or package pin was relaxed. Fresh combined CI remains required.
 
+**Source qualification passed:** [CI run 42244089519](https://github.com/amerged-org/cloudflare-postgres/actions/runs/42244089519)
+passed every required PR job at `6dd78838eb8878d7b82ed22778f0a3b949e13336`: static checks,
+API (1,441 tests in 145 files), Edge, other tests, Rust tests and Clippy, actual Linux kernel checks,
+and the complete node-image build with QEMU boot acceptance. The node-agent library passed
+969 tests with zero failures; its 23 privileged/kernel-only exclusions are covered by the separate
+kernel job. QEMU reported a 32-second image boot; that is not database restoration latency.
+Release signing/upload is intentionally not performed for a PR. This qualifies the candidate source,
+not a production release or live VPS round trip. The follow-up changes only this plan; executable source, schema, contracts and package locks
+remain the qualified candidate.
+
 **Read-only live preflight at 09:49 UTC:** the two active nodes were healthy, schedulable,
 placement-enabled and OS-converged; API contract 1.6.0 and migrations through `0097` were active.
 There were 224 logical databases, 220 sleeping and zero with more than 21 days of proven sleep.
 No cold-storage schema was deployed. These are point-in-time observations, not an inventory freeze.
 
-**Remaining release acceptance:** finish exact-revision CI/image qualification, compatible adopter
-client preparation and the real Dev round trip before enabling new archival. No deployment, live
+**Remaining release acceptance:** PR source qualification is complete. After the owner's costed
+go, qualify the exact signed main release, publish compatible adopter clients before API 1.7,
+and complete the real Dev round trip before enabling general archival. The bounded companion
+client changes are prepared and locally verified in the adopter repository; their publication is
+separately coordinated. No deployment, live
 D1 migration, tenant SQL, volume removal, purchase or customer-data migration occurred during this
 implementation. The next authorized same-region VPS is required for live cross-VPS acceptance;
 the current two regions each have one node. Production changes and new paid capacity retain the
