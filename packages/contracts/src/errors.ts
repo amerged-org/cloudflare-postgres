@@ -48,6 +48,8 @@ export const RETRYABLE_ERROR_REASONS = {
   generation_changed: 1,
   /** The database still applies an earlier change or has not started. */
   not_ready: 5,
+  /** A durable archive or recovery operation must finish before this change can apply. */
+  operation_in_progress: 5,
   /** The node lacks memory, CPU or storage for the change or the start now. */
   node_capacity: 30,
 } as const;
@@ -65,12 +67,14 @@ export const TERMINAL_ERROR_REASONS = [
   "no_recovery_point",
   "source_unavailable",
   "region_unavailable",
+  "storage_not_local",
 ] as const;
 export type RetryableErrorReason = keyof typeof RETRYABLE_ERROR_REASONS;
 export const ERROR_REASONS = [
   "mutation_in_progress",
   "generation_changed",
   "not_ready",
+  "operation_in_progress",
   "node_capacity",
   ...TERMINAL_ERROR_REASONS,
 ] as const satisfies readonly (
@@ -79,7 +83,7 @@ export const ERROR_REASONS = [
 export const ErrorReason = z.enum(ERROR_REASONS).meta({
   id: "ErrorReason",
   description:
-    "Stable cause of a refusal. Retryable: mutation_in_progress, generation_changed, not_ready, node_capacity; these answers carry a Retry-After header. Terminal: name_in_use, database_deleted, project_not_empty, role_exists, role_limit, role_being_deleted, role_has_members, archive_expired, archive_unusable, no_recovery_point, source_unavailable, region_unavailable.",
+    "Stable cause of a refusal. Retryable: mutation_in_progress, generation_changed, not_ready, operation_in_progress, node_capacity; these answers carry a Retry-After header. Terminal: name_in_use, database_deleted, project_not_empty, role_exists, role_limit, role_being_deleted, role_has_members, archive_expired, archive_unusable, no_recovery_point, source_unavailable, region_unavailable, storage_not_local.",
 });
 export type ErrorReason = z.infer<typeof ErrorReason>;
 

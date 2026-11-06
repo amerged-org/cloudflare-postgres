@@ -45,6 +45,10 @@ export const DatabaseAdmissionSnapshot = z
      * takes the authoritative wake path.
      */
     wakeable: z.boolean().optional(),
+    /** Nonlocal storage must take durable recovery, never a node-bound wake ticket. */
+    storage_residency: z
+      .enum(["local", "archiving", "archived", "restoring"])
+      .optional(),
     replacement_active: z.boolean().optional(),
     region: DatabaseRegionRoute,
     /** The node of the database, whose key signs the routes to it. */
@@ -64,6 +68,11 @@ export const DatabaseAdmissionSnapshot = z
         snapshot.runtime.database_id === snapshot.database_id &&
         snapshot.runtime.node_id === snapshot.node &&
         snapshot.runtime.generation === snapshot.generation),
+  )
+  .refine(
+    (snapshot) =>
+      (snapshot.storage_residency ?? "local") === "local" ||
+      (!snapshot.admissible && !snapshot.wakeable && snapshot.runtime === null),
   );
 export type DatabaseAdmissionSnapshot = z.infer<
   typeof DatabaseAdmissionSnapshot

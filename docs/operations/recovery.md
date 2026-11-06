@@ -19,6 +19,80 @@ drill. Controlled power cuts and reboots are separate, explicitly scoped fault-a
 The incident procedures below apply to an actual loss or a reviewed drill that preserves or
 recovers the same regional node.
 
+## Long-sleep R2 storage and request-triggered recovery
+
+The cold-storage candidate moves a database's durable copy entirely to R2 after **more than 21
+continuous days of proven sleep**, then releases its local volume. The rule is identical for all
+integrators and billing tiers. `sleep_since` is a confirmed sleep timestamp, not `updated_at`;
+repeated reports and configuration-only changes do not restart it. A real wake ends that interval.
+Migration `0098` backfills only a current, matching recovery proof and never ages a database early.
+
+`GET /v1/databases/{id}` exposes `storage_residency` (`local`, `archiving`, `archived`, `restoring`),
+`sleep_since` and `storage_operation_id`. Follow the operation through the ordinary operations API.
+The archive remains a live database with its original ID, region, endpoint and roles. It is not a
+deleted database or a new-ID restore. An archived database has no serving `node_id` or local volume.
+
+Archival first holds source wakes and pins its R2 recovery generation. An operation-owned scratch
+instance fetches the backup and recovers through the source's last archived committed WAL; it has
+no gateway route, customer-accessible socket, event delivery or R2 write credential. A positive
+identity-bound verification receipt and scratch cleanup precede the source's durable retirement
+order. Only the source node's positive volume-removal acknowledgment makes the database archived.
+Missing backup objects, failed recovery, insufficient scratch capacity and uncertain cleanup keep
+the source copy or its recovery pin. Never remove the source volume or release the pin manually
+to bypass a stalled operation.
+
+If the source node is lost after retirement was requested but before volume removal was
+acknowledged, the operation stays `retiring` with its archive pinned and a specific status requiring
+operator recovery. A provider power-off is not reported as reclaimed local storage. A failed
+recovery target, by contrast, may be replaced after its exact retirement is acknowledged or the
+existing node-loss procedure positively verifies both Tunnel revocation and provider power-off;
+mere staleness or a submitted power-off request is insufficient.
+
+An ordinary connection to an idle archive starts or joins one durable same-ID recovery. An
+explicitly suspended database still requires `POST /v1/databases/{id}/resume`. Recovery uses any
+eligible node in the original region, including the original node when it has room; it never
+silently crosses regions. New image-provisioned capacity participates through the existing node
+admission and placement path. No capacity means a pending recovery under the existing purchase
+policy, not an empty replacement database or authorization for a new purchase.
+
+The original HTTP SQL or WebSocket request waits within its existing 60-second admission deadline.
+It is forwarded only after recovery, current-role application, the first completed backup and the
+new route's publication. If the deadline or client connection ends earlier, recovery continues;
+a later request joins the same operation. A pre-execution refusal is retryable. Never replay a
+SQL write whose execution outcome is unknown. Recovery time depends on data size, WAL and load;
+the 60-second wait is not a recovery-time guarantee.
+
+During active archival or recovery, role mutations, resize, move, replacement, delete and manual
+power changes may return a conflict rather than invalidate an in-flight proof. Credential changes
+while fully archived remain metadata operations and are applied to the recovered database.
+Resume an archived database before a resize, explicit move or in-place replacement. Explicit
+deletion of an archived database uses the normal deletion-retention window and preserves archives
+still referenced by another recovery.
+
+**Rollout:** deploy additive `0098` and compatible API/native contracts with new archival disabled.
+Set `NATIVE_COLD_STORAGE_RELEASE_IDS` only to qualified, signed releases after node/OS readback and
+the real Dev round trip. Then set `COLD_STORAGE_ARCHIVAL_ENABLED="true"`. The empty or false default
+creates no archive claims. Turning it off stops new archival but leaves recovery operational.
+Once a region has used this format, its native compatibility floor cannot be lowered; keep
+compatible current and next releases in the qualification list during upgrades. An older Worker
+that ignores archive pins or residency is not a valid rollback after archival is enabled.
+Confirm bucket lifecycle rules cannot expire pinned recovery objects independently of the control
+plane. Production activation and new paid capacity require the owner's explicit, costed go.
+
+Observe residency and operation status, actual node volume/pool samples, restore duration and
+failures, and the existing R2 backup-byte usage measurements. A completed retirement proves a
+volume was removed. Nominal volume size is not the number of physical thin-pool bytes released;
+that byte count remains unknown without an authoritative physical measurement. The two existing
+regions each have one node, so cross-VPS recovery within one region needs separate live acceptance
+when an authorized second node exists. Local integration tests do not establish that acceptance.
+
+The control cron emits `cold_storage_metrics`: residency counts, confirmed volume retirements,
+24-hour restore outcomes/durations, oldest pending age and measured archived R2 bytes with explicit
+unknown coverage. `cold_restore_wait` records each waiting request's ready, failed, cancelled or
+timeout outcome and duration, without SQL or credentials. Verification scratch instances consume
+real CPU/RAM and startup admission, but `verification_runtime_ids` excludes them from the customer
+database count in node-minute rollups.
+
 ## Restore or PITR
 
 1. Check `/v1/operational-health?scope=databases` and the source's archive summary. Missing

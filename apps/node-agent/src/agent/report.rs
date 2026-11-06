@@ -84,6 +84,7 @@ pub(crate) struct Reports {
     held: HashMap<String, Held>,
     /// How the orders ended, until Cloudflare answered.
     orders: BTreeMap<String, Value>,
+    archive_verifications: BTreeMap<String, Value>,
     /// Events not yet queued for delivery.
     events: Vec<Value>,
     /// How many databases the next report carries: `DATABASES_PER_REPORT`, halved by each post that
@@ -96,6 +97,7 @@ impl Default for Reports {
             observations: BTreeMap::new(),
             held: HashMap::new(),
             orders: BTreeMap::new(),
+            archive_verifications: BTreeMap::new(),
             events: Vec::new(),
             limit: DATABASES_PER_REPORT,
         }
@@ -376,6 +378,19 @@ impl<M: Machine> Core<M> {
         self.changed.notify_one();
     }
 
+    /// A durable isolated verification receipt rides the ordinary observation channel.
+    pub(crate) fn report_archive_verification(&self, result: Value) {
+        let Some(operation) = result["operation"].as_str() else {
+            return;
+        };
+        self.reports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .archive_verifications
+            .insert(operation.to_string(), result);
+        self.changed.notify_one();
+    }
+
     /// Queues an event (`NodeEvent`) for delivery.
     pub(crate) fn event(&self, event: Value) {
         self.reports
@@ -393,7 +408,9 @@ impl<M: Machine> Core<M> {
     pub(crate) fn take_report(&self, events: &Events) -> Option<Value> {
         let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
         reports.forget_held();
-        let alone = reports.observations.is_empty() && reports.orders.is_empty();
+        let alone = reports.observations.is_empty()
+            && reports.orders.is_empty()
+            && reports.archive_verifications.is_empty();
         let databases = reports.take_databases();
         let orders: Vec<String> = reports
             .orders
@@ -409,6 +426,9 @@ impl<M: Machine> Core<M> {
                 .filter_map(|operation| reports.orders.remove(operation))
                 .collect::<Vec<_>>(),
         });
+        if let Some((_, result)) = reports.archive_verifications.pop_first() {
+            report["archive_verifications"] = json!([result]);
+        }
         // The agent's own log lines ride along, or leave alone.
         events.attach(&mut report, alone);
         (!alone || report.get("events").is_some()).then_some(report)
@@ -421,6 +441,14 @@ impl<M: Machine> Core<M> {
         let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
         reports.posted();
         reports.accepted(report, accepted, super::now_ms());
+        drop(reports);
+        for result in report["archive_verifications"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            self.archive_verification_posted(result);
+        }
     }
     /// The post of a report failed with `error`: if for want of time (`too_big`), the next report
     /// is half as large.
@@ -452,6 +480,18 @@ impl<M: Machine> Core<M> {
             if let Some(operation) = result["operation"].as_str() {
                 reports
                     .orders
+                    .entry(operation.to_string())
+                    .or_insert_with(|| result.clone());
+            }
+        }
+        for result in report["archive_verifications"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(operation) = result["operation"].as_str() {
+                reports
+                    .archive_verifications
                     .entry(operation.to_string())
                     .or_insert_with(|| result.clone());
             }

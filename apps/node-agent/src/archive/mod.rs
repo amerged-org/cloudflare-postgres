@@ -33,3 +33,4 @@ pub mod server;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod upload_log;
+pub mod verify;

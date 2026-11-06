@@ -24,6 +24,7 @@ export const CRON_STEPS = [
   "usage",
   "node_capacity",
   "retained_archives",
+  "cold_storage",
   "backup_retention",
   "webhook_events",
 ] as const;

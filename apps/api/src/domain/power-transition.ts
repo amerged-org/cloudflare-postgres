@@ -29,6 +29,7 @@ export function powerTransitionStatements(
       AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation AND desired_state='suspended' AND suspension_reason='idle') OR (?='hibernate' AND observed_state='provisioning' AND observed_power='awake' AND observed_generation=generation))
       AND (?=0 OR EXISTS(SELECT 1 FROM roles r WHERE r.database_id=databases.id AND r.name=? AND r.deleted_at IS NULL)))
       AND ${action === "resume" ? databaseResumeFitsSql("databases") : "1=1"}
+      AND ${action === "resume" || action === "wake" ? "storage_residency='local'" : "1=1"}
       AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(

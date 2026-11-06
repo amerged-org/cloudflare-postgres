@@ -888,6 +888,80 @@ export const MoveSource = RestoreSource.omit({ target_time: true }).extend({
   end: ProvenSleepRecord,
 });
 export type MoveSource = z.infer<typeof MoveSource>;
+
+/** Isolated scratch recovery; this request never creates a serving database or a route. */
+export const ArchiveVerificationRequest = z
+  .strictObject({
+    operation: OperationId,
+    database_id: DatabaseId,
+    source_node_id: NodeId,
+    source_generation: Positive,
+    source_storage_generation: Positive,
+    source: MoveSource,
+    inventory_sha256: Sha256,
+    resources: DatabaseEffectiveResources,
+    settings: z.strictObject({
+      max_connections: z.number().int().min(10).max(10_000),
+      archive_timeout_seconds: z.number().int().min(30).max(3600),
+    }),
+  })
+  .superRefine((request, ctx) => {
+    const archive = parseArchivePath(request.source.path);
+    if (
+      request.source.database_id !== request.database_id ||
+      archive?.database !== request.database_id ||
+      archive.generation !== request.source_storage_generation
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["source"],
+        message:
+          "Verification reads this database's exact source storage generation",
+      });
+  });
+export type ArchiveVerificationRequest = z.infer<
+  typeof ArchiveVerificationRequest
+>;
+
+/** Cleanup authority for a previously dispatched scratch runtime; never authority to start one. */
+export const ArchiveVerificationCancellation = z.strictObject({
+  operation: OperationId,
+  database_id: DatabaseId,
+  source_generation: Positive,
+  source_storage_generation: Positive,
+  inventory_sha256: Sha256,
+});
+export type ArchiveVerificationCancellation = z.infer<
+  typeof ArchiveVerificationCancellation
+>;
+
+const ArchiveVerificationIdentity = z.strictObject({
+  operation: OperationId,
+  database_id: DatabaseId,
+  source_generation: Positive,
+  source_storage_generation: Positive,
+  inventory_sha256: Sha256,
+  observed_at: Timestamp,
+});
+/** Success proves recovery and absence of all operation-owned scratch resources. */
+export const ArchiveVerificationResult = z.discriminatedUnion("status", [
+  ArchiveVerificationIdentity.extend({
+    status: z.literal("verified"),
+    backup_id: z.string().regex(BACKUP_ID),
+    end: ProvenSleepRecord,
+    system_identifier: ProvenSleepRecord.shape.system_identifier,
+    timeline: ProvenSleepRecord.shape.timeline,
+    cleaned_up: z.literal(true),
+  }),
+  ArchiveVerificationIdentity.extend({
+    status: z.literal("failed"),
+    reason: z.string().regex(/^[a-z0-9_]{1,64}$/),
+    cleaned_up: z.boolean(),
+  }),
+]);
+export type ArchiveVerificationResult = z.infer<
+  typeof ArchiveVerificationResult
+>;
 /**
  * How the node builds the storage generation: `create` (initdb, only onto an empty archive path),
  * `restore` (into a new database), `move` (this database's previous storage generation, to the
@@ -910,6 +984,7 @@ export const DatabaseOrigin = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("create") }),
   z.strictObject({ kind: z.literal("restore"), source: RestoreSource }),
   z.strictObject({ kind: z.literal("move"), source: MoveSource }),
+  z.strictObject({ kind: z.literal("rehydrate"), source: MoveSource }),
   z.strictObject({
     kind: z.literal("replace"),
     source: RestoreSource.extend({ target_time: Timestamp }),
@@ -1158,6 +1233,16 @@ export const NodeDesiredPage = z
     credentials_revision: Positive,
     /** Every open order, on every page. */
     orders: z.array(NodeOrder).max(NODE_ORDER_LIMIT),
+    /** Only qualified cold_storage_v1 releases receive one isolated verification at a time. */
+    archive_verifications: z
+      .array(ArchiveVerificationRequest)
+      .max(1)
+      .optional(),
+    /** Cleanup-only commands remain deliverable even when the node is fenced. */
+    archive_verification_cancellations: z
+      .array(ArchiveVerificationCancellation)
+      .max(1)
+      .optional(),
     /**
      * The probes an administrator asked for that the node has not answered, at most
      * `NODE_PROBE_REQUESTS_MAX`, oldest first; left out when there are none. They are on the first
@@ -1192,6 +1277,7 @@ export const NodeDesiredPage = z
     if (
       page.orders.some((order) => order.type === "fence") &&
       (page.databases.length > 0 ||
+        (page.archive_verifications?.length ?? 0) > 0 ||
         page.release !== null ||
         page.next !== null ||
         page.orders.some(
@@ -1205,6 +1291,17 @@ export const NodeDesiredPage = z
           "A fenced node's page holds no database and no release, and only fence and superseded orders",
       });
     const operations = new Set<string>();
+    for (const verification of page.archive_verifications ?? []) {
+      if (
+        parseArchivePath(verification.source.path)?.region !==
+        page.node.region_id
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["archive_verifications"],
+          message: "Archive verification stays in the database's region",
+        });
+    }
     page.orders.forEach((order, index) => {
       if (operations.has(order.operation))
         ctx.addIssue({
@@ -1473,6 +1570,7 @@ export const NodeObservationReport = z
       .array(NodeDatabaseObservation)
       .max(NODE_DESIRED_PAGE_LIMIT_MAX),
     orders: z.array(NodeOrderResult).max(NODE_ORDER_LIMIT),
+    archive_verifications: z.array(ArchiveVerificationResult).max(1).optional(),
     events: z.array(NodeReportEvent).max(NODE_REPORT_EVENTS_MAX).optional(),
   })
   .refine(
@@ -1551,6 +1649,8 @@ export const NodeSample = z
     }),
     /** Every database whose unit is active or starting. */
     awake: z.array(DatabaseId).max(NODE_AWAKE_LIMIT),
+    /** Awake isolated verification runtimes: physical usage counts, serving-database counts do not. */
+    verification_runtime_ids: z.array(DatabaseId).max(1).optional(),
     /** The memory sizes of the awake databases added up: their reservations. */
     awake_memory_mib: Count,
     /** How many of the awake databases are not ready yet. */
@@ -1560,13 +1660,24 @@ export const NodeSample = z
     /** The `NodeCredentials` revision the node applied; null before its first read. */
     credentials_revision: Positive.nullable(),
     /** Diagnostic copy of the binary capabilities; the connection hello is authoritative. */
-    capabilities: z.array(z.literal("restore_in_place_v1")).max(1).optional(),
+    capabilities: z
+      .array(z.enum(["restore_in_place_v1", "cold_storage_v1"]))
+      .max(2)
+      .optional(),
   })
   .superRefine((sample, ctx) => {
     const issue = (message: string) =>
       ctx.addIssue({ code: "custom", message });
     if (sample.memory.available_bytes > sample.memory.total_bytes)
       issue("Available memory cannot exceed the total");
+    if (
+      new Set(sample.verification_runtime_ids ?? []).size !==
+        (sample.verification_runtime_ids?.length ?? 0) ||
+      (sample.verification_runtime_ids ?? []).some(
+        (id) => !sample.awake.includes(id),
+      )
+    )
+      issue("Verification runtimes are unique members of the awake inventory");
     if (sample.cpu.busy_millicores > sample.cpu.cores * 1000)
       issue("Busy CPU cannot exceed the cores");
     if (
@@ -2038,7 +2149,10 @@ export const AgentLinkMessage = z.discriminatedUnion("type", [
     release_id: FleetReleaseId.nullable(),
     os: NodeOs,
     /** Authoritative capabilities of this binary/connection, accepted before new agents send them. */
-    capabilities: z.array(z.literal("restore_in_place_v1")).max(1).optional(),
+    capabilities: z
+      .array(z.enum(["restore_in_place_v1", "cold_storage_v1"]))
+      .max(2)
+      .optional(),
   }),
   z.strictObject({ type: z.literal("sample"), sample: NodeSample }),
 ]);

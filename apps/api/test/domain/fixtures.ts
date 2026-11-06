@@ -73,6 +73,24 @@ export async function cleanupFixtures(): Promise<void> {
         project,
         other,
       ),
+      env.DB.prepare(
+        `DELETE FROM archive_retention_claims WHERE EXISTS(
+          SELECT 1 FROM databases d WHERE d.project_id IN(?,?) AND (
+            archive_retention_claims.archive_path=d.archive_path
+            OR EXISTS(SELECT 1 FROM archive_pins p WHERE p.database_id=d.id AND p.archive_path=archive_retention_claims.archive_path)
+            OR EXISTS(SELECT 1 FROM database_cold_storage c WHERE c.database_id=d.id
+              AND archive_retention_claims.archive_path IN(c.source_archive_path,c.target_archive_path))))`,
+      ).bind(project, other),
+      env.DB.prepare(`DELETE FROM archive_pins WHERE ${databaseScope}`).bind(
+        project,
+        other,
+      ),
+      env.DB.prepare(
+        `DELETE FROM database_cold_storage WHERE ${databaseScope}`,
+      ).bind(project, other),
+      env.DB.prepare(
+        `DELETE FROM cold_storage_operations WHERE ${databaseScope}`,
+      ).bind(project, other),
       env.DB.prepare(`DELETE FROM operations WHERE ${databaseScope}`).bind(
         project,
         other,

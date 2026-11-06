@@ -7,6 +7,7 @@ import {
   serializeStorage,
   type DesiredState,
   type ObservedState,
+  type StorageResidency,
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
@@ -47,6 +48,9 @@ export interface DatabaseRow extends DatabaseHealthSource {
   observed_state: ObservedState;
   generation: number;
   storage_generation?: number;
+  storage_residency?: StorageResidency;
+  sleep_since?: string | null;
+  storage_operation_id?: string | null;
   storage_profile_json?: string | null;
   storage_volume_json?: string | null;
   runtime_json?: string | null;
@@ -144,6 +148,9 @@ export function databaseView(row: DatabaseRow, now = Date.now()): Database {
     suspension_reason: row.suspension_reason ?? null,
     generation: row.generation,
     storage_generation: row.storage_generation ?? 1,
+    storage_residency: row.storage_residency ?? "local",
+    sleep_since: row.sleep_since ?? null,
+    storage_operation_id: row.storage_operation_id ?? null,
     observed_generation: row.observed_generation,
     status_message: row.status_message,
     health: {
@@ -230,7 +237,8 @@ export async function databaseForRequest(
 const OPERATION_COLUMNS =
   "id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at";
 const OPERATIONS_OF_ALL_KINDS = `(SELECT ${OPERATION_COLUMNS} FROM operations
-      UNION ALL SELECT ${OPERATION_COLUMNS} FROM role_deletions)`;
+      UNION ALL SELECT ${OPERATION_COLUMNS} FROM role_deletions
+      UNION ALL SELECT ${OPERATION_COLUMNS} FROM cold_storage_operations)`;
 export async function operationForRequest(
   c: ApiContext,
   id: string,

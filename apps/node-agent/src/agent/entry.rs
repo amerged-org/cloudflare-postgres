@@ -126,7 +126,7 @@ impl Entry {
                     serde_json::from_value(origin["previous"]["end"].clone()).ok()?,
                     number(origin, "replacement_generation")?,
                 ),
-                "move" => {
+                "move" | "rehydrate" => {
                     let end = &origin["source"]["end"];
                     Origin::Move(
                         source(&origin["source"])?,

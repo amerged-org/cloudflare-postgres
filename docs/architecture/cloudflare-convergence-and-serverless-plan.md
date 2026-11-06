@@ -1,3 +1,53 @@
+# Long-sleep R2 storage candidate — 2026-11-06
+
+**Owner-approved implementation:** apply the same rule to Free and Paid databases: after more
+than 21 continuous days of proven sleep, verify the R2 recovery copy and remove local storage.
+An ordinary request restores an idle archive onto eligible capacity in its existing region and
+keeps the original request within the existing 60-second admission deadline. Manual suspension
+still requires an authorized resume. Database ID, endpoint, current roles and committed data are
+preserved. This is candidate source, not a deployed feature or a promise that every restore takes
+less than 60 seconds. Automatic archival remains disabled by default.
+
+- **Control and contracts:** additive migration `0098`, contract 1.7.0, independent storage
+  residency and verified sleep history, durable archive/rehydration operations, protected recovery
+  generations and a monotonic native release floor. Normal unassigned creation cannot initialize
+  an archived database. Placement includes pending verification/recovery demand and excludes full
+  or incompatible nodes; only verified recovery publishes a new serving node and route revision.
+- **Native durability:** an isolated, non-serving scratch restore verifies the pinned base backup
+  through committed WAL before source retirement. Read-only archive credentials are enforced
+  locally. Durable cancellation/completion fences reject delayed tasks; cleanup cancels and drains
+  queued archive handlers, stops surviving Barman units and confirms scratch removal before
+  acknowledging it. The source volume is removed only by its separate exact-generation order.
+- **Races and failures:** concurrent requests share one recovery; client timeout/disconnection
+  does not cancel it. Retention uses immutable, journaled delete batches mutually exclusive with
+  archive pins. Explicit cleanup tasks cover lost delivery, renewable credential references do not
+  change operation identity, and failed-target capacity remains reserved until cleanup or positive
+  node fencing. Fair cursors and same-proof failure backoff prevent stuck work from starving other
+  databases. A newer manual pause supersedes an earlier deferred resume.
+- **Operating boundaries:** source loss during retirement leaves the archive pinned and requires
+  operator recovery until physical removal is confirmed; it does not manufacture an archived/free
+  storage acknowledgment. Restore timing/outcomes, residency counts, confirmed volume removals and
+  existing R2 byte measurements are observable. Exact reclaimed physical thin-pool bytes remain
+  unknown without an authoritative measurement; nominal volume size is never substituted.
+- **Local evidence:** the complete API regression run passed **1,412 tests**. Additionally, 103
+  focused contract checks, 8 lifecycle integration checks, 6
+  reconciliation cases, 9 admission cases, 10 native cold-storage cases with PostgreSQL 18, 9 native
+  protocol cases and 6 native sample cases passed in their recorded runs. The native archive suite
+  passed **72 tests**, with one Linux/systemd-only case excluded on this host. The first broad API run found
+  two regression classes: D1 expression depth in the existing move path and OpenAPI shared-ID
+  nullability. Both were reproduced and fixed; all 24 move cases and 15 OpenAPI cases passed after
+  the fixes. Other red-first cases covered concurrent wake claims, a wake missed between reports,
+  mismatched recovery proofs, read-only archive uploads, late/queued work after cleanup and a
+  deferred resume overriding manual suspension. These checks are local evidence, not VPS acceptance.
+
+**Remaining release acceptance:** finish exact-revision CI/image qualification and the real Dev
+round trip before enabling new archival. No deployment, live D1 migration, tenant SQL, volume
+removal, purchase or customer-data migration occurred during this implementation. The next
+authorized same-region VPS is required for live cross-VPS acceptance; the current two regions each
+have one node. Production changes and new paid capacity retain the owner's explicit, costed-go
+requirement. See [the recovery runbook](../operations/recovery.md#long-sleep-r2-storage-and-request-triggered-recovery)
+for the rollout switches and recovery behavior. Preserve the earlier accepted records below.
+
 # Integration extension candidate — 2026-10-26
 
 **Current implementation scope:** generic contract 1.5.0 (1.6.0 adds data events, built and not deployed: [9.3](#93-updates), [events plan 4.5](database-events-and-schedules.md)), integer-MiB total volumes with exact

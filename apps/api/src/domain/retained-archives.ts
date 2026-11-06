@@ -2,6 +2,7 @@
 import type { Env } from "../env.ts";
 import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
+import { deleteUnpinnedArchiveKeys } from "./archive-retention-claims.ts";
 interface ExpiredArchive {
   source_database_id: string;
   region_id: string;
@@ -33,7 +34,8 @@ export function retainedArchiveRestorable(
     retained.storage_generation === (source.storage_generation ?? 1)
   );
 }
-const idle = `NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.source_database_id=a.source_database_id AND x.verified_at IS NULL AND o.status IN('pending','running'))`;
+const idle = `NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.source_database_id=a.source_database_id AND x.verified_at IS NULL AND o.status IN('pending','running'))
+  AND NOT EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.archive_path=a.archive_path AND pin.released_at IS NULL)`;
 export async function cleanupRetainedArchives(
   env: Env,
   now = Date.now(),
@@ -70,20 +72,26 @@ export async function cleanupRetainedArchives(
       },
       selected.bucketName,
     );
-    const listed = await selected.bucket.list({ prefix, limit: 128 });
-    if (
-      listed.objects.length > 128 ||
-      listed.delimitedPrefixes.length ||
-      listed.objects.some((o) => !o.key.startsWith(prefix)) ||
-      new Set(listed.objects.map((o) => o.key)).size !== listed.objects.length
-    )
-      throw new Error("archive_cleanup_listing_invalid");
-    if (listed.objects.length) {
-      await selected.bucket.delete(listed.objects.map((o) => o.key));
-      objects += listed.objects.length;
+    const deletion = await deleteUnpinnedArchiveKeys(
+      env,
+      selected.bucket,
+      row.archive_path,
+      prefix,
+      async () => {
+        const listed = await selected.bucket.list({ prefix, limit: 128 });
+        if (listed.objects.length > 128 || listed.delimitedPrefixes.length)
+          throw new Error("archive_cleanup_listing_invalid");
+        if (listed.truncated && listed.objects.length === 0)
+          throw new Error("archive_cleanup_listing_incomplete");
+        return { keys: listed.objects.map((o) => o.key), value: true };
+      },
+      now,
+    );
+    if (!deletion) continue;
+    if (deletion.keys.length) {
+      objects += deletion.keys.length;
       continue;
     }
-    if (listed.truncated) throw new Error("archive_cleanup_listing_incomplete");
     const result = await env.DB.batch([
       env.DB.prepare(
         `DELETE FROM retained_archives AS a WHERE source_database_id=? AND cleanup_claim=? AND archive_path=? AND storage_generation=? AND expires_at<=? AND ${idle}

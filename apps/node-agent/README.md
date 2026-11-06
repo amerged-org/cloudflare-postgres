@@ -813,3 +813,37 @@ disk that is slow to flush (its header says how to run it); the numbers it gave 
 
 The contract with Cloudflare is `packages/contracts/src/node-link.ts`. `node_link.rs` reads its
 generated JSON Schemas, and conformance tests hold the agent and the API to the same vectors.
+
+## Verification before R2-only storage
+
+A node advertising `cold_storage_v1` can receive one `archive_verifications` task on its desired
+page. It restores the exact pinned base backup and proven committed WAL into an operation-owned
+scratch runtime. The scratch ID is derived from the operation and source database, differs from
+the source and the fixed health-check ID, and has its own account, thin volume and private socket.
+It never enters the served database table, accepts a customer route, applies tenant roles, drains
+an outbox, or writes a base backup or WAL to the source archive. Its PostgreSQL configuration
+replaces the restored configuration and clears `postgresql.auto.conf`; only the agent's private
+peer-authenticated connection is admitted. Source archive credentials are read-only.
+
+The agent records ownership before creating scratch resources and records verified recovery
+before removing them. A receipt is successful only after the scratch PostgreSQL unit, its exact
+Barman transient jobs, volume, socket directory and account have been removed. Failed cleanup is
+reported as pending and retried from the private journal after a restart. A removed desired task
+cancels verification and triggers the same cleanup; absence is not acknowledgment. The journal
+remains until Cloudflare successfully acknowledges its cleanup receipt and a complete desired page
+no longer names it. Before dropping that full journal, a compact completed-operation receipt is
+persisted permanently; a delayed old request returns that receipt without recreating resources.
+Explicit `archive_verification_cancellations` also cover tasks that never
+reached the node: the node persists a cancellation tombstone before confirming resource absence.
+These retired-operation tombstones survive acknowledgment and restarts so that delayed old
+verification requests cannot recreate scratch work. Renewable source credential references are
+excluded from the journal's immutable request digest; archive scope, generation, recovery proof,
+object inventory and resource settings remain bound. Only Cloudflare's separate `superseded` order removes the original database's
+storage generation.
+
+Verification uses ordinary startup admission and backup-job limits. Physical usage and admitted
+memory include the scratch runtime; `verification_runtime_ids` distinguishes it from customer
+databases in node samples. The same-ID `rehydrate` origin uses the move recovery semantics,
+preserving committed data and outbox contents while applying current roles, verifying the new
+timeline and taking the first completed backup before readiness. Previously retired generations
+remain fenced when restoration uses a newer generation on the same node.

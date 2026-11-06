@@ -169,7 +169,7 @@ impl Link {
             "protocol": constant("NODE_PROTOCOL_VERSION"),
             "agent_version": config.agent_version,
             "release_id": config.release_id,
-            "capabilities": ["restore_in_place_v1"],
+            "capabilities": ["restore_in_place_v1", "cold_storage_v1"],
             "os": config.os,
         });
         if !schema_valid("AgentLinkMessage", &hello) {

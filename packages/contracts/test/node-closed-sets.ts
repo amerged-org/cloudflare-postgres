@@ -13,6 +13,9 @@
  * these sets, and the API deploys before the nodes.
  */
 export const NODE_CLOSED_SETS: Record<string, (string | number | boolean)[]> = {
+  // Cold storage is delivered only after cold_storage_v1 capability qualification.
+
+  "NodeDesiredPage.databases[].origin|kind=rehydrate.kind": ["rehydrate"],
   "NodeDesiredPage.databases[].origin|kind=replace_rollback.kind": [
     "replace_rollback",
   ],

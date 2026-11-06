@@ -269,6 +269,23 @@ export function growthFits(
   );
 }
 
+/** Staged cold restores and verification scratch copies have no serving node assignment yet. */
+function pendingColdSql(
+  node: string,
+  resource: "memory_mib" | "storage_mib",
+  sampleAt: string,
+): string {
+  return `COALESCE((SELECT SUM(r.${resource}) FROM database_cold_storage c JOIN database_resources r ON r.database_id=c.database_id
+    WHERE (c.verification_node_id=${node}.id AND (c.phase='verifying' OR (c.phase IN('failed','cancelled') AND EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.operation=c.operation AND pin.released_at IS NULL))))
+       OR (c.target_node_id=${node}.id AND (c.phase='restoring' OR (c.phase='failed' AND NOT EXISTS(SELECT 1 FROM lifecycle_orders l WHERE l.node_id=c.target_node_id AND l.database_id=c.database_id AND l.storage_generation=c.target_storage_generation AND l.type='superseded' AND l.remove_volume=1 AND l.result_status='done'))))
+       ${resource === "storage_mib" ? `OR (c.target_node_id=${node}.id AND c.phase='succeeded' AND c.completed_at>${sampleAt})` : ""}),0)`;
+}
+function pendingMemorySql(node: string, sampleAt: string): string {
+  return `(COALESCE((SELECT SUM(r.memory_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
+   WHERE d.node_id=${node}.id AND d.deleted_at IS NULL AND d.placed_at>COALESCE(${sampleAt},'')),0)
+   +${pendingColdSql(node, "memory_mib", sampleAt)})`;
+}
+
 /**
  * The storage in MiB of the databases on a node whose create, restore or resize has not finished,
  * or finished after `sampleAt`, the node's newest sample: the node's `pool_nominal_bytes` cannot
@@ -279,7 +296,7 @@ function pendingStorageSql(node: string, sampleAt: string): string {
   return `COALESCE((SELECT SUM(r.storage_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
     WHERE d.node_id=${node}.id AND d.deleted_at IS NULL AND EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id
       AND o.kind IN('database.create','database.restore','database.resize')
-      AND (o.status IN('pending','running') OR o.completed_at>${sampleAt}))),0)`;
+      AND (o.status IN('pending','running') OR o.completed_at>${sampleAt}))),0)+${pendingColdSql(node, "storage_mib", sampleAt)}`;
 }
 
 /**
@@ -346,8 +363,7 @@ export async function placementNodes(
         p.ram_peak_ppm,p.cpu_peak_ppm,
         CASE WHEN l.memory_total_bytes>0 AND l.memory_available_bytes IS NOT NULL
           THEN (l.memory_total_bytes-l.memory_available_bytes)*1000000/l.memory_total_bytes END ram_now_ppm,
-        COALESCE((SELECT SUM(r.memory_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
-          WHERE d.node_id=n.id AND d.deleted_at IS NULL AND d.placed_at>COALESCE(l.observed_at,'')),0) pending_memory_mib,
+        ${pendingMemorySql("n", "l.observed_at")} pending_memory_mib,
         ${pendingStorageSql("n", "l.observed_at")} pending_storage_mib
       FROM nodes n LEFT JOIN latest l ON l.node_id=n.id LEFT JOIN peaks p ON p.node_id=n.id
       WHERE n.region_id=? ORDER BY n.id`,
@@ -388,8 +404,7 @@ export function nodeLoadGuard(
     newest = `(CASE WHEN ${node}.last_observed_at<=${stamp(`+${CLOCK_SKEW_MS / 1000} seconds`)} THEN ${node}.last_observed_at END)`;
   return {
     sql: `(${newest}>=${stamp(`-${NODE_OBSERVATION_MAX_AGE_MS / 1000} seconds`)}
-      AND COALESCE((SELECT SUM(r.memory_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
-        WHERE d.node_id=${node}.id AND d.deleted_at IS NULL AND d.placed_at>COALESCE(${node}.last_observed_at,'')),0)=?
+      AND ${pendingMemorySql(node, `${node}.last_observed_at`)}=?
       AND ${pendingStorageSql(node, newest)}=?)`,
     bindings: [claim.pendingMemoryMib, claim.pendingStorageMib],
   };

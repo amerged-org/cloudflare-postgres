@@ -507,11 +507,20 @@ export async function scheduleDatabaseResize(
   own?: ResourceOverrides,
 ): Promise<string> {
   const db = env.DB;
+  if ((row.storage_residency ?? "local") !== "local")
+    throw new ApiError(
+      "conflict",
+      "Resume the archived database before resizing its storage",
+      {
+        reason: "storage_not_local",
+      },
+    );
   const writeAuthority = {
-    sql: `(${authority?.sql ?? "1=1"}) AND (${lease?.guard.sql ?? "1=1"})`,
+    sql: `(${authority?.sql ?? "1=1"}) AND (${lease?.guard.sql ?? "1=1"}) AND EXISTS(SELECT 1 FROM databases cold_guard WHERE cold_guard.id=? AND cold_guard.storage_residency='local')`,
     bindings: [
       ...(authority?.bindings ?? []),
       ...(lease?.guard.bindings ?? []),
+      row.id,
     ],
   };
   if (
@@ -846,6 +855,14 @@ export async function setDatabaseIdleTime(
   });
 }
 
+const coldStorageCleanupSafe = `NOT EXISTS(SELECT 1 FROM database_cold_storage cs
+  WHERE cs.database_id=databases.id AND cs.kind='rehydrate' AND cs.phase='failed' AND cs.target_node_id IS NOT NULL
+    AND NOT EXISTS(SELECT 1 FROM lifecycle_orders retired WHERE retired.node_id=cs.target_node_id
+      AND retired.database_id=cs.database_id AND retired.type='superseded'
+      AND retired.storage_generation=cs.target_storage_generation AND retired.remove_volume=1
+      AND (retired.result_status='done' OR EXISTS(SELECT 1 FROM node_losses loss WHERE loss.node_id=cs.target_node_id
+        AND loss.tunnel_deleted_at IS NOT NULL AND loss.powered_off_at IS NOT NULL))))`;
+
 export async function deleteDatabase(
   c: ApiContext,
   id: string,
@@ -878,10 +895,36 @@ export async function deleteDatabase(
           // one the batch finds; a change that committed after the request's first read is not a
           // conflict.
           const current = await c.env.DB.prepare(
-            "SELECT generation FROM databases WHERE id=? AND project_id=?",
+            `SELECT generation,storage_residency,${coldStorageCleanupSafe} cleanup_safe FROM databases WHERE id=? AND project_id=?`,
           )
             .bind(id, row.project_id)
-            .first<{ generation: number }>();
+            .first<{
+              generation: number;
+              storage_residency: string;
+              cleanup_safe: number;
+            }>();
+          if (
+            current &&
+            !["local", "archived"].includes(current.storage_residency)
+          )
+            throw new ApiError(
+              "conflict",
+              "Storage transition is still in progress",
+              {
+                reason: "mutation_in_progress",
+              },
+            );
+          if (
+            current?.storage_residency === "archived" &&
+            current.cleanup_safe !== 1
+          )
+            throw new ApiError(
+              "conflict",
+              "An interrupted storage restore is still being cleaned up",
+              {
+                reason: "mutation_in_progress",
+              },
+            );
           generation = (current?.generation ?? row.generation) + 1;
           const admission = mutation.guard(id);
           const guard = {
@@ -891,7 +934,9 @@ export async function deleteDatabase(
           return mutation.batch([
             c.env.DB.prepare(
               `UPDATE databases SET desired_state='deleted',generation=generation+1,deleted_at=?,updated_at=?
-        WHERE id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL) AND (${guard.sql})`,
+        WHERE id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND storage_residency IN('local','archived')
+          AND (storage_residency='local' OR ${coldStorageCleanupSafe})
+          AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL) AND (${guard.sql})`,
             ).bind(
               now,
               now,
@@ -947,6 +992,16 @@ export async function deleteDatabase(
               `UPDATE operations SET status='failed',completed_at=?,updated_at=?,error_code='superseded',error_message='Unplaced creation cancelled by deletion'
           WHERE database_id=? AND kind='database.create' AND status='pending' AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id IS NULL AND d.observed_state='deleted') AND (${guard.sql})`,
             ).bind(now, now, id, ...guard.bindings),
+            c.env.DB.prepare(
+              `UPDATE archive_pins SET released_at=? WHERE database_id=? AND released_at IS NULL
+               AND operation IN(SELECT cs.operation FROM database_cold_storage cs JOIN databases d ON d.id=cs.database_id
+                 WHERE d.id=archive_pins.database_id AND d.storage_residency='archived' AND d.desired_state='deleted'
+                 AND d.observed_state='deleted' AND d.deleted_at=?
+                 AND ((cs.kind='archive' AND cs.phase='archived') OR (cs.kind='rehydrate' AND cs.phase IN('failed','succeeded')))
+                 AND cs.source_archive_path=archive_pins.archive_path)
+               AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=archive_pins.database_id AND kind='database.delete' AND status='succeeded')
+               AND (${guard.sql})`,
+            ).bind(now, id, now, op, ...guard.bindings),
             lease.completeStatement(op, 202, {
               sql: `EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?) AND (${guard.sql})`,
               bindings: [op, row.project_id, ...guard.bindings],

@@ -6,6 +6,7 @@ import { expireReplacementArchives } from "./database-replacements.ts";
 import { purgeArchiveCredentials } from "./archive-credentials.ts";
 import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
+import { deleteUnpinnedArchiveKeys } from "./archive-retention-claims.ts";
 import { BACKUP_DATA, keysOf, walRangeArchived } from "./archive-chain.ts";
 import {
   parseBackupInfo,
@@ -148,8 +149,25 @@ export async function retainBackups(
   cutoff: number,
   maxDeletes = DEFAULT_DELETES_PER_DATABASE,
 ): Promise<RetentionResult> {
+  const plan = await retentionPlan(bucket, prefix, cutoff, maxDeletes);
+  await deleteKeys(bucket, plan.descriptors);
+  await deleteKeys(bucket, plan.data);
+  return plan.result;
+}
+
+async function retentionPlan(
+  bucket: R2Bucket,
+  prefix: string,
+  cutoff: number,
+  maxDeletes = DEFAULT_DELETES_PER_DATABASE,
+): Promise<{ descriptors: string[]; data: string[]; result: RetentionResult }> {
   const anchor = await findAnchor(bucket, prefix, cutoff);
-  if (!anchor) return { backups: 0, objects: 0, complete: true };
+  if (!anchor)
+    return {
+      descriptors: [],
+      data: [],
+      result: { backups: 0, objects: 0, complete: true },
+    };
   const descriptors: string[] = [],
     data: string[] = [];
   for await (const key of keysOf(bucket, `${prefix}base/`)) {
@@ -178,12 +196,14 @@ export async function retainBackups(
       }
       old.push(key);
     }
-  await deleteKeys(bucket, firstDescriptors);
-  await deleteKeys(bucket, [...baseData, ...old]);
   return {
-    backups: firstDescriptors.length,
-    objects: firstDescriptors.length + baseData.length + old.length,
-    complete: !more,
+    descriptors: firstDescriptors,
+    data: [...baseData, ...old],
+    result: {
+      backups: firstDescriptors.length,
+      objects: firstDescriptors.length + baseData.length + old.length,
+      complete: !more,
+    },
   };
 }
 
@@ -222,6 +242,7 @@ export async function enforceBackupRetention(
       LEFT JOIN backup_retention_runs c ON c.database_id=d.id AND c.archive_path=d.archive_path
       LEFT JOIN database_recovery_points p ON p.database_id=d.id AND p.storage_generation=d.storage_generation
       WHERE d.node_id IS NOT NULL AND d.deleted_at IS NULL AND d.desired_state<>'deleted'
+      AND NOT EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.archive_path=d.archive_path AND pin.released_at IS NULL)
       AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase IN('proving','restoring','rolling_back'))
       AND NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id
         WHERE x.source_database_id=d.id AND x.verified_at IS NULL AND o.status IN('pending','running'))
@@ -236,12 +257,33 @@ export async function enforceBackupRetention(
   for (const row of due) {
     run.checked++;
     try {
-      const selected = archiveBucket(env);
-      const result = await retainBackups(
+      const selected = archiveBucket(env),
+        prefix = validatedArchivePrefix(row, selected.bucketName);
+      const deletion = await deleteUnpinnedArchiveKeys(
+        env,
         selected.bucket,
-        validatedArchivePrefix(row, selected.bucketName),
-        now - row.backup_retention_days * 86_400_000,
+        row.archive_path,
+        prefix,
+        async () => {
+          const plan = await retentionPlan(
+            selected.bucket,
+            prefix,
+            now - row.backup_retention_days * 86_400_000,
+          );
+          return {
+            keys: [...plan.descriptors, ...plan.data],
+            value: plan.result,
+          };
+        },
+        now,
       );
+      if (!deletion) continue;
+      const result = deletion.value ?? {
+        backups: deletion.keys.filter((key) => key.endsWith("/backup.info"))
+          .length,
+        objects: deletion.keys.length,
+        complete: false,
+      };
       run.backups += result.backups;
       run.objects += result.objects;
       if (result.complete)
@@ -289,7 +331,10 @@ export async function expireSupersededArchives(
     FROM database_moves m JOIN databases d ON d.id=m.database_id JOIN size_classes s ON s.id=d.size_class_id
     WHERE m.status='${status}' AND m.${deleted} IS NULL AND m.${path} IS NOT NULL
     AND strftime('%Y-%m-%dT%H:%M:%fZ',m.completed_at,'+'||s.backup_retention_days||' days')<=?
-    AND substr(m.${path},1,length(?))=? AND m.${path}<>d.archive_path`;
+    AND substr(m.${path},1,length(?))=? AND m.${path}<>d.archive_path
+    AND NOT EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.archive_path=m.${path} AND pin.released_at IS NULL)
+    AND NOT EXISTS(SELECT 1 FROM database_restores reader JOIN operations op ON op.id=reader.operation_id
+      WHERE reader.source_archive_path=m.${path} AND reader.verified_at IS NULL AND op.status IN('pending','running'))`;
   const rows = (
     await env.DB.prepare(
       `${due("done", "source_archive_path", "source_archive_deleted_at", "source")}
@@ -327,15 +372,28 @@ export async function expireSupersededArchives(
     const path = parseArchivePath(row.archive_path);
     if (!path || path.bucket !== selected.bucketName) continue;
     const prefix = `${path.region}/${path.database}/g${path.generation}-${path.operation}/`;
-    const listed = await selected.bucket.list({
+    const deletion = await deleteUnpinnedArchiveKeys(
+      env,
+      selected.bucket,
+      row.archive_path,
       prefix,
-      limit: Math.min(limit, DELETE_BATCH),
-    });
-    if (listed.objects.some((object) => !object.key.startsWith(prefix)))
-      throw new Error("archive_cleanup_listing_invalid");
-    if (listed.objects.length > 0) {
-      await selected.bucket.delete(listed.objects.map((object) => object.key));
-      result.objects += listed.objects.length;
+      async () => {
+        const listed = await selected.bucket.list({
+          prefix,
+          limit: Math.min(limit, DELETE_BATCH),
+        });
+        if (listed.truncated && listed.objects.length === 0)
+          throw new Error("archive_cleanup_listing_incomplete");
+        return {
+          keys: listed.objects.map((object) => object.key),
+          value: true,
+        };
+      },
+      now,
+    );
+    if (!deletion) continue;
+    if (deletion.keys.length > 0) {
+      result.objects += deletion.keys.length;
       continue;
     }
     const deleted = `${row.side}_archive_deleted_at`;
@@ -345,6 +403,68 @@ export async function expireSupersededArchives(
       .bind(at, row.operation)
       .run();
     result.archives++;
+  }
+  return result;
+}
+
+/** A successful rehydration leaves its old archive readable for the database's recovery
+ * window. The new generation and all still-pinned or actively read sources stay untouched. */
+export async function expireColdStorageArchives(
+  env: Env,
+  now: number,
+  limit = DELETE_BATCH,
+): Promise<{ archives: number; objects: number }> {
+  const at = new Date(now).toISOString(),
+    selected = archiveBucket(env);
+  const rows = (
+    await env.DB.prepare(
+      `SELECT cs.operation,cs.source_archive_path archive_path FROM database_cold_storage cs
+     JOIN databases d ON d.id=cs.database_id JOIN size_classes s ON s.id=d.size_class_id
+     WHERE cs.kind='rehydrate' AND cs.phase='succeeded' AND cs.source_archive_deleted_at IS NULL
+       AND cs.source_archive_path<>d.archive_path
+       AND strftime('%Y-%m-%dT%H:%M:%fZ',cs.completed_at,'+'||s.backup_retention_days||' days')<=?
+       AND NOT EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.archive_path=cs.source_archive_path AND pin.released_at IS NULL)
+       AND NOT EXISTS(SELECT 1 FROM database_restores reader JOIN operations op ON op.id=reader.operation_id
+         WHERE reader.source_archive_path=cs.source_archive_path AND reader.verified_at IS NULL AND op.status IN('pending','running'))
+     ORDER BY cs.completed_at,cs.operation LIMIT 2`,
+    )
+      .bind(at)
+      .all<{ operation: string; archive_path: string }>()
+  ).results;
+  const result = { archives: 0, objects: 0 };
+  for (const row of rows) {
+    const path = parseArchivePath(row.archive_path);
+    if (!path || path.bucket !== selected.bucketName) continue;
+    const prefix = `${path.region}/${path.database}/g${path.generation}-${path.operation}/`;
+    const deletion = await deleteUnpinnedArchiveKeys(
+      env,
+      selected.bucket,
+      row.archive_path,
+      prefix,
+      async () => {
+        const page = await selected.bucket.list({
+          prefix,
+          limit: Math.min(limit, DELETE_BATCH),
+        });
+        if (page.truncated && page.objects.length === 0)
+          throw new Error("archive_cleanup_listing_incomplete");
+        return { keys: page.objects.map((object) => object.key), value: true };
+      },
+      now,
+    );
+    if (!deletion) continue;
+    result.objects += deletion.keys.length;
+    if (deletion.keys.length === 0) {
+      const marked = await env.DB.prepare(
+        `UPDATE database_cold_storage SET source_archive_deleted_at=? WHERE operation=? AND source_archive_path=?
+         AND phase='succeeded' AND source_archive_deleted_at IS NULL
+         AND NOT EXISTS(SELECT 1 FROM databases WHERE archive_path=database_cold_storage.source_archive_path)
+         AND NOT EXISTS(SELECT 1 FROM archive_pins WHERE archive_path=database_cold_storage.source_archive_path AND released_at IS NULL)`,
+      )
+        .bind(at, row.operation, row.archive_path)
+        .run();
+      result.archives += marked.meta.changes;
+    }
   }
   return result;
 }
@@ -359,6 +479,7 @@ export async function runBackupRetention(env: Env, now: number): Promise<void> {
   for (const part of [
     async () => (await enforceBackupRetention(env, now)).failed,
     async () => (await expireSupersededArchives(env, now), 0),
+    async () => (await expireColdStorageArchives(env, now), 0),
     async () => (await purgeArchiveCredentials(env.DB, now), 0),
   ]) {
     try {

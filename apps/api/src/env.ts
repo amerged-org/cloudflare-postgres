@@ -23,6 +23,10 @@ export type Env = Cloudflare.Env & {
   NODE_DNS_SERVERS?: string;
   /** JSON array of qualified signed native release IDs supporting MiB storage and membership flags. */
   NATIVE_EXTENDED_RESOURCES_RELEASE_IDS?: string;
+  /** Explicit rollout switch; turning it off never disables recovery of archived databases. */
+  COLD_STORAGE_ARCHIVAL_ENABLED?: string;
+  /** Qualified signed native releases supporting isolated archive verification and rehydration. */
+  NATIVE_COLD_STORAGE_RELEASE_IDS?: string;
   /** "on" quiesces the control plane for a schema cutover; existing native SQL sessions continue. */
   CONTROL_PLANE_MAINTENANCE?: string;
   /**

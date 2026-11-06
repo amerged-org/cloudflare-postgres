@@ -415,6 +415,8 @@ impl Rig {
             credentials_revision: 1,
             orders,
             diagnostics: Vec::new(),
+            archive_verifications: Vec::new(),
+            archive_verification_cancellations: Vec::new(),
             databases,
             complete: true,
         }

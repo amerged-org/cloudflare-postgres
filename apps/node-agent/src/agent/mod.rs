@@ -11,6 +11,7 @@
 mod apply;
 mod build;
 pub mod check;
+mod cold;
 mod drains;
 mod entry;
 mod metering;
@@ -27,6 +28,7 @@ pub(crate) mod report;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub(crate) use cold::VerificationCancellation;
 pub use entry::{Desired, Entry, Origin, Policy, Source};
 pub use readahead::{PREFETCH, Prefetch, Start};
 

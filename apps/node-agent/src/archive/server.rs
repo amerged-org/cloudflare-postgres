@@ -17,7 +17,10 @@ use std::{
     collections::HashMap,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -112,13 +115,45 @@ struct Entry {
     /// When the current run of failed archive calls began (Unix milliseconds).
     failing_since_ms: Mutex<Option<i64>>,
     fetch_status: Arc<FetchStatus>,
+    retired: AtomicBool,
+    cancelled: tokio::sync::Notify,
+}
+impl Entry {
+    fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+        // serial permits one active handler, so notify_one's retained permit also closes the
+        // race between that handler checking the flag and registering its await.
+        self.cancelled.notify_one();
+    }
+    async fn cancellation(&self) {
+        if !self.retired.load(Ordering::SeqCst) {
+            self.cancelled.notified().await;
+        }
+    }
 }
 /// The registered databases by ID; the agent keeps it as the desired page says.
 #[derive(Default)]
 pub struct Table {
     entries: RwLock<HashMap<String, Arc<Entry>>>,
+    /// Captured handlers can outlive synchronous removal (including a verifier future's Drop).
+    /// Weak references retain no completed registrations; the cleanup boundary drains live ones.
+    retired: Mutex<HashMap<String, Vec<Weak<Entry>>>>,
 }
 impl Table {
+    /// Called while holding entries.write(): a concurrent cleanup cannot miss the gap between
+    /// removing a registration and recording its still-running handlers.
+    fn retire(&self, entry: Arc<Entry>) {
+        entry.retire();
+        let mut retired = self.retired.lock().expect("retired table lock");
+        retired.retain(|_, entries| {
+            entries.retain(|entry| entry.strong_count() != 0);
+            !entries.is_empty()
+        });
+        retired
+            .entry(entry.registration.database.id.clone())
+            .or_default()
+            .push(Arc::downgrade(&entry));
+    }
     /// Registers a database, replacing an earlier registration of it.
     pub fn set(&self, registration: Registration) -> Arc<FetchStatus> {
         let fetch_status = Arc::new(FetchStatus::default());
@@ -127,15 +162,84 @@ impl Table {
             serial: tokio::sync::Mutex::new(()),
             failing_since_ms: Mutex::new(None),
             fetch_status: fetch_status.clone(),
+            retired: AtomicBool::new(false),
+            cancelled: tokio::sync::Notify::new(),
         });
-        self.entries
-            .write()
-            .expect("table lock")
-            .insert(entry.registration.database.id.clone(), entry);
+        let mut entries = self.entries.write().expect("table lock");
+        if let Some(previous) = entries.insert(entry.registration.database.id.clone(), entry) {
+            self.retire(previous);
+        }
         fetch_status
     }
     pub fn remove(&self, database: &str) {
-        self.entries.write().expect("table lock").remove(database);
+        let mut entries = self.entries.write().expect("table lock");
+        if let Some(entry) = entries.remove(database) {
+            self.retire(entry);
+        }
+    }
+    /// Cancels all handlers of this runtime, including ones captured before removal and queued
+    /// on a job semaphore, and waits until none can start another job. The caller must then stop
+    /// extant transient job units before removing the volume: a dropped systemd-run client alone
+    /// cannot prove its unit stopped. Callers serialize resource ownership across this boundary.
+    pub async fn remove_and_drain(&self, database: &str) {
+        self.remove(database);
+        let entries: Vec<_> = {
+            let retired = self.retired.lock().expect("retired table lock");
+            retired
+                .get(database)
+                .into_iter()
+                .flatten()
+                .filter_map(Weak::upgrade)
+                .collect()
+        };
+        for entry in &entries {
+            // A late clone that has not acquired serial yet sees retired before invoking a job.
+            let _drained = entry.serial.lock().await;
+        }
+        // Keep tracking until all waits finish: if this future is cancelled, a retry must still
+        // find its active handlers. Remove only this snapshot, never a newer retirement.
+        let mut retired = self.retired.lock().expect("retired table lock");
+        if let Some(pending) = retired.get_mut(database) {
+            pending.retain(|candidate| {
+                candidate.upgrade().is_some_and(|candidate| {
+                    !entries
+                        .iter()
+                        .any(|drained| Arc::ptr_eq(&candidate, drained))
+                })
+            });
+            if pending.is_empty() {
+                retired.remove(database);
+            }
+        }
+    }
+    /// Claims a scratch identity without replacing any serving or in-flight registration.
+    pub fn set_if_absent(&self, registration: Registration) -> Option<Arc<FetchStatus>> {
+        let mut entries = self.entries.write().expect("table lock");
+        let std::collections::hash_map::Entry::Vacant(entry) =
+            entries.entry(registration.database.id.clone())
+        else {
+            return None;
+        };
+        let status = Arc::new(FetchStatus::default());
+        entry.insert(Arc::new(Entry {
+            registration,
+            serial: tokio::sync::Mutex::new(()),
+            failing_since_ms: Mutex::new(None),
+            fetch_status: status.clone(),
+            retired: AtomicBool::new(false),
+            cancelled: tokio::sync::Notify::new(),
+        }));
+        Some(status)
+    }
+    /// Cancelling a scratch task cannot remove a newer registration for the same identity.
+    pub fn remove_if_current(&self, database: &str, status: &Arc<FetchStatus>) {
+        let mut entries = self.entries.write().expect("table lock");
+        if entries
+            .get(database)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.fetch_status, status))
+        {
+            self.retire(entries.remove(database).expect("matched entry"));
+        }
     }
     fn get(&self, database: &str) -> Option<Arc<Entry>> {
         self.entries
@@ -262,19 +366,33 @@ impl Server {
         let Ok(_call) = entry.serial.try_lock() else {
             return Reply::Failed(Some("agent_busy"));
         };
-        match request {
-            Request::Archive { name } => self.archive(&entry, &name, deadline).await,
-            Request::Fetch { name, destination } => {
-                let reply = self.fetch(&entry, &name, &destination, deadline).await;
-                entry.fetch_status.answered(reply);
-                reply
-            }
+        if entry.retired.load(Ordering::SeqCst) {
+            return Reply::Failed(Some("registration_retired"));
+        }
+        tokio::select! {
+            biased;
+            () = entry.cancellation() => Reply::Failed(Some("registration_retired")),
+            reply = async {
+                match request {
+                    Request::Archive { name } => self.archive(&entry, &name, deadline).await,
+                    Request::Fetch { name, destination } => {
+                        let reply = self.fetch(&entry, &name, &destination, deadline).await;
+                        entry.fetch_status.answered(reply);
+                        reply
+                    }
+                }
+            } => reply,
         }
     }
     /// `ok` once barman has exited 0, which is after R2 holds the object, and the upload log holds
     /// the segment on disk.
     async fn archive(&self, entry: &Entry, name: &str, deadline: Instant) -> Reply {
         let registration = &entry.registration;
+        // A scratch verifier only reads its pinned source. Refuse a PUT locally even if a
+        // PostgreSQL setting or an unexpected client attempts the archive protocol.
+        if registration.store.scope.access != crate::credentials::Access::ReadWrite {
+            return Reply::Failed(Some("archive_read_only"));
+        }
         let credential = match self
             .credentials
             .get(&registration.store.scope, unix_seconds())
@@ -504,6 +622,164 @@ mod tests {
         },
         credentials::{Access, Credential},
     };
+
+    #[tokio::test]
+    async fn a_read_only_verification_registration_never_attempts_an_archive_upload() {
+        let node = Node::start("verification-read-only", AGENT_BOUND).await;
+        let original = node.table.get(DATABASE).unwrap();
+        let mut registration = original.registration.clone();
+        registration.store = store(ARCHIVE, Access::ReadOnly);
+        registration.recovery = Some(node.recovery(None));
+        node.table.set(registration);
+
+        assert_eq!(node.archive(SEGMENT).await, "failed archive_read_only\n");
+        assert!(!node.fixture.object(ARCHIVE, SEGMENT).exists());
+        assert!(node.log().entries().unwrap().is_empty());
+        assert!(!node.fixture.store_directory().join("key-id").exists());
+    }
+
+    #[tokio::test]
+    async fn scratch_registration_is_exclusive_and_old_cleanup_cannot_remove_a_new_attempt() {
+        let node = Node::start("verification-registration", AGENT_BOUND).await;
+        let original = node.table.get(DATABASE).unwrap();
+        assert!(
+            node.table
+                .set_if_absent(original.registration.clone())
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(&node.table.get(DATABASE).unwrap(), &original));
+
+        let mut scratch = original.registration.clone();
+        scratch.database.id = "cccccccccccccccccccc".into();
+        let first = node.table.set_if_absent(scratch.clone()).unwrap();
+        let replacement = node.table.set(scratch.clone());
+        node.table.remove_if_current(&scratch.database.id, &first);
+        assert!(Arc::ptr_eq(
+            &node.table.get(&scratch.database.id).unwrap().fetch_status,
+            &replacement,
+        ));
+        node.table
+            .remove_if_current(&scratch.database.id, &replacement);
+        assert!(node.table.get(&scratch.database.id).is_none());
+        assert!(Arc::ptr_eq(&node.table.get(DATABASE).unwrap(), &original));
+    }
+
+    #[tokio::test]
+    async fn retiring_a_verifier_drains_queued_fetches_before_native_cleanup_can_finish() {
+        use super::super::job::Limits;
+        let node = Node::start("drain", AGENT_BOUND).await;
+        node.fixture
+            .put_object(SOURCE, SEGMENT, &vec![7u8; SEGMENT_BYTES as usize]);
+        let release = node.root.join("release");
+        let began = node.root.join("began");
+        node.fixture.install(
+            "barman-cloud-wal-archive",
+            format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\n",
+                began.display(),
+                release.display(),
+            ),
+        );
+        let jobs = Arc::new(Jobs::new(
+            node.fixture.runner(),
+            Limits {
+                wal_jobs: 1,
+                ..Limits::default()
+            },
+        ));
+        let blocker = tokio::spawn({
+            let jobs = jobs.clone();
+            let mut db = node
+                .table
+                .get(DATABASE)
+                .unwrap()
+                .registration
+                .database
+                .clone();
+            db.id = "bbbbbbbbbbbbbbbbbbbb".into();
+            async move {
+                let job = Job::wal_archive(
+                    &store(ARCHIVE, Access::ReadWrite),
+                    &db,
+                    SEGMENT,
+                    Duration::from_secs(15),
+                );
+                jobs.run(&db, &job, &credential(), None).await.unwrap()
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !began.exists() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        node.register(Some(node.recovery(Some(SEGMENT))));
+        let entry = node.table.get(DATABASE).unwrap();
+        let server = Arc::new(Server::new(
+            node.table.clone(),
+            jobs.clone(),
+            node.credentials.clone(),
+            Arc::new(TestCallers(node.uid)),
+        ));
+        let fetch = tokio::spawn(async move {
+            server
+                .answer(
+                    DATABASE,
+                    format!("pgcf-archive/1 fetch {SEGMENT} pg_wal/RECOVERYXLOG").as_bytes(),
+                )
+                .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while entry.serial.try_lock().is_ok() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Verifier drop removes its registration; native cleanup sees no running fetch unit
+        // because this request is still queued behind another database's WAL slot.
+        node.table.remove(DATABASE);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            node.table.remove_and_drain(DATABASE),
+        )
+        .await
+        .unwrap();
+        jobs.stop_earlier(DATABASE, super::super::job::Kind::WalFetch)
+            .await
+            .unwrap();
+        std::fs::write(release, "release").unwrap();
+        assert!(blocker.await.unwrap().succeeded());
+        assert_eq!(
+            fetch.await.unwrap(),
+            Reply::Failed(Some("registration_retired"))
+        );
+        assert!(!node.volume().join("data/pg_wal/RECOVERYXLOG").exists());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_handler_drain_keeps_its_pending_handlers_for_the_next_cleanup() {
+        let node = Node::start("drain-again", AGENT_BOUND).await;
+        let entry = node.table.get(DATABASE).unwrap();
+        let active = entry.serial.lock().await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                node.table.remove_and_drain(DATABASE),
+            )
+            .await
+            .is_err()
+        );
+        // Dropping a drain does not establish that the captured handler stopped. The retry
+        // still has to wait for it before acknowledging any physical-resource cleanup.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                node.table.remove_and_drain(DATABASE),
+            )
+            .await
+            .is_err()
+        );
+        drop(active);
+        node.table.remove_and_drain(DATABASE).await;
+    }
 
     #[tokio::test]
     async fn recovery_fetch_facts_belong_to_one_registration_and_never_to_archive_uploads() {

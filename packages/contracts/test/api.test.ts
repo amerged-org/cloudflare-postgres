@@ -629,4 +629,18 @@ it("publishes hibernation and explicit manual/automatic lifecycle operation kind
   expect(OperationKind.parse("database.resume")).toBe("database.resume");
   expect(OperationKind.parse("database.hibernate")).toBe("database.hibernate");
   expect(OperationKind.parse("database.wake")).toBe("database.wake");
+  expect(OperationKind.parse("database.archive")).toBe("database.archive");
+  expect(OperationKind.parse("database.rehydrate")).toBe("database.rehydrate");
+});
+
+it("distinguishes waiting for recovery from changes that require local storage", () => {
+  expect(retryAfterSeconds("conflict", "operation_in_progress")).toBe(5);
+  expect(retryAfterSeconds("conflict", "storage_not_local")).toBeUndefined();
+  expect(
+    ErrorBody.parse(
+      errorBody("conflict", "Resume the archived database first", "request", {
+        reason: "storage_not_local",
+      }),
+    ).error.details?.reason,
+  ).toBe("storage_not_local");
 });

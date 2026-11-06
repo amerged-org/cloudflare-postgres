@@ -84,6 +84,8 @@ describe("the node reads the documents Cloudflare sends and ignores the properti
       "NodeEnrollmentResponse",
       "NodeCredentials",
       "ArchiveCredential",
+      "ArchiveVerificationRequest",
+      "ArchiveVerificationCancellation",
       "NodeDesiredPage",
       "NodeObservationAnswer",
       "NodeFencedResponse",

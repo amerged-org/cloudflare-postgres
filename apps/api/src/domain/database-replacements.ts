@@ -11,6 +11,7 @@ import {
   type NodeObservationReport,
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
+import { deleteUnpinnedArchiveKeys } from "./archive-retention-claims.ts";
 import {
   databaseNeedsExtended,
   requireExtendedNative,
@@ -132,6 +133,14 @@ export async function startDatabaseReplacement(
         now = Date.now(),
         at = new Date(now).toISOString();
       await assertNoReplacement(c.env.DB, id);
+      if ((source.storage_residency ?? "local") !== "local")
+        throw new ApiError(
+          "conflict",
+          "Resume the archived database before replacing its storage",
+          {
+            reason: "storage_not_local",
+          },
+        );
       if (body.target_time > at)
         throw new ApiError(
           "invalid_request",
@@ -202,7 +211,8 @@ export async function startDatabaseReplacement(
             c.env.DB.prepare(
               `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at)
      SELECT ?,'database.restore','running',d.project_id,d.id,d.generation,?,? FROM databases d
-     WHERE d.id=? AND d.generation=? AND d.node_id=? AND d.archive_path=? AND d.deleted_at IS NULL
+     WHERE d.id=? AND d.generation=? AND d.node_id=? AND d.archive_path=? AND d.deleted_at IS NULL AND d.storage_residency='local'
+     AND NOT EXISTS(SELECT 1 FROM archive_retention_claims WHERE archive_path=d.archive_path)
      AND NOT EXISTS(SELECT 1 FROM database_replacements WHERE database_id=d.id AND ${ACTIVE_REPLACEMENT})
      AND NOT EXISTS(SELECT 1 FROM database_moves WHERE database_id=d.id AND status IN('proving','restoring'))
      AND NOT EXISTS(SELECT 1 FROM operations WHERE database_id=d.id AND status IN('pending','running'))
@@ -680,6 +690,7 @@ export async function expireReplacementArchives(
       deleted = `${side}_archive_deleted_at`,
       claim = `${side}_cleanup_claim`;
     const idle = `NOT EXISTS(SELECT 1 FROM databases d WHERE d.archive_path=p.${path})
+   AND NOT EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.archive_path=p.${path} AND pin.released_at IS NULL)
    AND NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.source_archive_path=p.${path} AND x.verified_at IS NULL AND o.status IN('pending','running'))
    AND NOT EXISTS(SELECT 1 FROM database_replacements a WHERE a.source_archive_path=p.${path}
      AND (a.phase IN('proving','restoring','rolling_back') OR (a.retained_until>? AND a.source_archive_deleted_at IS NULL)))
@@ -708,15 +719,28 @@ export async function expireReplacementArchives(
         .run();
       if (held.meta.changes !== 1) continue;
       const prefix = `${parsed.region}/${parsed.database}/g${parsed.generation}-${parsed.operation}/`;
-      const page = await selected.bucket.list({
+      const deletion = await deleteUnpinnedArchiveKeys(
+        env,
+        selected.bucket,
+        row.archive_path,
         prefix,
-        limit: Math.min(limit, 1000),
-      });
-      if (page.objects.some((object) => !object.key.startsWith(prefix)))
-        throw new Error("archive_cleanup_listing_invalid");
-      if (page.objects.length) {
-        await selected.bucket.delete(page.objects.map((object) => object.key));
-        objects += page.objects.length;
+        async () => {
+          const page = await selected.bucket.list({
+            prefix,
+            limit: Math.min(limit, 1000),
+          });
+          if (page.truncated && page.objects.length === 0)
+            throw new Error("archive_cleanup_listing_incomplete");
+          return {
+            keys: page.objects.map((object) => object.key),
+            value: true,
+          };
+        },
+        now,
+      );
+      if (!deletion) continue;
+      if (deletion.keys.length) {
+        objects += deletion.keys.length;
       } else {
         await env.DB.prepare(
           `UPDATE database_replacements SET ${deleted}=? WHERE operation=? AND ${claim}=?`,

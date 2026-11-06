@@ -23,10 +23,18 @@ import {
 import type { NodeCaller } from "./node-auth.ts";
 import { ensureArchiveCredentials } from "./archive-credentials.ts";
 import { moveTargets } from "./database-moves.ts";
+import {
+  coldStorageTargets,
+  coldStorageVerifications,
+  coldStorageVerificationCancellations,
+} from "./cold-storage.ts";
 import { replacementTargets } from "./database-replacements.ts";
 import { openNodeOrders } from "./lifecycle-orders.ts";
 import { openDiagnosticRequests } from "./node-diagnostics.ts";
-import { requireExtendedNative } from "./native-capabilities.ts";
+import {
+  requireExtendedNative,
+  coldStorageNativeGuard,
+} from "./native-capabilities.ts";
 import {
   credentialsRevision,
   nodeRouteKeyring,
@@ -231,6 +239,10 @@ export async function nodeDesiredPage(
       region_id: node.region_id,
     };
   const orders = await pageOrders(env, node, caller.fenced);
+  const archiveCancellations =
+    query.ids === undefined && query.after === undefined
+      ? await coldStorageVerificationCancellations(env, node.id)
+      : [];
   if (caller.fenced)
     return NodeDesiredPage.parse({
       node: identity,
@@ -238,6 +250,9 @@ export async function nodeDesiredPage(
       policy,
       credentials_revision: node.credentials_revision,
       orders,
+      ...(archiveCancellations.length
+        ? { archive_verification_cancellations: archiveCancellations }
+        : {}),
       databases: [],
       next: null,
     });
@@ -254,12 +269,31 @@ export async function nodeDesiredPage(
   // Refuse the whole page, never omit entries: an empty list can retire databases. A compatible
   // current release may still pull its next qualified release before its first post-restart sample.
   await requireExtendedNative(env, { nodeId: node.id }, extended, now, true);
+  const coldRequired = await env.DB.prepare(
+    `SELECT 1 FROM database_cold_storage c WHERE (c.verification_node_id=? AND c.phase='verifying') OR (c.target_node_id=? AND c.phase='restoring') OR (c.source_node_id=? AND c.phase='retiring')`,
+  )
+    .bind(node.id, node.id, node.id)
+    .first();
+  if (coldRequired) {
+    const cold = coldStorageNativeGuard(env, { nodeId: node.id }, now, true);
+    if (
+      !(await env.DB.prepare(`SELECT 1 WHERE ${cold.sql}`)
+        .bind(...cold.bindings)
+        .first())
+    )
+      throw new ApiError(
+        "conflict",
+        "Cold storage requires a qualified native release",
+        { reason: "not_ready" },
+      );
+  }
   // The databases of the node, and those a move restores onto it from another.
   const result = await env.DB.prepare(
     `SELECT d.id,d.generation,d.desired_state,d.suspension_reason,d.storage_generation,d.archive_path,d.pg_major,
        COALESCE(ae.route_revision,1) route_revision,dr.memory_mib,dr.cpu_millicores,dr.storage_mib,s.max_connections,
        s.archive_timeout_seconds,${effectiveSleepAfterSql("d")} sleep_after_seconds,
-       COALESCE((SELECT rp.operation FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase='proving'),
+       COALESCE((SELECT c.operation FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase='succeeded' AND c.target_generation=d.generation),
+         (SELECT rp.operation FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase='proving'),
          (SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
           ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1)) operation,
        (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,
@@ -275,15 +309,17 @@ export async function nodeDesiredPage(
      LEFT JOIN database_restores x ON x.target_database_id=d.id
      LEFT JOIN operations ro ON ro.id=x.operation_id AND ro.kind='database.restore'
      WHERE d.region_id=? AND d.desired_state IN('running','suspended','deleted')
-       AND ((d.node_id=? AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL)
+       AND ((d.node_id=? AND (d.storage_residency='local' OR (d.storage_residency='archiving' AND EXISTS(SELECT 1 FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase='verifying'))) AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL)
            AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation
              AND NOT EXISTS(SELECT 1 FROM node_volumes v WHERE v.node_id=d.node_id AND v.database_id=d.id)))
          OR d.id IN(SELECT database_id FROM database_moves WHERE target_node_id=? AND status='restoring')
-         OR d.id IN(SELECT database_id FROM database_replacements WHERE node_id=? AND phase IN('proving','restoring','rolling_back')))
+         OR d.id IN(SELECT database_id FROM database_replacements WHERE node_id=? AND phase IN('proving','restoring','rolling_back'))
+         OR d.id IN(SELECT database_id FROM database_cold_storage WHERE target_node_id=? AND phase='restoring'))
        ${query.after ? "AND d.id>?" : ""} ${query.ids ? "AND d.id IN(SELECT value FROM json_each(?))" : ""} ORDER BY d.id LIMIT ?`,
   )
     .bind(
       node.region_id,
+      node.id,
       node.id,
       node.id,
       node.id,
@@ -299,6 +335,7 @@ export async function nodeDesiredPage(
   const staged = new Map([
       ...(await moveTargets(env.DB, node.id, now)),
       ...(await replacementTargets(env, node.id, now)),
+      ...(await coldStorageTargets(env, node.id, now)),
     ]),
     issued = await ensureArchiveCredentials(
       env.DB,
@@ -401,6 +438,10 @@ export async function nodeDesiredPage(
     query.ids === undefined && query.after === undefined
       ? await openDiagnosticRequests(env.DB, node.id, now)
       : [];
+  const archiveVerifications =
+    query.ids === undefined && query.after === undefined
+      ? await coldStorageVerifications(env, node.id, now)
+      : [];
   return NodeDesiredPage.parse({
     node: identity,
     release: await pageRelease(env, node.region_id),
@@ -412,6 +453,12 @@ export async function nodeDesiredPage(
     ),
     orders,
     ...(diagnostics.length > 0 ? { diagnostics } : {}),
+    ...(archiveCancellations.length
+      ? { archive_verification_cancellations: archiveCancellations }
+      : {}),
+    ...(archiveVerifications.length > 0
+      ? { archive_verifications: archiveVerifications }
+      : {}),
     databases,
     next: result.results.length > query.limit ? rows.at(-1)!.id : null,
   });

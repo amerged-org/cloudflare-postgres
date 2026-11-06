@@ -67,6 +67,8 @@ export function foldSample(
 ): Minute {
   const minute = Math.floor(Date.parse(sample.observed_at) / MINUTE_MS),
     used = sample.memory.total_bytes - sample.memory.available_bytes,
+    verification = new Set(sample.verification_runtime_ids ?? []),
+    awakeDatabases = sample.awake.filter((id) => !verification.has(id)).length,
     base: Minute =
       previous?.minute === minute
         ? previous
@@ -105,8 +107,8 @@ export function foldSample(
       base.cpu_busy_millicores_max,
       sample.cpu.busy_millicores,
     ),
-    awake_sum: base.awake_sum + sample.awake.length,
-    awake_max: Math.max(base.awake_max, sample.awake.length),
+    awake_sum: base.awake_sum + awakeDatabases,
+    awake_max: Math.max(base.awake_max, awakeDatabases),
     awake_memory_mib_sum: base.awake_memory_mib_sum + sample.awake_memory_mib,
     awake_memory_mib_max: Math.max(
       base.awake_memory_mib_max,

@@ -35,7 +35,7 @@
       },
       {
         "id": "03-ready",
-        "label": "Ready: place eligible pending databases and hint their nodes",
+        "label": "Ready: place eligible new databases and hint their nodes",
         "evidence": [
           {
             "line": 213,
@@ -46,7 +46,7 @@
           {
             "line": 42,
             "path": "apps/api/src/domain/node-capacity.ts",
-            "sha256": "079e5fe98f9697bde3897a8973eab0850d2cb5b5426dd6a70af2496430320302",
+            "sha256": "a15c9ff32cd4f33f4dc10a09d32e60bbbf47093500f71bb575699ea9e4c6ed8a",
             "symbol": "placePendingDatabases"
           }
         ]

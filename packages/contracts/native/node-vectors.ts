@@ -106,6 +106,38 @@ const moved = {
     },
   },
 };
+const archiveVerification = {
+  operation,
+  database_id: source,
+  source_node_id: node.id,
+  source_generation: 4,
+  source_storage_generation: 3,
+  source: moved.origin.source,
+  inventory_sha256: "a".repeat(64),
+  resources: database.resources,
+  settings: database.settings,
+};
+const archiveVerified = {
+  operation,
+  database_id: source,
+  source_generation: 4,
+  source_storage_generation: 3,
+  inventory_sha256: "a".repeat(64),
+  observed_at: now,
+  status: "verified",
+  backup_id: moved.origin.source.backup_id,
+  end: proof,
+  system_identifier: proof.system_identifier,
+  timeline: 2,
+  cleaned_up: true,
+};
+const archiveCancellation = {
+  operation,
+  database_id: source,
+  source_generation: 4,
+  source_storage_generation: 3,
+  inventory_sha256: "a".repeat(64),
+};
 const replaced = {
   ...moved,
   origin: {
@@ -497,6 +529,9 @@ export const nodeSchemas = {
   NodeRequestClaims: link.NodeRequestClaims,
   NodeCredentials: link.NodeCredentials,
   ArchiveCredential: link.ArchiveCredential,
+  ArchiveVerificationRequest: link.ArchiveVerificationRequest,
+  ArchiveVerificationCancellation: link.ArchiveVerificationCancellation,
+  ArchiveVerificationResult: link.ArchiveVerificationResult,
   NodeDesiredPage: link.NodeDesiredPage,
   NodeObservationReport: link.NodeObservationReport,
   NodeObservationAnswer: link.NodeObservationAnswer,
@@ -528,6 +563,8 @@ export const nodeReceives = [
   "NodeEnrollmentResponse",
   "NodeCredentials",
   "ArchiveCredential",
+  "ArchiveVerificationRequest",
+  "ArchiveVerificationCancellation",
   "NodeDesiredPage",
   "NodeObservationAnswer",
   "NodeFencedResponse",
@@ -535,6 +572,58 @@ export const nodeReceives = [
 ] as const satisfies readonly (keyof typeof nodeSchemas)[];
 
 const cases: Record<keyof typeof nodeSchemas, Case[]> = {
+  ArchiveVerificationCancellation: [
+    ["cancel-exact-scratch", archiveCancellation, true],
+    [
+      "cancel-without-inventory",
+      { ...archiveCancellation, inventory_sha256: undefined },
+      false,
+    ],
+  ],
+  ArchiveVerificationRequest: [
+    ["isolated-archive-verification", archiveVerification, true],
+    [
+      "missing-inventory-binding",
+      { ...archiveVerification, inventory_sha256: undefined },
+      false,
+    ],
+    [
+      "wrong-source-database",
+      { ...archiveVerification, database_id: other },
+      false,
+      true,
+    ],
+    [
+      "wrong-source-generation",
+      { ...archiveVerification, source_storage_generation: 2 },
+      false,
+      true,
+    ],
+  ],
+  ArchiveVerificationResult: [
+    ["verified-and-cleaned", archiveVerified, true],
+    [
+      "verified-with-scratch-left",
+      { ...archiveVerified, cleaned_up: false },
+      false,
+    ],
+    ["verified-without-end", { ...archiveVerified, end: undefined }, false],
+    [
+      "failed-cleanup",
+      {
+        operation,
+        database_id: source,
+        source_generation: 4,
+        source_storage_generation: 3,
+        inventory_sha256: "a".repeat(64),
+        observed_at: now,
+        status: "failed",
+        reason: "scratch_cleanup_failed",
+        cleaned_up: false,
+      },
+      true,
+    ],
+  ],
   NodeEnrollmentSeed: [
     [
       "installer-seed",
@@ -740,6 +829,46 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
   ],
   NodeDesiredPage: [
+    [
+      "fenced-verification-cleanup",
+      { ...fenced, archive_verification_cancellations: [archiveCancellation] },
+      true,
+    ],
+    [
+      "same-id-rehydrate",
+      {
+        ...page,
+        orders: [],
+        databases: [
+          {
+            ...moved,
+            origin: { kind: "rehydrate", source: moved.origin.source },
+          },
+        ],
+      },
+      true,
+    ],
+    [
+      "archive-verification-page",
+      { ...bare, archive_verifications: [archiveVerification] },
+      true,
+    ],
+    [
+      "archive-verification-on-fenced-node",
+      { ...fenced, archive_verifications: [archiveVerification] },
+      false,
+      true,
+    ],
+    [
+      "archive-verification-cross-region",
+      {
+        ...bare,
+        node: { ...node, region_id: "us-dev" },
+        archive_verifications: [archiveVerification],
+      },
+      false,
+      true,
+    ],
     [
       "same-id-forward-rollback",
       { ...page, orders: [], databases: [rolledBack] },
@@ -1447,6 +1576,16 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
   ],
   NodeObservationReport: [
+    [
+      "archive-verification-result",
+      {
+        observed_at: now,
+        databases: [],
+        orders: [],
+        archive_verifications: [archiveVerified],
+      },
+      true,
+    ],
     ["asleep", observations(observation), true],
     [
       "ready-after-a-refused-sleep",
@@ -1699,6 +1838,27 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ["an-unknown-key", { databases: [], orders: 0, hint: true }, false],
   ],
   NodeSample: [
+    [
+      "isolated-verification-runtime",
+      { ...sample, verification_runtime_ids: [id] },
+      true,
+    ],
+    [
+      "verification-runtime-not-awake",
+      { ...sample, verification_runtime_ids: [other] },
+      false,
+      true,
+    ],
+    [
+      "more-than-one-verification-runtime",
+      { ...sample, awake: [id, other], verification_runtime_ids: [id, other] },
+      false,
+    ],
+    [
+      "cold-storage-capability",
+      { ...sample, capabilities: ["restore_in_place_v1", "cold_storage_v1"] },
+      true,
+    ],
     [
       "in-place-restore-capability",
       { ...sample, capabilities: ["restore_in_place_v1"] },

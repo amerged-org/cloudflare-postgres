@@ -261,11 +261,26 @@ fn tool_failed(program: &str, file: &str) -> io::Error {
 }
 
 /// The parent of process `pid` as `/proc/<pid>/stat` names it, `None` for a process that is gone.
+#[cfg(target_os = "linux")]
 fn parent_of(pid: u32) -> Option<u32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The name may hold spaces and parentheses: the fields follow its last one.
     let after = stat.get(stat.rfind(')')? + 1..)?;
     after.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// macOS has no procfs. The test-only machine still proves ancestry from the host OS, rather
+/// than treating every same-user client as a database's archive client.
+#[cfg(not(target_os = "linux"))]
+fn parent_of(pid: u32) -> Option<u32> {
+    let output = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
 }
 
 /// What a read of a unit fails with when the bus refuses the call, as dbus-daemon does past its
@@ -2520,4 +2535,11 @@ impl Host for LocalHost {
     async fn timestamps(&self, _slot: u32) -> Result<Option<(u64, u64)>, units::Error> {
         Ok(None)
     }
+}
+
+#[test]
+fn caller_ancestry_reads_the_current_process_parent_on_the_host_os() {
+    // SAFETY: getppid has no arguments and returns the process's current parent identifier.
+    let parent = unsafe { libc::getppid() };
+    assert_eq!(parent_of(std::process::id()), u32::try_from(parent).ok());
 }
