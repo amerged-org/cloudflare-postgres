@@ -381,7 +381,7 @@ describe("the desired page of a node", () => {
       },
     ]);
     expect(Date.parse(first.expires_at)).toBeGreaterThan(
-      Date.now() + 23 * 3_600_000,
+      Date.now() + 6 * 86_400_000,
     );
     // Young: the same credential, nothing new issued.
     expect((await entry(f, db.id))!.archive.credential).toEqual(first);

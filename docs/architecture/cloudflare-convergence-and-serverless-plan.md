@@ -1399,11 +1399,11 @@ The API Worker holds a parent R2 key, new in Stage 0, and **signs temporary cred
 
 | Purpose | Scope | Lifetime |
 | --- | --- | --- |
-| WAL and base backups of one database generation | Prefix `<region>/<db>/g<gen>-<op>/`; actions Get, Head, Put, ListObjectsV2 and multipart; **no DeleteObject(s)** | 24 hours (a credential a node has read cannot be revoked, so the lifetime is how long a fenced node keeps its own prefix). Renewed after at most a third of the lifetime, which a job of up to 6 hours outlasts; an alert fires when less than 25 % is left |
+| WAL and base backups of one database generation | Prefix `<region>/<db>/g<gen>-<op>/`; actions Get, Head, Put, ListObjectsV2 and multipart; **no DeleteObject(s)** | 7 days (plan default; R2 accepts it, Stage 1). Renewed after at most a third of the lifetime; an alert fires when less than 25 % is left |
 | Restore source | Read-only on the source prefix | For the operation |
 
 - **No delete rights on nodes.** Nodes never hold a delete right or the bucket-wide key. Retention runs in the Worker (section 7.7).
-- **Margin for outages.** The 24-hour lifetime leaves 16 hours of margin (two thirds) for a Worker, link or renewal outage. If a credential does expire, archiving fails, databases stay awake and WAL grows. The renewal alert fires long before that.
+- **Margin for outages.** The 7-day lifetime leaves days of margin for a Worker, link or renewal outage. If a credential does expire, archiving fails, databases stay awake and WAL grows. The renewal alert fires long before that.
 - **Overwrites stay possible.** A credential still allows overwriting objects inside its own generation's prefix. This is accepted, because that prefix belongs to that database and generation only.
 - **HeadBucket.** Barman needs HeadBucket only for `--test` and for `barman-cloud-check-wal-archive`, and we use neither. Stage 1 verified this: WAL archive, base backup, restore and WAL restore all ran with credentials that cannot call HeadBucket.
 
@@ -2404,7 +2404,7 @@ From the canary on, the EU1 stack is production.
 | Logical cap of 4 × pool, operator-configurable | Bounds the damage of a full pool without limiting the count |
 | barman-cloud 3.20.1, with jobs as the database's own user | AGENTS.md line 8; per-tenant permissions and credentials |
 | Retention in the Worker | Nodes never hold a delete right |
-| Locally signed R2 credentials with a 24-hour lifetime | Only local signing excludes delete; 16 hours of margin for outages, and a fenced node keeps its prefix for at most a day |
+| Locally signed R2 credentials with a 7-day lifetime | Only local signing excludes delete; days of margin for outages |
 | Ready only after the first base backup | A database is never writable before it is restorable |
 | systemd never restarts PostgreSQL by itself | Every start goes through admission |
 | Fill-first placement | Owner rule |
@@ -2453,7 +2453,7 @@ Each has a plan default. Work proceeds on the default unless the owner says othe
 | barman too costly per WAL segment at density | Memory pressure in backup jobs; archive backlog | Per-job limits and 2 uploads plus 1 base backup or restore, set from Stage 1; the cost trigger holds, so the WAL path moves to a native PUT (7.5) |
 | Thin pool fills (writers during an archive outage, or many writers at once) | Writes fail; affected databases stop until space returns | Logical cap; placement closes at 80 %; reserve from the measured write rate; per-database write limits; alerts; automated recovery; tested on the real pool in 5.5 |
 | A tenant fills its own volume or its inodes | That database stops | Per-volume alerts at 80 % and 90 %; reserve release for recovery; resize; tested in 5.5 |
-| R2 credential renewal fails | Archiving stops, databases stay awake, WAL grows | 24-hour lifetime; renewal after a third; alert at 25 % left |
+| R2 credential renewal fails | Archiving stops, databases stay awake, WAL grows | 7-day lifetime; renewal after a third; alert at 25 % left |
 | Wake storm | Queued wakes and `57P03` | Early sleep (D2); queue; retry rule; counted in the p95 and alerted |
 | Rebuilding what CNPG did (roles, crash restart, backups, retention) | Lifecycle bugs | Reuse the tested SQL and sleep proof; real-PostgreSQL tests; live acceptance after every node release |
 | Agent bug | Wrong decisions on a node | Units independent of the agent; the kernel enforces the slice; Cloudflare can refuse but never kill; read-only preflight of new binaries |

@@ -510,8 +510,8 @@ pass, which a name used twice would not.
     the token that step 2 made when it made a second one, the mirror token if there was one, and every
     bucket-wide key, and then, after the last pass of 11.5, the token of the copy. The Worker signs every credential a node holds from the
     parent key and never stores one, a credential's access key is the parent's, and a node reads a
-    credential only when its page names a new id (the API renews a row after a third of its 24
-    hours). Deleting an earlier parent token before the nodes hold credentials signed with the new one
+    credential only when its page names a new id (the API renews a row after a third of its seven
+    days). Deleting an earlier parent token before the nodes hold credentials signed with the new one
     ends the credentials they hold and archiving fails until they read new ones
     (`database_archive_failing`). So, in this order:
     1. Create the new parent token: object read and write on the new bucket and no other. Set
@@ -521,7 +521,7 @@ pass, which a name used twice would not.
        the time the deploy ended (T_KEY): every credential the Worker delivers from then on is signed
        with the new key, and the ones the nodes already hold are not.
     2. Replace the credentials the nodes hold, in one of two ways. Wait one credential lifetime: read
-       the time below at T_KEY and wait until it has passed (24 hours at most), after which every
+       the time below at T_KEY and wait until it has passed (seven days at most), after which every
        credential a node holds was delivered after T_KEY:
        ```sql
        SELECT max(expires_at) FROM archive_credentials WHERE issued_at<'<T_KEY>';
@@ -582,7 +582,7 @@ answer differs from step to step:
   - *A second token set as `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`.* That token
     is in production from step 2 on. It is the Worker's parent key and so the access key of every
     credential the Worker delivers from then on (for old-bucket paths too), and the nodes hold those
-    credentials for up to 24 hours. It does not go with the empty bucket: deleting it ends them,
+    credentials for up to seven days. It does not go with the empty bucket: deleting it ends them,
     archiving fails (`database_archive_failing`) and no database can sleep until their rows renew.
     Giving up therefore has two roads. Either keep the second token as the parent key and retire the
     previous token instead; or put the previous token back with both secrets in one `secret bulk`
@@ -599,7 +599,7 @@ answer differs from step to step:
   Worker's parent key goes back to the token that names the old bucket. Step 11.1 sets
   `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY` to a token without the old bucket, and
   a rollback that leaves it there signs every credential for the old bucket with a key R2 refuses
-  for it. This window lasts until 11.4, which is up to a credential lifetime (24 hours) when
+  for it. This window lasts until 11.4, which is up to a credential lifetime (seven days) when
   11.2 waits instead of forcing the refresh. The delete of 11.2 needs no undoing: the rollback's step
   2 deletes the credential rows again.
 - **Step 11.4 and after (the revocation).** There is no rollback. The earlier parent tokens are

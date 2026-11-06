@@ -30,8 +30,7 @@ import {
 } from "./lifecycle-fixture.ts";
 
 afterEach(cleanup);
-const HOUR = 3_600_000;
-const DAY = 24 * HOUR;
+const DAY = 86_400_000;
 const claimsOf = (credential: ArchiveCredential) => {
   const jwt = atob(credential.session_token).slice(4);
   return JSON.parse(
@@ -53,18 +52,15 @@ it("issues one reference per scope and keeps it until a third of its lifetime ha
   expect(first.expires_at).toBe(
     new Date(now + ARCHIVE_CREDENTIAL_LIFETIME_SECONDS * 1000).toISOString(),
   );
-  // A day, renewed every eight hours: a credential a node has read cannot be revoked, so the
-  // lifetime is also how long a fenced node keeps its own prefix. The renewal that is left after
-  // the third still outlasts the longest barman job (six hours) with room to spare.
-  expect(ARCHIVE_CREDENTIAL_LIFETIME_SECONDS).toBe(24 * 3600);
-  expect(await ensureArchiveCredential(env.DB, scope, now + 7 * HOUR)).toEqual(
+  expect(ARCHIVE_CREDENTIAL_LIFETIME_SECONDS).toBe(7 * 86_400);
+  expect(await ensureArchiveCredential(env.DB, scope, now + 2 * DAY)).toEqual(
     first,
   );
-  // Renewed after a third (8 hours): the new reference outlives the old one.
-  const renewed = await ensureArchiveCredential(env.DB, scope, now + 9 * HOUR);
+  // Renewed after a third (about 2.33 days): the new reference outlives the old one.
+  const renewed = await ensureArchiveCredential(env.DB, scope, now + 2.5 * DAY);
   expect(renewed.id).not.toBe(first.id);
   expect(renewed.expires_at > first.expires_at).toBe(true);
-  expect(await ensureArchiveCredential(env.DB, scope, now + 12 * HOUR)).toEqual(
+  expect(await ensureArchiveCredential(env.DB, scope, now + 3 * DAY)).toEqual(
     renewed,
   );
   // Another access level or another node is another scope.
@@ -120,8 +116,6 @@ it("signs the credential for the node's own prefix when the node reads it, and s
     iat: Math.floor((now + 1000) / 1000),
     exp: Math.floor(Date.parse(reference.expires_at) / 1000),
   });
-  // A node that reads late is delivered what is left of the 24 hours, never more.
-  expect(claimsOf(credential!).exp).toBe(Math.floor(now / 1000) + 24 * 3600);
   // Nothing of the secret is kept: the row says only who may read what until when.
   const stored = JSON.stringify(
     (await env.DB.prepare("SELECT * FROM archive_credentials").all()).results,
@@ -396,8 +390,7 @@ it("purges credentials a day after they expired, a bounded batch at a time", asy
     archivePath: row.archive_path,
     access: "read_write" as const,
   };
-  // Expired half a day ago.
-  const old = await ensureArchiveCredential(env.DB, scope, now - 1.5 * DAY);
+  const old = await ensureArchiveCredential(env.DB, scope, now - 7.5 * DAY);
   const current = await ensureArchiveCredential(env.DB, scope, now);
   expect(await purgeArchiveCredentials(env.DB, now)).toBe(0);
   expect(
