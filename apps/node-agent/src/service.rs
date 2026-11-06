@@ -2620,10 +2620,12 @@ mod tests {
         // The mount comes, the agent decides on the database, and the start ends ready.
         machine.release_mounts();
         eventually(30, "the database to be released", || {
-            service
-                .core()
-                .find(&id)
-                .is_some_and(|db| db.view().writer.is_some())
+            service.core().find(&id).is_some_and(|db| {
+                let view = db.view();
+                // Reconciliation publishes adopted only after the resumed permit's Finish
+                // event is queued. A writer alone is visible before that admission event.
+                view.adopted && view.writer.is_some()
+            })
         })
         .await;
         let snapshot = service.core().admission.snapshot().await.unwrap();
@@ -3088,6 +3090,18 @@ mod tests {
             machine.credentials_applied().len() == 1
         })
         .await;
+        // A welcomed link queues a background full pull. Finish every service task before
+        // changing responses or arming a one-shot installation failure for a particular pull.
+        // Direct pulls below still use the real TLS link and local credential installer.
+        service.stop();
+        loop {
+            let mut tasks = std::mem::take(&mut *service.tasks.lock().unwrap());
+            if tasks.is_empty() {
+                break;
+            }
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        }
         let operation = "op_mmmmmmmmmmmmmmmmmmmm";
         let fence = "op_ffffffffffffffffffff";
         let mut page = Rig::page(
