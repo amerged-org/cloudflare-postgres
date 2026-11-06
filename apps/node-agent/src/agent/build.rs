@@ -1818,7 +1818,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_database_is_hardened_when_it_is_created_and_when_the_agent_next_refreshes_an_older_one()
+    async fn a_database_is_hardened_at_creation_and_at_the_refresh_of_an_older_record_whoever_owns_pgcf()
      {
         let Some(rig) = Rig::new("events-baseline").await else {
             return;
@@ -1828,23 +1828,74 @@ mod tests {
         assert_eq!(reader_makes_large_objects(&data).await, [false; 3]);
 
         // A database from before the baseline: PostgreSQL's defaults, and the earlier record.
-        data.batch("GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(oid), pg_catalog.lo_creat(integer), pg_catalog.lo_from_bytea(oid, bytea) TO PUBLIC")
-            .await
-            .unwrap();
+        let open = "GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(oid), pg_catalog.lo_creat(integer), pg_catalog.lo_from_bytea(oid, bytea) TO PUBLIC";
+        data.batch(open).await.unwrap();
         let settings = rig.core.event_settings(&entry);
+        let files = rig.core.files(&entry.id);
         let mut earlier = pgcf::EventsRecord::of(&settings, false);
         earlier.schema = pgcf::SCHEMA_REVISION - 1;
-        rig.core.files(&entry.id).save_events(&earlier).unwrap();
+        files.save_events(&earlier).unwrap();
         assert_eq!(reader_makes_large_objects(&data).await, [true; 3]);
         assert_eq!(
             rig.core.refresh_events(&db, &entry, false).await,
             Refresh::Installed
         );
         assert_eq!(reader_makes_large_objects(&data).await, [false; 3]);
-
-        // The record is the current one now: the next refresh opens no session.
         assert_eq!(
-            rig.core.files(&entry.id).load_events().unwrap(),
+            files.load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, false))
+        );
+
+        // A tenant that took the name `pgcf` keeps the platform schema out, not the baseline.
+        data.batch("DROP SCHEMA pgcf CASCADE; CREATE SCHEMA pgcf AUTHORIZATION app")
+            .await
+            .unwrap();
+        data.batch(open).await.unwrap();
+        let mut earlier_conflict = pgcf::EventsRecord::of(&settings, true);
+        earlier_conflict.schema = pgcf::SCHEMA_REVISION - 1;
+        files.save_events(&earlier_conflict).unwrap();
+        assert_eq!(reader_makes_large_objects(&data).await, [true; 3]);
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Conflict
+        );
+        assert_eq!(reader_makes_large_objects(&data).await, [false; 3]);
+        assert_eq!(
+            files.load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, true))
+        );
+        data.batch("DROP SCHEMA pgcf CASCADE").await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Installed
+        );
+
+        // An error of the baseline ends the install: nothing is recorded, the refresh says it
+        // failed, and the next one finishes it. (The owner role has no name to grant to.)
+        std::fs::remove_file(files.directory().join("events.json")).unwrap();
+        data.batch("ALTER ROLE app RENAME TO app_renamed")
+            .await
+            .unwrap();
+        data.batch(open).await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Failed
+        );
+        assert_eq!(files.load_events().unwrap(), None);
+        assert_eq!(reader_makes_large_objects(&data).await, [true; 3]);
+        data.batch("ALTER ROLE app_renamed RENAME TO app")
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Installed
+        );
+        assert_eq!(reader_makes_large_objects(&data).await, [false; 3]);
+
+        // The record is the current one and the database is hardened: a refresh opens no session.
+        // With the database stopped none can be opened, so the answer proves it.
+        assert_eq!(
+            files.load_events().unwrap(),
             Some(pgcf::EventsRecord::of(&settings, false))
         );
         drop(data);

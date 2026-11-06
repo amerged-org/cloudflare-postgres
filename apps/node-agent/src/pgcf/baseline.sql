@@ -10,12 +10,19 @@
 -- function of pg_catalog are kept in the catalog of each database, so only a superuser can take
 -- them away and each database must be changed on its own. No other function of pg_catalog that
 -- every role may call leaves state in the database without a table privilege: lo_import and
--- lo_export are the superuser's already (checked on PostgreSQL 18), lo_put, lowrite, lo_truncate
--- and lo_unlink need a large object that exists and that the caller may change, and
--- pg_logical_emit_message writes WAL only.
+-- lo_export are the superuser's already (checked on PostgreSQL 18), and lo_put, lowrite,
+-- lo_truncate and lo_unlink need a large object that exists and that the caller may change.
+--
+-- Left open on purpose: pg_logical_emit_message. A login that holds SELECT only can write WAL
+-- records with it (one call of 1,000,000,000 bytes was measured, and nothing limits how often),
+-- though they leave no object in the database. The statement that would close it is
+--   REVOKE EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text, boolean),
+--     pg_catalog.pg_logical_emit_message(boolean, text, bytea, boolean) FROM PUBLIC;
 --
 -- The owner of the database receives the privilege with the grant option, so that the integrator,
--- which connects as the owner, can grant it to the runtime roles that need it. TEMPORARY is not
--- touched: the integrator decides it per role.
+-- which connects as the owner, can grant it to the runtime roles that need it. The owner can
+-- therefore also grant it to PUBLIC again, by design: the REVOKE below runs as the superuser and
+-- removes only the entries of PUBLIC that the function's owner granted, not one the database
+-- owner made. TEMPORARY is not touched: the integrator decides it per role.
 REVOKE EXECUTE ON FUNCTION pg_catalog.lo_create(pg_catalog.oid), pg_catalog.lo_creat(pg_catalog.int4), pg_catalog.lo_from_bytea(pg_catalog.oid, pg_catalog.bytea) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(pg_catalog.oid), pg_catalog.lo_creat(pg_catalog.int4), pg_catalog.lo_from_bytea(pg_catalog.oid, pg_catalog.bytea) TO "app" WITH GRANT OPTION;

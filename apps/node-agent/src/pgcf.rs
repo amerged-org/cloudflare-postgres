@@ -126,6 +126,10 @@ pub async fn install(
     settings: &Settings,
     truncate: bool,
 ) -> Result<Installed, Error> {
+    // An error here ends the install before the schema is looked at. `install_events` then saves no
+    // record, so `refresh_events` answers `Failed`: no drain is attached for the database, the wake
+    // that asked is not refused, and the next wake or the drain's backoff tries again. At creation
+    // and at a restore the same error fails the build.
     session.batch(BASELINE).await?;
     if conflict(session).await? {
         return Ok(Installed::Conflict);
@@ -618,6 +622,37 @@ mod tests {
             ]
         );
         install(&session, &SETTINGS, false).await.unwrap();
+        assert_eq!(creator_acls(&session).await, held);
+
+        // Privileges that were customised stay: a direct grant of the superuser, and a grant to
+        // PUBLIC that the owner made, which the owner may by design. The baseline's REVOKE runs as
+        // the superuser and takes away only what the function's owner granted to PUBLIC.
+        session
+            .batch("GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(oid) TO reader")
+            .await
+            .unwrap();
+        app.batch_execute("GRANT EXECUTE ON FUNCTION pg_catalog.lo_creat(integer) TO PUBLIC")
+            .await
+            .unwrap();
+        let customised = vec![
+            "lo_creat {postgres=X/postgres,app=X*/postgres,=X/app}".to_string(),
+            "lo_create {postgres=X/postgres,app=X*/postgres,reader=X/postgres}".to_string(),
+            held[2].clone(),
+        ];
+        assert_eq!(creator_acls(&session).await, customised);
+        install(&session, &SETTINGS, false).await.unwrap();
+        assert_eq!(creator_acls(&session).await, customised);
+        for sql in ["SELECT lo_creat(-1)", "SELECT lo_create(0)"] {
+            reader.batch_execute(sql).await.unwrap();
+        }
+        drop_own_large_objects(&reader).await;
+        app.batch_execute("REVOKE EXECUTE ON FUNCTION pg_catalog.lo_creat(integer) FROM PUBLIC")
+            .await
+            .unwrap();
+        session
+            .batch("REVOKE EXECUTE ON FUNCTION pg_catalog.lo_create(oid) FROM reader")
+            .await
+            .unwrap();
         assert_eq!(creator_acls(&session).await, held);
 
         // A tenant that owns the name `pgcf` keeps the platform schema out, not the baseline.
