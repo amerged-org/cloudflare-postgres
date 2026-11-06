@@ -729,6 +729,18 @@ pgcf "$PGCF_API/v1/databases/<database-id>/roles/web/connection-uri"
   hibernated database applies it at its next wake.
 - The URI has no port and no `sslmode`; see [3.1](#31-driver-configuration) for how to use it.
 
+**Large objects.** PostgreSQL lets every role create a large object (`lo_create`, `lo_creat`,
+`lo_from_bytea`), which is persistent state without any table privilege, and a role that owns one
+cannot be dropped. In every database PGCF therefore revokes these three functions from `PUBLIC` and
+grants them to `app` WITH GRANT OPTION: at creation and restore, and for a database that exists at
+its next wake after the node release that carries this. A role that needs large objects gets them
+from `app`, for example `GRANT EXECUTE ON FUNCTION pg_catalog.lo_from_bytea(oid, bytea) TO <role>`; the
+grant is kept in the database like any other, so a restore returns it as of the restore time, and
+`app` revokes it before a role that holds it is deleted (a privilege holder is `role_not_droppable`).
+Order: `app` holds no grant option before the baseline is applied, so grant onward only after the
+release has reached the database; a role that calls these functions today gets `42501` from that wake
+until you do. `TEMPORARY` is not touched; restrict it per role if you need to.
+
 **Attributes at creation.** All are optional; a role created without them is the plain login role
 of before. None can be changed afterwards (there is no `PATCH`): delete the role and create it
 again.
@@ -1212,7 +1224,10 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
     before you act on an event that matters.
   - **Dumps.** A logical dump of your database needs `pg_dump --exclude-schema=pgcf`: the platform schema is
     readable only by the platform, so a dump that includes it fails. The platform installs its schema again when
-    a database is created or restored.
+    a database is created or restored. To restore the dump into another PGCF database as `app`, add
+    `--exclude-schema=pg_catalog` as well: the dump otherwise carries the baseline's grant of the large-object
+    functions to `app` ([2.3](#23-roles-connection-uri-and-passwords)), which `app` cannot repeat in a database
+    that has it ("grant options cannot be granted back to your own grantor").
   - **Deletion.** Deleting a database dead-letters its waiting data deliveries once the API reads the `database.deleted`
     event (within the minute cron). They can be replayed for seven days; platform events of the database keep
     being delivered.

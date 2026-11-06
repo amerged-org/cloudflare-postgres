@@ -1789,6 +1789,72 @@ mod tests {
         );
     }
 
+    /// Whether the role `reader`, which the superuser's session takes on, may make a large object
+    /// with each of the three functions that make one from nothing.
+    async fn reader_makes_large_objects(data: &postgres::Session) -> [bool; 3] {
+        let mut made = [false; 3];
+        data.batch("SET ROLE reader").await.unwrap();
+        for (index, sql) in [
+            "SELECT lo_create(0)",
+            "SELECT lo_creat(-1)",
+            "SELECT lo_from_bytea(0, '\\x00')",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            made[index] = match data.client.batch_execute(sql).await {
+                Ok(()) => true,
+                Err(error) => {
+                    assert_eq!(error.code().map(|code| code.code()), Some("42501"), "{sql}");
+                    false
+                }
+            };
+        }
+        data.batch("RESET ROLE").await.unwrap();
+        data.batch("SELECT lo_unlink(oid) FROM pg_largeobject_metadata")
+            .await
+            .unwrap();
+        made
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_is_hardened_when_it_is_created_and_when_the_agent_next_refreshes_an_older_one()
+     {
+        let Some(rig) = Rig::new("events-baseline").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let data = in_database(&rig, &entry.id).await;
+        assert_eq!(reader_makes_large_objects(&data).await, [false; 3]);
+
+        // A database from before the baseline: PostgreSQL's defaults, and the earlier record.
+        data.batch("GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(oid), pg_catalog.lo_creat(integer), pg_catalog.lo_from_bytea(oid, bytea) TO PUBLIC")
+            .await
+            .unwrap();
+        let settings = rig.core.event_settings(&entry);
+        let mut earlier = pgcf::EventsRecord::of(&settings, false);
+        earlier.schema = pgcf::SCHEMA_REVISION - 1;
+        rig.core.files(&entry.id).save_events(&earlier).unwrap();
+        assert_eq!(reader_makes_large_objects(&data).await, [true; 3]);
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Installed
+        );
+        assert_eq!(reader_makes_large_objects(&data).await, [false; 3]);
+
+        // The record is the current one now: the next refresh opens no session.
+        assert_eq!(
+            rig.core.files(&entry.id).load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, false))
+        );
+        drop(data);
+        rig.machine.stop(&entry.id).await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Unchanged
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn refresh_events_configures_new_limits_and_leaves_the_outbox_alone() {
         let Some(rig) = Rig::new("events-limits").await else {

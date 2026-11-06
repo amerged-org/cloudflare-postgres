@@ -1588,6 +1588,7 @@ Nothing else a database's user writes outlives its unit outside its own volume, 
 
 **Tenant privileges:**
 - The owner role `app` is not a superuser and has no `CREATEDB`, `CREATEROLE` or `REPLICATION`.
+- **Hardening baseline.** PostgreSQL lets every role call `lo_create`, `lo_creat` and `lo_from_bytea`, and the large object they make is persistent state that needs no table privilege (a role with `SELECT` only could write, and the object keeps `DROP ROLE` from removing the role). Only a superuser can change the privilege, and it is kept in each database. The node agent therefore applies `apps/node-agent/src/pgcf/baseline.sql` to every tenant database as part of the platform-schema install (`pgcf::install`): at creation, at every restore and replacement (also to a point in time before the baseline), and once at the next wake or refresh of a database whose `events.json` holds an earlier `SCHEMA_REVISION`, with no further session after that. It revokes the three functions from `PUBLIC` and grants them to `app` WITH GRANT OPTION, whether or not a tenant took the schema name `pgcf`. `lo_import` and `lo_export` are the superuser's already, and the functions that change a large object need one the caller may write. `TEMPORARY` stays with `PUBLIC`: the integrator decides it per role.
 - Replication connections are refused at the gateway.
 - supautils (Apache-2.0) is a later option, if tenants need privileged extensions.
 

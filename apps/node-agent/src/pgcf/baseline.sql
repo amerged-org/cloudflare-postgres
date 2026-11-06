@@ -1,0 +1,21 @@
+-- pgcf-schema-revision: 2
+-- The hardening baseline of a tenant database. The agent runs this file as the cluster's superuser
+-- at every install of the platform schema, before it looks at the schema: it holds whoever owns the
+-- name pgcf. It is one batch, so it is atomic, and running it again changes nothing. The names are
+-- qualified because the file runs with whatever search_path the session has.
+--
+-- PostgreSQL lets every role call the three functions that make a large object from nothing, and
+-- what they make is persistent state: a login that holds SELECT only could write to the database,
+-- and the large object it owns keeps DROP ROLE from removing the role. The privileges on a
+-- function of pg_catalog are kept in the catalog of each database, so only a superuser can take
+-- them away and each database must be changed on its own. No other function of pg_catalog that
+-- every role may call leaves state in the database without a table privilege: lo_import and
+-- lo_export are the superuser's already (checked on PostgreSQL 18), lo_put, lowrite, lo_truncate
+-- and lo_unlink need a large object that exists and that the caller may change, and
+-- pg_logical_emit_message writes WAL only.
+--
+-- The owner of the database receives the privilege with the grant option, so that the integrator,
+-- which connects as the owner, can grant it to the runtime roles that need it. TEMPORARY is not
+-- touched: the integrator decides it per role.
+REVOKE EXECUTE ON FUNCTION pg_catalog.lo_create(pg_catalog.oid), pg_catalog.lo_creat(pg_catalog.int4), pg_catalog.lo_from_bytea(pg_catalog.oid, pg_catalog.bytea) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(pg_catalog.oid), pg_catalog.lo_creat(pg_catalog.int4), pg_catalog.lo_from_bytea(pg_catalog.oid, pg_catalog.bytea) TO "app" WITH GRANT OPTION;

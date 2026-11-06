@@ -4,6 +4,11 @@
 //! agent installs the schema as the cluster's superuser, configures its limits, and drains the
 //! outbox over its own events session. Its objects belong to the platform role (`PLATFORM_ROLE`),
 //! which can log in to nothing, so a tenant can reach them only through the functions it is granted.
+//!
+//! The same install applies the hardening baseline (`baseline.sql`): the privileges that
+//! PostgreSQL gives every role on functions of `pg_catalog`, which only a superuser can take away
+//! and which are kept in each database. It is applied whether or not the schema is, so a tenant
+//! that takes the name `pgcf` cannot keep it out.
 use crate::{
     Error,
     postgres::{self, Session},
@@ -12,14 +17,18 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
 use tokio::sync::Notify;
 
-/// The revision of `schema.sql`, which is also its first line.
-pub const SCHEMA_REVISION: u32 = 1;
+/// The revision of what `install` applies: `schema.sql` and `baseline.sql`, each of which carries
+/// it as its first line. A database whose record holds an earlier one is installed again at its
+/// next refresh, which is how a change to either file reaches the databases that exist.
+pub const SCHEMA_REVISION: u32 = 2;
 /// The role that owns the platform schema and its objects.
 pub const PLATFORM_ROLE: &str = "pgcf-events";
 /// The channel `pgcf.emit` notifies after each row, so the drain wakes up.
 pub const CHANNEL: &str = "pgcf_outbox";
 /// The platform schema, run between `BEGIN` and `COMMIT` by `install`.
 const SCHEMA: &str = include_str!("pgcf/schema.sql");
+/// The hardening baseline, one batch that `install` runs before it looks at the schema.
+const BASELINE: &str = include_str!("pgcf/baseline.sql");
 
 /// The limits and the storage generation (epoch) that `pgcf.emit` stamps on each row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,14 +118,15 @@ pub async fn conflict(session: &Session) -> Result<bool, Error> {
 }
 const CONFLICT_QUERY: &str = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspname = 'pgcf' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.oid = n.nspowner AND r.rolsuper))";
 
-/// Makes the platform schema of the database, with `settings`. A schema that exists keeps its
-/// rows; `truncate` empties the outbox and restarts its sequence. A foreign schema `pgcf` is never
-/// touched.
+/// Applies the hardening baseline to the database, and makes its platform schema with `settings`.
+/// A schema that exists keeps its rows; `truncate` empties the outbox and restarts its sequence. A
+/// foreign schema `pgcf` is never touched, and the baseline is applied before it is looked for.
 pub async fn install(
     session: &Session,
     settings: &Settings,
     truncate: bool,
 ) -> Result<Installed, Error> {
+    session.batch(BASELINE).await?;
     if conflict(session).await? {
         return Ok(Installed::Conflict);
     }
@@ -254,13 +264,21 @@ mod tests {
     }
     /// A session as `role` (password seed `seed`) on the tenant database, by its password.
     async fn as_role(cluster: &Cluster, role: &str, seed: u8) -> tokio_postgres::Client {
+        as_role_on(cluster, role, seed, "tenant").await
+    }
+    async fn as_role_on(
+        cluster: &Cluster,
+        role: &str,
+        seed: u8,
+        database: &str,
+    ) -> tokio_postgres::Client {
         let mut config = tokio_postgres::Config::new();
         config
             .host_path(cluster.socket_directory())
             .port(PORT)
             .user(role)
             .password(password(seed))
-            .dbname("tenant");
+            .dbname(database);
         let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
         tokio::spawn(connection);
         client
@@ -487,6 +505,232 @@ mod tests {
             .batch_execute("SELECT pgcf.emit('orders', '{}')")
             .await
             .unwrap();
+    }
+
+    /// The functions that make a large object from nothing, each as one statement. PostgreSQL
+    /// lets every role call them, and what they make is persistent state.
+    const LARGE_OBJECT_CREATORS: [&str; 3] = [
+        "SELECT lo_create(0)",
+        "SELECT lo_creat(-1)",
+        "SELECT lo_from_bytea(0, '\\x00')",
+    ];
+    /// The privileges on the three creators in the tenant database, in name order.
+    async fn creator_acls(session: &Session) -> Vec<String> {
+        session
+            .query(
+                "SELECT proname::pg_catalog.text || ' ' || coalesce(proacl::pg_catalog.text, 'PUBLIC') FROM pg_catalog.pg_proc WHERE pronamespace = 'pg_catalog'::pg_catalog.regnamespace AND proname IN ('lo_create', 'lo_creat', 'lo_from_bytea') ORDER BY proname",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+    async fn drop_own_large_objects(client: &tokio_postgres::Client) {
+        client
+            .batch_execute("SELECT lo_unlink(oid) FROM pg_largeobject_metadata WHERE pg_get_userbyid(lomowner) = current_user")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_baseline_takes_the_large_object_creators_from_public_and_gives_them_to_the_owner()
+    {
+        // The file carries the revision that the record keeps and grants to the owner role.
+        assert_eq!(
+            BASELINE.lines().next(),
+            Some(format!("-- pgcf-schema-revision: {SCHEMA_REVISION}").as_str())
+        );
+        assert!(BASELINE.contains(&format!("TO \"{OWNER_ROLE}\" WITH GRANT OPTION")));
+        let Some(cluster) = cluster_with_tenant("pgcf-baseline").await else {
+            return;
+        };
+        let session = events(&cluster).await;
+        let app = as_role(&cluster, "app", 1).await;
+        let reader = as_role(&cluster, "reader", 2).await;
+        app.batch_execute("CREATE TABLE notes (id int); GRANT SELECT ON notes TO reader")
+            .await
+            .unwrap();
+        // A database as it was before the baseline: a role that holds SELECT only still makes
+        // persistent state, and the large object it owns then keeps the role from being dropped.
+        for sql in LARGE_OBJECT_CREATORS {
+            reader
+                .batch_execute(sql)
+                .await
+                .unwrap_or_else(|error| panic!("before the baseline, {sql}: {error}"));
+        }
+        drop_own_large_objects(&reader).await;
+
+        install(&session, &SETTINGS, false).await.unwrap();
+        for sql in LARGE_OBJECT_CREATORS {
+            let error = reader.batch_execute(sql).await.expect_err(sql);
+            assert_eq!(state(&error), "42501", "{sql}");
+        }
+        let error = reader
+            .batch_execute("SELECT lo_from_bytea(0, '\\x00')")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_db_error().unwrap().message(),
+            "permission denied for function lo_from_bytea"
+        );
+        // Nothing else of the reader changed, and the files of the server stay out of reach.
+        reader
+            .batch_execute("SELECT count(*) FROM notes")
+            .await
+            .unwrap();
+        let error = reader
+            .batch_execute("SELECT lo_import('/etc/hostname')")
+            .await
+            .unwrap_err();
+        assert_eq!(state(&error), "42501");
+
+        // The owner makes large objects as before and grants the function onward, and only that.
+        for sql in LARGE_OBJECT_CREATORS {
+            app.batch_execute(sql).await.unwrap();
+        }
+        drop_own_large_objects(&app).await;
+        app.batch_execute(
+            "GRANT EXECUTE ON FUNCTION pg_catalog.lo_from_bytea(oid, bytea) TO reader",
+        )
+        .await
+        .unwrap();
+        reader
+            .batch_execute("SELECT lo_from_bytea(0, '\\x00')")
+            .await
+            .unwrap();
+        drop_own_large_objects(&reader).await;
+        let error = reader
+            .batch_execute("SELECT lo_create(0)")
+            .await
+            .unwrap_err();
+        assert_eq!(state(&error), "42501");
+
+        // Installing again changes no privilege, the owner's onward grant included.
+        let held = creator_acls(&session).await;
+        assert_eq!(
+            held,
+            [
+                "lo_creat {postgres=X/postgres,app=X*/postgres}",
+                "lo_create {postgres=X/postgres,app=X*/postgres}",
+                "lo_from_bytea {postgres=X/postgres,app=X*/postgres,reader=X/app}",
+            ]
+        );
+        install(&session, &SETTINGS, false).await.unwrap();
+        assert_eq!(creator_acls(&session).await, held);
+
+        // A tenant that owns the name `pgcf` keeps the platform schema out, not the baseline.
+        session
+            .batch("DROP SCHEMA pgcf CASCADE; CREATE SCHEMA pgcf AUTHORIZATION app; GRANT EXECUTE ON FUNCTION pg_catalog.lo_creat(integer) TO PUBLIC")
+            .await
+            .unwrap();
+        reader.batch_execute("SELECT lo_creat(-1)").await.unwrap();
+        drop_own_large_objects(&reader).await;
+        assert_eq!(
+            install(&session, &SETTINGS, false).await.unwrap(),
+            Installed::Conflict
+        );
+        let error = reader
+            .batch_execute("SELECT lo_creat(-1)")
+            .await
+            .unwrap_err();
+        assert_eq!(state(&error), "42501");
+    }
+
+    #[tokio::test]
+    async fn a_hardened_database_dumps_and_restores_into_another_for_its_owner_with_its_large_objects()
+     {
+        let Some(cluster) = cluster_with_tenant("pgcf-baseline-dump").await else {
+            return;
+        };
+        cluster
+            .agent()
+            .await
+            .batch_long("CREATE DATABASE copy OWNER app")
+            .await
+            .unwrap();
+        for database in ["tenant", "copy"] {
+            let session = connect(&cluster.socket_directory(), database, None)
+                .await
+                .unwrap();
+            install(&session, &SETTINGS, false).await.unwrap();
+        }
+        as_role(&cluster, "app", 1)
+            .await
+            .batch_execute(
+                "CREATE TABLE notes (id int); INSERT INTO notes VALUES (1); SELECT lo_from_bytea(0, '\\x0102')",
+            )
+            .await
+            .unwrap();
+        let bin = crate::testpg::bin_directory().unwrap();
+        let run = |program: &str, arguments: &[&std::ffi::OsStr]| {
+            std::process::Command::new(bin.join(program))
+                .arg("-h")
+                .arg(cluster.socket_directory())
+                .args(["-p", &PORT.to_string(), "-U", "app"])
+                .args(arguments)
+                .env("PGPASSWORD", password(1))
+                .output()
+                .unwrap()
+        };
+        let stdout = |output: std::process::Output| {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        // The platform schema is not the owner's to read, so every dump leaves it out. A dump
+        // that does not leave out the schema `pg_catalog` carries the privileges on its functions.
+        let (plain, lean) = (
+            cluster.root.join("plain.dump"),
+            cluster.root.join("lean.dump"),
+        );
+        for (file, extra) in [(&plain, None), (&lean, Some("--exclude-schema=pg_catalog"))] {
+            let mut arguments: Vec<&std::ffi::OsStr> = vec![
+                "-Fc".as_ref(),
+                "--exclude-schema=pgcf".as_ref(),
+                "-f".as_ref(),
+                file.as_ref(),
+            ];
+            arguments.extend(extra.map(std::ffi::OsStr::new));
+            arguments.push("tenant".as_ref());
+            stdout(run("pg_dump", &arguments));
+        }
+        let listing = stdout(run("pg_restore", &["-l".as_ref(), plain.as_ref()]));
+        assert!(listing.contains("ACL pg_catalog FUNCTION lo_create(oid)"));
+        let listing = stdout(run("pg_restore", &["-l".as_ref(), lean.as_ref()]));
+        assert!(!listing.contains("ACL pg_catalog"));
+        // The owner of a hardened database cannot grant to itself what the first dump carries: its
+        // restore into another hardened database stops at that statement and, in one transaction,
+        // leaves nothing behind. The second dump restores, large object included.
+        let into_copy = |file: &std::path::Path| {
+            run(
+                "pg_restore",
+                &[
+                    "-1".as_ref(),
+                    "-e".as_ref(),
+                    "-d".as_ref(),
+                    "copy".as_ref(),
+                    file.as_ref(),
+                ],
+            )
+        };
+        let refused = into_copy(&plain);
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("grant options cannot be granted back to your own grantor")
+        );
+        stdout(into_copy(&lean));
+        let copy = as_role_on(&cluster, "app", 1, "copy").await;
+        let rows = copy
+            .query("SELECT count(*) FROM pg_largeobject_metadata", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 1);
     }
 
     #[tokio::test]
