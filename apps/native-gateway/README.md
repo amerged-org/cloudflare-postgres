@@ -95,7 +95,7 @@ archive socket.
   (`holders_within_share`, `guaranteed_bytes`, `reserve_bytes`) when more than 32 databases are
   at or below their share and hold memory (a database above its share draws on the shared part
   and is not counted); the first line comes at once and a lasting stretch is logged again at the
-  first change after each minute. Under the `reserved` memory rule a 12 GB node holds about 37
+  first growth of any database's memory after each minute (a release does not trigger the check). Under the `reserved` memory rule a 12 GB node holds about 37
   awake databases of 256 MiB, which is more than 32. The default rule, `measured`, does not cap
   the number of awake databases, so there the line can appear on a node with many small awake
   databases. To cover more databases, raise `PGCF_GATEWAY_MEMORY_BYTES` first and then

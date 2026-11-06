@@ -35,7 +35,7 @@ impl Used {
     }
     /// The number of databases at or below their share, when the reserve cannot cover all of
     /// their shares and it was not said for [`REPORT_WINDOW`]. A stretch that lasts is said again
-    /// at the first change after each window.
+    /// at the first growth after each window (only a growth asks; a release does not).
     fn outgrown(&mut self, covered: usize, now: impl FnOnce() -> Instant) -> Option<usize> {
         if self.within <= covered {
             return None;
@@ -560,7 +560,7 @@ mod tests {
         drop(leases.pop());
         assert_eq!(within(), 2);
         // With a clock of the test's own: the first line at once, a lasting stretch again after
-        // each window, and a stretch that begins inside a window at the first change after it.
+        // each window, and a stretch that begins inside a window at the first growth after it.
         let (mut used, start) = (Used::default(), Instant::now());
         used.within = 3;
         assert_eq!(used.outgrown(2, || start), Some(3));
