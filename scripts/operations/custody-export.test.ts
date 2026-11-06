@@ -750,7 +750,7 @@ test("source builders preserve original exports, reject private keys and emit a 
       buildCustodyMaintenanceWrapperSource({
         originalImport: "./named-original.mjs",
         closedNamedWorkerEntrypoints: ["NamedWriter"],
-      } as Parameters<typeof buildCustodyMaintenanceWrapperSource>[0]),
+      } as unknown as Parameters<typeof buildCustodyMaintenanceWrapperSource>[0]),
     );
     assert.throws(() =>
       buildCustodyMaintenanceWrapperSource({
