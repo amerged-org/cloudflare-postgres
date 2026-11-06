@@ -753,10 +753,31 @@ the platform schema `pgcf`.
   before a role that holds it is deleted (a privilege holder is `role_not_droppable`).
 - **Order.** `app` holds no grant option before the baseline is applied, so grant onward only after
   the release has reached the database; until then a role that calls these functions still can.
-- **If the baseline fails.** The install ends before the platform schema: nothing is recorded, no new
-  data-event drain is attached for that database (its events stay off), and the database keeps
-  serving with PostgreSQL's defaults. The agent tries again at the next wake and, while the database
-  is running, on the drain's backoff. A build at creation or restore fails instead.
+- **If the baseline fails.** Because the revision went from 1 to 2, every existing database runs the
+  baseline before the platform-schema install may proceed (`pgcf.rs:133`; `build.rs:427-437`). An error
+  ends the install there: the record stays at revision 1 (`build.rs:365-368` is not reached), the
+  database keeps serving with PostgreSQL's defaults, and no wake is refused (`power.rs:537`,
+  `power.rs:922`). What happens to data events, from the code:
+  - **The outbox.** The old schema and its rows stay untouched, and `pgcf.emit` and the capture
+    triggers keep writing to it (revision 1 and 2 are the same schema). Only the drain deletes rows
+    (`pgcf.rs:224`), and it does not run, so events are delayed, not lost.
+  - **The drain.** A drain exists only in the agent process's memory (`drains.rs:28-35`, `drains.rs:101-105`)
+    and ends with it. The release that carries the baseline replaces the agent, so no old drain keeps
+    running on the old schema. A new drain attaches only after a refresh answers `Unchanged` or
+    `Installed` (`drains.rs:164-169`), and with the record at revision 1 that needs the install to
+    succeed: while the baseline keeps failing no drain attaches, after a restart as well, and each try waits
+    1 s, doubling to 60 s (`drains.rs:238-251`, `agent/mod.rs:159-160`). A drain already attached under
+    the new agent has a current record, and the baseline is not run for it again (`build.rs:420-421`,
+    `build.rs:427-436`).
+  - **Sleep and suspend.** A database whose outbox holds rows cannot sleep or be suspended: the proof
+    refuses with `power_outbox` (`proof.rs:94-111`), and the idle shortcut `outbox_backlog`
+    (`power.rs:1434`) knows only an attached drain.
+  - **A full outbox.** At the operator's row limit (10,000 by default) `pgcf.emit`, and so a write to a
+    watched table, fails with `53400` in the tenant's own transaction (`schema.sql:84`): the write is
+    refused and rolled back, not lost.
+  - **Recovery.** The next successful refresh (the next wake, or the drain's backoff while the database
+    runs) installs, records revision 2 and attaches a drain, which delivers what waited in sequence
+    order. A build at creation or restore fails instead.
 - **`app` can undo it.** `app` holds the grant option, so it can grant these functions to `PUBLIC`
   again; that is by design, `app` being yours. The baseline runs at every install, but its `REVOKE`
   is the superuser's and removes only the `PUBLIC` entries the function's owner granted: a grant to
@@ -767,7 +788,17 @@ the platform schema `pgcf`.
   role without `REPLICATION`; and `pg_notify` is the `NOTIFY` command, which no privilege guards, whose
   queue `max_notify_queue_pages` caps at 8 GB by default and which a session that listens and holds a
   transaction open can fill (156 MB for 20,000 notifications were measured; the files go when the
-  session ends). `TEMPORARY` is not touched either; restrict it per role if you need to.
+  session ends).
+- **Disk writes that remain.** Two more paths let a `SELECT`-only login write to the volume, and this
+  baseline closes neither. (a) `temp_file_limit` is unset (the default, -1), so a query can spill sort
+  and hash files to disk until it ends, bounded only by a `statement_timeout` (a role can change its
+  own) and the volume. (b) Temporary tables are not counted by `temp_file_limit`: they are closed per
+  role by revoking `TEMPORARY` on the database, which the baseline does not do and the integrator
+  does. What would close (a): `ALTER DATABASE <db> SET temp_file_limit = '<size>'`, run by the
+  superuser (a superuser-only setting, so tenants cannot change it), with a value the node agent
+  derives from the volume size. What would close `pg_notify`: `max_notify_queue_pages` in
+  `apps/node-agent/src/settings.rs` (a cluster setting, which needs a restart). Neither is built here,
+  because the right value is a capacity decision for the owner.
 
 **Attributes at creation.** All are optional; a role created without them is the plain login role
 of before. None can be changed afterwards (there is no `PATCH`): delete the role and create it
