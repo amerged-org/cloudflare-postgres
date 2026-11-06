@@ -3495,7 +3495,12 @@ mod tests {
         rig.core.apply(&page()).await;
         eventually(30, "the build to fail", || handle.phase() == Phase::Error).await;
         assert_eq!(handle.view().error, Some("archive_unusable"));
-        assert_eq!(rig.observation(&id)["error"], "archive_unusable");
+        // The phase changes before Core::set publishes its observation. Await that separate
+        // boundary, keeping the exact error and physical-cleanup assertions unchanged.
+        assert_eq!(
+            rig.observed(&id, "error").await["error"],
+            "archive_unusable"
+        );
         assert!(rig.machine.volumes().is_empty());
         assert!(!rig.machine.has_account(&id));
     }

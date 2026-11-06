@@ -598,10 +598,9 @@ mod tests {
         let (link, mut events) = start(&cloud, &base).await;
         assert_eq!(next(&mut events).await, Some(LinkEvent::Desired(None)));
         let hellos = || cloud.with(|inner| inner.hellos.clone());
-        assert_eq!(
-            hellos(),
-            [vector("AgentLinkMessage", "hello-with-in-place-restore")]
-        );
+        let mut expected = vector("AgentLinkMessage", "hello-with-in-place-restore");
+        expected["capabilities"] = json!(["restore_in_place_v1", "cold_storage_v1"]);
+        assert_eq!(hellos(), [expected]);
         // The packages changed in a maintenance cycle: the next hello says so, on a new link.
         let mut installed = os();
         installed["packages_sha256"] = "b".repeat(64).into();

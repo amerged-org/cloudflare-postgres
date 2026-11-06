@@ -48,6 +48,22 @@ have one node. Production changes and new paid capacity retain the owner's expli
 requirement. See [the recovery runbook](../operations/recovery.md#long-sleep-r2-storage-and-request-triggered-recovery)
 for the rollout switches and recovery behavior. Preserve the earlier accepted records below.
 
+**First CI qualification, run 42194790820:** static, API, Edge, other tests and Linux kernel
+checks passed. The Rust job passed 950 tests and excluded 23 kernel-only cases, but failed a stale
+hello-capability expectation and an existing phase-versus-observation publication race in the
+credential-timeout test. Both test assertions were corrected without changing runtime behavior
+or weakening cleanup/error checks, and the focused reruns passed. The node-image job compiled
+the release binaries, then failed fetching the pinned `bsdutils` package with HTTP 503 from
+Debian's snapshot service. The same package from Debian's official security mirror returned the
+exact locked 110,208 bytes and SHA-256. A narrow official-mirror fallback now preserves locked
+versions, sizes, digests, HTTPS and retry bounds; three downloader tests passed, including rejection
+of mismatched bytes and an HTTP redirect. Package pins are unchanged. Fresh CI remains required.
+
+The broad local macOS node-agent run passed 880 tests, excluded 17 and reported five failures:
+the corrected hello expectation and four unchanged Linux-specific readahead/residency assumptions.
+Those Linux-specific assertions were not relaxed; their existing Linux CI cases passed in the
+first run. Local host results are not substituted for the Linux release qualification.
+
 # Integration extension candidate — 2026-10-26
 
 **Current implementation scope:** generic contract 1.5.0 (1.6.0 adds data events, built and not deployed: [9.3](#93-updates), [events plan 4.5](database-events-and-schedules.md)), integer-MiB total volumes with exact

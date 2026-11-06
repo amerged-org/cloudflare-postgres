@@ -8,13 +8,13 @@
 // shares (Colima and Docker Desktop share the home directory).
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, createWriteStream, existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createReadStream, existsSync } from "node:fs";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { hostFilesSha256 } from "../../packages/contracts/src/releases.ts";
 import { digestBinaries } from "./binaries.ts";
+import { fetchLockedPackage } from "./download.ts";
 import { readHostFiles } from "./host-files.ts";
 import {
   aptListName,
@@ -77,22 +77,13 @@ async function download(entry: LockedPackage, directory: string): Promise<void> 
     if (present.size === entry.size && (await sha256File(target)) === entry.sha256) return;
     await rm(target);
   }
-  const partial = `${target}.partial`;
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const response = await fetch(entry.url, { signal: AbortSignal.timeout(300_000) });
-      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
-      if (!new URL(response.url).protocol.startsWith("https")) throw new Error("redirected off HTTPS");
-      await pipeline(Readable.fromWeb(response.body as never), createWriteStream(partial, { mode: 0o644 }));
-      const size = (await stat(partial)).size;
-      if (size !== entry.size) throw new Error(`size ${size} instead of ${entry.size}`);
-      if ((await sha256File(partial)) !== entry.sha256) throw new Error("sha256 mismatch");
-      await rename(partial, target);
+      await fetchLockedPackage(entry, target);
       return;
     } catch (error) {
       lastError = error;
-      await rm(partial, { force: true });
       if (attempt < 3) await new Promise((done) => setTimeout(done, attempt * 5_000));
     }
   }
