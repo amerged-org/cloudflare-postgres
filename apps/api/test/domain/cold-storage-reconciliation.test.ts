@@ -12,6 +12,10 @@ import { applyLifecycleObservations } from "../../src/domain/lifecycle-observati
 import { nodeDesiredPage } from "../../src/domain/node-desired.ts";
 import { placementNodes } from "../../src/domain/placement.ts";
 import { nodeKeyPair } from "./fixtures.ts";
+import {
+  insertSnapshotArchive,
+  insertSnapshotRehydrate,
+} from "./cold-snapshot-fixture.ts";
 import { observation, report } from "./lifecycle-fixture.ts";
 import {
   sleeping,
@@ -177,7 +181,7 @@ it(
           database_id: f.id,
           source_generation: c.task.source_generation,
           source_storage_generation: c.task.source_storage_generation,
-          inventory_sha256: c.task.inventory_sha256,
+          manifest_sha256: c.task.source.manifest_sha256,
           observed_at: new Date().toISOString(),
           status: "failed",
           reason: "archive_unusable",
@@ -314,45 +318,37 @@ async function blockedJob(f: Fixture, index: number) {
       `INSERT INTO cold_storage_operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,'database.archive','succeeded',?,?,1,?,?,?)`,
     ).bind(source, f.project, id, at, at, at),
     env.DB.prepare(
-      `INSERT INTO database_cold_storage(operation,kind,database_id,project_id,region_id,phase,source_node_id,source_generation,source_storage_generation,source_archive_path,source_backup_id,proven_sleep_json,verification_receipt_json,source_removed_at,created_at,updated_at,completed_at)
-      VALUES(?,'archive',?,?,?,'archived',?,1,1,?,?,?,'{}',?,?,?,?)`,
-    ).bind(
-      source,
-      id,
-      f.project,
-      f.region,
-      f.node,
-      path,
-      f.backup.backup_id,
-      JSON.stringify(f.proof),
-      at,
-      at,
-      at,
-      at,
-    ),
-    env.DB.prepare(
       `INSERT INTO cold_storage_operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) VALUES(?,'database.rehydrate','pending',?,?,2,?,?)`,
     ).bind(operation, f.project, id, at, at),
-    env.DB.prepare(
-      `INSERT INTO database_cold_storage(operation,kind,database_id,project_id,region_id,source_operation,phase,source_node_id,source_generation,source_storage_generation,source_archive_path,source_backup_id,proven_sleep_json,created_at,updated_at)
-      VALUES(?,'rehydrate',?,?,?,?,'waiting_capacity',?,1,1,?,?,?,?,?)`,
-    ).bind(
-      operation,
-      id,
-      f.project,
-      f.region,
-      source,
-      f.node,
-      path,
-      f.backup.backup_id,
-      JSON.stringify(f.proof),
-      at,
-      at,
-    ),
-    env.DB.prepare(
-      "INSERT INTO archive_pins(operation,archive_path,database_id,created_at) VALUES(?,?,?,?),(?,?,?,?)",
-    ).bind(source, path, id, at, operation, path, id, at),
   ]);
+  await insertSnapshotArchive({
+    operation: source,
+    id,
+    project: f.project,
+    region: f.region,
+    node: f.node,
+    path,
+    at,
+  });
+  await insertSnapshotRehydrate({
+    operation,
+    source,
+    node: f.node,
+    target: archiveDestinationPath(
+      env.ARCHIVE_BUCKET_NAME,
+      f.region,
+      id,
+      2,
+      operation,
+    ),
+    at,
+    phase: "waiting_capacity",
+  });
+  await env.DB.prepare(
+    "INSERT INTO archive_pins(operation,archive_path,database_id,created_at) VALUES(?,?,?,?),(?,?,?,?)",
+  )
+    .bind(source, path, id, at, operation, path, id, at)
+    .run();
 }
 
 it(
@@ -385,39 +381,43 @@ it(
   },
 );
 
+async function ineligibleSleepers(f: Fixture) {
+  const at = new Date().toISOString();
+  for (let i = 0; i < 20; i++) {
+    const id = `a${i.toString().padStart(19, "0")}`,
+      op = `op_0${i.toString().padStart(19, "0")}`;
+    const path = archiveDestinationPath(
+      env.ARCHIVE_BUCKET_NAME,
+      f.region,
+      id,
+      1,
+      op,
+    );
+    await env.DB.prepare(
+      `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,generation,archive_path,created_at,updated_at,observed_state,observed_power,observed_generation,sleep_since)
+      VALUES(?,?,?,NULL,?,?,'suspended',1,?,?,?,'provisioning','hibernated',1,?)`,
+    )
+      .bind(
+        id,
+        f.project,
+        f.region,
+        `no-proof-${i}`,
+        f.size,
+        path,
+        at,
+        at,
+        f.proof.proven_at,
+      )
+      .run();
+  }
+}
+
 it(
   "advances the due cursor past twenty ineligible sleepers",
   { timeout: 30000 },
   async () => {
-    const f = await sleeping(),
-      at = new Date().toISOString();
-    for (let i = 0; i < 20; i++) {
-      const id = `a${i.toString().padStart(19, "0")}`,
-        op = `op_0${i.toString().padStart(19, "0")}`;
-      const path = archiveDestinationPath(
-        env.ARCHIVE_BUCKET_NAME,
-        f.region,
-        id,
-        1,
-        op,
-      );
-      await env.DB.prepare(
-        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,generation,archive_path,created_at,updated_at,observed_state,observed_power,observed_generation,sleep_since)
-      VALUES(?,?,?,NULL,?,?,'suspended',1,?,?,?,'provisioning','hibernated',1,?)`,
-      )
-        .bind(
-          id,
-          f.project,
-          f.region,
-          `no-proof-${i}`,
-          f.size,
-          path,
-          at,
-          at,
-          f.proof.proven_at,
-        )
-        .run();
-    }
+    const f = await sleeping();
+    await ineligibleSleepers(f);
     expect((await runColdStorageCron(f.configured)).claimed).toBe(0);
     expect((await runColdStorageCron(f.configured)).claimed).toBe(1);
     expect(await residency(f.id)).toMatchObject({
@@ -425,3 +425,26 @@ it(
     });
   },
 );
+
+it("filters the rollout scope before paging due sleepers", async () => {
+  const f = await sleeping();
+  await ineligibleSleepers(f);
+  expect(
+    (
+      await runColdStorageCron({
+        ...f.configured,
+        COLD_STORAGE_ARCHIVAL_DATABASE_IDS: JSON.stringify([f.id]),
+      })
+    ).claimed,
+  ).toBe(1);
+  expect(await residency(f.id)).toMatchObject({
+    storage_residency: "archiving",
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM databases WHERE project_id=? AND id<>? AND storage_residency<>'local'",
+    )
+      .bind(f.project, f.id)
+      .first("n"),
+  ).toBe(0);
+});

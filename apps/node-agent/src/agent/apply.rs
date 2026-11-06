@@ -5,7 +5,7 @@
 //! desired state stops or removes what runs (plan 3.3, invariant 7): a page that does not name a
 //! database never does.
 use super::{
-    Core, Db, Desired, Entry, Phase, Policy, Reconcile, now_ms,
+    Core, Db, Desired, Entry, Origin, Phase, Policy, Reconcile, now_ms,
     power::{Slept, Why, writer_of},
 };
 use crate::{
@@ -43,6 +43,8 @@ pub(crate) enum Step {
     Nothing,
     /// Build the storage generation the entry's origin names.
     Build,
+    /// A higher-generation, no-origin activation grant after the staged snapshot was verified.
+    ActivateCold,
     Delete,
     /// The page suspends a database that runs.
     Suspend,
@@ -73,12 +75,48 @@ pub(crate) fn plan(f: &Facts) -> Step {
             Step::Delete
         };
     }
+    if entry.cold_snapshot_pending
+        && matches!(entry.origin, Some(Origin::Rehydrate(_)))
+        && !matches!(
+            f.phase,
+            Some(Phase::Building | Phase::Starting | Phase::Quiesce)
+        )
+        && f.state.is_some_and(|state| {
+            state.storage_generation == entry.storage_generation && state.cold_snapshot_start_intent
+        })
+        && (f.phase.is_none() || !f.unit_awake)
+    {
+        return Step::Fail("cold_snapshot_restart_required");
+    }
+    if entry.cold_snapshot_pending && entry.origin.is_none() {
+        if matches!(
+            f.phase,
+            Some(Phase::Building | Phase::Starting | Phase::Quiesce)
+        ) {
+            return Step::Nothing;
+        }
+        let granted = f.state.is_some_and(|state| {
+            state.storage_generation == entry.storage_generation && state.cold_snapshot_serving
+        });
+        return if !granted || f.phase.is_none() || !f.unit_awake {
+            Step::ActivateCold
+        } else {
+            Step::Nothing
+        };
+    }
     // The generation of the entry was built, with its first backup: from here a missing volume is
     // an error and never a fresh build.
     let built = f
         .state
         .is_some_and(|state| state.built && state.storage_generation == entry.storage_generation);
-    let build = !built && entry.origin.is_some();
+    let unconfirmed_cold = matches!(entry.origin, Some(Origin::Rehydrate(_)))
+        && f.state.is_none_or(|state| {
+            state.storage_generation != entry.storage_generation || !state.cold_snapshot_serving
+        });
+    // A process restart or a target PostgreSQL crash before Cloudflare cutover must recover the
+    // original clean snapshot, rather than replay WAL and lose its UNLOGGED main forks.
+    let build = (!built && entry.origin.is_some())
+        || (unconfirmed_cold && (f.phase.is_none() || !f.unit_awake));
     match f.phase {
         // A flow runs; it finishes before the next decision.
         Some(Phase::Building | Phase::Starting | Phase::Quiesce) => Step::Nothing,
@@ -424,6 +462,19 @@ impl<M: Machine> Core<M> {
         }
         match step {
             Step::Nothing => {}
+            Step::ActivateCold => {
+                turn.take();
+                if has_volume && !self.attach(db, &entry).await {
+                    return;
+                }
+                if let Err(error) = self.activate_cold(db, &entry).await {
+                    self.set(db, |view| {
+                        view.phase = Phase::Error;
+                        view.error = Some(error);
+                        view.writer = None;
+                    });
+                }
+            }
             Step::Build => {
                 let built = self.build(db, &entry).await;
                 if built == Err(super::replacement::CLEANUP_PENDING)
@@ -1148,6 +1199,60 @@ mod tests {
             refused: false,
             abandoned: false,
         })
+    }
+
+    #[test]
+    fn pending_cold_targets_never_crash_recover_or_recopy_after_a_postgres_start() {
+        let mut target = entry(|db| {
+            let id = db["id"].as_str().unwrap().to_string();
+            db["storage_generation"] = json!(2);
+            db["archive"]["path"] = json!(format!(
+                "s3://pgcf-eu/eu-dev/{id}/g2-op_bbbbbbbbbbbbbbbbbbbb"
+            ));
+            db["cold_snapshot_pending"] = json!(true);
+            db["origin"] = json!({"kind":"rehydrate","source":{
+                "database_id":id,"snapshot_operation":format!("op_{}","a".repeat(20)),"source_generation":1,
+                "source_storage_generation":1,"manifest_sha256":"a".repeat(64),"manifest_bytes":100,
+                "end":{"system_identifier":"7431215993172011234","timeline":1,"checkpoint_lsn":"0/3000060",
+                "last_archived_segment":"000000010000000000000002","proven_at":"2026-11-06T09:00:00.000Z"}
+            }});
+        });
+        let before = state(false, 2);
+        assert_eq!(
+            decide(&target, None, Some(&before), true, false),
+            Step::Build
+        );
+        let mut started = state(true, 2);
+        started.cold_snapshot_start_intent = true;
+        assert_eq!(
+            decide(&target, None, Some(&started), true, true),
+            Step::Fail("cold_snapshot_restart_required")
+        );
+        assert_eq!(
+            decide(&target, Some(Phase::Ready), Some(&started), true, false),
+            Step::Fail("cold_snapshot_restart_required")
+        );
+        assert_eq!(
+            decide(&target, Some(Phase::Ready), Some(&started), true, true),
+            Step::Nothing
+        );
+        target.origin = None;
+        target.generation += 1;
+        assert_eq!(
+            decide(&target, Some(Phase::Ready), Some(&started), true, true),
+            Step::ActivateCold
+        );
+        assert_eq!(
+            decide(&target, None, None, false, false),
+            Step::ActivateCold
+        );
+        target.cold_snapshot_pending = false;
+        started.cold_snapshot_serving = true;
+        started.cold_snapshot_committed = true;
+        assert_eq!(
+            decide(&target, None, Some(&started), true, true),
+            Step::AdoptRunning
+        );
     }
 
     #[test]

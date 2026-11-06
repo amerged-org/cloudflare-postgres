@@ -200,12 +200,12 @@ function archive(id = operation) {
     database_id: database,
     project_id: project,
     region_id: "eu-a",
-    phase: "verifying",
+    phase: "capturing",
     source_node_id: node,
     source_generation: 4,
     source_storage_generation: 1,
     source_archive_path: path,
-    source_backup_id: "20261020T090000",
+    snapshot_prefix: `cold-snapshots/eu-a/${database}/g1-${id}/`,
     proven_sleep_json: proof,
     created_at: now,
     updated_at: now,
@@ -231,8 +231,8 @@ it("keeps the native floor and archive pin after archival, and rejects an unveri
     created_at: now,
   });
   db.prepare(
-    "UPDATE database_cold_storage SET phase='archived',verification_receipt_json='{}',source_removed_at=?,completed_at=?",
-  ).run(now, now);
+    "UPDATE database_cold_storage SET phase='archived',verification_receipt_json='{}',source_removed_at=?,completed_at=?,snapshot_manifest_sha256=?,snapshot_manifest_bytes=1000,snapshot_total_bytes=8195,snapshot_file_count=2,snapshot_chunk_count=1,snapshot_seal_checked_chunks=1,snapshot_manifest_declared_at=?,snapshot_sealed_at=?",
+  ).run(now, now, "a".repeat(64), now, now);
   db.prepare(
     "UPDATE cold_storage_operations SET status='succeeded',completed_at=?",
   ).run(now);
@@ -318,4 +318,74 @@ it("stores independent cron cursors with the identifier type of their scan", () 
   expect(() =>
     insert("cold_storage_cursors", { name: "another_scan", cursor: null }),
   ).toThrow(/CHECK/);
+});
+
+it("freezes declared chunk identities and permanently fences uploads during payload retirement", () => {
+  apply(migration);
+  archive();
+  db.prepare(
+    "UPDATE database_cold_storage SET snapshot_manifest_sha256=?,snapshot_manifest_bytes=1000,snapshot_total_bytes=8195,snapshot_file_count=2,snapshot_chunk_count=1",
+  ).run("a".repeat(64));
+  insert("cold_snapshot_chunks", {
+    operation,
+    chunk_index: 0,
+    size_bytes: 8195,
+    sha256: "b".repeat(64),
+    created_at: now,
+    updated_at: now,
+  });
+  expect(() =>
+    db.prepare("UPDATE cold_snapshot_chunks SET sha256=?").run("c".repeat(64)),
+  ).toThrow(/immutable/);
+  db.prepare("UPDATE database_cold_storage SET cleanup_fenced_at=?").run(now);
+  expect(() =>
+    db.exec("UPDATE cold_snapshot_chunks SET state='uploading'"),
+  ).toThrow(/fenced/);
+  expect(() =>
+    insert("cold_snapshot_chunks", {
+      operation,
+      chunk_index: 1,
+      size_bytes: 1,
+      sha256: "b".repeat(64),
+      created_at: now,
+      updated_at: now,
+    }),
+  ).toThrow(/fenced/);
+  db.exec("UPDATE cold_snapshot_chunks SET state='retired'");
+  expect(() =>
+    db.exec("UPDATE cold_snapshot_chunks SET state='committed'"),
+  ).toThrow(/immutable/);
+  expect(() =>
+    db
+      .prepare("UPDATE database_cold_storage SET snapshot_manifest_sha256=?")
+      .run("c".repeat(64)),
+  ).toThrow(/immutable|fenced/);
+});
+
+it("never joins a recovery to a snapshot whose cleanup authority is already fenced", () => {
+  apply(migration);
+  archive();
+  db.prepare(
+    "UPDATE database_cold_storage SET phase='archived',verification_receipt_json='{}',source_removed_at=?,snapshot_manifest_sha256=?,snapshot_manifest_bytes=1000,snapshot_total_bytes=8195,snapshot_file_count=2,snapshot_chunk_count=1,snapshot_seal_checked_chunks=1,snapshot_manifest_declared_at=?,snapshot_sealed_at=?",
+  ).run(now, "a".repeat(64), now, now);
+  db.prepare("UPDATE database_cold_storage SET cleanup_fenced_at=?").run(now);
+  const child = `op_${"c".repeat(20)}`;
+  insert("cold_storage_operations", {
+    id: child,
+    kind: "database.rehydrate",
+    status: "pending",
+    project_id: project,
+    database_id: database,
+    generation: 5,
+    created_at: now,
+    updated_at: now,
+  });
+  expect(() =>
+    db
+      .prepare(
+        `INSERT INTO database_cold_storage(operation,kind,database_id,project_id,region_id,source_operation,phase,source_node_id,source_generation,source_storage_generation,source_archive_path,proven_sleep_json,snapshot_prefix,snapshot_manifest_sha256,snapshot_manifest_bytes,snapshot_total_bytes,snapshot_file_count,snapshot_chunk_count,snapshot_manifest_declared_at,snapshot_sealed_at,snapshot_seal_checked_chunks,created_at,updated_at)
+    SELECT ?,'rehydrate',database_id,project_id,region_id,operation,'waiting_capacity',source_node_id,source_generation,source_storage_generation,source_archive_path,proven_sleep_json,snapshot_prefix,snapshot_manifest_sha256,snapshot_manifest_bytes,snapshot_total_bytes,snapshot_file_count,snapshot_chunk_count,snapshot_manifest_declared_at,snapshot_sealed_at,snapshot_seal_checked_chunks,created_at,updated_at FROM database_cold_storage WHERE operation=?`,
+      )
+      .run(child, operation),
+  ).toThrow(/cold_snapshot_source_unavailable/);
 });

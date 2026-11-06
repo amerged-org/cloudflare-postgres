@@ -21,77 +21,107 @@ recovers the same regional node.
 
 ## Long-sleep R2 storage and request-triggered recovery
 
-The cold-storage candidate moves a database's durable copy entirely to R2 after **more than 21
-continuous days of proven sleep**, then releases its local volume. The rule is identical for all
-integrators and billing tiers. `sleep_since` is a confirmed sleep timestamp, not `updated_at`;
-repeated reports and configuration-only changes do not restart it. A real wake ends that interval.
-Migration `0098` backfills only a current, matching recovery proof and never ages a database early.
+The cold-storage candidate releases a database's local volume after **more than 21 continuous
+days of proven sleep**, for every integrator and billing tier. It preserves the same database ID,
+endpoint, region, current roles and data. Manual suspension still requires an authorized resume.
+`sleep_since` is a confirmed sleep timestamp, not `updated_at`: repeated reports and metadata-only
+changes do not reset it. Migration `0098` backfills only a current, matching recovery proof.
+
+**Cold snapshots are complete clean-shutdown copies, not Barman archive recovery.** They preserve
+all captured PostgreSQL files, including WAL, UNLOGGED relations and sequences. Barman remains the
+normal backup and PITR mechanism. Ordinary Restore/PITR and the existing explicit Move API retain
+their archive-recovery semantics; this feature's automatic relocation uses the new cold-snapshot
+path. PostgreSQL's normal loss of UNLOGGED contents after an actual server crash is unchanged.
 
 `GET /v1/databases/{id}` exposes `storage_residency` (`local`, `archiving`, `archived`, `restoring`),
 `sleep_since` and `storage_operation_id`. Follow the operation through the ordinary operations API.
-The archive remains a live database with its original ID, region, endpoint and roles. It is not a
-deleted database or a new-ID restore. An archived database has no serving `node_id` or local volume.
+An archived database remains live logically, with no serving `node_id` or local volume.
 
-Archival first holds source wakes and pins its R2 recovery generation. An operation-owned scratch
-instance fetches the backup and recovers through the source's last archived committed WAL; it has
-no gateway route, customer-accessible socket, event delivery or R2 write credential. A positive
-identity-bound verification receipt and scratch cleanup precede the source's durable retirement
-order. Only the source node's positive volume-removal acknowledgment makes the database archived.
-Missing backup objects, failed recovery, insufficient scratch capacity and uncertain cleanup keep
-the source copy or its recovery pin. Never remove the source volume or release the pin manually
-to bypass a stalled operation.
+Archival holds the exact source generation stopped and captures its complete expected file
+inventory **before uploading data**. The manifest binds every file's path, byte range and SHA-256,
+every packed chunk's size and SHA-256, and the original clean PostgreSQL identity/checkpoint.
+The source is checked again before sealing. A missing or changed chunk cannot be treated as a
+smaller valid backup. An isolated scratch copy validates every file and chunk before PostgreSQL
+starts, then checks a clean startup under the original system ID and timeline. It has no customer
+route, tenant socket access, event delivery or archive-write capability. Only after verification
+and scratch cleanup does Cloudflare order retirement of the original local generation; the node's
+positive removal acknowledgment is required before reporting it archived.
 
-If the source node is lost after retirement was requested but before volume removal was
-acknowledged, the operation stays `retiring` with its archive pinned and a specific status requiring
-operator recovery. A provider power-off is not reported as reclaimed local storage. A failed
-recovery target, by contrast, may be replaced after its exact retirement is acknowledged or the
-existing node-loss procedure positively verifies both Tunnel revocation and provider power-off;
-mere staleness or a submitted power-off request is insufficient.
+Snapshots live in the dedicated `cold-snapshots/` R2 namespace, outside ordinary Barman credential
+scopes. Only signed, operation-scoped node API calls may declare a manifest, upload matching
+immutable chunks, seal it and read an assigned recovery source. The complete manifest precedes
+chunk uploads; sealing verifies every expected part. Retirement replaces payload objects with
+**permanent zero-byte fences**. Do not delete these keys or expire them through bucket lifecycle
+rules: their continued presence prevents an old, uncertain conditional upload from recreating
+retired payload. Ordinary backup retention continues independently.
 
-An ordinary connection to an idle archive starts or joins one durable same-ID recovery. An
-explicitly suspended database still requires `POST /v1/databases/{id}/resume`. Recovery uses any
-eligible node in the original region, including the original node when it has room; it never
-silently crosses regions. New image-provisioned capacity participates through the existing node
-admission and placement path. No capacity means a pending recovery under the existing purchase
-policy, not an empty replacement database or authorization for a new purchase.
+Format 1 packs files into uncompressed 4 MiB chunks. It bounds the manifest at 4 MiB, with at most
+16,384 files, 4,096 directories and 16,384 chunks (64 GiB of actual file payload). Symlinks,
+hardlinks, special files, external tablespaces and active recovery/startup markers are refused.
+Unsupported or oversized layouts remain local with an explicit failure; nothing is truncated or
+silently handed to the old recovery-only path. A timeline above 1 must include its nonempty current
+timeline-history file. These limits do not reduce an existing volume's configured quota.
+
+An ordinary connection to an idle archive starts or joins one durable recovery onto any eligible
+node in the original region. A full original node does not prevent using another node. There is no
+automatic cross-region relocation or authorization to purchase new capacity. Restore validates
+all bytes and the clean control file before PostgreSQL starts, reapplies current managed settings
+and roles, preserves the outbox, and establishes the new generation's normal Barman backup and
+WAL/history acknowledgments. A staged runtime is not yet routable. A higher-generation activation
+page and a durably recorded serving state must be acknowledged before the current route is made
+available to the waiting request.
 
 The original HTTP SQL or WebSocket request waits within its existing 60-second admission deadline.
-It is forwarded only after recovery, current-role application, the first completed backup and the
-new route's publication. If the deadline or client connection ends earlier, recovery continues;
-a later request joins the same operation. A pre-execution refusal is retryable. Never replay a
-SQL write whose execution outcome is unknown. Recovery time depends on data size, WAL and load;
-the 60-second wait is not a recovery-time guarantee.
+If that deadline or the client connection ends first, recovery continues and later requests join
+it. A pre-execution refusal is retryable; never replay a SQL write whose execution outcome is
+unknown. Recovery duration depends on size, capacity and load; 60 seconds is a waiting limit, not
+a recovery-time guarantee.
 
-During active archival or recovery, role mutations, resize, move, replacement, delete and manual
-power changes may return a conflict rather than invalidate an in-flight proof. Credential changes
-while fully archived remain metadata operations and are applied to the recovered database.
-Resume an archived database before a resize, explicit move or in-place replacement. Explicit
-deletion of an archived database uses the normal deletion-retention window and preserves archives
-still referenced by another recovery.
+Once PostgreSQL has been started in a pending target, a failed or uncertain attempt cannot rewind
+that generation's files or WAL prefix. Cloudflare retires it before a retry uses a higher storage
+generation. A serving or committed target is never overwritten by a stale staging page or an old
+snapshot. If the source node is lost during retirement before removal acknowledgment, the operation
+remains pending with its snapshot pinned and an explicit operator-recovery status. Provider
+power-off is not reported as reclaimed physical space. A failed target may be replaced after its
+exact removal acknowledgment or the established node-loss procedure positively verifies both
+Tunnel revocation and provider power-off; a submitted power-off request alone is insufficient.
 
-**Rollout:** deploy additive `0098` and compatible API/native contracts with new archival disabled.
-Set `NATIVE_COLD_STORAGE_RELEASE_IDS` only to qualified, signed releases after node/OS readback and
-the real Dev round trip. Then set `COLD_STORAGE_ARCHIVAL_ENABLED="true"`. The empty or false default
-creates no archive claims. Turning it off stops new archival but leaves recovery operational.
-Once a region has used this format, its native compatibility floor cannot be lowered; keep
-compatible current and next releases in the qualification list during upgrades. An older Worker
-that ignores archive pins or residency is not a valid rollback after archival is enabled.
-Confirm bucket lifecycle rules cannot expire pinned recovery objects independently of the control
-plane. Production activation and new paid capacity require the owner's explicit, costed go.
+During capture, verification, recovery or activation, conflicting role mutations, resize, move,
+replacement, delete and power changes can return a conflict. Role changes while fully archived
+remain metadata operations and are applied to the recovered database. Resume before resize, an
+explicit move or in-place replacement. Explicit deletion uses the existing retention window and
+preserves copies still referenced by a live recovery.
 
-Observe residency and operation status, actual node volume/pool samples, restore duration and
-failures, and the existing R2 backup-byte usage measurements. A completed retirement proves a
-volume was removed. Nominal volume size is not the number of physical thin-pool bytes released;
-that byte count remains unknown without an authoritative physical measurement. The two existing
-regions each have one node, so cross-VPS recovery within one region needs separate live acceptance
-when an authorized second node exists. Local integration tests do not establish that acceptance.
+**Rollout:** first qualify integrator clients against contract 1.7: clients with strict database
+response parsing must accept the added residency, operation and snapshot-accounting fields.
+Resume adapters must recognize same-ID rehydration and deferred archive cancellation without
+mistaking a pending operation for completed power intent. Apply additive `0098` and deploy the
+compatible API reader with archival disabled before upgrading nodes to `cold_storage_v2`.
+Configure `NATIVE_COLD_STORAGE_RELEASE_IDS` only with software-qualified signed releases after
+OS/readback. On the shared Dev stack, scope the authorized acceptance to its owned fixtures using
+`COLD_STORAGE_ARCHIVAL_DATABASE_IDS` (a JSON array of at most 256 database IDs) before enabling `COLD_STORAGE_ARCHIVAL_ENABLED="true"`.
+An empty or invalid explicit scope admits no new archives. This scope never bypasses the
+sleep-proof or 21-day eligibility checks; an aged fixture must be
+explicitly recorded as an injected test date, not historical production evidence. Only after real
+Dev acceptance may the scope be removed for the general 21-day policy. Unset or false creates no
+new archive claims; turning it off leaves recovery operational. Once used, the native compatibility
+floor cannot be lowered.
+An older Worker that ignores residency, snapshot references or retention fences is not a valid
+rollback. Production activation and new paid capacity require the owner's explicit, costed go.
 
-The control cron emits `cold_storage_metrics`: residency counts, confirmed volume retirements,
-24-hour restore outcomes/durations, oldest pending age and measured archived R2 bytes with explicit
-unknown coverage. `cold_restore_wait` records each waiting request's ready, failed, cancelled or
-timeout outcome and duration, without SQL or credentials. Verification scratch instances consume
-real CPU/RAM and startup admission, but `verification_runtime_ids` excludes them from the customer
-database count in node-minute rollups.
+`cold_snapshot_storage` on database GET/list reports acknowledged payload bytes, retained-copy
+bytes, the newest persisted fact used in the total and explicit gaps. The timestamp is null when
+no snapshot exists; it is not a fresh R2 listing or the response time. Unknown uploads
+and retirement remain unknown; completed zero-byte fences count as zero payload. Existing
+`/v1/usage` backup-byte metrics remain Barman-only. The cron's `cold_storage_metrics` and each
+request's `cold_restore_wait` event report lifecycle counts, outcomes and durations without SQL
+or credentials. Native CPU/RAM and startup accounting include verification work; scratch runtimes
+are excluded from the customer database count.
+
+A completed retirement proves a volume was removed. Nominal volume size is not the exact number
+of physical thin-pool bytes released; that count remains unknown without an authoritative
+measurement. Each current region has one node. Cross-VPS recovery in one region needs its own
+live acceptance when an authorized second node exists; local integration tests do not establish it.
 
 ## Restore or PITR
 

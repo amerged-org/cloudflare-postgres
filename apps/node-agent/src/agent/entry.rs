@@ -42,6 +42,8 @@ pub enum Origin {
     /// This database's previous storage generation, to the end of its WAL: `end` is the record
     /// that proved the source's sleep.
     Move(Source, End),
+    /// Lossless clean-shutdown PGDATA; never archive recovery (which resets UNLOGGED data).
+    Rehydrate(super::cold::ColdSnapshotSource),
     /// A PITR into this database's connection identity. The original generation and its full
     /// proven-sleep record are retained locally until promotion and explicit cleanup.
     Replace(Source, u64, crate::state::ProvenSleepRecord),
@@ -68,6 +70,8 @@ pub struct Entry {
     pub archive_path: String,
     pub credential_id: String,
     pub origin: Option<Origin>,
+    /// Cloudflare still owns a staged/activating cold target; ordinary idle sleep is held.
+    pub cold_snapshot_pending: bool,
 }
 
 fn string(value: &Value, key: &str) -> Option<String> {
@@ -126,7 +130,10 @@ impl Entry {
                     serde_json::from_value(origin["previous"]["end"].clone()).ok()?,
                     number(origin, "replacement_generation")?,
                 ),
-                "move" | "rehydrate" => {
+                "rehydrate" => {
+                    Origin::Rehydrate(super::ColdSnapshotSource::received(&origin["source"]).ok()?)
+                }
+                "move" => {
                     let end = &origin["source"]["end"];
                     Origin::Move(
                         source(&origin["source"])?,
@@ -169,6 +176,10 @@ impl Entry {
             archive_path: string(&db["archive"], "path")?,
             credential_id: string(&db["archive"]["credential"], "id")?,
             origin,
+            cold_snapshot_pending: db
+                .get("cold_snapshot_pending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
     /// The nominal size of the volume.

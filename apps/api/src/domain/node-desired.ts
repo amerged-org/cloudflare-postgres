@@ -22,9 +22,11 @@ import {
 } from "./rows.ts";
 import type { NodeCaller } from "./node-auth.ts";
 import { ensureArchiveCredentials } from "./archive-credentials.ts";
-import { moveTargets } from "./database-moves.ts";
+import { moveTargets, type MoveTarget } from "./database-moves.ts";
 import {
   coldStorageTargets,
+  coldStorageCaptures,
+  coldStorageCaptureCancellations,
   coldStorageVerifications,
   coldStorageVerificationCancellations,
 } from "./cold-storage.ts";
@@ -243,6 +245,10 @@ export async function nodeDesiredPage(
     query.ids === undefined && query.after === undefined
       ? await coldStorageVerificationCancellations(env, node.id)
       : [];
+  const captureCancellations =
+    query.ids === undefined && query.after === undefined
+      ? await coldStorageCaptureCancellations(env, node.id)
+      : [];
   if (caller.fenced)
     return NodeDesiredPage.parse({
       node: identity,
@@ -252,6 +258,9 @@ export async function nodeDesiredPage(
       orders,
       ...(archiveCancellations.length
         ? { archive_verification_cancellations: archiveCancellations }
+        : {}),
+      ...(captureCancellations.length
+        ? { cold_snapshot_capture_cancellations: captureCancellations }
         : {}),
       databases: [],
       next: null,
@@ -270,7 +279,7 @@ export async function nodeDesiredPage(
   // current release may still pull its next qualified release before its first post-restart sample.
   await requireExtendedNative(env, { nodeId: node.id }, extended, now, true);
   const coldRequired = await env.DB.prepare(
-    `SELECT 1 FROM database_cold_storage c WHERE (c.verification_node_id=? AND c.phase='verifying') OR (c.target_node_id=? AND c.phase='restoring') OR (c.source_node_id=? AND c.phase='retiring')`,
+    `SELECT 1 FROM database_cold_storage c WHERE (c.verification_node_id=? AND c.phase IN('capturing','verifying','cancelling')) OR (c.target_node_id=? AND c.phase IN('restoring','activating')) OR (c.source_node_id=? AND c.phase IN('capturing','cancelling','retiring'))`,
   )
     .bind(node.id, node.id, node.id)
     .first();
@@ -292,7 +301,7 @@ export async function nodeDesiredPage(
     `SELECT d.id,d.generation,d.desired_state,d.suspension_reason,d.storage_generation,d.archive_path,d.pg_major,
        COALESCE(ae.route_revision,1) route_revision,dr.memory_mib,dr.cpu_millicores,dr.storage_mib,s.max_connections,
        s.archive_timeout_seconds,${effectiveSleepAfterSql("d")} sleep_after_seconds,
-       COALESCE((SELECT c.operation FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase='succeeded' AND c.target_generation=d.generation),
+       COALESCE((SELECT c.operation FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase IN('activating','succeeded') AND c.target_serving_generation=d.generation),
          (SELECT rp.operation FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase='proving'),
          (SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
           ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1)) operation,
@@ -309,12 +318,12 @@ export async function nodeDesiredPage(
      LEFT JOIN database_restores x ON x.target_database_id=d.id
      LEFT JOIN operations ro ON ro.id=x.operation_id AND ro.kind='database.restore'
      WHERE d.region_id=? AND d.desired_state IN('running','suspended','deleted')
-       AND ((d.node_id=? AND (d.storage_residency='local' OR (d.storage_residency='archiving' AND EXISTS(SELECT 1 FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase='verifying'))) AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL)
+       AND ((d.node_id=? AND (d.storage_residency='local' OR (d.storage_residency='archiving' AND EXISTS(SELECT 1 FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase IN('capturing','verifying','cancelling')))) AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL)
            AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation
              AND NOT EXISTS(SELECT 1 FROM node_volumes v WHERE v.node_id=d.node_id AND v.database_id=d.id)))
          OR d.id IN(SELECT database_id FROM database_moves WHERE target_node_id=? AND status='restoring')
          OR d.id IN(SELECT database_id FROM database_replacements WHERE node_id=? AND phase IN('proving','restoring','rolling_back'))
-         OR d.id IN(SELECT database_id FROM database_cold_storage WHERE target_node_id=? AND phase='restoring'))
+         OR d.id IN(SELECT database_id FROM database_cold_storage WHERE target_node_id=? AND phase IN('restoring','activating')))
        ${query.after ? "AND d.id>?" : ""} ${query.ids ? "AND d.id IN(SELECT value FROM json_each(?))" : ""} ORDER BY d.id LIMIT ?`,
   )
     .bind(
@@ -332,7 +341,13 @@ export async function nodeDesiredPage(
     credentials = keyring(env.CREDENTIAL_KEYS);
   // The credentials the page names are issued here, a batch for the whole page. A database the
   // node may not hold one for is not on the page.
-  const staged = new Map([
+  const staged = new Map<
+      string,
+      Omit<MoveTarget, "origin"> & {
+        origin?: MoveTarget["origin"];
+        cold_snapshot_pending?: boolean;
+      }
+    >([
       ...(await moveTargets(env.DB, node.id, now)),
       ...(await replacementTargets(env, node.id, now)),
       ...(await coldStorageTargets(env, node.id, now)),
@@ -430,6 +445,9 @@ export async function nodeDesiredPage(
         credential: credential!,
       },
       ...(origin ? { origin } : {}),
+      ...(move && "cold_snapshot_pending" in move
+        ? { cold_snapshot_pending: true }
+        : {}),
     });
   }
   // A pull of named databases is a wake's, and a later page repeats the first: the probes wait for
@@ -437,6 +455,10 @@ export async function nodeDesiredPage(
   const diagnostics =
     query.ids === undefined && query.after === undefined
       ? await openDiagnosticRequests(env.DB, node.id, now)
+      : [];
+  const captures =
+    query.ids === undefined && query.after === undefined
+      ? await coldStorageCaptures(env, node.id, now)
       : [];
   const archiveVerifications =
     query.ids === undefined && query.after === undefined
@@ -455,6 +477,10 @@ export async function nodeDesiredPage(
     ...(diagnostics.length > 0 ? { diagnostics } : {}),
     ...(archiveCancellations.length
       ? { archive_verification_cancellations: archiveCancellations }
+      : {}),
+    ...(captures.length ? { cold_snapshot_captures: captures } : {}),
+    ...(captureCancellations.length
+      ? { cold_snapshot_capture_cancellations: captureCancellations }
       : {}),
     ...(archiveVerifications.length > 0
       ? { archive_verifications: archiveVerifications }

@@ -5,6 +5,7 @@ import {
   ApiKeyCreate,
   AuditEvent,
   DatabaseCreate,
+  ColdSnapshotStorage,
   DatabaseIdleTime,
   DatabasePatch,
   DatabasePowerChange,
@@ -643,4 +644,29 @@ it("distinguishes waiting for recovery from changes that require local storage",
       }),
     ).error.details?.reason,
   ).toBe("storage_not_local");
+});
+
+it("exposes cold snapshot accounting gaps without claiming unknown payload as zero", () => {
+  const unknown = {
+    payload_bytes: null,
+    retained_payload_bytes: 0,
+    accounted_at: null,
+    gaps: ["upload_pending"],
+  };
+  expect(ColdSnapshotStorage.parse(unknown)).toEqual(unknown);
+  expect(
+    ColdSnapshotStorage.parse({
+      payload_bytes: 0,
+      retained_payload_bytes: 0,
+      accounted_at: "2026-11-06T12:00:00.000Z",
+      gaps: [],
+    }),
+  ).toMatchObject({ payload_bytes: 0, gaps: [] });
+  expect(
+    ColdSnapshotStorage.safeParse({ ...unknown, payload_bytes: -1 }).success,
+  ).toBe(false);
+  expect(
+    ColdSnapshotStorage.safeParse({ ...unknown, gaps: ["assumed_complete"] })
+      .success,
+  ).toBe(false);
 });

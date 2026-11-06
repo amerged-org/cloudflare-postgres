@@ -8,6 +8,7 @@
 //! Responses other than the enrollment, the desired page and the credentials carry no data the
 //! node needs: a success is the acknowledgement.
 mod backoff;
+mod cold_snapshot;
 mod desired;
 mod events;
 pub(crate) mod file;
@@ -169,7 +170,7 @@ impl Link {
             "protocol": constant("NODE_PROTOCOL_VERSION"),
             "agent_version": config.agent_version,
             "release_id": config.release_id,
-            "capabilities": ["restore_in_place_v1", "cold_storage_v1"],
+            "capabilities": ["restore_in_place_v1", "cold_storage_v2"],
             "os": config.os,
         });
         if !schema_valid("AgentLinkMessage", &hello) {
@@ -599,7 +600,7 @@ mod tests {
         assert_eq!(next(&mut events).await, Some(LinkEvent::Desired(None)));
         let hellos = || cloud.with(|inner| inner.hellos.clone());
         let mut expected = vector("AgentLinkMessage", "hello-with-in-place-restore");
-        expected["capabilities"] = json!(["restore_in_place_v1", "cold_storage_v1"]);
+        expected["capabilities"] = json!(["restore_in_place_v1", "cold_storage_v2"]);
         assert_eq!(hellos(), [expected]);
         // The packages changed in a maintenance cycle: the next hello says so, on a new link.
         let mut installed = os();

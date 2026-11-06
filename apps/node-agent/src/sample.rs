@@ -139,7 +139,7 @@ pub fn node_sample(inputs: &Inputs) -> Value {
         "starting": inputs.awake.starting,
         "queued": inputs.awake.queued,
         "credentials_revision": inputs.credentials_revision,
-        "capabilities": ["restore_in_place_v1", "cold_storage_v1"],
+        "capabilities": ["restore_in_place_v1", "cold_storage_v2"],
     })
 }
 
@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(sample["awake"], json!(["dbbbbbbbbbbbbbbbbbbb"]));
         assert_eq!(
             sample["capabilities"],
-            json!(["restore_in_place_v1", "cold_storage_v1"])
+            json!(["restore_in_place_v1", "cold_storage_v2"])
         );
         // What is not known is null and never zero: no pool, no archive facts, no credentials yet.
         let unknown = node_sample(&Inputs {

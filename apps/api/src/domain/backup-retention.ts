@@ -7,6 +7,7 @@ import { purgeArchiveCredentials } from "./archive-credentials.ts";
 import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
 import { deleteUnpinnedArchiveKeys } from "./archive-retention-claims.ts";
+import { retireColdSnapshots } from "./cold-snapshot-retention.ts";
 import { BACKUP_DATA, keysOf, walRangeArchived } from "./archive-chain.ts";
 import {
   parseBackupInfo,
@@ -407,8 +408,9 @@ export async function expireSupersededArchives(
   return result;
 }
 
-/** A successful rehydration leaves its old archive readable for the database's recovery
- * window. The new generation and all still-pinned or actively read sources stay untouched. */
+/** Cold recovery retains normal Barman history independently of the complete snapshot:
+ * successful sources, failed targets and a deleted original source each expire only after
+ * their retention window. The current archive, pinned paths and live readers remain protected. */
 export async function expireColdStorageArchives(
   env: Env,
   now: number,
@@ -418,18 +420,30 @@ export async function expireColdStorageArchives(
     selected = archiveBucket(env);
   const rows = (
     await env.DB.prepare(
-      `SELECT cs.operation,cs.source_archive_path archive_path FROM database_cold_storage cs
-     JOIN databases d ON d.id=cs.database_id JOIN size_classes s ON s.id=d.size_class_id
-     WHERE cs.kind='rehydrate' AND cs.phase='succeeded' AND cs.source_archive_deleted_at IS NULL
-       AND cs.source_archive_path<>d.archive_path
-       AND strftime('%Y-%m-%dT%H:%M:%fZ',cs.completed_at,'+'||s.backup_retention_days||' days')<=?
-       AND NOT EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.archive_path=cs.source_archive_path AND pin.released_at IS NULL)
-       AND NOT EXISTS(SELECT 1 FROM database_restores reader JOIN operations op ON op.id=reader.operation_id
-         WHERE reader.source_archive_path=cs.source_archive_path AND reader.verified_at IS NULL AND op.status IN('pending','running'))
-     ORDER BY cs.completed_at,cs.operation LIMIT 2`,
+      `WITH candidates AS (
+      SELECT c.source_archive_path archive_path,strftime('%Y-%m-%dT%H:%M:%fZ',c.completed_at,'+'||s.backup_retention_days||' days') due_at
+        FROM database_cold_storage c JOIN databases d ON d.id=c.database_id JOIN size_classes s ON s.id=d.size_class_id
+        WHERE c.kind='rehydrate' AND c.phase='succeeded' AND c.source_archive_deleted_at IS NULL
+      UNION ALL
+      SELECT c.target_archive_path archive_path,strftime('%Y-%m-%dT%H:%M:%fZ',c.completed_at,'+'||s.backup_retention_days||' days') due_at
+        FROM database_cold_storage c JOIN databases d ON d.id=c.database_id JOIN size_classes s ON s.id=d.size_class_id
+        WHERE c.kind='rehydrate' AND c.phase='failed' AND c.target_archive_deleted_at IS NULL AND c.target_archive_path IS NOT NULL
+          AND EXISTS(SELECT 1 FROM lifecycle_orders retired WHERE retired.node_id=c.target_node_id AND retired.database_id=c.database_id
+            AND retired.storage_generation=c.target_storage_generation AND retired.type='superseded' AND retired.remove_volume=1
+            AND (retired.result_status='done' OR EXISTS(SELECT 1 FROM node_losses loss WHERE loss.node_id=c.target_node_id
+              AND loss.tunnel_deleted_at IS NOT NULL AND loss.powered_off_at IS NOT NULL)))
+      UNION ALL
+      SELECT c.source_archive_path archive_path,c.snapshot_retained_until due_at FROM database_cold_storage c
+        WHERE c.kind='archive' AND c.phase='archived' AND c.source_archive_deleted_at IS NULL AND c.snapshot_retained_until IS NOT NULL
+    ) SELECT archive_path,MIN(due_at) due_at FROM candidates
+      WHERE due_at<=? AND NOT EXISTS(SELECT 1 FROM databases d WHERE d.archive_path=candidates.archive_path)
+        AND NOT EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.archive_path=candidates.archive_path AND pin.released_at IS NULL)
+        AND NOT EXISTS(SELECT 1 FROM database_restores reader JOIN operations op ON op.id=reader.operation_id
+          WHERE reader.source_archive_path=candidates.archive_path AND reader.verified_at IS NULL AND op.status IN('pending','running'))
+      GROUP BY archive_path ORDER BY due_at,archive_path LIMIT 2`,
     )
       .bind(at)
-      .all<{ operation: string; archive_path: string }>()
+      .all<{ archive_path: string }>()
   ).results;
   const result = { archives: 0, objects: 0 };
   for (const row of rows) {
@@ -454,17 +468,22 @@ export async function expireColdStorageArchives(
     );
     if (!deletion) continue;
     result.objects += deletion.keys.length;
-    if (deletion.keys.length === 0) {
-      const marked = await env.DB.prepare(
-        `UPDATE database_cold_storage SET source_archive_deleted_at=? WHERE operation=? AND source_archive_path=?
-         AND phase='succeeded' AND source_archive_deleted_at IS NULL
-         AND NOT EXISTS(SELECT 1 FROM databases WHERE archive_path=database_cold_storage.source_archive_path)
-         AND NOT EXISTS(SELECT 1 FROM archive_pins WHERE archive_path=database_cold_storage.source_archive_path AND released_at IS NULL)`,
-      )
-        .bind(at, row.operation, row.archive_path)
-        .run();
-      result.archives += marked.meta.changes;
-    }
+    if (deletion.keys.length !== 0) continue;
+    // Several attempts may reference the same generation. Record one physical expiry across
+    // every completed reference so a failed activation cannot strand its original source.
+    const unused = `NOT EXISTS(SELECT 1 FROM databases WHERE archive_path=?)
+      AND NOT EXISTS(SELECT 1 FROM archive_pins WHERE archive_path=? AND released_at IS NULL)`;
+    const marked = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE database_cold_storage SET source_archive_deleted_at=? WHERE source_archive_path=?
+        AND source_archive_deleted_at IS NULL AND phase IN('archived','succeeded','failed','cancelled') AND ${unused}`,
+      ).bind(at, row.archive_path, row.archive_path, row.archive_path),
+      env.DB.prepare(
+        `UPDATE database_cold_storage SET target_archive_deleted_at=? WHERE target_archive_path=?
+        AND target_archive_deleted_at IS NULL AND phase='failed' AND ${unused}`,
+      ).bind(at, row.archive_path, row.archive_path, row.archive_path),
+    ]);
+    if (marked.some((entry) => entry.meta.changes > 0)) result.archives++;
   }
   return result;
 }
@@ -480,6 +499,7 @@ export async function runBackupRetention(env: Env, now: number): Promise<void> {
     async () => (await enforceBackupRetention(env, now)).failed,
     async () => (await expireSupersededArchives(env, now), 0),
     async () => (await expireColdStorageArchives(env, now), 0),
+    async () => (await retireColdSnapshots(env, now), 0),
     async () => (await purgeArchiveCredentials(env.DB, now), 0),
   ]) {
     try {

@@ -50,6 +50,9 @@
     // rollout and OS/readback verification. Keep compatible current and next release IDs during updates.
     // COLD_STORAGE_ARCHIVAL_ENABLED: "true" enables new 21-day archive claims after Dev acceptance.
     // Unset/false stops new archival; restoration of existing archives remains operational.
+    // COLD_STORAGE_ARCHIVAL_DATABASE_IDS: optional JSON array of at most 256 database IDs for
+    // scoped rollout acceptance. Unset permits all eligible databases when enabled; empty/invalid
+    // permits none. This does not bypass the 21-day rule or restrict recovery of existing archives.
     // NATIVE_COLD_STORAGE_RELEASE_IDS: JSON array of signed releases qualified for isolated
     // verification and same-ID rehydration; keep compatible current/next releases during rollout.
     // NODE_SHELL_HOSTNAME: "true" also gives each node a shell hostname (pgcf-shell-<id>.<domain>) on

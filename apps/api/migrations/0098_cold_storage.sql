@@ -73,24 +73,41 @@ CREATE TABLE database_cold_storage (
   project_id TEXT NOT NULL REFERENCES projects(id),
   region_id TEXT NOT NULL REFERENCES regions(id),
   source_operation TEXT REFERENCES database_cold_storage(operation),
-  phase TEXT NOT NULL CHECK(phase IN('verifying','retiring','archived','waiting_capacity','restoring','succeeded','failed','cancelled')),
+  phase TEXT NOT NULL CHECK(phase IN('capturing','verifying','cancelling','retiring','archived','waiting_capacity','restoring','activating','succeeded','failed','cancelled')),
   source_node_id TEXT NOT NULL REFERENCES nodes(id),
   source_generation INTEGER NOT NULL CHECK(source_generation>=1),
   source_storage_generation INTEGER NOT NULL CHECK(source_storage_generation>=1),
   source_archive_path TEXT NOT NULL CHECK(length(source_archive_path)<=512),
-  source_backup_id TEXT NOT NULL CHECK(length(source_backup_id)=15),
   proven_sleep_json TEXT NOT NULL CHECK(json_valid(proven_sleep_json)),
-  inventory_sha256 TEXT CHECK(inventory_sha256 IS NULL OR (length(inventory_sha256)=64 AND NOT inventory_sha256 GLOB '*[^a-f0-9]*')),
-  inventory_json TEXT CHECK(inventory_json IS NULL OR json_valid(inventory_json)),
+  snapshot_prefix TEXT NOT NULL CHECK(length(snapshot_prefix)<=512),
+  snapshot_manifest_sha256 TEXT CHECK(snapshot_manifest_sha256 IS NULL OR (length(snapshot_manifest_sha256)=64 AND NOT snapshot_manifest_sha256 GLOB '*[^a-f0-9]*')),
+  snapshot_manifest_bytes INTEGER CHECK(snapshot_manifest_bytes IS NULL OR snapshot_manifest_bytes BETWEEN 1 AND 4194304),
+  snapshot_total_bytes INTEGER CHECK(snapshot_total_bytes IS NULL OR snapshot_total_bytes BETWEEN 1 AND 68719476736),
+  snapshot_file_count INTEGER CHECK(snapshot_file_count IS NULL OR snapshot_file_count BETWEEN 2 AND 16384),
+  snapshot_chunk_count INTEGER CHECK(snapshot_chunk_count IS NULL OR snapshot_chunk_count BETWEEN 1 AND 16384),
+  snapshot_manifest_declared_at TEXT,
+  snapshot_sealed_at TEXT,
+  snapshot_seal_checked_chunks INTEGER NOT NULL DEFAULT 0 CHECK(snapshot_seal_checked_chunks BETWEEN 0 AND 16384),
+  cleanup_fenced_at TEXT,
+  snapshot_payload_retired_at TEXT,
+  snapshot_retained_until TEXT,
+  snapshot_cleanup_cursor INTEGER NOT NULL DEFAULT 0 CHECK(snapshot_cleanup_cursor BETWEEN 0 AND 16385),
+  capture_dispatched_at TEXT,
+  capture_receipt_json TEXT CHECK(capture_receipt_json IS NULL OR json_valid(capture_receipt_json)),
+  capture_cleaned_at TEXT,
   verification_node_id TEXT REFERENCES nodes(id),
   verification_dispatched_at TEXT,
   verification_receipt_json TEXT CHECK(verification_receipt_json IS NULL OR json_valid(verification_receipt_json)),
+  verification_cleaned_at TEXT,
+  cancel_resume_operation TEXT REFERENCES operations(id),
   retirement_operation TEXT REFERENCES lifecycle_orders(operation),
   source_removed_at TEXT,
   source_archive_deleted_at TEXT,
+  target_archive_deleted_at TEXT,
   target_node_id TEXT REFERENCES nodes(id),
   target_started_at TEXT,
   target_generation INTEGER CHECK(target_generation IS NULL OR target_generation>source_generation),
+  target_serving_generation INTEGER CHECK(target_serving_generation IS NULL OR (target_generation IS NOT NULL AND target_serving_generation>target_generation)),
   target_storage_generation INTEGER CHECK(target_storage_generation IS NULL OR target_storage_generation>source_storage_generation),
   target_archive_path TEXT CHECK(target_archive_path IS NULL OR length(target_archive_path)<=512),
   wake_requested INTEGER NOT NULL DEFAULT 0 CHECK(wake_requested IN(0,1)),
@@ -100,32 +117,91 @@ CREATE TABLE database_cold_storage (
   updated_at TEXT NOT NULL,
   completed_at TEXT,
   CHECK((kind='archive' AND source_operation IS NULL) OR (kind='rehydrate' AND source_operation IS NOT NULL)),
-  CHECK(kind='archive' OR phase NOT IN('verifying','retiring','archived')),
-  CHECK(kind='rehydrate' OR phase NOT IN('waiting_capacity','restoring','succeeded')),
+  CHECK(kind='archive' OR phase NOT IN('capturing','verifying','retiring','archived')),
+  CHECK(kind='rehydrate' OR phase NOT IN('waiting_capacity','restoring','activating','succeeded')),
   CHECK((target_generation IS NULL)=(target_storage_generation IS NULL)),
   CHECK((target_generation IS NULL)=(target_archive_path IS NULL)),
   CHECK(instr(source_archive_path,'/'||region_id||'/'||database_id||'/g'||source_storage_generation||'-op_')>5),
+  CHECK(snapshot_prefix='cold-snapshots/'||region_id||'/'||database_id||'/g'||source_storage_generation||'-'||COALESCE(source_operation,operation)||'/'),
   CHECK(target_archive_path IS NULL OR instr(target_archive_path,'/'||region_id||'/'||database_id||'/g'||target_storage_generation||'-op_')>5),
   CHECK(phase NOT IN('retiring','archived') OR verification_receipt_json IS NOT NULL),
+  CHECK(phase NOT IN('verifying','retiring','archived','waiting_capacity','restoring','activating','succeeded') OR snapshot_sealed_at IS NOT NULL),
+  CHECK(snapshot_manifest_declared_at IS NULL OR (snapshot_manifest_sha256 IS NOT NULL AND snapshot_manifest_bytes IS NOT NULL AND snapshot_total_bytes IS NOT NULL AND snapshot_file_count IS NOT NULL AND snapshot_chunk_count IS NOT NULL)),
+  CHECK(snapshot_sealed_at IS NULL OR (snapshot_manifest_declared_at IS NOT NULL AND snapshot_seal_checked_chunks=snapshot_chunk_count)),
+  CHECK(snapshot_payload_retired_at IS NULL OR cleanup_fenced_at IS NOT NULL),
   CHECK(phase<>'archived' OR source_removed_at IS NOT NULL),
-  CHECK(phase NOT IN('restoring','succeeded') OR (target_generation IS NOT NULL AND target_node_id IS NOT NULL))
+  CHECK(phase NOT IN('restoring','activating','succeeded') OR (target_generation IS NOT NULL AND target_node_id IS NOT NULL)),
+  CHECK(phase NOT IN('activating','succeeded') OR target_serving_generation IS NOT NULL)
 );
 CREATE UNIQUE INDEX database_cold_storage_active_idx ON database_cold_storage(database_id)
-  WHERE phase IN('verifying','retiring','waiting_capacity','restoring');
+  WHERE phase IN('capturing','verifying','cancelling','retiring','waiting_capacity','restoring','activating');
 CREATE UNIQUE INDEX database_cold_storage_region_verifying_idx ON database_cold_storage(region_id)
-  WHERE phase='verifying';
+  WHERE kind='archive' AND phase IN('capturing','verifying','cancelling');
 CREATE INDEX database_cold_storage_work_idx ON database_cold_storage(phase,updated_at,operation);
-CREATE INDEX database_cold_storage_target_idx ON database_cold_storage(target_node_id) WHERE phase='restoring';
+CREATE INDEX database_cold_storage_database_idx ON database_cold_storage(database_id,kind);
+CREATE INDEX database_cold_storage_target_idx ON database_cold_storage(target_node_id) WHERE phase IN('restoring','activating');
 CREATE INDEX database_cold_storage_verifier_idx ON database_cold_storage(verification_node_id) WHERE phase='verifying';
 CREATE TRIGGER database_cold_storage_source_immutable BEFORE UPDATE ON database_cold_storage
 WHEN NEW.operation<>OLD.operation OR NEW.kind<>OLD.kind OR NEW.database_id<>OLD.database_id
   OR NEW.project_id<>OLD.project_id OR NEW.region_id<>OLD.region_id OR NEW.source_operation IS NOT OLD.source_operation
   OR NEW.source_node_id<>OLD.source_node_id OR NEW.source_generation<>OLD.source_generation
   OR NEW.source_storage_generation<>OLD.source_storage_generation OR NEW.source_archive_path<>OLD.source_archive_path
-  OR NEW.source_backup_id<>OLD.source_backup_id OR NEW.proven_sleep_json<>OLD.proven_sleep_json OR NEW.created_at<>OLD.created_at
+  OR NEW.snapshot_prefix<>OLD.snapshot_prefix OR NEW.proven_sleep_json<>OLD.proven_sleep_json OR NEW.created_at<>OLD.created_at
+  OR (OLD.capture_dispatched_at IS NOT NULL AND NEW.capture_dispatched_at IS NOT OLD.capture_dispatched_at)
+  OR (OLD.verification_dispatched_at IS NOT NULL AND NEW.verification_dispatched_at IS NOT OLD.verification_dispatched_at)
 BEGIN SELECT RAISE(ABORT,'cold_storage_source_immutable'); END;
+CREATE TRIGGER cold_snapshot_rehydrate_source_guard BEFORE INSERT ON database_cold_storage
+WHEN NEW.kind='rehydrate' AND NOT EXISTS(
+  SELECT 1 FROM database_cold_storage source WHERE source.operation=NEW.source_operation
+    AND source.kind='archive' AND source.phase='archived' AND source.database_id=NEW.database_id
+    AND source.project_id=NEW.project_id AND source.region_id=NEW.region_id
+    AND source.source_storage_generation=NEW.source_storage_generation
+    AND source.source_archive_path=NEW.source_archive_path AND source.snapshot_prefix=NEW.snapshot_prefix
+    AND source.snapshot_manifest_sha256=NEW.snapshot_manifest_sha256
+    AND source.cleanup_fenced_at IS NULL AND source.snapshot_payload_retired_at IS NULL)
+BEGIN SELECT RAISE(ABORT,'cold_snapshot_source_unavailable'); END;
+CREATE TRIGGER cold_snapshot_declaration_immutable BEFORE UPDATE ON database_cold_storage
+WHEN (OLD.snapshot_manifest_sha256 IS NOT NULL AND (NEW.snapshot_manifest_sha256 IS NOT OLD.snapshot_manifest_sha256
+  OR NEW.snapshot_manifest_bytes IS NOT OLD.snapshot_manifest_bytes OR NEW.snapshot_total_bytes IS NOT OLD.snapshot_total_bytes
+  OR NEW.snapshot_file_count IS NOT OLD.snapshot_file_count OR NEW.snapshot_chunk_count IS NOT OLD.snapshot_chunk_count))
+  OR (OLD.snapshot_sealed_at IS NOT NULL AND NEW.snapshot_sealed_at IS NOT OLD.snapshot_sealed_at)
+  OR (OLD.cleanup_fenced_at IS NOT NULL AND NEW.cleanup_fenced_at IS NOT OLD.cleanup_fenced_at)
+  OR (OLD.snapshot_payload_retired_at IS NOT NULL AND NEW.snapshot_payload_retired_at IS NOT OLD.snapshot_payload_retired_at)
+BEGIN SELECT RAISE(ABORT,'cold_snapshot_declaration_immutable'); END;
 CREATE TRIGGER cold_storage_protocol_floor_operation_insert AFTER INSERT ON database_cold_storage
 BEGIN UPDATE regions SET native_cold_storage_required=1 WHERE id=NEW.region_id AND native_cold_storage_required=0; END;
+
+-- The source declares the complete expected packed stream before any chunk upload. R2 objects
+-- are conditional-create-only; retirement replaces their payload with permanent zero-byte
+-- tombstones rather than deleting keys, so a delayed old PUT cannot recreate retired data.
+CREATE TABLE cold_snapshot_chunks (
+  operation TEXT NOT NULL REFERENCES database_cold_storage(operation),
+  chunk_index INTEGER NOT NULL CHECK(chunk_index BETWEEN 0 AND 16383),
+  size_bytes INTEGER NOT NULL CHECK(size_bytes BETWEEN 1 AND 4194304),
+  sha256 TEXT NOT NULL CHECK(length(sha256)=64 AND NOT sha256 GLOB '*[^a-f0-9]*'),
+  state TEXT NOT NULL DEFAULT 'expected' CHECK(state IN('expected','uploading','committed','retired')),
+  r2_version TEXT,
+  committed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(operation,chunk_index)
+);
+CREATE TRIGGER cold_snapshot_chunk_immutable BEFORE UPDATE ON cold_snapshot_chunks
+WHEN NEW.operation<>OLD.operation OR NEW.chunk_index<>OLD.chunk_index OR NEW.size_bytes<>OLD.size_bytes
+  OR NEW.sha256<>OLD.sha256 OR NEW.created_at<>OLD.created_at
+  OR (OLD.state='retired' AND NEW.state<>'retired')
+BEGIN SELECT RAISE(ABORT,'cold_snapshot_chunk_immutable'); END;
+CREATE TRIGGER cold_snapshot_chunk_insert_fenced BEFORE INSERT ON cold_snapshot_chunks
+WHEN EXISTS(SELECT 1 FROM database_cold_storage WHERE operation=NEW.operation AND cleanup_fenced_at IS NOT NULL)
+BEGIN SELECT RAISE(ABORT,'cold_snapshot_cleanup_fenced'); END;
+CREATE TRIGGER cold_snapshot_chunk_upload_fenced BEFORE UPDATE OF state ON cold_snapshot_chunks
+WHEN NEW.state='uploading' AND EXISTS(SELECT 1 FROM database_cold_storage WHERE operation=NEW.operation AND cleanup_fenced_at IS NOT NULL)
+BEGIN SELECT RAISE(ABORT,'cold_snapshot_cleanup_fenced'); END;
+CREATE TRIGGER cold_snapshot_declaration_fenced BEFORE UPDATE ON database_cold_storage
+WHEN NEW.cleanup_fenced_at IS NOT NULL AND (NEW.snapshot_manifest_sha256 IS NOT OLD.snapshot_manifest_sha256
+  OR NEW.snapshot_manifest_bytes IS NOT OLD.snapshot_manifest_bytes OR NEW.snapshot_total_bytes IS NOT OLD.snapshot_total_bytes
+  OR NEW.snapshot_file_count IS NOT OLD.snapshot_file_count OR NEW.snapshot_chunk_count IS NOT OLD.snapshot_chunk_count)
+BEGIN SELECT RAISE(ABORT,'cold_snapshot_cleanup_fenced'); END;
 
 -- Pins survive the archive operation ending, node loss and failed recovery attempts. The last
 -- usable source may be released only after a verified successor or explicit database deletion.

@@ -159,6 +159,7 @@ pub struct Service<M: Machine> {
     archive_verifications: Mutex<HashMap<String, Arc<VerificationCancellation>>>,
     archive_verification_slot: Semaphore,
     desired_archive_verifications: Mutex<HashSet<String>>,
+    desired_cold_snapshot_captures: Mutex<HashSet<String>>,
     /// The databases whose page a wake waits for (`catch_up`), which `wanted_pulls` pulls together.
     wanted: Mutex<BTreeSet<String>>,
     wanted_signal: Notify,
@@ -224,7 +225,7 @@ fn credential_ids(entry: &Entry) -> Vec<String> {
             | Origin::Replace(source, _, _)
             | Origin::ReplaceRollback(source, _, _, _),
         ) => ids.push(source.credential_id.clone()),
-        Some(Origin::Create) | None => {}
+        Some(Origin::Create | Origin::Rehydrate(_)) | None => {}
     }
     ids
 }
@@ -376,6 +377,7 @@ impl<M: Machine> Service<M> {
             },
             running,
         );
+        core.set_cold_snapshot_store(Arc::new(link.clone()));
         let service = Arc::new(Self {
             core: core.clone(),
             link,
@@ -397,6 +399,7 @@ impl<M: Machine> Service<M> {
             archive_verifications: Mutex::new(HashMap::new()),
             archive_verification_slot: Semaphore::new(1),
             desired_archive_verifications: Mutex::new(HashSet::new()),
+            desired_cold_snapshot_captures: Mutex::new(HashSet::new()),
             wanted: Mutex::new(BTreeSet::new()),
             wanted_signal: Notify::new(),
             updating: AtomicBool::new(false),
@@ -515,22 +518,13 @@ impl<M: Machine> Service<M> {
     async fn deliver_credentials(&self, page: &Page) {
         use futures_util::StreamExt;
         let entries: Vec<Entry> = page.databases.iter().filter_map(Entry::parse).collect();
-        let mut wanted = {
+        let wanted = {
             let delivered = self
                 .delivered
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             wanted_credentials(&entries, &delivered, |id| self.core.ran_at_start(id))
         };
-        for request in &page.archive_verifications {
-            if let Some(id) = request["source"]["credential"]["id"].as_str()
-                && !wanted.iter().any(|held| held == id)
-            {
-                // Verification credentials may have expired since an earlier attempt. Read the
-                // exact scoped credential again; values remain in memory and never in its journal.
-                wanted.push(id.to_string());
-            }
-        }
         futures_util::stream::iter(wanted)
             .map(|id| async move {
                 let delivered = match self.link.archive_credential(&id).await {
@@ -649,6 +643,18 @@ impl<M: Machine> Service<M> {
     }
 
     fn cancel_archive_verifications(&self, page: &Page) {
+        for cancellation in &page.cold_snapshot_capture_cancellations {
+            let _ = self.core.record_cold_capture_cancellation(cancellation);
+            if let Some(operation) = cancellation["operation"].as_str()
+                && let Some(running) = self
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&format!("capture:{operation}"))
+            {
+                running.cancel();
+            }
+        }
         for cancellation in &page.archive_verification_cancellations {
             let _ = self.core.record_archive_cancellation(cancellation);
             if let Some(operation) = cancellation["operation"].as_str()
@@ -664,6 +670,14 @@ impl<M: Machine> Service<M> {
         if !page.complete {
             return;
         }
+        *self
+            .desired_cold_snapshot_captures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = page
+            .cold_snapshot_captures
+            .iter()
+            .filter_map(|value| value["operation"].as_str().map(str::to_string))
+            .collect();
         let active: HashSet<&str> = page
             .archive_verifications
             .iter()
@@ -680,7 +694,9 @@ impl<M: Machine> Service<M> {
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
         {
-            if !active.contains(operation.as_str()) {
+            // Capture disappearance can mean seal succeeded; only its explicit cancellation
+            // ends a running producer. Verification disappearance still cancels scratch work.
+            if !operation.starts_with("capture:") && !active.contains(operation.as_str()) {
                 cancellation.cancel();
             }
         }
@@ -709,6 +725,88 @@ impl<M: Machine> Service<M> {
                     .core
                     .cleanup_archive_verifications(&active, &running)
                     .await;
+                let captures = service
+                    .desired_cold_snapshot_captures
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                service
+                    .core
+                    .resend_cold_capture_receipts(&captures, &running);
+            });
+        }
+        for cancellation in &page.cold_snapshot_capture_cancellations {
+            let Some(operation) = cancellation["operation"].as_str() else {
+                continue;
+            };
+            let key = format!("capture-cancel:{operation}");
+            {
+                let mut running = self
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if running.contains_key(&key) {
+                    continue;
+                }
+                running.insert(key.clone(), Arc::new(VerificationCancellation::default()));
+            }
+            let service = self.clone();
+            let cancellation = cancellation.clone();
+            self.spawn(async move {
+                let Ok(_slot) = service.archive_verification_slot.acquire().await else {
+                    return;
+                };
+                let result = service.core.cancel_cold_snapshot_capture(&cancellation);
+                service.core.report_cold_snapshot_capture(result);
+                service
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
+            });
+        }
+        for request in &page.cold_snapshot_captures {
+            let Some(operation) = request["operation"].as_str() else {
+                continue;
+            };
+            if !self
+                .desired_cold_snapshot_captures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(operation)
+            {
+                continue;
+            }
+            let key = format!("capture:{operation}");
+            let cancellation = Arc::new(VerificationCancellation::default());
+            {
+                let mut running = self
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if running.contains_key(&key) {
+                    continue;
+                }
+                running.insert(key.clone(), cancellation.clone());
+            }
+            let service = self.clone();
+            let request = request.clone();
+            self.spawn(async move {
+                let Ok(_slot) = service.archive_verification_slot.acquire().await else {
+                    return;
+                };
+                let result = service
+                    .core
+                    .capture_cold_snapshot(&request, &service.link.node().id, &cancellation)
+                    .await;
+                if !result.is_null() {
+                    service.core.report_cold_snapshot_capture(result);
+                }
+                service
+                    .archive_verifications
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
             });
         }
         for cancellation in &page.archive_verification_cancellations {

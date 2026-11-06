@@ -20,6 +20,10 @@ import {
 } from "./operational-health.ts";
 import type { Page } from "../platform/pagination.ts";
 import { effectiveOf, effectiveResourcesColumnsSql } from "./resources.ts";
+import {
+  coldSnapshotStorageSql,
+  coldSnapshotStorageView,
+} from "./cold-snapshot-accounting.ts";
 
 export interface DatabaseRow extends DatabaseHealthSource {
   id: string;
@@ -51,6 +55,7 @@ export interface DatabaseRow extends DatabaseHealthSource {
   storage_residency?: StorageResidency;
   sleep_since?: string | null;
   storage_operation_id?: string | null;
+  cold_snapshot_storage_json?: string | null;
   storage_profile_json?: string | null;
   storage_volume_json?: string | null;
   runtime_json?: string | null;
@@ -151,6 +156,9 @@ export function databaseView(row: DatabaseRow, now = Date.now()): Database {
     storage_residency: row.storage_residency ?? "local",
     sleep_since: row.sleep_since ?? null,
     storage_operation_id: row.storage_operation_id ?? null,
+    cold_snapshot_storage: coldSnapshotStorageView(
+      row.cold_snapshot_storage_json,
+    ),
     observed_generation: row.observed_generation,
     status_message: row.status_message,
     health: {
@@ -225,7 +233,7 @@ export async function databaseForRequest(
 ): Promise<DatabaseRow> {
   await getAuth(c);
   const row = await c.env.DB.prepare(
-    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${latestFilesystemSampleSql("d")} filesystem_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")} FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${latestFilesystemSampleSql("d")} filesystem_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")},${coldSnapshotStorageSql("d")} cold_snapshot_storage_json FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
   )
     .bind(id)
     .first<DatabaseRow>();

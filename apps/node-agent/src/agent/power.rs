@@ -281,15 +281,21 @@ impl<M: Machine> Core<M> {
         db: &Db,
         change: impl FnOnce(&mut DatabaseState),
     ) -> io::Result<()> {
-        let mut state = db
-            .view()
-            .state
-            .clone()
-            .ok_or_else(|| io::Error::other("the database has no state"))?;
-        change(&mut state);
-        self.files(&db.id).save(&state)?;
-        self.set(db, |view| view.state = Some(state));
-        Ok(())
+        let mut result = Ok(());
+        self.set(db, |view| {
+            let Some(mut state) = view.state.clone() else {
+                result = Err(io::Error::other("the database has no state"));
+                return;
+            };
+            // Serialize the read, mutation and durable write with serving-route publication.
+            // A background backup must never overwrite its newer serving latch with an old clone.
+            change(&mut state);
+            match self.files(&db.id).save(&state) {
+                Ok(()) => view.state = Some(state),
+                Err(error) => result = Err(error),
+            }
+        });
+        result
     }
 
     /// The database's volume, of the storage generation the page serves.
@@ -1030,6 +1036,12 @@ impl<M: Machine> Core<M> {
                 .map_or(entry.generation, |c| c.generation);
             (entry, generation)
         };
+        if entry.cold_snapshot_pending && matches!(why, Why::Idle | Why::Early { .. }) {
+            if matches!(why, Why::Early { .. }) {
+                self.admission.early_sleep_refused(&db.id);
+            }
+            return Slept::BackupPutOff;
+        }
         // The idle time is when a due base backup is taken, while the database still runs: it
         // is never woken for one. One that is put off for a wake keeps the database up, since
         // nothing would ask for the backup before its next idle sleep; the next idle pass asks
@@ -1199,6 +1211,30 @@ impl<M: Machine> Core<M> {
             return Recovered::Done;
         }
         if entry.desired == Desired::Deleted {
+            return Recovered::Done;
+        }
+        if entry.cold_snapshot_pending && entry.origin.is_none() {
+            match self.activate_cold(db, &entry).await {
+                Ok(()) => {}
+                Err(error) => self.set(db, |view| {
+                    view.phase = Phase::Error;
+                    view.error = Some(error);
+                    view.writer = None;
+                }),
+            }
+            return Recovered::Done;
+        }
+        let cold_staging = matches!(entry.origin, Some(super::Origin::Rehydrate(_))) && {
+            let view = db.view();
+            view.state.as_ref().is_none_or(|state| {
+                state.storage_generation != entry.storage_generation || !state.cold_snapshot_serving
+            })
+        };
+        if cold_staging {
+            // This entry came from Cloudflare's authoritative page. A staging cold target has
+            // never served the cutover route; archive crash recovery would reset UNLOGGED data.
+            // Rebuild from the complete clean snapshot before allowing its next ready report.
+            let _ = self.build(db, &entry).await;
             return Recovered::Done;
         }
         let Some(volume) = Self::volume_id(&entry) else {
@@ -1403,6 +1439,9 @@ impl<M: Machine> Core<M> {
             )
         };
         let Some(entry) = entry else { return };
+        if entry.cold_snapshot_pending {
+            return;
+        }
         // An always-warm database takes its backup while it serves. So does one that was put
         // off for the longest: the idle sleep that would take it does not come while the
         // database is used.
@@ -1626,6 +1665,87 @@ mod tests {
     }
     fn report(observation: Value) -> Value {
         json!({"observed_at": "2026-10-18T10:11:12.345Z", "databases": [observation], "orders": []})
+    }
+
+    #[tokio::test]
+    async fn a_background_state_save_cannot_drop_the_durable_cold_serving_marker() {
+        let Some(rig) = Rig::new("cold-serving-state-race").await else {
+            return;
+        };
+        let mut entry = rig.entry();
+        entry.origin = None;
+        entry.storage_generation = 2;
+        entry.archive_path = entry.archive_path.replace("/g1-", "/g2-");
+        entry.route_revision += 1;
+        let db = rig.core.db(&entry.id);
+        let mut state = DatabaseState::new(entry.storage_generation);
+        state.built = true;
+        state.cold_snapshot_restore = Some(crate::state::ColdSnapshotRestore {
+            snapshot_operation: format!("op_{}", "a".repeat(20)),
+            manifest_sha256: "a".repeat(64),
+            system_identifier: "7431215993172011234".into(),
+            timeline: 1,
+            checkpoint_lsn: "0/3000060".into(),
+            verified_at: "2026-11-06T10:00:00.000Z".into(),
+        });
+        state.cold_snapshot_target_operation = Some(entry.operation.clone());
+        state.cold_snapshot_start_intent = true;
+        state.cold_snapshot_source = Some(crate::agent::ColdSnapshotSource {
+            database_id: entry.id.clone(),
+            snapshot_operation: format!("op_{}", "a".repeat(20)),
+            source_generation: 1,
+            source_storage_generation: 1,
+            manifest_sha256: "a".repeat(64),
+            manifest_bytes: 100,
+            end: crate::state::ProvenSleepRecord {
+                system_identifier: "7431215993172011234".into(),
+                timeline: 1,
+                checkpoint_lsn: "0/3000060".into(),
+                last_archived_segment: "000000010000000000000002".into(),
+                proven_at: "2026-11-06T09:00:00.000Z".into(),
+            },
+        });
+        rig.core.files(&entry.id).save(&state).unwrap();
+        rig.core.set(&db, |view| view.state = Some(state));
+        let (cloned_tx, cloned_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let saving = {
+            let core = rig.core.clone();
+            let db = db.clone();
+            std::thread::spawn(move || {
+                core.save_state(&db, |state| {
+                    cloned_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    state.config = Some("b".repeat(64));
+                })
+                .unwrap()
+            })
+        };
+        cloned_rx.recv().unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let accepting = {
+            let core = rig.core.clone();
+            let db = db.clone();
+            std::thread::spawn(move || {
+                assert!(core.accept(&db, entry));
+                accepted_tx.send(()).unwrap();
+            })
+        };
+        // Before the fix, accept can fsync true while the earlier state writer holds a false
+        // clone. With serialized saves, it waits for that writer and then persists true last.
+        let _ = accepted_rx.recv_timeout(Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        saving.join().unwrap();
+        accepting.join().unwrap();
+        assert!(
+            rig.core
+                .files(&db.id)
+                .load()
+                .unwrap()
+                .unwrap()
+                .cold_snapshot_serving
+        );
+        assert!(db.view().state.as_ref().unwrap().cold_snapshot_serving);
     }
 
     #[test]

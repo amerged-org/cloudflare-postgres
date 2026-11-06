@@ -11,7 +11,8 @@ import {
   emitColdStorageMetrics,
 } from "../../src/domain/cold-storage-metrics.ts";
 import { measureBackupUsage } from "../../src/domain/backup-usage.ts";
-import { cleanup, lifecycle, PROOF } from "./lifecycle-fixture.ts";
+import { cleanup, lifecycle } from "./lifecycle-fixture.ts";
+import { insertSnapshotArchive } from "./cold-snapshot-fixture.ts";
 
 const keys: string[] = [];
 afterEach(async () => {
@@ -68,6 +69,9 @@ it("emits one bounded metric record and distinguishes no archives from unmeasure
     archived_backup_unknown: 0,
     archived_backup_oldest_observed_at: null,
     archived_backup_newest_observed_at: null,
+    archived_snapshot_bytes: 0,
+    archived_snapshot_measured: 0,
+    archived_snapshot_unknown: 0,
     released_physical_bytes: null,
   });
 });
@@ -97,24 +101,15 @@ it("counts residency, acknowledged removals, restore outcomes and durations with
     now - 600_000,
   );
   const at = new Date(now - 600_000).toISOString();
-  await env.DB.prepare(
-    `INSERT INTO database_cold_storage(operation,kind,database_id,project_id,region_id,phase,source_node_id,source_generation,source_storage_generation,source_archive_path,source_backup_id,proven_sleep_json,verification_receipt_json,source_removed_at,created_at,updated_at,completed_at)
-    VALUES(?,'archive',?,?,?,'archived',?,1,1,?,'20261018T093000',?,'{}',?,?,?,?)`,
-  )
-    .bind(
-      archive,
-      f.id,
-      f.project,
-      f.region,
-      f.node,
-      row.archive_path,
-      JSON.stringify(PROOF),
-      at,
-      at,
-      at,
-      at,
-    )
-    .run();
+  await insertSnapshotArchive({
+    operation: archive,
+    id: f.id,
+    project: f.project,
+    region: f.region,
+    node: f.node,
+    path: row.archive_path,
+    at,
+  });
   await operation(
     f,
     "database.rehydrate",
@@ -162,6 +157,74 @@ it("counts residency, acknowledged removals, restore outcomes and durations with
   expect(measured.archived_backup_bytes).toBeNull();
   expect(measured.archived_backup_unknown).toBe(1);
   expect(measured.released_physical_bytes).toBeNull();
+});
+
+it("reports committed snapshot object bytes separately from normal backups and keeps partial coverage unknown", async () => {
+  const f = await lifecycle(),
+    row = await f.row(),
+    now = Date.now(),
+    at = new Date(now).toISOString();
+  const op = await operation(
+    f,
+    "database.archive",
+    "succeeded",
+    now - 1000,
+    now,
+  );
+  const prefix = await insertSnapshotArchive({
+    operation: op,
+    id: f.id,
+    project: f.project,
+    region: f.region,
+    node: f.node,
+    path: row.archive_path,
+    at,
+  });
+  await env.DB.prepare(
+    "UPDATE databases SET node_id=NULL,storage_residency='archived',storage_operation_id=? WHERE id=?",
+  )
+    .bind(op, f.id)
+    .run();
+  const chunk = prefix + "chunks/00000000",
+    manifest = prefix + "manifest.json";
+  keys.push(chunk, manifest);
+  const uploaded = await env.ARCHIVE.put(chunk, new Uint8Array(9));
+  await env.ARCHIVE.put(manifest, new Uint8Array(17));
+  await env.DB.prepare(
+    "INSERT INTO cold_snapshot_chunks(operation,chunk_index,size_bytes,sha256,state,created_at,updated_at) VALUES(?,0,9,?,'uploading',?,?)",
+  )
+    .bind(op, "b".repeat(64), at, at)
+    .run();
+  expect(
+    (await readColdStorageMetrics(env)).archived_snapshot_bytes,
+  ).toBeNull();
+  await env.DB.prepare(
+    "UPDATE cold_snapshot_chunks SET state='committed',committed_at=? WHERE operation=?",
+  )
+    .bind(at, op)
+    .run();
+  expect(
+    (await readColdStorageMetrics(env)).archived_snapshot_bytes,
+  ).toBeNull();
+  await env.DB.prepare(
+    "UPDATE cold_snapshot_chunks SET state='committed',r2_version=?,committed_at=? WHERE operation=?",
+  )
+    .bind(uploaded!.version, at, op)
+    .run();
+  await measureBackupUsage(env, f.id);
+  const measured = await readColdStorageMetrics(env);
+  expect(measured.archived_snapshot_bytes).toBe(26);
+  expect(measured.archived_snapshot_measured).toBe(1);
+  expect(measured.archived_snapshot_unknown).toBe(0);
+  expect(measured.archived_backup_bytes).toBe(0);
+  await env.DB.prepare(
+    "UPDATE database_cold_storage SET cleanup_fenced_at=? WHERE operation=?",
+  )
+    .bind(at, op)
+    .run();
+  expect(
+    (await readColdStorageMetrics(env)).archived_snapshot_bytes,
+  ).toBeNull();
 });
 
 it("uses the latest complete backup measurement only for its matching current archive generation", async () => {

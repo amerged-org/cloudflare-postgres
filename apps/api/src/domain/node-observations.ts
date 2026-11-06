@@ -17,6 +17,7 @@ import { recoverFailedResume, recoverQuiescence } from "./lifecycle.ts";
 import { powerTransitionStatements } from "./power-transition.ts";
 import { hintDatabases } from "./node-hints.ts";
 import { applyLifecycleObservations } from "./lifecycle-observations.ts";
+import { coldStorageObservationAllowed } from "./cold-storage.ts";
 import { USAGE_SNAPSHOT_SQL } from "./resources.ts";
 import {
   ADMISSION_PUBLISH_ANSWER_MS,
@@ -79,7 +80,7 @@ const REFUSAL_RECOVERY = {
  * that report runs, and no other writer does.
  */
 const SLEEP_EVENT = `EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.generation=d.generation AND e.kind IN('suspended','hibernated'))`;
-const OPERATION_OF_GENERATION = `COALESCE((SELECT c.operation FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase='succeeded' AND c.target_generation=d.generation),
+const OPERATION_OF_GENERATION = `COALESCE((SELECT c.operation FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase IN('activating','succeeded') AND c.target_serving_generation=d.generation),
   (SELECT rp.operation FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase='proving'),
   (SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
   ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1))`;
@@ -903,6 +904,11 @@ async function takeObservation(
   let row = await readRow(env, observation.id, node.id);
   // A database this node does not serve is not this node's to report.
   if (row === null) return "stale";
+  if (
+    row.storage_residency === "restoring" &&
+    !(await coldStorageObservationAllowed(env, node.id, observation))
+  )
+    return "conflict";
   const desired = () => ({
     generation: row!.generation,
     operation: row!.operation,

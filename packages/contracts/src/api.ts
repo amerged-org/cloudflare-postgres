@@ -422,6 +422,33 @@ export type StorageResidency = z.infer<typeof StorageResidency>;
 /** Equal for every integrator's billing tier; this is a physical storage policy. */
 export const COLD_STORAGE_SLEEP_SECONDS = 21 * 86_400;
 
+/** Ledger accounting of complete cold images and partial uploads; not a fresh R2 listing. */
+export const ColdSnapshotStorage = z
+  .strictObject({
+    payload_bytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER)
+      .nullable(),
+    retained_payload_bytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER)
+      .nullable(),
+    accounted_at: z
+      .union([Timestamp, z.null()])
+      .describe(
+        "Newest persisted fact used in this ledger total; null when no snapshot exists. This is not the time of an R2 inventory read.",
+      ),
+    gaps: z.array(
+      z.enum(["upload_pending", "retirement_pending", "metadata_incomplete"]),
+    ),
+  })
+  .meta({ id: "ColdSnapshotStorage" });
+export type ColdSnapshotStorage = z.infer<typeof ColdSnapshotStorage>;
+
 export const Database = z
   .strictObject({
     id: DatabaseId,
@@ -458,6 +485,9 @@ export const Database = z
       ),
     // A union keeps the shared OperationId component non-nullable for every other use.
     storage_operation_id: z.union([OperationId, z.null()]).optional(),
+    cold_snapshot_storage: ColdSnapshotStorage.optional().describe(
+      "Ledger-accounted cold-snapshot payload and manifest bytes, including current, retained and partial copies. Unknown totals are null with explicit gaps; zero-byte retirement fences count as zero. This is separate from local volume storage and normal Barman backup usage.",
+    ),
     observed_generation: z.number().int().min(0),
     status_message: z.string().max(TEXT_MAX_LENGTH).nullable(),
     health: DatabaseHealth,

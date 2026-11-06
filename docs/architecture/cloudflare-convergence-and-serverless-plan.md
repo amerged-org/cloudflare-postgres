@@ -1,52 +1,91 @@
 # Long-sleep R2 storage candidate — 2026-11-06
 
 **Owner-approved implementation:** apply the same rule to Free and Paid databases: after more
-than 21 continuous days of proven sleep, verify the R2 recovery copy and remove local storage.
+than 21 continuous days of proven sleep, verify the complete R2 copy and remove local storage.
 An ordinary request restores an idle archive onto eligible capacity in its existing region and
 keeps the original request within the existing 60-second admission deadline. Manual suspension
-still requires an authorized resume. Database ID, endpoint, current roles and committed data are
-preserved. This is candidate source, not a deployed feature or a promise that every restore takes
-less than 60 seconds. Automatic archival remains disabled by default.
+still requires an authorized resume. Database ID, endpoint, current roles, settings, region and
+committed data are preserved. The owner additionally approved a clean-shutdown cold-snapshot
+format to preserve UNLOGGED data. This is candidate source, not a deployed feature or a promise
+that every restore takes less than 60 seconds. Automatic archival remains disabled by default.
 
 - **Control and contracts:** additive migration `0098`, contract 1.7.0, independent storage
   residency and verified sleep history, durable archive/rehydration operations, protected recovery
   generations and a monotonic native release floor. Normal unassigned creation cannot initialize
   an archived database. Placement includes pending verification/recovery demand and excludes full
-  or incompatible nodes; only verified recovery publishes a new serving node and route revision.
-- **Native durability:** an isolated, non-serving scratch restore verifies the pinned base backup
-  through committed WAL before source retirement. Read-only archive credentials are enforced
-  locally. Durable cancellation/completion fences reject delayed tasks; cleanup cancels and drains
-  queued archive handlers, stops surviving Barman units and confirms scratch removal before
-  acknowledging it. The source volume is removed only by its separate exact-generation order.
-- **Races and failures:** concurrent requests share one recovery; client timeout/disconnection
-  does not cancel it. Retention uses immutable, journaled delete batches mutually exclusive with
-  archive pins. Explicit cleanup tasks cover lost delivery, renewable credential references do not
-  change operation identity, and failed-target capacity remains reserved until cleanup or positive
-  node fencing. Fair cursors and same-proof failure backoff prevent stuck work from starving other
-  databases. A newer manual pause supersedes an earlier deferred resume.
+  or incompatible nodes. Historical dates backfill only from the current storage generation's
+  valid proof; a real intervening wake starts a new continuous-sleep interval.
+- **Complete cold snapshot:** the stopped source declares every file, packed chunk and SHA-256
+  before any upload, including UNLOGGED relations, WAL and timeline history. The dedicated R2
+  namespace is outside Barman credential scopes. Signed operation-scoped node calls enforce
+  immutable writes and bounded sealing. Missing parts cannot silently produce a smaller valid
+  backup. Format 1 bounds actual file payload at 64 GiB, with 4 MiB chunks and manifest, 16,384 files
+  and 4,096 directories. Unsupported layouts remain local; configured volume quotas are unchanged.
+- **Verification and retirement:** isolated scratch extraction verifies the complete inventory and
+  clean control file before starting PostgreSQL with the original system ID and timeline. It has
+  no customer route, event delivery or archive-write capability. Durable cancellation/completion
+  fences reject delayed tasks. Scratch cleanup precedes the separate exact-generation source
+  retirement order; only a positive native removal acknowledgment clears the serving assignment.
+- **Restore and activation:** same-ID recovery stages a fresh storage generation, reapplies current
+  roles/settings and renews WAL/history acknowledgments plus the first normal Barman backup.
+  A distinct higher-generation activation page and durable native serving marker precede route
+  publication. After any PostgreSQL start, an uncertain target is never rewound; a retry requires
+  retirement and another storage generation. Stale pages cannot overwrite a serving database.
+- **Races and retention:** concurrent requests share one durable recovery; client timeout or
+  disconnection does not cancel it. Cancellation before source retirement waits for cleanup, then
+  wakes locally. A newer manual pause supersedes an earlier deferred resume. Permanent zero-byte
+  R2 retirement fences prevent late uncertain uploads from resurrecting removed payload; they
+  must not be deleted by bucket lifecycle rules. Ordinary Barman retention remains independent.
+  Fair cursors and same-proof failure backoff prevent stuck work from starving other databases.
 - **Operating boundaries:** source loss during retirement leaves the archive pinned and requires
-  operator recovery until physical removal is confirmed; it does not manufacture an archived/free
-  storage acknowledgment. Restore timing/outcomes, residency counts, confirmed volume removals and
-  existing R2 byte measurements are observable. Exact reclaimed physical thin-pool bytes remain
-  unknown without an authoritative measurement; nominal volume size is never substituted.
-- **Local evidence:** the complete API regression run passed **1,412 tests**. Additionally, 103
-  focused contract checks, 8 lifecycle integration checks, 6
-  reconciliation cases, 9 admission cases, 10 native cold-storage cases with PostgreSQL 18, 9 native
-  protocol cases and 6 native sample cases passed in their recorded runs. The native archive suite
-  passed **72 tests**, with one Linux/systemd-only case excluded on this host. The first broad API run found
-  two regression classes: D1 expression depth in the existing move path and OpenAPI shared-ID
-  nullability. Both were reproduced and fixed; all 24 move cases and 15 OpenAPI cases passed after
-  the fixes. Other red-first cases covered concurrent wake claims, a wake missed between reports,
-  mismatched recovery proofs, read-only archive uploads, late/queued work after cleanup and a
-  deferred resume overriding manual suspension. These checks are local evidence, not VPS acceptance.
+  operator recovery until physical removal is confirmed. Failed-target capacity stays reserved
+  until removal or positive Tunnel/provider-power fencing. Metrics expose restoration outcomes,
+  wait timeouts, residency, acknowledged snapshot bytes and explicit accounting gaps. Confirmed
+  volume removals do not establish exact reclaimed physical thin-pool bytes; nominal volume size
+  is never substituted for a missing measurement.
 
-**Remaining release acceptance:** finish exact-revision CI/image qualification and the real Dev
-round trip before enabling new archival. No deployment, live D1 migration, tenant SQL, volume
-removal, purchase or customer-data migration occurred during this implementation. The next
-authorized same-region VPS is required for live cross-VPS acceptance; the current two regions each
-have one node. Production changes and new paid capacity retain the owner's explicit, costed-go
-requirement. See [the recovery runbook](../operations/recovery.md#long-sleep-r2-storage-and-request-triggered-recovery)
-for the rollout switches and recovery behavior. Preserve the earlier accepted records below.
+**Why the format changed:** an actual PostgreSQL/Barman reproduction used the pinned Barman
+3.20.1 package. Removing one additional base-backup tar part still let its listing-based downloader
+finish, preserve the system identifier, promote and replay witness WAL, while the omitted table
+could not be read. A separate valid recovery preserved a logged row but cleared the UNLOGGED row;
+a clean restart retained both. Comparing arbitrary post-recovery file hashes was also rejected:
+normal hint/checksum/LSN changes can legitimately differ. These local reproductions invalidate the
+old Barman-only cold-verification candidate. Normal Barman backup/PITR and the explicit Move API
+retain their existing archive-recovery semantics; the new controlled cold relocation uses the
+complete clean snapshot. Normal PostgreSQL UNLOGGED crash semantics remain unchanged.
+
+**Current local evidence:** 26 focused native cold-storage tests passed with real PostgreSQL 18,
+including complete-file integrity, clean startup, UNLOGGED preservation, timeline-2 history,
+cancellation, new-generation retries after pre-ready crashes, first-backup failure and activation
+across agent restart. The activation/restart case preserved newer logged and UNLOGGED writes
+without fetching the old snapshot again. The complete shared-contract run passed 367 tests and
+the full API run passed 1,436 tests.
+Raw signed binary transport passed in both the Worker and native client. The earlier API failures
+were corrected without raising the 850-statement cron budget: unchanged cursors no longer write,
+and ledger timestamps describe persisted facts instead of response time. A further review then
+reproduced a sealed snapshot masking a final source mismatch, including a concurrent verifier
+interleaving. The failure now fences the operation before publishing capture cleanup; 31 focused
+API checks passed after that correction. A real PostgreSQL regression also proved that a lost
+seal response must still run the final source/control checks before it may reconcile. The bounded
+Dev rollout now has an optional database-ID scope; 19 focused checks cover fail-closed parsing,
+selection before pagination, the unchanged strict 21-day boundary and recovery with archival off.
+Exact-revision Linux/image checks remain pending. These
+numbers describe separate runs and must not be added as unique test coverage or called live VPS
+acceptance. The earlier 1,412-test API result and CI records below cover the superseded candidate.
+
+**Read-only live preflight at 09:49 UTC:** the two active nodes were healthy, schedulable,
+placement-enabled and OS-converged; API contract 1.6.0 and migrations through `0097` were active.
+There were 224 logical databases, 220 sleeping and zero with more than 21 days of proven sleep.
+No cold-storage schema was deployed. These are point-in-time observations, not an inventory freeze.
+
+**Remaining release acceptance:** finish exact-revision CI/image qualification, compatible adopter
+client preparation and the real Dev round trip before enabling new archival. No deployment, live
+D1 migration, tenant SQL, volume removal, purchase or customer-data migration occurred during this
+implementation. The next authorized same-region VPS is required for live cross-VPS acceptance;
+the current two regions each have one node. Production changes and new paid capacity retain the
+owner's explicit, costed-go requirement. See [the recovery runbook](../operations/recovery.md#long-sleep-r2-storage-and-request-triggered-recovery)
+for rollout switches, client compatibility, recovery and format bounds. Preserve earlier records
+below; none qualifies the revised snapshot format without fresh checks.
 
 **First CI qualification, run 42194790820:** static, API, Edge, other tests and Linux kernel
 checks passed. The Rust job passed 950 tests and excluded 23 kernel-only cases, but failed a stale
@@ -75,6 +114,15 @@ snapshot URIs. A read-only-base probe successfully fetched the 140,421-byte sign
 inputs and that verified package, with owner-only permissions and cleanup. Debian signature
 verification and all package pins remain unchanged; missing indexes now fail explicitly.
 All 80 node-image/installer unit tests and the image-tool typecheck passed. Fresh image CI is pending.
+
+**Third CI qualification, run 42202079892:** all application and Linux kernel checks passed
+for the earlier candidate. Image construction failed fetching the pinned `tzdata` package:
+the primary snapshot returned 503 and the live Debian mirror had pruned the exact version (404).
+Debian's official Cloudflare snapshot frontend returned the same timestamp/path with the exact
+locked 266,488 bytes and SHA-256. Downloads now try that snapshot frontend before the live mirror,
+only after availability failures; TLS, size or digest failures still stop the build. Package pins,
+signatures and builder APT snapshot remain unchanged. All 81 image/installer tests passed locally.
+Fresh complete CI is required for the revised cold-snapshot source and this availability fix.
 
 # Integration extension candidate — 2026-10-26
 

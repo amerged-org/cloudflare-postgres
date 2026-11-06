@@ -259,6 +259,27 @@ impl Api {
         target: &str,
         body: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Error> {
+        self.raw(method, target, body, "application/json", MAX_RESPONSE_BYTES)
+            .await
+    }
+
+    /// Snapshot chunks are binary. Sign exactly the bounded bytes sent, do not re-encode them
+    /// as JSON, and never follow a redirect carrying a node credential.
+    pub(super) async fn raw(
+        &self,
+        method: Method,
+        target: &str,
+        body: Option<Vec<u8>>,
+        media_type: &'static str,
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        if body
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_REQUEST_BYTES)
+            || maximum > MAX_RESPONSE_BYTES
+        {
+            return Err("node transfer exceeds bound".into());
+        }
         let (url, bearer) = self.signed(method.as_str(), target, body.as_deref().unwrap_or(&[]))?;
         let mut request = self
             .transport
@@ -266,9 +287,9 @@ impl Api {
             .request(method, url)
             .bearer_auth(bearer);
         if let Some(body) = body {
-            request = request.header(CONTENT_TYPE, "application/json").body(body);
+            request = request.header(CONTENT_TYPE, media_type).body(body);
         }
-        let answer = finish(request.send().await?, MAX_RESPONSE_BYTES).await;
+        let answer = finish(request.send().await?, maximum).await;
         if answer.as_ref().is_err_and(|error| error.is::<Fenced>()) {
             self.events.fence();
         }
@@ -324,6 +345,86 @@ pub(super) mod tests {
         assert_eq!(
             cloud.requests().last().unwrap().signed,
             Some(Err("signature"))
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_snapshot_requests_sign_exact_bytes_and_bound_authenticated_reads() {
+        let cloud = Cloud::start().await;
+        let (api, _) = enrolled(&cloud).await;
+        let payload = vec![0, 255, 254, 192, 0, 1, 2];
+        // The JSON usage endpoint refuses PUT, but the server records the verified signature
+        // over the original non-UTF8 bytes and the explicit binary content type first.
+        assert!(
+            api.raw(
+                Method::PUT,
+                "/node/v1/usage",
+                Some(payload.clone()),
+                "application/octet-stream",
+                65536
+            )
+            .await
+            .is_err()
+        );
+        let seen = cloud.requests();
+        let sent = seen.last().unwrap();
+        assert_eq!(sent.signed, Some(Ok(())));
+        assert_eq!(sent.body_bytes, payload);
+        assert_eq!(
+            sent.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        let target = "/node/v1/cold-snapshots/op_abcdefghijklmnopqrst/chunks/0";
+        cloud.with(|inner| {
+            inner.files.insert(target.into(), payload.clone());
+        });
+        assert_eq!(
+            api.raw(
+                Method::GET,
+                target,
+                None,
+                "application/octet-stream",
+                payload.len()
+            )
+            .await
+            .unwrap(),
+            payload
+        );
+        assert_eq!(cloud.requests().last().unwrap().signed, Some(Ok(())));
+        assert!(
+            api.raw(
+                Method::GET,
+                target,
+                None,
+                "application/octet-stream",
+                payload.len() - 1
+            )
+            .await
+            .is_err()
+        );
+        cloud.with(|inner| inner.fenced = true);
+        assert!(
+            api.raw(Method::GET, target, None, "application/octet-stream", 64)
+                .await
+                .unwrap_err()
+                .is::<Fenced>()
+        );
+        let before = cloud.requests().len();
+        assert!(
+            api.raw(
+                Method::PUT,
+                target,
+                Some(vec![0; MAX_REQUEST_BYTES + 1]),
+                "application/octet-stream",
+                64
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            cloud.requests().len(),
+            before,
+            "an oversized body is refused before transmission"
         );
     }
 

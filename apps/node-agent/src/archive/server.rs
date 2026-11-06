@@ -135,7 +135,7 @@ impl Entry {
 #[derive(Default)]
 pub struct Table {
     entries: RwLock<HashMap<String, Arc<Entry>>>,
-    /// Captured handlers can outlive synchronous removal (including a verifier future's Drop).
+    /// Captured handlers can outlive synchronous removal (including an interrupted recovery).
     /// Weak references retain no completed registrations; the cleanup boundary drains live ones.
     retired: Mutex<HashMap<String, Vec<Weak<Entry>>>>,
 }
@@ -210,35 +210,6 @@ impl Table {
             if pending.is_empty() {
                 retired.remove(database);
             }
-        }
-    }
-    /// Claims a scratch identity without replacing any serving or in-flight registration.
-    pub fn set_if_absent(&self, registration: Registration) -> Option<Arc<FetchStatus>> {
-        let mut entries = self.entries.write().expect("table lock");
-        let std::collections::hash_map::Entry::Vacant(entry) =
-            entries.entry(registration.database.id.clone())
-        else {
-            return None;
-        };
-        let status = Arc::new(FetchStatus::default());
-        entry.insert(Arc::new(Entry {
-            registration,
-            serial: tokio::sync::Mutex::new(()),
-            failing_since_ms: Mutex::new(None),
-            fetch_status: status.clone(),
-            retired: AtomicBool::new(false),
-            cancelled: tokio::sync::Notify::new(),
-        }));
-        Some(status)
-    }
-    /// Cancelling a scratch task cannot remove a newer registration for the same identity.
-    pub fn remove_if_current(&self, database: &str, status: &Arc<FetchStatus>) {
-        let mut entries = self.entries.write().expect("table lock");
-        if entries
-            .get(database)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.fetch_status, status))
-        {
-            self.retire(entries.remove(database).expect("matched entry"));
         }
     }
     fn get(&self, database: &str) -> Option<Arc<Entry>> {
@@ -636,32 +607,6 @@ mod tests {
         assert!(!node.fixture.object(ARCHIVE, SEGMENT).exists());
         assert!(node.log().entries().unwrap().is_empty());
         assert!(!node.fixture.store_directory().join("key-id").exists());
-    }
-
-    #[tokio::test]
-    async fn scratch_registration_is_exclusive_and_old_cleanup_cannot_remove_a_new_attempt() {
-        let node = Node::start("verification-registration", AGENT_BOUND).await;
-        let original = node.table.get(DATABASE).unwrap();
-        assert!(
-            node.table
-                .set_if_absent(original.registration.clone())
-                .is_none()
-        );
-        assert!(Arc::ptr_eq(&node.table.get(DATABASE).unwrap(), &original));
-
-        let mut scratch = original.registration.clone();
-        scratch.database.id = "cccccccccccccccccccc".into();
-        let first = node.table.set_if_absent(scratch.clone()).unwrap();
-        let replacement = node.table.set(scratch.clone());
-        node.table.remove_if_current(&scratch.database.id, &first);
-        assert!(Arc::ptr_eq(
-            &node.table.get(&scratch.database.id).unwrap().fetch_status,
-            &replacement,
-        ));
-        node.table
-            .remove_if_current(&scratch.database.id, &replacement);
-        assert!(node.table.get(&scratch.database.id).is_none());
-        assert!(Arc::ptr_eq(&node.table.get(DATABASE).unwrap(), &original));
     }
 
     #[tokio::test]

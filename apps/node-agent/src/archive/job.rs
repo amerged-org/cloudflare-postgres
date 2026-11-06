@@ -781,6 +781,11 @@ impl Jobs {
     pub async fn stop_earlier(&self, database: &str, kind: Kind) -> Result<(), Unstopped> {
         self.runner.stop_earlier(database, kind).await
     }
+    /// Rust snapshot transfers share the same background big-job budget as Barman.
+    pub async fn snapshot_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, Busy> {
+        self.big.acquire().await.map_err(|_| Busy)
+    }
+
     /// Confirms that no transient job of this runtime remains, without mutating an unowned job.
     pub async fn absent(&self, database: &str) -> Result<bool, Unstopped> {
         self.runner.absent(database).await

@@ -165,6 +165,47 @@ impl Backup {
     }
 }
 
+/// The complete clean PGDATA bytes were verified before any configuration edit or server start.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdSnapshotRestore {
+    pub snapshot_operation: String,
+    pub manifest_sha256: String,
+    pub system_identifier: String,
+    pub timeline: u32,
+    pub checkpoint_lsn: String,
+    pub verified_at: String,
+}
+fn operation_valid(operation: &str) -> bool {
+    operation.len() == 23
+        && operation.starts_with("op_")
+        && operation.as_bytes()[3..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+impl ColdSnapshotRestore {
+    fn valid(&self) -> bool {
+        operation_valid(&self.snapshot_operation)
+            && self.manifest_sha256.len() == 64
+            && self
+                .manifest_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && !self.system_identifier.starts_with('0')
+            && self
+                .system_identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+            && self.system_identifier.parse::<u64>().is_ok()
+            && self.timeline > 0
+            && Lsn::parse(&self.checkpoint_lsn).is_some()
+            && timestamp(&self.verified_at)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseState {
@@ -184,6 +225,23 @@ pub struct DatabaseState {
     /// What the unit's limits and the volume were last set to.
     #[serde(default)]
     pub resources: Option<Resources>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_snapshot_restore: Option<ColdSnapshotRestore>,
+    /// The target operation is separate from the source snapshot operation in the attestation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_snapshot_target_operation: Option<String>,
+    /// Retained until this generation is retired, including across a lost cutover acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_snapshot_source: Option<crate::agent::ColdSnapshotSource>,
+    /// Before the first PG exec: a retry after this point needs a fresh storage/archive generation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cold_snapshot_start_intent: bool,
+    /// Monotonic within this storage generation, fsynced before publishing a serving route.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cold_snapshot_serving: bool,
+    /// Cloudflare has completed the cutover; a stale pending page can never revoke this fact.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cold_snapshot_committed: bool,
 }
 impl DatabaseState {
     pub fn new(storage_generation: u64) -> Self {
@@ -196,6 +254,12 @@ impl DatabaseState {
             backup: None,
             config: None,
             resources: None,
+            cold_snapshot_restore: None,
+            cold_snapshot_target_operation: None,
+            cold_snapshot_source: None,
+            cold_snapshot_start_intent: false,
+            cold_snapshot_serving: false,
+            cold_snapshot_committed: false,
         }
     }
     fn valid(&self) -> bool {
@@ -204,6 +268,53 @@ impl DatabaseState {
             && self.record.as_ref().is_none_or(ProvenSleepRecord::valid)
             && self.backup.as_ref().is_none_or(Backup::valid)
             && self.resources.as_ref().is_none_or(Resources::valid)
+            && self
+                .cold_snapshot_restore
+                .as_ref()
+                .is_none_or(ColdSnapshotRestore::valid)
+            && (self.cold_snapshot_source.is_some()
+                == self.cold_snapshot_target_operation.is_some())
+            && self.cold_snapshot_source.as_ref().is_none_or(|source| {
+                source.database_id.len() == 20
+                    && source.database_id.as_bytes()[0].is_ascii_lowercase()
+                    && source
+                        .database_id
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                    && operation_valid(&source.snapshot_operation)
+                    && (1..=9_007_199_254_740_991).contains(&source.source_generation)
+                    && source.source_storage_generation > 0
+                    && source.source_storage_generation < self.storage_generation
+                    && (1..=4_194_304).contains(&source.manifest_bytes)
+                    && source.manifest_sha256.len() == 64
+                    && source
+                        .manifest_sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    && source.end.valid()
+            })
+            && self
+                .cold_snapshot_restore
+                .as_ref()
+                .is_none_or(|attestation| {
+                    self.cold_snapshot_source.as_ref().is_some_and(|source| {
+                        attestation.snapshot_operation == source.snapshot_operation
+                            && attestation.manifest_sha256 == source.manifest_sha256
+                            && attestation.system_identifier == source.end.system_identifier
+                            && attestation.timeline == source.end.timeline
+                            && attestation.checkpoint_lsn == source.end.checkpoint_lsn
+                    })
+                })
+            && self
+                .cold_snapshot_target_operation
+                .as_deref()
+                .is_none_or(operation_valid)
+            && (!self.cold_snapshot_serving
+                || (self.built
+                    && self.cold_snapshot_start_intent
+                    && self.cold_snapshot_restore.is_some()))
+            && (!self.cold_snapshot_start_intent || self.cold_snapshot_restore.is_some())
+            && (!self.cold_snapshot_committed || self.cold_snapshot_serving)
             && self.config.as_ref().is_none_or(|sha| {
                 sha.len() == 64
                     && sha

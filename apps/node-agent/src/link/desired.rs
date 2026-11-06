@@ -95,6 +95,8 @@ pub struct Desired {
     pub archive_verifications: Vec<Value>,
     /// Explicit cleanup authority also for work that never reached this node.
     pub archive_verification_cancellations: Vec<Value>,
+    pub cold_snapshot_captures: Vec<Value>,
+    pub cold_snapshot_capture_cancellations: Vec<Value>,
     /// `NodeDesiredDatabase` entries, each once.
     pub databases: Vec<Value>,
     /// Every database of the node (a full pull) or only the ones asked for. A database that a full
@@ -155,6 +157,24 @@ impl Desired {
                 self.archive_verification_cancellations.push(cancellation);
             }
         }
+        for capture in later.cold_snapshot_captures {
+            if self
+                .cold_snapshot_captures
+                .iter()
+                .all(|held| held["operation"] != capture["operation"])
+            {
+                self.cold_snapshot_captures.push(capture);
+            }
+        }
+        for cancellation in later.cold_snapshot_capture_cancellations {
+            if self
+                .cold_snapshot_capture_cancellations
+                .iter()
+                .all(|held| held["operation"] != cancellation["operation"])
+            {
+                self.cold_snapshot_capture_cancellations.push(cancellation);
+            }
+        }
         self.release = later.release;
         self.policy = later.policy;
         self.credentials_revision = later.credentials_revision;
@@ -198,6 +218,14 @@ async fn page(api: &Api, target: &str) -> Result<(Desired, Option<String>), Erro
             Some(requests) => serde_json::from_value(requests.clone())?,
             None => Vec::new(),
         },
+        cold_snapshot_captures: page["cold_snapshot_captures"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        cold_snapshot_capture_cancellations: page["cold_snapshot_capture_cancellations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
         archive_verification_cancellations: page["archive_verification_cancellations"]
             .as_array()
             .cloned()

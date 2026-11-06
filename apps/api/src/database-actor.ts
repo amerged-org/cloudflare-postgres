@@ -129,6 +129,10 @@ export const GATEWAY_COLUMNS = (region: string, node: string) =>
   `CASE WHEN ${node}.gateway_url IS NOT NULL THEN ${node}.gateway_url ELSE ${region}.gateway_url END gateway_url,CASE WHEN ${node}.gateway_url IS NOT NULL THEN NULL ELSE ${region}.gateway_binding END gateway_binding`;
 export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.storage_generation,d.storage_residency,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
   d.runtime_json,COALESCE(e.route_revision,1) route_revision,r.name role_name,g.id,${GATEWAY_COLUMNS("g", "n")},n.id node_id,n.lost_at,
+  EXISTS(SELECT 1 FROM database_cold_storage cr JOIN cold_storage_operations co ON co.id=cr.operation
+    WHERE cr.operation=d.storage_operation_id AND cr.database_id=d.id AND cr.project_id=d.project_id
+      AND cr.manual_resume_requested=1 AND cr.wake_requested=1 AND co.status IN('pending','running')
+      AND cr.phase IN('cancelling','retiring','archived','waiting_capacity','restoring','activating')) cold_resume_authorized,
   CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL)
     AND NOT EXISTS(SELECT 1 FROM database_replacements p WHERE p.database_id=d.id AND p.phase IN('proving','restoring','rolling_back')) THEN 0 ELSE 1 END admission_blocked
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
@@ -157,6 +161,7 @@ interface AdmissionRow {
   node_id: string | null;
   lost_at: string | null;
   admission_blocked: number;
+  cold_resume_authorized: number;
 }
 
 function admittedRoute(
@@ -221,7 +226,7 @@ export class DatabaseActor extends DurableObject<Env> {
     string,
     {
       deadline: number;
-      resolve: (ready: boolean) => void;
+      resolve: (outcome: "ready" | "local" | "failed") => void;
       owner: object;
       operation: string;
     }
@@ -1534,7 +1539,7 @@ export class DatabaseActor extends DurableObject<Env> {
       const cold = this.coldWaiters.get(waiterId);
       if (cold?.owner === owner) {
         this.coldWaiters.delete(waiterId);
-        cold.resolve(false);
+        cold.resolve("failed");
         this.interruptColdPoll?.();
       }
     }
@@ -1560,22 +1565,26 @@ export class DatabaseActor extends DurableObject<Env> {
         for (const [key, waiter] of this.coldWaiters)
           if (waiter.deadline <= Date.now()) {
             this.coldWaiters.delete(key);
-            waiter.resolve(false);
+            waiter.resolve("failed");
           }
         if (!this.coldWaiters.size) break;
-        const outcomes = new Map<string, "pending" | "ready" | "failed">();
+        const outcomes = new Map<
+          string,
+          "pending" | "ready" | "local" | "failed"
+        >();
         for (const operation of new Set(
           [...this.coldWaiters.values()].map((waiter) => waiter.operation),
         )) {
           try {
             let outcome = await readColdStorageWake(this.env, id, operation);
-            if (outcome === "ready") {
+            if (outcome === "ready" || outcome === "local") {
               const state = this.admissionState();
               // The D1 cutover precedes publication. Hold the original request through that
               // barrier instead of releasing it into a transient not-ready refusal.
               if (
                 state?.barrier ||
-                !state?.snapshot?.admissible ||
+                !state?.snapshot ||
+                (outcome === "ready" && !state.snapshot.admissible) ||
                 (state.snapshot.storage_residency ?? "local") !== "local"
               )
                 outcome = "pending";
@@ -1588,9 +1597,13 @@ export class DatabaseActor extends DurableObject<Env> {
         }
         for (const [key, waiter] of this.coldWaiters) {
           const outcome = outcomes.get(waiter.operation);
-          if (outcome === "ready" || outcome === "failed") {
+          if (
+            outcome === "ready" ||
+            outcome === "local" ||
+            outcome === "failed"
+          ) {
             this.coldWaiters.delete(key);
-            waiter.resolve(outcome === "ready" && waiter.deadline > Date.now());
+            waiter.resolve(waiter.deadline > Date.now() ? outcome : "failed");
           }
         }
         if (!this.coldWaiters.size) break;
@@ -1615,7 +1628,7 @@ export class DatabaseActor extends DurableObject<Env> {
         });
       }
     } catch {
-      for (const waiter of this.coldWaiters.values()) waiter.resolve(false);
+      for (const waiter of this.coldWaiters.values()) waiter.resolve("failed");
       this.coldWaiters.clear();
     }
   }
@@ -1660,7 +1673,11 @@ export class DatabaseActor extends DurableObject<Env> {
       if ("ok" in current) return current;
       if (
         current.desired_state === "suspended" &&
-        current.suspension_reason !== "idle"
+        current.suspension_reason !== "idle" &&
+        !(
+          current.storage_residency !== "local" &&
+          current.cold_resume_authorized === 1
+        )
       )
         return { ok: false, sqlstate: "57P03" };
       if (current.storage_residency !== "local") {
@@ -1691,7 +1708,7 @@ export class DatabaseActor extends DurableObject<Env> {
           this.coldWaiters.has(options.waiterId)
         )
           return { ok: false, sqlstate: "57P03" };
-        const pending = new Promise<boolean>((resolve) =>
+        const pending = new Promise<"ready" | "local" | "failed">((resolve) =>
           this.coldWaiters.set(options.waiterId, {
             deadline,
             resolve,
@@ -1700,7 +1717,10 @@ export class DatabaseActor extends DurableObject<Env> {
           }),
         );
         this.startColdPolling(id.data);
-        return (await pending)
+        const outcome = await pending;
+        if (outcome === "local")
+          return this.waitForAwake(databaseId, user, options, owner);
+        return outcome === "ready"
           ? this.admit(id.data, role.data)
           : { ok: false, sqlstate: "57P03" };
       }
@@ -1914,7 +1934,7 @@ export class DatabaseActor extends DurableObject<Env> {
     const cold = this.coldWaiters.get(waiterId);
     if (cold) {
       this.coldWaiters.delete(waiterId);
-      cold.resolve(false);
+      cold.resolve("failed");
       this.interruptColdPoll?.();
       return true;
     }

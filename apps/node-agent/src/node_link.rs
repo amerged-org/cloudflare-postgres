@@ -101,6 +101,10 @@ pub fn contract_valid(name: &str, value: &Value) -> bool {
         && match name {
             "NodeDesiredPage" => page_rules(value),
             "ArchiveVerificationRequest" => verification_request_rules(value),
+            "ColdSnapshotManifest" => {
+                serde_json::from_value::<crate::archive::cold_snapshot::Manifest>(value.clone())
+                    .is_ok_and(|manifest| manifest.validate().is_ok())
+            }
             "NodeEnrollmentRequest" => public_key_canonical(&value["public_key"]),
             "NodeObservationReport" => observation_rules(value),
             "AgentLinkMessage" => value["type"] != "sample" || sample_rules(&value["sample"]),
@@ -384,25 +388,19 @@ pub fn event_valid(event: &Value) -> bool {
 fn verification_request_rules(request: &Value) -> bool {
     let source = &request["source"];
     source["database_id"] == request["database_id"]
-        && source["path"]
-            .as_str()
-            .and_then(archive_path)
-            .is_some_and(|archive| {
-                Some(archive.database) == request["database_id"].as_str()
-                    && Some(archive.generation) == request["source_storage_generation"].as_u64()
-            })
+        && source["snapshot_operation"] == request["operation"]
+        && source["source_generation"] == request["source_generation"]
+        && source["source_storage_generation"] == request["source_storage_generation"]
 }
 
 fn page_rules(page: &Value) -> bool {
     let region = page["node"]["region_id"].as_str();
     let verifications = array(&page["archive_verifications"]);
-    if !verifications.iter().all(|request| {
-        verification_request_rules(request)
-            && request["source"]["path"]
-                .as_str()
-                .and_then(archive_path)
-                .is_some_and(|archive| Some(archive.region) == region)
-    }) {
+    if !verifications.iter().all(verification_request_rules)
+        || array(&page["cold_snapshot_captures"])
+            .iter()
+            .any(|capture| capture["source_node_id"] != page["node"]["id"])
+    {
         return false;
     }
     let mut served: HashMap<&str, u64> = HashMap::new();
@@ -421,6 +419,7 @@ fn page_rules(page: &Value) -> bool {
             || archive.generation != storage
             || Some(archive.region) != region
             || !origin_valid(&db["origin"], id, storage)
+            || (db["origin"]["kind"] == "rehydrate" && db["cold_snapshot_pending"] != true)
             || !roles_valid(db)
         {
             return false;
@@ -429,7 +428,8 @@ fn page_rules(page: &Value) -> bool {
     let orders = page["orders"].as_array().into_iter().flatten();
     // A fenced node's page holds no database and no release, and only fence and superseded orders.
     if orders.clone().any(|order| order["type"] == "fence")
-        && (!verifications.is_empty()
+        && (!array(&page["cold_snapshot_captures"]).is_empty()
+            || !verifications.is_empty()
             || !served.is_empty()
             || !page["release"].is_null()
             || !page["next"].is_null()
@@ -471,13 +471,22 @@ fn origin_valid(origin: &Value, id: &str, storage: u64) -> bool {
     let Some(source_id) = source["database_id"].as_str() else {
         return false;
     };
+    if kind == Some("rehydrate") {
+        return source_id == id
+            && source["source_storage_generation"]
+                .as_u64()
+                .is_some_and(|generation| generation < storage)
+            && source.get("path").is_none()
+            && source.get("target_time").is_none()
+            && source.get("credential").is_none();
+    }
     let Some(from) = source["path"].as_str().and_then(archive_path) else {
         return false;
     };
     from.database == source_id
         && match kind {
             Some("restore") => source_id != id && source.get("end").is_none(),
-            Some("move" | "rehydrate") => {
+            Some("move") => {
                 source_id == id && from.generation < storage && source.get("target_time").is_none()
             }
             Some("replace") => {

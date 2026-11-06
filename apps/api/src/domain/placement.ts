@@ -276,8 +276,8 @@ function pendingColdSql(
   sampleAt: string,
 ): string {
   return `COALESCE((SELECT SUM(r.${resource}) FROM database_cold_storage c JOIN database_resources r ON r.database_id=c.database_id
-    WHERE (c.verification_node_id=${node}.id AND (c.phase='verifying' OR (c.phase IN('failed','cancelled') AND EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.operation=c.operation AND pin.released_at IS NULL))))
-       OR (c.target_node_id=${node}.id AND (c.phase='restoring' OR (c.phase='failed' AND NOT EXISTS(SELECT 1 FROM lifecycle_orders l WHERE l.node_id=c.target_node_id AND l.database_id=c.database_id AND l.storage_generation=c.target_storage_generation AND l.type='superseded' AND l.remove_volume=1 AND l.result_status='done'))))
+    WHERE (c.verification_node_id=${node}.id AND (c.phase IN('capturing','verifying','cancelling') OR (c.phase IN('failed','cancelled') AND EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.operation=c.operation AND pin.released_at IS NULL))))
+       OR (c.target_node_id=${node}.id AND (${resource === "memory_mib" ? "c.phase='restoring'" : "c.phase IN('restoring','activating')"} OR (c.phase='failed' AND NOT EXISTS(SELECT 1 FROM lifecycle_orders l WHERE l.node_id=c.target_node_id AND l.database_id=c.database_id AND l.storage_generation=c.target_storage_generation AND l.type='superseded' AND l.remove_volume=1 AND l.result_status='done'))))
        ${resource === "storage_mib" ? `OR (c.target_node_id=${node}.id AND c.phase='succeeded' AND c.completed_at>${sampleAt})` : ""}),0)`;
 }
 function pendingMemorySql(node: string, sampleAt: string): string {

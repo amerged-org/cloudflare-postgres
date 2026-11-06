@@ -25,12 +25,14 @@ export async function deleteUnpinnedArchiveKeys<T>(
        WHERE reader.source_archive_path=? AND reader.verified_at IS NULL AND op.status IN('pending','running'))
      AND NOT EXISTS(SELECT 1 FROM database_replacements reader WHERE reader.source_archive_path=? AND reader.phase IN('proving','restoring','rolling_back'))
      AND NOT EXISTS(SELECT 1 FROM database_moves reader WHERE reader.source_archive_path=? AND reader.status IN('proving','restoring'))
+     AND NOT EXISTS(SELECT 1 FROM database_cold_storage reader WHERE reader.source_archive_path=? AND reader.kind='rehydrate' AND reader.phase IN('waiting_capacity','restoring','activating'))
      ON CONFLICT(archive_path) DO NOTHING`,
   )
     .bind(
       archivePath,
       token,
       new Date(now).toISOString(),
+      archivePath,
       archivePath,
       archivePath,
       archivePath,

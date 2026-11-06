@@ -38,6 +38,7 @@ import { nodeObservations } from "../domain/node-observations.ts";
 import { getNodePolicy, setNodePolicy } from "../domain/node-policy.ts";
 import { NODE_HEADER, NODE_UID_HEADER } from "../node-actor.ts";
 import { nodeActor } from "../domain/node-hints.ts";
+import { registerNodeColdSnapshots } from "./node-cold-snapshots.ts";
 
 const json = (schema: z.ZodType) => ({ "application/json": { schema } });
 const errors = Object.fromEntries(
@@ -74,6 +75,7 @@ const node = [{ NodeBearer: [] }];
 
 export function registerNodeLink(app: ApiApp): void {
   app.use("/node/v1/*", nodeAuthentication);
+  registerNodeColdSnapshots(app);
   app.openAPIRegistry.registerComponent("securitySchemes", "NodeBearer", {
     type: "http",
     scheme: "bearer",

@@ -45,6 +45,7 @@ const stagedObjects: string[] = [];
 const qualifiedNativeReleases: string[] = [];
 const nativeTestBindings: Partial<Env> = {};
 export async function cleanupFixtures(): Promise<void> {
+  await env.DB.prepare("DELETE FROM cold_storage_cursors").run();
   if (stagedObjects.length > 0)
     await env.ARCHIVE.delete(stagedObjects.splice(0));
   for (const fixture of fixtures.splice(0)) {
@@ -85,6 +86,9 @@ export async function cleanupFixtures(): Promise<void> {
         project,
         other,
       ),
+      env.DB.prepare(
+        `DELETE FROM cold_snapshot_chunks WHERE operation IN(SELECT operation FROM database_cold_storage WHERE ${databaseScope})`,
+      ).bind(project, other),
       env.DB.prepare(
         `DELETE FROM database_cold_storage WHERE ${databaseScope}`,
       ).bind(project, other),

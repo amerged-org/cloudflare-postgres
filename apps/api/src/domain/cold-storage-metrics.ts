@@ -10,6 +10,7 @@ interface ArchiveMeasurement {
   archive_path: string;
   region_id: string;
   sample: string | null;
+  snapshot: string | null;
 }
 interface OperationCounts {
   archives_removed: number;
@@ -36,6 +37,9 @@ export interface ColdStorageMetrics {
   archived_backup_unknown: number;
   archived_backup_oldest_observed_at: string | null;
   archived_backup_newest_observed_at: string | null;
+  archived_snapshot_bytes: number | null;
+  archived_snapshot_measured: number;
+  archived_snapshot_unknown: number;
   released_physical_bytes: null;
 }
 
@@ -61,10 +65,17 @@ export async function readColdStorageMetrics(
     ).bind(cutoff, at),
     env.DB.prepare(
       `SELECT d.id,d.archive_path,d.region_id,
+      (SELECT json_object('sealed_at',snap.snapshot_sealed_at,'manifest_bytes',snap.snapshot_manifest_bytes,
+        'total_bytes',snap.snapshot_total_bytes,'chunk_count',snap.snapshot_chunk_count,
+        'cleanup_fenced_at',snap.cleanup_fenced_at,'retired_at',snap.snapshot_payload_retired_at,
+        'committed_count',(SELECT COUNT(*) FROM cold_snapshot_chunks chunk WHERE chunk.operation=snap.operation AND chunk.state='committed' AND chunk.r2_version IS NOT NULL AND chunk.committed_at IS NOT NULL),
+        'committed_bytes',(SELECT SUM(size_bytes) FROM cold_snapshot_chunks chunk WHERE chunk.operation=snap.operation AND chunk.state='committed' AND chunk.r2_version IS NOT NULL AND chunk.committed_at IS NOT NULL))
+       FROM database_cold_storage snap WHERE snap.operation=CASE WHEN current.kind='archive' THEN current.operation ELSE current.source_operation END) snapshot,
       (SELECT json_object('producer_id',s.producer_id,'observed_at',s.observed_at,'bytes',json_extract(s.payload,'$.backup_bytes'))
        FROM usage_samples s WHERE s.database_id=d.id AND s.source='backup'
        ORDER BY s.observed_at DESC,s.sequence DESC,s.producer_id DESC LIMIT 1) sample
-      FROM databases d JOIN projects p ON p.id=d.project_id WHERE d.storage_residency='archived' AND d.deleted_at IS NULL
+      FROM databases d JOIN projects p ON p.id=d.project_id LEFT JOIN database_cold_storage current ON current.operation=d.storage_operation_id
+      WHERE d.storage_residency='archived' AND d.deleted_at IS NULL
         AND d.desired_state<>'deleted' AND p.deleted_at IS NULL ORDER BY d.id LIMIT ?`,
     ).bind(COLD_STORAGE_METRIC_SAMPLE_LIMIT),
   ]);
@@ -84,7 +95,42 @@ export async function readColdStorageMetrics(
     total = 0,
     oldest: string | null = null,
     newest: string | null = null;
+  let snapshotMeasured = 0,
+    snapshotBytes = 0;
   for (const row of archives!.results as unknown as ArchiveMeasurement[]) {
+    if (row.snapshot !== null) {
+      const snapshot = JSON.parse(row.snapshot) as {
+        sealed_at: string | null;
+        manifest_bytes: number | null;
+        total_bytes: number | null;
+        chunk_count: number | null;
+        cleanup_fenced_at: string | null;
+        retired_at: string | null;
+        committed_count: number;
+        committed_bytes: number | null;
+      };
+      if (
+        snapshot.sealed_at !== null &&
+        snapshot.cleanup_fenced_at === null &&
+        snapshot.retired_at === null &&
+        snapshot.manifest_bytes !== null &&
+        Number.isSafeInteger(snapshot.manifest_bytes) &&
+        snapshot.manifest_bytes > 0 &&
+        snapshot.total_bytes !== null &&
+        Number.isSafeInteger(snapshot.total_bytes) &&
+        snapshot.total_bytes > 0 &&
+        snapshot.chunk_count !== null &&
+        snapshot.chunk_count > 0 &&
+        snapshot.committed_count === snapshot.chunk_count &&
+        snapshot.committed_bytes === snapshot.total_bytes &&
+        Number.isSafeInteger(
+          snapshotBytes + snapshot.committed_bytes + snapshot.manifest_bytes,
+        )
+      ) {
+        snapshotMeasured++;
+        snapshotBytes += snapshot.committed_bytes + snapshot.manifest_bytes;
+      }
+    }
     if (row.sample === null) continue;
     const sample = JSON.parse(row.sample) as {
       producer_id: string;
@@ -151,6 +197,10 @@ export async function readColdStorageMetrics(
     archived_backup_unknown: databases.archived - measured,
     archived_backup_oldest_observed_at: oldest,
     archived_backup_newest_observed_at: newest,
+    archived_snapshot_bytes:
+      snapshotMeasured === databases.archived ? snapshotBytes : null,
+    archived_snapshot_measured: snapshotMeasured,
+    archived_snapshot_unknown: databases.archived - snapshotMeasured,
     // Nominal LV sizes and a removal acknowledgment cannot establish reclaimed physical bytes.
     released_physical_bytes: null,
   };

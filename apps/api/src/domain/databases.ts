@@ -72,6 +72,7 @@ import {
 } from "./rows.ts";
 
 import { hintDatabases } from "./node-hints.ts";
+import { coldSnapshotStorageSql } from "./cold-snapshot-accounting.ts";
 export function hint(c: ApiContext, ids: string[]): void {
   // Hints are best effort; the node's own pull of its desired page remains authoritative.
   c.executionCtx.waitUntil(hintDatabases(c.env, ids).catch(() => 0));
@@ -363,7 +364,7 @@ export async function listDatabases(c: ApiContext): Promise<Response> {
     bindings.push(query.observed_state);
   }
   const result = await c.env.DB.prepare(
-    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${latestFilesystemSampleSql("d")} filesystem_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")} FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${latestFilesystemSampleSql("d")} filesystem_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")},${coldSnapshotStorageSql("d")} cold_snapshot_storage_json FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
   )
     .bind(...bindings, ...cursor.bindings, pagination.limit + 1)
     .all<DatabaseRow>();
@@ -992,6 +993,18 @@ export async function deleteDatabase(
               `UPDATE operations SET status='failed',completed_at=?,updated_at=?,error_code='superseded',error_message='Unplaced creation cancelled by deletion'
           WHERE database_id=? AND kind='database.create' AND status='pending' AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id IS NULL AND d.observed_state='deleted') AND (${guard.sql})`,
             ).bind(now, now, id, ...guard.bindings),
+            c.env.DB.prepare(
+              `UPDATE database_cold_storage SET snapshot_retained_until=(SELECT MAX(COALESCE(database_cold_storage.snapshot_retained_until,''),retained.expires_at)
+                 FROM retained_archives retained WHERE retained.source_database_id=database_cold_storage.database_id)
+               WHERE database_id=? AND kind='archive' AND phase='archived' AND snapshot_payload_retired_at IS NULL
+                 AND EXISTS(SELECT 1 FROM databases d JOIN retained_archives retained ON retained.source_database_id=d.id
+                   WHERE d.id=database_cold_storage.database_id AND d.storage_residency='archived' AND d.desired_state='deleted'
+                     AND d.observed_state='deleted' AND d.deleted_at=? AND retained.deleted_at=d.deleted_at
+                     AND (d.storage_operation_id=database_cold_storage.operation OR EXISTS(SELECT 1 FROM database_cold_storage current
+                       WHERE current.operation=d.storage_operation_id AND current.source_operation=database_cold_storage.operation)))
+                 AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=database_cold_storage.database_id AND kind='database.delete' AND status='succeeded')
+                 AND (${guard.sql})`,
+            ).bind(id, now, op, ...guard.bindings),
             c.env.DB.prepare(
               `UPDATE archive_pins SET released_at=? WHERE database_id=? AND released_at IS NULL
                AND operation IN(SELECT cs.operation FROM database_cold_storage cs JOIN databases d ON d.id=cs.database_id

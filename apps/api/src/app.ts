@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
 import {
+  COLD_SNAPSHOT_API_PREFIX,
   ERROR_HTTP_STATUS,
   errorBody,
   retryAfterSeconds,
@@ -137,6 +138,9 @@ export const DIAGNOSTIC_ROUTES = new Set([
   "/node/v1/data-events",
   "/node/v1/diagnostics",
   "/node/v1/archive-credentials/:id",
+  "/node/v1/cold-snapshots/:operation/manifest",
+  "/node/v1/cold-snapshots/:operation/chunks/:index",
+  "/node/v1/cold-snapshots/:operation/seal",
   "/node/v1/openapi.json",
 ]);
 
@@ -157,6 +161,7 @@ export function apiError(
 async function readJsonBody(
   request: Request,
   maximum: number,
+  binary = false,
 ): Promise<{ text: string; bytes: Uint8Array }> {
   const reader = request.body!.getReader();
   const chunks: Uint8Array[] = [];
@@ -190,9 +195,11 @@ async function readJsonBody(
       at += chunk.byteLength;
     }
     return {
-      text: new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
-        bytes,
-      ),
+      text: binary
+        ? ""
+        : new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+            bytes,
+          ),
       bytes,
     };
   } catch (error) {
@@ -301,6 +308,17 @@ export function createApp(): ApiApp {
   app.use("/node/v1/*", nodeLookup);
   app.use("*", async (c, next) => {
     if (c.req.raw.body !== null) {
+      // Only the exact authenticated-node chunk route carries binary database bytes. Every
+      // other endpoint retains JSON decoding and validation. Authentication below binds the
+      // original bytes, including invalid UTF-8, rather than a re-encoded representation.
+      const pathname = new URL(c.req.url).pathname;
+      const binary =
+        c.req.method === "PUT" &&
+        c.get("nodeClaim") !== undefined &&
+        pathname.startsWith(COLD_SNAPSHOT_API_PREFIX) &&
+        /^op_[a-z0-9]{20}\/chunks\/(?:0|[1-9][0-9]{0,4})$/.test(
+          pathname.slice(COLD_SNAPSHOT_API_PREFIX.length),
+        );
       // Only a request that names an enrolled node's key may carry a node's larger body; the
       // installer's progress and the enrollment are read like any other request.
       const { text, bytes } = await readJsonBody(
@@ -308,6 +326,7 @@ export function createApp(): ApiApp {
         c.get("nodeClaim") === undefined
           ? JSON_BODY_MAX_BYTES
           : NODE_JSON_BODY_MAX_BYTES,
+        binary,
       );
       // The bytes a node signed are the bytes it sent, not what parsing leaves of them.
       c.set("body", bytes);
@@ -315,22 +334,30 @@ export function createApp(): ApiApp {
       if (bytes.byteLength !== 0) {
         const mediaType = c.req.header("Content-Type")?.split(";")[0]?.trim();
         if (
-          mediaType === undefined ||
-          !/^application\/(?:[a-z0-9.+-]+\+)?json$/i.test(mediaType)
+          binary
+            ? mediaType?.toLowerCase() !== "application/octet-stream"
+            : mediaType === undefined ||
+              !/^application\/(?:[a-z0-9.+-]+\+)?json$/i.test(mediaType)
         ) {
           throw new ApiError(
             "invalid_request",
-            "Content-Type must be application/json",
+            binary
+              ? "Content-Type must be application/octet-stream"
+              : "Content-Type must be application/json",
           );
         }
-        try {
-          JSON.parse(text);
-        } catch {
-          throw new ApiError("invalid_request", "Malformed JSON body");
+        if (!binary) {
+          try {
+            JSON.parse(text);
+          } catch {
+            throw new ApiError("invalid_request", "Malformed JSON body");
+          }
         }
       }
       // Preserve the bounded body for validators and idempotency request hashing.
-      c.req.raw = new Request(c.req.raw, { body: text });
+      c.req.raw = new Request(c.req.raw, {
+        body: binary ? bytes.slice().buffer : text,
+      });
     }
     await next();
   });

@@ -193,6 +193,401 @@
         }
       }
     },
+    "ColdSnapshotManifest": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "version": { "type": "number", "const": 1 },
+        "operation": { "$ref": "#/$defs/OperationId" },
+        "database_id": { "$ref": "#/$defs/DatabaseId" },
+        "source_generation": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "source_storage_generation": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "pg_major": { "type": "number", "const": 18 },
+        "end": {
+          "type": "object",
+          "properties": {
+            "system_identifier": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,19}$"
+            },
+            "timeline": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            "checkpoint_lsn": {
+              "type": "string",
+              "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+            },
+            "last_archived_segment": {
+              "type": "string",
+              "pattern": "^[0-9A-F]{24}$"
+            },
+            "proven_at": { "$ref": "#/$defs/Timestamp" }
+          },
+          "required": [
+            "system_identifier",
+            "timeline",
+            "checkpoint_lsn",
+            "last_archived_segment",
+            "proven_at"
+          ],
+          "additionalProperties": false
+        },
+        "total_bytes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 68719476736
+        },
+        "directories": {
+          "maxItems": 4096,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^[A-Za-z0-9_.-]+(?:\\/[A-Za-z0-9_.-]+)*$"
+          }
+        },
+        "files": {
+          "minItems": 2,
+          "maxItems": 16384,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024,
+                "pattern": "^[A-Za-z0-9_.-]+(?:\\/[A-Za-z0-9_.-]+)*$"
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 68719476736
+              },
+              "size_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 68719476736
+              },
+              "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+            },
+            "required": ["path", "offset", "size_bytes", "sha256"],
+            "additionalProperties": false
+          }
+        },
+        "chunks": {
+          "minItems": 1,
+          "maxItems": 16384,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "index": { "type": "integer", "minimum": 0, "maximum": 16383 },
+              "size_bytes": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 4194304
+              },
+              "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+            },
+            "required": ["index", "size_bytes", "sha256"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "version",
+        "operation",
+        "database_id",
+        "source_generation",
+        "source_storage_generation",
+        "pg_major",
+        "end",
+        "total_bytes",
+        "directories",
+        "files",
+        "chunks"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
+    "ColdSnapshotSource": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "database_id": { "$ref": "#/$defs/DatabaseId" },
+        "snapshot_operation": { "$ref": "#/$defs/OperationId" },
+        "source_generation": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "source_storage_generation": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "manifest_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "manifest_bytes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 4194304
+        },
+        "end": {
+          "type": "object",
+          "properties": {
+            "system_identifier": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,19}$"
+            },
+            "timeline": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            "checkpoint_lsn": {
+              "type": "string",
+              "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+            },
+            "last_archived_segment": {
+              "type": "string",
+              "pattern": "^[0-9A-F]{24}$"
+            },
+            "proven_at": { "$ref": "#/$defs/Timestamp" }
+          },
+          "required": [
+            "system_identifier",
+            "timeline",
+            "checkpoint_lsn",
+            "last_archived_segment",
+            "proven_at"
+          ]
+        }
+      },
+      "required": [
+        "database_id",
+        "snapshot_operation",
+        "source_generation",
+        "source_storage_generation",
+        "manifest_sha256",
+        "manifest_bytes",
+        "end"
+      ],
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
+    "ColdSnapshotCaptureRequest": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "operation": { "$ref": "#/$defs/OperationId" },
+        "database_id": { "$ref": "#/$defs/DatabaseId" },
+        "source_node_id": { "$ref": "#/$defs/NodeId" },
+        "source_generation": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "source_storage_generation": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "end": {
+          "type": "object",
+          "properties": {
+            "system_identifier": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,19}$"
+            },
+            "timeline": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            "checkpoint_lsn": {
+              "type": "string",
+              "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+            },
+            "last_archived_segment": {
+              "type": "string",
+              "pattern": "^[0-9A-F]{24}$"
+            },
+            "proven_at": { "$ref": "#/$defs/Timestamp" }
+          },
+          "required": [
+            "system_identifier",
+            "timeline",
+            "checkpoint_lsn",
+            "last_archived_segment",
+            "proven_at"
+          ]
+        }
+      },
+      "required": [
+        "operation",
+        "database_id",
+        "source_node_id",
+        "source_generation",
+        "source_storage_generation",
+        "end"
+      ],
+      "$defs": {
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
+    "ColdSnapshotCaptureResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "operation": { "$ref": "#/$defs/OperationId" },
+            "database_id": { "$ref": "#/$defs/DatabaseId" },
+            "source_generation": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "source_storage_generation": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "observed_at": { "$ref": "#/$defs/Timestamp" },
+            "status": { "type": "string", "const": "captured" },
+            "manifest_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "manifest_bytes": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 4194304
+            },
+            "end": {
+              "type": "object",
+              "properties": {
+                "system_identifier": {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]{0,19}$"
+                },
+                "timeline": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295
+                },
+                "checkpoint_lsn": {
+                  "type": "string",
+                  "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+                },
+                "last_archived_segment": {
+                  "type": "string",
+                  "pattern": "^[0-9A-F]{24}$"
+                },
+                "proven_at": { "$ref": "#/$defs/Timestamp" }
+              },
+              "required": [
+                "system_identifier",
+                "timeline",
+                "checkpoint_lsn",
+                "last_archived_segment",
+                "proven_at"
+              ],
+              "additionalProperties": false
+            },
+            "cleaned_up": { "type": "boolean", "const": true }
+          },
+          "required": [
+            "operation",
+            "database_id",
+            "source_generation",
+            "source_storage_generation",
+            "observed_at",
+            "status",
+            "manifest_sha256",
+            "manifest_bytes",
+            "end",
+            "cleaned_up"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "operation": { "$ref": "#/$defs/OperationId" },
+            "database_id": { "$ref": "#/$defs/DatabaseId" },
+            "source_generation": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "source_storage_generation": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "observed_at": { "$ref": "#/$defs/Timestamp" },
+            "status": { "type": "string", "const": "failed" },
+            "reason": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
+            "cleaned_up": { "type": "boolean" }
+          },
+          "required": [
+            "operation",
+            "database_id",
+            "source_generation",
+            "source_storage_generation",
+            "observed_at",
+            "status",
+            "reason",
+            "cleaned_up"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "$defs": {
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
     "ArchiveVerificationRequest": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
@@ -214,18 +609,25 @@
           "type": "object",
           "properties": {
             "database_id": { "$ref": "#/$defs/DatabaseId" },
-            "path": {
-              "type": "string",
-              "pattern": "^s3:\\/\\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\\/([a-z][a-z0-9-]{1,30}[a-z0-9])\\/([a-z][a-z0-9]{19})\\/g([1-9][0-9]{0,15})-(op_[a-z0-9]{20})$"
+            "snapshot_operation": { "$ref": "#/$defs/OperationId" },
+            "source_generation": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
             },
-            "backup_id": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}$" },
-            "credential": {
-              "type": "object",
-              "properties": {
-                "id": { "type": "string", "pattern": "^crd_[a-z0-9]{20}$" },
-                "expires_at": { "$ref": "#/$defs/Timestamp" }
-              },
-              "required": ["id", "expires_at"]
+            "source_storage_generation": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "manifest_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "manifest_bytes": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 4194304
             },
             "end": {
               "type": "object",
@@ -258,9 +660,16 @@
               ]
             }
           },
-          "required": ["database_id", "path", "backup_id", "credential", "end"]
+          "required": [
+            "database_id",
+            "snapshot_operation",
+            "source_generation",
+            "source_storage_generation",
+            "manifest_sha256",
+            "manifest_bytes",
+            "end"
+          ]
         },
-        "inventory_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "resources": { "$ref": "#/$defs/DatabaseEffectiveResources" },
         "settings": {
           "type": "object",
@@ -286,7 +695,6 @@
         "source_generation",
         "source_storage_generation",
         "source",
-        "inventory_sha256",
         "resources",
         "settings"
       ],
@@ -367,15 +775,13 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 9007199254740991
-        },
-        "inventory_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
       },
       "required": [
         "operation",
         "database_id",
         "source_generation",
-        "source_storage_generation",
-        "inventory_sha256"
+        "source_storage_generation"
       ],
       "$defs": {
         "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
@@ -400,13 +806,12 @@
               "minimum": 1,
               "maximum": 9007199254740991
             },
-            "inventory_sha256": {
+            "observed_at": { "$ref": "#/$defs/Timestamp" },
+            "status": { "type": "string", "const": "verified" },
+            "manifest_sha256": {
               "type": "string",
               "pattern": "^[0-9a-f]{64}$"
             },
-            "observed_at": { "$ref": "#/$defs/Timestamp" },
-            "status": { "type": "string", "const": "verified" },
-            "backup_id": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}$" },
             "end": {
               "type": "object",
               "properties": {
@@ -447,6 +852,10 @@
               "minimum": 1,
               "maximum": 4294967295
             },
+            "checkpoint_lsn": {
+              "type": "string",
+              "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+            },
             "cleaned_up": { "type": "boolean", "const": true }
           },
           "required": [
@@ -454,13 +863,13 @@
             "database_id",
             "source_generation",
             "source_storage_generation",
-            "inventory_sha256",
             "observed_at",
             "status",
-            "backup_id",
+            "manifest_sha256",
             "end",
             "system_identifier",
             "timeline",
+            "checkpoint_lsn",
             "cleaned_up"
           ],
           "additionalProperties": false
@@ -480,12 +889,14 @@
               "minimum": 1,
               "maximum": 9007199254740991
             },
-            "inventory_sha256": {
-              "type": "string",
-              "pattern": "^[0-9a-f]{64}$"
-            },
             "observed_at": { "$ref": "#/$defs/Timestamp" },
             "status": { "type": "string", "const": "failed" },
+            "manifest_sha256": {
+              "anyOf": [
+                { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                { "type": "null" }
+              ]
+            },
             "reason": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
             "cleaned_up": { "type": "boolean" }
           },
@@ -494,7 +905,6 @@
             "database_id",
             "source_generation",
             "source_storage_generation",
-            "inventory_sha256",
             "observed_at",
             "status",
             "reason",
@@ -506,6 +916,41 @@
       "$defs": {
         "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
         "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
+    "ColdSnapshotRestoreAttestation": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "snapshot_operation": { "$ref": "#/$defs/OperationId" },
+        "manifest_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "system_identifier": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,19}$"
+        },
+        "timeline": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "checkpoint_lsn": {
+          "type": "string",
+          "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+        },
+        "verified_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": [
+        "snapshot_operation",
+        "manifest_sha256",
+        "system_identifier",
+        "timeline",
+        "checkpoint_lsn",
+        "verified_at"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
         "Timestamp": {
           "type": "string",
           "format": "date-time",
@@ -1033,6 +1478,93 @@
             ]
           }
         },
+        "cold_snapshot_captures": {
+          "maxItems": 1,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "operation": { "$ref": "#/$defs/OperationId" },
+              "database_id": { "$ref": "#/$defs/DatabaseId" },
+              "source_node_id": { "$ref": "#/$defs/NodeId" },
+              "source_generation": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "source_storage_generation": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "end": {
+                "type": "object",
+                "properties": {
+                  "system_identifier": {
+                    "type": "string",
+                    "pattern": "^[1-9][0-9]{0,19}$"
+                  },
+                  "timeline": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4294967295
+                  },
+                  "checkpoint_lsn": {
+                    "type": "string",
+                    "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+                  },
+                  "last_archived_segment": {
+                    "type": "string",
+                    "pattern": "^[0-9A-F]{24}$"
+                  },
+                  "proven_at": { "$ref": "#/$defs/Timestamp" }
+                },
+                "required": [
+                  "system_identifier",
+                  "timeline",
+                  "checkpoint_lsn",
+                  "last_archived_segment",
+                  "proven_at"
+                ]
+              }
+            },
+            "required": [
+              "operation",
+              "database_id",
+              "source_node_id",
+              "source_generation",
+              "source_storage_generation",
+              "end"
+            ]
+          }
+        },
+        "cold_snapshot_capture_cancellations": {
+          "maxItems": 1,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "operation": { "$ref": "#/$defs/OperationId" },
+              "database_id": { "$ref": "#/$defs/DatabaseId" },
+              "source_generation": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "source_storage_generation": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "operation",
+              "database_id",
+              "source_generation",
+              "source_storage_generation"
+            ]
+          }
+        },
         "archive_verifications": {
           "maxItems": 1,
           "type": "array",
@@ -1056,24 +1588,25 @@
                 "type": "object",
                 "properties": {
                   "database_id": { "$ref": "#/$defs/DatabaseId" },
-                  "path": {
-                    "type": "string",
-                    "pattern": "^s3:\\/\\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\\/([a-z][a-z0-9-]{1,30}[a-z0-9])\\/([a-z][a-z0-9]{19})\\/g([1-9][0-9]{0,15})-(op_[a-z0-9]{20})$"
+                  "snapshot_operation": { "$ref": "#/$defs/OperationId" },
+                  "source_generation": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
                   },
-                  "backup_id": {
-                    "type": "string",
-                    "pattern": "^[0-9]{8}T[0-9]{6}$"
+                  "source_storage_generation": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
                   },
-                  "credential": {
-                    "type": "object",
-                    "properties": {
-                      "id": {
-                        "type": "string",
-                        "pattern": "^crd_[a-z0-9]{20}$"
-                      },
-                      "expires_at": { "$ref": "#/$defs/Timestamp" }
-                    },
-                    "required": ["id", "expires_at"]
+                  "manifest_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "manifest_bytes": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 4194304
                   },
                   "end": {
                     "type": "object",
@@ -1108,15 +1641,13 @@
                 },
                 "required": [
                   "database_id",
-                  "path",
-                  "backup_id",
-                  "credential",
+                  "snapshot_operation",
+                  "source_generation",
+                  "source_storage_generation",
+                  "manifest_sha256",
+                  "manifest_bytes",
                   "end"
                 ]
-              },
-              "inventory_sha256": {
-                "type": "string",
-                "pattern": "^[0-9a-f]{64}$"
               },
               "resources": { "$ref": "#/$defs/DatabaseEffectiveResources" },
               "settings": {
@@ -1143,7 +1674,6 @@
               "source_generation",
               "source_storage_generation",
               "source",
-              "inventory_sha256",
               "resources",
               "settings"
             ]
@@ -1166,18 +1696,13 @@
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
-              },
-              "inventory_sha256": {
-                "type": "string",
-                "pattern": "^[0-9a-f]{64}$"
               }
             },
             "required": [
               "operation",
               "database_id",
               "source_generation",
-              "source_storage_generation",
-              "inventory_sha256"
+              "source_storage_generation"
             ]
           }
         },
@@ -1248,6 +1773,7 @@
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
+              "cold_snapshot_pending": { "type": "boolean" },
               "pg_major": { "type": "number", "const": 18 },
               "resources": { "$ref": "#/$defs/DatabaseEffectiveResources" },
               "settings": {
@@ -1482,24 +2008,27 @@
                         "type": "object",
                         "properties": {
                           "database_id": { "$ref": "#/$defs/DatabaseId" },
-                          "path": {
-                            "type": "string",
-                            "pattern": "^s3:\\/\\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\\/([a-z][a-z0-9-]{1,30}[a-z0-9])\\/([a-z][a-z0-9]{19})\\/g([1-9][0-9]{0,15})-(op_[a-z0-9]{20})$"
+                          "snapshot_operation": {
+                            "$ref": "#/$defs/OperationId"
                           },
-                          "backup_id": {
-                            "type": "string",
-                            "pattern": "^[0-9]{8}T[0-9]{6}$"
+                          "source_generation": {
+                            "type": "integer",
+                            "exclusiveMinimum": 0,
+                            "maximum": 9007199254740991
                           },
-                          "credential": {
-                            "type": "object",
-                            "properties": {
-                              "id": {
-                                "type": "string",
-                                "pattern": "^crd_[a-z0-9]{20}$"
-                              },
-                              "expires_at": { "$ref": "#/$defs/Timestamp" }
-                            },
-                            "required": ["id", "expires_at"]
+                          "source_storage_generation": {
+                            "type": "integer",
+                            "exclusiveMinimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "manifest_sha256": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          },
+                          "manifest_bytes": {
+                            "type": "integer",
+                            "exclusiveMinimum": 0,
+                            "maximum": 4194304
                           },
                           "end": {
                             "type": "object",
@@ -1534,9 +2063,11 @@
                         },
                         "required": [
                           "database_id",
-                          "path",
-                          "backup_id",
-                          "credential",
+                          "snapshot_operation",
+                          "source_generation",
+                          "source_storage_generation",
+                          "manifest_sha256",
+                          "manifest_bytes",
                           "end"
                         ]
                       }
@@ -1861,7 +2392,9 @@
                   "no_recovery_point",
                   "archive_unusable",
                   "build_failed",
-                  "start_failed"
+                  "start_failed",
+                  "cold_snapshot_restart_required",
+                  "cold_activation_uncertain"
                 ]
               },
               "storage_bytes": {
@@ -1905,6 +2438,40 @@
                   { "type": "null" }
                 ]
               },
+              "cold_snapshot_restore": {
+                "type": "object",
+                "properties": {
+                  "snapshot_operation": { "$ref": "#/$defs/OperationId" },
+                  "manifest_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "system_identifier": {
+                    "type": "string",
+                    "pattern": "^[1-9][0-9]{0,19}$"
+                  },
+                  "timeline": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4294967295
+                  },
+                  "checkpoint_lsn": {
+                    "type": "string",
+                    "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+                  },
+                  "verified_at": { "$ref": "#/$defs/Timestamp" }
+                },
+                "required": [
+                  "snapshot_operation",
+                  "manifest_sha256",
+                  "system_identifier",
+                  "timeline",
+                  "checkpoint_lsn",
+                  "verified_at"
+                ],
+                "additionalProperties": false
+              },
+              "cold_snapshot_serving": { "type": "boolean" },
               "refusal": {
                 "type": "string",
                 "enum": ["power_busy", "power_archive", "power_outbox"]
@@ -2026,15 +2593,11 @@
                     "minimum": 1,
                     "maximum": 9007199254740991
                   },
-                  "inventory_sha256": {
-                    "type": "string",
-                    "pattern": "^[0-9a-f]{64}$"
-                  },
                   "observed_at": { "$ref": "#/$defs/Timestamp" },
                   "status": { "type": "string", "const": "verified" },
-                  "backup_id": {
+                  "manifest_sha256": {
                     "type": "string",
-                    "pattern": "^[0-9]{8}T[0-9]{6}$"
+                    "pattern": "^[0-9a-f]{64}$"
                   },
                   "end": {
                     "type": "object",
@@ -2076,6 +2639,10 @@
                     "minimum": 1,
                     "maximum": 4294967295
                   },
+                  "checkpoint_lsn": {
+                    "type": "string",
+                    "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+                  },
                   "cleaned_up": { "type": "boolean", "const": true }
                 },
                 "required": [
@@ -2083,13 +2650,13 @@
                   "database_id",
                   "source_generation",
                   "source_storage_generation",
-                  "inventory_sha256",
                   "observed_at",
                   "status",
-                  "backup_id",
+                  "manifest_sha256",
                   "end",
                   "system_identifier",
                   "timeline",
+                  "checkpoint_lsn",
                   "cleaned_up"
                 ],
                 "additionalProperties": false
@@ -2109,9 +2676,127 @@
                     "minimum": 1,
                     "maximum": 9007199254740991
                   },
-                  "inventory_sha256": {
+                  "observed_at": { "$ref": "#/$defs/Timestamp" },
+                  "status": { "type": "string", "const": "failed" },
+                  "manifest_sha256": {
+                    "anyOf": [
+                      { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                      { "type": "null" }
+                    ]
+                  },
+                  "reason": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9_]{1,64}$"
+                  },
+                  "cleaned_up": { "type": "boolean" }
+                },
+                "required": [
+                  "operation",
+                  "database_id",
+                  "source_generation",
+                  "source_storage_generation",
+                  "observed_at",
+                  "status",
+                  "reason",
+                  "cleaned_up"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "cold_snapshot_captures": {
+          "maxItems": 1,
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "operation": { "$ref": "#/$defs/OperationId" },
+                  "database_id": { "$ref": "#/$defs/DatabaseId" },
+                  "source_generation": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  },
+                  "source_storage_generation": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  },
+                  "observed_at": { "$ref": "#/$defs/Timestamp" },
+                  "status": { "type": "string", "const": "captured" },
+                  "manifest_sha256": {
                     "type": "string",
                     "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "manifest_bytes": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 4194304
+                  },
+                  "end": {
+                    "type": "object",
+                    "properties": {
+                      "system_identifier": {
+                        "type": "string",
+                        "pattern": "^[1-9][0-9]{0,19}$"
+                      },
+                      "timeline": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 4294967295
+                      },
+                      "checkpoint_lsn": {
+                        "type": "string",
+                        "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+                      },
+                      "last_archived_segment": {
+                        "type": "string",
+                        "pattern": "^[0-9A-F]{24}$"
+                      },
+                      "proven_at": { "$ref": "#/$defs/Timestamp" }
+                    },
+                    "required": [
+                      "system_identifier",
+                      "timeline",
+                      "checkpoint_lsn",
+                      "last_archived_segment",
+                      "proven_at"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "cleaned_up": { "type": "boolean", "const": true }
+                },
+                "required": [
+                  "operation",
+                  "database_id",
+                  "source_generation",
+                  "source_storage_generation",
+                  "observed_at",
+                  "status",
+                  "manifest_sha256",
+                  "manifest_bytes",
+                  "end",
+                  "cleaned_up"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "operation": { "$ref": "#/$defs/OperationId" },
+                  "database_id": { "$ref": "#/$defs/DatabaseId" },
+                  "source_generation": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  },
+                  "source_storage_generation": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
                   },
                   "observed_at": { "$ref": "#/$defs/Timestamp" },
                   "status": { "type": "string", "const": "failed" },
@@ -2126,7 +2811,6 @@
                   "database_id",
                   "source_generation",
                   "source_storage_generation",
-                  "inventory_sha256",
                   "observed_at",
                   "status",
                   "reason",
@@ -2369,7 +3053,7 @@
           "type": "array",
           "items": {
             "type": "string",
-            "enum": ["restore_in_place_v1", "cold_storage_v1"]
+            "enum": ["restore_in_place_v1", "cold_storage_v2"]
           }
         }
       },
@@ -3094,7 +3778,7 @@
               "type": "array",
               "items": {
                 "type": "string",
-                "enum": ["restore_in_place_v1", "cold_storage_v1"]
+                "enum": ["restore_in_place_v1", "cold_storage_v2"]
               }
             }
           },
@@ -3273,7 +3957,7 @@
                   "type": "array",
                   "items": {
                     "type": "string",
-                    "enum": ["restore_in_place_v1", "cold_storage_v1"]
+                    "enum": ["restore_in_place_v1", "cold_storage_v2"]
                   }
                 }
               },
@@ -3365,6 +4049,15 @@
   },
   "constants": {
     "NODE_PROTOCOL_VERSION": 1,
+    "COLD_SNAPSHOT_VERSION": 1,
+    "COLD_SNAPSHOT_CHUNK_BYTES": 4194304,
+    "COLD_SNAPSHOT_MANIFEST_MAX_BYTES": 4194304,
+    "COLD_SNAPSHOT_FILES_MAX": 16384,
+    "COLD_SNAPSHOT_DIRECTORIES_MAX": 4096,
+    "COLD_SNAPSHOT_CHUNKS_MAX": 16384,
+    "COLD_SNAPSHOT_TOTAL_MAX_BYTES": 68719476736,
+    "COLD_SNAPSHOT_API_PREFIX": "/node/v1/cold-snapshots/",
+    "COLD_SNAPSHOT_CAPABILITY": "cold_storage_v2",
     "NODE_API_PATHS": {
       "enroll": "/node/v1/enroll",
       "link": "/node/v1/link",
@@ -3376,7 +4069,8 @@
       "events": "/node/v1/events",
       "usage": "/node/v1/usage",
       "dataEvents": "/node/v1/data-events",
-      "diagnostics": "/node/v1/diagnostics"
+      "diagnostics": "/node/v1/diagnostics",
+      "coldSnapshots": "/node/v1/cold-snapshots/"
     },
     "NODE_ORDER_TYPES": ["wake", "move", "superseded", "fence", "maintenance"],
     "INSTALLER_PROGRESS_PATH": "/node/v1/installer/progress",
@@ -3466,7 +4160,9 @@
       "no_recovery_point",
       "archive_unusable",
       "build_failed",
-      "start_failed"
+      "start_failed",
+      "cold_snapshot_restart_required",
+      "cold_activation_uncertain"
     ],
     "INSTALLER_CHECKPOINTS": [
       "started",

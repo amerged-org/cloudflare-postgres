@@ -12,15 +12,20 @@ import {
   deliverArchiveCredential,
 } from "../../src/domain/archive-credentials.ts";
 import { startDatabaseMove } from "../../src/domain/database-moves.ts";
-import { cleanup, keyedEnv, lifecycle, PROOF } from "./lifecycle-fixture.ts";
+import { cleanupRetainedArchives } from "../../src/domain/retained-archives.ts";
+import { cleanup, keyedEnv, lifecycle } from "./lifecycle-fixture.ts";
 import { request } from "./fixtures.ts";
+import {
+  insertSnapshotArchive,
+  insertSnapshotRehydrate,
+} from "./cold-snapshot-fixture.ts";
 
 const objects = new Set<string>();
 afterEach(async () => {
   if (objects.size) await env.ARCHIVE.delete([...objects]);
   objects.clear();
   await env.DB.exec(
-    "DELETE FROM archive_retention_claims; DELETE FROM archive_pins; DELETE FROM database_cold_storage WHERE source_operation IS NOT NULL; DELETE FROM database_cold_storage; DELETE FROM cold_storage_operations;",
+    "DELETE FROM archive_retention_claims; DELETE FROM archive_pins; DELETE FROM cold_snapshot_chunks; DELETE FROM database_cold_storage WHERE source_operation IS NOT NULL; DELETE FROM database_cold_storage; DELETE FROM cold_storage_operations;",
   );
   await cleanup();
 });
@@ -186,24 +191,15 @@ it("an abandoned unprepared claim is safely selected once, and a stale selector 
 
 async function archived(f: Awaited<ReturnType<typeof fixture>>) {
   await f.pin();
-  await env.DB.prepare(
-    `INSERT INTO database_cold_storage(operation,kind,database_id,project_id,region_id,phase,source_node_id,source_generation,source_storage_generation,source_archive_path,source_backup_id,proven_sleep_json,verification_receipt_json,source_removed_at,created_at,updated_at,completed_at)
-     VALUES(?,'archive',?,?,?,'archived',?,1,1,?,'20261018T093000',?,'{}',?,?,?,?)`,
-  )
-    .bind(
-      f.op,
-      f.id,
-      f.project,
-      f.region,
-      f.node,
-      f.path,
-      JSON.stringify(PROOF),
-      f.now,
-      f.now,
-      f.now,
-      f.now,
-    )
-    .run();
+  await insertSnapshotArchive({
+    operation: f.op,
+    id: f.id,
+    project: f.project,
+    region: f.region,
+    node: f.node,
+    path: f.path,
+    at: f.now,
+  });
   await env.DB.prepare(
     "UPDATE databases SET node_id=NULL,storage_residency='archived',storage_operation_id=?,desired_state='suspended',suspension_reason='idle',observed_state='provisioning',observed_power='hibernated' WHERE id=?",
   )
@@ -256,27 +252,17 @@ it("expires an old rehydration source only after its retention window and final 
       "INSERT INTO cold_storage_operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,'database.rehydrate','succeeded',?,?,2,?,?,?)",
     ).bind(op, f.project, f.id, at, at, at),
     env.DB.prepare(
-      `INSERT INTO database_cold_storage(operation,kind,database_id,project_id,region_id,source_operation,phase,source_node_id,source_generation,source_storage_generation,source_archive_path,source_backup_id,proven_sleep_json,target_node_id,target_generation,target_storage_generation,target_archive_path,created_at,updated_at,completed_at)
-       VALUES(?,'rehydrate',?,?,?,?,'succeeded',?,1,1,?,'20261018T093000',?,?,2,2,?,?,?,?)`,
-    ).bind(
-      op,
-      f.id,
-      f.project,
-      f.region,
-      f.op,
-      f.node,
-      f.path,
-      JSON.stringify(PROOF),
-      f.other,
-      target,
-      at,
-      at,
-      at,
-    ),
-    env.DB.prepare(
       "UPDATE databases SET node_id=?,storage_residency='local',generation=2,storage_generation=2,archive_path=? WHERE id=?",
     ).bind(f.other, target, f.id),
   ]);
+  await insertSnapshotRehydrate({
+    operation: op,
+    source: f.op,
+    node: f.other,
+    target,
+    at,
+    phase: "succeeded",
+  });
   expect(await expireColdStorageArchives(env, Date.now())).toEqual({
     archives: 0,
     objects: 0,
@@ -343,30 +329,20 @@ async function failedTarget(f: Awaited<ReturnType<typeof fixture>>) {
       "INSERT INTO cold_storage_operations(id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at) VALUES(?,'database.rehydrate','failed',?,?,2,'build_failed','Recovery failed',?,?,?)",
     ).bind(op, f.project, f.id, f.now, f.now, f.now),
     env.DB.prepare(
-      `INSERT INTO database_cold_storage(operation,kind,database_id,project_id,region_id,source_operation,phase,source_node_id,source_generation,source_storage_generation,source_archive_path,source_backup_id,proven_sleep_json,target_node_id,target_generation,target_storage_generation,target_archive_path,failure,created_at,updated_at,completed_at)
-       VALUES(?,'rehydrate',?,?,?,?,'failed',?,1,1,?,'20261018T093000',?,?,2,2,?,'build_failed',?,?,?)`,
-    ).bind(
-      op,
-      f.id,
-      f.project,
-      f.region,
-      f.op,
-      f.node,
-      f.path,
-      JSON.stringify(PROOF),
-      f.other,
-      target,
-      f.now,
-      f.now,
-      f.now,
-    ),
-    env.DB.prepare(
       "INSERT INTO archive_pins(operation,archive_path,database_id,created_at) VALUES(?,?,?,?)",
     ).bind(op, f.path, f.id, f.now),
     env.DB.prepare(
       "INSERT INTO lifecycle_orders(operation,node_id,type,database_id,storage_generation,remove_volume,created_at) VALUES(?,?,'superseded',?,2,1,?)",
     ).bind(retired, f.other, f.id, f.now),
   ]);
+  await insertSnapshotRehydrate({
+    operation: op,
+    source: f.op,
+    node: f.other,
+    target,
+    at: f.now,
+    phase: "failed",
+  });
   return retired;
 }
 
@@ -439,6 +415,109 @@ it("a confirmed tunnel and provider power fence permits deletion after a restore
       .bind(f.id)
       .first("n"),
   ).toBe(0);
+});
+
+it("expires a failed target's Barman archive only after positive retirement and its recovery window", async () => {
+  const f = await fixture(),
+    retired = await failedTarget(f);
+  const target = (await env.DB.prepare(
+    "SELECT operation,target_archive_path FROM database_cold_storage WHERE database_id=? AND kind='rehydrate'",
+  )
+    .bind(f.id)
+    .first<{ operation: string; target_archive_path: string }>())!;
+  const key =
+    target.target_archive_path.replace(`s3://${env.ARCHIVE_BUCKET_NAME}/`, "") +
+    "/database/base/failed";
+  await put(key);
+  const after = Date.parse(f.now) + 8 * 86_400_000;
+  expect((await expireColdStorageArchives(env, after)).objects).toBe(0);
+  await env.DB.prepare(
+    "UPDATE lifecycle_orders SET result_status='done',closed_at=? WHERE operation=?",
+  )
+    .bind(f.now, retired)
+    .run();
+  expect(
+    (await expireColdStorageArchives(env, Date.parse(f.now))).objects,
+  ).toBe(0);
+  expect(await expireColdStorageArchives(env, after)).toEqual({
+    archives: 0,
+    objects: 1,
+  });
+  expect(await expireColdStorageArchives(env, after)).toEqual({
+    archives: 1,
+    objects: 0,
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT target_archive_deleted_at FROM database_cold_storage WHERE operation=?",
+    )
+      .bind(target.operation)
+      .first("target_archive_deleted_at"),
+  ).not.toBeNull();
+});
+
+it("deleting after activation failure retains then expires the original source despite the monotonic failed-target archive path", async () => {
+  const f = await fixture(),
+    retired = await failedTarget(f);
+  const target = (await env.DB.prepare(
+    "SELECT operation,target_archive_path FROM database_cold_storage WHERE database_id=? AND kind='rehydrate'",
+  )
+    .bind(f.id)
+    .first<{ operation: string; target_archive_path: string }>())!;
+  await env.DB.prepare(
+    "UPDATE lifecycle_orders SET result_status='done',closed_at=? WHERE operation=?",
+  )
+    .bind(f.now, retired)
+    .run();
+  await env.DB.prepare(
+    "UPDATE database_cold_storage SET target_serving_generation=3 WHERE operation=?",
+  )
+    .bind(target.operation)
+    .run();
+  await env.DB.prepare(
+    "UPDATE databases SET generation=3,storage_generation=2,archive_path=?,storage_operation_id=? WHERE id=?",
+  )
+    .bind(target.target_archive_path, target.operation, f.id)
+    .run();
+  const sourceKey = f.prefix + "database/original-source",
+    targetKey =
+      target.target_archive_path.replace(
+        `s3://${env.ARCHIVE_BUCKET_NAME}/`,
+        "",
+      ) + "/database/failed-target";
+  await put(sourceKey);
+  await put(targetKey);
+  expect(
+    (await expireColdStorageArchives(env, Date.parse(f.now) + 8 * 86_400_000))
+      .objects,
+  ).toBe(0);
+  expect(
+    (await request(`/v1/databases/${f.id}`, f.integrator, "DELETE")).status,
+  ).toBe(202);
+  const expires = (await env.DB.prepare(
+    "SELECT snapshot_retained_until FROM database_cold_storage WHERE operation=?",
+  )
+    .bind(f.op)
+    .first<string>("snapshot_retained_until"))!;
+  expect(expires).not.toBeNull();
+  expect(
+    (await expireColdStorageArchives(env, Date.parse(expires) - 1)).objects,
+  ).toBe(0);
+  expect(
+    (await expireColdStorageArchives(env, Date.parse(expires))).objects,
+  ).toBe(1);
+  expect(await env.ARCHIVE.head(sourceKey)).toBeNull();
+  expect(await env.ARCHIVE.head(targetKey)).not.toBeNull();
+  await cleanupRetainedArchives(env, Date.parse(expires));
+  expect(await env.ARCHIVE.head(targetKey)).toBeNull();
+  await expireColdStorageArchives(env, Date.parse(expires));
+  expect(
+    await env.DB.prepare(
+      "SELECT source_archive_deleted_at FROM database_cold_storage WHERE operation=?",
+    )
+      .bind(f.op)
+      .first("source_archive_deleted_at"),
+  ).not.toBeNull();
 });
 
 it("a node cannot renew or retrieve the former serving archive's write credential after archival", async () => {

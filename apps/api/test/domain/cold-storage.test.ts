@@ -12,6 +12,11 @@ import {
 import { applyLifecycleObservations } from "../../src/domain/lifecycle-observations.ts";
 import { nodeDesiredPage } from "../../src/domain/node-desired.ts";
 import { nodeRequest, nodeKeyPair } from "./fixtures.ts";
+import {
+  readColdSnapshotChunk,
+  readColdSnapshotManifest,
+  sealColdSnapshot,
+} from "../../src/domain/cold-snapshots.ts";
 import { observation, report } from "./lifecycle-fixture.ts";
 
 import {
@@ -20,6 +25,8 @@ import {
   residency,
   activePins,
   claimed,
+  capturing,
+  declareFixtureSnapshot,
   receipt,
   archived,
   cleanupColdFixture,
@@ -29,7 +36,14 @@ afterEach(cleanupColdFixture);
 it("requires strictly more than 21 days of current proven sleep and explicit feature enablement", async () => {
   const f = await sleeping(COLD_STORAGE_SLEEP_MS);
   expect(
-    await startColdStorageArchive(f.configured, f.id, f.current),
+    await startColdStorageArchive(
+      {
+        ...f.configured,
+        COLD_STORAGE_ARCHIVAL_DATABASE_IDS: JSON.stringify([f.id]),
+      },
+      f.id,
+      f.current,
+    ),
   ).toBeNull();
   expect(
     await startColdStorageArchive(
@@ -42,6 +56,38 @@ it("requires strictly more than 21 days of current proven sleep and explicit fea
     await startColdStorageArchive(f.configured, f.id, f.current + 1),
   ).not.toBeNull();
   expect(await activePins(f.id)).toBe(1);
+});
+
+it("limits new claims to the rollout allowlist and refuses malformed or empty scopes", async () => {
+  const f = await sleeping();
+  const scoped = (value: string) => ({
+    ...f.configured,
+    COLD_STORAGE_ARCHIVAL_DATABASE_IDS: value,
+  });
+  expect(await startColdStorageArchive(scoped("[]"), f.id)).toBeNull();
+  expect(await startColdStorageArchive(scoped("["), f.id)).toBeNull();
+  expect(await startColdStorageArchive(scoped("null"), f.id)).toBeNull();
+  expect(
+    await startColdStorageArchive(
+      scoped(JSON.stringify([f.id, "not-a-database-id"])),
+      f.id,
+    ),
+  ).toBeNull();
+  expect(
+    await startColdStorageArchive(
+      scoped(JSON.stringify(["a0000000000000000000"])),
+      f.id,
+    ),
+  ).toBeNull();
+  const selected = scoped(JSON.stringify([f.id]));
+  expect((await runColdStorageCron(scoped("[]"))).claimed).toBe(0);
+  expect(
+    await startColdStorageArchive(
+      { ...selected, COLD_STORAGE_ARCHIVAL_ENABLED: "false" },
+      f.id,
+    ),
+  ).toBeNull();
+  expect(await startColdStorageArchive(selected, f.id)).not.toBeNull();
 });
 
 it("preserves an identical sleep proof but resets the clock when a new sleep is reported without an intervening awake report", async () => {
@@ -75,15 +121,9 @@ it("preserves an identical sleep proof but resets the clock when a new sleep is 
   expect(await startColdStorageArchive(f.configured, f.id)).toBeNull();
 });
 
-it("requires the complete current recovery proof and WAL before it claims a local database", async () => {
+it("requires the exact current stopped-source proof rather than relying on legacy backup objects", async () => {
   const f = await sleeping();
   await env.ARCHIVE.delete(f.last);
-  expect(await startColdStorageArchive(f.configured, f.id)).toBeNull();
-  expect(await residency(f.id)).toMatchObject({
-    storage_residency: "local",
-    node_id: f.node,
-  });
-  await f.put(f.last);
   await env.DB.prepare(
     "UPDATE database_recovery_points SET generation=generation+1 WHERE database_id=?",
   )
@@ -105,19 +145,62 @@ it("requires the complete current recovery proof and WAL before it claims a loca
     .run();
   expect(await startColdStorageArchive(f.configured, f.id)).toBeNull();
   expect(await activePins(f.id)).toBe(0);
+  await env.DB.prepare(
+    "UPDATE database_recovery_points SET proven_sleep_json=? WHERE database_id=?",
+  )
+    .bind(JSON.stringify(f.proof), f.id)
+    .run();
+  expect(await startColdStorageArchive(f.configured, f.id)).not.toBeNull();
+  expect(await residency(f.id)).toMatchObject({
+    storage_residency: "archiving",
+    node_id: f.node,
+  });
+});
+
+it("does not seal or verify a snapshot with a declared but missing chunk", async () => {
+  const f = await sleeping();
+  const c = await capturing(f);
+  const snapshot = await declareFixtureSnapshot(f, c);
+  await expect(
+    sealColdSnapshot(f.configured, c.caller, c.operation, snapshot.sha256),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(await status(c.operation)).toMatchObject({
+    phase: "capturing",
+    snapshot_sealed_at: null,
+    retirement_operation: null,
+  });
+  expect(await residency(f.id)).toMatchObject({
+    node_id: f.node,
+    storage_residency: "archiving",
+  });
 });
 
 it("rejects a verification of changed objects and retains the local copy", async () => {
   const f = await sleeping();
   const c = await claimed(f);
-  await f.put(f.data, "different-archive-bytes");
+  await f.put(c.chunkKey, "different-snapshot-bytes");
+  await expect(
+    readColdSnapshotChunk(f.configured, c.caller, c.operation, 0),
+  ).rejects.toMatchObject({ code: "conflict" });
   await applyLifecycleObservations(f.configured, f.node, {
     ...report([]),
-    archive_verifications: [receipt(c.task)],
+    archive_verifications: [
+      {
+        operation: c.operation,
+        database_id: f.id,
+        source_generation: c.task.source_generation,
+        source_storage_generation: c.task.source_storage_generation,
+        manifest_sha256: c.sha256,
+        observed_at: new Date().toISOString(),
+        status: "failed",
+        reason: "snapshot_read_failed",
+        cleaned_up: true,
+      },
+    ],
   });
   expect(await status(c.operation)).toMatchObject({
     phase: "failed",
-    failure: "archive_changed",
+    failure: "snapshot_read_failed",
     retirement_operation: null,
   });
   expect(await residency(f.id)).toMatchObject({
@@ -139,9 +222,9 @@ it("does not remove storage on a stale verification, and keeps a dispatched veri
   expect((await status(c.operation)).phase).toBe("verifying");
   expect(
     await requestColdStorageWake(f.configured, f.id, { role: "app" }),
-  ).toMatchObject({ handled: false, cancelledArchive: true });
+  ).toMatchObject({ handled: true, waiting: true });
   expect(await residency(f.id)).toMatchObject({
-    storage_residency: "local",
+    storage_residency: "archiving",
     node_id: f.node,
   });
   expect(await activePins(f.id)).toBe(1);
@@ -150,13 +233,21 @@ it("does not remove storage on a stale verification, and keeps a dispatched veri
     archive_verifications: [receipt(c.task)],
   });
   expect(await activePins(f.id)).toBe(0);
+  expect(await residency(f.id)).toMatchObject({
+    storage_residency: "local",
+    node_id: f.node,
+  });
 });
 
 it("rehydrates the same identity on the original node once, even when automatic archival is disabled", async () => {
   const f = await sleeping();
   const before = await f.row();
   await archived(f);
-  const disabled = { ...f.configured, COLD_STORAGE_ARCHIVAL_ENABLED: "false" };
+  const disabled = {
+    ...f.configured,
+    COLD_STORAGE_ARCHIVAL_ENABLED: "false",
+    COLD_STORAGE_ARCHIVAL_DATABASE_IDS: "invalid-rollout-scope",
+  };
   const [first, second] = await Promise.all([
     requestColdStorageWake(disabled, f.id, { role: "app" }),
     requestColdStorageWake(disabled, f.id, { role: "app" }),
@@ -173,6 +264,7 @@ it("rehydrates the same identity on the original node once, even when automatic 
     storage_residency: "restoring",
   });
   const targets = await coldStorageTargets(disabled, f.node);
+  expect(targets.get(f.id)?.cold_snapshot_pending).toBe(true);
   expect(targets.get(f.id)?.origin).toMatchObject({
     kind: "rehydrate",
     source: { database_id: f.id, end: f.proof },
@@ -184,10 +276,97 @@ it("rehydrates the same identity on the original node once, even when automatic 
     storage_generation: staged.target_storage_generation!,
     instance: crypto.randomUUID(),
     state: "ready",
-    backup: { ...f.backup, timeline: f.proof.timeline + 1 },
+    backup: {
+      ...f.backup,
+      timeline: f.proof.timeline,
+      completed_at: new Date().toISOString(),
+    },
+    cold_snapshot_restore: {
+      snapshot_operation: staged.source_operation!,
+      manifest_sha256: staged.snapshot_manifest_sha256!,
+      system_identifier: f.proof.system_identifier,
+      timeline: f.proof.timeline,
+      checkpoint_lsn: f.proof.checkpoint_lsn,
+      verified_at: new Date().toISOString(),
+    },
+    cold_snapshot_serving: false,
     proven_sleep: null,
   });
-  await applyLifecycleObservations(disabled, f.node, report([target]));
+  const stagedResponse = await nodeRequest(f, "/node/v1/observations", {
+    method: "POST",
+    body: report([target]),
+    bindings: disabled,
+  });
+  expect(stagedResponse.status).toBe(200);
+  const activating = await status(first.operationId!);
+  expect(activating.phase).toBe("activating");
+  expect(activating.target_serving_generation).toBeGreaterThan(
+    activating.target_generation!,
+  );
+  expect(await residency(f.id)).toMatchObject({
+    storage_residency: "restoring",
+    node_id: f.node,
+    generation: activating.target_serving_generation,
+  });
+  expect(await activePins(f.id)).toBeGreaterThan(0);
+  const targetCaller = {
+    id: f.node,
+    uid: f.nodeUid,
+    region_id: f.region,
+    fenced: false,
+  };
+  expect(
+    (
+      await readColdSnapshotManifest(
+        disabled,
+        targetCaller,
+        staged.source_operation!,
+      )
+    ).status,
+  ).toBe(200);
+  expect(
+    (
+      await readColdSnapshotChunk(
+        disabled,
+        targetCaller,
+        staged.source_operation!,
+        0,
+      )
+    ).status,
+  ).toBe(200);
+  const servingPage = await nodeDesiredPage(
+    disabled,
+    { id: f.node, uid: f.nodeUid, region_id: f.region, fenced: false },
+    NodeDesiredQuery.parse({}),
+  );
+  const servingEntry = servingPage.databases.find((d) => d.id === f.id)!;
+  expect(servingEntry).toMatchObject({
+    generation: activating.target_serving_generation,
+    operation: first.operationId,
+    cold_snapshot_pending: true,
+  });
+  expect(servingEntry.origin).toBeUndefined();
+  expect(
+    (
+      await nodeRequest(f, "/node/v1/observations", {
+        method: "POST",
+        body: report([target]),
+        bindings: disabled,
+      })
+    ).status,
+  ).toBe(200);
+  expect((await status(first.operationId!)).phase).toBe("activating");
+  const serving = {
+    ...target,
+    generation: activating.target_serving_generation!,
+    cold_snapshot_serving: true,
+  };
+  const response = await nodeRequest(f, "/node/v1/observations", {
+    method: "POST",
+    body: report([serving]),
+    bindings: disabled,
+  });
+  expect(response.status).toBe(200);
   expect(await residency(f.id)).toMatchObject({
     storage_residency: "local",
     node_id: f.node,
@@ -196,12 +375,17 @@ it("rehydrates the same identity on the original node once, even when automatic 
   });
   expect((await f.row()).id).toBe(f.id);
   expect(await activePins(f.id)).toBe(0);
-  const response = await nodeRequest(f, "/node/v1/observations", {
-    method: "POST",
-    body: report([target]),
-    bindings: disabled,
-  });
-  expect(response.status).toBe(200);
+  await expect(
+    readColdSnapshotManifest(disabled, targetCaller, staged.source_operation!),
+  ).rejects.toMatchObject({ code: "not_found" });
+  const completedPage = await nodeDesiredPage(
+    disabled,
+    { id: f.node, uid: f.nodeUid, region_id: f.region, fenced: false },
+    NodeDesiredQuery.parse({}),
+  );
+  expect(
+    completedPage.databases.find((d) => d.id === f.id)?.cold_snapshot_pending,
+  ).not.toBe(true);
   expect(
     ((await response.json()) as { databases: { verdict: string }[] })
       .databases[0]?.verdict,
@@ -214,6 +398,65 @@ it("rehydrates the same identity on the original node once, even when automatic 
       )
     ).ok,
   ).toBe(true);
+});
+
+it("never accepts same-timeline readiness without the exact complete-snapshot attestation", async () => {
+  const f = await sleeping();
+  await archived(f);
+  const wake = await requestColdStorageWake(f.configured, f.id, {
+    role: "app",
+  });
+  const staged = await status(wake.operationId!);
+  const ready = observation({
+    id: f.id,
+    operation: staged.operation,
+    generation: staged.target_generation!,
+    storage_generation: staged.target_storage_generation!,
+    state: "ready",
+    instance: crypto.randomUUID(),
+    backup: {
+      ...f.backup,
+      timeline: f.proof.timeline,
+      completed_at: new Date().toISOString(),
+    },
+    proven_sleep: null,
+  });
+  expect(
+    (
+      await nodeRequest(f, "/node/v1/observations", {
+        method: "POST",
+        body: report([ready]),
+        bindings: f.configured,
+      })
+    ).status,
+  ).toBe(200);
+  expect((await status(staged.operation)).phase).toBe("restoring");
+  expect(await residency(f.id)).toMatchObject({
+    node_id: null,
+    storage_residency: "restoring",
+  });
+  const wrong = {
+    ...ready,
+    cold_snapshot_restore: {
+      snapshot_operation: staged.source_operation!,
+      manifest_sha256: "f".repeat(64),
+      system_identifier: f.proof.system_identifier,
+      timeline: f.proof.timeline,
+      checkpoint_lsn: f.proof.checkpoint_lsn,
+      verified_at: new Date().toISOString(),
+    },
+  };
+  expect(
+    (
+      await nodeRequest(f, "/node/v1/observations", {
+        method: "POST",
+        body: report([wrong]),
+        bindings: f.configured,
+      })
+    ).status,
+  ).toBe(200);
+  expect((await status(staged.operation)).phase).toBe("restoring");
+  expect(await activePins(f.id)).toBe(2);
 });
 
 it("places recovery on another qualified node in the same region when the original is full", async () => {
@@ -262,6 +505,22 @@ it("places recovery on another qualified node in the same region when the origin
   expect(page.databases.find((d) => d.id === f.id)?.origin?.kind).toBe(
     "rehydrate",
   );
+  expect(
+    (
+      await readColdSnapshotManifest(
+        f.configured,
+        { ...identity, fenced: false },
+        staged.source_operation!,
+      )
+    ).status,
+  ).toBe(200);
+  await expect(
+    readColdSnapshotManifest(
+      f.configured,
+      { id: f.node, uid: f.nodeUid, region_id: f.region, fenced: false },
+      staged.source_operation!,
+    ),
+  ).rejects.toMatchObject({ code: "not_found" });
 });
 
 it("keeps recovery durable without regional capacity and places it when capacity returns", async () => {
@@ -292,7 +551,11 @@ it("keeps recovery durable without regional capacity and places it when capacity
   )
     .bind(f.node)
     .run();
-  await runColdStorageCron(disabled);
+  await runColdStorageCron({
+    ...disabled,
+    COLD_STORAGE_ARCHIVAL_ENABLED: "true",
+    COLD_STORAGE_ARCHIVAL_DATABASE_IDS: "invalid-rollout-scope",
+  });
   expect(await status(wake.operationId!)).toMatchObject({
     phase: "restoring",
     target_node_id: f.node,

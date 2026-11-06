@@ -5,6 +5,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { format } from "prettier";
 import * as link from "../src/node-link.ts";
 import * as local from "../src/node-local.ts";
+import * as cold from "../src/cold-snapshot.ts";
 import {
   OWNER_ROLE_NAME,
   RESERVED_ROLE_NAMES,
@@ -39,6 +40,15 @@ const files = {
     schemas: nodeJsonSchemas(),
     constants: {
       NODE_PROTOCOL_VERSION: link.NODE_PROTOCOL_VERSION,
+      COLD_SNAPSHOT_VERSION: cold.COLD_SNAPSHOT_VERSION,
+      COLD_SNAPSHOT_CHUNK_BYTES: cold.COLD_SNAPSHOT_CHUNK_BYTES,
+      COLD_SNAPSHOT_MANIFEST_MAX_BYTES: cold.COLD_SNAPSHOT_MANIFEST_MAX_BYTES,
+      COLD_SNAPSHOT_FILES_MAX: cold.COLD_SNAPSHOT_FILES_MAX,
+      COLD_SNAPSHOT_DIRECTORIES_MAX: cold.COLD_SNAPSHOT_DIRECTORIES_MAX,
+      COLD_SNAPSHOT_CHUNKS_MAX: cold.COLD_SNAPSHOT_CHUNKS_MAX,
+      COLD_SNAPSHOT_TOTAL_MAX_BYTES: cold.COLD_SNAPSHOT_TOTAL_MAX_BYTES,
+      COLD_SNAPSHOT_API_PREFIX: cold.COLD_SNAPSHOT_API_PREFIX,
+      COLD_SNAPSHOT_CAPABILITY: cold.COLD_SNAPSHOT_CAPABILITY,
       NODE_API_PATHS: link.NODE_API_PATHS,
       NODE_ORDER_TYPES: link.NODE_ORDER_TYPES,
       INSTALLER_PROGRESS_PATH: link.INSTALLER_PROGRESS_PATH,

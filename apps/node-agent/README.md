@@ -814,36 +814,58 @@ disk that is slow to flush (its header says how to run it); the numbers it gave 
 The contract with Cloudflare is `packages/contracts/src/node-link.ts`. `node_link.rs` reads its
 generated JSON Schemas, and conformance tests hold the agent and the API to the same vectors.
 
-## Verification before R2-only storage
+## Complete cold snapshots and R2-only storage
 
-A node advertising `cold_storage_v1` can receive one `archive_verifications` task on its desired
-page. It restores the exact pinned base backup and proven committed WAL into an operation-owned
-scratch runtime. The scratch ID is derived from the operation and source database, differs from
-the source and the fixed health-check ID, and has its own account, thin volume and private socket.
-It never enters the served database table, accepts a customer route, applies tenant roles, drains
-an outbox, or writes a base backup or WAL to the source archive. Its PostgreSQL configuration
-replaces the restored configuration and clears `postgresql.auto.conf`; only the agent's private
-peer-authenticated connection is admitted. Source archive credentials are read-only.
+`cold_storage_v2` captures a complete, cleanly stopped PostgreSQL 18 data directory, including
+`pg_wal` and UNLOGGED relation files. Barman remains the ordinary backup and PITR mechanism;
+Barman archive recovery is never used to rehydrate a cold snapshot, because it would reset
+UNLOGGED relations. Both scratch verification and the serving restore retain the snapshot's
+system identifier and timeline. Ordinary PostgreSQL crash recovery and PITR keep their normal
+UNLOGGED semantics.
 
-The agent records ownership before creating scratch resources and records verified recovery
-before removing them. A receipt is successful only after the scratch PostgreSQL unit, its exact
-Barman transient jobs, volume, socket directory and account have been removed. Failed cleanup is
-reported as pending and retried from the private journal after a restart. A removed desired task
-cancels verification and triggers the same cleanup; absence is not acknowledgment. The journal
-remains until Cloudflare successfully acknowledges its cleanup receipt and a complete desired page
-no longer names it. Before dropping that full journal, a compact completed-operation receipt is
-persisted permanently; a delayed old request returns that receipt without recreating resources.
-Explicit `archive_verification_cancellations` also cover tasks that never
-reached the node: the node persists a cancellation tombstone before confirming resource absence.
-These retired-operation tombstones survive acknowledgment and restarts so that delayed old
-verification requests cannot recreate scratch work. Renewable source credential references are
-excluded from the journal's immutable request digest; archive scope, generation, recovery proof,
-object inventory and resource settings remain bound. Only Cloudflare's separate `superseded` order removes the original database's
-storage generation.
+A `cold_snapshot_captures` task holds the source's flow and data-directory lock, checks the
+current proven sleep and stopped unit, and inventories every regular file and directory. A
+complete source-produced manifest binds each file's path, packed offset, length and SHA-256 and
+each global chunk's length and SHA-256. The source declares that immutable manifest before
+uploading chunks, rechecks the source, and seals only the complete set. Version one uses
+uncompressed four-MiB chunks and a manifest of at most four MiB, with at most 16,384 files, 4,096
+directories and 16,384 chunks (64 GiB of file contents). Unsupported layouts or limits leave the
+original database local. Symlinks, hard links, special files, online-backup labels and recovery
+signals are refused.
 
-Verification uses ordinary startup admission and backup-job limits. Physical usage and admitted
-memory include the scratch runtime; `verification_runtime_ids` distinguishes it from customer
-databases in node samples. The same-ID `rehydrate` origin uses the move recovery semantics,
-preserving committed data and outbox contents while applying current roles, verifying the new
-timeline and taking the first completed backup before readiness. Previously retired generations
-remain fenced when restoration uses a newer generation on the same node.
+Snapshot objects live outside the Barman credential namespace and move through the authenticated
+node API. Source and target nodes receive no general R2 snapshot credential. Uploads are immutable
+and operation scoped; a download is authorized only for its assigned verification or restore.
+Capture and transfer share the existing background big-job budget. Bounded file operations yield
+between chunks; no detached writer survives cancellation.
+
+An `archive_verifications` task extracts the exact manifest into an operation-owned scratch
+account, thin volume and private socket. Every expected chunk and complete file, the exact file
+namespace, and the clean control identity/checkpoint are verified before PostgreSQL starts.
+The scratch runtime never enters the served table, accepts a customer route, applies roles or
+dispatches an outbox, and its archiving is disabled. Configuration and `postgresql.auto.conf` are
+replaced only after the snapshot's full verification. The receipt binds the manifest hash and
+actual pre-start control facts; success also proves removal of the scratch runtime, volume and
+account. Only Cloudflare's subsequent exact-generation `superseded` order removes the source.
+
+Private journals precede resource creation and preserve receipts until Cloudflare acknowledges
+them. Completed-operation markers and explicit capture/verification cancellation tombstones
+prevent a delayed old page from recreating work after its pin has been released. Unknown cleanup
+blocks the next scratch runtime. Physical usage and admitted memory include scratch verification;
+`verification_runtime_ids` distinguishes it from customer databases in node samples.
+
+The same-ID `rehydrate` origin downloads the complete snapshot into a fresh storage generation,
+verifies all files before startup, applies current roles while preserving outbox contents, and
+completes the new Barman backup before reporting staged readiness. Copied archive-completion
+markers belong to the old prefix: the target rearchives required WAL and timeline history into
+its new prefix. A durable start intent prevents an interrupted attempt from rewinding that same
+prefix. Once PostgreSQL may have started, an uncertain unpublished attempt is retired and retried
+at a new storage generation.
+
+Cloudflare activates the verified target at a higher generation with no origin and
+`cold_snapshot_pending: true`. The node persists its serving intent before publishing readiness;
+only a matching serving-ready observation releases the waiting request. A fresh pending-false
+page records the committed handoff. That latch prevents stale pending pages or old origins from
+rewinding data that may already have been served. Pending targets stay awake through the
+handshake. Agent or PostgreSQL failures before authoritative completion follow the fenced retry
+path; completed databases retain normal PostgreSQL recovery behavior.

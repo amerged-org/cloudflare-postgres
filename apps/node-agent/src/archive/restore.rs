@@ -51,7 +51,7 @@ pub struct Failed;
 /// one further attempt before reporting `archive_unusable`.
 pub(crate) const RECOVERY_FETCH_TIMEOUT: &str = "recovery_fetch_timeout";
 
-pub(super) fn recovery_error(fetch: &FetchStatus, fallback: &'static str) -> &'static str {
+fn recovery_error(fetch: &FetchStatus, fallback: &'static str) -> &'static str {
     match fetch.failure() {
         Some(FetchFailure::TimedOut) => RECOVERY_FETCH_TIMEOUT,
         Some(FetchFailure::Unavailable) => "archive_unusable",
