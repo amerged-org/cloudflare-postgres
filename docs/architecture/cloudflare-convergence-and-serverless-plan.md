@@ -64,6 +64,18 @@ the corrected hello expectation and four unchanged Linux-specific readahead/resi
 Those Linux-specific assertions were not relaxed; their existing Linux CI cases passed in the
 first run. Local host results are not substituted for the Linux release qualification.
 
+**Second CI qualification, run 42197552870:** all application checks passed, including Rust,
+API, Edge, other tests, static checks and Linux kernel tests. Locked package downloads succeeded.
+The image builder then failed on HTTP 503/504 responses for the same snapshot's APT indexes, before
+image construction or boot acceptance. Those exact indexes were reachable over HTTPS. The pinned
+builder base has no CA bundle, so the builder now bootstraps trust from the already locked
+`ca-certificates` package, verifies its digest again inside Docker, and uses HTTPS for the unchanged
+snapshot URIs. A read-only-base probe successfully fetched the 140,421-byte signed index using
+148 pinned certificate roots. The temporary build context contains only the explicit builder
+inputs and that verified package, with owner-only permissions and cleanup. Debian signature
+verification and all package pins remain unchanged; missing indexes now fail explicitly.
+All 80 node-image/installer unit tests and the image-tool typecheck passed. Fresh image CI is pending.
+
 # Integration extension candidate — 2026-10-26
 
 **Current implementation scope:** generic contract 1.5.0 (1.6.0 adds data events, built and not deployed: [9.3](#93-updates), [events plan 4.5](database-events-and-schedules.md)), integer-MiB total volumes with exact

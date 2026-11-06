@@ -10,22 +10,34 @@ FROM ${PGCF_BUILDER_BASE}
 ARG PGCF_DEBIAN_SNAPSHOT
 ARG PGCF_MKOSI_REPOSITORY
 ARG PGCF_MKOSI_COMMIT
+ARG PGCF_CA_CERTIFICATES_SHA256
+
+COPY --chmod=0600 bootstrap-ca-certificates.deb /tmp/bootstrap-ca-certificates.deb
 
 RUN set -eu; \
     test -n "$PGCF_DEBIAN_SNAPSHOT"; \
     test -n "$PGCF_MKOSI_REPOSITORY"; \
     test -n "$PGCF_MKOSI_COMMIT"; \
+    test -n "$PGCF_CA_CERTIFICATES_SHA256"; \
+    test "$(sha256sum /tmp/bootstrap-ca-certificates.deb | cut -d ' ' -f 1)" = "$PGCF_CA_CERTIFICATES_SHA256"; \
+    mkdir -m 0700 /tmp/pgcf-bootstrap-ca; \
+    dpkg-deb --extract /tmp/bootstrap-ca-certificates.deb /tmp/pgcf-bootstrap-ca; \
+    mkdir -p /etc/ssl/certs; \
+    cat /tmp/pgcf-bootstrap-ca/usr/share/ca-certificates/mozilla/*.crt > /etc/ssl/certs/ca-certificates.crt; \
+    chmod 0644 /etc/ssl/certs/ca-certificates.crt; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
+    rm -rf /tmp/pgcf-bootstrap-ca /tmp/bootstrap-ca-certificates.deb; \
     rm -f /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; \
     printf '%s\n' \
       'Types: deb' \
-      "URIs: http://snapshot.debian.org/archive/debian/$PGCF_DEBIAN_SNAPSHOT" \
+      "URIs: https://snapshot.debian.org/archive/debian/$PGCF_DEBIAN_SNAPSHOT" \
       'Suites: trixie trixie-updates' \
       'Components: main' \
       'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
       'Check-Valid-Until: no' \
       '' \
       'Types: deb' \
-      "URIs: http://snapshot.debian.org/archive/debian-security/$PGCF_DEBIAN_SNAPSHOT" \
+      "URIs: https://snapshot.debian.org/archive/debian-security/$PGCF_DEBIAN_SNAPSHOT" \
       'Suites: trixie-security' \
       'Components: main' \
       'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
@@ -36,7 +48,7 @@ RUN set -eu; \
       dpkg --add-architecture amd64; \
       grub='grub-efi-amd64-bin:amd64 grub-pc-bin:amd64'; \
     fi; \
-    apt-get update; \
+    apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 update; \
     apt-get install --yes --no-install-recommends \
       apt-utils ca-certificates cpio curl dosfstools e2fsprogs git \
       grub-common $grub kmod mtools python3 \

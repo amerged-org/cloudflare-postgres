@@ -15,6 +15,7 @@ import { pipeline } from "node:stream/promises";
 import { hostFilesSha256 } from "../../packages/contracts/src/releases.ts";
 import { digestBinaries } from "./binaries.ts";
 import { fetchLockedPackage } from "./download.ts";
+import { builderTag, withBuilderContext } from "./builder-bootstrap.ts";
 import { readHostFiles } from "./host-files.ts";
 import {
   aptListName,
@@ -103,24 +104,20 @@ async function downloadAll(entries: LockedPackage[], directory: string): Promise
   await Promise.all(workers);
 }
 
-function builderTag(lock: PackageLock): string {
-  const hash = createHash("sha256");
-  hash.update(JSON.stringify(lock.builder));
-  hash.update(lock.debian.snapshot);
-  return `pgcf-node-image-builder:${hash.digest("hex").slice(0, 16)}`;
-}
-
-function buildBuilder(lock: PackageLock): string {
+async function buildBuilder(lock: PackageLock, work: string): Promise<string> {
   const tag = builderTag(lock);
-  run("docker", [
-    "build",
-    "--build-arg", `PGCF_BUILDER_BASE=${lock.builder.base}`,
-    "--build-arg", `PGCF_DEBIAN_SNAPSHOT=${lock.debian.snapshot}`,
-    "--build-arg", `PGCF_MKOSI_REPOSITORY=${lock.builder.mkosi.repository}`,
-    "--build-arg", `PGCF_MKOSI_COMMIT=${lock.builder.mkosi.commit}`,
-    "--tag", tag,
-    join(here, "builder"),
-  ]);
+  await withBuilderContext(lock, join(here, "builder"), work, download, (context, ca) => {
+    run("docker", [
+      "build",
+      "--build-arg", `PGCF_BUILDER_BASE=${lock.builder.base}`,
+      "--build-arg", `PGCF_DEBIAN_SNAPSHOT=${lock.debian.snapshot}`,
+      "--build-arg", `PGCF_MKOSI_REPOSITORY=${lock.builder.mkosi.repository}`,
+      "--build-arg", `PGCF_MKOSI_COMMIT=${lock.builder.mkosi.commit}`,
+      "--build-arg", `PGCF_CA_CERTIFICATES_SHA256=${ca.sha256}`,
+      "--tag", tag,
+      context,
+    ]);
+  });
   return tag;
 }
 
@@ -156,7 +153,7 @@ async function resolveLock(work: string): Promise<void> {
   await downloadAll(lock.extra, extraDebs);
   await rm(out, { recursive: true, force: true });
   await mkdir(out, { recursive: true });
-  const tag = buildBuilder(lock);
+  const tag = await buildBuilder(lock, work);
   runBuilder(tag, lock, "resolve", { debs: extraDebs, out }, "resolve");
 
   const installed = installedFromManifest(JSON.parse(await readFile(join(out, "manifest.json"), "utf8")));
@@ -194,7 +191,7 @@ async function checkAdvisories(work: string): Promise<void> {
   const out = join(work, "advisories");
   await rm(out, { recursive: true, force: true });
   await mkdir(out, { recursive: true });
-  runBuilder(buildBuilder(lock), lock, "advisories", { out }, "advisories");
+  runBuilder(await buildBuilder(lock, work), lock, "advisories", { out }, "advisories");
 
   const locked = new Map([...lock.extra, ...lock.packages].map((entry) => [entry.name, entry.version]));
   const pinned = pinnedPackages(await readFile(join(here, "mkosi.conf"), "utf8"));
@@ -238,7 +235,7 @@ async function buildImage(work: string, binaries: string, release: string): Prom
   const out = join(work, "out");
   await rm(out, { recursive: true, force: true });
   await mkdir(out, { recursive: true });
-  const tag = buildBuilder(lock);
+  const tag = await buildBuilder(lock, work);
   runBuilder(tag, lock, "build", { debs: join(work, "debs"), out, binaries }, release);
 
   const installed = installedFromManifest(JSON.parse(await readFile(join(out, "manifest.json"), "utf8")));
