@@ -74,8 +74,13 @@ pub(crate) fn page_size() -> u64 {
 
 /// Opens a file of the data directory to read its length and advise the kernel on it. The
 /// directory is the database user's: a link at the file is not followed (`O_NOFOLLOW` covers the
-/// last part of the path; the directories are checked by the caller), and a pipe or a device is
-/// not opened for reading.
+/// last part of the path only), and a pipe or a device is not opened for reading. The directories
+/// on the way are checked by the caller before the open, not pinned by it: a user who swaps one
+/// for a link in between makes the agent resolve another path. That is harmless where the file
+/// name is fixed, only a regular file is read, no more than a small limit of it, and a caller that
+/// parses it checks it against what it knows. A guarantee would open the volume's directory once
+/// with `O_DIRECTORY | O_NOFOLLOW` (for `facts`, `/proc/<pid>/root`) and resolve the rest with
+/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, which needs Linux 5.6.
 pub(crate) fn open(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)

@@ -68,7 +68,8 @@ pub fn parse(text: &str) -> Result<Postmaster, &'static str> {
 
 /// The text of the `postmaster.pid` of the database whose volume is mounted at `volume`. The
 /// database's user can replace `data` and the file in it, and the agent reads as root on a worker
-/// of its runtime: a link at either is refused, and so is anything but a regular file, which a
+/// of its runtime: a link at either is refused (`data` is checked before the open, see
+/// `cache::open`), and so is anything but a regular file, which a
 /// pipe would make the read wait for and a device would never end. A file longer than a pid file
 /// is refused without being read past the limit.
 pub fn read(volume: &Path) -> Result<String, &'static str> {
