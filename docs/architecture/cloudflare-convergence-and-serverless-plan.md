@@ -1,3 +1,38 @@
+# Production cold-storage rollout — 2026-11-06
+
+The owner authorized Production rollout and bounded Dev acceptance with at most USD 10 incremental
+test usage on the existing EU1/US1 nodes. PR #37 merged as `fd8a280756e824e19a7d8be3163424d14b15526a`;
+main workflow `42256997663` passed every required check, image/QEMU acceptance and signing.
+Before migration, a private 118,272,077-byte D1 export was imported and checked locally: 1,530
+historical database rows, integrity OK, zero foreign-key violations. Migration `0098` preserved
+all preexisting database columns and exactly 220 valid historical sleep dates in rehearsal.
+It was applied live at 17:18 UTC: 224 active databases stayed local, with those 220 dates backfilled.
+
+API 1.7.0 was deployed from the qualified main as Worker `329a27f3-c57e-4aa4-a9f4-5b3704207313`,
+then the matching existing TypeScript Edge. All 15 API secret names and existing resource bindings
+were preserved. Signed release `sha-fd8a280756e8`, spec
+`15a4fcd64a8a09980a76754718d6b06c679afba4f0ef44bf55ef3541a3b2dd1e`, was registered after verifying
+all artifact digests and its signature. EU1 and US1 converged and remained ready/OS-convergent;
+operator readback verified the actual running agent SHA-256 on both nodes as
+`32de21fd1511691c9873fc4630158c3a60cbe8a3a9f3235aaae39f8b2a7ff8d1`.
+No VPS was purchased or reinstalled. Purchase/autoscale switches remain disabled.
+
+General archival remains closed behind client publication and live acceptance. The adopter's
+PGCF 1.7 compatibility source is prepared, but its Production database-management Worker still
+uses the earlier contract. The only enabled archive scope contains two owned EU1 test databases,
+in a separate project: one idle and one manually suspended. Both hold committed logged and
+UNLOGGED rows, a sequence and an emitted outbox sequence. Only their control-plane `sleep_since`
+was injected 22 days into the past; native proof and committed WAL identity were unchanged.
+This is explicitly injected eligibility evidence, not historical customer sleep.
+
+**Live acceptance finding:** no archive was claimed during the normal control run. Its cold-storage
+step reused the overall cron start time after earlier steps had run beyond the node clock-skew
+allowance. A real local D1/Actor regression reproduced a current report being refused as future;
+the step now reads its clock when it starts. The regression plus existing reconciliation and
+850-statement bound checks passed (9 tests across three files). The API correction still needs
+its normal CI/deployment qualification. Original local copies remain intact; no cold retirement
+or end-to-end restoration latency is claimed by this record.
+
 # Long-sleep R2 storage candidate — 2026-11-06
 
 **Owner-approved implementation:** apply the same rule to Free and Paid databases: after more

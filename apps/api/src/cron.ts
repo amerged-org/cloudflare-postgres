@@ -365,7 +365,9 @@ export async function runCron(
     cleanupRetainedArchives(env, now),
   );
   await attempt("cold_storage", undefined, async () => {
-    await runColdStorageCron(env, now);
+    // Earlier steps can outlive the node clock-skew allowance. Judge current reports when
+    // this step starts, rather than against the beginning of the whole control run.
+    await runColdStorageCron(env);
   });
   await attempt("backup_retention", undefined, () =>
     runBackupRetention(env, now),
