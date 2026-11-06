@@ -233,6 +233,9 @@ pub(crate) struct Claim {
 pub(crate) struct View {
     /// The newest entry of the page the node accepted.
     pub entry: Option<Entry>,
+    /// Desired intent retained only for retry: persisted state has not passed acceptance yet.
+    /// No route, observation, wake or build may use it until reconcile revalidates that state.
+    pub acceptance_pending: bool,
     /// The archive path of the build that failed in this run and was abandoned. A path names one
     /// build (it holds the operation, and a generation never writes into another's), and the page
     /// keeps naming the build until the API has ended its operation: it is not begun again.
@@ -306,6 +309,7 @@ impl View {
     fn new() -> Self {
         Self {
             entry: None,
+            acceptance_pending: false,
             abandoned_build: None,
             credential_missing_since_ms: None,
             phase: Phase::Asleep,
@@ -772,6 +776,9 @@ impl<M: Machine> Core<M> {
 
 /// The gateway's entry for a database: where its PostgreSQL stands for the clients.
 fn table_entry(id: &str, view: &View) -> Option<protocol::Database> {
+    if view.acceptance_pending {
+        return None;
+    }
     let entry = view.entry.as_ref()?;
     let (generation, operation) = match &view.claim {
         Some(claim) => (claim.generation, claim.operation.clone()),
@@ -835,8 +842,36 @@ impl<M: Machine> Core<M> {
     /// it knows: an entry below it is stale and `false`; one at it with another operation wins;
     /// a wake claim the page has caught up with is done.
     pub(crate) fn accept(&self, db: &Db, entry: Entry) -> bool {
+        self.accept_checked(db, entry, false)
+    }
+
+    /// Reconciliation never replaces a newer page with the entry it captured before reading
+    /// disk. A deferred intent is rechecked under the same view lock as normal acceptance.
+    pub(crate) fn revalidate_entry(&self, db: &Db, entry: &Entry) -> bool {
+        {
+            let view = db.view();
+            if view.entry.as_ref() != Some(entry) {
+                return false;
+            }
+            if !view.acceptance_pending {
+                return true;
+            }
+        }
+        self.accept_checked(db, entry.clone(), true)
+    }
+
+    fn accept_checked(&self, db: &Db, entry: Entry, pending_only: bool) -> bool {
         let mut accepted = false;
         self.set(db, |view| {
+            if pending_only {
+                if view.entry.as_ref() != Some(&entry) {
+                    return;
+                }
+                if !view.acceptance_pending {
+                    accepted = true;
+                    return;
+                }
+            }
             let known = view.entry.as_ref().map(|known| {
                 (
                     known.generation,
@@ -849,7 +884,9 @@ impl<M: Machine> Core<M> {
             }) {
                 return;
             }
-            if entry.origin.is_none() || matches!(entry.origin, Some(Origin::Rehydrate(_))) {
+            if entry.desired != Desired::Deleted
+                && (entry.origin.is_none() || matches!(entry.origin, Some(Origin::Rehydrate(_))))
+            {
                 let held = match view
                     .state
                     .clone()
@@ -858,7 +895,18 @@ impl<M: Machine> Core<M> {
                     .unwrap_or_else(|| self.files(&db.id).load())
                 {
                     Ok(state) => state,
-                    Err(_) => return,
+                    Err(_) => {
+                        // Keep the desired intent so the existing reconciliation/backoff can
+                        // distinguish a temporary read failure from corrupt state. It remains
+                        // quarantined until the same acceptance guards run with readable state.
+                        view.entry = Some(entry.clone());
+                        view.acceptance_pending = true;
+                        view.adopted = false;
+                        view.phase = Phase::Unproven;
+                        view.writer = None;
+                        accepted = true;
+                        return;
+                    }
                 };
                 if let Some(mut state) = held {
                     if entry.storage_generation < state.storage_generation {
@@ -916,6 +964,7 @@ impl<M: Machine> Core<M> {
                 view.refusal = None;
             }
             view.entry = Some(entry);
+            view.acceptance_pending = false;
             accepted = true;
         });
         accepted

@@ -205,6 +205,9 @@ impl<M: Machine> Core<M> {
     /// to give: the page has not named it, a wake is under way, the unit of a ready database is
     /// not known, or the size of the filesystem of a ready or sleeping one has not been read.
     fn observe(&self, db: &Db, view: &View) -> Option<Value> {
+        if view.acceptance_pending {
+            return None;
+        }
         let entry = view.entry.as_ref()?;
         let (mut state, error) = match view.phase {
             Phase::Building => ("building", None),

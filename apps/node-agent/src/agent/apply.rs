@@ -400,13 +400,26 @@ impl<M: Machine> Core<M> {
         // A damaged state file must block starts, but must not strand an explicitly deleted DB.
         if entry.desired != Desired::Deleted && db.view().state.is_none() {
             match self.files(&db.id).load() {
-                Ok(state) => self.set(db, |view| view.state = state),
+                Ok(state) => self.set(db, |view| {
+                    // A concurrent acceptance may already have installed and fsynced a newer
+                    // cold serving/commit latch. Never overwrite it with this earlier read.
+                    if view.state.is_none() {
+                        view.state = state;
+                    }
+                }),
                 // A state that was read and cannot be trusted is not taken for a new database.
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     self.set(db, |view| {
+                        // This failed read must not overwrite a valid state/entry that a newer
+                        // page accepted while the filesystem read was in progress.
+                        if view.entry.as_ref() != Some(&entry) || view.state.is_some() {
+                            return;
+                        }
                         view.adopted = true;
+                        view.acceptance_pending = false;
                         view.phase = Phase::Error;
                         view.error = Some("volume_missing");
+                        view.writer = None;
                     });
                     return;
                 }
@@ -414,6 +427,12 @@ impl<M: Machine> Core<M> {
                 // about the database: like LVM and systemd, it is read again.
                 Err(error) => return Self::unread(db, "state", error.into()),
             }
+        }
+        // Acceptance may have retained an unread-state intent solely for this retry. Reapply
+        // its persisted-generation/serving guards before any lifecycle step or route exposure.
+        // A newer page can also have superseded this entry while its state was being read.
+        if !self.revalidate_entry(db, &entry) || db.view().acceptance_pending {
+            return;
         }
         if self.replacement_blocks(db, &entry) {
             self.set(db, |view| {
@@ -2963,6 +2982,119 @@ mod tests {
         let handle = rig.core.db(&id);
         eventually(10, "the state to be refused", || handle.view().adopted).await;
         assert_eq!(handle.phase(), Phase::Error);
+    }
+
+    /// A retry may discover a durable cold-serving latch. The previously unread desired entry
+    /// must pass the same acceptance guard before any plan, writer or observation can use it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unread_cold_state_is_revalidated_before_a_stale_stage_can_be_adopted() {
+        use crate::{agent::ColdSnapshotSource, state::ColdSnapshotRestore};
+        let Some(rig) = Rig::new("unread-cold-stage").await else {
+            return;
+        };
+        let mut current = rig.entry_json();
+        let id = id_of(&current);
+        let path = format!("s3://pgcf-eu/eu-dev/{id}/g2-op_cccccccccccccccccccc");
+        current["storage_generation"] = json!(2);
+        current["archive"]["path"] = json!(path);
+        rig.deliver(&path, "read_write");
+        let (_, handle) = rig.create_from(&current).await;
+        let data = tenant(&rig, &id).await;
+        data.batch("CREATE UNLOGGED TABLE committed_cold_data(value integer); INSERT INTO committed_cold_data VALUES(42)").await.unwrap();
+        drop(data);
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+        let mut state = handle.state().unwrap();
+        let end = state.record.clone().unwrap();
+        let source = ColdSnapshotSource {
+            database_id: id.clone(),
+            snapshot_operation: "op_ssssssssssssssssssss".into(),
+            source_generation: 1,
+            source_storage_generation: 1,
+            manifest_sha256: "a".repeat(64),
+            manifest_bytes: 1,
+            end: end.clone(),
+        };
+        state.cold_snapshot_restore = Some(ColdSnapshotRestore {
+            snapshot_operation: source.snapshot_operation.clone(),
+            manifest_sha256: source.manifest_sha256.clone(),
+            system_identifier: end.system_identifier.clone(),
+            timeline: end.timeline,
+            checkpoint_lsn: end.checkpoint_lsn.clone(),
+            verified_at: end.proven_at.clone(),
+        });
+        state.cold_snapshot_source = Some(source.clone());
+        state.cold_snapshot_target_operation = Some(current["operation"].as_str().unwrap().into());
+        state.cold_snapshot_start_intent = true;
+        state.cold_snapshot_serving = true;
+        state.cold_snapshot_committed = true;
+        rig.core.files(&id).save(&state).unwrap();
+        drop(handle);
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        let file = rig.core.files(&id).directory().join("state.json");
+        let kept = file.with_extension("kept");
+        std::fs::rename(&file, &kept).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let mut stale = current.clone();
+        stale["generation"] = json!(2);
+        stale["cold_snapshot_pending"] = true.into();
+        stale["origin"] = json!({"kind":"rehydrate","source":source});
+        rig.core.apply(&Rig::page(vec![stale], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(10, "unread cold entry waits for its state", || {
+            handle.view().retrying
+        })
+        .await;
+        assert!(!handle.view().adopted);
+        assert!(crate::agent::table_entry(&id, &handle.view()).is_none());
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::rename(&kept, &file).unwrap();
+        eventually(10, "committed cold state read by retry", || {
+            handle
+                .view()
+                .state
+                .as_ref()
+                .is_some_and(|state| state.cold_snapshot_committed)
+        })
+        .await;
+        assert!(
+            !handle.view().adopted,
+            "a recovered committed latch rejects the stale stage before planning"
+        );
+        assert!(crate::agent::table_entry(&id, &handle.view()).is_none());
+        assert!(rig.core.pending_observation(&id).is_none());
+        assert_eq!(rig.cold_store.reads(), 0);
+        assert!(!rig.machine.running(&id));
+        current.as_object_mut().unwrap().remove("origin");
+        current["generation"] = json!(3);
+        current["cold_snapshot_pending"] = false.into();
+        rig.core
+            .apply(&Rig::page(vec![current.clone()], vec![]))
+            .await;
+        eventually(30, "fresh current entry adopted", || handle.view().adopted).await;
+        assert_eq!(handle.phase(), Phase::Asleep);
+        assert!(handle.state().unwrap().cold_snapshot_committed);
+        // A newer same-generation route can arrive after the retry captured its entry.
+        // Revalidating that earlier clone must neither replace nor republish it.
+        let previous = rig.entry_for(&current);
+        current["route_revision"] = json!(current["route_revision"].as_u64().unwrap() + 1);
+        let newer = rig.entry_for(&current);
+        assert!(rig.core.accept(&handle, newer.clone()));
+        assert!(!rig.core.revalidate_entry(&handle, &previous));
+        assert_eq!(handle.view().entry.as_ref(), Some(&newer));
+        let result = rig.core.wake(&Rig::ticket(&rig.entry_for(&current))).await;
+        assert_eq!(result.outcome, Outcome::Started, "{result:?}");
+        let rows = tenant(&rig, &id)
+            .await
+            .query("SELECT value FROM committed_cold_data", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, i32>(0), 42);
+        assert_eq!(
+            rig.cold_store.reads(),
+            0,
+            "the recovered committed generation is never recopied"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

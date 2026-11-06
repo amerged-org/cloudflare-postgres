@@ -88,6 +88,22 @@ Debian's official Cloudflare Snapshot and the live mirror within three total att
 authorization, TLS and HTTPS-downgrade failures stop without another transport. All 89 combined
 image/installer tests and image-tool typechecking passed. Package locks remain unchanged.
 
+**Revised-snapshot CI, run 42236316170 at `b1dc0962`:** API passed 1,441 tests in 145 files;
+static, Edge, other tests and Linux kernel checks passed. The node-agent suite passed 967 tests,
+excluded 23 kernel-only cases and failed one existing unread-state retry test. A deterministic
+local reproduction showed the new cold acceptance guard rejected an entry before scheduling its
+normal reconciliation whenever its state file could not be read. The correction retains the
+entry without routes or observations, reuses the existing retry mechanism and rechecks the exact
+current entry against durable cold-generation/serving guards before adoption or mutation. The
+original retry test, a real committed-cold recovery/stale-route regression preserving UNLOGGED
+data with zero snapshot reads, and corrupt-state authorized deletion all passed with unchanged
+test time limits. Independent source review confirmed the acceptance and concurrent-read guards.
+The image job separately failed TLS verification because APT did not discover the bootstrapped
+CA file. Explicit `Acquire::https::CaInfo` now selects that same pinned bundle: the unchanged
+request failed without it and succeeded with it, and the exact pinned base verified all three
+signed repository indexes plus amd64/arm64 package indexes (20.1 MB). All 89 image/installer tests
+passed. No TLS/signature check or package pin was relaxed. Fresh combined CI remains required.
+
 **Read-only live preflight at 09:49 UTC:** the two active nodes were healthy, schedulable,
 placement-enabled and OS-converged; API contract 1.6.0 and migrations through `0097` were active.
 There were 224 logical databases, 220 sleeping and zero with more than 21 days of proven sleep.
