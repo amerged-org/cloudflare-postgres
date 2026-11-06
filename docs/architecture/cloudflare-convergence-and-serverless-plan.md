@@ -33,6 +33,51 @@ the step now reads its clock when it starts. The regression plus existing reconc
 its normal CI/deployment qualification. Original local copies remain intact; no cold retirement
 or end-to-end restoration latency is claimed by this record.
 
+## EU1 live round trips and deadline finding
+
+PR #41's correction merged as `9e6c2a9b257a56d5acdccaedf315970cc3c24f34`; main workflow
+`42265882246` passed all required jobs and signing. API Worker
+`81fc31f7-33a4-4fb3-a947-ded4b0d7d995` deployed that exact source at 18:06 UTC. Native nodes
+remain on the qualified `sha-fd8a280756e8` because the correction changed only the API clock.
+
+The manual fixture archived 82,669,928 payload bytes and acknowledged source removal at
+18:10:28.883 UTC. Ordinary authenticated SQL preserved its manual suspension and created no
+recovery. Authorized resume and three concurrent HTTP requests shared one recovery; the original
+INSERT was held **28,349.421 ms**, returned 200 and executed exactly once. Logged row 41,
+UNLOGGED row 42, sequence value 77, database ID and the original connection URI/password survived.
+Its outbox sequence advanced from 1 before archival to 2 after recovery.
+
+The idle fixture's first capture conservatively failed `snapshot_source_changed`, with no payload
+or source removal. Its retained local copy still served both records. A genuine wake and next
+idle sleep reset the sleep clock; after a second explicitly injected test age, archival preserved
+99,496,662 bytes and source removal was acknowledged at 18:21:09.204 UTC. Three concurrent
+requests shared one automatic same-ID recovery. Its initiating INSERT returned 200 after
+**27,550.840 ms**, executed once and preserved the same logged/UNLOGGED rows, sequence, URI and
+credentials. The outbox sequence likewise continued 1 to 2. These are measured small-fixture
+request-to-answer times, not a 60-second restoration guarantee for arbitrary databases.
+
+A second archive of the restored manual fixture also succeeded (99,665,748 payload bytes,
+storage generation 2 removed at 18:30:26.305 UTC). To test absent eligible capacity without
+changing regional policy or buying hardware, only this archived fixture temporarily requested
+64,000 millicores. The request ended after **60,233.063 ms**; its one recovery stayed
+`waiting_capacity`, with no target node or storage generation. The override was restored to its
+original null/inherited value, recovery continued independently to generation 3, and all data
+remained readable. The timed-out INSERT marker 109 was absent and was never replayed.
+
+**Deadline finding:** the deployed Edge's outer admission timer returned SQLSTATE `08006`
+(`connection admission interrupted`), obscuring the pre-execution not-ready outcome. New HTTP
+and WebSocket regressions reproduced it. Expiry while Actor admission is pending now returns
+retryable `57P03`; client abort and a gateway connection already in progress retain `08006`.
+The absolute 60-second budget, waiter cancellation and no-late-forwarding behavior remain.
+All 97 affected TypeScript HTTP/WebSocket tests, 22 Rust policy tests, Rust/Wasm Clippy and Edge
+typechecking passed locally. The Rust/Wasm target receives the same distinction; it remains an
+unaccepted deployment target under D12. This Edge correction still requires CI and live retry.
+
+Three native source-volume removals are confirmed. Exact physical thin-pool bytes released have
+not been attributed; nominal quota and snapshot payload bytes are not substituted. No cross-VPS
+acceptance, customer archival or general feature activation is claimed. Client publication and
+final live deadline qualification remain open.
+
 # Long-sleep R2 storage candidate — 2026-11-06
 
 **Owner-approved implementation:** apply the same rule to Free and Paid databases: after more

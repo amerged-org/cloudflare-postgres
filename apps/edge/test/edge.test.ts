@@ -2402,7 +2402,7 @@ it("a wake timeout cancels the waiter once, never forwards late success and keep
   await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
   const connection = await pending;
   vi.useRealTimers();
-  expect(await errorCode(connection)).toBe("08006");
+  expect(await errorCode(connection)).toBe("57P03");
   const cid = JSON.parse(logs.mock.calls.at(-1)![0] as string).cid;
   expect(cancel).toHaveBeenCalledExactlyOnceWith(database, cid);
   expect(ensure).toHaveBeenCalledTimes(1);

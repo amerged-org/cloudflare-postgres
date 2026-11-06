@@ -23,6 +23,13 @@ impl Failure {
     pub fn interrupted() -> Self {
         Self::new("08006", "connection admission interrupted")
     }
+    pub fn admission_deadline(gateway_started: bool) -> Self {
+        if gateway_started {
+            Self::interrupted()
+        } else {
+            Self::new("57P03", "database is not ready yet")
+        }
+    }
     pub fn gateway() -> Self {
         Self::new("08006", "gateway connection failed")
     }

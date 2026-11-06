@@ -12,7 +12,11 @@ use pgcf_native_protocol::{
     wake,
 };
 use serde_json::{Value, json};
-use std::{cell::RefCell, future::Future, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    future::Future,
+    rc::Rc,
+};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{AbortController, AbortSignal};
 use worker::{Context, Env, Request, Response, WebSocket, WebSocketPair};
@@ -200,11 +204,12 @@ async fn upgrade(admit: Admit) -> Result<Upgraded, Failure> {
     })
 }
 
-/// Runs `admission` until its deadline (60 s) or the client's abort, whichever comes first; either
-/// refuses with 08006 and aborts the signal `admission` was given.
+/// Expiry before gateway connection is a retryable pre-execution refusal. Client cancellation
+/// and interrupted gateway connections retain their connection-failure meaning.
 pub async fn bounded<T, F, Fut>(
     request: &Request,
     ctx: &Context,
+    timings: Shared,
     admission: F,
 ) -> Result<T, Failure>
 where
@@ -217,9 +222,19 @@ where
     let _request = host::propagate(&request.inner().signal(), &controller)?;
     let deadline = host::now().saturating_add(constant("ADMISSION_DEADLINE_MS"));
     let timeout = controller.clone();
+    let expired = Rc::new(Cell::new(false));
+    let did_expire = expired.clone();
     let _timer = host::Timer::new(deadline.saturating_sub(host::now()), move || {
+        did_expire.set(true);
         timeout.abort()
     })?;
+    let failure = || {
+        if expired.get() && !request.inner().signal().aborted() {
+            Failure::admission_deadline(timings.borrow().gateway_started.is_some())
+        } else {
+            Failure::interrupted()
+        }
+    };
     let interrupted = host::Interrupted::new(&signal)?;
     let (sender, receiver) = oneshot::channel();
     let task = admission(signal.clone(), deadline);
@@ -233,12 +248,13 @@ where
     futures_util::pin_mut!(interrupted);
     match select(receiver, interrupted).await {
         Either::Left((result, _)) => {
-            let value = result.map_err(|_| Failure::gateway())??;
             if signal.aborted() {
-                value.dispose();
-                Err(Failure::interrupted())
+                if let Ok(Ok(value)) = result {
+                    value.dispose();
+                }
+                Err(failure())
             } else {
-                Ok(value)
+                result.map_err(|_| Failure::gateway())?
             }
         }
         Either::Right((_, mut pending)) => {
@@ -246,7 +262,7 @@ where
             if let Ok(Some(Ok(late))) = pending.try_recv() {
                 late.dispose();
             }
-            Err(Failure::interrupted())
+            Err(failure())
         }
     }
 }
@@ -270,7 +286,7 @@ async fn connect(
         timings.clone(),
         host::owned_context(ctx),
     );
-    bounded(request, ctx, move |signal, deadline| {
+    bounded(request, ctx, timings.clone(), move |signal, deadline| {
         upgrade(Admit {
             env,
             hints,
