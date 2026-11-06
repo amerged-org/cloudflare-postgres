@@ -1843,9 +1843,9 @@ mod tests {
                 active: "test".into(),
                 keys: HashMap::new(),
             },
-            maximum_memory: 384 << 20,
+            maximum_memory: 192 << 20,
             database_memory: 96 << 20,
-            reserve_memory: 192 << 20,
+            reserve_memory: 96 << 20,
             guaranteed_memory: 3 << 20,
         }))
     }

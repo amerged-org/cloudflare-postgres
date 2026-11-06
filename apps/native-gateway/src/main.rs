@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use pgcf_native_gateway::{
-    activation, local,
+    activation, budget, local,
     transport::{self, Config, Gateway},
 };
 use pgcf_native_protocol::{agent, constant, route::Keyring, valid_pattern};
@@ -47,10 +47,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "PGCF_GATEWAY_GUARANTEED_BYTES",
         constant("DEFAULT_DATABASE_GUARANTEED_MEMORY_BYTES") as usize,
     )?;
-    if database_memory > maximum_memory
-        || reserve_memory >= maximum_memory
-        || guaranteed_memory > database_memory
-    {
+    if let Err(message) = budget::check_bounds(
+        maximum_memory,
+        database_memory,
+        reserve_memory,
+        guaranteed_memory,
+    ) {
+        // The only startup refusal that says why: it names a variable of the operator's, and no
+        // secret.
+        eprintln!(
+            "{}",
+            serde_json::json!({"event":"gateway_memory_bounds_invalid","message":message})
+        );
         return Err("invalid gateway memory bounds".into());
     }
     let config = Arc::new(Config {
