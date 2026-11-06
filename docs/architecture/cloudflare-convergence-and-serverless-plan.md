@@ -73,6 +73,13 @@ Exact-revision Linux/image checks remain pending. These
 numbers describe separate runs and must not be added as unique test coverage or called live VPS
 acceptance. The earlier 1,412-test API result and CI records below cover the superseded candidate.
 
+**Serving-boundary regression:** a real staged cold target, while its gateway mode was still
+Sleeping and its durable serving grant was false, attached an outbox drain, delivered/deleted its
+queued event and recorded 159 ms of serving usage. One shared durable-grant predicate now gates
+the gateway, event drains and serving metering. The regression passed red-to-green: before grant
+the event remains queued and serving usage is zero; after activation it is delivered once and
+normal accounting begins. This is local behavior evidence, not end-to-end VPS recovery latency.
+
 **Concurrent main integration:** the first revised-snapshot push could not start PR CI because
 `main` advanced to `ed698ea3`, including the post-wake event-drain correction and signed APT package
 cache. The merge preserves both changes and the pinned CA/HTTPS bootstrap. The private builder

@@ -291,6 +291,18 @@ pub(crate) enum Reconcile {
     Again,
 }
 impl View {
+    /// Physical readiness is not a serving grant for a staged cold target. Keep the gateway,
+    /// event drains and serving-usage accounting on this same durable boundary.
+    pub(super) fn ungranted_cold(&self) -> bool {
+        self.entry.as_ref().is_some_and(|entry| {
+            entry.cold_snapshot_pending
+                && !self.state.as_ref().is_some_and(|state| {
+                    state.storage_generation == entry.storage_generation
+                        && state.cold_snapshot_serving
+                })
+        })
+    }
+
     fn new() -> Self {
         Self {
             entry: None,
@@ -765,11 +777,7 @@ fn table_entry(id: &str, view: &View) -> Option<protocol::Database> {
         Some(claim) => (claim.generation, claim.operation.clone()),
         None => (entry.generation, entry.operation.clone()),
     };
-    let ungranted_cold = entry.cold_snapshot_pending
-        && !view.state.as_ref().is_some_and(|state| {
-            state.storage_generation == entry.storage_generation && state.cold_snapshot_serving
-        });
-    let (mode, writer) = if ungranted_cold {
+    let (mode, writer) = if view.ungranted_cold() {
         (protocol::Mode::Sleeping, None)
     } else {
         match (view.phase, &view.writer) {
@@ -794,9 +802,9 @@ impl<M: Machine> Core<M> {
     pub(crate) fn set(&self, db: &Db, change: impl FnOnce(&mut View)) {
         let (entry, served) = {
             let mut view = db.view();
-            let before = metering::is_served(view.phase);
+            let before = metering::is_served(&view);
             change(&mut view);
-            let after = metering::is_served(view.phase);
+            let after = metering::is_served(&view);
             (
                 table_entry(&db.id, &view),
                 (before != after).then_some(after),

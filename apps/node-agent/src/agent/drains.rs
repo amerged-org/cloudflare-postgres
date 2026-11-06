@@ -256,7 +256,7 @@ impl<M: Machine> Core<M> {
 /// The entry of a database that is served and not deleted: the databases a drain runs for.
 fn served_entry(db: &Db) -> Option<Entry> {
     let view = db.view();
-    if !metering::is_served(view.phase) {
+    if !metering::is_served(&view) {
         return None;
     }
     let entry = view.entry.clone();
@@ -849,5 +849,115 @@ mod tests {
             .unwrap()[0]
             .get(0);
         assert_eq!(rows, 100);
+    }
+    /// A physically running cold target is still unpublished until its serving grant is fsynced.
+    /// Its outbox and usage meter must follow the same boundary as the gateway's table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_staged_cold_target_neither_drains_nor_meters_before_its_durable_grant() {
+        use crate::{
+            agent::{Phase, cold::tests::sleeping},
+            link::Order,
+        };
+        let Some(rig) = Rig::new("cold-drain-grant").await else {
+            return;
+        };
+        let _gateway = rig.connect_gateway().await;
+        let (request, db, mut entry) = sleeping(&rig).await;
+        let id = db.id.clone();
+        let retired = "op_rrrrrrrrrrrrrrrrrrrr";
+        rig.core
+            .apply(&Rig::page(
+                vec![],
+                vec![Order::Superseded {
+                    operation: retired.into(),
+                    database: id.clone(),
+                    storage_generation: 1,
+                    remove_volume: true,
+                }],
+            ))
+            .await;
+        eventually(30, "original storage retired", || {
+            rig.core.pending_order(retired).is_some()
+        })
+        .await;
+        // Close and forget the original serving interval before measuring the unpublished target.
+        rig.core.meter_tick(|_| Ok(())).await.unwrap();
+        let operation = "op_nnnnnnnnnnnnnnnnnnnn";
+        let path = format!("s3://pgcf-eu/eu-dev/{id}/g2-{operation}");
+        entry["generation"] = json!(entry["generation"].as_u64().unwrap() + 1);
+        entry["storage_generation"] = json!(2);
+        entry["operation"] = json!(operation);
+        entry["route_revision"] = json!(entry["route_revision"].as_u64().unwrap() + 1);
+        entry["archive"]["path"] = json!(path);
+        entry["origin"] = json!({"kind":"rehydrate","source":request["source"]});
+        entry["cold_snapshot_pending"] = true.into();
+        rig.deliver(&path, "read_write");
+        rig.core
+            .apply(&Rig::page(vec![entry.clone()], vec![]))
+            .await;
+        eventually(120, "cold target staged", || {
+            matches!(db.phase(), Phase::Ready | Phase::Error)
+        })
+        .await;
+        assert_eq!(db.phase(), Phase::Ready, "{:?}", db.view().error);
+        assert!(!db.state().unwrap().cold_snapshot_serving);
+        assert_eq!(
+            crate::agent::table_entry(&id, &db.view()).unwrap().mode,
+            pgcf_native_protocol::agent::Mode::Sleeping
+        );
+        // Internal maintenance may leave an event while the target is staged. It is not yet
+        // authorized for external delivery, even though PostgreSQL itself accepts connections.
+        tenant(&rig, &id)
+            .await
+            .batch("SELECT pgcf.emit('orders', '{\"staged\":true}')")
+            .await
+            .unwrap();
+        rig.core.drain_pass().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let attached = rig.core.drains.running(&id);
+        let delivered = accepted(&rig).len();
+        let retained = outbox(&rig, &id).await;
+        let mut awake = 0i64;
+        rig.core
+            .meter_tick(|rows| {
+                awake = rows
+                    .iter()
+                    .map(|row| row["awake_ms"].as_i64().unwrap_or(0))
+                    .sum();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (attached, delivered, retained, awake),
+            (false, 0, 1, 0),
+            "staged target must not deliver events or count as serving use"
+        );
+        entry.as_object_mut().unwrap().remove("origin");
+        entry["generation"] = json!(entry["generation"].as_u64().unwrap() + 1);
+        entry["route_revision"] = json!(entry["route_revision"].as_u64().unwrap() + 1);
+        rig.core.apply(&Rig::page(vec![entry], vec![])).await;
+        eventually(30, "durable activation grant", || {
+            db.state().unwrap().cold_snapshot_serving
+        })
+        .await;
+        rig.core.drain_pass().await;
+        assert!(rig.core.drains.running(&id));
+        drained(&rig, &id).await;
+        assert_eq!(accepted(&rig).len(), 1);
+        assert_eq!(accepted(&rig)[0]["payload"], json!({"staged":true}));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut awake = 0i64;
+        rig.core
+            .meter_tick(|rows| {
+                awake = rows
+                    .iter()
+                    .map(|row| row["awake_ms"].as_i64().unwrap_or(0))
+                    .sum();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(awake > 0, "the grant begins normal serving accounting");
     }
 }

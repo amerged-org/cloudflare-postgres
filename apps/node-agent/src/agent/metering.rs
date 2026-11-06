@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! What the core tells the usage meter (`usage.rs`): when a database is served, and the ticks that
 //! close the intervals.
-use super::{Core, Phase, now_ms};
+use super::{Core, Phase, View, now_ms};
 use crate::{Error, machine::Machine, usage::Counters};
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -12,8 +12,8 @@ const READINGS_AT_ONCE: usize = 32;
 
 /// A database is metered awake from its release to the gateway until its unit stops: a start that
 /// waits for admission, a build and a recovery are the node's own work and nobody's use.
-pub(super) fn is_served(phase: Phase) -> bool {
-    matches!(phase, Phase::Ready | Phase::Quiesce)
+pub(super) fn is_served(view: &View) -> bool {
+    matches!(view.phase, Phase::Ready | Phase::Quiesce) && !view.ungranted_cold()
 }
 
 impl<M: Machine> Core<M> {
@@ -25,13 +25,11 @@ impl<M: Machine> Core<M> {
     ) -> Result<usize, Error> {
         let (mut served, mut known) = (HashSet::new(), HashSet::new());
         for db in self.all() {
-            match db.phase() {
-                Phase::Deleted | Phase::Retired => {}
-                phase => {
-                    known.insert(db.id.clone());
-                    if is_served(phase) {
-                        served.insert(db.id.clone());
-                    }
+            let view = db.view();
+            if !matches!(view.phase, Phase::Deleted | Phase::Retired) {
+                known.insert(db.id.clone());
+                if is_served(&view) {
+                    served.insert(db.id.clone());
                 }
             }
         }
