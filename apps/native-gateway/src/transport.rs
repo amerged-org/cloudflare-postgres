@@ -255,14 +255,22 @@ impl Gateway {
     /// Writes `bytes` to a session's writer while the database admits new work and `writer` is its
     /// writer. Any other change of the database's entry, such as a later route revision, leaves
     /// the session's admission as it was. See [`Gateway::write_fenced`] for how the table is held.
+    ///
+    /// Precondition, kept by each caller and not by the types: the session `id` is marked busy
+    /// before the call (`Sessions::update`), because the table is not held while the bytes wait
+    /// for room in PostgreSQL's socket, and a message whose first bytes crossed is finished after
+    /// a published change: the busy session is what the agent's quiesce waits for. Call sites:
+    /// the first write of `run_session`, and `sql::write_guarded` (the StartupMessage, the
+    /// pipeline and the cleanup of a session).
     pub(crate) async fn write_admitted(
         &self,
+        id: &str,
         database: &str,
         writer: &Writer,
         postgres: &mut UnixStream,
         bytes: &[u8],
     ) -> Result<(), Blocked> {
-        self.write_fenced(postgres, bytes, |table| {
+        self.write_fenced(id, postgres, bytes, |table| {
             if !table.admits(database) {
                 return Err(Blocked::Fenced);
             }
@@ -279,14 +287,19 @@ impl Gateway {
     /// last table stands: only the agent stops a database, and it does so over the channel or by
     /// stopping the unit, which ends the session. See [`Gateway::write_fenced`] for how the table
     /// is held.
+    ///
+    /// Precondition, kept by each caller and not by the types: the session `id` is marked busy
+    /// before the call, as for [`Gateway::write_admitted`]. Call site: `forward_if_running`, for
+    /// the relay's client messages and the bytes it held.
     pub(crate) async fn write_running(
         &self,
+        id: &str,
         database: &str,
         writer: &Writer,
         postgres: &mut UnixStream,
         bytes: &[u8],
     ) -> Result<bool, Blocked> {
-        self.write_fenced(postgres, bytes, |table| {
+        self.write_fenced(id, postgres, bytes, |table| {
             if !table.permits(database, writer) {
                 return Err(Blocked::TargetChanged);
             }
@@ -309,10 +322,15 @@ impl Gateway {
     /// by then is [`Blocked::Lost`].
     async fn write_fenced(
         &self,
+        id: &str,
         postgres: &mut UnixStream,
         bytes: &[u8],
         fence: impl Fn(&LocalTable) -> Result<bool, Blocked>,
     ) -> Result<bool, Blocked> {
+        debug_assert!(
+            self.sessions.lock().unwrap().marked_busy(id),
+            "session {id} writes to PostgreSQL without being marked busy"
+        );
         let deadline = tokio::time::Instant::now() + WRITE_BOUND;
         loop {
             let written = {
@@ -1175,7 +1193,7 @@ async fn run_session(
         }
         update(gateway, id, &activity, true, false);
         match gateway
-            .write_admitted(&claims.db, target, &mut postgres, &initial)
+            .write_admitted(id, &claims.db, target, &mut postgres, &initial)
             .await
         {
             Ok(()) => {}
@@ -1688,7 +1706,7 @@ async fn relay(
             && let Some((bytes, lease)) = held.take()
         {
             update(gateway, id, activity, true, false);
-            if forward_if_running(gateway, database, target, postgres, &bytes, stages).await? {
+            if forward_if_running(gateway, id, database, target, postgres, &bytes, stages).await? {
                 drop(lease);
             } else {
                 held = Some((bytes, lease));
@@ -1743,7 +1761,7 @@ async fn relay(
                         let lease=wire.take_message().inspect_err(|_|stages.outcome="websocket_error")?;{let mut metrics=gateway.measurements.lock().unwrap();metrics.ingress(id,bytes.len());if !bytes.is_empty(){metrics.client_activity(id);}}
                         activity.observe_frontend(&bytes);update(gateway,id,activity,true,false);
                         if held.is_some(){stages.outcome="database_retired";close(websocket,CloseCode::Restart,"database retired").await;break;}
-                        if forward_if_running(gateway,database,target,postgres,&bytes,stages).await?{drop(lease);}
+                        if forward_if_running(gateway,id,database,target,postgres,&bytes,stages).await?{drop(lease);}
                         else{held=Some((bytes.to_vec(),vec![lease]));}
                     },
                     Some(Ok(Message::Pong(_)))=>alive=true,
@@ -1769,6 +1787,7 @@ async fn relay(
 /// Forwards client bytes while the database runs on the session's writer; false while they wait.
 async fn forward_if_running(
     gateway: &Gateway,
+    id: &str,
     database: &str,
     target: &Writer,
     postgres: &mut UnixStream,
@@ -1779,7 +1798,7 @@ async fn forward_if_running(
     // in PostgreSQL's socket. Bytes already being written stay busy; new bytes cannot begin to
     // cross a published change.
     match gateway
-        .write_running(database, target, postgres, bytes)
+        .write_running(id, database, target, postgres, bytes)
         .await
     {
         Ok(written) => Ok(written),

@@ -489,6 +489,26 @@ impl Client {
     async fn refused(&mut self) -> String {
         self.refusal().await.0
     }
+    /// Whether the gateway answers a ping within `bound`. Its relay reads the ping only after the
+    /// messages before it were written to PostgreSQL, so a ping that stays unanswered shows the
+    /// relay stuck in the write of the message sent last.
+    async fn answers_ping(&mut self, bound: Duration) -> bool {
+        self.socket
+            .send(Message::Ping(Vec::new().into()))
+            .await
+            .unwrap();
+        timeout(bound, async {
+            loop {
+                match self.socket.next().await {
+                    Some(Ok(Message::Pong(_))) => return,
+                    Some(Ok(_)) => {}
+                    other => panic!("the gateway ended the connection: {other:?}"),
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
     /// Nothing reaches the client within `bound`.
     async fn silent(&mut self, bound: Duration) {
         assert!(self.buffer.is_empty(), "{:?}", self.buffer);
@@ -514,6 +534,22 @@ impl Client {
 }
 fn blocking<T>(work: impl FnOnce() -> T) -> T {
     tokio::task::block_in_place(work)
+}
+/// `sql` as the superuser in the tenant's database, `psql -At`.
+fn tenant_sql(cluster: &Cluster, sql: &str) -> String {
+    let output = cluster
+        .client("psql")
+        .args([
+            "-X", "-A", "-t", "-q", "-U", "postgres", "-d", DATABASE, "-c", sql,
+        ])
+        .output()
+        .expect("psql runs");
+    assert!(
+        output.status.success(),
+        "psql: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1044,6 +1080,105 @@ async fn an_http_pipeline_whose_postgresql_stops_reading_holds_up_no_one_else_on
     // The stuck write is bounded: the request ends with an unknown outcome.
     let (status, answer) = stuck.await.unwrap();
     assert_eq!((status, answer["code"].as_str()), (400, Some("08007")));
+    node.finish().await;
+}
+
+/// A write that finds no room in PostgreSQL's socket waits for it outside the table and asks the
+/// table's fence again: a quiesce published meanwhile stops the message before a byte of it
+/// crosses, and the message runs, whole, once the database runs again.
+///
+/// The tenant's PostgreSQL runs `pg_sleep` and reads nothing, and the tenant sends messages of
+/// about 1 KiB, which a stream socket takes whole or not at all (on Linux), until one finds the
+/// socket full. The gateway's relay answers no ping while it is in that write, which shows where
+/// it stands. PostgreSQL counts the messages it runs in a sequence.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_that_waits_for_room_is_fenced_again_before_a_byte_of_it_crosses() {
+    let Some(bin) = binaries() else { return };
+    let cluster = blocking(|| database_cluster(&bin));
+    blocking(|| {
+        tenant_sql(
+            &cluster,
+            "create sequence trail; grant usage on sequence trail to app",
+        )
+    });
+    let counted = || {
+        blocking(|| {
+            tenant_sql(
+                &cluster,
+                "select case when is_called then last_value else 0 end from trail",
+            )
+        })
+    };
+    let node = Node::start().await;
+    let running = entry(1, &operation('a'), Mode::Running, Some(unit(&cluster)));
+    node.table(vec![running.clone()]).await;
+    let mut tenant = node.upgrade(&route(1, 1, INSTANCE)).await.unwrap();
+    tenant.login().await;
+    tenant.send(query("select pg_sleep(60)")).await;
+    sleeping(&cluster).await;
+    let filler = query(&format!(
+        "select nextval('trail') /* {} */",
+        "x".repeat(1000)
+    ));
+    let mut sent = 0;
+    loop {
+        assert!(sent < 5000, "the socket to PostgreSQL never filled");
+        tenant.send(filler.clone()).await;
+        sent += 1;
+        if !tenant.answers_ping(Duration::from_millis(500)).await {
+            break;
+        }
+    }
+    // The first `sent - 1` messages are in the socket. The last one found it full, wrote nothing
+    // and waits for room.
+    timeout(
+        PROMPT,
+        node.update(Database {
+            mode: Mode::Quiesce,
+            ..running.clone()
+        }),
+    )
+    .await
+    .expect("the quiesce waited behind the write that waits for room");
+    // PostgreSQL reads again and runs what is in the socket; room opens up for the last message.
+    blocking(|| {
+        cluster.psql(
+            "postgres",
+            "select pg_cancel_backend(pid) from pg_stat_activity where query = 'select pg_sleep(60)'",
+        )
+    });
+    timeout(Duration::from_secs(10), async {
+        while counted().parse::<usize>().unwrap() < sent - 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("PostgreSQL runs the messages that are in the socket");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        counted(),
+        (sent - 1).to_string(),
+        "the message that waited for room crossed a published quiesce"
+    );
+
+    // The database runs again: the message is written whole, which PostgreSQL could not take
+    // behind a part of it, and the session goes on.
+    node.update(running).await;
+    timeout(Duration::from_secs(10), async {
+        while counted() != sent.to_string() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the held message runs once the database runs again");
+    tenant.send(query("select 'whole'")).await;
+    loop {
+        let (tag, body) = tenant.message().await.expect("PostgreSQL answers");
+        if tag == b'D' && body.ends_with(b"whole") {
+            break;
+        }
+    }
     node.finish().await;
 }
 
