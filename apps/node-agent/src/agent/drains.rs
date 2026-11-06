@@ -143,12 +143,18 @@ impl<M: Machine> Core<M> {
             .unwrap_or(false)
     }
 
-    /// Starts the drain of `db` once its platform schema is the agent's. The database's flow is
-    /// taken without waiting: a flow that runs is passed over until the next pass.
+    /// Starts the drain of `db` once its platform schema is the agent's. A short unit watch must
+    /// give this pass a fair turn even when both loops' ticks line up. Waiting at most one watch
+    /// period leaves the hub bounded when a lifecycle flow or a backup holds the database longer.
     async fn start_drain(&self, db: &Db, events: EventLimits) {
-        let Ok(_flow) = db.lock.try_lock() else {
+        let Ok(_flow) = tokio::time::timeout(self.timing.watch, db.lock.lock()).await else {
             return;
         };
+        // A node can be fenced while this pass waits for the database's flow.
+        if self.fences.fenced() {
+            self.drains.stop_all();
+            return;
+        }
         // The database may have left service while the flow was taken.
         let Some(entry) = served_entry(db) else {
             return;
@@ -335,6 +341,172 @@ mod tests {
                 .all(|body| body["database"] == entry.id.as_str()
                     && contract_valid("NodeDataEventReport", body))
         );
+    }
+
+    /// The service runs both the unit watcher and this hub once per `Timing::watch`. A brief
+    /// systemd read must not indefinitely prevent attachment just because their ticks line up.
+    /// PostgreSQL and its events connection are real; the existing machine gate stands in only
+    /// for a bounded unit read, and releases the flow for most of every interval.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_brief_unit_reads_do_not_starve_a_ready_databases_drain() {
+        let Some(rig) = Rig::with_timing("drain-watch-phase", Timing::default()).await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let baseline = rig
+            .machine
+            .unit_reads_by_database()
+            .get(&entry.id)
+            .copied()
+            .unwrap_or(0);
+        let period = Timing::default().watch;
+        let start = tokio::time::Instant::now() + Duration::from_millis(20);
+        rig.machine.hold_unit_reads([entry.id.clone()]);
+        let (watch_entered, mut watch_read) = tokio::sync::mpsc::unbounded_channel();
+        let (hub_polled, mut hub_started) = tokio::sync::mpsc::unbounded_channel();
+
+        let watcher = {
+            let core = rig.core.clone();
+            tokio::spawn(async move {
+                let mut ticks = tokio::time::interval_at(start, period);
+                for _ in 0..3 {
+                    ticks.tick().await;
+                    core.watch_pass().await;
+                }
+            })
+        };
+        let hub = {
+            let core = rig.core.clone();
+            tokio::spawn(async move {
+                let mut ticks = tokio::time::interval_at(start + Duration::from_millis(20), period);
+                for _ in 0..3 {
+                    ticks.tick().await;
+                    watch_read.recv().await.unwrap();
+                    let pass = core.drain_pass();
+                    tokio::pin!(pass);
+                    let first = futures_util::poll!(&mut pass);
+                    hub_polled.send(()).unwrap();
+                    if first.is_pending() {
+                        pass.await;
+                    }
+                }
+            })
+        };
+
+        for turn in 0..3 {
+            within(2, "the unit watcher to enter its read", async {
+                loop {
+                    let reads = rig
+                        .machine
+                        .unit_reads_by_database()
+                        .get(&entry.id)
+                        .copied()
+                        .unwrap_or(0);
+                    if reads > baseline + turn {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            watch_entered.send(()).unwrap();
+            within(
+                2,
+                "the drain hub to poll while the watch holds the flow",
+                async {
+                    hub_started.recv().await.unwrap();
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            rig.machine.release_unit_reads();
+            if turn < 2 {
+                tokio::time::sleep_until(start + period * turn as u32 + period * 9 / 10).await;
+                rig.machine.hold_unit_reads([entry.id.clone()]);
+            }
+        }
+        watcher.await.unwrap();
+        hub.await.unwrap();
+
+        assert_eq!(db.phase(), super::super::Phase::Ready);
+        let attached = rig.core.drains.running(&entry.id);
+        assert!(
+            attached,
+            "the default-period drain hub never attached, despite the bounded watch releasing the flow between ticks"
+        );
+        let rows = tenant(&rig, &entry.id)
+            .await
+            .query(
+                "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE datname=current_database() AND application_name=$1",
+                &[&postgres::EVENTS_APPLICATION],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get::<_, i64>(0),
+            1,
+            "the real events connection exists"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_long_flow_wait_is_bounded_and_another_database_attaches_while_it_waits() {
+        let Some(rig) = Rig::with_timing("drain-flow-bound", Timing::default()).await else {
+            return;
+        };
+        let (blocked, blocked_db) = rig.create().await;
+        let (free, _free_db) = rig.create().await;
+        let flow = blocked_db.lock.lock().await;
+        let core = rig.core.clone();
+        let mut pass = tokio::spawn(async move { core.drain_pass().await });
+        eventually(
+            1,
+            "the other database to attach without the held flow",
+            || rig.core.drains.running(&free.id),
+        )
+        .await;
+        let bounded = tokio::time::timeout(
+            Timing::default().watch + Duration::from_millis(500),
+            &mut pass,
+        )
+        .await;
+        if bounded.is_err() {
+            pass.abort();
+        }
+        let blocked_attached = rig.core.drains.running(&blocked.id);
+        drop(flow);
+        bounded
+            .expect("the hub must finish even while the lifecycle flow stays held")
+            .unwrap();
+        assert!(!blocked_attached);
+        assert!(rig.core.drains.running(&free.id));
+
+        rig.core.drain_pass().await;
+        assert!(rig.core.drains.running(&blocked.id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_fenced_during_the_flow_wait_attaches_nothing() {
+        let Some(rig) = Rig::with_timing("drain-flow-fence", Timing::default()).await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let flow = db.lock.lock().await;
+        let pass = rig.core.drain_pass();
+        tokio::pin!(pass);
+        assert!(
+            futures_util::poll!(&mut pass).is_pending(),
+            "the pass is waiting behind the held flow"
+        );
+        rig.core
+            .fences
+            .fence("op_fenced_during_drain_wait")
+            .unwrap();
+        drop(flow);
+        tokio::time::timeout(Timing::default().watch, pass)
+            .await
+            .expect("a fenced pass must finish");
+        assert!(!rig.core.drains.running(&entry.id));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

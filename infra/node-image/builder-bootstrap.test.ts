@@ -33,7 +33,7 @@ test("builder contexts contain only explicit inputs and verified 0600 trust byte
   const lock = { ...committed, packages: [ca] };
   try {
     await mkdir(source); await mkdir(work);
-    for (const name of ["Dockerfile", "build.sh", "normalize-modes.sh", "unrelated.txt"]) await writeFile(join(source, name), name);
+    for (const name of ["Dockerfile", "build.sh", "normalize-modes.sh", "cache-packages.sh", "unrelated.txt"]) await writeFile(join(source, name), name);
     let built = false;
     await assert.rejects(withBuilderContext(lock, source, work, async (entry, directory) => {
       await writeFile(join(directory, debFileName(entry)), payload);
@@ -42,7 +42,7 @@ test("builder contexts contain only explicit inputs and verified 0600 trust byte
       built = true;
       assert.equal(entry.sha256, ca.sha256);
       assert.equal((await stat(context)).mode & 0o777, 0o700);
-      assert.deepEqual((await readdir(context)).sort(), [BOOTSTRAP_CA_FILE, "Dockerfile", "build.sh", "normalize-modes.sh"].sort());
+      assert.deepEqual((await readdir(context)).sort(), [BOOTSTRAP_CA_FILE, "Dockerfile", "build.sh", "normalize-modes.sh", "cache-packages.sh"].sort());
       for (const name of await readdir(context)) assert.equal((await stat(join(context, name))).mode & 0o777, 0o600);
       assert.deepEqual(await readFile(join(context, BOOTSTRAP_CA_FILE)), payload);
       throw new Error("builder failed");

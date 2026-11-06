@@ -14,6 +14,8 @@ ARG PGCF_CA_CERTIFICATES_SHA256
 
 COPY --chmod=0600 bootstrap-ca-certificates.deb /tmp/bootstrap-ca-certificates.deb
 
+COPY --chmod=0755 cache-packages.sh /usr/local/bin/pgcf-cache-builder-packages
+
 RUN set -eu; \
     test -n "$PGCF_DEBIAN_SNAPSHOT"; \
     test -n "$PGCF_MKOSI_REPOSITORY"; \
@@ -49,10 +51,13 @@ RUN set -eu; \
       grub='grub-efi-amd64-bin:amd64 grub-pc-bin:amd64'; \
     fi; \
     apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 update; \
-    apt-get install --yes --no-install-recommends \
-      apt-utils ca-certificates cpio curl dosfstools e2fsprogs git \
+    set -- apt-utils ca-certificates cpio curl dosfstools e2fsprogs git \
       grub-common $grub kmod mtools python3 \
       systemd systemd-repart zstd; \
+    apt-get -o Acquire::ForceHash=SHA256 --print-uris --yes --no-install-recommends install "$@" > /tmp/pgcf-builder-packages; \
+    /usr/local/bin/pgcf-cache-builder-packages "$PGCF_DEBIAN_SNAPSHOT" /tmp/pgcf-builder-packages /var/cache/apt/archives; \
+    apt-get install --yes --no-install-recommends "$@"; \
+    rm -f /tmp/pgcf-builder-packages; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*; \
     git init --quiet /opt/mkosi; \

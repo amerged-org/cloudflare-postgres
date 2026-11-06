@@ -4,7 +4,7 @@ import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, rename, rm } from "no
 import { join } from "node:path";
 import { debFileName, type LockedPackage, type PackageLock } from "./lock.ts";
 
-const BUILDER_FILES = ["Dockerfile", "build.sh", "normalize-modes.sh"] as const;
+const BUILDER_FILES = ["Dockerfile", "build.sh", "normalize-modes.sh", "cache-packages.sh"] as const;
 export const BOOTSTRAP_CA_FILE = "bootstrap-ca-certificates.deb";
 
 /** Resolving an old lock may replace other packages, but trust never comes from an unpinned source. */
