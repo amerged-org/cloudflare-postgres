@@ -13,6 +13,7 @@
 use crate::{
     Error,
     archive::{facts, upload_log::UploadLog},
+    cache,
     pg_control::{CONTROL_FILE, ControlFile, Lsn, parse_control_file},
     postgres,
     sleep::{self, Refusal, Switched, SystemIdentity, is_segment},
@@ -20,7 +21,6 @@ use crate::{
 };
 use std::{
     future::Future,
-    io::Read,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -29,9 +29,10 @@ use std::{
 const ARCHIVE_POLL: Duration = Duration::from_millis(100);
 /// How often the proof looks at the outbox while a sleep waits for it to empty.
 const OUTBOX_CHECK: Duration = Duration::from_millis(100);
-/// `pg_control` is one 8 KiB block; the agent reads that much and no more of a file the
-/// database's user can replace.
-const CONTROL_READ: u64 = 8192;
+/// `pg_control` is one block of `PG_CONTROL_FILE_SIZE`, 8192 bytes, and PostgreSQL always writes
+/// the whole of it, so the cap needs no margin: a file of more is not a control file, and the
+/// agent, which reads as root a file the database's user can replace, refuses it.
+const CONTROL_LIMIT: u64 = 8192;
 
 /// The database a proof concerns.
 #[derive(Clone, Debug)]
@@ -191,14 +192,15 @@ pub async fn run<S: Steps>(proof: &Proof, steps: &S) -> Outcome {
 }
 
 /// `pg_control` of a database whose volume is mounted at `volume`. The database's user can
-/// replace what is below its mount point, and the agent reads as root: a component that is a link
-/// is refused, and no more than the block is read.
+/// replace what is below its mount point, and the agent reads as root: a directory on the way
+/// that is a link is refused, and the file is opened as `cache::open` does (no link, no pipe, no
+/// device) and read only up to the block.
 pub fn read_control(volume: &Path) -> std::io::Result<Vec<u8>> {
     let refuse = |path: &Path| -> std::io::Result<()> {
         if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "a link where the data directory has a file",
+                "a link where the data directory has a directory",
             ));
         }
         Ok(())
@@ -206,13 +208,7 @@ pub fn read_control(volume: &Path) -> std::io::Result<Vec<u8>> {
     let data = volume.join("data");
     refuse(&data)?;
     refuse(&data.join("global"))?;
-    let file = volume.join(CONTROL_FILE);
-    refuse(&file)?;
-    let mut bytes = Vec::new();
-    std::fs::File::open(file)?
-        .take(CONTROL_READ)
-        .read_to_end(&mut bytes)?;
-    Ok(bytes)
+    cache::read_small(&volume.join(CONTROL_FILE), CONTROL_LIMIT)
 }
 
 fn now_ms() -> i64 {
@@ -223,8 +219,11 @@ fn now_ms() -> i64 {
 
 /// Step 8 and the record of step 9, from what the stopped data directory and the archive show.
 fn verify_stopped(proof: &Proof, running: &Running) -> Result<ProvenSleepRecord, &'static str> {
-    if proof.data().join("postmaster.pid").exists() {
-        return Err("postmaster_pid");
+    // Anything at the path but nothing is a pid file: `exists` follows a link, and a link to
+    // nowhere is a file the database's user put there.
+    match std::fs::symlink_metadata(proof.data().join("postmaster.pid")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err("postmaster_pid"),
     }
     let bytes = read_control(&proof.volume).map_err(|_| "control_unreadable")?;
     let file = parse_control_file(&bytes)?;
@@ -1016,6 +1015,14 @@ mod tests {
             // The postmaster's pid file is still there.
             std::fs::write(volume.root.join("data/postmaster.pid"), "1\n").unwrap();
             assert_eq!(check(), Err("postmaster_pid"));
+            // A link in its place is a file the user put there, whether or not it leads anywhere.
+            std::fs::remove_file(volume.root.join("data/postmaster.pid")).unwrap();
+            std::os::unix::fs::symlink(
+                volume.root.join("nowhere"),
+                volume.root.join("data/postmaster.pid"),
+            )
+            .unwrap();
+            assert_eq!(check(), Err("postmaster_pid"));
         }
 
         #[test]
@@ -1065,6 +1072,65 @@ mod tests {
             std::fs::rename(&data, volume.root.join("moved")).unwrap();
             std::os::unix::fs::symlink(volume.root.join("moved"), &data).unwrap();
             assert!(read_control(&volume.root).is_err());
+        }
+
+        /// The database's user can replace `pg_control` with anything, and the agent reads as root
+        /// on a worker of its runtime: a pipe is not waited for, a link is not followed, a file
+        /// longer than the block PostgreSQL writes is not read, and the block itself is.
+        #[test]
+        fn a_control_file_the_user_replaced_by_a_pipe_a_link_or_a_large_file_is_not_read() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let volume = Volume::new("stopped-hostile");
+            let control = volume.root.join("data/global/pg_control");
+
+            // The block PostgreSQL writes, to the byte.
+            std::fs::write(&control, vec![0u8; 8192]).unwrap();
+            assert_eq!(read_control(&volume.root).unwrap().len(), 8192);
+            // A file with more than that is not a control file, and is not read to its end.
+            std::fs::write(&control, vec![0u8; 8192 + 1]).unwrap();
+            assert!(
+                read_control(&volume.root).is_err(),
+                "one byte past the block"
+            );
+            std::fs::write(&control, vec![0u8; 1 << 20]).unwrap();
+            assert!(read_control(&volume.root).is_err(), "a megabyte");
+
+            // A link, to a block that would read.
+            let elsewhere = volume.root.join("elsewhere");
+            std::fs::write(&elsewhere, vec![0u8; 8192]).unwrap();
+            std::fs::remove_file(&control).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &control).unwrap();
+            assert!(read_control(&volume.root).is_err(), "a link");
+
+            // A file that is not there stays the error it was.
+            std::fs::remove_file(&control).unwrap();
+            assert_eq!(
+                read_control(&volume.root).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+
+            // A pipe with no writer blocks whoever opens it for reading and waits: the read is
+            // made on a thread, so that a read that waits fails the test where it would stop it.
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&control)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let root = volume.root.clone();
+            std::thread::spawn(move || sender.send(read_control(&root).is_err()));
+            let answer = receiver.recv_timeout(Duration::from_secs(5));
+            // A writer that opens the pipe ends a read that waits, so that its thread ends too.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&control);
+            assert!(
+                answer.expect("the read of a pipe did not wait for a writer"),
+                "a pipe"
+            );
         }
 
         #[test]

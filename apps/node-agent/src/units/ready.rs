@@ -4,10 +4,13 @@
 //! `READY=1` and nothing polls, neither `pg_ctl` nor this. The postmaster writes its status line
 //! just before it sends `READY=1`, so a finished job leaves exactly one file read to do: it names
 //! the postmaster that is ready and the socket it listens on, which the gateway dials.
+use crate::cache;
 use std::path::{Path, PathBuf};
 
 /// The data directory's lock file, below the volume's mount point.
 pub const PID_FILE: &str = "data/postmaster.pid";
+/// The most of it the agent reads: PostgreSQL 18 writes eight lines of a few hundred bytes.
+const PID_FILE_LIMIT: u64 = 4096;
 
 /// The status line of `postmaster.pid`, the eighth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,17 +66,31 @@ pub fn parse(text: &str) -> Result<Postmaster, &'static str> {
     })
 }
 
-/// The socket of the postmaster that is ready and is the unit's main process. `directory` is the
-/// database's mount point, `main_pid` the unit's `MainPID`.
-pub fn ready_socket(directory: &Path, main_pid: u32) -> Result<PathBuf, &'static str> {
-    let text = std::fs::read_to_string(directory.join(PID_FILE)).map_err(|error| {
+/// The text of the `postmaster.pid` of the database whose volume is mounted at `volume`. The
+/// database's user can replace `data` and the file in it, and the agent reads as root on a worker
+/// of its runtime: a link at either is refused, and so is anything but a regular file, which a
+/// pipe would make the read wait for and a device would never end. A file longer than a pid file
+/// is refused without being read past the limit.
+pub fn read(volume: &Path) -> Result<String, &'static str> {
+    let reason = |error: std::io::Error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             "postmaster_pid_missing"
         } else {
             "postmaster_pid_unreadable"
         }
-    })?;
-    let postmaster = parse(&text)?;
+    };
+    let data = std::fs::symlink_metadata(volume.join("data")).map_err(reason)?;
+    if !data.is_dir() {
+        return Err("postmaster_pid_unreadable");
+    }
+    let bytes = cache::read_small(&volume.join(PID_FILE), PID_FILE_LIMIT).map_err(reason)?;
+    String::from_utf8(bytes).map_err(|_| "postmaster_pid_unreadable")
+}
+
+/// The socket of the postmaster that is ready and is the unit's main process. `directory` is the
+/// database's mount point, `main_pid` the unit's `MainPID`.
+pub fn ready_socket(directory: &Path, main_pid: u32) -> Result<PathBuf, &'static str> {
+    let postmaster = parse(&read(directory)?)?;
     if postmaster.pid != main_pid {
         return Err("postmaster_pid_mismatch");
     }
@@ -209,6 +226,76 @@ mod tests {
         assert_eq!(
             ready_socket(&garbage.0, 1),
             Err("postmaster_pid_unreadable")
+        );
+    }
+
+    /// The database's user can replace `data` and `postmaster.pid` in it, and the agent reads as
+    /// root, on a worker of its runtime and before it admits anything: what is not a regular file
+    /// of a real `data` directory, or is larger than a pid file ever is, is unreadable, and no
+    /// replacement makes the read follow, wait or grow.
+    #[test]
+    fn a_postmaster_pid_the_user_replaced_is_refused_and_never_followed_or_waited_for() {
+        use std::os::unix::fs::{OpenOptionsExt, symlink};
+        let ready = |volume: &Volume| ready_socket(&volume.0, 14405);
+        let unreadable = Err("postmaster_pid_unreadable");
+
+        // A link at the file, to a pid file that would read as ready, and to nothing.
+        let volume = Volume::with("");
+        let pid_file = volume.0.join(PID_FILE);
+        let elsewhere = volume.0.join("elsewhere");
+        std::fs::write(&elsewhere, READY).unwrap();
+        std::fs::remove_file(&pid_file).unwrap();
+        symlink(&elsewhere, &pid_file).unwrap();
+        assert_eq!(ready(&volume), unreadable, "a link is not followed");
+        std::fs::remove_file(&elsewhere).unwrap();
+        assert_eq!(
+            ready(&volume),
+            unreadable,
+            "nor is a link to nowhere a missing file"
+        );
+
+        // A link as the directory.
+        let volume = Volume::with(READY);
+        let moved = volume.0.join("moved");
+        std::fs::rename(volume.0.join("data"), &moved).unwrap();
+        symlink(&moved, volume.0.join("data")).unwrap();
+        assert_eq!(
+            ready(&volume),
+            unreadable,
+            "a link above the file is not walked"
+        );
+
+        // A file larger than a pid file ever is, with a ready pid file at its start.
+        let volume = Volume::with(READY);
+        let mut large = READY.to_string();
+        large.push_str(&"padding\n".repeat(1 << 17));
+        std::fs::write(volume.0.join(PID_FILE), large).unwrap();
+        assert_eq!(ready(&volume), unreadable, "only a bounded file is read");
+
+        // A pipe with no writer blocks whoever opens it for reading and waits. The read is made
+        // on a thread so that a read that waits fails the test where it would stop it.
+        let volume = Volume::with("");
+        let pid_file = volume.0.join(PID_FILE);
+        std::fs::remove_file(&pid_file).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pid_file)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let directory = volume.0.clone();
+        std::thread::spawn(move || sender.send(ready_socket(&directory, 14405)));
+        let answer = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        // A writer that opens the pipe ends a read that waits, so that its thread ends too.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&pid_file);
+        assert_eq!(
+            answer.expect("the read of a pipe did not wait for a writer"),
+            unreadable
         );
     }
 

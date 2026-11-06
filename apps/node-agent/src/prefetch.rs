@@ -303,14 +303,6 @@ fn real_directory(data: &Path, relative: &Path) -> bool {
     true
 }
 
-/// Up to `limit` bytes of a small file of the data directory.
-fn read_small(path: &Path, limit: u64) -> Option<Vec<u8>> {
-    let file = cache::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 <= limit).then_some(bytes)
-}
-
 /// The WAL a start reads first, as `(segment, spans)` with the spans ascending and merged: a
 /// window of `WAL_WINDOW` at the block of the latest checkpoint record, and, where a crash left
 /// the redo point earlier, a window at the block of that. The redo point of a clean stop is the
@@ -632,7 +624,7 @@ impl<'a> Builder<'a> {
         }
         let Some(bytes) = self
             .path(global, "pg_control")
-            .and_then(|path| read_small(&path, MAX_SMALL))
+            .and_then(|path| cache::read_small(&path, MAX_SMALL).ok())
         else {
             return;
         };
@@ -723,7 +715,7 @@ impl<'a> Builder<'a> {
             self.add(directory, "pg_filenode.map", None);
             let map = self
                 .path(directory, "pg_filenode.map")
-                .and_then(|path| read_small(&path, MAX_SMALL))
+                .and_then(|path| cache::read_small(&path, MAX_SMALL).ok())
                 .and_then(|bytes| FilenodeMap::parse(&bytes))
                 .unwrap_or_default();
             for &catalog in CATALOGS {
