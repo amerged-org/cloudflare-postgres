@@ -30,7 +30,8 @@ const MAXIMUM_MESSAGE: usize = 64 * 1024;
 /// The most PBKDF2 iterations a PostgreSQL verifier may ask for: 4 times the 4096 that PostgreSQL
 /// and the node agent write (`ITERATIONS` in apps/node-agent/src/scram.rs). A tenant may set its
 /// own verifier, and each login it causes holds one of the two derivation slots for this many
-/// rounds, so the bound keeps one role from queueing every other login behind a long derivation.
+/// rounds, so the bound shortens how long one role can hold a slot and delay the other logins; it
+/// does not give a database a slot of its own.
 pub const MAXIMUM_ITERATIONS: u32 = 16_384;
 /// The PBKDF2 derivations that run at once, on blocking threads.
 static DERIVATIONS: Semaphore = Semaphore::const_new(2);
@@ -534,7 +535,7 @@ mod tests {
             "r=otherserver,s=c2FsdA==,i=4096",
             "r=clientserver,s=,i=4096",
             "r=clientserver,s=c2FsdA==,i=0",
-            "r=clientserver,s=c2FsdA==,i=100001",
+            "r=clientserver,s=c2FsdA==,i=16385",
             "r=clientserver,s=c2FsdA==,i=4096,m=extension",
             "r=client server,s=c2FsdA==,i=4096",
         ] {
@@ -573,30 +574,36 @@ mod tests {
 
     #[test]
     fn pbkdf2_runs_off_the_async_workers() {
-        // One worker thread: a derivation on it would stop the ticker until it ends.
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering::SeqCst},
+        };
+        // One worker thread: a derivation on it would stop the ticker until it ends, so the widest
+        // stretch without a tick, the one still running at the end included, is the whole derivation.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counted = ticks.clone();
+            let started = std::time::Instant::now();
+            let (last, widest) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+            let (tick, gap) = (last.clone(), widest.clone());
             let ticker = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let now = started.elapsed().as_micros() as u64;
+                    gap.fetch_max(now - tick.swap(now, SeqCst), SeqCst);
                 }
             });
-            let started = std::time::Instant::now();
             Salted::derive(&password(b"pencil"), b"salt".to_vec(), MAXIMUM_ITERATIONS)
                 .await
                 .unwrap();
-            let elapsed = started.elapsed();
+            let elapsed = started.elapsed().as_micros() as u64;
             ticker.abort();
-            let ticks = ticks.load(std::sync::atomic::Ordering::SeqCst);
+            let widest = widest.load(SeqCst).max(elapsed - last.load(SeqCst));
             assert!(
-                elapsed.as_millis() < 10 || ticks as u128 >= elapsed.as_millis() / 4,
-                "{ticks} ticks in {elapsed:?}"
+                elapsed < 10_000 || widest * 2 < elapsed,
+                "{widest} us without a tick in {elapsed} us"
             );
         });
     }
