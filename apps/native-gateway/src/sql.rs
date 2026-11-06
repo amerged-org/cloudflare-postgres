@@ -124,7 +124,9 @@ fn not_accepting(outcome: &'static str) -> Refused {
 fn connection_failed(outcome: &'static str) -> Refused {
     refused(outcome, "08006", "database connection failed")
 }
-/// After the statement bytes were written: PostgreSQL may have committed them.
+/// After the statement bytes were written: PostgreSQL may have committed them. Also when the
+/// gateway had no memory for the answer (`memory_capacity`): the answer is not too large, its
+/// memory was not there, and the statements had been sent.
 fn unknown(outcome: &'static str) -> Refused {
     refused(
         outcome,
@@ -1074,7 +1076,7 @@ impl Answer {
         if needed > capacity {
             let grown = needed.max(capacity * 2).min(MAX_RESPONSE_BYTES);
             if !self.memory.grow(grown - capacity) {
-                return Err(too_large());
+                return Err(unknown("memory_capacity"));
             }
             self.bytes.reserve_exact(grown - self.bytes.len());
         }
@@ -1228,7 +1230,7 @@ async fn results(
         // Each message is leased while it is held.
         let held = body.len();
         if !answer.memory.grow(held) {
-            return Err(too_large());
+            return Err(unknown("memory_capacity"));
         }
         let step = match tag {
             b'1' | b'2' | b'3' | b'N' | b'S' | b'A' => Ok(()),
@@ -1414,7 +1416,7 @@ mod tests {
     }
     #[test]
     fn the_answer_leases_what_it_holds_and_refuses_beyond_its_bound() {
-        let budget = crate::budget::MemoryBudget::new(64 * 1024 * 1024, 32 * 1024 * 1024);
+        let budget = crate::budget::MemoryBudget::new(64 * 1024 * 1024, 32 * 1024 * 1024, 0, 0);
         let mut answer = Answer::new(budget.lease("db"), true).unwrap();
         answer.begin(&[json!({"name":"x"})]).unwrap();
         answer.row(&row(&[None, Some(b"a\"b\n")])).unwrap();
@@ -1446,14 +1448,15 @@ mod tests {
         );
         assert!(answer.bytes.len() <= MAX_RESPONSE_BYTES);
         assert_eq!(budget.database_used("db"), answer.bytes.capacity());
-        // The budget refuses before the bound does.
-        let small = crate::budget::MemoryBudget::new(1024 * 1024, 1024 * 1024);
+        // The budget refuses before the bound does, and says so: the answer is not too large, the
+        // gateway has no memory for it.
+        let small = crate::budget::MemoryBudget::new(1024 * 1024, 1024 * 1024, 0, 0);
         let mut answer = Answer::new(small.lease("db"), false).unwrap();
         answer.begin(&[]).unwrap();
         let refused = (0..1_000_000).find_map(|_| answer.row(&null).err());
         assert_eq!(
             refused.map(|refusal| refusal.outcome),
-            Some("response_too_large")
+            Some("memory_capacity")
         );
         assert!(answer.bytes.capacity() <= 1024 * 1024);
     }

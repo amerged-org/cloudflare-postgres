@@ -39,7 +39,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "PGCF_GATEWAY_DATABASE_MEMORY_BYTES",
         constant("DEFAULT_DATABASE_MEMORY_LIMIT_BYTES") as usize,
     )?;
-    if database_memory > maximum_memory {
+    let reserve_memory = positive(
+        "PGCF_GATEWAY_RESERVE_BYTES",
+        constant("DEFAULT_MEMORY_RESERVE_BYTES") as usize,
+    )?;
+    let guaranteed_memory = positive(
+        "PGCF_GATEWAY_GUARANTEED_BYTES",
+        constant("DEFAULT_DATABASE_GUARANTEED_MEMORY_BYTES") as usize,
+    )?;
+    if database_memory > maximum_memory
+        || reserve_memory >= maximum_memory
+        || guaranteed_memory > database_memory
+    {
         return Err("invalid gateway memory bounds".into());
     }
     let config = Arc::new(Config {
@@ -48,6 +59,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         keyring,
         maximum_memory,
         database_memory,
+        reserve_memory,
+        guaranteed_memory,
     });
     let (stop, receiver) = watch::channel(false);
     // On a node: the agent's table over its local channel, PostgreSQL on Unix sockets, and only

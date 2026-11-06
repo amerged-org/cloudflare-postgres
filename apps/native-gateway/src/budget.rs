@@ -18,17 +18,30 @@ struct Used {
     total: usize,
     databases: HashMap<String, usize>,
 }
+/// The gateway's accounted buffer memory. `maximum` is the node total; `reserve` of it is kept
+/// for databases that hold less than `guaranteed` bytes, so a database that holds more can never
+/// take it, and `database_maximum` bounds one database.
 pub struct MemoryBudget {
     maximum: usize,
     database_maximum: usize,
+    reserve: usize,
+    guaranteed: usize,
     used: Mutex<Used>,
 }
 impl MemoryBudget {
-    pub fn new(maximum: usize, database_maximum: usize) -> Arc<Self> {
+    pub fn new(
+        maximum: usize,
+        database_maximum: usize,
+        reserve: usize,
+        guaranteed: usize,
+    ) -> Arc<Self> {
         assert!(maximum > 0 && database_maximum > 0 && database_maximum <= maximum);
+        assert!(reserve < maximum && guaranteed <= database_maximum);
         Arc::new(Self {
             maximum,
             database_maximum,
+            reserve,
+            guaranteed,
             used: Mutex::new(Used::default()),
         })
     }
@@ -61,7 +74,15 @@ impl Lease {
     pub fn grow(&mut self, bytes: usize) -> bool {
         let mut used = self.budget.used.lock().unwrap();
         let current = *used.databases.get(&self.database).unwrap_or(&0);
-        if bytes > self.budget.maximum - used.total
+        // A database that stays within its guaranteed share may use all of the total; beyond it, a
+        // database competes for what the reserve leaves. The total may lie above that ceiling:
+        // the reserve was drawn on.
+        let ceiling = if current.saturating_add(bytes) <= self.budget.guaranteed {
+            self.budget.maximum
+        } else {
+            self.budget.maximum - self.budget.reserve
+        };
+        if bytes > ceiling.saturating_sub(used.total)
             || bytes > self.budget.database_maximum - current
         {
             return false;
@@ -351,7 +372,7 @@ mod tests {
     }
     #[test]
     fn advertised_memory_is_reserved_before_payload_and_freed_on_failure() {
-        let memory = MemoryBudget::new(1024, 1024);
+        let memory = MemoryBudget::new(1024, 1024, 0, 0);
         let wire = WireBudget::new(memory.lease("db"));
         let packet = frame(2, true, &[0; 512]);
         assert!(wire.observe(&packet[..8]).is_err());
@@ -360,7 +381,7 @@ mod tests {
     }
     #[test]
     fn fragmented_message_owns_one_charge_until_forwarded_and_partial_input_is_busy() {
-        let memory = MemoryBudget::new(4096, 4096);
+        let memory = MemoryBudget::new(4096, 4096, 0, 0);
         let wire = WireBudget::new(memory.lease("db"));
         let first = frame(2, false, b"abc");
         wire.observe(&first[..1]).unwrap();
@@ -380,7 +401,7 @@ mod tests {
     }
     #[test]
     fn database_and_global_budgets_are_independent_and_never_evict_live_buffers() {
-        let memory = MemoryBudget::new(2048, 1024);
+        let memory = MemoryBudget::new(2048, 1024, 0, 0);
         let a = WireBudget::new(memory.lease("a"));
         let b = WireBudget::new(memory.lease("b"));
         a.observe(&frame(2, true, &[0; 300])).unwrap();
@@ -397,8 +418,34 @@ mod tests {
         assert_eq!(memory.used(), 0);
     }
     #[test]
+    fn two_databases_at_their_cap_leave_every_other_database_its_guaranteed_share() {
+        let memory = MemoryBudget::new(384 << 20, 96 << 20, 192 << 20, 3 << 20);
+        let (mut a, mut b) = (memory.lease("a"), memory.lease("b"));
+        while a.grow(1 << 20) {}
+        while b.grow(1 << 20) {}
+        assert_eq!(memory.database_used("a"), 96 << 20);
+        assert_eq!(memory.database_used("b"), 96 << 20);
+        // A session and a masked frame of a third database are within its guaranteed share.
+        let mut c = memory.lease("c");
+        assert!(c.grow(crate::transport::SESSION_MEMORY_BYTES));
+        let wire = WireBudget::new(memory.lease("c"));
+        wire.observe(&frame(10, true, b"")).unwrap();
+        wire.observe(&frame(2, true, &[0; 1024])).unwrap();
+        // A database beyond its guaranteed share competes for the shared part only.
+        let mut d = memory.lease("d");
+        assert!(
+            !d.grow(4 << 20),
+            "above the guaranteed share the reserve is closed"
+        );
+        assert!(d.grow(3 << 20));
+        assert!(
+            !d.grow(1),
+            "past the guaranteed share the reserve stays closed"
+        );
+    }
+    #[test]
     fn startup_fragments_cannot_evade_total_bound_and_relay_accepts_large_advertisement() {
-        let memory = MemoryBudget::new(100 * 1024 * 1024, 96 * 1024 * 1024);
+        let memory = MemoryBudget::new(100 * 1024 * 1024, 96 * 1024 * 1024, 0, 0);
         let startup = WireBudget::new(memory.lease("db"));
         startup.observe(&frame(2, false, &vec![0; 32768])).unwrap();
         assert!(startup.observe(&frame(0, true, &vec![0; 32769])).is_err());
