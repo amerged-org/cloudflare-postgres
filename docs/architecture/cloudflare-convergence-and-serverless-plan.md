@@ -1,3 +1,24 @@
+# Selective operator credential custody — 2026-11-06
+
+The owner authorized rotation of unknown active credentials, append-only local custody, short
+client interruption and bounded non-Production breakage. Correct baseline-local credentials
+remain unchanged; Production data and recovery dependencies stay protected.
+
+One isolated operator-test project integrator credential was replaced and durably saved before
+consumer verification. New-key HTTP SQL and fresh WebSocket SQL passed before and after old-key
+revocation; the old key then returned 401 and the protected administrator still returned 200.
+No Production integrator, encryption key, archive object or backup reader was changed by that
+operation. The retained witness resumed on its existing local volume, served constant SELECT
+queries, and its ordinary idle hibernation was observed; no VPS was purchased.
+
+The [sealed custody exporter](../operations/custody-export.md) adds a reviewed source-builder
+candidate for a private owning-Worker entrypoint and signed, serialized bridge. It preserves
+the original modules/exports and can inherit bindings from an explicit serving version through
+the newer Workers API. Final Linux CI and hosted 0%-version wiring acceptance remain required
+before Production-critical capture. Source preparation is not a live export or another rotated
+credential. Full unknown-key rotation, historical-reader migration and architecture consolidation
+remain open until their per-identity and recovery checks pass.
+
 # Production backend delivery and live acceptance — 2026-11-06
 
 **Delivered backend:** additive schema `0098`, API 1.7.0, matching TypeScript Edge and both existing
