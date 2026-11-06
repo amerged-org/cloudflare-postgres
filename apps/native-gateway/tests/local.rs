@@ -63,11 +63,20 @@ fn route(id: usize, generation: u64, instance: &str) -> String {
     route_at(id, generation, instance, ROUTE_REVISION)
 }
 fn route_at(id: usize, generation: u64, instance: &str, route_revision: u64) -> String {
+    route_to(DATABASE, id, generation, instance, route_revision)
+}
+fn route_to(
+    database: &str,
+    id: usize,
+    generation: u64,
+    instance: &str,
+    route_revision: u64,
+) -> String {
     let now = http::now() / 1000;
     token(
         wire("nodeRouteTokenPrefix"),
         wire("nodeRouteSignatureDomain"),
-        json!({"v":6,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"route_revision":route_revision,"node":NODE,"inst":instance}),
+        json!({"v":6,"db":database,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"route_revision":route_revision,"node":NODE,"inst":instance}),
     )
 }
 /// The wake ticket Cloudflare signs for a sleeping database.
@@ -314,7 +323,13 @@ impl Node {
         Self::sql_on(self.port, route, query).await
     }
     async fn sql_on(port: u16, route: &str, query: &str) -> (u16, Value) {
-        let body = json!({"password":URL_SAFE_NO_PAD.encode(PASSWORD),"queries":[{"query":query,"params":[]}]}).to_string();
+        let queries = json!([{"query":query,"params":[]}]);
+        Self::sql_request(port, route, json!({"queries":queries})).await
+    }
+    /// One `POST /sql` with this body, to which the role's password is added.
+    async fn sql_request(port: u16, route: &str, mut body: Value) -> (u16, Value) {
+        body["password"] = URL_SAFE_NO_PAD.encode(PASSWORD).into();
+        let body = body.to_string();
         let request = format!(
             "POST /sql HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-PGCF-Route: {route}\r\n\r\n{body}",
             body.len()
@@ -336,6 +351,18 @@ impl Node {
             .unwrap();
         (status, serde_json::from_slice(&bytes[split..]).unwrap())
     }
+    /// The status of `GET /readyz`.
+    async fn readyz(&self) -> u16 {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
+        stream
+            .write_all(b"GET /readyz HTTP/1.1\r\nHost: gateway\r\n\r\n")
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        text.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
     async fn finish(self) {
         let _ = self.stop.send(true);
         for task in self.tasks {
@@ -351,7 +378,10 @@ struct Client {
     buffer: Vec<u8>,
 }
 fn startup() -> Vec<u8> {
-    let body = format!("user\0app\0database\0{DATABASE}\0\0");
+    startup_to(DATABASE)
+}
+fn startup_to(database: &str) -> Vec<u8> {
+    let body = format!("user\0app\0database\0{database}\0\0");
     let mut bytes = ((body.len() + 8) as u32).to_be_bytes().to_vec();
     bytes.extend_from_slice(&196_608u32.to_be_bytes());
     bytes.extend_from_slice(body.as_bytes());
@@ -417,7 +447,10 @@ impl Client {
     /// The StartupMessage with the password pipelined behind it, as the Edge's clients send it:
     /// the gateway asks for it in clear text and logs in to PostgreSQL with SCRAM itself.
     async fn login(&mut self) {
-        let mut bytes = startup();
+        self.login_to(DATABASE).await;
+    }
+    async fn login_to(&mut self, database: &str) {
+        let mut bytes = startup_to(database);
         bytes.extend_from_slice(&frame(b'p', format!("{PASSWORD}\0").as_bytes()));
         self.send(bytes).await;
         assert_eq!(self.message().await, Some((b'R', vec![0, 0, 0, 3])));
@@ -826,6 +859,191 @@ async fn sessions_outlive_the_agent_channel_and_new_routes_wait_for_its_table() 
         database: DATABASE.into(),
     });
     assert!(client.closed().await.is_some());
+    node.finish().await;
+}
+
+/// Another tenant's database on the node, served here by the same PostgreSQL.
+const OTHER: &str = "bbbbbbbbbbbbbbbbbbbb";
+/// A database the agent changes while a write is stuck; nobody connects to it.
+const UNRELATED: &str = "cccccccccccccccccccc";
+/// More than a Unix socket holds, so that a write of it blocks while PostgreSQL reads nothing.
+const STALLING_BYTES: usize = 3 * 1024 * 1024;
+/// What the others are given while a write is stuck: far below the write's own bound of 10 s.
+const PROMPT: Duration = Duration::from_secs(3);
+
+/// A node whose `DATABASE` (the tenant that stalls) and `OTHER` (another tenant) run on one
+/// PostgreSQL, with `UNRELATED` asleep.
+async fn shared_node(cluster: &Cluster) -> Node {
+    let node = Node::start().await;
+    let running = |database: &str| Database {
+        database: database.into(),
+        ..entry(1, &operation('a'), Mode::Running, Some(unit(cluster)))
+    };
+    node.table(vec![
+        running(DATABASE),
+        running(OTHER),
+        Database {
+            database: UNRELATED.into(),
+            ..entry(1, &operation('a'), Mode::Sleeping, None)
+        },
+    ])
+    .await;
+    node
+}
+/// Waits until PostgreSQL runs `select pg_sleep(60)`: from then on its backend reads nothing.
+async fn sleeping(cluster: &Cluster) {
+    timeout(Duration::from_secs(10), async {
+        while blocking(|| {
+            cluster.psql(
+                "postgres",
+                "select count(*) from pg_stat_activity where query = 'select pg_sleep(60)' and state = 'active'",
+            )
+        }) != "1"
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("PostgreSQL runs the statement");
+}
+/// What the agent and another tenant do while a write to the stalled tenant's PostgreSQL is
+/// stuck: the agent's table change and requests are answered and the other tenant's traffic
+/// runs, each within `PROMPT`. A stuck write that holds the gateway's table stops all of it.
+async fn others_are_served(node: &mut Node, established: &mut Client) {
+    node.send(ToGateway::Database {
+        database: Database {
+            database: UNRELATED.into(),
+            route_revision: ROUTE_REVISION + 1,
+            ..entry(1, &operation('a'), Mode::Sleeping, None)
+        },
+    });
+    timeout(
+        PROMPT,
+        node.until(|table| {
+            table
+                .record(UNRELATED)
+                .is_some_and(|record| record.route_revision == ROUTE_REVISION + 1)
+        }),
+    )
+    .await
+    .expect("the agent's table change waited behind the stuck write");
+    node.send(ToGateway::Control {
+        id: 9,
+        action: ControlAction::Status,
+        database: OTHER.into(),
+        generation: 1,
+    });
+    let answer = timeout(
+        PROMPT,
+        node.receive(|message| matches!(message, FromGateway::Status { id: 9, .. })),
+    )
+    .await
+    .expect("the agent's request waited behind the stuck write");
+    assert!(
+        matches!(
+            answer,
+            FromGateway::Status {
+                status: SessionStatus::Running,
+                connections: 1,
+                ..
+            }
+        ),
+        "{answer:?}"
+    );
+    assert_eq!(
+        timeout(PROMPT, node.readyz())
+            .await
+            .expect("readiness waited behind the stuck write"),
+        200
+    );
+    assert_eq!(
+        timeout(PROMPT, established.value("select 'both ways'"))
+            .await
+            .expect("the other tenant's session waited behind the stuck write"),
+        "both ways"
+    );
+    let mut fresh = timeout(
+        PROMPT,
+        node.upgrade(&route_to(OTHER, 20, 1, INSTANCE, ROUTE_REVISION)),
+    )
+    .await
+    .expect("a new admission waited behind the stuck write")
+    .unwrap();
+    timeout(PROMPT, async {
+        fresh.login_to(OTHER).await;
+        assert_eq!(fresh.value("select 'admitted'").await, "admitted");
+    })
+    .await
+    .expect("a new session of the other tenant waited behind the stuck write");
+}
+
+/// One tenant's PostgreSQL reads nothing (it runs `pg_sleep`) while the tenant sends more than
+/// the socket holds: the gateway's write to it is stuck until its own bound. Nobody else on the
+/// node waits for it, the agent's table changes included, and the stuck write ends by itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_whose_postgresql_stops_reading_holds_up_no_one_else_on_the_node() {
+    let Some(bin) = binaries() else { return };
+    let cluster = blocking(|| database_cluster(&bin));
+    blocking(|| cluster.psql("postgres", &format!("create database {OTHER} owner app")));
+    let mut node = shared_node(&cluster).await;
+    let mut other = node
+        .upgrade(&route_to(OTHER, 1, 1, INSTANCE, ROUTE_REVISION))
+        .await
+        .unwrap();
+    other.login_to(OTHER).await;
+
+    let mut tenant = node.upgrade(&route(2, 1, INSTANCE)).await.unwrap();
+    tenant.login().await;
+    tenant.send(query("select pg_sleep(60)")).await;
+    sleeping(&cluster).await;
+    tenant
+        .send(query(&format!("select '{}'", "x".repeat(STALLING_BYTES))))
+        .await;
+    // The gateway has read the message from the client and its write to PostgreSQL is stuck.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    others_are_served(&mut node, &mut other).await;
+    // The stuck write is bounded: the tenant's session ends without an answer.
+    assert_eq!(tenant.message().await, None);
+    node.finish().await;
+}
+
+/// The same through HTTP SQL: a pipeline that starts with `pg_sleep` and carries more than the
+/// socket holds behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_http_pipeline_whose_postgresql_stops_reading_holds_up_no_one_else_on_the_node() {
+    let Some(bin) = binaries() else { return };
+    let cluster = blocking(|| database_cluster(&bin));
+    blocking(|| cluster.psql("postgres", &format!("create database {OTHER} owner app")));
+    let mut node = shared_node(&cluster).await;
+    let mut other = node
+        .upgrade(&route_to(OTHER, 1, 1, INSTANCE, ROUTE_REVISION))
+        .await
+        .unwrap();
+    other.login_to(OTHER).await;
+
+    let (port, tenant) = (node.port, route(2, 1, INSTANCE));
+    let stuck = tokio::spawn(async move {
+        Node::sql_request(
+            port,
+            &tenant,
+            json!({
+                "queries":[
+                    {"query":"select pg_sleep(60)","params":[]},
+                    {"query":"select $1::text","params":["x".repeat(STALLING_BYTES)]},
+                ],
+                "transaction":{},
+            }),
+        )
+        .await
+    });
+    sleeping(&cluster).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    others_are_served(&mut node, &mut other).await;
+    // The stuck write is bounded: the request ends with an unknown outcome.
+    let (status, answer) = stuck.await.unwrap();
+    assert_eq!((status, answer["code"].as_str()), (400, Some("08007")));
     node.finish().await;
 }
 

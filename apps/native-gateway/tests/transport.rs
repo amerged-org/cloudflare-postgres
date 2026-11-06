@@ -1232,6 +1232,54 @@ async fn a_large_frontend_write_reaches_a_slowly_reading_postgres_in_full() {
     client.close(None).await.unwrap();
     fixture.stop().await;
 }
+#[tokio::test]
+async fn a_message_being_written_when_a_quiesce_is_published_arrives_whole_and_the_next_one_waits()
+{
+    // The double reads a message only after 200 ms, so the 1 MiB message is still being written
+    // when the quiesce is published. The table does not wait for that write, yet the message is
+    // never split: it reaches PostgreSQL whole, and the message behind it, which would begin to
+    // cross the published quiesce, waits until the database runs again.
+    let mut fixture = Fixture::congested().await;
+    let mut client = fixture.authenticate(971).await;
+    let bytes = large_query();
+    client
+        .send(Message::Binary(bytes.clone().into()))
+        .await
+        .unwrap();
+    client.send(Message::Binary(query().into())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fixture.set(Mode::Quiesce, 1, true).await;
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        bytes
+    );
+    let reply = timeout(Duration::from_secs(10), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data();
+    assert_eq!(&reply[..], [b'Z', 0, 0, 0, 5, b'I']);
+    assert!(
+        timeout(Duration::from_millis(500), fixture.upstream.recv())
+            .await
+            .is_err(),
+        "frontend bytes began to cross a published quiesce"
+    );
+    fixture.set(Mode::Running, 1, true).await;
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        query()
+    );
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
 /// One plain HTTP request to the gateway: the status and the body.
 async fn get(fixture: &Fixture, path: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", fixture.port))

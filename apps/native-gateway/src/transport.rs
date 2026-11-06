@@ -28,7 +28,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UnixStream},
     sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch},
     task::JoinSet,
-    time::timeout,
+    time::{timeout, timeout_at},
 };
 use tokio_tungstenite::{
     WebSocketStream, accept_async_with_config,
@@ -253,9 +253,8 @@ impl Gateway {
         self.table.read().await.permits(database, writer)
     }
     /// Writes `bytes` to a session's writer while the database admits new work and `writer` is its
-    /// writer, holding the table for the bounded write: a change that would stop the write waits
-    /// for it. Any other change of the database's entry, such as a later route revision, leaves
-    /// the session's admission as it was.
+    /// writer. Any other change of the database's entry, such as a later route revision, leaves
+    /// the session's admission as it was. See [`Gateway::write_fenced`] for how the table is held.
     pub(crate) async fn write_admitted(
         &self,
         database: &str,
@@ -263,20 +262,23 @@ impl Gateway {
         postgres: &mut UnixStream,
         bytes: &[u8],
     ) -> Result<(), Blocked> {
-        let table = self.table.read().await;
-        if !table.admits(database) {
-            return Err(Blocked::Fenced);
-        }
-        if !table.permits(database, writer) {
-            return Err(Blocked::TargetChanged);
-        }
-        bounded_write(postgres, bytes).await
+        self.write_fenced(postgres, bytes, |table| {
+            if !table.admits(database) {
+                return Err(Blocked::Fenced);
+            }
+            if !table.permits(database, writer) {
+                return Err(Blocked::TargetChanged);
+            }
+            Ok(true)
+        })
+        .await
+        .map(|_| ())
     }
     /// Writes `bytes` of a running session while its database runs on `writer`; false, with
-    /// nothing written, while the database is quiescing or retired. The table is held through
-    /// the bounded write, so new bytes never cross a published change. Without the channel the
+    /// nothing written, while the database is quiescing or retired. Without the channel the
     /// last table stands: only the agent stops a database, and it does so over the channel or by
-    /// stopping the unit, which ends the session.
+    /// stopping the unit, which ends the session. See [`Gateway::write_fenced`] for how the table
+    /// is held.
     pub(crate) async fn write_running(
         &self,
         database: &str,
@@ -284,14 +286,57 @@ impl Gateway {
         postgres: &mut UnixStream,
         bytes: &[u8],
     ) -> Result<bool, Blocked> {
-        let table = self.table.read().await;
-        if !table.permits(database, writer) {
-            return Err(Blocked::TargetChanged);
+        self.write_fenced(postgres, bytes, |table| {
+            if !table.permits(database, writer) {
+                return Err(Blocked::TargetChanged);
+            }
+            Ok(table.mode(database) == Some(Mode::Running))
+        })
+        .await
+    }
+    /// Writes `bytes` to PostgreSQL while `fence`, asked of the table, lets them through: `Ok(true)`
+    /// writes, `Ok(false)` holds them (nothing written, and the answer is false), an error refuses
+    /// them.
+    ///
+    /// The table is node-global, and a PostgreSQL that stops reading its socket is the tenant's to
+    /// make, so the table is never held while waiting for room in the socket: the fence is asked
+    /// under the table's read guard and the guard is dropped again around one non-blocking write.
+    /// A write that finds no room waits for it outside the table and asks the fence again, so
+    /// bytes never begin to cross a change the table has published. Once the first of the bytes is
+    /// in the socket the rest follow outside the table, so a message is never split: its session
+    /// is busy for as long (the caller marks it busy before it writes), which is what the agent's
+    /// quiescence waits for. All of it is bounded by one [`WRITE_BOUND`]; a write that is not done
+    /// by then is [`Blocked::Lost`].
+    async fn write_fenced(
+        &self,
+        postgres: &mut UnixStream,
+        bytes: &[u8],
+        fence: impl Fn(&LocalTable) -> Result<bool, Blocked>,
+    ) -> Result<bool, Blocked> {
+        let deadline = tokio::time::Instant::now() + WRITE_BOUND;
+        loop {
+            let written = {
+                let table = self.table.read().await;
+                if !fence(&table)? {
+                    return Ok(false);
+                }
+                postgres.try_write(bytes)
+            };
+            match written {
+                Ok(written) => {
+                    return match timeout_at(deadline, postgres.write_all(&bytes[written..])).await {
+                        Ok(Ok(())) => Ok(true),
+                        _ => Err(Blocked::Lost),
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if !matches!(timeout_at(deadline, postgres.writable()).await, Ok(Ok(()))) {
+                        return Err(Blocked::Lost);
+                    }
+                }
+                Err(_) => return Err(Blocked::Lost),
+            }
         }
-        if table.mode(database) != Some(Mode::Running) {
-            return Ok(false);
-        }
-        bounded_write(postgres, bytes).await.map(|()| true)
     }
     /// What a session of the database does now, given what it was last asked: run, hold its
     /// bytes while the database quiesces, or close.
@@ -330,12 +375,6 @@ impl Gateway {
             return Err("target_changed");
         }
         Ok(())
-    }
-}
-async fn bounded_write(postgres: &mut UnixStream, bytes: &[u8]) -> Result<(), Blocked> {
-    match timeout(WRITE_BOUND, postgres.write_all(bytes)).await {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(Blocked::Lost),
     }
 }
 pub(crate) struct SessionLease {
@@ -1736,8 +1775,9 @@ async fn forward_if_running(
     bytes: &[u8],
     stages: &mut Stages,
 ) -> Result<bool, Failure> {
-    // The bounded enqueue and the table's changes share this read/write boundary.
-    // Bytes already being written stay busy; new bytes cannot cross a published change.
+    // The fence is asked of the table before bytes begin to cross, never while they wait for room
+    // in PostgreSQL's socket. Bytes already being written stay busy; new bytes cannot begin to
+    // cross a published change.
     match gateway
         .write_running(database, target, postgres, bytes)
         .await

@@ -63,6 +63,15 @@ archive socket.
   charges remain owned until forwarding or closure. Startup buffering is bounded separately;
   ordinary messages support the existing 32 MiB limit and outbound frames are at most 64 KiB.
   Authenticated activity history preserves unknown/partial values and never invents zero usage.
+- The table is the node's, and a tenant's PostgreSQL that stops reading its socket (a long
+  statement while the client goes on sending) must not stop the other databases, so a write to
+  PostgreSQL never holds the table while it waits for room in the socket. The table is asked
+  under its read lock before a write's first bytes cross, and again after every wait for room;
+  once the first bytes are in the socket the rest of that message follows outside the lock. The
+  session is busy for as long, which is what the agent's quiesce waits for, so a published
+  quiesce lets no new message begin to cross and no message is split. The write is bounded
+  (`WRITE_BOUND`, 10 s) and a write that is not done by then ends its session or request. HTTP
+  SQL writes its statements the same way.
 - There is no PostgreSQL write retry, credential replay or query replay after transport handoff.
 
 ## Restart and drain
