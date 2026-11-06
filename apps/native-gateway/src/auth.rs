@@ -7,8 +7,9 @@
 //!
 //! The gateway's one SCRAM client accepts a PostgreSQL that proves the password's verifier, or one
 //! that asks for no password; any other request (a cleartext or MD5 password) never receives it.
-//! Its PBKDF2 runs off the async workers, a bounded number at once, for at most
-//! [`MAXIMUM_ITERATIONS`].
+//! Its PBKDF2 runs off the async workers, at most two derivations at once node-wide. One login
+//! costs its verifier's iteration count in HMAC rounds, once per derivation, so a verifier may ask
+//! for at most [`MAXIMUM_ITERATIONS`].
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
 use pgcf_native_protocol::{constant, startup::error_response};
@@ -26,9 +27,11 @@ type Failure = Box<dyn std::error::Error + Send + Sync>;
 pub const CLEARTEXT_REQUEST: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 3];
 /// The longest message PostgreSQL may send while the gateway logs in for the client.
 const MAXIMUM_MESSAGE: usize = 64 * 1024;
-/// The most PBKDF2 iterations a PostgreSQL verifier may ask for: 25 times PostgreSQL's default
-/// (4096), so no role's verifier makes a login cost the gateway more than milliseconds of CPU.
-pub const MAXIMUM_ITERATIONS: u32 = 100_000;
+/// The most PBKDF2 iterations a PostgreSQL verifier may ask for: 4 times the 4096 that PostgreSQL
+/// and the node agent write (`ITERATIONS` in apps/node-agent/src/scram.rs). A tenant may set its
+/// own verifier, and each login it causes holds one of the two derivation slots for this many
+/// rounds, so the bound keeps one role from queueing every other login behind a long derivation.
+pub const MAXIMUM_ITERATIONS: u32 = 16_384;
 /// The PBKDF2 derivations that run at once, on blocking threads.
 static DERIVATIONS: Semaphore = Semaphore::const_new(2);
 
@@ -540,6 +543,30 @@ mod tests {
                     .server_first(server_first.as_bytes())
                     .is_err(),
                 "{server_first}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verifier_is_accepted_up_to_the_maximum_iterations_and_refused_above_it() {
+        for iterations in [4_096, 16_384] {
+            let server_first = format!("r=clientserver,s=c2FsdA==,i={iterations}");
+            let (_, accepted) = Scram::new("client")
+                .server_first(server_first.as_bytes())
+                .unwrap();
+            assert_eq!(accepted, iterations);
+        }
+        for iterations in [16_385, 100_000] {
+            let server_first = format!("r=clientserver,s=c2FsdA==,i={iterations}");
+            let refused = Scram::new("client")
+                .server_first(server_first.as_bytes())
+                .unwrap_err();
+            assert_eq!(refused.to_string(), "invalid SCRAM iteration count");
+            assert!(
+                Salted::derive(&password(b"pencil"), b"salt".to_vec(), iterations)
+                    .await
+                    .is_err(),
+                "{iterations}"
             );
         }
     }
