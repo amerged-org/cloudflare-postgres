@@ -11,6 +11,8 @@ test("builder repository bootstrap establishes pinned CA trust before HTTPS APT 
   const verify = dockerfile.indexOf("sha256sum /tmp/bootstrap-ca-certificates.deb"), extract = dockerfile.indexOf("dpkg-deb --extract"), apt = dockerfile.indexOf("APT::Update::Error-Mode=any");
   assert.ok(verify > 0 && verify < extract && extract < apt);
   assert.match(dockerfile, /Acquire::Retries=3/);
+  const trustConfig = dockerfile.indexOf('Acquire::https::CaInfo "/etc/ssl/certs/ca-certificates.crt";');
+  assert.ok(trustConfig > extract && trustConfig < apt, "APT must use the bootstrapped CA file before its usual OpenSSL trust paths exist");
   assert.match(dockerfile, /Signed-By: \/usr\/share\/keyrings\/debian-archive-keyring.gpg/);
   assert.match(dockerfile, /Check-Valid-Until: no/);
   assert.doesNotMatch(dockerfile, /AllowUnauthenticated|Verify-Peer=false|trusted=yes/);

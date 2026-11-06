@@ -28,6 +28,7 @@ RUN set -eu; \
     cat /tmp/pgcf-bootstrap-ca/usr/share/ca-certificates/mozilla/*.crt > /etc/ssl/certs/ca-certificates.crt; \
     chmod 0644 /etc/ssl/certs/ca-certificates.crt; \
     test -s /etc/ssl/certs/ca-certificates.crt; \
+    printf '%s\n' 'Acquire::https::CaInfo "/etc/ssl/certs/ca-certificates.crt";' > /etc/apt/apt.conf.d/99pgcf-bootstrap-ca; \
     rm -rf /tmp/pgcf-bootstrap-ca /tmp/bootstrap-ca-certificates.deb; \
     rm -f /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; \
     printf '%s\n' \
