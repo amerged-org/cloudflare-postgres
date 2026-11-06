@@ -21,22 +21,26 @@ struct Used {
     total: usize,
     /// The databases that hold memory, and how much.
     databases: HashMap<String, usize>,
-    /// Whether more databases hold memory than the reserve covers.
-    outgrown: bool,
+    /// How many of them hold no more than their guaranteed share. Those are the ones the reserve
+    /// guarantees; a database above its share draws on the shared part and is not counted.
+    within: usize,
     reported: Option<Instant>,
 }
 impl Used {
-    /// The number of holders, when the reserve no longer covers the guaranteed share of every
-    /// database that holds memory and that has not been said for [`REPORT_WINDOW`].
-    fn outgrown(&mut self, covered: usize, now: Instant) -> Option<usize> {
-        let holders = self.databases.len();
-        if holders <= covered {
-            self.outgrown = false;
+    /// A database went from holding `from` to holding `to` bytes.
+    fn moved(&mut self, from: usize, to: usize, guaranteed: usize) {
+        let within = |bytes: usize| (bytes > 0 && bytes <= guaranteed) as usize;
+        self.within += within(to);
+        self.within -= within(from);
+    }
+    /// The number of databases at or below their share, when the reserve cannot cover all of
+    /// their shares and it was not said for [`REPORT_WINDOW`]. A stretch that lasts is said again
+    /// at the first change after each window.
+    fn outgrown(&mut self, covered: usize, now: impl FnOnce() -> Instant) -> Option<usize> {
+        if self.within <= covered {
             return None;
         }
-        if std::mem::replace(&mut self.outgrown, true) {
-            return None;
-        }
+        let now = now();
         if self
             .reported
             .is_some_and(|at| now.duration_since(at) < REPORT_WINDOW)
@@ -44,7 +48,7 @@ impl Used {
             return None;
         }
         self.reported = Some(now);
-        Some(holders)
+        Some(self.within)
     }
 }
 /// Why a configuration of the byte budgets cannot be served, naming the variable to change.
@@ -157,18 +161,15 @@ impl Lease {
         used.total += bytes;
         *used.databases.entry(self.database.clone()).or_default() += bytes;
         self.bytes += bytes;
-        // One line when a database starts to hold memory that the reserve cannot cover with
-        // everyone's guaranteed share; nothing else changes.
-        let holders = if current == 0 {
-            used.outgrown(self.budget.covered(), Instant::now())
-        } else {
-            None
-        };
+        used.moved(current, current + bytes, self.budget.guaranteed);
+        // One line when the databases within their share outnumber what the reserve covers;
+        // nothing else changes.
+        let within = used.outgrown(self.budget.covered(), Instant::now);
         drop(used);
-        if let Some(holders) = holders {
+        if let Some(within) = within {
             println!(
                 "{}",
-                serde_json::json!({"event":"memory_reserve_outgrown","holders":holders,"guaranteed_bytes":self.budget.guaranteed,"reserve_bytes":self.budget.reserve})
+                serde_json::json!({"event":"memory_reserve_outgrown","holders_within_share":within,"guaranteed_bytes":self.budget.guaranteed,"reserve_bytes":self.budget.reserve})
             );
         }
         true
@@ -189,12 +190,14 @@ impl Lease {
         }
         let mut used = self.budget.used.lock().unwrap();
         used.total -= bytes;
-        let current = used.databases.get_mut(&self.database).unwrap();
-        *current -= bytes;
-        if *current == 0 {
+        let held = used.databases.get_mut(&self.database).unwrap();
+        let from = *held;
+        *held -= bytes;
+        let to = *held;
+        if to == 0 {
             used.databases.remove(&self.database);
-            used.outgrown(self.budget.covered(), Instant::now());
         }
+        used.moved(from, to, self.budget.guaranteed);
         self.bytes -= bytes;
     }
 }
@@ -537,8 +540,10 @@ mod tests {
         assert!(message.contains("at least 100663297"));
         assert!(check_bounds(100, 200, 10, 5).is_err_and(|m| m.contains("DATABASE_MEMORY")));
         assert!(check_bounds(100, 50, 10, 60).is_err_and(|m| m.contains("GUARANTEED")));
-        // Three databases hold memory where the reserve covers two guaranteed shares.
+        // Three databases hold memory where the reserve covers two guaranteed shares; one that
+        // holds more than its share draws on the shared part and is not counted.
         let memory = MemoryBudget::new(1000, 500, 20, 10);
+        let within = || memory.used.lock().unwrap().within;
         let mut leases: Vec<Lease> = ["a", "b", "c"]
             .map(|database| {
                 let mut lease = memory.lease(database);
@@ -546,25 +551,27 @@ mod tests {
                 lease
             })
             .into();
-        assert!(memory.used.lock().unwrap().outgrown);
+        assert_eq!(within(), 3);
+        assert!(memory.used.lock().unwrap().reported.is_some());
+        assert!(leases[2].grow(10));
+        assert_eq!(within(), 2);
+        leases[2].shrink(10);
+        assert_eq!(within(), 3);
         drop(leases.pop());
-        assert!(!memory.used.lock().unwrap().outgrown);
-        // It is said once for a stretch above the reserve and at most once in the window.
+        assert_eq!(within(), 2);
+        // With a clock of the test's own: the first line at once, a lasting stretch again after
+        // each window, and a stretch that begins inside a window at the first change after it.
         let (mut used, start) = (Used::default(), Instant::now());
-        for database in ["a", "b", "c"] {
-            used.databases.insert(database.into(), 1);
-        }
-        assert_eq!(used.outgrown(2, start), Some(3));
-        assert_eq!(used.outgrown(2, start), None);
-        used.databases.remove("c");
-        assert_eq!(used.outgrown(2, start), None);
-        used.databases.insert("c".into(), 1);
-        assert_eq!(used.outgrown(2, start + REPORT_WINDOW / 2), None);
-        assert_eq!(used.outgrown(2, start + REPORT_WINDOW), None);
-        used.databases.remove("c");
-        used.outgrown(2, start + REPORT_WINDOW);
-        used.databases.insert("c".into(), 1);
-        assert_eq!(used.outgrown(2, start + REPORT_WINDOW), Some(3));
+        used.within = 3;
+        assert_eq!(used.outgrown(2, || start), Some(3));
+        assert_eq!(used.outgrown(2, || start + REPORT_WINDOW / 2), None);
+        assert_eq!(used.outgrown(2, || start + REPORT_WINDOW), Some(3));
+        used.within = 2;
+        assert_eq!(used.outgrown(2, || start + 2 * REPORT_WINDOW), None);
+        used.within = 3;
+        let early = start + REPORT_WINDOW + REPORT_WINDOW / 2;
+        assert_eq!(used.outgrown(2, || early), None);
+        assert_eq!(used.outgrown(2, || start + 2 * REPORT_WINDOW), Some(3));
     }
     #[test]
     fn startup_fragments_cannot_evade_total_bound_and_relay_accepts_large_advertisement() {
