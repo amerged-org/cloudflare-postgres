@@ -419,8 +419,10 @@ in `agent/mod.rs`, `bin/current` in `update.rs`, `main.rs` and `machine/node.rs`
 
 ## PostgreSQL configuration
 
-The agent writes `postgresql.conf`, `pg_hba.conf` and `pg_ident.conf` before every start and owns
-all three (`settings.rs`); a restored database's files are the source's and are replaced first.
+The agent writes `postgresql.conf`, `pg_hba.conf`, `pg_ident.conf` and `postgresql.auto.conf` before
+every start and owns all four (`settings.rs`); a restored database's files are the source's and are
+replaced first. `postgresql.auto.conf` is reset to its initdb header because PostgreSQL reads it
+after `postgresql.conf` and tenants cannot use `ALTER SYSTEM`.
 
 - **No network.** `listen_addresses` is empty and the socket directory is `/run/pgcf/<id>`.
 - **Memory** follows the database's memory size _m_ in MiB: `shared_buffers` _m_/8, `effective_cache_size`
