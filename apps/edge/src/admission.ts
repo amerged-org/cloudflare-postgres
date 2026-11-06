@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * The admission every database request takes, a WebSocket connection (`index.ts`) and an HTTP
- * query (`sql.ts`) alike: the Edge limiters and the DatabaseActor's admission run together, and
- * an admitted request is signed its route to the node's gateway.
+ * query (`sql.ts`) alike: the Edge limiters and the DatabaseActor's admission, and an admitted
+ * request is signed its route to the node's gateway. A WebSocket upgrade runs the limiters and the
+ * Actor's admission together; an HTTP query counts in the limiters first (`limitRoute`), before
+ * its body is read, and takes the Actor's admission after the body is understood.
  */
 import {
   parseRouteKeyring,
@@ -20,7 +22,10 @@ export interface Hints {
 
 /** Milliseconds of each admission stage that ran, logged with the admission. */
 export interface AdmissionTimings {
-  /** The limiters, which run in parallel with the Actor's admission. */
+  /**
+   * The limiters: in parallel with the Actor's admission for a WebSocket upgrade, and ahead of the
+   * body, before the Actor's admission begins, for an HTTP query.
+   */
   limiters_ms?: number;
   admit_ms?: number;
   /** A thrown RPC and an Actor's generic failure are distinct; never log exception text. */
@@ -202,8 +207,9 @@ export async function admitRoute(
         .catch(() => false),
     );
   signal.addEventListener("abort", cancel, { once: true });
-  // The limiters and the Actor's admission run together: none of them waits for another. The
-  // per-database bucket therefore also counts connects that admission refuses.
+  // Unless `limitRoute` has counted the request, the limiters and the Actor's admission run
+  // together: none of them waits for another. The per-database bucket therefore also counts
+  // connects that admission refuses.
   const started = Date.now();
   let admission: PromiseSettledResult<DatabaseWakeAdmission>;
   let outcomes: PromiseSettledResult<RateLimitOutcome>[];

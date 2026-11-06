@@ -602,28 +602,40 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     expect(await forwarded()).toHaveLength(0);
   });
 
-  it("counts a body that turns out malformed against the limiters once, and refuses it before the Actor", async () => {
-    const connection = vi.fn(async () => ({ success: true }));
-    const perDatabase = vi.fn(async () => ({ success: true }));
-    const admission = vi.fn(async () => awake());
-    const response = await post(
-      admitting(admission, {
-        CONNECTION_RATE_LIMITER: { limit: connection } as unknown as RateLimit,
-        DATABASE_CONNECTION_RATE_LIMITER: {
-          limit: perDatabase,
-        } as unknown as RateLimit,
-      }),
-      { query: 1 },
-    );
-    expect(await refusal(response)).toBe("08P01");
-    expect(connection).toHaveBeenCalledExactlyOnceWith({
-      key: JSON.stringify(["sql", database, "app", "ipv4:192.0.2.1"]),
-    });
-    expect(perDatabase).toHaveBeenCalledExactlyOnceWith({
-      key: JSON.stringify(["sql", database]),
-    });
-    expect(admission).not.toHaveBeenCalled();
-    expect(await forwarded()).toHaveLength(0);
+  it("counts a body that is empty or turns out malformed against the limiters once, and never reaches the Actor", async () => {
+    // A transaction of no statements is answered at once; a malformed body is refused. Neither
+    // needs the Actor, and neither is free: each is one request of the client's budget.
+    for (const [body, code] of [
+      [{ query: 1 }, "08P01"],
+      [{ queries: [] }, null],
+    ] as const) {
+      const connection = vi.fn(async () => ({ success: true }));
+      const perDatabase = vi.fn(async () => ({ success: true }));
+      const admission = vi.fn(async () => awake());
+      const response = await post(
+        admitting(admission, {
+          CONNECTION_RATE_LIMITER: {
+            limit: connection,
+          } as unknown as RateLimit,
+          DATABASE_CONNECTION_RATE_LIMITER: {
+            limit: perDatabase,
+          } as unknown as RateLimit,
+        }),
+        body,
+      );
+      if (code === null) {
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ results: [] });
+      } else expect(await refusal(response)).toBe(code);
+      expect(connection).toHaveBeenCalledExactlyOnceWith({
+        key: JSON.stringify(["sql", database, "app", "ipv4:192.0.2.1"]),
+      });
+      expect(perDatabase).toHaveBeenCalledExactlyOnceWith({
+        key: JSON.stringify(["sql", database]),
+      });
+      expect(admission).not.toHaveBeenCalled();
+      expect(await forwarded()).toHaveLength(0);
+    }
   });
 
   it("aborts a chunked body at the size cap instead of buffering it", async () => {
