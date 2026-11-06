@@ -1413,7 +1413,7 @@ mod tests {
     }
     #[test]
     fn the_answer_leases_what_it_holds_and_refuses_beyond_its_bound() {
-        let budget = crate::budget::MemoryBudget::new(64 * 1024 * 1024, 32 * 1024 * 1024);
+        let budget = crate::budget::MemoryBudget::new(64 * 1024 * 1024, 32 * 1024 * 1024, 0, 0);
         let mut answer = Answer::new(budget.lease("db"), true).unwrap();
         answer.begin(&[json!({"name":"x"})]).unwrap();
         answer.row(&row(&[None, Some(b"a\"b\n")])).unwrap();
@@ -1446,7 +1446,7 @@ mod tests {
         assert!(answer.bytes.len() <= MAX_RESPONSE_BYTES);
         assert_eq!(budget.database_used("db"), answer.bytes.capacity());
         // The budget refuses before the bound does.
-        let small = crate::budget::MemoryBudget::new(1024 * 1024, 1024 * 1024);
+        let small = crate::budget::MemoryBudget::new(1024 * 1024, 1024 * 1024, 0, 0);
         let mut answer = Answer::new(small.lease("db"), false).unwrap();
         answer.begin(&[]).unwrap();
         let refused = (0..1_000_000).find_map(|_| answer.row(&null).err());

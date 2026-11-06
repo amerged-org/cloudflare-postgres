@@ -68,11 +68,15 @@ fn route(id: usize) -> String {
 }
 /// The admission route for the database at `generation` and `route_revision`.
 fn route_at(id: usize, generation: u64, route_revision: u64) -> String {
+    route_in(DATABASE, id, generation, route_revision)
+}
+/// The admission route for `database`, which runs on the fixture's unit like `DATABASE`.
+fn route_in(database: &str, id: usize, generation: u64, route_revision: u64) -> String {
     let now = http::now() / 1000;
     token(
         wire("nodeRouteTokenPrefix"),
         wire("nodeRouteSignatureDomain"),
-        json!({"v":6,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"route_revision":route_revision,"node":NODE,"inst":INSTANCE}),
+        json!({"v":6,"db":database,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"route_revision":route_revision,"node":NODE,"inst":INSTANCE}),
     )
 }
 fn wake_operation() -> String {
@@ -89,8 +93,17 @@ fn wake_token(id: usize, generation: u64) -> String {
 }
 /// The agent's entry for the database: `mode` at `generation`, on `unit` while PostgreSQL runs.
 fn entry(mode: Mode, generation: u64, operation: &str, unit: &Writer) -> Database {
+    entry_of(DATABASE, mode, generation, operation, unit)
+}
+fn entry_of(
+    database: &str,
+    mode: Mode,
+    generation: u64,
+    operation: &str,
+    unit: &Writer,
+) -> Database {
     Database {
-        database: DATABASE.into(),
+        database: database.into(),
         generation,
         operation: operation.into(),
         mode,
@@ -262,7 +275,8 @@ enum Authentication {
 /// a small fixed language: `select ...` returns its parameters as one row of text columns (or
 /// `1` without parameters), `insert` inserts one row, `fail` raises 42P01 when executed, `copy`
 /// starts COPY FROM STDIN, `hang` drops the connection once executed, `big` returns 12 MiB of
-/// rows, `nulls` returns 1,700,000 rows of one NULL (6 bytes each on the wire).
+/// rows, `nulls` returns 1,700,000 rows of one NULL (6 bytes each on the wire), `stall` sends one
+/// row of as many bytes as its parameter says and then neither CommandComplete nor ReadyForQuery.
 async fn postgres_session(
     mut stream: UnixStream,
     journal: Journal,
@@ -398,7 +412,7 @@ async fn postgres_session(
                         .map(|(n, o, s)| (n.as_str(), *o, *s))
                         .collect();
                     send(&mut stream, b'T', &row_description(&columns)).await?;
-                } else if query == "big" || query == "nulls" {
+                } else if query == "big" || query == "nulls" || query == "stall" {
                     send(&mut stream, b'T', &row_description(&[("x", 25, -1)])).await?;
                 } else {
                     send(&mut stream, b'n', &[]).await?;
@@ -451,6 +465,12 @@ async fn postgres_session(
                         }
                         send(&mut stream, b'C', &complete("SELECT 12")).await?;
                     }
+                    "stall" => {
+                        let length: usize = params[0].as_ref().unwrap().parse().unwrap();
+                        send(&mut stream, b'D', &data_row(&[Some(&vec![b'x'; length])])).await?;
+                        journal.push("stalled".into());
+                        return std::future::pending().await;
+                    }
                     "nulls" => {
                         let mut rows = Vec::new();
                         for _ in 0..1_700_000 {
@@ -491,6 +511,10 @@ impl Fixture {
     }
     /// The database `mode` at generation 1; a sleeping one has no unit.
     async fn with(mode: Mode) -> Self {
+        Self::sized(mode, [384 << 20, 96 << 20, 192 << 20, 3 << 20]).await
+    }
+    /// The gateway's byte budgets: the total, one database's, the reserve and the guaranteed share.
+    async fn sized(mode: Mode, memory: [usize; 4]) -> Self {
         let directory = Directory::new("sql");
         let socket = directory.path().join(".s.PGSQL.5432");
         let upstream = UnixListener::bind(&socket).unwrap();
@@ -508,8 +532,10 @@ impl Fixture {
                 active: "test".into(),
                 keys: HashMap::from([("test".into(), vec![7; 32])]),
             },
-            maximum_memory: 192 * 1024 * 1024,
-            database_memory: 96 * 1024 * 1024,
+            maximum_memory: memory[0],
+            database_memory: memory[1],
+            reserve_memory: memory[2],
+            guaranteed_memory: memory[3],
         }));
         gateway
             .table
@@ -915,6 +941,68 @@ async fn copy_and_an_oversized_result_close_the_session() {
         .await;
     assert_eq!((status, &answer["code"]), (400, &json!("54000")));
     fixture.idle(0).await;
+    fixture.stop().await;
+}
+/// Stalls requests of `database` until the gateway refuses one; the others stay held.
+async fn stall_until_refused(
+    fixture: &Fixture,
+    database: &str,
+    ids: &mut usize,
+) -> Vec<JoinHandle<(u16, Value)>> {
+    let mut held = Vec::new();
+    loop {
+        *ids += 1;
+        let route = route_in(database, *ids, 1, ROUTE_REVISION);
+        let request = body(PASSWORD, &[("stall", json!(["16384"]))], None).to_string();
+        let (port, before) = (fixture.port, fixture.journal.count("stalled"));
+        let mut task = tokio::spawn(async move { post(port, &route, request.as_bytes()).await });
+        timeout(Duration::from_secs(5), async {
+            while fixture.journal.count("stalled") == before && !task.is_finished() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the request neither stalled nor was refused");
+        // Time for the gateway to take the row in, which it may refuse.
+        match timeout(Duration::from_millis(25), &mut task).await {
+            Ok(refused) => {
+                assert_eq!(refused.unwrap().0, 400);
+                return held;
+            }
+            Err(_) => held.push(task),
+        }
+    }
+}
+#[tokio::test]
+async fn two_stalled_databases_leave_another_database_its_sessions() {
+    // Two databases hold answers that PostgreSQL never finishes, until the gateway's bytes are
+    // spent: each answer is a row of 16 KiB in a buffer of twice that, beside 144 KiB of session.
+    let fixture = Fixture::sized(Mode::Running, [4 << 20, 2 << 20, 3 << 19, 1 << 20]).await;
+    let (second, third) = ("bbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccc");
+    fixture.gateway.table.write().await.replace(
+        [DATABASE, second, third]
+            .map(|database| entry_of(database, Mode::Running, 1, &operation(), &fixture.unit))
+            .to_vec(),
+    );
+    let mut ids = 100;
+    let mut held = stall_until_refused(&fixture, DATABASE, &mut ids).await;
+    held.extend(stall_until_refused(&fixture, second, &mut ids).await);
+    assert!(held.len() > 10, "{} stalled", held.len());
+    // The third database still gets a session and an answer of 128 KiB (its guaranteed share
+    // is 1 MiB), and nobody's live request was cut for it.
+    let wide = "c".repeat(128 * 1024);
+    let (status, answer) = fixture
+        .sql(
+            &route_in(third, 1, 1, ROUTE_REVISION),
+            &body(PASSWORD, &[("select $1", json!([wide.clone()]))], None),
+        )
+        .await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["rows"][0][0], json!(wide));
+    assert!(held.iter().all(|task| !task.is_finished()));
+    for task in held {
+        task.abort();
+    }
     fixture.stop().await;
 }
 #[tokio::test]

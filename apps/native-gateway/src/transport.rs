@@ -52,8 +52,14 @@ pub struct Config {
     /// The node this gateway serves; its keyring verifies only the routes made for it.
     pub node: String,
     pub keyring: Keyring,
+    /// The accounted buffer memory of the whole gateway, the reserve included.
     pub maximum_memory: usize,
+    /// The most one database may hold.
     pub database_memory: usize,
+    /// The part of `maximum_memory` only databases under `guaranteed_memory` can draw on.
+    pub reserve_memory: usize,
+    /// What every database may hold before it competes for the shared part.
+    pub guaranteed_memory: usize,
 }
 pub(crate) struct Admission {
     pub(crate) replay: ReplayCache,
@@ -100,7 +106,12 @@ pub struct Gateway {
 impl Gateway {
     pub fn new(config: Arc<Config>) -> Arc<Self> {
         Arc::new(Self {
-            memory: MemoryBudget::new(config.maximum_memory, config.database_memory),
+            memory: MemoryBudget::new(
+                config.maximum_memory,
+                config.database_memory,
+                config.reserve_memory,
+                config.guaranteed_memory,
+            ),
             config,
             table: Arc::default(),
             sessions: Arc::new(Mutex::new(Sessions::default())),
@@ -1773,8 +1784,10 @@ mod tests {
                 active: "test".into(),
                 keys: HashMap::new(),
             },
-            maximum_memory: 192 << 20,
+            maximum_memory: 384 << 20,
             database_memory: 96 << 20,
+            reserve_memory: 192 << 20,
+            guaranteed_memory: 3 << 20,
         }))
     }
     fn route(route_revision: u64) -> Route {

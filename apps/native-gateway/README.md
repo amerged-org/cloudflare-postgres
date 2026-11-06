@@ -8,7 +8,8 @@ records those.
 ## Configuration
 
 `PGCF_REGION_ID`, `PGCF_NODE_ID`, the node's derived `PGCF_ROUTE_KEY`, `PGCF_GATEWAY_PORT`,
-`PGCF_GATEWAY_MEMORY_BYTES`, `PGCF_GATEWAY_DATABASE_MEMORY_BYTES` and `PGCF_AGENT_SOCKET`
+`PGCF_GATEWAY_MEMORY_BYTES`, `PGCF_GATEWAY_DATABASE_MEMORY_BYTES`, `PGCF_GATEWAY_RESERVE_BYTES`,
+`PGCF_GATEWAY_GUARANTEED_BYTES` (the byte budgets, see Connections) and `PGCF_AGENT_SOCKET`
 (default `/run/pgcf/agent/gateway.sock`). The gateway listens on loopback only, for cloudflared. On a
 node it serves the socket that `pgcf-gateway.socket` holds and passes to it as descriptor 3
 (`LISTEN_PID`, `LISTEN_FDS`; a socket that is not on loopback is refused, and `PGCF_GATEWAY_PORT` is
@@ -63,6 +64,16 @@ archive socket.
   charges remain owned until forwarding or closure. Startup buffering is bounded separately;
   ordinary messages support the existing 32 MiB limit and outbound frames are at most 64 KiB.
   Authenticated activity history preserves unknown/partial values and never invents zero usage.
+- The accounted buffer memory is 384 MiB in all and at most 96 MiB for one database, of which 192
+  MiB is a reserve. A database may hold its guaranteed share (3 MiB: twenty 144-KiB sessions) from
+  the whole budget; beyond that share it competes only for what the reserve leaves. So databases
+  that fill the shared 192 MiB, for example with HTTP SQL answers that PostgreSQL has not finished
+  (an answer's buffer is held until PostgreSQL ends the statement), cannot take a neighbour's
+  sessions or frames from it. A neighbour's answer above its guaranteed share is still refused
+  while the shared part is full. The reserve has to cover every awake database's
+  guaranteed share and the held wake connections (144 KiB each, at most 512), about 185 MiB for 37
+  awake databases; a node with more awake databases needs `PGCF_GATEWAY_RESERVE_BYTES` raised. The
+  budgets are accounted bytes, not a limit on the process's memory.
 - There is no PostgreSQL write retry, credential replay or query replay after transport handoff.
 
 ## Restart and drain
