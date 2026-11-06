@@ -19,6 +19,15 @@ count unchanged at one. The protected administrator continued returning 200. Act
 capture confirmed that the existing routing and credential-encryption rings match the retained
 local historical copies, so those known correct keys were not rotated.
 
+Four further unknown runtime provider tokens were replaced under their exact existing policies,
+resources, conditions and expiry: PGCF Tunnel/DNS, Development SaaS, Production SaaS and Production
+web-domain management. Each one-time successor was appended before the selected binding changed;
+read-only capability probes passed before and after old-token revocation, and all four old tokens
+then failed authentication. No DNS, Tunnel, certificate, archive object or protected local key was
+removed. Seven credential identities/configured secrets have completed rotation in this execution;
+recovered old material and two new operator-custody maintenance keys are excluded from that count.
+The independent-identity inventory remains open; binding-name totals are not key totals.
+
 The [sealed custody exporter](../operations/custody-export.md) adds a reviewed source-builder
 candidate for a private owning-Worker entrypoint and signed, serialized bridge. It preserves
 the original modules/exports and can inherit bindings from an explicit serving version through
