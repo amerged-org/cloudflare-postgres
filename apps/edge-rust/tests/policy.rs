@@ -20,6 +20,13 @@ fn vectors() -> Value {
     ))
     .unwrap()
 }
+
+#[test]
+fn deadline_before_gateway_connection_is_retryable_without_reclassifying_connection_abort() {
+    assert_eq!(Failure::admission_deadline(false).sqlstate, "57P03");
+    assert_eq!(Failure::admission_deadline(true), Failure::interrupted());
+    assert_eq!(Failure::interrupted().sqlstate, "08006");
+}
 #[test]
 fn authoritative_typescript_ip_and_signing_vectors() {
     let edge = &vectors()["edge"];

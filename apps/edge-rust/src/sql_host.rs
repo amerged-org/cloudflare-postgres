@@ -219,21 +219,26 @@ async fn run(
         timings.clone(),
         host::owned_context(ctx),
     );
-    let admitted = bounded(request, ctx, move |signal, deadline| async move {
-        let admit = Admit {
-            env: admitting,
-            hints,
-            source,
-            cid,
-            signal,
-            deadline,
-            ctx: owned,
-            timings: shared,
-            scope: &["sql"],
-        };
-        let (region, token) = admit.route().await?;
-        Ok(Admitted { region, token })
-    })
+    let admitted = bounded(
+        request,
+        ctx,
+        timings.clone(),
+        move |signal, deadline| async move {
+            let admit = Admit {
+                env: admitting,
+                hints,
+                source,
+                cid,
+                signal,
+                deadline,
+                ctx: owned,
+                timings: shared,
+                scope: &["sql"],
+            };
+            let (region, token) = admit.route().await?;
+            Ok(Admitted { region, token })
+        },
+    )
     .await?;
     *region = Some(admitted.region.id.clone());
     forward(&admitted, &body, env, &request.inner().signal(), timings).await

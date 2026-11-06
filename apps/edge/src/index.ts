@@ -119,8 +119,12 @@ export default {
     let outcome = "accepted";
     try {
       const routed = (hints = routingHints(url));
-      const upstream = await bounded(request, ctx, (signal, deadline) =>
-        admit(request, env, routed, cid, signal, deadline, ctx, timings),
+      const upstream = await bounded(
+        request,
+        ctx,
+        (signal, deadline) =>
+          admit(request, env, routed, cid, signal, deadline, ctx, timings),
+        () => timings.gateway_started !== undefined,
       );
       region = upstream.region;
       // Attaching an unopened socket delegates the stream to the runtime: the Edge sees no frame

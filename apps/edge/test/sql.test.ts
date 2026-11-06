@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index.ts";
 import { MAX_SQL_REQUEST_BYTES } from "@pgcf/contracts/edge-sql";
 import type { DatabaseWakeAdmission, Env } from "../src/env.ts";
+import { ADMISSION_DEADLINE_MS } from "../src/session-policy.ts";
 
 const testEnv = env as unknown as Env & { GATEWAY: Fetcher };
 const origin = `https://${["edge", "invalid"].join(".")}`;
@@ -117,6 +118,40 @@ afterEach(async () => {
   await testEnv.GATEWAY.fetch(`${gatewayOrigin}/reset`);
   logs.mockRestore();
   vi.restoreAllMocks();
+});
+
+it("refuses an admission deadline as retryable before forwarding SQL, including late Actor success", async () => {
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const bindings = admitting(async () => {
+    entered();
+    await held;
+    return awake();
+  });
+  vi.useFakeTimers();
+  try {
+    const pending = post(bindings, {
+      query: "INSERT INTO once_only VALUES (1)",
+      params: [],
+    });
+    await started;
+    await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
+    const response = await pending;
+    expect(await refusal(response)).toBe("57P03");
+    expect(await forwarded()).toHaveLength(0);
+    release();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await forwarded()).toHaveLength(0);
+  } finally {
+    release();
+    vi.useRealTimers();
+  }
 });
 
 describe("HTTP SQL in the Neon serverless driver's wire format", () => {

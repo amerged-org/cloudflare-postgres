@@ -238,27 +238,39 @@ export async function admitRoute(
 }
 
 /**
- * Runs `admission` until its deadline (60 s) or the client's abort, whichever comes first; either
- * refuses with 08006 and aborts the signal `admission` was given.
+ * Before a gateway connection starts, expiry is a retryable pre-execution refusal. Client
+ * cancellation and an interrupted gateway connection retain their connection-failure meaning.
  */
 export async function bounded<T>(
   request: Request,
   ctx: ExecutionContext,
   admission: (signal: AbortSignal, deadline: number) => Promise<T>,
+  gatewayStarted: () => boolean = () => false,
 ): Promise<T> {
   const deadline = Date.now() + ADMISSION_DEADLINE_MS;
   const controller = new AbortController();
-  const abort = () => controller.abort();
+  const abort = () =>
+    controller.abort(
+      new AdmissionFailure("08006", "connection admission interrupted"),
+    );
   request.signal.addEventListener("abort", abort, { once: true });
   if (request.signal.aborted) abort();
   let refuse!: () => void;
   const interrupted = new Promise<never>((_resolve, reject) => {
-    refuse = () =>
-      reject(new AdmissionFailure("08006", "connection admission interrupted"));
+    refuse = () => reject(controller.signal.reason);
     if (controller.signal.aborted) refuse();
     else controller.signal.addEventListener("abort", refuse, { once: true });
   });
-  const timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
+  const timer = setTimeout(
+    () => {
+      controller.abort(
+        gatewayStarted()
+          ? new AdmissionFailure("08006", "connection admission interrupted")
+          : new AdmissionFailure("57P03", "database is not ready yet"),
+      );
+    },
+    Math.max(0, deadline - Date.now()),
+  );
   const admitted = Promise.race([
     interrupted,
     admission(controller.signal, deadline),
