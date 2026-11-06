@@ -75,6 +75,10 @@ impl Sessions {
             session.pending_dial = pending_dial;
         }
     }
+    /// Whether the session is marked busy by `update`; the wire's own busy state is not counted.
+    pub fn marked_busy(&self, id: &str) -> bool {
+        self.entries.get(id).is_some_and(|session| session.busy)
+    }
     pub fn remove(&mut self, id: &str) {
         self.entries.remove(id);
     }

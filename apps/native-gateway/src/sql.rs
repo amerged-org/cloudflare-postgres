@@ -934,7 +934,8 @@ async fn authenticate(
 }
 /// Writes to PostgreSQL only while the agent's table still admits new work for the session's
 /// database on its writer; the table is not held while the write waits for PostgreSQL
-/// (`Gateway::write_admitted`).
+/// (`Gateway::write_admitted`). The session is marked busy before each call, which that function
+/// requires: `open` and `handle` mark it, and it stays so until the session is parked.
 async fn write_guarded(
     gateway: &Gateway,
     backend: &mut Backend,
@@ -947,7 +948,7 @@ async fn write_guarded(
         ..
     } = backend;
     gateway
-        .write_admitted(database, &lease.target, postgres, bytes)
+        .write_admitted(&lease.id, database, &lease.target, postgres, bytes)
         .await
         .map_err(|blocked| match blocked {
             Blocked::Fenced | Blocked::TargetChanged => Guard::Fenced,

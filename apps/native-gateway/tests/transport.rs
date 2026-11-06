@@ -256,12 +256,13 @@ impl Double {
 /// One session of the double: the StartupMessage, the login, then a ReadyForQuery for every
 /// message until Terminate or the end of the stream. `slow` reads each message only after 200 ms.
 /// While `gate` is closed the login waits after the StartupMessage: the test opens it when it
-/// wants the login to go on.
+/// wants the login to go on. While `reading` is closed, the double reads no message.
 async fn postgres_session(
     mut stream: UnixStream,
     double: Double,
     slow: bool,
     mut gate: watch::Receiver<bool>,
+    mut reading: watch::Receiver<bool>,
     send: mpsc::Sender<Vec<u8>>,
     ended: mpsc::Sender<()>,
 ) {
@@ -281,6 +282,9 @@ async fn postgres_session(
         return;
     }
     loop {
+        if reading.wait_for(|open| *open).await.is_err() {
+            break;
+        }
         if slow {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -328,6 +332,8 @@ struct Fixture {
     ends: mpsc::Receiver<()>,
     /// While it is closed, the double does not log a session in after its StartupMessage.
     gate: watch::Sender<bool>,
+    /// While it is closed, the double reads no message of a logged-in session.
+    reading: watch::Sender<bool>,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     _directory: Directory,
@@ -409,6 +415,7 @@ impl Fixture {
         let (send, received) = mpsc::channel(16);
         let (ended, ends) = mpsc::channel(16);
         let (gate, open) = watch::channel(true);
+        let (reading, reads) = watch::channel(true);
         let mut shutdown = receiver.clone();
         let counted = calls.clone();
         let upstream_task = tokio::spawn(async move {
@@ -419,7 +426,7 @@ impl Fixture {
                     accepted = upstream.accept() => {
                         let (stream, _) = accepted.unwrap();
                         counted.fetch_add(1, Ordering::SeqCst);
-                        tasks.spawn(postgres_session(stream, double.clone(), slow, open.clone(), send.clone(), ended.clone()));
+                        tasks.spawn(postgres_session(stream, double.clone(), slow, open.clone(), reads.clone(), send.clone(), ended.clone()));
                     }
                 }
             }
@@ -463,6 +470,7 @@ impl Fixture {
             upstream: received,
             ends,
             gate,
+            reading,
             stop,
             tasks: vec![upstream_task, gateway_task],
             _directory: directory,
@@ -1235,13 +1243,15 @@ async fn a_large_frontend_write_reaches_a_slowly_reading_postgres_in_full() {
     fixture.stop().await;
 }
 #[tokio::test]
-async fn a_message_being_written_when_a_quiesce_is_published_arrives_whole_and_the_next_one_waits()
+async fn a_quiesce_published_while_a_message_is_mid_write_waits_for_no_write_and_splits_no_message()
 {
-    // The double reads a message only after 200 ms, so the 1 MiB message is still being written
-    // when the quiesce is published. The table does not wait for that write, yet the message is
-    // never split: it reaches PostgreSQL whole, and the message behind it, which would begin to
-    // cross the published quiesce, waits until the database runs again.
-    let mut fixture = Fixture::congested().await;
+    // PostgreSQL reads nothing, so the gateway's write of the 1 MiB message stops mid-message
+    // when the socket is full, and the message behind it waits for it. The quiesce is published
+    // then: it does not wait for the write (it did, while the write held the table), the message
+    // in flight still reaches PostgreSQL whole once PostgreSQL reads, and the message behind it,
+    // which would begin to cross the published quiesce, waits until the database runs again.
+    let mut fixture = Fixture::new().await;
+    fixture.reading.send(false).unwrap();
     let mut client = fixture.authenticate(971).await;
     let bytes = large_query();
     client
@@ -1249,8 +1259,18 @@ async fn a_message_being_written_when_a_quiesce_is_published_arrives_whole_and_t
         .await
         .unwrap();
     client.send(Message::Binary(query().into())).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    fixture.set(Mode::Quiesce, 1, true).await;
+    // The relay reads the ping only after the write: no pong shows it stuck in the write.
+    client.send(Message::Ping(Vec::new().into())).await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(300), client.next())
+            .await
+            .is_err(),
+        "the write is not in flight"
+    );
+    timeout(Duration::from_secs(2), fixture.set(Mode::Quiesce, 1, true))
+        .await
+        .expect("the published quiesce waited for the message in flight");
+    fixture.reading.send(true).unwrap();
     assert_eq!(
         timeout(Duration::from_secs(10), fixture.upstream.recv())
             .await
