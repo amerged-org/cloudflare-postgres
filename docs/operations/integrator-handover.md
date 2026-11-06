@@ -1421,7 +1421,7 @@ SQL and allows 16 local connections.
   password pipelined with it is a PasswordMessage of at most 4,096 bytes; an empty, oversized or
   wrong one, an unknown role and an unknown database are all answered with the same `28P01`.
 - The gateway logs in with a pipelined password (and over HTTP) only to a PostgreSQL that asks for
-  SCRAM-SHA-256 with at most 100,000 iterations (PostgreSQL's default `scram_iterations` is
+  SCRAM-SHA-256 with at most 16,384 iterations (PostgreSQL's default `scram_iterations` is
   4,096), or for no password; anything else answers `08006` and never receives the password.
 
 ### 3.3 TLS
