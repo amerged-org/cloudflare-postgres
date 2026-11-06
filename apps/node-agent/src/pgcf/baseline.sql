@@ -4,25 +4,32 @@
 -- name pgcf. It is one batch, so it is atomic, and running it again changes nothing. The names are
 -- qualified because the file runs with whatever search_path the session has.
 --
--- PostgreSQL lets every role call the three functions that make a large object from nothing, and
--- what they make is persistent state: a login that holds SELECT only could write to the database,
--- and the large object it owns keeps DROP ROLE from removing the role. The privileges on a
--- function of pg_catalog are kept in the catalog of each database, so only a superuser can take
--- them away and each database must be changed on its own. No other function of pg_catalog that
--- every role may call leaves state in the database without a table privilege: lo_import and
--- lo_export are the superuser's already (checked on PostgreSQL 18), and lo_put, lowrite,
--- lo_truncate and lo_unlink need a large object that exists and that the caller may change.
+-- PostgreSQL lets every role call two groups of functions that leave state or volume behind
+-- without any table privilege, and this file takes both from PUBLIC:
+--   * lo_create, lo_creat and lo_from_bytea make a large object. It is persistent state: a login
+--     that holds SELECT only could write to the database, and the large object it owns keeps
+--     DROP ROLE from removing the role.
+--   * the two forms of pg_logical_emit_message write a WAL record. A login that holds SELECT only
+--     could write 1,000,000,000 bytes with one call (measured), as often as it likes, to the
+--     volume and to the archive.
+-- The privileges on a function of pg_catalog are kept in the catalog of each database, so only a
+-- superuser can take them away and each database must be changed on its own. The function names
+-- and their argument types are the same on PostgreSQL 17 and 18 (checked on 17.7 and 18.6).
 --
--- Left open on purpose: pg_logical_emit_message. A login that holds SELECT only can write WAL
--- records with it (one call of 1,000,000,000 bytes was measured, and nothing limits how often),
--- though they leave no object in the database. The statement that would close it is
---   REVOKE EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text, boolean),
---     pg_catalog.pg_logical_emit_message(boolean, text, bytea, boolean) FROM PUBLIC;
+-- Reviewed and left, because each is refused, needs something that exists, or is bounded by a
+-- setting: lo_import and lo_export are the superuser's already, lo_put, lowrite, lo_truncate and
+-- lo_unlink need a large object that the caller may change, the advisory-lock functions take the
+-- shared lock table that max_locks_per_transaction caps, the replication-slot functions refuse a
+-- role without REPLICATION, pg_nextoid and pg_import_system_collations refuse a role that is not
+-- a superuser, and pg_notify is the NOTIFY command (no privilege guards that, so a REVOKE would
+-- change nothing) whose queue max_notify_queue_pages caps at 8 GB by default, which a session that
+-- listens and holds a transaction open can fill (156 MB for 20,000 notifications, measured; the
+-- files go when the session ends), so only a setting of the cluster can bound it.
 --
--- The owner of the database receives the privilege with the grant option, so that the integrator,
--- which connects as the owner, can grant it to the runtime roles that need it. The owner can
--- therefore also grant it to PUBLIC again, by design: the REVOKE below runs as the superuser and
+-- The owner of the database receives the privileges with the grant option, so that the integrator,
+-- which connects as the owner, can grant them to the runtime roles that need them. The owner can
+-- therefore also grant them to PUBLIC again, by design: the REVOKE below runs as the superuser and
 -- removes only the entries of PUBLIC that the function's owner granted, not one the database
 -- owner made. TEMPORARY is not touched: the integrator decides it per role.
-REVOKE EXECUTE ON FUNCTION pg_catalog.lo_create(pg_catalog.oid), pg_catalog.lo_creat(pg_catalog.int4), pg_catalog.lo_from_bytea(pg_catalog.oid, pg_catalog.bytea) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(pg_catalog.oid), pg_catalog.lo_creat(pg_catalog.int4), pg_catalog.lo_from_bytea(pg_catalog.oid, pg_catalog.bytea) TO "app" WITH GRANT OPTION;
+REVOKE EXECUTE ON FUNCTION pg_catalog.lo_create(pg_catalog.oid), pg_catalog.lo_creat(pg_catalog.int4), pg_catalog.lo_from_bytea(pg_catalog.oid, pg_catalog.bytea), pg_catalog.pg_logical_emit_message(pg_catalog.bool, pg_catalog.text, pg_catalog.text, pg_catalog.bool), pg_catalog.pg_logical_emit_message(pg_catalog.bool, pg_catalog.text, pg_catalog.bytea, pg_catalog.bool) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(pg_catalog.oid), pg_catalog.lo_creat(pg_catalog.int4), pg_catalog.lo_from_bytea(pg_catalog.oid, pg_catalog.bytea), pg_catalog.pg_logical_emit_message(pg_catalog.bool, pg_catalog.text, pg_catalog.text, pg_catalog.bool), pg_catalog.pg_logical_emit_message(pg_catalog.bool, pg_catalog.text, pg_catalog.bytea, pg_catalog.bool) TO "app" WITH GRANT OPTION;

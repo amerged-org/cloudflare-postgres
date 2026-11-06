@@ -1789,15 +1789,18 @@ mod tests {
         );
     }
 
-    /// Whether the role `reader`, which the superuser's session takes on, may make a large object
-    /// with each of the three functions that make one from nothing.
-    async fn reader_makes_large_objects(data: &postgres::Session) -> [bool; 3] {
-        let mut made = [false; 3];
+    /// Whether the role `reader`, which the superuser's session takes on, may call each of the
+    /// functions that PostgreSQL lets every role call and that write state or WAL without a table
+    /// privilege: the three that make a large object and the two forms of the WAL message.
+    async fn reader_writes_state(data: &postgres::Session) -> [bool; 5] {
+        let mut made = [false; 5];
         data.batch("SET ROLE reader").await.unwrap();
         for (index, sql) in [
             "SELECT lo_create(0)",
             "SELECT lo_creat(-1)",
             "SELECT lo_from_bytea(0, '\\x00')",
+            "SELECT pg_logical_emit_message(true, 'p', 'x', true)",
+            "SELECT pg_logical_emit_message(true, 'p', '\\x00'::bytea, true)",
         ]
         .into_iter()
         .enumerate()
@@ -1825,22 +1828,22 @@ mod tests {
         };
         let (entry, db) = rig.create().await;
         let data = in_database(&rig, &entry.id).await;
-        assert_eq!(reader_makes_large_objects(&data).await, [false; 3]);
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
 
         // A database from before the baseline: PostgreSQL's defaults, and the earlier record.
-        let open = "GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(oid), pg_catalog.lo_creat(integer), pg_catalog.lo_from_bytea(oid, bytea) TO PUBLIC";
+        let open = "GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(oid), pg_catalog.lo_creat(integer), pg_catalog.lo_from_bytea(oid, bytea), pg_catalog.pg_logical_emit_message(boolean, text, text, boolean), pg_catalog.pg_logical_emit_message(boolean, text, bytea, boolean) TO PUBLIC";
         data.batch(open).await.unwrap();
         let settings = rig.core.event_settings(&entry);
         let files = rig.core.files(&entry.id);
         let mut earlier = pgcf::EventsRecord::of(&settings, false);
         earlier.schema = pgcf::SCHEMA_REVISION - 1;
         files.save_events(&earlier).unwrap();
-        assert_eq!(reader_makes_large_objects(&data).await, [true; 3]);
+        assert_eq!(reader_writes_state(&data).await, [true; 5]);
         assert_eq!(
             rig.core.refresh_events(&db, &entry, false).await,
             Refresh::Installed
         );
-        assert_eq!(reader_makes_large_objects(&data).await, [false; 3]);
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
         assert_eq!(
             files.load_events().unwrap(),
             Some(pgcf::EventsRecord::of(&settings, false))
@@ -1854,12 +1857,12 @@ mod tests {
         let mut earlier_conflict = pgcf::EventsRecord::of(&settings, true);
         earlier_conflict.schema = pgcf::SCHEMA_REVISION - 1;
         files.save_events(&earlier_conflict).unwrap();
-        assert_eq!(reader_makes_large_objects(&data).await, [true; 3]);
+        assert_eq!(reader_writes_state(&data).await, [true; 5]);
         assert_eq!(
             rig.core.refresh_events(&db, &entry, false).await,
             Refresh::Conflict
         );
-        assert_eq!(reader_makes_large_objects(&data).await, [false; 3]);
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
         assert_eq!(
             files.load_events().unwrap(),
             Some(pgcf::EventsRecord::of(&settings, true))
@@ -1882,7 +1885,7 @@ mod tests {
             Refresh::Failed
         );
         assert_eq!(files.load_events().unwrap(), None);
-        assert_eq!(reader_makes_large_objects(&data).await, [true; 3]);
+        assert_eq!(reader_writes_state(&data).await, [true; 5]);
         data.batch("ALTER ROLE app_renamed RENAME TO app")
             .await
             .unwrap();
@@ -1890,7 +1893,7 @@ mod tests {
             rig.core.refresh_events(&db, &entry, true).await,
             Refresh::Installed
         );
-        assert_eq!(reader_makes_large_objects(&data).await, [false; 3]);
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
 
         // The record is the current one and the database is hardened: a refresh opens no session.
         // With the database stopped none can be opened, so the answer proves it.

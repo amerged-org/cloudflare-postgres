@@ -729,11 +729,14 @@ pgcf "$PGCF_API/v1/databases/<database-id>/roles/web/connection-uri"
   hibernated database applies it at its next wake.
 - The URI has no port and no `sslmode`; see [3.1](#31-driver-configuration) for how to use it.
 
-**Large objects.** PostgreSQL lets every role create a large object (`lo_create`, `lo_creat`,
-`lo_from_bytea`), which is persistent state without any table privilege, and a role that owns one
-cannot be dropped. PGCF therefore revokes these three functions from `PUBLIC` and grants them to
-`app` WITH GRANT OPTION. The node agent does this as the superuser in each database's own catalog,
-as part of installing the platform schema `pgcf`.
+**Large objects and WAL messages.** PostgreSQL lets every role create a large object (`lo_create`,
+`lo_creat`, `lo_from_bytea`) and write a WAL record (`pg_logical_emit_message`, in two forms), and
+neither needs a table privilege. A large object is persistent state, and a role that owns one
+cannot be dropped. A WAL record goes to the volume and to the archive: one call wrote
+1,000,000,000 bytes when measured, and nothing limits how often a login may call it. PGCF
+therefore revokes these five functions from `PUBLIC` and grants them to `app` WITH GRANT OPTION.
+The node agent does this as the superuser in each database's own catalog, as part of installing
+the platform schema `pgcf`.
 
 - **When.** At creation, and at every restore, replacement and move. For a database that exists, at
   its next platform-schema install or refresh after the node release that carries this: its next
@@ -743,9 +746,11 @@ as part of installing the platform schema `pgcf`.
   outbox rows stay); a database whose record is already revision 2 opens no session for it.
 - **What a role sees.** A role that calls these functions gets `42501` from the moment its database
   is hardened. `app` gives it back: `GRANT EXECUTE ON FUNCTION pg_catalog.lo_from_bytea(oid, bytea)
-  TO <role>` (`lo_create(oid)` and `lo_creat(integer)` the same way). The grant is kept in the
-  database like any other, so a restore to a point in time returns it as it was then, and `app`
-  revokes it before a role that holds it is deleted (a privilege holder is `role_not_droppable`).
+  TO <role>` (`lo_create(oid)` and `lo_creat(integer)` the same way), and
+  `GRANT EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text, boolean) TO <role>`
+  with `(boolean, text, bytea, boolean)` for the other form. The grant is kept in the database like
+  any other, so a restore to a point in time returns it as it was then, and `app` revokes it
+  before a role that holds it is deleted (a privilege holder is `role_not_droppable`).
 - **Order.** `app` holds no grant option before the baseline is applied, so grant onward only after
   the release has reached the database; until then a role that calls these functions still can.
 - **If the baseline fails.** The install ends before the platform schema: nothing is recorded, no new
@@ -756,11 +761,13 @@ as part of installing the platform schema `pgcf`.
   again; that is by design, `app` being yours. The baseline runs at every install, but its `REVOKE`
   is the superuser's and removes only the `PUBLIC` entries the function's owner granted: a grant to
   `PUBLIC` that `app` made stays (`=X/app` in `proacl`) until `app` revokes it.
-- **Not covered.** `pg_logical_emit_message` stays callable by every role. A login that holds only
-  `SELECT` can write WAL records with it (one call of 1,000,000,000 bytes was measured, and nothing
-  limits how often); they leave no object in the database but use the volume and the archive. PGCF
-  leaves it open on purpose; closing it is one `REVOKE` in `baseline.sql`. `TEMPORARY` is not
-  touched either; restrict it per role if you need to.
+- **Reviewed and left.** `lo_import` and `lo_export` are the superuser's already; `lo_put`, `lowrite`,
+  `lo_truncate` and `lo_unlink` need a large object the caller may change; the advisory-lock functions
+  take lock-table slots that `max_locks_per_transaction` caps; the replication-slot functions refuse a
+  role without `REPLICATION`; and `pg_notify` is the `NOTIFY` command, which no privilege guards, whose
+  queue `max_notify_queue_pages` caps at 8 GB by default and which a session that listens and holds a
+  transaction open can fill (156 MB for 20,000 notifications were measured; the files go when the
+  session ends). `TEMPORARY` is not touched either; restrict it per role if you need to.
 
 **Attributes at creation.** All are optional; a role created without them is the plain login role
 of before. None can be changed afterwards (there is no `PATCH`): delete the role and create it
@@ -1246,10 +1253,10 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
   - **Dumps.** A logical dump of your database needs `pg_dump --exclude-schema=pgcf`: the platform schema is
     readable only by the platform, so a dump that includes it fails. The platform installs its schema again when
     a database is created or restored. To restore the dump into another PGCF database as `app`, add
-    `--exclude-schema=pg_catalog` as well: the dump otherwise carries the baseline's grant of the large-object
-    functions to `app` ([2.3](#23-roles-connection-uri-and-passwords)), which `app` cannot repeat in a database
-    that has it ("grant options cannot be granted back to your own grantor"). That option removes the whole
-    entry for the three functions, including the grants you made onward to your roles: after such a restore,
+    `--exclude-schema=pg_catalog` as well: the dump otherwise carries the baseline's grant of the large-object and
+    WAL-message functions to `app` ([2.3](#23-roles-connection-uri-and-passwords)), which `app` cannot repeat in a
+    database that has it ("grant options cannot be granted back to your own grantor"). That option removes the
+    whole entry for the five functions, including the grants you made onward to your roles: after such a restore,
     grant them again as `app`.
   - **Deletion.** Deleting a database dead-letters its waiting data deliveries once the API reads the `database.deleted`
     event (within the minute cron). They can be replayed for seven days; platform events of the database keep

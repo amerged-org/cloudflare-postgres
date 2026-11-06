@@ -518,6 +518,25 @@ mod tests {
         "SELECT lo_creat(-1)",
         "SELECT lo_from_bytea(0, '\\x00')",
     ];
+    /// The two forms of the function that writes a WAL record. PostgreSQL lets every role call
+    /// them as well, and one call writes up to a gigabyte to the volume and the archive.
+    const WAL_MESSAGE_WRITERS: [&str; 2] = [
+        "SELECT pg_logical_emit_message(true, 'p', 'x', true)",
+        "SELECT pg_logical_emit_message(true, 'p', '\\x00'::bytea, true)",
+    ];
+    /// The privileges on the two forms of that function, in the order of their argument types.
+    async fn message_acls(session: &Session) -> Vec<String> {
+        session
+            .query(
+                "SELECT oid::pg_catalog.regprocedure::pg_catalog.text || ' ' || coalesce(proacl::pg_catalog.text, 'PUBLIC') FROM pg_catalog.pg_proc WHERE pronamespace = 'pg_catalog'::pg_catalog.regnamespace AND proname = 'pg_logical_emit_message' ORDER BY 1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
     /// The privileges on the three creators in the tenant database, in name order.
     async fn creator_acls(session: &Session) -> Vec<String> {
         session
@@ -539,8 +558,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_baseline_takes_the_large_object_creators_from_public_and_gives_them_to_the_owner()
-    {
+    async fn the_baseline_takes_the_large_object_creators_and_the_wal_message_writers_from_public_and_gives_them_to_the_owner()
+     {
         // The file carries the revision that the record keeps and grants to the owner role.
         assert_eq!(
             BASELINE.lines().next(),
@@ -565,11 +584,26 @@ mod tests {
                 .unwrap_or_else(|error| panic!("before the baseline, {sql}: {error}"));
         }
         drop_own_large_objects(&reader).await;
+        // So does it write WAL records of any size to the volume and the archive.
+        for sql in WAL_MESSAGE_WRITERS {
+            reader
+                .batch_execute(sql)
+                .await
+                .unwrap_or_else(|error| panic!("before the baseline, {sql}: {error}"));
+        }
 
         install(&session, &SETTINGS, false).await.unwrap();
         for sql in LARGE_OBJECT_CREATORS {
             let error = reader.batch_execute(sql).await.expect_err(sql);
             assert_eq!(state(&error), "42501", "{sql}");
+        }
+        for sql in WAL_MESSAGE_WRITERS {
+            let error = reader.batch_execute(sql).await.expect_err(sql);
+            assert_eq!(state(&error), "42501", "{sql}");
+            assert_eq!(
+                error.as_db_error().unwrap().message(),
+                "permission denied for function pg_logical_emit_message"
+            );
         }
         let error = reader
             .batch_execute("SELECT lo_from_bytea(0, '\\x00')")
@@ -610,6 +644,21 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(state(&error), "42501");
+        // The same for the writers of WAL records: the owner calls both and grants one onward.
+        for sql in WAL_MESSAGE_WRITERS {
+            app.batch_execute(sql).await.unwrap();
+        }
+        app.batch_execute(
+            "GRANT EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text, boolean) TO reader",
+        )
+        .await
+        .unwrap();
+        reader.batch_execute(WAL_MESSAGE_WRITERS[0]).await.unwrap();
+        let error = reader
+            .batch_execute(WAL_MESSAGE_WRITERS[1])
+            .await
+            .unwrap_err();
+        assert_eq!(state(&error), "42501");
 
         // Installing again changes no privilege, the owner's onward grant included.
         let held = creator_acls(&session).await;
@@ -621,14 +670,23 @@ mod tests {
                 "lo_from_bytea {postgres=X/postgres,app=X*/postgres,reader=X/app}",
             ]
         );
+        let held_messages = message_acls(&session).await;
+        assert_eq!(
+            held_messages,
+            [
+                "pg_logical_emit_message(boolean,text,bytea,boolean) {postgres=X/postgres,app=X*/postgres}",
+                "pg_logical_emit_message(boolean,text,text,boolean) {postgres=X/postgres,app=X*/postgres,reader=X/app}",
+            ]
+        );
         install(&session, &SETTINGS, false).await.unwrap();
         assert_eq!(creator_acls(&session).await, held);
+        assert_eq!(message_acls(&session).await, held_messages);
 
         // Privileges that were customised stay: a direct grant of the superuser, and a grant to
         // PUBLIC that the owner made, which the owner may by design. The baseline's REVOKE runs as
         // the superuser and takes away only what the function's owner granted to PUBLIC.
         session
-            .batch("GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(oid) TO reader")
+            .batch("GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(oid) TO reader; GRANT EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, bytea, boolean) TO reader")
             .await
             .unwrap();
         app.batch_execute("GRANT EXECUTE ON FUNCTION pg_catalog.lo_creat(integer) TO PUBLIC")
@@ -639,35 +697,53 @@ mod tests {
             "lo_create {postgres=X/postgres,app=X*/postgres,reader=X/postgres}".to_string(),
             held[2].clone(),
         ];
+        let customised_messages = vec![
+            "pg_logical_emit_message(boolean,text,bytea,boolean) {postgres=X/postgres,app=X*/postgres,reader=X/postgres}".to_string(),
+            held_messages[1].clone(),
+        ];
         assert_eq!(creator_acls(&session).await, customised);
+        assert_eq!(message_acls(&session).await, customised_messages);
         install(&session, &SETTINGS, false).await.unwrap();
         assert_eq!(creator_acls(&session).await, customised);
+        assert_eq!(message_acls(&session).await, customised_messages);
         for sql in ["SELECT lo_creat(-1)", "SELECT lo_create(0)"] {
             reader.batch_execute(sql).await.unwrap();
         }
         drop_own_large_objects(&reader).await;
+        for sql in WAL_MESSAGE_WRITERS {
+            reader.batch_execute(sql).await.unwrap();
+        }
         app.batch_execute("REVOKE EXECUTE ON FUNCTION pg_catalog.lo_creat(integer) FROM PUBLIC")
             .await
             .unwrap();
         session
-            .batch("REVOKE EXECUTE ON FUNCTION pg_catalog.lo_create(oid) FROM reader")
+            .batch("REVOKE EXECUTE ON FUNCTION pg_catalog.lo_create(oid) FROM reader; REVOKE EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, bytea, boolean) FROM reader")
             .await
             .unwrap();
         assert_eq!(creator_acls(&session).await, held);
+        assert_eq!(message_acls(&session).await, held_messages);
 
         // A tenant that owns the name `pgcf` keeps the platform schema out, not the baseline.
         session
-            .batch("DROP SCHEMA pgcf CASCADE; CREATE SCHEMA pgcf AUTHORIZATION app; GRANT EXECUTE ON FUNCTION pg_catalog.lo_creat(integer) TO PUBLIC")
+            .batch("DROP SCHEMA pgcf CASCADE; CREATE SCHEMA pgcf AUTHORIZATION app; GRANT EXECUTE ON FUNCTION pg_catalog.lo_creat(integer) TO PUBLIC; GRANT EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text, boolean), pg_catalog.pg_logical_emit_message(boolean, text, bytea, boolean) TO PUBLIC")
             .await
             .unwrap();
         reader.batch_execute("SELECT lo_creat(-1)").await.unwrap();
         drop_own_large_objects(&reader).await;
+        for sql in WAL_MESSAGE_WRITERS {
+            reader.batch_execute(sql).await.unwrap();
+        }
         assert_eq!(
             install(&session, &SETTINGS, false).await.unwrap(),
             Installed::Conflict
         );
         let error = reader
             .batch_execute("SELECT lo_creat(-1)")
+            .await
+            .unwrap_err();
+        assert_eq!(state(&error), "42501");
+        let error = reader
+            .batch_execute(WAL_MESSAGE_WRITERS[1])
             .await
             .unwrap_err();
         assert_eq!(state(&error), "42501");
@@ -736,6 +812,7 @@ mod tests {
         }
         let listing = stdout(run("pg_restore", &["-l".as_ref(), plain.as_ref()]));
         assert!(listing.contains("ACL pg_catalog FUNCTION lo_create(oid)"));
+        assert!(listing.contains("ACL pg_catalog FUNCTION pg_logical_emit_message("));
         let listing = stdout(run("pg_restore", &["-l".as_ref(), lean.as_ref()]));
         assert!(!listing.contains("ACL pg_catalog"));
         // The owner of a hardened database cannot grant to itself what the first dump carries: its
