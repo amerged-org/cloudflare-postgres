@@ -78,25 +78,35 @@ archive socket.
   sessions) may draw on the whole budget; beyond that share it competes only for the other 96 MiB.
   So databases that fill the shared part, for example with HTTP SQL answers that PostgreSQL has
   not finished (an answer's buffer is held until PostgreSQL ends the statement), cannot take a
-  neighbour's guaranteed share. A neighbour's answer above its share is still refused while the
-  shared part is full: an HTTP SQL request answers `08007` (its statements were sent, so the
-  outcome is unknown) with the outcome `memory_capacity`, a WebSocket upgrade 503
-  `memory_capacity` (429 when the database itself is at its limit). A refusal does not stall: a
+  neighbour's guaranteed share. The price of keeping the total at 192 MiB is that the capacity
+  above the shares of all databases together is 96 MiB, and one database can still occupy all of
+  it (it equals the per-database cap): while that lasts, other databases' answers above their
+  3 MiB share are refused; what is guaranteed is that sessions and frames within the share keep
+  working. A refusal of an answer is `08007` for HTTP SQL (its statements were sent, so the
+  outcome is unknown) with the outcome `memory_capacity`, and 503 `memory_capacity` for a
+  WebSocket upgrade (429 when the database itself is at its limit). A refusal does not stall: a
   frame is charged twice its length plus 256 bytes and a refused charge closes the live
   connection, so a database that holds its 3 MiB share with many sessions (twenty use 2.8 MiB)
   can have a connection closed by its next large frame while the shared part is full.
-- The guarantee holds while at most 32 databases hold memory at once (the reserve divided by the
-  share, 96 MiB / 3 MiB). Beyond that it degrades gracefully: a database at its share still
-  draws on whatever is free, but can be refused when the shared part is full. Nothing else
-  limits the number of holders, so the gateway logs `memory_reserve_outgrown` (`holders`,
-  `guaranteed_bytes`, `reserve_bytes`; once per stretch above 32 and at most once a minute)
-  whenever the shares of the databases that hold memory add up to more than the reserve. Under
-  the `reserved` memory rule a 12 GB node holds about 37 awake databases of 256 MiB, which is
-  more than 32: where that rule is deployed, raise `PGCF_GATEWAY_RESERVE_BYTES` (and
-  `PGCF_GATEWAY_MEMORY_BYTES` above it, or the gateway refuses to start naming both). The
-  default rule, `measured`, does not cap the number of awake databases at all, so there the
-  count of holders is limited only by the node's available memory beyond its floor. The budgets
-  are accounted bytes, not a limit on the process's memory.
+- The guarantee holds while at most 32 databases that hold memory are at or below their share
+  (the reserve divided by the share, 96 MiB / 3 MiB). Beyond that it degrades gracefully: a
+  database at its share still draws on whatever is free, but can be refused when the shared part
+  is full. Nothing else limits that number, so the gateway logs `memory_reserve_outgrown`
+  (`holders_within_share`, `guaranteed_bytes`, `reserve_bytes`) when more than 32 databases are
+  at or below their share and hold memory (a database above its share draws on the shared part
+  and is not counted); the first line comes at once and a lasting stretch is logged again at the
+  first change after each minute. Under the `reserved` memory rule a 12 GB node holds about 37
+  awake databases of 256 MiB, which is more than 32. The default rule, `measured`, does not cap
+  the number of awake databases, so there the line can appear on a node with many small awake
+  databases. To cover more databases, raise `PGCF_GATEWAY_MEMORY_BYTES` first and then
+  `PGCF_GATEWAY_RESERVE_BYTES` by the same amount, 3 MiB for each database more (37 need a
+  reserve of 111 MiB and a total of 207 MiB). Raising the reserve alone is possible while it
+  stays below the total, but it takes the extra from the shared part (a reserve of 111 MiB in
+  192 MiB leaves 81 MiB, below the cap of one database), and a reserve at or above the total
+  makes the gateway refuse to start naming both variables. A larger total raises the memory the
+  gateway may account, and use, by the same amount, from the node's headroom beyond its memory
+  floor, so check the node's available memory first. The budgets are accounted bytes, not a limit
+  on the process's memory.
 - There is no PostgreSQL write retry, credential replay or query replay after transport handoff.
 
 ## Restart and drain
