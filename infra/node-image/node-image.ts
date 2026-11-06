@@ -8,14 +8,13 @@
 // shares (Colima and Docker Desktop share the home directory).
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, createWriteStream, existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { hostFilesSha256 } from "../../packages/contracts/src/releases.ts";
 import { digestBinaries } from "./binaries.ts";
 import { readHostFiles } from "./host-files.ts";
+import { download, sha256File } from "./download.ts";
 import {
   aptListName,
   behindLock,
@@ -53,12 +52,6 @@ function run(command: string, args: string[], options: { quiet?: boolean } = {})
   }
 }
 
-async function sha256File(path: string): Promise<string> {
-  const hash = createHash("sha256");
-  await pipeline(createReadStream(path), hash);
-  return hash.digest("hex");
-}
-
 // resolve replaces the package list, so an old one that validateLock now refuses (a pre-release,
 // say) must not stop the run that fixes it.
 async function readLock(options: { resolving?: boolean } = {}): Promise<PackageLock> {
@@ -67,36 +60,6 @@ async function readLock(options: { resolving?: boolean } = {}): Promise<PackageL
   const keySha = await sha256File(join(here, lock.pgdg.key.path));
   if (keySha !== lock.pgdg.key.sha256) throw new Error("the PGDG key does not match its locked sha256");
   return lock;
-}
-
-// Download one locked file and keep it only if its size and sha256 match.
-async function download(entry: LockedPackage, directory: string): Promise<void> {
-  const target = join(directory, debFileName(entry));
-  if (existsSync(target)) {
-    const present = await stat(target);
-    if (present.size === entry.size && (await sha256File(target)) === entry.sha256) return;
-    await rm(target);
-  }
-  const partial = `${target}.partial`;
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await fetch(entry.url, { signal: AbortSignal.timeout(300_000) });
-      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
-      if (!new URL(response.url).protocol.startsWith("https")) throw new Error("redirected off HTTPS");
-      await pipeline(Readable.fromWeb(response.body as never), createWriteStream(partial, { mode: 0o644 }));
-      const size = (await stat(partial)).size;
-      if (size !== entry.size) throw new Error(`size ${size} instead of ${entry.size}`);
-      if ((await sha256File(partial)) !== entry.sha256) throw new Error("sha256 mismatch");
-      await rename(partial, target);
-      return;
-    } catch (error) {
-      lastError = error;
-      await rm(partial, { force: true });
-      if (attempt < 3) await new Promise((done) => setTimeout(done, attempt * 5_000));
-    }
-  }
-  throw new Error(`${entry.name} ${entry.version}: ${String(lastError)}`);
 }
 
 async function downloadAll(entries: LockedPackage[], directory: string): Promise<void> {
