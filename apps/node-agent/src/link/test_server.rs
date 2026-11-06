@@ -169,6 +169,8 @@ pub struct Inner {
     pub credential_paths: std::collections::HashMap<String, String>,
     /// Credential identifiers whose archive scope grants read-only access.
     pub read_only_credentials: std::collections::HashSet<String>,
+    /// A credential read's status and body, when it cannot return a valid credential.
+    pub credential_responses: std::collections::HashMap<String, (u16, Value)>,
     /// How long the double takes to answer a read of an archive credential, as the Worker takes
     /// (a lookup in D1 and a round trip): zero unless a test gives it one.
     pub credential_delay: Duration,
@@ -257,6 +259,7 @@ impl Cloud {
             samples: vec![],
             credential_paths: Default::default(),
             read_only_credentials: Default::default(),
+            credential_responses: Default::default(),
             credential_delay: Duration::ZERO,
             node_credentials_delay: Duration::ZERO,
             page_delay: Duration::ZERO,
@@ -592,6 +595,9 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
                 .unwrap_or_else(|| vector("NodeCredentials", "credentials")),
         )
     } else if let Some(id) = path.strip_prefix(paths["archiveCredentials"].as_str().unwrap()) {
+        if let Some((status, body)) = inner.credential_responses.get(id) {
+            return answer(*status, body.clone());
+        }
         let mut credential = vector("ArchiveCredential", "read-write");
         credential["expires_at"] = serde_json::Value::String("2099-01-01T00:00:00.000Z".into());
         credential["id"] = id.into();

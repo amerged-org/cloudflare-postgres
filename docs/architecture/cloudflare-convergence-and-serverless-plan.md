@@ -24,9 +24,31 @@ resources, conditions and expiry: PGCF Tunnel/DNS, Development SaaS, Production 
 web-domain management. Each one-time successor was appended before the selected binding changed;
 read-only capability probes passed before and after old-token revocation, and all four old tokens
 then failed authentication. No DNS, Tunnel, certificate, archive object or protected local key was
-removed. Seven credential identities/configured secrets have completed rotation in this execution;
+removed. Thirteen credential identities/configured secrets have completed rotation in this execution;
 recovered old material and two new operator-custody maintenance keys are excluded from that count.
 The independent-identity inventory remains open; binding-name totals are not key totals.
+
+The six subsequent completions are both Cloudflare OAuth client secrets, Development WorkOS
+Connect, both R2 analytics tokens and Production WFP. Every successor was saved before activation.
+Both old OAuth slots were retired only after the single purpose-qualified local legacy secret was
+proven invalid, current sealed consumer values matched saved successors, and both complete local
+files remained locked and byte-identical. No other WorkOS issuer secret was removed.
+
+The PGCF archive parent and Development R2-management authority have verified saved successors
+active, with old parents retained. New-parent acceptance used exactly four fresh operator targets:
+four DONE base backups, one EU and two US WAL objects, actual full restore and successful PITR in
+both regions (before-marker present, after-marker absent). All four credential URIs were saved
+before SQL. The four targets were deleted and their node-volume inventory reached zero; the
+original source and its 18 existing operator databases were untouched. This is not retirement of
+the old parent: the original 225 live write scopes still need proven credential refresh or expiry.
+
+Source inspection found that native credential failures were logged without preventing maintenance
+completion. A focused Rust correction now withholds maintenance admission until a complete page's
+node and archive credentials are installed, while startup fencing and wake holds apply before I/O.
+Three authored regression groups cover failed/malformed downloads, installation failure, retry,
+startup security ordering and partial pages. Independent source review and formatting completed;
+Linux CI, signed release, live rollout and all-node refresh remain required. No macOS native test
+or build result is claimed.
 
 The [sealed custody exporter](../operations/custody-export.md) adds a reviewed source-builder
 candidate for a private owning-Worker entrypoint and signed, serialized bridge. It preserves

@@ -425,7 +425,12 @@ impl<M: Machine> Service<M> {
         let _ = machine
             .set_slice_memory(core.policy().admission.admission.awake_budget_mib)
             .await;
-        service.pull_page(page, true).await;
+        if let Err(error) = service.pull_page(page, true).await {
+            crate::timing::emit_event(json!({
+                "event": "page_credentials_incomplete",
+                "class": crate::diagnostics::error_code(&error),
+            }));
+        }
         // The link stands: the previous boot's journal goes to Cloudflare, if there was a boot.
         let s = service.clone();
         service.spawn(async move { s.report_boot().await });
@@ -515,9 +520,14 @@ impl<M: Machine> Service<M> {
     /// Reads the archive credentials the page's databases need and have not been read, some at a
     /// time: a node has a credential for each of its databases, and each is a round trip to
     /// Cloudflare.
-    async fn deliver_credentials(&self, page: &Page) {
+    async fn deliver_credentials(&self, page: &Page) -> Result<(), Error> {
         use futures_util::StreamExt;
         let entries: Vec<Entry> = page.databases.iter().filter_map(Entry::parse).collect();
+        let complete = if entries.len() == page.databases.len() {
+            Ok(())
+        } else {
+            Err("credential_entry_invalid".into())
+        };
         let wanted = {
             let delivered = self
                 .delivered
@@ -534,21 +544,25 @@ impl<M: Machine> Service<M> {
                 (id, delivered)
             })
             .buffer_unordered(CREDENTIALS_AT_ONCE)
-            .for_each(|(id, delivered)| async move {
+            .fold(complete, |complete, (id, delivered)| async move {
                 match delivered {
                     Ok(()) => {
                         self.delivered
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .insert(id);
+                        complete
                     }
-                    Err(error) => crate::timing::emit_event(json!({
-                        "event": "credential_not_delivered",
-                        "class": crate::diagnostics::error_code(&error),
-                    })),
+                    Err(error) => {
+                        crate::timing::emit_event(json!({
+                            "event": "credential_not_delivered",
+                            "class": crate::diagnostics::error_code(&error),
+                        }));
+                        complete.and(Err(error))
+                    }
                 }
             })
-            .await;
+            .await
     }
 
     /// The two reads from Cloudflare that a page needs: they do not depend on each other. The
@@ -556,16 +570,18 @@ impl<M: Machine> Service<M> {
     /// own for the gateway and the Tunnel (`apply_credentials`); they share no state. The node's
     /// credentials are polled first because the Worker makes several calls to Cloudflare's API for
     /// them.
-    async fn read_credentials(&self, page: &Page) {
+    async fn read_credentials(&self, page: &Page) -> Result<(), Error> {
         let _one_at_a_time = self.reading.lock().await;
-        tokio::join!(self.apply_credentials(page), self.deliver_credentials(page));
+        let (node, archive) =
+            tokio::join!(self.apply_credentials(page), self.deliver_credentials(page));
+        node.and(archive)
     }
 
     /// The Tunnel token and the route keyring, when the page names a newer revision than the one
     /// applied: the gateway and the Tunnel start with them (plan 8). The revision also rises when
     /// only the operator shell's state changed; the gateway and the Tunnel restart for a change of
     /// their own secrets alone, because a restart ends every client connection of the node.
-    async fn apply_credentials(&self, page: &Page) {
+    async fn apply_credentials(&self, page: &Page) -> Result<(), Error> {
         let applied = self
             .credentials
             .lock()
@@ -575,7 +591,7 @@ impl<M: Machine> Service<M> {
             .as_ref()
             .is_some_and(|applied| applied.revision >= page.credentials_revision)
         {
-            return;
+            return Ok(());
         }
         let credentials = match self.link.credentials().await {
             Ok(credentials) => credentials,
@@ -583,10 +599,13 @@ impl<M: Machine> Service<M> {
                 crate::timing::emit_event(json!({
                     "event": "credentials_not_read", "class": crate::diagnostics::error_code(&error),
                 }));
-                return;
+                return Err(error);
             }
         };
         let revision = credentials["revision"].as_u64().unwrap_or(0);
+        if revision < page.credentials_revision {
+            return Err("credentials_revision_stale".into());
+        }
         let secrets = gateway_secrets(&credentials);
         let restart = applied
             .as_ref()
@@ -602,11 +621,16 @@ impl<M: Machine> Service<M> {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) =
                     Some(AppliedCredentials { revision, secrets });
+                Ok(())
             }
-            Err(error) => crate::timing::emit_event(json!({
-                "event": "credentials_not_applied",
-                "class": crate::diagnostics::error_code(&error.into()),
-            })),
+            Err(error) => {
+                let error = error.into();
+                crate::timing::emit_event(json!({
+                    "event": "credentials_not_applied",
+                    "class": crate::diagnostics::error_code(&error),
+                }));
+                Err(error)
+            }
         }
     }
 
@@ -614,32 +638,61 @@ impl<M: Machine> Service<M> {
     /// (`agent_start_phase`).
     ///
     /// The credentials come first for a page after the first: a database that is built needs its
-    /// own from its first step. The first page is applied at once and the credentials are read
-    /// after it, in the background: a node has 300 of them at 120 ms a round trip, and its gateway
-    /// and the wakes of its databases wait for the decisions on the databases that run and for
-    /// nothing else (EU1, 2026-10-23: the reads were 4.7 s of the 28.7 s to the first served wake).
+    /// own from its first step. The first page without maintenance is applied at once and the
+    /// credentials are read after it, in the background: a node has 300 of them at 120 ms a round
+    /// trip. Its gateway and wakes wait only for the decisions on the databases that run (EU1,
+    /// 2026-10-23: the reads were 4.7 s of the 28.7 s to the first served wake).
     /// A database that runs is registered with the archive socket when its credential arrives
     /// (`Core::deliver`), those first (`wanted_credentials`), and a build waits for its own and
     /// begins when it arrives (`Core::build`, `Core::deliver`).
-    async fn pull_page(self: &Arc<Self>, page: Page, first: bool) {
+    /// Maintenance always waits for those reads, even on startup, and remains untaken on failure
+    /// or a partial page so a later full pull can retry it.
+    async fn pull_page(self: &Arc<Self>, page: Page, first: bool) -> Result<(), Error> {
         self.cancel_archive_verifications(&page);
         if first {
-            self.core.apply(&page).await;
+            self.core.apply_with_credentials(&page, false).await;
             crate::timing::phase("apply");
+        }
+        let credentials = if first
+            && !page
+                .orders
+                .iter()
+                .any(|order| matches!(order, crate::link::Order::Maintenance { .. }))
+        {
             let (service, credentials_page) = (self.clone(), page.clone());
             self.spawn(async move {
-                service.read_credentials(&credentials_page).await;
+                let credentials = service.read_credentials(&credentials_page).await;
                 service.answer_archive_verifications(&credentials_page);
-                // Beside the row: it ends when the reads do, whatever the start has reached.
-                crate::timing::phase_once("credentials");
+                match credentials {
+                    Ok(()) => {
+                        // Beside the row: it ends when the reads do, whatever the start has reached.
+                        crate::timing::phase_once("credentials");
+                    }
+                    Err(error) => crate::timing::emit_event(json!({
+                        "event": "page_credentials_incomplete",
+                        "class": crate::diagnostics::error_code(&error),
+                    })),
+                }
             });
+            Ok(())
         } else {
-            self.read_credentials(&page).await;
-            self.core.apply(&page).await;
+            let credentials = self.read_credentials(&page).await;
+            if first {
+                if credentials.is_ok() {
+                    self.core.start_maintenance_after_credentials(&page);
+                    crate::timing::phase_once("credentials");
+                }
+            } else {
+                self.core
+                    .apply_with_credentials(&page, credentials.is_ok())
+                    .await;
+            }
             self.answer_archive_verifications(&page);
-        }
+            credentials
+        };
         self.answer_probes(&page);
         self.consider_update(&page.release);
+        credentials
     }
 
     fn cancel_archive_verifications(&self, page: &Page) {
@@ -916,7 +969,14 @@ impl<M: Machine> Service<M> {
 
     async fn pull(self: &Arc<Self>, ids: Option<&[String]>) {
         match self.link.desired_page(ids).await {
-            Ok(page) => self.pull_page(page, false).await,
+            Ok(page) => {
+                if let Err(error) = self.pull_page(page, false).await {
+                    crate::timing::emit_event(json!({
+                        "event": "page_credentials_incomplete",
+                        "class": crate::diagnostics::error_code(&error),
+                    }));
+                }
+            }
             Err(error) => crate::timing::emit_event(json!({
                 "event": "desired_pull_failed", "class": crate::diagnostics::error_code(&error),
             })),
@@ -2920,6 +2980,175 @@ mod tests {
             .count()
     }
 
+    /// Startup maintenance must wait for every credential, including one that failed to download
+    /// or validate. Successful deliveries survive the retry; only the missing member is read again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn maintenance_waits_for_all_archive_credentials_before_it_can_report_done() {
+        let Some((machine, _fixture, _root)) = site("maintenance-credentials", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1", &same(b"bin"));
+        machine.set_packages(&[("bash", "5.2")]);
+        let cloud = Cloud::start().await;
+        let release = release_of(&cloud, "r1", &same(b"bin"), BASH_LOCK.as_bytes());
+        let operation = "op_mmmmmmmmmmmmmmmmmmmm";
+        let databases: Vec<Value> = (0..2)
+            .map(|n| {
+                let mut db = database(&database_id(n));
+                db.as_object_mut().unwrap().remove("origin");
+                db["archive"]["credential"]["id"] = json!(format!("crd_{n:020}"));
+                db
+            })
+            .collect();
+        let missing = databases[1]["archive"]["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        cloud.with(|inner| {
+            inner.release = Some(release);
+            inner.databases = databases.clone();
+            inner.orders = vec![json!({"type": "maintenance", "operation": operation})];
+            for db in &databases {
+                inner.credential_paths.insert(
+                    db["archive"]["credential"]["id"].as_str().unwrap().into(),
+                    db["archive"]["path"].as_str().unwrap().into(),
+                );
+            }
+            inner
+                .credential_responses
+                .insert(missing.clone(), (503, json!({"error": "unavailable"})));
+        });
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        // This is synchronous order admission, not an absence-of-response timeout.
+        assert!(!service.core.has_taken_order(operation));
+        assert!(service.core.pending_order(operation).is_none());
+        assert!(service.core.maintenance.load(Ordering::Relaxed));
+        assert_eq!(stored(&service, &databases), 1);
+        assert_eq!(machine.credentials_applied().len(), 1);
+
+        cloud.with(|inner| {
+            inner
+                .credential_responses
+                .insert(missing.clone(), (200, json!({})));
+        });
+        service.pull(None).await;
+        assert!(!service.core.has_taken_order(operation));
+        assert!(service.core.pending_order(operation).is_none());
+        assert_eq!(stored(&service, &databases), 1);
+
+        cloud.with(|inner| {
+            inner.credential_responses.remove(&missing);
+        });
+        service.pull(None).await;
+        assert_eq!(stored(&service, &databases), databases.len());
+        assert!(service.core.has_taken_order(operation));
+        eventually(
+            60,
+            "maintenance done after every credential is installed",
+            || {
+                cloud
+                    .acknowledged("/node/v1/observations")
+                    .iter()
+                    .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                    .any(|order| order["operation"] == operation && order["status"] == "done")
+            },
+        )
+        .await;
+        let first = databases[0]["archive"]["credential"]["id"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            cloud
+                .requests()
+                .iter()
+                .filter(|request| request.path().ends_with(first))
+                .count(),
+            1,
+            "successful members are not fetched twice"
+        );
+        service.stop();
+    }
+
+    /// A node credential read or installation failure withholds maintenance but never withholds a
+    /// security fence from the same page. A later successful installation can retry the open order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_node_credentials_leave_maintenance_untaken_and_still_apply_a_fence() {
+        let Some((machine, _fixture, _root)) = site("maintenance-node-credentials", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(10, "the initial node credentials", || {
+            machine.credentials_applied().len() == 1
+        })
+        .await;
+        let operation = "op_mmmmmmmmmmmmmmmmmmmm";
+        let fence = "op_ffffffffffffffffffff";
+        let mut page = Rig::page(
+            vec![],
+            vec![
+                crate::link::Order::Fence {
+                    operation: fence.into(),
+                },
+                crate::link::Order::Maintenance {
+                    operation: operation.into(),
+                },
+            ],
+        );
+        page.credentials_revision = 4;
+        let mut credentials = crate::link::test_server::vector("NodeCredentials", "credentials");
+        credentials["revision"] = json!(4);
+        let mut invalid = credentials.clone();
+        invalid["route_keyring"] = Value::Null;
+        cloud.with(|inner| {
+            inner.credentials = Some(invalid);
+            inner.node_credentials_delay = Duration::from_millis(300);
+        });
+        let startup = service.pull_page(page.clone(), true);
+        tokio::pin!(startup);
+        assert!(futures_util::poll!(startup.as_mut()).is_pending());
+        // The first poll is blocked on credential I/O, but security orders and the wake hold
+        // already apply. Maintenance itself is not admitted while those reads remain pending.
+        assert!(service.core.fences.fenced());
+        assert!(service.core.has_taken_order(fence));
+        assert!(!service.core.has_taken_order(operation));
+        assert!(service.core.pending_order(operation).is_none());
+        assert!(service.core.maintenance.load(Ordering::Relaxed));
+        startup.await.unwrap_err();
+        assert!(!service.core.has_taken_order(operation));
+
+        cloud.with(|inner| {
+            inner.credentials = Some(credentials);
+            inner.node_credentials_delay = Duration::ZERO;
+        });
+        machine.fail_next_credentials();
+        service.pull_page(page.clone(), false).await.unwrap_err();
+        assert!(!service.core.has_taken_order(operation));
+        assert!(service.core.pending_order(operation).is_none());
+        assert_eq!(machine.credentials_applied().len(), 1);
+        assert_eq!(
+            service
+                .credentials
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .revision,
+            3
+        );
+
+        service.pull_page(page, false).await.unwrap();
+        assert_eq!(machine.credentials_applied().last().unwrap().2, 4);
+        assert!(service.core.has_taken_order(operation));
+        service.stop();
+    }
+
     /// The archive credentials of the databases and the node's own credentials (the Tunnel and the
     /// route keyring) are two reads from Cloudflare, and neither needs the other: both are done in
     /// about the time of the slower one, and not of both added.
@@ -3046,7 +3275,8 @@ mod tests {
         let service = serve(&machine, &cloud, &base).await;
         service
             .deliver_credentials(&Rig::page(vec![source.clone()], vec![]))
-            .await;
+            .await
+            .unwrap();
         let held = |path: &str, access| {
             service.core.store(path, access).is_some_and(|store| {
                 service
@@ -3077,7 +3307,8 @@ mod tests {
         }}});
         service
             .deliver_credentials(&Rig::page(vec![target.clone()], vec![]))
-            .await;
+            .await
+            .unwrap();
         assert!(
             held(source_path, Access::ReadOnly),
             "replacement must fetch the source reader credential"
@@ -3106,7 +3337,8 @@ mod tests {
             .remove("target_time");
         service
             .deliver_credentials(&Rig::page(vec![target.clone()], vec![]))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(
             source_reads(),
             2,
@@ -3115,7 +3347,8 @@ mod tests {
         assert!(held(&rollback_path, Access::ReadWrite));
         service
             .deliver_credentials(&Rig::page(vec![target], vec![]))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(
             source_reads(),
             2,
