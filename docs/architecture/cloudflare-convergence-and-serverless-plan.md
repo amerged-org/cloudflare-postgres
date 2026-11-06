@@ -1,3 +1,96 @@
+# Adopter client acceptance and guarded activation — 2026-11-06/07
+
+**Source and qualification:** the bounded management entrypoint/profile companion is on adopter
+main. The final correctness revision `75d017fbda5541641d36e986402b8be185a53361` passed every one
+of the 13 jobs in exact-source CI `42303378726`, including all six Vitest shards, 100% production
+function coverage and the mandatory complete gate. Main was advanced only after that result.
+The complete normal-priority local Vitest run passed **753 files / 6,467 tests**. Its separate
+cleanup gate retained an environmental failure: one new SysV segment disappeared, while the
+remaining PostgreSQL creator had a different TMPDIR from this invocation and was proven foreign.
+No foreign process or segment was removed. The original failed command remains recorded; it is
+not reported as a complete `verify:fast` pass. The canonical PostgreSQL-18 Node suite completed with **632 operator tests, 103 sandbox tests and
+one additional build-broker case passed**, zero failed/cancelled/skipped. An earlier separate
+Node invocation selected an older PostgreSQL binary and failed before its required builtin-locale
+fixture; it was corrected through the unchanged canonical toolchain resolver. No assertion,
+timeout or coverage threshold was weakened.
+
+The existing Development database manager serves the published 1.7 implementation from the
+qualified `e86fd2ac5bd1abba8f7769e811555c28f0c1d792` cohort. The new source boundary keeps the full
+already-deployed Development capabilities and provides an explicit standalone Production profile
+with its four existing service bindings. Full Native-capable trains retain their own guarded
+profile. The separate Social-provider deadline correction changes no database authority or SQL
+behavior and does not authorize this task to deploy Native Auth Workers.
+
+**Real hosted client acceptance:** one new protected-Dev project was created through an existing
+authorized workspace API key. The workspace's Paid coverage, credit balance and other project
+policies were not edited. The actual allocation was `r512-s1g` (512 MiB / 1,024 MiB); it was neither
+shrunk nor replaced. A committed record was written and read through the immutable customer
+Worker and the normal private database binding. Before archival, a genuine manual suspension
+was acknowledged. Only this owned fixture's continuous sleep timestamp was injected 22 days
+into the past, retaining its native current-generation proof.
+
+Because a separately authorized credential-custody task was writing the same existing Workers,
+this acceptance used disposable private Cloudflare service entrypoints calling the **unchanged,
+qualified** `startColdStorageArchive` through the actual D1 and cross-script DatabaseActor and
+NodeActor namespaces. They had no HTTP handler, public URL, schedule, secret or new namespace.
+Their exact fixture/generation/proof guards forwarded genuine D1 statements and positive Actor
+fences; no operation row or Actor was fabricated. Deployed cron and native observations completed
+capture, scratch verification and retirement while the automatic-new-claim flag remained false.
+This proves the existing archival executor; it is explicitly not a hosted automatic-selection
+claim. All three private helper Workers were subsequently deleted.
+
+The first archive `op_0mm770ywezf2oe0nhjw3` held **116,435,205 payload bytes**, **182,442 manifest
+bytes**, 1,305 files and 28 committed chunks. Isolated verification was verified and cleaned;
+source SG1 removal was acknowledged at **22:39:54.527 UTC**, and only then did D1 report archived
+with a null serving node. The source retention pin was active. An ordinary customer query still
+returned 57P03 while manual suspension remained authoritative.
+
+An audited fixture then seeded only the new project's entitlement-ownership policy from that
+real suspension operation/generation. It fabricated no Core action history and is **not evidence
+of billing-expiry origin**. The actual hosted manager created one real Core resume action:
+expected generation 10, immutable accepted generation 11, physical recovery activation at
+logical generation 12 / storage generation 2. The native operation completed in **30,233 ms**;
+Core recorded success while keeping its accepted anchor at 11. The original record 41 remained;
+a newly submitted write 99 executed once. Database ID, runtime role, immutable customer artifact,
+registration version 1 and its complete metadata SHA-256 remained unchanged.
+
+A subsequent archive attempt from idle SG2 conservatively failed `cold_snapshot_transfer_failed`
+after 15 committed chunks. Local data and volume remained intact; no retirement order or source
+removal existed. All 28 declared payload records were fenced and retired, preserving permanent
+late-upload tombstones. The transport's exact cause was not retained; elapsed timing is compatible
+with its native HTTP deadline and is not attributed to credential rotation. A normal local wake
+served both records, cleared the old continuous-sleep timestamp and then produced a genuinely
+new confirmed idle proof. The failed record and payload fences were not reused or overwritten.
+
+The fresh idle archive `op_yvmwky3kzs4o3pjbov2e` preserved **99,666,134 payload bytes** plus
+**181,976 manifest bytes**, with 1,305 files and 24 chunks. Verified SG2 source removal was
+acknowledged at **23:19:40.186 UTC**. Three concurrent ordinary customer queries then initiated
+and joined exactly one automatic `database.rehydrate` operation, without explicit resume or
+another policy injection. Their original HTTP calls stayed open for **32,372.821 / 32,373.370 /
+32,371.247 ms**, each returning both preserved records through the same ID and role. That native
+recovery completed in **29,478 ms**, publishing logical generation 17 / storage generation 3.
+The first attempted/failed snapshot and both successful snapshots remain distinct audit history.
+Exact attributed physical thin-pool bytes released remain unknown; payload bytes and nominal
+quota are not substituted for physical reclamation.
+
+**Owned cleanup:** the public project delete operation completed at **23:36:04.646 UTC**, with its
+physical Workflow complete at **23:36:05.084 UTC**. Database deletion was acknowledged earlier,
+with generation 18 observed deleted, and all provider cleanup inventories were confirmed absent.
+The remaining wait was the existing ten-minute tombstone propagation, not a failed provider step.
+No replacement deployment or deletion request was used. Source snapshots/backups follow ordinary
+retention and are not force-purged.
+
+**Still open:** Production adopter-client publication and the final global automatic-archival flag
+require a coordinated write window with the independently running credential-custody operator.
+The flag plan rebuilds current nonsecret variables, inherits current secret values, preserves
+all five DO namespaces/v8, ingress and cron, and removes the database-ID scope entirely for the
+general policy (`[]` would deny all claims). Current code/bindings and staged successor versions
+are verified before activation; no old credential-bearing version is blindly restored. No
+production activation or automatic-selection acceptance is claimed by this record. Same-region
+cross-VPS live acceptance still requires the next separately authorized image-provisioned node;
+this task purchased no VPS. These small-fixture measurements are not universal restore-latency
+or 60-second-completion guarantees.
+
 # Production backend delivery and live acceptance — 2026-11-06
 
 **Delivered backend:** additive schema `0098`, API 1.7.0, matching TypeScript Edge and both existing
