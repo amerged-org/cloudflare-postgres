@@ -1789,6 +1789,126 @@ mod tests {
         );
     }
 
+    /// Whether the role `reader`, which the superuser's session takes on, may call each of the
+    /// functions that PostgreSQL lets every role call and that write state or WAL without a table
+    /// privilege: the three that make a large object and the two forms of the WAL message.
+    async fn reader_writes_state(data: &postgres::Session) -> [bool; 5] {
+        let mut made = [false; 5];
+        data.batch("SET ROLE reader").await.unwrap();
+        for (index, sql) in [
+            "SELECT lo_create(0)",
+            "SELECT lo_creat(-1)",
+            "SELECT lo_from_bytea(0, '\\x00')",
+            "SELECT pg_logical_emit_message(true, 'p', 'x', true)",
+            "SELECT pg_logical_emit_message(true, 'p', '\\x00'::bytea, true)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            made[index] = match data.client.batch_execute(sql).await {
+                Ok(()) => true,
+                Err(error) => {
+                    assert_eq!(error.code().map(|code| code.code()), Some("42501"), "{sql}");
+                    false
+                }
+            };
+        }
+        data.batch("RESET ROLE").await.unwrap();
+        data.batch("SELECT lo_unlink(oid) FROM pg_largeobject_metadata")
+            .await
+            .unwrap();
+        made
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_is_hardened_at_creation_and_at_the_refresh_of_an_older_record_whoever_owns_pgcf()
+     {
+        let Some(rig) = Rig::new("events-baseline").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let data = in_database(&rig, &entry.id).await;
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
+
+        // A database from before the baseline: PostgreSQL's defaults, and the earlier record.
+        let open = "GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(oid), pg_catalog.lo_creat(integer), pg_catalog.lo_from_bytea(oid, bytea), pg_catalog.pg_logical_emit_message(boolean, text, text, boolean), pg_catalog.pg_logical_emit_message(boolean, text, bytea, boolean) TO PUBLIC";
+        data.batch(open).await.unwrap();
+        let settings = rig.core.event_settings(&entry);
+        let files = rig.core.files(&entry.id);
+        let mut earlier = pgcf::EventsRecord::of(&settings, false);
+        earlier.schema = pgcf::SCHEMA_REVISION - 1;
+        files.save_events(&earlier).unwrap();
+        assert_eq!(reader_writes_state(&data).await, [true; 5]);
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Installed
+        );
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
+        assert_eq!(
+            files.load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, false))
+        );
+
+        // A tenant that took the name `pgcf` keeps the platform schema out, not the baseline.
+        data.batch("DROP SCHEMA pgcf CASCADE; CREATE SCHEMA pgcf AUTHORIZATION app")
+            .await
+            .unwrap();
+        data.batch(open).await.unwrap();
+        let mut earlier_conflict = pgcf::EventsRecord::of(&settings, true);
+        earlier_conflict.schema = pgcf::SCHEMA_REVISION - 1;
+        files.save_events(&earlier_conflict).unwrap();
+        assert_eq!(reader_writes_state(&data).await, [true; 5]);
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Conflict
+        );
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
+        assert_eq!(
+            files.load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, true))
+        );
+        data.batch("DROP SCHEMA pgcf CASCADE").await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Installed
+        );
+
+        // An error of the baseline ends the install: nothing is recorded, the refresh says it
+        // failed, and the next one finishes it. (The owner role has no name to grant to.)
+        std::fs::remove_file(files.directory().join("events.json")).unwrap();
+        data.batch("ALTER ROLE app RENAME TO app_renamed")
+            .await
+            .unwrap();
+        data.batch(open).await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Failed
+        );
+        assert_eq!(files.load_events().unwrap(), None);
+        assert_eq!(reader_writes_state(&data).await, [true; 5]);
+        data.batch("ALTER ROLE app_renamed RENAME TO app")
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Installed
+        );
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
+
+        // The record is the current one and the database is hardened: a refresh opens no session.
+        // With the database stopped none can be opened, so the answer proves it.
+        assert_eq!(
+            files.load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, false))
+        );
+        drop(data);
+        rig.machine.stop(&entry.id).await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Unchanged
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn refresh_events_configures_new_limits_and_leaves_the_outbox_alone() {
         let Some(rig) = Rig::new("events-limits").await else {
