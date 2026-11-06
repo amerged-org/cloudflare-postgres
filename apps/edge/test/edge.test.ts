@@ -427,6 +427,79 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(await stats()).toHaveLength(0);
   }, 30_000);
 
+  it("a source past its coarse budget is refused on both routes before the Actor is got, and another source is admitted", async () => {
+    const budget = 5;
+    const used = new Map<string, number>();
+    // Counts every route of one source network together, whatever database each request names.
+    const source = {
+      limit: vi.fn(async ({ key }: { key: string }) => {
+        const count = (used.get(key) ?? 0) + 1;
+        used.set(key, count);
+        return { success: count <= budget };
+      }),
+    } as unknown as RateLimit;
+    const bindings = { ...testEnv, SOURCE_RATE_LIMITER: source } as Env;
+    const gets = vi.spyOn(Object.getPrototypeOf(testEnv.DATABASE_ACTOR), "get");
+    const sourceIp = [198, 51, 100, 7].join(".");
+    const admitted = await Promise.all(
+      Array.from({ length: budget }, () =>
+        open({ ip: sourceIp, bindings, database: newDatabaseId() }),
+      ),
+    );
+    expect(new Set(await Promise.all(admitted.map(errorCode)))).toEqual(
+      new Set(["28P01"]),
+    );
+    expect(gets).toHaveBeenCalledTimes(budget);
+    // Past the budget, fresh databases on the same source are refused, WebSocket and HTTP alike.
+    const refused = await Promise.all(
+      Array.from({ length: 3 * budget }, () =>
+        open({ ip: sourceIp, bindings, database: newDatabaseId() }),
+      ),
+    );
+    expect(new Set(await Promise.all(refused.map(errorCode)))).toEqual(
+      new Set(["53300"]),
+    );
+    const upload = { pulled: 0 };
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          upload.pulled++;
+          controller.enqueue(new TextEncoder().encode('{"query":"select 1"}'));
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const ctx = createExecutionContext();
+    const sql = await worker.fetch(
+      new Request(`${origin}/sql`, {
+        method: "POST",
+        headers: {
+          "CF-Connecting-IP": sourceIp,
+          "Neon-Connection-String": `postgresql://app:password@${["db", "invalid"].join(".")}/${newDatabaseId()}`,
+          "Neon-Raw-Text-Output": "true",
+          "Neon-Array-Mode": "true",
+        },
+        body,
+        duplex: "half",
+      } as RequestInit),
+      bindings,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(((await sql.json()) as { code: string }).code).toBe("53300");
+    expect(upload.pulled).toBe(0);
+    expect(gets).toHaveBeenCalledTimes(budget);
+    // Another source keeps its own budget.
+    const other = await open({
+      ip: [198, 51, 100, 8].join("."),
+      bindings,
+      database: newDatabaseId(),
+    });
+    expect(await errorCode(other)).toBe("28P01");
+    expect(gets).toHaveBeenCalledTimes(budget + 1);
+  });
+
   it("a seeded unknown role makes no authoritative D1 query or gateway call", async () => {
     const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
     expect(await errorCode(await open({ user: "missing" }))).toBe("28P01");
