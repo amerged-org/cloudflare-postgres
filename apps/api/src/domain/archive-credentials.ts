@@ -16,10 +16,18 @@ import { archiveEndpoint } from "./archive-bucket.ts";
  * which node may read which scope until when; the desired page names it by its reference and the
  * node reads the secret from `GET /node/v1/archive-credentials/<id>`, where it is signed from the
  * Worker's parent key. Nothing of the secret is stored, and a credential cannot be revoked once
- * read: it can only expire, which is why a lost node's rows stop being delivered at once.
+ * read: it can only expire, which is why a lost node's rows stop being delivered at once, and why
+ * the lifetime is also how long a fenced node keeps the right to write its own prefix.
+ *
+ * A day. A node pulls its page every minute (`full_pull` of the node agent) and every pull names
+ * a credential younger than a third of the lifetime (8 hours), so it reads the next one within
+ * minutes of its issue. A job runs on the credential held when it began: a base backup, restore or
+ * listing may run 6 hours (`BIG_JOB_BOUND`), and that credential has at least two thirds of the
+ * lifetime left (16 hours). An outage of the Worker or the link that outlasts those 16 hours stops
+ * archiving until it ends.
  */
-export const ARCHIVE_CREDENTIAL_LIFETIME_SECONDS = 7 * 86_400;
-/** Renewed once a third of the lifetime has passed, so an outage has days of margin. */
+export const ARCHIVE_CREDENTIAL_LIFETIME_SECONDS = 24 * 3600;
+/** Renewed once a third of the lifetime has passed, so an outage has hours of margin. */
 const RENEW_AFTER_MS = (ARCHIVE_CREDENTIAL_LIFETIME_SECONDS * 1000) / 3;
 /** A row stays a day after it expired, so a late read is told "expired" and not "unknown". */
 const PURGE_AFTER_MS = 86_400_000;

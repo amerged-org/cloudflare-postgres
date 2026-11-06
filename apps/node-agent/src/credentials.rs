@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The R2 temporary credentials a barman job runs with (ULTRA plan 7.3). The API Worker holds the
-//! parent R2 key and signs them (an explicit action list without delete, one archive prefix, 7
-//! days); Cloudflare delivers each to the node (`ArchiveCredential` of the node contract) and
+//! parent R2 key and signs them (an explicit action list without delete, one archive prefix, 24
+//! hours); Cloudflare delivers each to the node (`ArchiveCredential` of the node contract) and
 //! renews it after a third of its lifetime. The node holds what it was delivered and never the
 //! parent key, which could mint any scope, delete included.
 use std::{collections::HashMap, fmt, sync::RwLock};
