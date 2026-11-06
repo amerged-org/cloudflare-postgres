@@ -19,6 +19,8 @@ export interface DatabaseActorNamespace {
 
 export interface Env {
   readonly DATABASE_ACTOR: DatabaseActorNamespace;
+  /** Every route of one source network together, whatever database it names (`admission.ts`). */
+  readonly SOURCE_RATE_LIMITER: RateLimit;
   readonly CONNECTION_RATE_LIMITER: RateLimit;
   /** Callers on a service binding (no CF-Connecting-IP), per database and role. */
   readonly BINDING_CONNECTION_RATE_LIMITER: RateLimit;

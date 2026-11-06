@@ -2,9 +2,11 @@
 /**
  * The admission every database request takes, a WebSocket connection (`index.ts`) and an HTTP
  * query (`sql.ts`) alike: the Edge limiters and the DatabaseActor's admission, and an admitted
- * request is signed its route to the node's gateway. A WebSocket upgrade runs the limiters and the
- * Actor's admission together; an HTTP query counts in the limiters first (`limitRoute`), before
- * its body is read, and takes the Actor's admission after the body is understood.
+ * request is signed its route to the node's gateway. Both count the source network first
+ * (`limitSource`), before any Actor is got. A WebSocket upgrade then runs the per-database and
+ * per-role limiters and the Actor's admission together; an HTTP query counts in the limiters first
+ * (`limitRoute`), before its body is read, and takes the Actor's admission after the body is
+ * understood.
  */
 import {
   parseRouteKeyring,
@@ -23,8 +25,9 @@ export interface Hints {
 /** Milliseconds of each admission stage that ran, logged with the admission. */
 export interface AdmissionTimings {
   /**
-   * The limiters: in parallel with the Actor's admission for a WebSocket upgrade, and ahead of the
-   * body, before the Actor's admission begins, for an HTTP query.
+   * The limiters: the source limiter first and alone, then the others in parallel with the Actor's
+   * admission for a WebSocket upgrade, and ahead of the body, before the Actor's admission begins,
+   * for an HTTP query. The stage is the longest of its limiters' waits, not their sum.
    */
   limiters_ms?: number;
   admit_ms?: number;
@@ -137,6 +140,28 @@ function countLimits(
   );
 }
 
+/**
+ * The source limiter: one coarse bucket per source network across every database and route, so
+ * that fresh database identities cannot escape the limits below. A caller on a service binding (no
+ * `CF-Connecting-IP`) keeps its own budget and never counts here; a malformed address is refused by
+ * the connection limiters that `routeLimits` checks.
+ */
+async function limitSource(
+  request: Request,
+  env: Env,
+  timings: AdmissionTimings,
+): Promise<void> {
+  const network = connectionRateKey(request.headers.get("CF-Connecting-IP"));
+  if (network === null || network === "binding") return;
+  const limits: Limit[] = [
+    [env.SOURCE_RATE_LIMITER, network, "connection rate limit exceeded"],
+  ];
+  const outcomes = await Promise.allSettled(
+    countLimits(limits, timings, Date.now()),
+  );
+  refuseLimited(limits, outcomes);
+}
+
 /** Refuses with 53300 when a limiter failed or said no. */
 function refuseLimited(
   limits: readonly Limit[],
@@ -169,6 +194,7 @@ export async function limitRoute(
       throw new AdmissionFailure("08006", "connection admission interrupted");
   };
   check();
+  await limitSource(request, env, timings);
   const limits = routeLimits(request, env, hints, scope);
   const outcomes = await Promise.allSettled(
     countLimits(limits, timings, Date.now()),
@@ -198,6 +224,9 @@ export async function admitRoute(
       throw new AdmissionFailure("08006", "connection admission interrupted");
   };
   check();
+  // A request that `limitRoute` counted has passed the source limiter already.
+  if (!counted) await limitSource(request, env, timings);
+  check();
   const limits = counted ? [] : routeLimits(request, env, hints, scope);
   const actor = databaseActor(env, hints.database);
   const cancel = () =>
@@ -207,9 +236,9 @@ export async function admitRoute(
         .catch(() => false),
     );
   signal.addEventListener("abort", cancel, { once: true });
-  // Unless `limitRoute` has counted the request, the limiters and the Actor's admission run
-  // together: none of them waits for another. The per-database bucket therefore also counts
-  // connects that admission refuses.
+  // Unless `limitRoute` has counted the request, the per-database and per-role limiters and the
+  // Actor's admission run together: none of them waits for another, only for the source limiter
+  // above. The per-database bucket therefore also counts connects that admission refuses.
   const started = Date.now();
   let admission: PromiseSettledResult<DatabaseWakeAdmission>;
   let outcomes: PromiseSettledResult<RateLimitOutcome>[];

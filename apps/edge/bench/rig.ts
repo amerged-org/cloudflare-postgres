@@ -295,6 +295,11 @@ export async function startRig(
             namespace_id: "4",
             simple: unlimited,
           },
+          {
+            name: "SOURCE_RATE_LIMITER",
+            namespace_id: "5",
+            simple: unlimited,
+          },
         ],
       },
     });

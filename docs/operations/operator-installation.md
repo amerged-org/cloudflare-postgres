@@ -990,9 +990,13 @@ The deployed Edge Worker is the TypeScript `apps/edge`; the management API and D
 in TypeScript. Start the private deployment configuration from `apps/edge/wrangler.example.jsonc`
 and preserve the existing Worker name, hostname, DatabaseActor binding, rate-limit namespaces,
 gateway service bindings (if a region uses one) and `ROUTE_MASTER_KEYS` secret.
-The example also sets `minify: true`, a `BINDING_CONNECTION_RATE_LIMITER` rate limit with a
-namespace of its own for same-account Workers on a service binding (without it every such caller
-is refused with `53300` "connection admission unavailable"), and `DATABASE_ACTOR_LOCATION_HINT`,
+The example also sets `minify: true`, a `SOURCE_RATE_LIMITER` rate limit with a namespace of its
+own that counts every route of one source network (600 per 60 s, a product default to adjust;
+without it every public WebSocket connection and HTTP query is refused with `53300` "connection
+admission unavailable", so add the namespace before or with the deploy), a
+`BINDING_CONNECTION_RATE_LIMITER` rate limit with a namespace of its own for same-account Workers
+on a service binding (without it every such caller is refused with `53300` "connection admission
+unavailable"), and `DATABASE_ACTOR_LOCATION_HINT`,
 which must equal the API Worker's value; the hint places only DatabaseActor objects created after
 it is set.
 
@@ -1034,7 +1038,7 @@ protocol behavior. They do not replace live acceptance on the EU1 stack: a real 
 node's gateway, reached through its Tunnel.
 
 Start the replacement's private configuration from `apps/edge-rust/wrangler.example.jsonc`;
-it has the same bindings, variable and secret as the TypeScript example, and serves the same
+it has the same bindings, variable and secret as the TypeScript example except `SOURCE_RATE_LIMITER`, which only the TypeScript Edge counts, and serves the same
 routes (`/v2` WebSocket connections and `/sql` HTTP queries). The example intentionally has no
 custom build command: delivery uses the qualified artifact instead of compiling again. Do not
 activate the replacement until the selected bytes pass live database acceptance on the EU1

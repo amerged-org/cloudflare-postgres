@@ -246,6 +246,30 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     });
   });
 
+  it("counts an admitted query once in the source limiter, and never a caller on a service binding", async () => {
+    const limit = vi.fn(async () => ({ success: true }));
+    const bindings = admitting(awake(), {
+      SOURCE_RATE_LIMITER: { limit } as unknown as RateLimit,
+    });
+    const admitted = await post(bindings, { query: "select 1", params: [] });
+    expect(admitted.status).toBe(200);
+    expect(limit).toHaveBeenCalledTimes(1);
+    limit.mockClear();
+    const ctx = createExecutionContext();
+    const viaBinding = await worker.fetch(
+      new Request(`${origin}/sql`, {
+        method: "POST",
+        headers: neonHeaders(),
+        body: JSON.stringify({ query: "select 1", params: [] }),
+      }),
+      bindings,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(viaBinding.status).toBe(200);
+    expect(limit).not.toHaveBeenCalled();
+  });
+
   it("logs the stages of a request: where it was admitted, its body, its statements and the Edge's share", async () => {
     const bindings = admitting(awake());
     const send = async (queries: unknown[]) => {
