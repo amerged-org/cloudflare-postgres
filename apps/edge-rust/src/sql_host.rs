@@ -2,6 +2,12 @@
 //! HTTP SQL at the Edge (`POST /sql`): admitted as a WebSocket connection is admitted, signed a
 //! route and forwarded once to the gateway of the node that serves the database, which runs it on
 //! a pooled PostgreSQL session. The Edge never retries a forwarded request.
+//!
+//! Not deployed, and not yet level with the TypeScript Edge on one point: `run` reads and parses
+//! the body before any admission, while `apps/edge/src/sql.ts` counts the request in the limiters
+//! first (`limitRoute`), from the headers alone, so that a client over its budget costs no body
+//! read. A deployment of this port must take the same order: the limiters, then the body, then the
+//! Actor's admission and the route (a route token lives 30 s).
 use crate::{
     gateway, host,
     policy::{self, Failure, GatewayRegion, Hints, Log},
