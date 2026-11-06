@@ -14,6 +14,11 @@ export function officialDebianFallbackUrl(source: string): string | null {
   return `${mirror}/${match[2]}`;
 }
 
+/** Debian's official Cloudflare frontend keeps the exact snapshot timestamp and package path. */
+export function officialDebianSnapshotFallbackUrl(source: string): string | null {
+  return officialDebianFallbackUrl(source) === null ? null : source.replace("https://snapshot.debian.org/", "https://snapshot-cloudflare.debian.org/");
+}
+
 class DownloadUnavailable extends Error {}
 async function httpsResponse(source: string, signal: AbortSignal): Promise<Response> {
   let current = source;
@@ -39,20 +44,24 @@ async function httpsResponse(source: string, signal: AbortSignal): Promise<Respo
   throw new DownloadUnavailable("too many package redirects");
 }
 
-/** One attempt: the snapshot first, its official mirror only on an availability failure.
- * A live mirror may have pruned an old version; the locked size and digest remain mandatory.
+/** Try official snapshot frontends before the live mirror, which may have pruned old versions.
+ * Only availability failures advance to another source; locked bytes and HTTPS remain mandatory.
  */
 export async function fetchLockedPackage(entry: LockedPackage, target: string): Promise<void> {
   const partial = `${target}.partial`;
   const signal = AbortSignal.timeout(300_000);
   try {
-    let response: Response;
-    try { response = await httpsResponse(entry.url, signal); }
-    catch (error) {
-      const fallback = officialDebianFallbackUrl(entry.url);
-      if (!(error instanceof DownloadUnavailable) || fallback === null) throw error;
-      response = await httpsResponse(fallback, signal);
+    let response: Response | undefined;
+    const unavailable: string[] = [];
+    const candidates = [entry.url, officialDebianSnapshotFallbackUrl(entry.url), officialDebianFallbackUrl(entry.url)].filter((url): url is string => url !== null);
+    for (const url of candidates) {
+      try { response = await httpsResponse(url, signal); break; }
+      catch (error) {
+        if (!(error instanceof DownloadUnavailable)) throw error;
+        unavailable.push(`${new URL(url).hostname}: ${error.message}`);
+      }
     }
+    if (!response) throw new DownloadUnavailable(unavailable.join("; "));
     await pipeline(Readable.fromWeb(response.body as never), createWriteStream(partial, { mode: 0o644 }));
     const size = (await stat(partial)).size;
     if (size !== entry.size) throw new Error(`size ${size} instead of ${entry.size}`);

@@ -5,10 +5,11 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fetchLockedPackage, officialDebianFallbackUrl } from "./download.ts";
+import { fetchLockedPackage, officialDebianFallbackUrl, officialDebianSnapshotFallbackUrl } from "./download.ts";
 import type { LockedPackage } from "./lock.ts";
 
 const snapshot = "https://snapshot.debian.org/archive/debian-security/20261024T011300Z/pool/updates/main/u/util-linux/bsdutils_2.41.5-0+deb13u1_amd64.deb";
+const snapshotMirror = snapshot.replace("snapshot.debian.org", "snapshot-cloudflare.debian.org");
 const mirror = "https://security.debian.org/debian-security/pool/updates/main/u/util-linux/bsdutils_2.41.5-0+deb13u1_amd64.deb";
 const payload = Buffer.from("the exact locked package bytes");
 const entry: LockedPackage = { name: "bsdutils", version: "1:2.41.5-0+deb13u1", architecture: "amd64", url: snapshot, size: payload.length, sha256: createHash("sha256").update(payload).digest("hex") };
@@ -28,7 +29,7 @@ test("a Debian snapshot outage falls back to the official mirror with the exact 
   try {
     const target = join(dir, "package.deb");
     await fetchLockedPackage(entry, target);
-    assert.deepEqual(calls, [snapshot, mirror]);
+    assert.deepEqual(calls, [snapshot, snapshotMirror]);
     assert.deepEqual(await readFile(target), payload);
     assert.deepEqual(await readdir(dir), ["package.deb"]);
   } finally { await rm(dir, { recursive: true, force: true }); }
@@ -49,7 +50,7 @@ test("a mirror cannot replace a pinned package with different bytes or an HTTP r
     assert.deepEqual(await readdir(dir), []);
     redirect = true; calls.length = 0;
     await assert.rejects(fetchLockedPackage(entry, target), /HTTPS/);
-    assert.deepEqual(calls, [snapshot, mirror]);
+    assert.deepEqual(calls, [snapshot, snapshotMirror]);
     assert.deepEqual(await readdir(dir), []);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
@@ -57,6 +58,34 @@ test("a mirror cannot replace a pinned package with different bytes or an HTTP r
 test("fallback mappings preserve the pool path and exclude unrelated hosts and archive paths", () => {
   assert.equal(officialDebianFallbackUrl("https://snapshot.debian.org/archive/debian/20261024T011300Z/pool/main/z/zlib/zlib1g_1.3.1_amd64.deb"), "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.3.1_amd64.deb");
   assert.equal(officialDebianFallbackUrl(snapshot.replace("snapshot.debian.org", "packages.example.org")), null);
+  assert.equal(officialDebianSnapshotFallbackUrl(snapshot.replace("snapshot.debian.org", "packages.example.org")), null);
+  assert.equal(officialDebianSnapshotFallbackUrl(snapshot), snapshotMirror);
   assert.equal(officialDebianFallbackUrl(snapshot.replace("https:", "http:")), null);
   assert.equal(officialDebianFallbackUrl(snapshot.replace("/pool/", "/unrelated/")), null);
+});
+
+test("a live mirror is used only after both official snapshot frontends are unavailable, retaining every failure status", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pgcf-package-download-"));
+  const calls: string[] = [];
+  let liveMissing = false;
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    const url = String(input); calls.push(url);
+    if (url === snapshot) return response(url, null, 503);
+    if (url === snapshotMirror) return response(url, null, 502);
+    return liveMissing ? response(url, null, 404) : response(url, payload);
+  });
+  try {
+    const target = join(dir, "package.deb");
+    await fetchLockedPackage(entry, target);
+    assert.deepEqual(calls, [snapshot, snapshotMirror, mirror]);
+    await rm(target); calls.length = 0; liveMissing = true;
+    await assert.rejects(fetchLockedPackage(entry, target), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /snapshot\.debian\.org: HTTP 503/);
+      assert.match(error.message, /snapshot-cloudflare\.debian\.org: HTTP 502/);
+      assert.match(error.message, /security\.debian\.org: HTTP 404/);
+      return true;
+    });
+    assert.deepEqual(await readdir(dir), []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
