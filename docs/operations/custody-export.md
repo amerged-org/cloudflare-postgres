@@ -37,9 +37,13 @@ Reports contain identity, scope, deployment and boolean verification receipts on
 3. Upload through the newer `/accounts/{account}/workers/workers/{id}/versions` JSON API.
    Inherit each binding explicitly from the pinned serving UUID. Legacy scripts uploads accept
    only `latest`, which is not a safe substitute for an explicitly selected version.
-4. Deploy the original version at 100% and exporter at 0%. Use the generated temporary bridge
-   with a private `CUSTODY_TARGET` binding to `CustodyExportService` and a
-   `CUSTODY_COORDINATOR` Durable Object binding to `CustodyCoordinator`.
+4. Deploy the original version at 100% and exporter at 0%. The newer version API applies a
+   Durable Object migration only when its version deploys: first upload/deploy the generated
+   bridge class and migration **without** its self-binding, keeping its public route disabled.
+   Then identify its exact provisioned namespace by script/class, verify SQLite storage, and
+   deploy the same reviewed code with `CUSTODY_COORDINATOR` bound to that namespace ID and
+   `CUSTODY_TARGET` bound privately to `CustodyExportService`. Do not create and reference a
+   new namespace in the same version; the provider refuses that sequence.
 5. Sign the exact bytes returned by `custodyRequestBody(policy)`. POST them to
    `/custody/export` with `Content-Type: application/json` and the unpadded Base64URL
    Ed25519 signature in `x-pgcf-custody-signature`. The bridge's fetch call pins the exporter
@@ -75,3 +79,23 @@ not justify losing protected backup keys, bytes, WAL or recovery metadata.
 
 The source tests exercise real WebCrypto and generated core bytes. They do not replace the
 hosted entrypoint/DO/version-override canary or actual consumer and restore acceptance.
+
+## Temporary writer maintenance wrapper
+
+`buildCustodyMaintenanceWrapperSource` is a separate, explicitly selected entrypoint fence.
+It replaces default HTTP handling with a fixed 503 and rejects scheduled/queue handling.
+For named RPC writers, require a complete verified list: selected exports become empty
+`WorkerEntrypoint` subclasses, overriding the original star exports without inheriting their
+writer methods. Unselected Durable Object and Workflow exports are preserved.
+
+Fencing only a default export is insufficient when a service binding names a writer class.
+For example, a domain-management default HTTP handler may be inert while the actual cipher
+producers live in a named service. Inspect the actual bindings and all producer paths first.
+Importing retained exports still evaluates the original module; verify that initialization
+has no write side effects.
+
+This wrapper does not stop requests already admitted, queued storage calls or external provider
+effects. Do not infer quiescence from a finite wait or a zero-count snapshot. Deploy dual readers
+first where late old-generation ciphertext can arrive, or use an independently qualified
+storage-side protocol preserving late provider results. Restore exact original code and
+configuration after the scoped maintenance step; an ingress fence alone is not migration proof.

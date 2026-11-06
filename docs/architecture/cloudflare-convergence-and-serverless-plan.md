@@ -11,6 +11,14 @@ No Production integrator, encryption key, archive object or backup reader was ch
 operation. The retained witness resumed on its existing local volume, served constant SELECT
 queries, and its ordinary idle hibernation was observed; no VPS was purchased.
 
+Two further configured secrets were rotated and appended before consumer activation: the shared
+Edge Access secret and the consumed first-administrator bootstrap token. Access issuer version
+advanced from 3 to 4; Client ID stayed unchanged, the old secret expired, and both HTTP SQL and
+fresh WebSocket SQL passed afterward. Bootstrap still returned 401 with the administrator-row
+count unchanged at one. The protected administrator continued returning 200. Actual runtime
+capture confirmed that the existing routing and credential-encryption rings match the retained
+local historical copies, so those known correct keys were not rotated.
+
 The [sealed custody exporter](../operations/custody-export.md) adds a reviewed source-builder
 candidate for a private owning-Worker entrypoint and signed, serialized bridge. It preserves
 the original modules/exports and can inherit bindings from an explicit serving version through
@@ -18,6 +26,14 @@ the newer Workers API. Final Linux CI and hosted 0%-version wiring acceptance re
 before Production-critical capture. Source preparation is not a live export or another rotated
 credential. Full unknown-key rotation, historical-reader migration and architecture consolidation
 remain open until their per-identity and recovery checks pass.
+
+The exact source at `03f4267c5c610d9db7e6d2f1751d5100dea3744b` passed every required Linux CI
+job in workflow `42285266773`. The isolated hosted fixture subsequently passed private named
+entrypoint routing, explicit serving-version binding inheritance, 0%-version override, sealed
+round-trip decryption and original-module/latest-version cleanup. An initial helper migration
+ordering refusal was resolved by deploying the namespace creation before its self-binding; no
+Production-critical key was selected before the hosted acceptance. The named-writer maintenance
+wrapper remains a separately reviewed source extension and does not prove in-flight quiescence.
 
 # Production backend delivery and live acceptance — 2026-11-06
 

@@ -356,35 +356,85 @@ export function buildCustodyExporterSource(input: CustodyExportPolicy): string {
   return `import { WorkerEntrypoint } from "cloudflare:workers";\nconst core = (${CUSTODY_RUNTIME_SOURCE})(${JSON.stringify(policy)});\nexport class CustodyExportService extends WorkerEntrypoint {\n  async fetch(request) { return core.capture(request, this.env); }\n}\n`;
 }
 
-/** Add only the private entrypoint, leaving the original main and every export intact. */
-export function buildCustodyWrapperSource(input: {
-  originalImport: string;
-  exporterImport: string;
-  existingExports: readonly string[];
-}): string {
-  const validImport = (value: string) =>
+function safeModuleImport(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
     /^\.\/(?:[A-Za-z0-9_@-][A-Za-z0-9._@-]*\/)*[A-Za-z0-9_@-][A-Za-z0-9._@-]*$/u.test(
       value,
     ) &&
     !value
       .slice(2)
       .split("/")
-      .some((part) => part === ".." || part === ".");
-  // The leading './' is allowed; no subsequent dot/path traversal component is.
-  const safeImport = (value: string) =>
-    value.startsWith("./") &&
-    validImport(`./${value.slice(2)}`.replace(/^\.\//u, "./"));
+      .some((part) => part === ".." || part === ".")
+  );
+}
+
+/** Add only the private entrypoint, leaving the original main and every export intact. */
+export function buildCustodyWrapperSource(input: {
+  originalImport: string;
+  exporterImport: string;
+  existingExports: readonly string[];
+}): string {
   if (
-    typeof input.originalImport !== "string" ||
-    typeof input.exporterImport !== "string" ||
-    !safeImport(input.originalImport) ||
-    !safeImport(input.exporterImport) ||
+    !safeModuleImport(input.originalImport) ||
+    !safeModuleImport(input.exporterImport) ||
     input.originalImport === input.exporterImport ||
     !Array.isArray(input.existingExports) ||
     input.existingExports.includes("CustodyExportService")
   )
     throw new Error("Custody wrapper imports or existing exports are invalid");
   return `export * from ${JSON.stringify(input.originalImport)};\nexport { default } from ${JSON.stringify(input.originalImport)};\nexport { CustodyExportService } from ${JSON.stringify(input.exporterImport)};\n`;
+}
+
+/**
+ * A verified-entrypoint maintenance fence, not a drain barrier. The caller must identify every
+ * mutating entrypoint and separately drain in-flight work. Selected named WorkerEntrypoints
+ * become empty platform-base classes, not subclasses of the original writers. Other named
+ * exports and original module initialization remain; this wrapper never invokes the original
+ * default constructor or handlers. Module initialization must itself be checked for side effects.
+ */
+export function buildCustodyMaintenanceWrapperSource(
+  input: { originalImport: string } & (
+    | {
+        verifiedDefaultOnly: true;
+        verifiedCompleteWriteEntrypoints?: never;
+        closedNamedWorkerEntrypoints?: never;
+      }
+    | {
+        verifiedDefaultOnly?: never;
+        verifiedCompleteWriteEntrypoints: true;
+        closedNamedWorkerEntrypoints: readonly string[];
+      }
+  ),
+): string {
+  const named = input.closedNamedWorkerEntrypoints;
+  const defaultOnly =
+    input.verifiedDefaultOnly === true &&
+    input.verifiedCompleteWriteEntrypoints === undefined &&
+    named === undefined;
+  const complete =
+    input.verifiedCompleteWriteEntrypoints === true &&
+    input.verifiedDefaultOnly === undefined &&
+    Array.isArray(named) &&
+    named.length <= 32 &&
+    named.every(
+      (name) =>
+        typeof name === "string" && /^[A-Z][A-Za-z0-9_]{0,99}$/u.test(name),
+    ) &&
+    new Set(named).size === named.length;
+  if ((!defaultOnly && !complete) || !safeModuleImport(input.originalImport))
+    throw new Error("Custody maintenance fence scope or import is invalid");
+  const closed = complete ? [...named!].sort() : [];
+  const platformImport = closed.length
+    ? 'import { WorkerEntrypoint as __CustodyClosedWorkerEntrypoint } from "cloudflare:workers";\n'
+    : "";
+  const replacements = closed
+    .map(
+      (name) =>
+        `export class ${name} extends __CustodyClosedWorkerEntrypoint {}\n`,
+    )
+    .join("");
+  return `${platformImport}export * from ${JSON.stringify(input.originalImport)};\n${replacements}const reject = () => { throw new Error("Credential maintenance in progress"); };\nexport default {\n  fetch() { return new Response("Credential maintenance in progress", { status: 503, headers: { "cache-control": "no-store", "content-type": "text/plain" } }); },\n  scheduled: reject,\n  queue: reject\n};\n`;
 }
 
 /** A temporary operator-only bridge; its Durable Object stores sealed packet/phase metadata. */

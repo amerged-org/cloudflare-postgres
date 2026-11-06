@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   buildCustodyBridgeSource,
   buildCustodyExporterSource,
+  buildCustodyMaintenanceWrapperSource,
   buildCustodyWrapperSource,
   custodyRecipientFingerprint,
   custodyRequestBody,
@@ -573,6 +574,196 @@ test("source builders preserve original exports, reject private keys and emit a 
     assert.equal(overlaid.InfrastructureBackup, original.InfrastructureBackup);
     assert.equal(typeof overlaid.CustodyExportService, "function");
     assert.equal(await overlaid.default.fetch().text(), "original");
+
+    const objectImport = "./object-default.mjs";
+    const objectFence = buildCustodyMaintenanceWrapperSource({
+      originalImport: objectImport,
+      verifiedDefaultOnly: true,
+    });
+    await writeFile(
+      join(directory, "object-default.mjs"),
+      'export const calls = { constructor: 0, fetch: 0, scheduled: 0, queue: 0, write: 0 };\nexport class RetainedObject {}\nexport default { fetch() { calls.fetch++; return new Response("unfenced"); }, scheduled() { calls.scheduled++; }, queue() { calls.queue++; }, write() { calls.write++; } };\n',
+    );
+    await writeFile(join(directory, "object-fence.mjs"), objectFence);
+    const objectOriginal = await import(
+      pathToFileURL(join(directory, "object-default.mjs")).href
+    );
+    const objectFenced = await import(
+      pathToFileURL(join(directory, "object-fence.mjs")).href
+    );
+    let keyReads = 0;
+    const unreadableEnv = new Proxy(
+      {},
+      {
+        get() {
+          keyReads++;
+          throw new Error(CAPTURED);
+        },
+      },
+    );
+    const objectResponse = objectFenced.default.fetch(
+      new Request("https://maintenance.invalid/write"),
+      unreadableEnv,
+      {},
+    ) as Response;
+    assert.equal(objectResponse.status, 503);
+    assert.equal(objectResponse.headers.get("cache-control"), "no-store");
+    assert.equal(
+      await objectResponse.text(),
+      "Credential maintenance in progress",
+    );
+    assert.throws(
+      () => objectFenced.default.scheduled(),
+      /Credential maintenance in progress/u,
+    );
+    assert.throws(
+      () => objectFenced.default.queue(),
+      /Credential maintenance in progress/u,
+    );
+    assert.equal(objectFenced.default.write, undefined);
+    assert.deepEqual(Object.keys(objectFenced.default).sort(), [
+      "fetch",
+      "queue",
+      "scheduled",
+    ]);
+    assert.equal(objectFenced.RetainedObject, objectOriginal.RetainedObject);
+    assert.deepEqual(objectOriginal.calls, {
+      constructor: 0,
+      fetch: 0,
+      scheduled: 0,
+      queue: 0,
+      write: 0,
+    });
+
+    await writeFile(
+      join(directory, "class-default.mjs"),
+      "export const calls = { constructor: 0, fetch: 0, scheduled: 0, queue: 0, write: 0 };\nexport class RetainedObject {}\nexport default class OriginalDefault { constructor() { calls.constructor++; } fetch() { calls.fetch++; } scheduled() { calls.scheduled++; } queue() { calls.queue++; } write() { calls.write++; } }\n",
+    );
+    await writeFile(
+      join(directory, "class-fence.mjs"),
+      buildCustodyMaintenanceWrapperSource({
+        originalImport: "./class-default.mjs",
+        verifiedDefaultOnly: true,
+      }),
+    );
+    const classOriginal = await import(
+      pathToFileURL(join(directory, "class-default.mjs")).href
+    );
+    const classFenced = await import(
+      pathToFileURL(join(directory, "class-fence.mjs")).href
+    );
+    const classResponse = classFenced.default.fetch(
+      new Request("https://maintenance.invalid/write"),
+      unreadableEnv,
+      {},
+    ) as Response;
+    assert.equal(classResponse.status, 503);
+    assert.equal(classResponse.headers.get("cache-control"), "no-store");
+    assert.throws(
+      () => classFenced.default.scheduled(),
+      /Credential maintenance in progress/u,
+    );
+    assert.throws(
+      () => classFenced.default.queue(),
+      /Credential maintenance in progress/u,
+    );
+    assert.equal(classFenced.default.write, undefined);
+    assert.equal(classFenced.RetainedObject, classOriginal.RetainedObject);
+    assert.deepEqual(classOriginal.calls, {
+      constructor: 0,
+      fetch: 0,
+      scheduled: 0,
+      queue: 0,
+      write: 0,
+    });
+    assert.equal(keyReads, 0);
+
+    await writeFile(
+      join(directory, "named-original.mjs"),
+      "export const calls = { namedConstructor: 0, namedWrite: 0, defaultWrite: 0 };\nexport class CloudflareDomainManagementService { constructor() { calls.namedConstructor++; } write() { calls.namedWrite++; } }\nexport class RetainedObject {}\nexport class RetainedWorkflow {}\nexport default { write() { calls.defaultWrite++; } };\n",
+    );
+    await writeFile(
+      join(directory, "platform-fixture.mjs"),
+      "export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }\n",
+    );
+    const namedFence = buildCustodyMaintenanceWrapperSource({
+      originalImport: "./named-original.mjs",
+      verifiedCompleteWriteEntrypoints: true,
+      closedNamedWorkerEntrypoints: ["CloudflareDomainManagementService"],
+    });
+    assert.ok(
+      !namedFence.includes("extends CloudflareDomainManagementService"),
+    );
+    // Only the platform builtin is replaced in this Node fixture; generated fence logic is intact.
+    await writeFile(
+      join(directory, "named-fence.mjs"),
+      namedFence.replace('"cloudflare:workers"', '"./platform-fixture.mjs"'),
+    );
+    const namedOriginal = await import(
+      pathToFileURL(join(directory, "named-original.mjs")).href
+    );
+    const namedFenced = await import(
+      pathToFileURL(join(directory, "named-fence.mjs")).href
+    );
+    assert.notEqual(
+      namedFenced.CloudflareDomainManagementService,
+      namedOriginal.CloudflareDomainManagementService,
+    );
+    const closedNamed = new namedFenced.CloudflareDomainManagementService(
+      {},
+      unreadableEnv,
+    );
+    assert.equal(closedNamed.write, undefined);
+    assert.throws(() => closedNamed.write());
+    assert.equal(namedFenced.default.write, undefined);
+    assert.equal(namedFenced.default.fetch().status, 503);
+    assert.equal(namedFenced.RetainedObject, namedOriginal.RetainedObject);
+    assert.equal(namedFenced.RetainedWorkflow, namedOriginal.RetainedWorkflow);
+    assert.deepEqual(namedOriginal.calls, {
+      namedConstructor: 0,
+      namedWrite: 0,
+      defaultWrite: 0,
+    });
+    assert.equal(keyReads, 0);
+    assert.throws(() =>
+      buildCustodyMaintenanceWrapperSource({
+        originalImport: "./named-original.mjs",
+        verifiedCompleteWriteEntrypoints: true,
+        closedNamedWorkerEntrypoints: ["default"],
+      }),
+    );
+    assert.throws(() =>
+      buildCustodyMaintenanceWrapperSource({
+        originalImport: "./named-original.mjs",
+        verifiedCompleteWriteEntrypoints: true,
+        closedNamedWorkerEntrypoints: ["NamedWriter", "NamedWriter"],
+      }),
+    );
+    assert.throws(() =>
+      buildCustodyMaintenanceWrapperSource({
+        originalImport: "./named-original.mjs",
+        verifiedCompleteWriteEntrypoints: true,
+        closedNamedWorkerEntrypoints: ["NamedWriter;inject()"],
+      }),
+    );
+    assert.throws(() =>
+      buildCustodyMaintenanceWrapperSource({
+        originalImport: "./named-original.mjs",
+        closedNamedWorkerEntrypoints: ["NamedWriter"],
+      } as Parameters<typeof buildCustodyMaintenanceWrapperSource>[0]),
+    );
+    assert.throws(() =>
+      buildCustodyMaintenanceWrapperSource({
+        originalImport: objectImport,
+        verifiedDefaultOnly: false as true,
+      }),
+    );
+    assert.throws(() =>
+      buildCustodyMaintenanceWrapperSource({
+        originalImport: "../outside.mjs",
+        verifiedDefaultOnly: true,
+      }),
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
