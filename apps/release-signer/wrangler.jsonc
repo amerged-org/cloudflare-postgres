@@ -2,10 +2,10 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   // The Worker that signs the release manifest of a CI run of main (docs/operations/release-signing.md).
   // This file is tracked, unlike the other Workers' configurations, because it holds nothing private:
-  // no account id and no secret. The key is the secret RELEASE_SIGNING_KEY, which only
-  // `node scripts/operations/release-signing.ts provision` sets. An adopter's fork changes the
+  // no account id and no secret. RELEASE_SIGNING_KEY uses operator custody saved before activation;
+  // the legacy provision command is not used for this rotation. An adopter's fork changes the
   // variables below, which name the one workflow that may ask for a signature.
-  "name": "pgcf-release-signer-dev",
+  "name": "pgcf-release-signer-next-v20261106",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-02",
   // Reached at its workers.dev address, which CI requests its identity token for; no preview URLs.
