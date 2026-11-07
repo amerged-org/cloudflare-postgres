@@ -1,3 +1,52 @@
+# General cold-storage Production activation — 2026-11-07
+
+**Released:** the owner-authorized policy is active for Free and Paid databases after strictly
+more than 21 continuous days of confirmed sleep. Manually suspended databases still require an
+authorized resume. The additive schema, cold snapshot format (including UNLOGGED contents),
+same-ID recovery and bounded request admission had already passed the real EU1 acceptance below.
+
+At **09:53:15.604 UTC**, the existing control Worker `pgcf-api-dev` was verified at 100% version
+`e4b52cb4-f390-41d7-96e4-f0dc9fe49fb3`, deployment
+`8c7691c1-9e2f-4ede-b6de-d5982a497f4f`. Exactly two configuration changes were made:
+`COLD_STORAGE_ARCHIVAL_ENABLED="true"` and complete removal of
+`COLD_STORAGE_ARCHIVAL_DATABASE_IDS`; an empty array would deny every new claim.
+The complete current serving modules were copied byte-for-byte from
+`1a1b21ff-1b47-4526-b9a3-8901306870c1`, preserving the newly qualified signing authority from
+`f9faade99747ca333894d92f315fcd01559f8ad4`. The `index.js` SHA-256 remained
+`fcc03d44207b1380f9128f03bebbe3d91d5b37c910f47325996e9a9f6eaaa254`.
+All 54 unselected bindings were inherited explicitly from that immutable current serving version,
+including all 15 opaque secrets, both expanded native qualification lists and current archive
+credentials. No old code bundle or retired credential was restored. Existing Durable Object
+namespaces and migration v8, runtime, schedules and ingress were verified unchanged before staging,
+before activation and after activation. The overlapping custody operator granted an exclusive
+write window for this release.
+
+The Production management client already served the complete Native-capable 1.7 cohort from
+qualified source `d0bff935d4bd4eee120fd0f475fa1bfa6cb584b8`, version
+`555bc63c-00cf-4500-94a8-f489eb3675d0`, deployment
+`c1d9aaaa-da3c-4a1c-bb5b-6e32c8dadbeb`. Its code matched the accepted Development artifact and
+all 12 service bindings were retained. No client deployment or narrower profile replacement was
+necessary for this activation.
+
+Read-only control snapshots immediately before and after activation contained **225 live
+databases**, all local: four desired running and 221 desired suspended. Their complete current
+ID/storage-generation/sleep-timestamp tuples were identical across the release. The oldest
+confirmed sleep timestamp was **2026-10-20 00:00:32.428 UTC**; **zero** databases met the strict
+21-day boundary. No sleep date was restarted or aged by this release, and no customer database
+was archived early. EU1 and US1 both remained ready, schedulable and placement-enabled on
+`sha-f9faade99747`, with fresh observations. Administrator read access returned 200.
+
+The next observed completed regular cron started at **09:55:03.604 UTC** and completed at
+**09:55:14.397 UTC**, with `failing_steps_json={}`. The exclusive write window was then released
+to the custody operator with the exact active versions and flag preservation requirement. General
+selection is enabled; with no eligible live database, this activation does not claim a newly
+executed automatic archive. The earlier real hosted acceptance held three ordinary initiating
+queries for **32,372.821 / 32,373.370 / 32,371.247 ms**, returning preserved data through one
+same-ID recovery. Sixty seconds remains the pre-execution request waiting limit, not a restore
+completion guarantee. Real same-region cross-VPS acceptance remains deferred until the next
+separately authorized image-provisioned node exists. No VPS was purchased; attributed physical
+thin-pool reclamation bytes remain unmeasured rather than inferred from archive size or quota.
+
 # Selective operator credential custody — 2026-11-06
 
 The owner authorized rotation of unknown active credentials, append-only local custody, short
@@ -352,16 +401,14 @@ The remaining wait was the existing ten-minute tombstone propagation, not a fail
 No replacement deployment or deletion request was used. Source snapshots/backups follow ordinary
 retention and are not force-purged.
 
-**Still open:** Production adopter-client publication and the final global automatic-archival flag
-require a coordinated write window with the independently running credential-custody operator.
-The flag plan rebuilds current nonsecret variables, inherits current secret values, preserves
-all five DO namespaces/v8, ingress and cron, and removes the database-ID scope entirely for the
-general policy (`[]` would deny all claims). Current code/bindings and staged successor versions
-are verified before activation; no old credential-bearing version is blindly restored. No
-production activation or automatic-selection acceptance is claimed by this record. Same-region
-cross-VPS live acceptance still requires the next separately authorized image-provisioned node;
-this task purchased no VPS. These small-fixture measurements are not universal restore-latency
-or 60-second-completion guarantees.
+**Activation gate closed on 2026-11-07:** the current full Production client was independently
+verified already deployed, and the global automatic-archival flag was then enabled in the
+coordinated exclusive window. The release record at the top of this plan gives exact current
+versions and preservation checks. This earlier acceptance remains an executor/request-recovery
+proof, not an executed automatic-selection claim. Same-region cross-VPS live acceptance still
+requires the next separately authorized image-provisioned node; this task purchased no VPS.
+These small-fixture measurements are not universal restore-latency or 60-second-completion
+guarantees.
 
 # Production backend delivery and live acceptance — 2026-11-06
 
