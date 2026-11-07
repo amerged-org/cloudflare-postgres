@@ -228,18 +228,24 @@ mod linux {
     }
 
     pub async fn check() -> Result<(), Error> {
+        use check::report::{self, Stage};
         // Before anything is made: the scratch volume is mounted in this process's namespace.
         pgcf_node_agent::machine::refuse_init_mount_namespace(
             std::path::Path::new("/proc/self/ns/mnt"),
             std::path::Path::new("/proc/1/ns/mnt"),
-        )?;
+        )
+        .map_err(|error| report::at(Stage::MountNamespace, error))?;
         let node = Node::connect(
             Layout::default(),
             storage::Config::default(),
             slots::CHECK_SLOT..slots::CHECK_SLOT + 1,
         )
-        .await?;
-        let account = node.scratch_account(SCRATCH).await?;
+        .await
+        .map_err(|error| report::at(Stage::NodeConnect, error))?;
+        let account = node
+            .scratch_account(SCRATCH)
+            .await
+            .map_err(|error| report::at(Stage::ScratchAccount, error))?;
         let checked = check::run(&node, &account).await?;
         println!(
             "{}",
@@ -250,14 +256,19 @@ mod linux {
 }
 
 /// The exit code of a command. `run` tells the journal the class of a failure only, as the text
-/// of an error can carry an address or a path; `check` is run by a person on the node, and what
-/// failed is the point of it.
+/// of an error can carry an address or a path. `check` is also run by maintenance: only its
+/// closed stage/class report may cross the child-process boundary.
 fn finish(result: Result<(), pgcf_node_agent::Error>, command: &str) -> std::process::ExitCode {
     let Err(error) = result else {
         return std::process::ExitCode::SUCCESS;
     };
     // On Linux `run` has said `agent_failed` with the class and has waited (`linux::run`).
-    if command != "run" || cfg!(not(target_os = "linux")) {
+    if command == "check" {
+        println!(
+            "{}",
+            pgcf_node_agent::agent::check::report::Failure::for_cli(&error).json()
+        );
+    } else if command != "run" || cfg!(not(target_os = "linux")) {
         eprintln!("pgcf-agent {command}: {error}");
     }
     std::process::ExitCode::FAILURE
@@ -280,7 +291,12 @@ fn main() -> std::process::ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("pgcf-agent {command}: {error}");
+            if command == "check" {
+                use pgcf_node_agent::agent::check::report::{Failure, Stage};
+                println!("{}", Failure::from_io(Stage::Runtime, &error).json());
+            } else {
+                eprintln!("pgcf-agent {command}: {error}");
+            }
             return std::process::ExitCode::FAILURE;
         }
     };
