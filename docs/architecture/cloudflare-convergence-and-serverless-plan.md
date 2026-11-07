@@ -24,7 +24,7 @@ resources, conditions and expiry: PGCF Tunnel/DNS, Development SaaS, Production 
 web-domain management. Each one-time successor was appended before the selected binding changed;
 read-only capability probes passed before and after old-token revocation, and all four old tokens
 then failed authentication. No DNS, Tunnel, certificate, archive object or protected local key was
-removed. Twenty credential identities/configured secrets have completed rotation in this execution;
+removed. Twenty-three credential identities/configured secrets have completed rotation in this execution;
 recovered old material and two new operator-custody maintenance keys are excluded from that count.
 The independent-identity inventory remains open; binding-name totals are not key totals.
 
@@ -81,23 +81,49 @@ material rotation, with historical reader coverage retained.
 
 The frozen selected inventory contains 79 material identities across 48 owning Workers, rather
 than one identity per binding name. Forty initially correct locally held identities stay unchanged.
-Verified receipts account for 20 completed rotations and six saved active successors with old
-authorities retained. The selected cohort also contains 40 correct local KEEP identities, four
-retirements, eight ROTATE identities still open and one BLOCKED identity. The automated ledger
-refresh stopped before output because its fresh alias metadata differed from the immutable original
-census; that original remains unchanged while the structural difference is investigated. Replacement activation with retained authority is not counted
-as completed retirement.
+The final reconciled cohort contains 79 identities: 40 initially correct locally held identities
+remain KEEP, 23 replacement transactions are verified, seven have saved active replacements with
+old authorities or verifiers retained, five remain open, and four are retired. All four webhook
+policy containers were verified without adding identities. The immutable original master census
+still has 13 references and 10 distinct groups; its bytes and inode were preserved. A stale
+capability-URL capture reference had stopped parsing the API owner before its routing reference;
+exact same-material capture lineage and fatal owner-parse handling resolved that accounting error.
+No unresolved deduplication or container cases remain. The scope excludes 17 ownership-unresolved
+Workers and credentials outside the selected platform-owner cohort.
 Two unused WFP diagnostic-secret bindings and one obsolete wake-probe Bearer reference were
 retired; that probe's other integrator identity was already revoked and expired before this task.
 The obsolete Worker was removed only after reference checks, exact immutable identity verification
 and a durably decrypt-verified sealed source/settings/secret backup. No active project credential
 was substituted into that obsolete consumer. The four retirements are not new-key rotations.
 
-Separate Native-auth custody work stopped before target-key generation or credential-file changes.
-Its private capture restored the original modules and bindings under a new serving-version ID; a
-raw settings comparison stopped on generated annotation metadata. No rotation was completed. The webhook candidate also remains unchanged: its required tool pin did not match, so
-execution stopped before a receiver/token mutation or delivery. Neither attempt adds to the
-20 completed rotations; the qualified owning-tool gates still apply.
+Both Development Native-auth masters now have saved version-20261106 writers and exact historical
+version-1 readers. EU's zero-object scope passed actual private old/new/AAD crypto, complete sealed
+raw-binding, qualified module/settings and final-pin verification. US passed actual private old/new
+crypto and then a narrower independent acceptance through the ordinary Native release: the exact
+qualified d0 release inherited the saved keys, its current JSON writer was 20261106, and the same
+known owned user remained active and recoverable through the normal Owner API. This proves the
+configured master transition and retained-data readback; it does not observe the executing Durable
+Object version or establish that all older writers have retired. Failed observation attempts remain
+recorded without a fabricated success or request-outcome claim. No registry, user, engine-secret or
+session rewrite was used to complete the rotation.
+
+Both webhook Workers received qualified dual-verifier source while preserving their four original
+primary values and all resource bindings. Production GitHub's replacement was saved before its
+single secret-only issuer PATCH and immediate new-primary promotion. Private old/new verification,
+actual saved-value readback and cleanup passed. Its old additional verifier expires at
+2026-11-14 06:16:33.713 UTC. Natural-delivery/backlog retirement is not claimed, so this is the seventh
+active overlap rather than another strict completion. Both WorkOS same-URL replacement attempts
+returned 409 without issuing a new secret, changing a receiver, deleting an old endpoint or retrying.
+Those two HMACs, the manually issued GitHub App private key and the unresolved Make receiver URL
+and Bearer remain the five open identities.
+
+Two known, not-yet-active Production Native masters were also appended exactly from their existing
+private first-install files and read back equal. They are additional initial custody, not rotations
+or extra members of the historical 79-identity cohort. Neither original private file was changed.
+Both original environment files remain mode 0600, ignored and untracked; every original byte and
+assignment occurrence was verified unchanged under a short snapshot lock. Independent Worker
+leases and append-prefix/own-value guards now permit parallel cloud work without holding both local
+credential stores locked throughout network operations.
 
 The PGCF archive parent, Development R2-management, the shared Production R2-management/storage
 authority and Development storage have verified saved successors active, with old parents retained. New-parent acceptance used exactly four fresh operator targets:
@@ -124,7 +150,7 @@ saved successor and retained old parent. Its validation used authentication, LIS
 existing archive metadata only; no archive GET, object write, Container job or customer recovery
 operation was invoked. Both Recovery configurations retain their known INPUT and same-principal
 PGCF credentials unchanged. The six saved active R2 successors are disclosed separately from the
-20 completed rotations.
+23 completed rotations.
 
 Source inspection found that native credential failures were logged without preventing maintenance
 completion. A focused Rust correction now withholds maintenance admission until a complete page's
@@ -196,6 +222,28 @@ reset, SSH, customer-volume repair, new key, env write, fixture deletion or purc
 by this causal rollout. EU1 remains on b312 with its genuine earlier full-page barrier and the
 owned EU witness retained. Old R2 authorities remain active; no old transient-job absence or old
 parent retirement is claimed.
+
+The release-signing authority subsequently completed the two-release trust transition. Original
+OLD-signed T `f1a2c8e9a4bda9c2c8709c59dcee5f00b873632d` passed full main CI `42345250767`;
+original NEW-signed F `f9faade99747ca333894d92f315fcd01559f8ad4` passed full main CI `42348453126`.
+All seven original members and both signatures were pinned before T reached either node. Both
+nodes reached the explicitly qualified T bridge without T maintenance. The API then received the
+NEW-public F code while inheriting every actual current binding; a fresh sealed capture verified
+all 15 protected values, entrypoints, settings, cron and ingress. Both nodes reached F. One US cycle
+definitively failed `power_busy`; the failed operation and receipt were retained, and a separately
+recorded guarded successor completed. EU maintenance completed as well. Both post-cycle heartbeats,
+owned HTTP/WebSocket SQL, administrator access and unchanged scope manifests passed. Only then was
+the exact old signer Worker deleted without force; provider absence and fresh F-node health were
+verified. The new signer remains active, with its private half in local custody and genuine GitHub
+OIDC signing proved by F. No archive reader, backup object, tenant volume or known local key was
+removed by this signing transition. The legacy CLI default now targets that retained current signer
+and still refuses to overwrite an existing secret.
+
+The one extra owned EU signing witness was subsequently deleted through its normal operation;
+its desired/observed deleted state and zero node-volume inventory were verified. Existing databases
+and archives were left unchanged. The six R2 predecessor authorities remain active while historical
+jobs, temporary credentials and download URLs are reconciled; no expiration or revocation is
+claimed for them. Their overlap is distinct from GitHub's fixed additional-verifier deadline.
 
 The [sealed custody exporter](../operations/custody-export.md) adds a reviewed source-builder
 candidate for a private owning-Worker entrypoint and signed, serialized bridge. It preserves
