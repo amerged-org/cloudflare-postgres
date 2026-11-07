@@ -75,10 +75,30 @@ pub async fn run<M: Machine>(machine: &M, account: &Account) -> Result<Checked, 
         .await
         .map_err(|error| report::at(Stage::PoolSample, error))?;
     // Finishes what an earlier call left: it makes the volume and its filesystem, or only mounts it.
-    machine
+    let create_needs_repair = match machine
         .create_volume(&volume, VOLUME_BYTES, account, &policy())
         .await
+    {
+        Ok(()) => false,
+        Err(storage::Error::NeedsRepair) => true,
+        Err(error) => return Err(report::at(Stage::VolumeCreate, error)),
+    };
+    // A mounted suspect can make create succeed with its start link withheld. Only this fixed
+    // scratch volume is repaired, after its unit stopped, using storage's offline holder guards.
+    let suspect = machine
+        .needs_repair(&volume)
+        .await
         .map_err(|error| report::at(Stage::VolumeCreate, error))?;
+    if create_needs_repair || suspect {
+        machine
+            .recover_volume(&volume, &policy())
+            .await
+            .map_err(|error| report::at(Stage::VolumeCreate, error))?;
+        // Repair keeps an existing cluster. A missing marker must never turn it into initdb.
+        if !data.join("PG_VERSION").exists() {
+            return Err(report::invariant(Stage::VolumeCreate));
+        }
+    }
     let created = !data.join("PG_VERSION").exists();
     if created {
         machine
@@ -202,12 +222,57 @@ mod tests {
         assert_eq!(first.uid, account.uid);
         assert!(!machine.running(SCRATCH), "the check leaves the unit down");
         let made = identity(&machine);
+        let volume = VolumeId::new(SCRATCH, 1).unwrap();
+        let sentinel = machine.layout().data(SCRATCH).join("check-sentinel");
+        std::fs::write(&sentinel, b"same scratch cluster").unwrap();
+        let other = VolumeId::new("b1c2d3e4f5g6h7i8j9k0", 1).unwrap();
+        let other_account = machine.ensure_account(other.database()).await.unwrap();
+        machine
+            .create_volume(&other, VOLUME_BYTES, &other_account, &policy())
+            .await
+            .unwrap();
+        let other_sentinel = machine.layout().volume(other.database()).join("kept");
+        std::fs::write(&other_sentinel, b"another volume is untouched").unwrap();
+        machine.mark_suspect(&other);
 
+        // A mounted suspect can make create succeed while its start link stays withheld.
+        machine.mark_suspect(&volume);
         let second = run(&machine, &account).await.unwrap();
         assert!(!second.created);
         assert!(!machine.running(SCRATCH));
+        assert!(!machine.is_suspect(&volume));
         assert_eq!(identity(&machine), made, "the same cluster, not a new one");
-        assert_eq!(machine.volumes().len(), 1);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"same scratch cluster");
+
+        // After the mount namespace is gone, create refuses this existing suspect volume.
+        machine.forget_mounts();
+        machine.mark_suspect(&volume);
+        machine.fail_next_volume_creation(storage::Error::NeedsRepair);
+        assert!(!run(&machine, &account).await.unwrap().created);
+        assert!(!machine.is_suspect(&volume));
+        assert!(!machine.running(SCRATCH));
+        assert_eq!(identity(&machine), made);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"same scratch cluster");
+        assert!(machine.is_suspect(&other));
+        assert_eq!(
+            std::fs::read(&other_sentinel).unwrap(),
+            b"another volume is untouched"
+        );
+        assert_eq!(machine.volumes().len(), 2);
+        let calls = machine.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| **call == format!("recover {SCRATCH}"))
+                .count(),
+            2
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call == &format!("recover {}", other.database())
+                    || call.starts_with("remove "))
+        );
     }
 
     /// The check starts the scratch database as every database starts, in a slot, but in the one
@@ -246,5 +311,81 @@ mod tests {
         assert!(!machine.running(SCRATCH));
 
         assert!(!run(&machine, &account).await.unwrap().created);
+    }
+
+    #[tokio::test]
+    async fn busy_or_unrepairable_scratch_stays_stopped_and_keeps_its_cluster() {
+        let Some(machine) = Local::new("check-repair-refused") else {
+            return;
+        };
+        let account = machine.ensure_account(SCRATCH).await.unwrap();
+        run(&machine, &account).await.unwrap();
+        let volume = VolumeId::new(SCRATCH, 1).unwrap();
+        let made = identity(&machine);
+        let sentinel = machine.layout().data(SCRATCH).join("check-sentinel");
+        std::fs::write(&sentinel, b"repair must keep this").unwrap();
+        let starts = || {
+            machine
+                .calls()
+                .iter()
+                .filter(|call| **call == format!("start {SCRATCH}"))
+                .count()
+        };
+        let before = starts();
+        machine.mark_suspect(&volume);
+        machine.hold_volume(&volume);
+        let error = run(&machine, &account).await.unwrap_err();
+        let report = error.downcast_ref::<report::Failure>().unwrap();
+        assert_eq!(report.stage, Stage::VolumeCreate);
+        assert_eq!(report.class, report::Class::StorageBusy);
+        assert!(machine.is_suspect(&volume));
+        assert!(!machine.running(SCRATCH));
+        assert_eq!(starts(), before, "a held volume never reaches PostgreSQL");
+        machine.release_volume(&volume);
+
+        machine.fail_next_volume_repair(storage::Error::Fsck(4));
+        let error = run(&machine, &account).await.unwrap_err();
+        let report = error.downcast_ref::<report::Failure>().unwrap();
+        assert_eq!(report.stage, Stage::VolumeCreate);
+        assert_eq!(report.class, report::Class::StorageFsckFailed);
+        assert_eq!(report.exit_code, Some(4));
+        assert!(machine.is_suspect(&volume));
+        assert!(!machine.running(SCRATCH));
+        assert_eq!(
+            starts(),
+            before,
+            "a refused repair never reaches PostgreSQL"
+        );
+        assert_eq!(identity(&machine), made);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"repair must keep this");
+        assert!(!run(&machine, &account).await.unwrap().created);
+        assert_eq!(identity(&machine), made);
+        assert_eq!(machine.volumes().len(), 1);
+        assert!(
+            !machine
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("remove "))
+        );
+    }
+
+    #[tokio::test]
+    async fn repaired_existing_scratch_without_cluster_marker_is_not_initialized_again() {
+        let Some(machine) = Local::new("check-repair-no-reset") else {
+            return;
+        };
+        let account = machine.ensure_account(SCRATCH).await.unwrap();
+        run(&machine, &account).await.unwrap();
+        let made = identity(&machine);
+        let data = machine.layout().data(SCRATCH);
+        std::fs::rename(data.join("PG_VERSION"), data.join("PG_VERSION.kept")).unwrap();
+        machine.mark_suspect(&VolumeId::new(SCRATCH, 1).unwrap());
+        let error = run(&machine, &account).await.unwrap_err();
+        let report = error.downcast_ref::<report::Failure>().unwrap();
+        assert_eq!(report.stage, Stage::VolumeCreate);
+        assert_eq!(report.class, report::Class::Invariant);
+        assert!(!data.join("PG_VERSION").exists());
+        assert_eq!(identity(&machine), made);
+        assert!(!machine.running(SCRATCH));
     }
 }

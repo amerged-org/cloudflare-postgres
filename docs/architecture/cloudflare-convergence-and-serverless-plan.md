@@ -24,7 +24,7 @@ resources, conditions and expiry: PGCF Tunnel/DNS, Development SaaS, Production 
 web-domain management. Each one-time successor was appended before the selected binding changed;
 read-only capability probes passed before and after old-token revocation, and all four old tokens
 then failed authentication. No DNS, Tunnel, certificate, archive object or protected local key was
-removed. Eighteen credential identities/configured secrets have completed rotation in this execution;
+removed. Nineteen credential identities/configured secrets have completed rotation in this execution;
 recovered old material and two new operator-custody maintenance keys are excluded from that count.
 The independent-identity inventory remains open; binding-name totals are not key totals.
 
@@ -62,6 +62,16 @@ configured shared-Gateway bindings and the configured cache-propagation window w
 no hosted session, ticket redemption, Core principal authorization or per-customer cache eviction
 is claimed. The correct locally held Production session key pair was not changed.
 
+Development's Cloudflare OAuth-token cipher subsequently completed a controlled new-writer
+rotation from its actual version 2 to 20261106. The new primary, exact old-version-2 reader map
+and historical raw reader were appended before the atomic qualified code-and-crypto release from
+adopter main `11a8c1740d77655a12c6b32feaef989dcc8163a3`. All six current encrypted grant references
+were version 2 and remain covered. Actual owning-Worker execution read old and new public fixtures,
+rejected wrong AAD, sealed with the new writer and completed an existing read-only identity RPC.
+Final sealed raw-binding, complete new-module/main, settings and serving-pin checks passed; the
+real private upload payload and temporary bridge were removed. No customer grant refresh, provider
+verification write, customer build or historical-version-1 recovery is claimed by this operation.
+
 The frozen selected inventory contains 79 material identities across 48 owning Workers, rather
 than one identity per binding name. Forty initially correct locally held identities stay unchanged.
 Two unused WFP diagnostic-secret bindings and one obsolete wake-probe Bearer reference were
@@ -95,7 +105,7 @@ saved successor and retained old parent. Its validation used authentication, LIS
 existing archive metadata only; no archive GET, object write, Container job or customer recovery
 operation was invoked. Both Recovery configurations retain their known INPUT and same-principal
 PGCF credentials unchanged. The six saved active R2 successors are disclosed separately from the
-18 completed rotations.
+19 completed rotations.
 
 Source inspection found that native credential failures were logged without preventing maintenance
 completion. A focused Rust correction now withholds maintenance admission until a complete page's
@@ -124,6 +134,33 @@ discarded by the current service, so a bounded diagnostic source change is requi
 attempt. The owned EU fixture is retained as a witness. Old R2 parents remain active; no absence
 of old transient jobs is inferred from agent restart or maintenance alone. No all-node maintenance
 completion or macOS native test/build result is claimed.
+
+The bounded diagnostic correction then merged as `212d6fbb10a3ecca9611670ec65b2afb6ca284dd`
+(PR #46). Exact PR CI `42331396593` and signed main CI `42333567134` passed every required Linux
+job. The child health check now reports only closed stage/class/program/exit fields; raw errors,
+stdout and stderr are never forwarded. Three regression groups cover privacy, the child boundary
+and retained scratch stop/recovery behavior. All seven artifact checksums and the old trusted
+signature passed; only the agent binary differs from b312, with kernel, packages, host files and
+the other three binaries unchanged. The release was registered and assigned to US1 only; EU1
+remains on b312. Both native allowlists retained every prior ID and added the diagnostic release,
+with all 15 API secret bindings inherited unchanged from the fully sealed current baseline.
+
+One new diagnostic maintenance again failed `check_failed`. Its bounded journal report identifies
+`volume_create` / `storage_needs_repair` for the fixed internal health-check scratch volume, with
+child exit 1. This identifies a retained suspect-volume repair requirement, rather than establishing
+the earlier OOM's cause. No further maintenance, manual placement reset, SSH, volume deletion or
+customer-data repair was performed. The next bounded source correction must use the existing
+stopped-volume recovery path for that scratch volume while preserving the same cluster; customer
+volumes and all old R2 authorities remain untouched.
+
+The causal source correction now limits recovery to that fixed scratch generation after its unit
+has stopped. It handles only the typed repair requirement, checks suspect state even when create
+succeeds with its start link withheld, and uses the existing offline recovery path exactly once.
+The same cluster and volume must survive; a missing PostgreSQL marker after repair fails instead
+of running initdb. Busy or unrepaired storage still refuses the check. Three regression groups
+were written first for mounted/unmounted suspect state, retained cluster/sentinel and unrelated
+volume, repair refusal without execution, and refusal to reinitialize. Independent Root source
+review and pinned formatting passed; the required Linux CI and live repair remain pending.
 
 The [sealed custody exporter](../operations/custody-export.md) adds a reviewed source-builder
 candidate for a private owning-Worker entrypoint and signed, serialized bridge. It preserves

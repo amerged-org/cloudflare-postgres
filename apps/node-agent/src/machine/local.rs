@@ -205,6 +205,8 @@ struct State {
     suspects: BTreeSet<VolumeId>,
     /// A repair of a volume takes this long, as an `e2fsck` does.
     repair_delay: Option<Duration>,
+    /// The next offline repair fails without clearing the volume's suspect tag.
+    repair_error: Option<storage::Error>,
     units_unreadable: bool,
     /// The `archive_command` of a database, where it is not the layout's.
     archive_commands: HashMap<String, String>,
@@ -771,6 +773,12 @@ impl Local {
     pub fn mark_suspect(&self, id: &VolumeId) {
         self.state().suspects.insert(id.clone());
     }
+    pub fn fail_next_volume_creation(&self, error: storage::Error) {
+        self.state().volume_error = Some(error);
+    }
+    pub fn fail_next_volume_repair(&self, error: storage::Error) {
+        self.state().repair_error = Some(error);
+    }
     /// Whether the volume is tagged suspect.
     pub fn is_suspect(&self, id: &VolumeId) -> bool {
         let state = self.state();
@@ -1235,6 +1243,7 @@ impl Machine for Local {
         let (delay, no_room) = {
             let mut state = self.state();
             state.calls.push(format!("recover {}", id.database()));
+            state.attached.remove(id);
             (state.repair_delay, state.no_room)
         };
         // The repair detaches the volume first, which a holder refuses, and writes, which a pool
@@ -1245,12 +1254,17 @@ impl Machine for Local {
         if no_room {
             return Err(storage::Error::NoRoom(NoRoom::Reserve));
         }
+        if let Some(error) = self.state().repair_error.take() {
+            return Err(error);
+        }
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
         let mut state = self.state();
         state.needs_repair = false;
         state.suspects.remove(id);
+        // Node recovery attaches the same repaired volume and restores its start link.
+        state.attached.insert(id.clone());
         Ok(())
     }
     async fn inventory(&self) -> Result<Inventory, storage::Error> {
