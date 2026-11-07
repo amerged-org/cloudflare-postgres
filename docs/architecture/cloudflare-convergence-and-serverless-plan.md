@@ -241,7 +241,16 @@ and still refuses to overwrite an existing secret.
 
 The one extra owned EU signing witness was subsequently deleted through its normal operation;
 its desired/observed deleted state and zero node-volume inventory were verified. Existing databases
-and archives were left unchanged. The six R2 predecessor authorities remain active while historical
+and archives were left unchanged. Both isolated environment canary projects subsequently reached
+terminal deletion through their exact accepted operations. Fresh canonical Core snapshots proved
+all 84 business-resource counters zero and all original project/environment/source identities before
+fresh action-bound deletion plans were used. The public-dummy custody fixture Worker was deleted
+without force and verified absent by both direct 404 and the complete Worker list. Cleanup therefore
+closed exactly two test projects, one extra EU database with zero remaining node volumes and one
+dummy Worker. No deletion request was reissued, no other database or Worker was targeted and no
+archive object was removed. All local credential assignments remain preserved.
+
+The six R2 predecessor authorities remain active while historical
 jobs, temporary credentials and download URLs are reconciled; no expiration or revocation is
 claimed for them. Their overlap is distinct from GitHub's fixed additional-verifier deadline.
 
