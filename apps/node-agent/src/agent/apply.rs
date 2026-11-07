@@ -134,9 +134,28 @@ pub(crate) fn plan(f: &Facts) -> Step {
 }
 
 impl<M: Machine> Core<M> {
-    /// Applies a pull of the desired page: the orders that outlive their result first, then the
-    /// entries, then the orders that act.
+    #[cfg(test)]
+    pub(crate) fn has_taken_order(&self, operation: &str) -> bool {
+        self.taken
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(operation)
+    }
+
+    /// Core fixtures install credentials directly rather than through the service's link.
+    #[cfg(test)]
     pub async fn apply(self: &Arc<Self>, page: &Page) {
+        self.apply_with_credentials(page, true).await;
+    }
+
+    /// Applies a pull of the desired page: the orders that outlive their result first, then the
+    /// entries, then the orders that act. Only complete credential delivery for a full page lets
+    /// maintenance begin; other orders and the wake hold still apply when delivery failed.
+    pub(crate) async fn apply_with_credentials(
+        self: &Arc<Self>,
+        page: &Page,
+        credentials_ready: bool,
+    ) {
         // An order runs once in this process: the page lists it until the API has its result, and
         // the pulls in between do not run it again.
         let take_up = |operation: &str| {
@@ -206,12 +225,14 @@ impl<M: Machine> Core<M> {
                 self.schedule_page(&db);
             }
         }
-        if page.complete {
-            let open = page
-                .orders
-                .iter()
-                .any(|order| matches!(order, Order::Maintenance { .. }));
+        let open = page
+            .orders
+            .iter()
+            .any(|order| matches!(order, Order::Maintenance { .. }));
+        if open || page.complete {
             self.maintenance.store(open, Ordering::Relaxed);
+        }
+        if page.complete {
             // A move ends when the API has its result: the hold on the wakes ends with its order.
             for db in self.all() {
                 let held = db.view().moving.clone();
@@ -232,8 +253,10 @@ impl<M: Machine> Core<M> {
             }
         }
         for order in &page.orders {
-            if matches!(order, Order::Fence { .. } | Order::Superseded { .. })
-                || !take_up(order.operation())
+            if matches!(
+                order,
+                Order::Fence { .. } | Order::Superseded { .. } | Order::Maintenance { .. }
+            ) || !take_up(order.operation())
             {
                 continue;
             }
@@ -258,10 +281,31 @@ impl<M: Machine> Core<M> {
                             .await
                     });
                 }
-                Order::Maintenance { operation } => {
-                    tokio::spawn(async move { core.obey_maintenance(&operation).await });
-                }
-                Order::Fence { .. } | Order::Superseded { .. } => {}
+                Order::Fence { .. } | Order::Superseded { .. } | Order::Maintenance { .. } => {}
+            }
+        }
+        if credentials_ready {
+            self.start_maintenance_after_credentials(page);
+        }
+    }
+
+    /// The startup page is already applied before credential I/O, preserving security orders and
+    /// the wake hold. After every credential is installed, admit only its maintenance orders;
+    /// replaying the whole page would schedule the entries' reconciliation again.
+    pub(crate) fn start_maintenance_after_credentials(self: &Arc<Self>, page: &Page) {
+        if !page.complete {
+            return;
+        }
+        for order in &page.orders {
+            if let Order::Maintenance { operation } = order
+                && self
+                    .taken
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(operation.clone())
+            {
+                let (core, operation) = (self.clone(), operation.clone());
+                tokio::spawn(async move { core.obey_maintenance(&operation).await });
             }
         }
     }
@@ -1218,6 +1262,42 @@ mod tests {
             refused: false,
             abandoned: false,
         })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partial_page_cannot_start_maintenance_or_release_its_wake_hold() {
+        let Some(rig) = Rig::new("maintenance-full-page").await else {
+            return;
+        };
+        let operation = "op_mmmmmmmmmmmmmmmmmmmm";
+        let mut page = Rig::page(
+            vec![],
+            vec![Order::Maintenance {
+                operation: operation.into(),
+            }],
+        );
+        page.complete = false;
+        rig.core.apply(&page).await;
+        assert!(rig.core.maintenance.load(Ordering::Relaxed));
+        assert!(!rig.core.has_taken_order(operation));
+        assert!(rig.core.pending_order(operation).is_none());
+
+        let mut partial_without_order = Rig::page(vec![], vec![]);
+        partial_without_order.complete = false;
+        rig.core.apply(&partial_without_order).await;
+        assert!(rig.core.maintenance.load(Ordering::Relaxed));
+
+        page.complete = true;
+        rig.core.apply(&page).await;
+        assert!(rig.core.has_taken_order(operation));
+        eventually(10, "maintenance to reach the service", || {
+            rig.core.take_slept() == vec![operation.to_string()]
+        })
+        .await;
+        rig.core.apply(&page).await;
+        assert!(rig.core.take_slept().is_empty(), "not run twice");
+        rig.core.apply(&Rig::page(vec![], vec![])).await;
+        assert!(!rig.core.maintenance.load(Ordering::Relaxed));
     }
 
     #[test]

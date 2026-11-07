@@ -1,3 +1,73 @@
+# Selective operator credential custody — 2026-11-06
+
+The owner authorized rotation of unknown active credentials, append-only local custody, short
+client interruption and bounded non-Production breakage. Correct baseline-local credentials
+remain unchanged; Production data and recovery dependencies stay protected.
+
+One isolated operator-test project integrator credential was replaced and durably saved before
+consumer verification. New-key HTTP SQL and fresh WebSocket SQL passed before and after old-key
+revocation; the old key then returned 401 and the protected administrator still returned 200.
+No Production integrator, encryption key, archive object or backup reader was changed by that
+operation. The retained witness resumed on its existing local volume, served constant SELECT
+queries, and its ordinary idle hibernation was observed; no VPS was purchased.
+
+Two further configured secrets were rotated and appended before consumer activation: the shared
+Edge Access secret and the consumed first-administrator bootstrap token. Access issuer version
+advanced from 3 to 4; Client ID stayed unchanged, the old secret expired, and both HTTP SQL and
+fresh WebSocket SQL passed afterward. Bootstrap still returned 401 with the administrator-row
+count unchanged at one. The protected administrator continued returning 200. Actual runtime
+capture confirmed that the existing routing and credential-encryption rings match the retained
+local historical copies, so those known correct keys were not rotated.
+
+Four further unknown runtime provider tokens were replaced under their exact existing policies,
+resources, conditions and expiry: PGCF Tunnel/DNS, Development SaaS, Production SaaS and Production
+web-domain management. Each one-time successor was appended before the selected binding changed;
+read-only capability probes passed before and after old-token revocation, and all four old tokens
+then failed authentication. No DNS, Tunnel, certificate, archive object or protected local key was
+removed. Thirteen credential identities/configured secrets have completed rotation in this execution;
+recovered old material and two new operator-custody maintenance keys are excluded from that count.
+The independent-identity inventory remains open; binding-name totals are not key totals.
+
+The six subsequent completions are both Cloudflare OAuth client secrets, Development WorkOS
+Connect, both R2 analytics tokens and Production WFP. Every successor was saved before activation.
+Both old OAuth slots were retired only after the single purpose-qualified local legacy secret was
+proven invalid, current sealed consumer values matched saved successors, and both complete local
+files remained locked and byte-identical. No other WorkOS issuer secret was removed.
+
+The PGCF archive parent, Development R2-management, the shared Production R2-management/storage
+authority and Development storage have verified saved successors active, with old parents retained. New-parent acceptance used exactly four fresh operator targets:
+four DONE base backups, one EU and two US WAL objects, actual full restore and successful PITR in
+both regions (before-marker present, after-marker absent). All four credential URIs were saved
+before SQL. The four targets were deleted and their node-volume inventory reached zero; the
+original source and its 18 existing operator databases were untouched. This is not retirement of
+the old parent: the original 225 live write scopes still need proven credential refresh or expiry.
+
+Source inspection found that native credential failures were logged without preventing maintenance
+completion. A focused Rust correction now withholds maintenance admission until a complete page's
+node and archive credentials are installed, while startup fencing and wake holds apply before I/O.
+Three authored regression groups cover failed/malformed downloads, installation failure, retry,
+startup security ordering and partial pages. Independent source review and formatting completed;
+Exact native source `c2b09c3dbba320036701e19a8c9c04f3ad5559b7` passed every required Linux
+CI job in workflow `42311967230`. Two test synchronization races were corrected without changing
+production behavior, assertions or timeouts. Signed main release, live rollout and all-node refresh
+remain required. No macOS native test or build result is claimed.
+
+The [sealed custody exporter](../operations/custody-export.md) adds a reviewed source-builder
+candidate for a private owning-Worker entrypoint and signed, serialized bridge. It preserves
+the original modules/exports and can inherit bindings from an explicit serving version through
+the newer Workers API. Final Linux CI and hosted 0%-version wiring acceptance remain required
+before Production-critical capture. Source preparation is not a live export or another rotated
+credential. Full unknown-key rotation, historical-reader migration and architecture consolidation
+remain open until their per-identity and recovery checks pass.
+
+The exact source at `03f4267c5c610d9db7e6d2f1751d5100dea3744b` passed every required Linux CI
+job in workflow `42285266773`. The isolated hosted fixture subsequently passed private named
+entrypoint routing, explicit serving-version binding inheritance, 0%-version override, sealed
+round-trip decryption and original-module/latest-version cleanup. An initial helper migration
+ordering refusal was resolved by deploying the namespace creation before its self-binding; no
+Production-critical key was selected before the hosted acceptance. The named-writer maintenance
+wrapper remains a separately reviewed source extension and does not prove in-flight quiescence.
+
 # Adopter client acceptance and guarded activation — 2026-11-06/07
 
 **Source and qualification:** the bounded management entrypoint/profile companion is on adopter

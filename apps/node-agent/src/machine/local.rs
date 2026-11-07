@@ -212,6 +212,8 @@ struct State {
     direct_archive: bool,
     /// The credentials applied: region, node, revision, restart.
     credentials: Vec<(String, String, u64, bool)>,
+    /// The next credential installation fails before it changes the node.
+    credentials_apply_fails: bool,
     /// The Debian packages of the node, as dpkg would list them.
     packages: BTreeMap<String, String>,
     /// How often the node booted since the test began, and the kernel it runs: a boot starts the
@@ -670,6 +672,9 @@ impl Local {
     }
     pub fn credentials_applied(&self) -> Vec<(String, String, u64, bool)> {
         self.state().credentials.clone()
+    }
+    pub fn fail_next_credentials(&self) {
+        self.state().credentials_apply_fails = true;
     }
     pub fn slice_memory_mib(&self) -> Option<u64> {
         self.state().slice_memory_mib
@@ -1578,7 +1583,11 @@ impl Machine for Local {
         credentials: &serde_json::Value,
         restart: bool,
     ) -> io::Result<()> {
-        self.state().credentials.push((
+        let mut state = self.state();
+        if std::mem::take(&mut state.credentials_apply_fails) {
+            return Err(io::Error::other("credential installation failed"));
+        }
+        state.credentials.push((
             node.region_id.clone(),
             node.id.clone(),
             credentials["revision"].as_u64().unwrap_or(0),
