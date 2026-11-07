@@ -22,6 +22,9 @@ use crate::{
 };
 use std::time::Duration;
 
+pub mod report;
+use report::Stage;
+
 /// The scratch database's identifier, a valid database id no placement ever draws (they are random).
 pub const SCRATCH: &str = "pgcfcheckscratch0000";
 /// The smallest database: a 1 GiB volume, which a thin pool commits almost nothing for.
@@ -54,20 +57,34 @@ fn policy() -> storage::Policy {
 /// Makes or wakes the scratch database, queries it and stops it. `account` is the database's user.
 /// The unit is stopped when this returns, whether the database answered or not.
 pub async fn run<M: Machine>(machine: &M, account: &Account) -> Result<Checked, Error> {
-    let volume = VolumeId::new(SCRATCH, 1)?;
+    let volume =
+        VolumeId::new(SCRATCH, 1).map_err(|error| report::at(Stage::VolumeIdentity, error))?;
     let layout = machine.layout();
     let data = layout.data(SCRATCH);
     // A call that was killed left its slot running; the files are rewritten only while it is down.
-    machine.adopt_slots().await?;
-    machine.stop(SCRATCH).await?;
-    machine.poll_pool().await?;
+    machine
+        .adopt_slots()
+        .await
+        .map_err(|error| report::at(Stage::AdoptSlots, error))?;
+    machine
+        .stop(SCRATCH)
+        .await
+        .map_err(|error| report::at(Stage::StopPrevious, error))?;
+    machine
+        .poll_pool()
+        .await
+        .map_err(|error| report::at(Stage::PoolSample, error))?;
     // Finishes what an earlier call left: it makes the volume and its filesystem, or only mounts it.
     machine
         .create_volume(&volume, VOLUME_BYTES, account, &policy())
-        .await?;
+        .await
+        .map_err(|error| report::at(Stage::VolumeCreate, error))?;
     let created = !data.join("PG_VERSION").exists();
     if created {
-        machine.initdb(account, &data).await?;
+        machine
+            .initdb(account, &data)
+            .await
+            .map_err(|error| report::at(Stage::Initdb, error))?;
     }
     let conf = settings::postgresql_conf(&Settings {
         socket_directory: &layout.socket_directory(SCRATCH),
@@ -77,21 +94,24 @@ pub async fn run<M: Machine>(machine: &M, account: &Account) -> Result<Checked, 
         archive_timeout_seconds: ARCHIVE_TIMEOUT_SECONDS,
         archive_command: None,
     })
-    .ok_or("the settings cannot be written")?;
+    .ok_or_else(|| report::invariant(Stage::SettingsBuild))?;
     let ident = settings::pg_ident(&machine.agent_user(), &account.name)
-        .ok_or("the users cannot be written")?;
+        .ok_or_else(|| report::invariant(Stage::SettingsBuild))?;
     for (name, content) in [
         ("postgresql.conf", conf.as_str()),
         ("pg_hba.conf", settings::PG_HBA),
         ("pg_ident.conf", ident.as_str()),
     ] {
-        write_owned(&data, name, content, account)?;
+        write_owned(&data, name, content, account)
+            .map_err(|error| report::at(Stage::SettingsWrite, error))?;
     }
-    machine.prepare_socket_directory(SCRATCH, account)?;
+    machine
+        .prepare_socket_directory(SCRATCH, account)
+        .map_err(|error| report::at(Stage::SocketPrepare, error))?;
     let answered = answer(machine, account, &data).await;
     let stopped = machine.stop(SCRATCH).await;
     let (uid, slot) = answered?;
-    stopped?;
+    stopped.map_err(|error| report::at(Stage::StopAfter, error))?;
     Ok(Checked { created, uid, slot })
 }
 
@@ -102,7 +122,8 @@ async fn answer<M: Machine>(
     account: &Account,
     data: &std::path::Path,
 ) -> Result<(u32, Option<u32>), Error> {
-    let volume = VolumeId::new(SCRATCH, 1)?;
+    let volume =
+        VolumeId::new(SCRATCH, 1).map_err(|error| report::at(Stage::VolumeIdentity, error))?;
     let bind = Bind {
         device: machine.device(&volume).into(),
         data: machine.layout().data(SCRATCH),
@@ -118,26 +139,42 @@ async fn answer<M: Machine>(
     };
     // The check's slot is built like the pool's, here and not in the bind: its user is made by the
     // refill, never by a start.
-    machine.refill_slot(1).await?;
-    let bound = machine.bind(SCRATCH, &bind).await?;
-    let started = machine.exec(&bound).await?;
+    machine
+        .refill_slot(1)
+        .await
+        .map_err(|error| report::at(Stage::SlotRefill, error))?;
+    let bound = machine
+        .bind(SCRATCH, &bind)
+        .await
+        .map_err(|error| report::at(Stage::SlotBind, error))?;
+    let started = machine
+        .exec(&bound)
+        .await
+        .map_err(|error| report::at(Stage::SlotExec, error))?;
     if started.slot.is_none() {
-        return Err("the scratch database did not start in a slot".into());
+        return Err(report::invariant(Stage::SlotExec));
     }
-    let session = postgres::agent(&machine.layout().socket_directory(SCRATCH)).await?;
+    let session = postgres::agent(&machine.layout().socket_directory(SCRATCH))
+        .await
+        .map_err(|error| report::at(Stage::SqlConnect, error))?;
     let rows = session
         .query(
             "SELECT 1::int4 AS answer, current_setting('data_directory') AS data",
             &[],
         )
-        .await?;
-    let row = rows.first().ok_or("the scratch database gave no row")?;
+        .await
+        .map_err(|error| report::at(Stage::SqlQuery, error))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| report::invariant(Stage::SqlValidate))?;
     if row.get::<_, i32>("answer") != 1 {
-        return Err("the scratch database gave a wrong answer".into());
+        return Err(report::invariant(Stage::SqlValidate));
     }
     let reported = row.get::<_, String>("data");
-    if std::fs::canonicalize(&reported)? != std::fs::canonicalize(data)? {
-        return Err("the scratch database runs on another directory than its volume".into());
+    if std::fs::canonicalize(&reported).map_err(|error| report::at(Stage::SqlValidate, error))?
+        != std::fs::canonicalize(data).map_err(|error| report::at(Stage::SqlValidate, error))?
+    {
+        return Err(report::invariant(Stage::SqlValidate));
     }
     Ok((started.uid, started.slot.map(|report| report.slot)))
 }
@@ -200,7 +237,12 @@ mod tests {
         run(&machine, &account).await.unwrap();
 
         machine.fail_next_start();
-        assert!(run(&machine, &account).await.is_err());
+        let failure = run(&machine, &account).await.unwrap_err();
+        let cli = report::Failure::for_cli(&failure);
+        let failure = failure.downcast_ref::<report::Failure>().unwrap();
+        assert_eq!(failure.stage, report::Stage::SlotExec);
+        assert_eq!(failure.class, report::Class::UnitsRefused);
+        assert_eq!(cli, *failure);
         assert!(!machine.running(SCRATCH));
 
         assert!(!run(&machine, &account).await.unwrap().created);

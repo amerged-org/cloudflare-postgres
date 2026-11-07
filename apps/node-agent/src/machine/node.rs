@@ -773,15 +773,15 @@ impl Machine for Node {
         // The check tags the volumes it finds mounted when the pool takes no writes, in a storage
         // of its own: what this one listed before may be out of date, however the check ended.
         self.storage.changed_elsewhere();
-        let output = output?;
+        let output = output.map_err(|error| {
+            crate::timing::emit_event(crate::agent::check::report::spawn_failure_event(&error));
+            io::Error::new(error.kind(), "health check child could not be started")
+        })?;
         if output.status.success() {
             Ok(())
         } else {
-            Err(io::Error::other(format!(
-                "pgcf-agent check ended with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            )))
+            crate::timing::emit_event(crate::agent::check::report::child_failure_event(&output));
+            Err(io::Error::other("health check child failed"))
         }
     }
 

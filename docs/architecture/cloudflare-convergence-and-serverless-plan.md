@@ -24,7 +24,7 @@ resources, conditions and expiry: PGCF Tunnel/DNS, Development SaaS, Production 
 web-domain management. Each one-time successor was appended before the selected binding changed;
 read-only capability probes passed before and after old-token revocation, and all four old tokens
 then failed authentication. No DNS, Tunnel, certificate, archive object or protected local key was
-removed. Thirteen credential identities/configured secrets have completed rotation in this execution;
+removed. Eighteen credential identities/configured secrets have completed rotation in this execution;
 recovered old material and two new operator-custody maintenance keys are excluded from that count.
 The independent-identity inventory remains open; binding-name totals are not key totals.
 
@@ -34,13 +34,68 @@ Both old OAuth slots were retired only after the single purpose-qualified local 
 proven invalid, current sealed consumer values matched saved successors, and both complete local
 files remained locked and byte-identical. No other WorkOS issuer secret was removed.
 
+Both adopter PGCF integrator secrets subsequently rotated in their existing API-key rows. Their
+principal IDs, scopes, project membership and expiry remained unchanged; only the guarded secret
+hash changed. This preserves the idempotency namespace instead of creating a new principal that
+could replay an uncertain write. Development and Production retained their 11 and 27 completed
+idempotency records respectively, with none in progress. Both Neon and Recovery consumers were
+privately checked after activation; old secrets returned 401, new scoped reads passed, cross-project
+reads returned 404 and administrator access remained valid. These are operator provider checks
+from sealed current bindings, not an executed customer Recovery Container operation.
+
+Both Development and Production environment-secret writers are now version 20261106. Their new
+keys and historical version-1 readers were durably appended before activation; all four Control
+and Delivery consumers retained every other secret, source module and setting. Fresh isolated
+hosted builds in both environments read the old version-1 and new version-20261106 sentinels
+successfully. All six isolated builds completed and their accepted quotes total USD 1.012152
+against the owner's USD 2 ceiling. Final scoped public proofs, sealed current-consumer captures,
+serving pins and complete current-file preservation passed. Fixture credentials and historical
+reader copies do not add another rotation to the count; the two owned test projects remain
+temporarily available for the next credential gate and still require scoped cleanup.
+
+The unknown Development DevAccess session key pair also completed one controlled rotation. Both
+P-256 JSON values were saved before one atomic binding update. A fresh sealed current-pair proof
+matched the saved values, passed the official key-pair validation and new-signature check, and
+rejected the old signature under the new public key. Every other raw binding, module and setting,
+including the completed environment-secret cohort and Portal password, remained unchanged. The
+configured shared-Gateway bindings and the configured cache-propagation window were checked;
+no hosted session, ticket redemption, Core principal authorization or per-customer cache eviction
+is claimed. The correct locally held Production session key pair was not changed.
+
+The frozen selected inventory contains 79 material identities across 48 owning Workers, rather
+than one identity per binding name. Forty initially correct locally held identities stay unchanged.
+Two unused WFP diagnostic-secret bindings and one obsolete wake-probe Bearer reference were
+retired; that probe's other integrator identity was already revoked and expired before this task.
+The obsolete Worker was removed only after reference checks, exact immutable identity verification
+and a durably decrypt-verified sealed source/settings/secret backup. No active project credential
+was substituted into that obsolete consumer. The four retirements are not new-key rotations.
+
 The PGCF archive parent, Development R2-management, the shared Production R2-management/storage
 authority and Development storage have verified saved successors active, with old parents retained. New-parent acceptance used exactly four fresh operator targets:
 four DONE base backups, one EU and two US WAL objects, actual full restore and successful PITR in
 both regions (before-marker present, after-marker absent). All four credential URIs were saved
 before SQL. The four targets were deleted and their node-volume inventory reached zero; the
 original source and its 18 existing operator databases were untouched. This is not retirement of
-the old parent: the original 225 live write scopes still need proven credential refresh or expiry.
+the old parent: the initial 225-scope snapshot was not a permanent fleet total. A fresh pre-rollout
+snapshot contained 224 scopes; the one new owned EU fixture is included in subsequent manifests.
+Retirement still requires complete current-scope evidence and resolution of retained jobs and
+expiring children; installation alone does not establish that old processes have stopped.
+
+Development Recovery now also has a saved successor R2 authority active, with the old parent
+retained for running Containers, queued jobs, temporary credentials and existing download URLs.
+Only its R2 token and public parent ID changed inside the compound configuration; the known INPUT
+key, newly rotated same-principal PGCF key, all other raw values, code and Container associations
+were preserved. An owned public 50-byte object exposed encoded HEAD responses without a
+Content-Length header. The initial attempt stopped before activation; separate read-only diagnosis
+and an immutable linked continuation verified the exact public bytes, removed only that nonce
+object and confirmed its absence before cutover. No archive payload or customer Container job was
+read or invoked. This is a fifth verified authority cutover, not an old-parent retirement.
+Production Recovery has now completed the same selective two-field cutover with its independently
+saved successor and retained old parent. Its validation used authentication, LIST and HEAD of
+existing archive metadata only; no archive GET, object write, Container job or customer recovery
+operation was invoked. Both Recovery configurations retain their known INPUT and same-principal
+PGCF credentials unchanged. The six saved active R2 successors are disclosed separately from the
+18 completed rotations.
 
 Source inspection found that native credential failures were logged without preventing maintenance
 completion. A focused Rust correction now withholds maintenance admission until a complete page's
@@ -49,8 +104,26 @@ Three authored regression groups cover failed/malformed downloads, installation 
 startup security ordering and partial pages. Independent source review and formatting completed;
 Exact native source `c2b09c3dbba320036701e19a8c9c04f3ad5559b7` passed every required Linux
 CI job in workflow `42311967230`. Two test synchronization races were corrected without changing
-production behavior, assertions or timeouts. Signed main release, live rollout and all-node refresh
-remain required. No macOS native test or build result is claimed.
+production behavior, assertions or timeouts. PR #44 merged as
+`b312bd02fcc811cdef1745f63c6602ca3c6db0ce`; its exact main workflow `42316992421` passed every
+required job including release signing. The qualified release was registered with its old trusted
+signature, with purchases and autoscaling disabled. Its binaries, packages, kernel and host-file
+pins differ from the running release only in the node agent. EU1 now reports this agent release
+and OS convergence. Its new full-page maintenance barrier completed with an unchanged 194-scope
+manifest, including the one owned EU fixture. US1 also converged to the same signed release, but
+its fresh maintenance failed `check_failed`. One separately authorized successor, after fresh
+memory, pool, scope and SQL checks, failed the same health-check gate; no further cycle was issued.
+The original failed receipt remains byte-identical. The second preflight had 11,185 MiB available
+against the 1,368-MiB floor, and 305,856,708,608 free pool bytes against the 6-GiB reserve plus
+1-GiB scratch requirement. A later read-only snapshot confirmed both nodes ready, schedulable and
+OS-converged, unchanged US31/EU194 scope membership, fresh HTTP/WebSocket SELECT 1 in both
+regions and administrator 200. US database placement remains closed by its original maintenance
+closure; no manual reset was performed. An aggregate OOM notification during the first failed
+window does not identify the victim or establish the check's cause. The child check's detail is
+discarded by the current service, so a bounded diagnostic source change is required before another
+attempt. The owned EU fixture is retained as a witness. Old R2 parents remain active; no absence
+of old transient jobs is inferred from agent restart or maintenance alone. No all-node maintenance
+completion or macOS native test/build result is claimed.
 
 The [sealed custody exporter](../operations/custody-export.md) adds a reviewed source-builder
 candidate for a private owning-Worker entrypoint and signed, serialized bridge. It preserves
