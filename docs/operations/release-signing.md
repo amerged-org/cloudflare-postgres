@@ -18,18 +18,19 @@ key still does not protect is under "What is and is not protected".
 
 ## How it works
 
-- **The key.** An Ed25519 key pair. The private half is the secret `RELEASE_SIGNING_KEY` of the signer, a
-  Cloudflare Worker (`apps/release-signer`, deployed as `pgcf-release-signer-dev`). A Cloudflare secret
-  is write-only through the API and the dashboard: no person, no CI job and no other Worker can read it
-  back, and the key pair is made in the memory of `provision` and never written to a disk, a log or a
-  terminal, so there is no copy to steal. **The signer's own code can read it**, because it is bound to
-  the Worker as `env.RELEASE_SIGNING_KEY`: whoever can deploy a version of that Worker (a member of the
-  Cloudflare account, or any API token with Workers Scripts: Edit) can deploy code that returns the key,
-  keep it for good, and redeploy the real code afterwards without a trace in the Worker's behaviour.
-  Edit access to Workers in the account is therefore access to the key (see "The trust root" and "If the
-  secret is lost or may have been disclosed"). The public half is the file
-  `apps/node-agent/release-signing.pub` (64 lower-case hex digits), which the agent's build reads as a
-  constant. A node has no setting, file or flag that changes the key it trusts.
+- **The key.** An Ed25519 pair. The private half is the Worker's secret
+  `RELEASE_SIGNING_KEY`; the canonical successor is `pgcf-release-signer-next-v20261106`.
+  During the owner-authorized custody rotation, the successor private/public pair is durably saved
+  in the operator's ignored repository `.env.local`, mode 0600, and verified before any consumer
+  activation. Existing correct local credentials and original file bytes are preserved. Private
+  material never belongs in Git, logs, terminal output, CI variables or workflow artifacts.
+  Cloudflare's ordinary secret API is write-only, but the owning Worker's code can read
+  `env.RELEASE_SIGNING_KEY`. Workers edit access is therefore key access: an authorized private
+  custody export can recover a still-bound key, and a malicious deployment can disclose it. The
+  legacy `provision` command generates in memory and refuses an existing secret; it does not implement
+  the saved-before-activation custody contract and is not used for this rotation. The public half is
+  `apps/node-agent/release-signing.pub` (64 lower-case hex digits), compiled into the agent, and the
+  generated API constant. A node has no setting, file or flag that changes the key it trusts.
 - **Why not a GitHub secret.** A repository secret is handed to every workflow run of the repository, so
   a pull request from a branch of the same repository, or a run dispatched from any branch, with an
   edited `ci.yml`, could print it; an environment secret needs a branch policy that has to be created
@@ -182,6 +183,11 @@ key still does not protect is under "What is and is not protected".
 
 ## Setting it up (once, by the owner)
 
+These are historical first-install bootstrap steps. They do not implement the current custody
+rotation below. Never run legacy `provision` against either the retained old signer or the already
+saved successor during this rotation. It cannot overwrite an existing secret, and making another
+key before durable custody would violate the current contract.
+
 The order matters, because of what each step makes possible. Nothing in these commands is a secret, and
 no step prints one.
 
@@ -307,84 +313,77 @@ that has not taken the first release is the case that needs the hand replacement
 
 ## Rotating the key
 
-The key changes only through a release that the **old** key signed and that ships an agent with the
-**new** public key. Until every node runs that release, the nodes trust the old key. The API Worker
-verifies with the same key, as a constant of its code, so it too has to hold the old key while the
-transition release is registered and installed from, and the new key only from the first release the new
-key signs. That fixes the order: **the API is deployed with the new key after every node trusts it, and
-not before.** One Worker holds one secret and a secret cannot be read back, so the new key cannot wait in
-the old signer: it is made in a second signer, and the cut-over is the repository variable.
+Keep the old signer and its CI URL while preparing two exact releases. **T** carries the new public
+key but is signed by the old key; **F** is signed by the saved new key. Both complete MAIN builds and
+both original signatures must be durably pinned before any live T assignment. Correct local keys
+are kept; only an unknown or lost authority enters this rotation.
 
-1. Deploy a second signer from the same code under another name, with the same variables:
-   `cd apps/release-signer && npx wrangler deploy --name pgcf-release-signer-next`.
-2. `node scripts/operations/release-signing.ts provision --rotate --worker pgcf-release-signer-next
-   --token-env … --account-env …` makes the new key in memory, sets it as the second signer's secret
-   and writes its public half to `release-signing.pub`; then `node
-   packages/contracts/native/generate-release-key.ts` writes it into the API's constant. **Keep the
-   `--worker` flag:** the command refuses a Worker that already holds the secret, whatever else is given,
-   so run without it, it stops at the live signer after listing its secrets and changes nothing. The old
-   signer still holds the old key, and the nodes and the API trust it.
-3. Commit both files and merge. CI builds the release with the agent that trusts the new key, and
-   `RELEASE_SIGNER_URL`, still the old signer's address, has it signed with the **old** key. The dry run
-   reports that the signature does not verify with this checkout's key; that is the expected state of this
-   one release (the transition release, T). Merge nothing else to `main` until step 5: every build before it
-   is signed by the old key and is refused by the nodes that already run the new agent. **Do not deploy
-   the API from this commit or a later one yet.** The API that runs holds the old key and verifies T,
-   which the old key signed, when it is registered and when a node is installed from it. If the API has to
-   be deployed in these steps, deploy it from the commit before this one.
-4. Register T with the old public key, which is in git history, from a checkout of that commit:
-   `git show <commit before step 3>:apps/node-agent/release-signing.pub > .local/old-release.pub`, then
-   `register-node-image.ts ... --release-key .local/old-release.pub`. Assign it to every region, and
-   wait until `GET /v1/nodes/{id}/release` says `converged` for every node, `fenced` ones excepted
-   (those are reinstalled). A node added meanwhile is installed from T: the API verifies it with the old
-   key, and its agent trusts the new one.
-5. Point `RELEASE_SIGNER_URL` at the second signer (`gh variable set RELEASE_SIGNER_URL --body …`), set
-   `name` in `apps/release-signer/wrangler.jsonc` to the second signer's name so that later deploys
-   update it, and delete the old Worker (`npx wrangler delete --name pgcf-release-signer-dev`), so that
-   the old key can sign nothing more. Merge a commit to `main` (the change of `wrangler.jsonc` is one):
-   its build is signed by the new key and is the first the fleet accepts under it. Wait for its
-   `sign-release` job.
-6. Deploy the API of that commit with the new key (migrations first). From now the API verifies with the
-   new key: it refuses a registration signed by the old key and, when it renders an installer, a release
-   row signed by it (T). **Register the build of step 5 and assign it to every region at once**
-   (`register-node-image.ts` with the default key, the one of the checkout). An addition that reaches its
-   install start between this deploy and that assignment waits with `install_blocker: release_unverified`
-   and goes on by itself on the pass after the assignment; nothing fails, and no update is refused at any
-   point, because agents verify with their own key. Start step 6 when no addition is `audited` to keep even
-   that wait away.
+1. Verify the saved canonical Ed25519 pair against its public identity and unique local assignments.
+   Save every successor before any consumer activation. Reuse the already staged, disabled successor
+   Worker and its immutable version; keep the same signer code and five GitHub OIDC policy fields.
+   Do not generate another pair, overwrite either secret, or run legacy `provision --rotate`.
+2. Merge T with both public files changed together. Keep `RELEASE_SIGNER_URL` on the old signer.
+   Require every MAIN CI job and the OLD-signature job to pass. Preserve the exact run, attempt,
+   artifact IDs and archive digests; verify all seven original release members and the original
+   `release.sig` against the OLD public key from Git history. Pin image, binary, package, kernel and
+   host-file facts. A pull-request artifact, rebuilt file or locally re-signed manifest is not this
+   gate. Keep the OLD public override as a real mode-0600 file in a mode-0700 operator directory;
+   never reopen stdin as a filename payload.
+3. After that pin and a separate owner go, deploy only the saved successor version at 100% while
+   workers.dev and previews remain disabled. Verify its exact modules, settings, six bindings and
+   absence of other resource/route references. Separately enable only its workers.dev URL, with
+   previews disabled, and verify the readback. An unauthenticated 404 or 401 proves only the limited
+   endpoint/refusal behavior; it does not prove an OIDC-authorized signature or the bound private key.
+4. With a separate CI-variable go, point `RELEASE_SIGNER_URL` at the saved successor. Prepare F with
+   the tracked signer name `pgcf-release-signer-next-v20261106`, unchanged code and OIDC policy.
+   Merge F only after T's original OLD-signature pin. Require every F MAIN job and its genuine
+   NEW-signature job to pass, verify that original signature with the saved NEW public key, and pin
+   its original release files and complete OS facts. This is the actual successor key/OIDC-use
+   acceptance. **F must be ready before T goes live.** Keep the old signer available throughout.
+5. Register original T while the API still verifies with the OLD key, using the explicit OLD-public
+   override and the exact T artifacts. Preserve all existing native qualification IDs when adding
+   the qualified T and F IDs. Recheck physical node UIDs, region revisions, current scopes, SQL
+   witnesses and purchase controls; assign T one region at a time using revision CAS.
+6. Observe the fresh T agent identity and binary pins against the original pinned artifact, with
+   unchanged kernel, package and host-file facts. Its embedded NEW key cannot verify T's own OLD
+   signature. That specific bridge condition requires its explicit semantic gate; it is not general
+   permission to accept another refusal or to claim an ordinary maintenance result. **Do not run T
+   maintenance.** Both nodes must reach the qualified T identity before the API changes its key.
+7. Deploy the NEW-public API code from F, explicitly inheriting every current raw secret, plain
+   setting, namespace/resource binding, ingress and schedule from the pinned current API version.
+   Do not repopulate opaque runtime values from a partial local environment or delete historical
+   release rows. Register the already pinned NEW-signed F and assign it to both regions with fresh
+   revision CAS. Keep additions and purchases closed during the signature transition.
+8. Require fresh F identity, signed spec and OS convergence on both nodes, then fresh F maintenance
+   and owned HTTP/WebSocket SQL acceptance in each region, with the complete applicable credential
+   scopes and recovery checks. Only after this final acceptance may a separately authorized action
+   retire old signing authority. Retain old public keys and immutable artifacts for offline history;
+   do not delete the old signer as an intermediate cutover step.
 
-A node that missed the transition (it was offline) still trusts the old key and refuses the releases
-of the new one: reinstall it, as for a lost node. There is no rotating in place: `provision` never
-replaces a secret. Deleting the signer's secret by hand (`npx wrangler secret delete
-RELEASE_SIGNING_KEY --name <worker>`) and provisioning again is a cut-over with no transition: the
-old key stops signing at once, and no running node accepts a release again until it is reinstalled,
-which is the loss case below.
+The legacy provisioning CLI still refuses to replace a secret, but it generates a new key before
+providing local custody. That behavior is not a substitute for this controlled saved-key protocol.
+The local custody copy remains private and must never be passed to CI; CI receives only its normal
+short-lived GitHub identity token and obtains the public signature from the Worker.
 
 ## If the secret is lost or may have been disclosed
 
-**The secret cannot be recovered, and there is no backup, by design.** The key was never written
-anywhere, so nobody can leak a copy and nobody can restore it. If the Worker is deleted, the secret
-is removed or overwritten by mistake, or the Cloudflare account is lost, and no other signer holds the
-key, no signature that a node accepts can be made any more: the nodes keep running, serve their
-databases and keep their data, but no release can reach them again, and **every node has to be
-reinstalled** from an image built with a new key's public half. Deploy a signer, run
-`provision --rotate` against a Worker that holds no secret (a new Worker name, or after
-`npx wrangler secret delete RELEASE_SIGNING_KEY --name <worker>` for one whose secret is lost or
-wrong; `provision` never replaces a secret itself), write the new public key into the API's constant
-(`generate-release-key.ts`) and commit both files, deploy the API of that commit before anything is
-registered (it verifies with the key it was built with), build and register the image, and reinstall
-every node (AddNode in recover mode, plan 9.2 and [recovery.md](recovery.md)); each database is restored
-from its archive.
+First distinguish an unknown local value from a missing authority. A correct retained local key is
+verified against the trusted public identity and kept. If the Worker still holds the key, an explicit
+owner-authorized private custody export may recover it; the normal Cloudflare API cannot read it.
+Use the qualified [private export path](custody-export.md), preserve its purpose/identity checks and
+never publish an export endpoint or raw key. Recovery material and signatures stay private or in
+owner-approved public-key artifacts, according to their type.
 
-**A key that may have been disclosed is a lost key, and the procedure is the same.** Whoever can
-deploy a version of the signer Worker can read the key out of it and keep it, and redeploying the real
-code afterwards does not undo that. So apply this procedure not only when the account is under someone
-else's control but to any suspected misuse of Workers edit access: an API token with Workers Scripts:
-Edit that leaked, a member of the account who should not have had that access, an unexplained version
-of the signer Worker in its deployment history. Delete the secret first if you still can (`npx wrangler
-secret delete RELEASE_SIGNING_KEY --name pgcf-release-signer-dev`) so that the old key signs nothing
-more through the Worker, and treat every release signed since the suspected misuse as untrusted: the
-holder of the key can also sign a transition release that carries their own key.
+If no trusted copy or signing authority survives, running nodes retain their databases but cannot
+accept a newly signed release under their old trust root. Use an approved recovery plan with verified
+Production backups before changing trust or reinstalling anything. Do not delete a remaining secret,
+Worker or database volume merely to make legacy provisioning run.
+
+A suspected disclosure is an incident, even when the signer still works: whoever can deploy its code
+can retain the key, and restoring the original code does not undo that disclosure. Review the
+signatures and release provenance in the affected interval under the incident's explicit containment
+plan. Preserve the verified recovery path; a successful signature alone does not prove that authority
+was never disclosed.
 
 ## What is and is not protected
 

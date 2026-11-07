@@ -24,7 +24,7 @@ resources, conditions and expiry: PGCF Tunnel/DNS, Development SaaS, Production 
 web-domain management. Each one-time successor was appended before the selected binding changed;
 read-only capability probes passed before and after old-token revocation, and all four old tokens
 then failed authentication. No DNS, Tunnel, certificate, archive object or protected local key was
-removed. Nineteen credential identities/configured secrets have completed rotation in this execution;
+removed. Twenty credential identities/configured secrets have completed rotation in this execution;
 recovered old material and two new operator-custody maintenance keys are excluded from that count.
 The independent-identity inventory remains open; binding-name totals are not key totals.
 
@@ -72,13 +72,32 @@ Final sealed raw-binding, complete new-module/main, settings and serving-pin che
 real private upload payload and temporary bridge were removed. No customer grant refresh, provider
 verification write, customer build or historical-version-1 recovery is claimed by this operation.
 
+Production's Domain-management writer subsequently passed its controlled new-primary and exact
+old-version-1 reader acceptance. The final current raw values, qualified code/settings, serving pin,
+private upload payload and bridge cleanup were verified. Actual owning-Worker checks read the old-1
+and new fixtures, rejected wrong AAD and completed the existing read-only identity RPC. The
+owner-authoritative continuation completed at 2026-11-07 06:10:30 UTC; this is the twentieth completed
+material rotation, with historical reader coverage retained.
+
 The frozen selected inventory contains 79 material identities across 48 owning Workers, rather
 than one identity per binding name. Forty initially correct locally held identities stay unchanged.
+Verified receipts account for 20 completed rotations and six saved active successors with old
+authorities retained. The selected cohort also contains 40 correct local KEEP identities, four
+retirements, eight ROTATE identities still open and one BLOCKED identity. The automated ledger
+refresh stopped before output because its fresh alias metadata differed from the immutable original
+census; that original remains unchanged while the structural difference is investigated. Replacement activation with retained authority is not counted
+as completed retirement.
 Two unused WFP diagnostic-secret bindings and one obsolete wake-probe Bearer reference were
 retired; that probe's other integrator identity was already revoked and expired before this task.
 The obsolete Worker was removed only after reference checks, exact immutable identity verification
 and a durably decrypt-verified sealed source/settings/secret backup. No active project credential
 was substituted into that obsolete consumer. The four retirements are not new-key rotations.
+
+Separate Native-auth custody work stopped before target-key generation or credential-file changes.
+Its private capture restored the original modules and bindings under a new serving-version ID; a
+raw settings comparison stopped on generated annotation metadata. No rotation was completed. The webhook candidate also remains unchanged: its required tool pin did not match, so
+execution stopped before a receiver/token mutation or delivery. Neither attempt adds to the
+20 completed rotations; the qualified owning-tool gates still apply.
 
 The PGCF archive parent, Development R2-management, the shared Production R2-management/storage
 authority and Development storage have verified saved successors active, with old parents retained. New-parent acceptance used exactly four fresh operator targets:
@@ -105,7 +124,7 @@ saved successor and retained old parent. Its validation used authentication, LIS
 existing archive metadata only; no archive GET, object write, Container job or customer recovery
 operation was invoked. Both Recovery configurations retain their known INPUT and same-principal
 PGCF credentials unchanged. The six saved active R2 successors are disclosed separately from the
-19 completed rotations.
+20 completed rotations.
 
 Source inspection found that native credential failures were logged without preventing maintenance
 completion. A focused Rust correction now withholds maintenance admission until a complete page's
@@ -127,8 +146,8 @@ The original failed receipt remains byte-identical. The second preflight had 11,
 against the 1,368-MiB floor, and 305,856,708,608 free pool bytes against the 6-GiB reserve plus
 1-GiB scratch requirement. A later read-only snapshot confirmed both nodes ready, schedulable and
 OS-converged, unchanged US31/EU194 scope membership, fresh HTTP/WebSocket SELECT 1 in both
-regions and administrator 200. US database placement remains closed by its original maintenance
-closure; no manual reset was performed. An aggregate OOM notification during the first failed
+regions and administrator 200. At that snapshot US database placement remained closed by its original
+maintenance closure; no manual reset was performed. An aggregate OOM notification during the first failed
 window does not identify the victim or establish the check's cause. The child check's detail is
 discarded by the current service, so a bounded diagnostic source change is required before another
 attempt. The owned EU fixture is retained as a witness. Old R2 parents remain active; no absence
@@ -159,8 +178,24 @@ succeeds with its start link withheld, and uses the existing offline recovery pa
 The same cluster and volume must survive; a missing PostgreSQL marker after repair fails instead
 of running initdb. Busy or unrepaired storage still refuses the check. Three regression groups
 were written first for mounted/unmounted suspect state, retained cluster/sentinel and unrelated
-volume, repair refusal without execution, and refusal to reinitialize. Independent Root source
-review and pinned formatting passed; the required Linux CI and live repair remain pending.
+volume, repair refusal without execution, and refusal to reinitialize. Independent Root and peer
+source review and pinned formatting passed. PR #47 Linux CI `42339016110` passed, and exact main
+`3ff56e43c8b438dfdc9970cf4cf7bca04c4cc290` passed every required job and OLD release signing in
+`42339992870`. All seven original members and the OLD signature were qualified; only the agent
+binary changed, with the kernel, packages, host files and gateway/archive/WAL-fetch bytes unchanged
+against both prior releases.
+
+US1 then received only that qualified causal release, using revision CAS 19 to 20. The two Native
+qualification lists retained all prior IDs; every other plain value, all 15 raw secret bindings,
+code, namespaces and settings were inherited from the exact current API source. One new maintenance
+completed at 2026-11-07 05:19:54.832 UTC. Its exact UID/spec/OS and post-terminal heartbeat
+(05:20:05.820 UTC), unchanged US31/EU194 scope manifests, both regions' owned HTTP/WebSocket
+SELECT 1 and administrator 200 passed final acceptance at 05:20:44.996 UTC. Normal successful-cycle
+ownership reopened US placement; both placement closures were null. No diagnostic probe, manual
+reset, SSH, customer-volume repair, new key, env write, fixture deletion or purchase was performed
+by this causal rollout. EU1 remains on b312 with its genuine earlier full-page barrier and the
+owned EU witness retained. Old R2 authorities remain active; no old transient-job absence or old
+parent retirement is claimed.
 
 The [sealed custody exporter](../operations/custody-export.md) adds a reviewed source-builder
 candidate for a private owning-Worker entrypoint and signed, serialized bridge. It preserves
