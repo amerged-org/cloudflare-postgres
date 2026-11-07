@@ -427,6 +427,38 @@ test("when the file cannot be written after the secret is set, the error says so
   }
 });
 
+test("the default provisioning target is the current signer", async () => {
+  const { root, publicPath } = await checkout();
+  const api = await cloudflare(publicPath);
+  try {
+    await assert.rejects(
+      main(
+        [
+          "provision",
+          "--token-env",
+          "PGCF_TEST_TOKEN",
+          "--account-env",
+          "PGCF_TEST_ACCOUNT",
+          "--public",
+          publicPath,
+          "--api-base",
+          api.apiBase,
+        ],
+        { PGCF_TEST_TOKEN: TOKEN, PGCF_TEST_ACCOUNT: ACCOUNT },
+        () => {},
+      ),
+    );
+    assert.equal(api.seen.length, 1);
+    assert.equal(
+      api.seen[0]!.path,
+      `/accounts/${ACCOUNT}/workers/scripts/pgcf-release-signer-next-v20261106/secrets`,
+    );
+  } finally {
+    await api.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("the command takes the names of the variables that hold the token and the account, never their values", async () => {
   const { root, publicPath } = await checkout();
   const api = await cloudflare(publicPath);

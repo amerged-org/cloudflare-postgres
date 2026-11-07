@@ -19,7 +19,7 @@
 //     steps. The private key is never written to a disk, a log or a terminal; nobody ever sees
 //     it. --token-env and --account-env name the environment variables that hold the API token
 //     (Workers Scripts edit on the account) and the account id: a value never goes on the
-//     command line. --worker is the signer (default pgcf-release-signer-dev), which has to be
+//     command line. --worker is the signer (default pgcf-release-signer-next-v20261106), which has to be
 //     deployed already. The command NEVER replaces a secret: it refuses while the Worker already
 //     holds RELEASE_SIGNING_KEY, whatever else is given, because a secret cannot be read back and
 //     the one the Worker holds may be the only copy of the key every node trusts. A new key goes to
@@ -314,7 +314,7 @@ export async function main(
     options: {
       "token-env": { type: "string" },
       "account-env": { type: "string" },
-      worker: { type: "string", default: "pgcf-release-signer-dev" },
+      worker: { type: "string", default: "pgcf-release-signer-next-v20261106" },
       public: { type: "string" },
       "api-base": { type: "string", default: DEFAULT_API_BASE },
       rotate: { type: "boolean", default: false },
