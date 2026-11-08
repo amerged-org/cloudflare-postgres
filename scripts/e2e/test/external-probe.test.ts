@@ -220,14 +220,16 @@ test("source proof checks the whole allowlist and rejects overlapping, mapped an
     cidrPoolsDisjoint([`${host6(0x2001)}/48`], [`${host6(0x2001)}/64`]),
     false,
   );
-  assert.throws(() => cidrPoolsDisjoint(pool, []));
+  // A deny-all firewall has an empty allowlist, which proves the pool disjoint; an empty pool proves nothing.
+  assert.equal(cidrPoolsDisjoint(pool, []), true);
+  assert.throws(() => cidrPoolsDisjoint([], pool));
   assert.throws(() =>
     cidrPoolsDisjoint([`::ffff:${host4(203, 0, 113, 7)}/128`], pool),
   );
   assert.throws(() => cidrPoolsDisjoint(pool, ["invalid"]));
 });
 
-test("secret configuration expires and cannot omit the authoritative allowlist", () => {
+test("secret configuration expires and cannot omit or mark incomplete the authoritative allowlist", () => {
   const value = input();
   assert.throws(() =>
     parseProbeConfig(
@@ -242,8 +244,26 @@ test("secret configuration expires and cannot omit the authoritative allowlist",
     ),
   );
   assert.throws(() =>
-    parseProbeConfig(JSON.stringify({ ...value, operator_allowlist: [] }), now),
+    parseProbeConfig(
+      JSON.stringify({ ...value, operator_allowlist: undefined }),
+      now,
+    ),
   );
+  // A deny-all node firewall states its complete allowlist as [], which is a truthful value.
+  const denyAll = parseProbeConfig(
+    JSON.stringify({ ...value, operator_allowlist: [] }),
+    now,
+  );
+  assert.deepEqual(denyAll.operator_allowlist, []);
+  const report = probeReport(
+    denyAll,
+    [`${host4(203, 0, 113, 0)}/24`],
+    context,
+    now,
+  );
+  assert.equal(report.source_pool_disjoint, true);
+  assert.equal(report.allowlist_hash, keyedHash(denyAll, "allowlist", "[]"));
+  assert.throws(() => probeReport(denyAll, [], context, now));
   assert.throws(() =>
     parseProbeConfig(
       JSON.stringify({

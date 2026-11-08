@@ -152,8 +152,11 @@ function cidr(value: string): { family: 4 | 6; first: bigint; last: bigint } {
     last: address.value | mask,
   };
 }
-function normalizedCidrs(values: readonly string[]): string[] {
-  if (!values.length || values.length > 256)
+function normalizedCidrs(
+  values: readonly string[],
+  allowEmpty = false,
+): string[] {
+  if ((!allowEmpty && !values.length) || values.length > 256)
     throw new HarnessError("external_probe_allowlist_required");
   return [
     ...new Set(
@@ -169,7 +172,7 @@ export function cidrPoolsDisjoint(
   allowlist: readonly string[],
 ): boolean {
   normalizedCidrs(pool);
-  normalizedCidrs(allowlist);
+  normalizedCidrs(allowlist, true);
   return pool.every((entry) => {
     const source = cidr(entry);
     return allowlist.every((entry) => {
@@ -218,7 +221,7 @@ export function parseProbeConfig(value: string, now = Date.now()): ProbeConfig {
   if (ipValue(control).family !== 4 || targets.includes(control))
     throw new HarnessError("external_probe_control_invalid");
   assertPublicProofAddresses({ control, targets: targets as string[] });
-  normalizedCidrs(allowlist as string[]);
+  normalizedCidrs(allowlist as string[], true);
   return {
     version: 1,
     nonce: entry.nonce,
@@ -284,7 +287,7 @@ export function probeReport(
     allowlist_hash: keyedHash(
       config,
       "allowlist",
-      JSON.stringify(normalizedCidrs(config.operator_allowlist)),
+      JSON.stringify(normalizedCidrs(config.operator_allowlist, true)),
     ),
     control_hash: keyedHash(config, "control", config.control),
     commit_hash: keyedHash(config, "commit", context.commit),
@@ -468,8 +471,8 @@ export function assertExternalReport(
     if (row[field] !== expected[field])
       throw new HarnessError("external_probe_report_mismatch");
   if (
-    JSON.stringify(normalizedCidrs(authoritativeAllowlist)) !==
-      JSON.stringify(normalizedCidrs(config.operator_allowlist)) ||
+    JSON.stringify(normalizedCidrs(authoritativeAllowlist, true)) !==
+      JSON.stringify(normalizedCidrs(config.operator_allowlist, true)) ||
     !expected.source_pool_disjoint
   )
     throw new HarnessError("external_probe_source_not_proven");
