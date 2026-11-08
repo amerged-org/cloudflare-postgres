@@ -408,7 +408,7 @@ refill before the bind.
 | `/run/pgcf/<id>`                               | The database's socket directory (`pgcf-<id>:pgcf-gateway`, 0750), made again for every database when the agent starts                                                                                       |
 | `/run/pgcf/slot/<n>/control`                   | A slot's supervisor socket (`RuntimeDirectory=` of the unit, mode 0700 for the slot's user; only root is served)                                                                                              |
 | `/run/pgcf/agent/gateway.sock`, `archive.sock` | The gateway's channel (the gateway's user only) and the archive socket (the databases, known by the slot that holds them)                                                                                     |
-| `/run/pgcf/agent/jobs/`                        | The barman jobs' environment files (credentials): tmpfs, made private at each start, and what a crashed run left is removed then                                                                            |
+| `/run/pgcf/agent/jobs/`                        | The barman jobs' environment files (credentials): tmpfs, made private at each start, and what a crashed run left is removed then (so is the old `/var/lib/pgcf/agent/jobs`)                                                                            |
 
 `layout.rs` names the volumes, the agent's own directory, the databases' files, the jobs and the
 sockets, and tests give it another root. The rest are named where they are used: `credentials/`,
