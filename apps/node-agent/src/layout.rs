@@ -154,7 +154,10 @@ mod tests {
         // The jobs' environment files hold the credentials: they live on the runtime directory's
         // tmpfs, never on the root disk, which an offline read of the disk would reach.
         assert_eq!(layout.jobs(), PathBuf::from("/run/pgcf/agent/jobs"));
-        assert_eq!(layout.legacy_jobs(), PathBuf::from("/var/lib/pgcf/agent/jobs"));
+        assert_eq!(
+            layout.legacy_jobs(),
+            PathBuf::from("/var/lib/pgcf/agent/jobs")
+        );
         // Nothing of the agent's own is below a database's volume, which its user can rearrange.
         assert!(!layout.database_files("a").starts_with(layout.volume("a")));
     }

@@ -66,6 +66,22 @@ it("carries the fence of a lost node on and applies the recovery windows, each i
       .bind(f.node)
       .first("fencing_error"),
   ).toBe("fence_unconfigured");
+  // The node is not fenced yet, so it can still write: its archive is left alone, nothing is deleted.
+  expect(
+    (await env.ARCHIVE.list({ prefix: `${prefix}base/${old}/` })).objects,
+  ).toHaveLength(2);
+  expect(
+    (await env.ARCHIVE.list({ prefix: `${prefix}wals/` })).objects,
+  ).toHaveLength(6);
+
+  // Once the fence has completed, the same pass applies the recovery window to what the node wrote before it.
+  const fenced = new Date().toISOString();
+  await env.DB.prepare(
+    "UPDATE node_losses SET tunnel_deleted_at=?,power_off_requested_at=?,powered_off_at=? WHERE node_id=?",
+  )
+    .bind(fenced, fenced, fenced, f.node)
+    .run();
+  await runCron(env, now + 120_000);
   expect(
     (await env.ARCHIVE.list({ prefix: `${prefix}base/${old}/` })).objects,
   ).toEqual([]);
