@@ -127,7 +127,9 @@ async function findAnchor(
   try {
     return (
       (await readRestoreCatalog(bucket, prefix, notAfter)).backups.find(
-        (backup) => Date.parse(backup.end) <= cutoff,
+        (backup) =>
+          Date.parse(backup.end) <= cutoff &&
+          idMs(backup.id) <= cutoff + 86_400_000,
       ) ?? null
     );
   } catch (error) {
@@ -219,6 +221,9 @@ export async function enforceBackupRetention(
   limit = 2,
 ): Promise<RetentionRun> {
   const at = new Date(now).toISOString();
+  // An archive that names another bucket is out of this Worker's reach and is never selected, so it
+  // cannot fill the batch of two.
+  const named = `s3://${archiveBucket(env).bucketName}/`;
   const due = (
     await env.DB.prepare(
       `SELECT d.id,d.region_id,d.archive_path,d.storage_generation,s.backup_retention_days,${fencedAtSql("d.node_id")} AS fenced_at
@@ -227,6 +232,7 @@ export async function enforceBackupRetention(
       LEFT JOIN database_recovery_points p ON p.database_id=d.id AND p.storage_generation=d.storage_generation
       WHERE d.node_id IS NOT NULL AND d.deleted_at IS NULL AND d.desired_state<>'deleted'
       AND NOT EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=d.node_id AND l.powered_off_at IS NULL)
+      AND substr(d.archive_path,1,length(?))=?
       AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase IN('proving','restoring','rolling_back'))
       AND NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id
         WHERE x.source_database_id=d.id AND x.verified_at IS NULL AND o.status IN('pending','running'))
@@ -234,10 +240,17 @@ export async function enforceBackupRetention(
         OR json_extract(p.backup_json,'$.completed_at')>c.checked_at)
       ORDER BY c.checked_at IS NOT NULL,c.checked_at,d.id LIMIT ?`,
     )
-      .bind(new Date(now - RECHECK_MS).toISOString(), limit)
+      .bind(named, named, new Date(now - RECHECK_MS).toISOString(), limit)
       .all<DueRow>()
   ).results;
   const run: RetentionRun = { checked: 0, backups: 0, objects: 0, failed: 0 };
+  const recordCheck = (row: DueRow, backups: number, objects: number) =>
+    env.DB.prepare(
+      `INSERT INTO backup_retention_runs(database_id,archive_path,checked_at,backups_deleted,objects_deleted) VALUES(?,?,?,?,?)
+      ON CONFLICT(database_id) DO UPDATE SET archive_path=excluded.archive_path,checked_at=excluded.checked_at,backups_deleted=excluded.backups_deleted,objects_deleted=excluded.objects_deleted`,
+    )
+      .bind(row.id, row.archive_path, at, backups, objects)
+      .run();
   for (const row of due) {
     run.checked++;
     try {
@@ -252,12 +265,7 @@ export async function enforceBackupRetention(
       run.backups += result.backups;
       run.objects += result.objects;
       if (result.complete)
-        await env.DB.prepare(
-          `INSERT INTO backup_retention_runs(database_id,archive_path,checked_at,backups_deleted,objects_deleted) VALUES(?,?,?,?,?)
-          ON CONFLICT(database_id) DO UPDATE SET archive_path=excluded.archive_path,checked_at=excluded.checked_at,backups_deleted=excluded.backups_deleted,objects_deleted=excluded.objects_deleted`,
-        )
-          .bind(row.id, row.archive_path, at, result.backups, result.objects)
-          .run();
+        await recordCheck(row, result.backups, result.objects);
     } catch (error) {
       run.failed++;
       console.error(
@@ -271,6 +279,9 @@ export async function enforceBackupRetention(
               : "retention_failed",
         }),
       );
+      // A check without counts sends an archive that throws to the back for the recheck interval; if the
+      // write fails too, the row is simply due again next minute.
+      await recordCheck(row, 0, 0).catch(() => undefined);
     }
   }
   return run;
