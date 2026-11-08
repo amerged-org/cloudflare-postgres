@@ -25,7 +25,10 @@ export {
 const AUTH_MAX_BYTES = DECOY_AUTH_MAX_BYTES;
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 // Not fatal, and a leading byte-order mark stays: bytes that are not UTF-8, or that start with a mark, never equal the offered name.
-const mechanismName = new TextDecoder("utf-8", { ignoreBOM: true });
+const mechanismName = new TextDecoder("utf-8", {
+  fatal: false,
+  ignoreBOM: true,
+});
 const encoder = new TextEncoder();
 function authentication(code: number, text: string): Uint8Array {
   const body = encoder.encode(text),
