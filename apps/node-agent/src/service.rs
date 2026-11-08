@@ -352,6 +352,7 @@ impl<M: Machine> Service<M> {
         let table = Arc::new(Table::default());
         let credentials = Arc::new(Credentials::default());
         crate::link::file::create_private_directory(&layout.jobs())?;
+        crate::archive::job::remove_leftovers(&layout.jobs())?;
         let jobs = Arc::new(Jobs::new(
             Runner::new(&layout.systemd_run, &layout.barman_bin, layout.jobs()),
             policy.backup.clone(),

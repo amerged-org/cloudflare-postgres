@@ -656,6 +656,20 @@ fn write_private(directory: &Path, file: &Path, content: &str) -> std::io::Resul
         .open(file)?
         .write_all(content.as_bytes())
 }
+/// Removes what an earlier run of the agent left in `directory`: a job's directory outlives the
+/// agent only when the agent died during the job, and a job unit that has started has read its
+/// environment file already. Called at start, before any job runs.
+pub fn remove_leftovers(directory: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
 /// Reads a pipe to its end and keeps its first or last `limit` bytes.
 async fn capture(mut reader: impl AsyncRead + Unpin, limit: usize, tail: bool) -> Vec<u8> {
     let mut kept = Vec::new();
@@ -1170,6 +1184,25 @@ mod tests {
         for secret in ["secret/value+1=", "token.part-2_~"] {
             assert!(!all.contains(secret));
         }
+    }
+
+    #[test]
+    fn a_crashed_run_leaves_no_environment_file_for_the_next_start() {
+        let jobs = crate::archive::test_support::directory("stale-jobs");
+        let credential =
+            Credential::delivered("fixturekeyid", "fixturesecret", "fixturetoken", 1 << 40)
+                .unwrap();
+        // The directory of a run the agent died in: its environment file was never removed.
+        let stale = jobs.join("pgcf-wal-abcdefghijklmnopqrst-7");
+        write_private(
+            &stale,
+            &stale.join("environment"),
+            &environment_file(&credential),
+        )
+        .unwrap();
+        remove_leftovers(&jobs).unwrap();
+        assert!(jobs.is_dir(), "the jobs directory itself stays");
+        assert_eq!(std::fs::read_dir(&jobs).unwrap().count(), 0);
     }
 
     mod running {
