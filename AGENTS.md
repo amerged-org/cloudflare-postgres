@@ -29,5 +29,7 @@ Rust is an owner-approved architecture choice; measurements validate its impleme
 First-party code is Apache-2.0; upstream components keep their own licenses.
 Pin upstream versions and digests; record licenses and notices in THIRD_PARTY.md.
 The repository is public: never print or commit secrets, .env* files, node keys, Tunnel and enrollment tokens, R2 keys, kubeconfigs or Talos configs.
+Whenever a token or key is created, received or deployed, also append it to the repository's untracked `.env.local`, alongside Cloudflare or whichever secret store holds the deployed value; never print or commit the file.
+Treat `.env.local` as append-only: never delete the file or any entry, and never truncate or replace the file; update an existing entry only when the owner expressly requests that exact update, then ask again and proceed only after the owner explicitly confirms it.
 Never content-search private files or bypass the private-file search exclusions. Load a known required credential file only in memory, and output only explicitly selected nonsecret metadata.
 New paid resources and production writes need the owner's explicit, costed go.
