@@ -237,7 +237,10 @@ postmaster coming up without the lock).
 **The archive socket** knows a caller by the slot that holds it: the pool's table says which
 database a slot's uid belongs to, and only a process in that slot's cgroup and invocation (read from
 `/proc/<pid>/cgroup` and the `trusted.invocation_id` systemd keeps on the cgroup) is the holder's. A
-uid with no database now gets `peer_unknown`.
+uid with no database now gets `peer_unknown`. The socket holds 256 connections at once and 4 per
+uid (`MAX_CONNECTIONS`, `MAX_CONNECTIONS_PER_UID`): a connection beyond them is closed unread, so a
+flooding uid refuses only its own calls. A client that does not send its line within 2 s gets
+`bad_request`.
 
 **Adoption.** The table is never written to disk. When the agent starts it reads the units, each
 main process, `/proc/<pid>/exe`, its mount table and `/proc/locks` (`Pool::adopt`; the volume a

@@ -34,6 +34,9 @@ PrivateMounts=yes
 # The gateway's channel (gateway.sock) and the databases' archive socket (archive.sock).
 RuntimeDirectory=pgcf/agent
 RuntimeDirectoryMode=0755
+# The archive socket holds at most 256 connections, 4 per uid (archive/server.rs); the agent's
+# other descriptors (state files, /proc, database sessions) need the rest of the table.
+LimitNOFILE=65536
 OOMScoreAdjust=-900
 MemoryLow=128M
 

@@ -22,12 +22,21 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
+    net::{UnixListener, UnixStream, unix::UCred},
+    sync::{OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
 
 /// How long a client may take to send its line.
-const READ_BOUND: Duration = Duration::from_secs(10);
+const READ_BOUND: Duration = Duration::from_secs(2);
+/// Connections the archive socket holds at once, from all callers. Far above what a node needs (a
+/// call lasts a few seconds and about five are in flight at a time), and below the descriptors the
+/// agent's unit allows, so a burst from the databases cannot starve the agent of descriptors.
+const MAX_CONNECTIONS: usize = 256;
+/// Connections one uid holds at once. A database makes one archive call at a time (its `serial`
+/// lock), and PostgreSQL's archiver and recovery never ask in parallel, so two connections are
+/// the most a legitimate uid needs; four leave room for a retry that starts before the last ends.
+const MAX_CONNECTIONS_PER_UID: usize = 4;
 /// How much of a failed job's stderr goes to the log.
 const LOGGED_STDERR: usize = 400;
 
@@ -171,6 +180,29 @@ pub struct Server {
     credentials: Arc<Credentials>,
     callers: Arc<dyn Callers>,
     bound: Duration,
+    /// The connections the socket holds at once, from all uids.
+    connections: Arc<Semaphore>,
+    /// The connections each uid holds; an entry is removed when its last connection ends.
+    in_flight: Arc<Mutex<HashMap<u32, usize>>>,
+}
+
+/// One accepted connection's place on the socket: a global permit and a share of its uid, both
+/// given back when the connection ends.
+struct Admission {
+    _permit: OwnedSemaphorePermit,
+    uid: u32,
+    in_flight: Arc<Mutex<HashMap<u32, usize>>>,
+}
+impl Drop for Admission {
+    fn drop(&mut self) {
+        let mut in_flight = self.in_flight.lock().expect("connection lock");
+        if let Some(held) = in_flight.get_mut(&self.uid) {
+            *held -= 1;
+            if *held == 0 {
+                in_flight.remove(&self.uid);
+            }
+        }
+    }
 }
 
 /// Binds the archive socket, replacing the socket of an agent that is gone. Any local user may
@@ -209,28 +241,54 @@ impl Server {
             credentials,
             callers,
             bound: AGENT_BOUND,
+            connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            in_flight: Arc::default(),
         }
     }
     /// How long one call may take before the agent answers `failed`.
     pub fn with_bound(self, bound: Duration) -> Self {
         Self { bound, ..self }
     }
-    /// Serves connections for ever.
+    /// Serves connections for ever. A connection beyond the socket's cap or its uid's share is
+    /// closed at once, unread: a uid that floods the socket only refuses its own calls.
     pub async fn serve(self: Arc<Self>, listener: UnixListener) -> std::convert::Infallible {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    let Ok(peer) = stream.peer_cred() else {
+                        continue;
+                    };
+                    let Some(admission) = self.admit(peer.uid()) else {
+                        continue;
+                    };
                     let server = self.clone();
-                    tokio::spawn(async move { server.handle(stream).await });
+                    tokio::spawn(async move {
+                        let _admission = admission;
+                        server.handle(stream, peer).await
+                    });
                 }
                 // A full descriptor table or an aborted connection passes.
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
             }
         }
     }
-    async fn handle(&self, mut stream: UnixStream) {
-        let reply = match (stream.peer_cred(), read_line(&mut stream).await) {
-            (Ok(peer), Some(line)) => {
+    fn admit(&self, uid: u32) -> Option<Admission> {
+        let permit = self.connections.clone().try_acquire_owned().ok()?;
+        let mut in_flight = self.in_flight.lock().expect("connection lock");
+        let held = in_flight.entry(uid).or_default();
+        if *held >= MAX_CONNECTIONS_PER_UID {
+            return None;
+        }
+        *held += 1;
+        Some(Admission {
+            _permit: permit,
+            uid,
+            in_flight: self.in_flight.clone(),
+        })
+    }
+    async fn handle(&self, mut stream: UnixStream, peer: UCred) {
+        let reply = match read_line(&mut stream).await {
+            Some(line) => {
                 let caller = peer
                     .pid()
                     .and_then(|pid| u32::try_from(pid).ok())
@@ -240,8 +298,7 @@ impl Server {
                     None => Reply::Failed(Some("peer_unknown")),
                 }
             }
-            (Err(_), _) => Reply::Failed(Some("peer_unknown")),
-            (_, None) => Reply::Failed(Some("bad_request")),
+            None => Reply::Failed(Some("bad_request")),
         };
         let _ = tokio::time::timeout(READ_BOUND, async {
             stream.write_all(&reply.encode()).await?;
@@ -703,6 +760,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_uid_past_its_share_of_connections_is_closed_at_once_and_its_silent_client_frees_it()
+    {
+        let node = Node::start("connection-share", AGENT_BOUND).await;
+        // Clients that send nothing hold the uid's whole share until they close.
+        let mut silent = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_UID {
+            silent.push(UnixStream::connect(&node.socket).await.unwrap());
+        }
+        // The next connection of that uid is closed at once: no answer, and no wait for the bound.
+        let mut refused = UnixStream::connect(&node.socket).await.unwrap();
+        let mut answer = String::new();
+        tokio::time::timeout(Duration::from_secs(1), refused.read_to_string(&mut answer))
+            .await
+            .expect("a refused connection is closed within a second")
+            .unwrap();
+        assert_eq!(answer, "");
+        // Once one silent client has gone, a well-formed request is answered.
+        silent.remove(0);
+        let answered = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let answer = node
+                    .ask("pgcf-archive/1 delete 000000010000000000000001\n")
+                    .await;
+                if !answer.is_empty() {
+                    return answer;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the uid has its share back within a second");
+        assert_eq!(answered, "failed bad_request\n");
+    }
+
+    #[tokio::test]
     async fn callers_the_agent_does_not_know_and_lines_it_does_not_understand_get_failed() {
         let node = Node::start("callers", AGENT_BOUND).await;
         assert_eq!(
@@ -738,9 +830,10 @@ mod tests {
             Arc::new(TestCallers(node.uid.wrapping_add(1))),
         ));
         let (near, mut far) = tokio::net::UnixStream::pair().unwrap();
+        let peer = near.peer_cred().unwrap();
         let handling = tokio::spawn({
             let server = server.clone();
-            async move { server.handle(near).await }
+            async move { server.handle(near, peer).await }
         });
         far.write_all(format!("pgcf-archive/1 archive {SEGMENT}\n").as_bytes())
             .await
