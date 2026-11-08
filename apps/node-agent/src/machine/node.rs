@@ -568,7 +568,10 @@ impl Machine for Node {
     }
     async fn stop(&self, database: &str) -> Result<(), units::Error> {
         self.end_unit(database).await?;
-        self.clear_socket_directory(database).await
+        // The unit has ended, so a failed cleanup must not turn the stop into the error that says
+        // PostgreSQL may still run; the next bind empties the directory again.
+        let _ = self.clear_socket_directory(database).await;
+        Ok(())
     }
     async fn kill(&self, database: &str) -> Result<(), units::Error> {
         if self.pool.kill(database).await? {
