@@ -27,7 +27,8 @@ const RESERVED_SUFFIXES = [
 ];
 
 /**
- * Accepts only an https URL whose host is a DNS name. A public DNS name that resolves to a private
+ * Accepts only an https URL whose host is a DNS name. Literal IP addresses, localhost and reserved
+ * names are refused here, at create and at delivery. A public DNS name that resolves to a private
  * address is not detectable here, and nothing in the delivery path resolves it: the Worker's
  * `global_fetch_strictly_public` flag makes the runtime refuse such a destination at connection time.
  */
