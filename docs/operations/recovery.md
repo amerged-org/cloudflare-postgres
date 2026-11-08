@@ -171,16 +171,17 @@ database moves (plan 7.11, 9.4).
    records (`DELETE /zones/{zone}/dns_records/{record}`). Never delete a `pgcf-` record whose Tunnel
    is alive, and never a record by name pattern alone: the cleanup of 2026-10-22 deleted only a
    record whose target was one of the account's own deleted Tunnels.
-   **Suspected compromise.** A restore or backup-retention pass of a lost node's archive reads only
-   the objects uploaded up to the fence, and refuses a source on a lost node that is not yet fenced.
-   The R2 credentials a node was given stay valid for their 7 days after the fence, though: when
-   compromise of the node is suspected, the operator replaces the R2 parent key as a planned step,
-   with the owner's approval: create the new token (object read and write on the archive bucket),
-   set `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`, deploy, then delete the old token.
-   Deleting it ends every credential the old key signed at once
-   ([credentials](credentials.md#provider-and-account-credentials)). Healthy nodes fail archiving
-   (`database_archive_failing`) until they read new credentials, and the bucket is shared by every
-   region, so the step affects them too.
+   **Suspected compromise.** When the restore catalog of a lost node's archive is read, the objects that
+   node uploaded after its fence are ignored, so the base backup and the WAL range a restore starts from
+   are the ones written before it. A restore or replacement from a source on a lost node that is not yet
+   fenced is refused with the retryable `not_ready`, and a retention pass skips such a node. The
+   restoring node's own `wal-fetch` still reads the live archive prefix, though, and the R2 credentials
+   the node was given stay valid for their 7 days after the fence. When compromise of the node is
+   suspected, the operator therefore replaces the R2 parent key as a planned step, with the owner's
+   approval, by the procedure of [the node credentials](credentials.md#node-credentials): delete the old
+   token only after the check described there, because deleting it ends every credential it signed at
+   once, healthy nodes fail archiving (`database_archive_failing`) until they read new ones, and the
+   bucket is shared by every region.
 4. Only when the status is `fenced`, restore the affected databases onto healthy capacity with the
    separate-target restore procedure above. Each restore is a new database with a new ID; the
    integrator rebinds. The last archived commit is what comes back, not the last acknowledged one

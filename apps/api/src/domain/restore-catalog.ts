@@ -101,7 +101,8 @@ export const fencedAtSql = (node: string) =>
 
 /**
  * The upload cutoff for reading the archive a node wrote: its fence time, or undefined when the node
- * is not lost. A node that is lost but not yet fenced can still write, so its archive is refused.
+ * is not lost. A node that is lost but not yet fenced can still write, so its archive is refused until the
+ * fence completes (retryable, `not_ready`).
  */
 export async function archiveCutoff(
   db: D1Database,
@@ -116,7 +117,7 @@ export async function archiveCutoff(
     throw new ApiError(
       "conflict",
       "The source node is lost and not yet fenced",
-      { reason: "source_unavailable" },
+      { reason: "not_ready" },
     );
   return loss?.powered_off_at ?? undefined;
 }

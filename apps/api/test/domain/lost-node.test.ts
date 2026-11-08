@@ -173,7 +173,7 @@ it("refuses to restore from a lost node's database until the node is fenced", as
   // Lost but not fenced: the node can still write, so its archive is not read.
   expect(await refusal(await restore())).toMatchObject({
     status: 409,
-    reason: "source_unavailable",
+    reason: "not_ready",
   });
   const fenced = new Date().toISOString();
   await env.DB.prepare(
