@@ -287,7 +287,8 @@ pub fn postgresql_conf(settings: &Settings) -> Option<String> {
          min_wal_size = 32MB\n\
          max_wal_size = {max_wal_mib}MB\n\
          password_encryption = scram-sha-256\n\
-         log_line_prefix = '%m [%p] %q%u@%d '\n",
+         log_line_prefix = '%m [%p] %q%u@%d '\n\
+         authentication_timeout = 10s\n",
         max_connections = settings.max_connections,
         preload = PRELOAD_LIBRARIES.join(","),
         autoprewarm = if AUTOPREWARM { "on" } else { "off" },
@@ -744,6 +745,7 @@ mod tests {
             "{}max_wal_size = 256MB\n\
              password_encryption = scram-sha-256\n\
              log_line_prefix = '%m [%p] %q%u@%d '\n\
+             authentication_timeout = 10s\n\
              autovacuum_worker_slots = 2\n\
              io_workers = 1\n\
              max_parallel_workers_per_gather = 0\n\
@@ -760,6 +762,7 @@ mod tests {
             "{}max_wal_size = 25600MB\n\
              password_encryption = scram-sha-256\n\
              log_line_prefix = '%m [%p] %q%u@%d '\n\
+             authentication_timeout = 10s\n\
              {tail}",
             head(25, 128, 768, 4, 64, 60, 2)
         );

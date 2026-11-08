@@ -1000,6 +1000,19 @@ unavailable"), and `DATABASE_ACTOR_LOCATION_HINT`,
 which must equal the API Worker's value; the hint places only DatabaseActor objects created after
 it is set.
 
+A PostgreSQL backend holds its slot from the StartupMessage until the login completes. Every
+database's configuration sets `authentication_timeout = 10s`, which the node agent writes at each
+start (a database that has not started since this release keeps PostgreSQL's default of one
+minute until its next start), and the gateway ends a connection that is not logged in 10 s after
+its first write to PostgreSQL, answering `08006`. A client that never logs in therefore holds a
+slot for at most about 10 s. The Edge's connection limiters still bound a reconnect flood: with
+the example values, the per-database limiter (`DATABASE_CONNECTION_RATE_LIMITER`, 120 per 60 s)
+and the per-database-role-network limiter (`CONNECTION_RATE_LIMITER`, 120 per 60 s) let about two
+such connections start per second, so about 20 unauthenticated slots can be held at once, which is
+the whole `max_connections` of an `xs` database. This release does not change the limiters; their
+configured values are the bound on such a flood, so set them for each installation with that in
+mind.
+
 A fresh Edge isolate parses and evaluates the whole bundle before it answers its first request, so
 the bundle holds no zod: it was 487.65 KiB (gzip 107.22 KiB) with it and is 25.48 KiB (gzip 9.63
 KiB) without. The Edge imports the zod-free modules of `@pgcf/contracts` (`ids-core`,
