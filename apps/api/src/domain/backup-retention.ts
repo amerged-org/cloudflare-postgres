@@ -261,8 +261,6 @@ export async function enforceBackupRetention(
         await recordCheck(row, result.backups, result.objects);
     } catch (error) {
       run.failed++;
-      // A check without counts sends an archive that throws to the back for the recheck interval.
-      await recordCheck(row, 0, 0);
       console.error(
         JSON.stringify({
           event: "backup_retention_failed",
@@ -274,6 +272,9 @@ export async function enforceBackupRetention(
               : "retention_failed",
         }),
       );
+      // A check without counts sends an archive that throws to the back for the recheck interval; if the
+      // write fails too, the row is simply due again next minute.
+      await recordCheck(row, 0, 0).catch(() => undefined);
     }
   }
   return run;

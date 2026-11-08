@@ -25,7 +25,7 @@ const lifetimeSeconds = (access: ArchiveAccess) =>
   access === "read_only"
     ? READ_ONLY_LIFETIME_SECONDS
     : ARCHIVE_CREDENTIAL_LIFETIME_SECONDS;
-/** Renewed once a third of its own lifetime has passed, so an outage has a third of it as margin. */
+/** Renewed once a third of its own lifetime has passed, so an outage has the other two thirds as margin. */
 const renewedBefore = (access: ArchiveAccess, now: number) =>
   iso(now - (lifetimeSeconds(access) * 1000) / 3);
 /** A row stays a day after it expired, so a late read is told "expired" and not "unknown". */
