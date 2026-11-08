@@ -66,8 +66,8 @@ export interface PlacementNode {
   /** Highest 30-minute average of active RAM and of CPU load in the last three days. */
   ram_peak_ppm: number | null;
   cpu_peak_ppm: number | null;
-  /** Active RAM in the newest sample, in parts per million: what the 30-minute average has not caught up with. */
-  ram_now_ppm: number | null;
+  /** MemAvailable of the newest sample: the active RAM it shows is what the 30-minute average has not caught up with. */
+  memory_available_bytes: number | null;
   /** Memory of the databases placed after the node's newest sample: no sample includes them yet. */
   pending_memory_mib: number;
   /** Storage of the databases whose volume the node may not have counted in `pool_nominal_bytes` yet. */
@@ -187,8 +187,16 @@ function load(
 ): { current: bigint; projected: bigint } | null {
   if (node.ram_peak_ppm === null || node.memory_total_bytes === null)
     return null;
-  // The average lags behind a burst of starts: what the newest sample shows counts as well.
-  const peak = BigInt(Math.max(node.ram_peak_ppm, node.ram_now_ppm ?? 0));
+  // The newest sample's active RAM, in integers: the average lags behind a burst of starts, so
+  // what the newest sample shows counts as well.
+  const total = BigInt(node.memory_total_bytes);
+  const nowPpm =
+    node.memory_available_bytes === null
+      ? 0n
+      : ((total - BigInt(node.memory_available_bytes)) * PPM) / total;
+  // SQLite returns a real for a rollup that overflows 64 bits (only forged samples do); a ppm is whole.
+  const average = BigInt(Math.floor(node.ram_peak_ppm));
+  const peak = average > nowPpm ? average : nowPpm;
   return {
     current: peak + memoryPpm(node.pending_memory_mib, node.memory_total_bytes),
     projected:
@@ -344,8 +352,7 @@ export async function placementNodes(
         l.observed_at sampled_at,l.memory_total_bytes,l.cpu_cores,l.room,
         l.pool_data_total_bytes,l.pool_data_used_bytes,l.pool_metadata_total_bytes,l.pool_metadata_used_bytes,l.pool_nominal_bytes,l.volumes_total,
         p.ram_peak_ppm,p.cpu_peak_ppm,
-        CASE WHEN l.memory_total_bytes>0 AND l.memory_available_bytes IS NOT NULL
-          THEN (l.memory_total_bytes-l.memory_available_bytes)*1000000/l.memory_total_bytes END ram_now_ppm,
+        l.memory_available_bytes,
         COALESCE((SELECT SUM(r.memory_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
           WHERE d.node_id=n.id AND d.deleted_at IS NULL AND d.placed_at>COALESCE(l.observed_at,'')),0) pending_memory_mib,
         ${pendingStorageSql("n", "l.observed_at")} pending_storage_mib

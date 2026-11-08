@@ -1515,9 +1515,12 @@ export type NodeObservationAnswer = z.infer<typeof NodeObservationAnswer>;
 export const NodeSample = z
   .strictObject({
     observed_at: Timestamp,
-    /** MemTotal and MemAvailable. */
+    /**
+     * MemTotal and MemAvailable. A node is far below 1 TiB; the bound keeps the placement
+     * arithmetic of the rollups inside SQLite's 64-bit integers.
+     */
     memory: z.strictObject({
-      total_bytes: Positive,
+      total_bytes: Positive.max(2 ** 40),
       available_bytes: Bytes,
     }),
     /** Busy CPU averaged over the interval since the previous sample. */

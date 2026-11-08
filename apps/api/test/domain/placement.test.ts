@@ -59,7 +59,7 @@ function node(overrides: Partial<PlacementNode> = {}): PlacementNode {
     volumes_total: 0,
     ram_peak_ppm: 0,
     cpu_peak_ppm: 0,
-    ram_now_ppm: 0,
+    memory_available_bytes: NODE_BYTES,
     pending_memory_mib: 0,
     pending_storage_mib: 0,
     ...overrides,
@@ -133,18 +133,27 @@ describe("which node takes a new database", () => {
 
   it("lets the newest sample stand in for an average that has not caught up with a burst of starts", () => {
     // The average is 10 %, the newest sample shows 75 % of the node in use: a 256 MiB database (2.5 %) reaches 77.5 %, 1,024 MiB (10 %) would not fit.
+    // 25 % of the 10 GiB node available: 75 % in use.
+    const quarterFree = NODE_BYTES * 0.25;
     expect(
-      pick([node({ ram_peak_ppm: 100_000, ram_now_ppm: 750_000 })]),
+      pick([
+        node({ ram_peak_ppm: 100_000, memory_available_bytes: quarterFree }),
+      ]),
     ).not.toBeNull();
     expect(
-      pick([node({ ram_peak_ppm: 100_000, ram_now_ppm: 750_000 })], {
-        ...SMALL,
-        memory_mib: 1024,
-      }),
+      pick(
+        [node({ ram_peak_ppm: 100_000, memory_available_bytes: quarterFree })],
+        { ...SMALL, memory_mib: 1024 },
+      ),
     ).toBeNull();
     // A sample below the average changes nothing.
     expect(
-      pick([node({ ram_peak_ppm: 790_000, ram_now_ppm: 100_000 })]),
+      pick([
+        node({
+          ram_peak_ppm: 790_000,
+          memory_available_bytes: NODE_BYTES * 0.9,
+        }),
+      ]),
     ).toBeNull();
   });
 
@@ -553,12 +562,19 @@ describe("the load of a node, read from its samples", () => {
     expect((await load(f.region, a)).pending_memory_mib).toBe(512 + 1024);
   });
 
-  it("reads the active RAM of the newest sample", async () => {
+  it("reads the available memory of the newest sample", async () => {
     const { f, a } = await regionWith();
     await seedSamples(a, steady(NOW, 5, { ramPpm: 250_000 }));
     const got = await load(f.region, a);
-    expect(got.ram_now_ppm).toBeGreaterThan(240_000);
-    expect(got.ram_now_ppm).toBeLessThan(260_000);
+    expect(got.memory_available_bytes).toBe(NODE_BYTES * 0.75);
+  });
+
+  it("does not throw on a forged memory total, and the node that reports it is not chosen", async () => {
+    const { f, a } = await regionWith();
+    await seedSamples(a, steady(NOW, 5, { totalBytes: 9e15, usedBytes: 8e15 }));
+    const nodes = await placementNodes(env.DB, f.region, NOW);
+    expect(() => choosePlacement(nodes, SMALL, NOW)).not.toThrow();
+    expect(choosePlacement(nodes, SMALL, NOW)).toBeNull();
   });
 
   it("does not count a database that is deleted", async () => {
