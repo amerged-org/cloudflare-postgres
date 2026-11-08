@@ -27,3 +27,6 @@ worker-configuration.d.ts
 
 # The Edge benchmark extracts a base ref here while it runs
 apps/edge/bench/.base-src/
+
+# Private local adopter tooling state
+/.ohmyhost/

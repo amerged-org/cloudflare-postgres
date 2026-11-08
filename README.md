@@ -2,9 +2,34 @@
 
 Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare account** and **your
 VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
-Each VPS is a self-contained Debian node installed from one image: real, unmodified PostgreSQL
-runs as one sandboxed systemd service per database on its own thin LVM volume, next to one Rust
-node agent. There is no Kubernetes and no control server. Server loss is recovered from R2.
+Each VPS is a self-contained Debian 13 (trixie) node installed from one image. Unmodified
+PostgreSQL 18.6 runs in sandboxed systemd slots, with one isolated instance and thin LVM volume
+per database, next to one Rust node agent. Server loss is recovered from R2.
+
+## Stack
+
+| Part | Runtime |
+| --- | --- |
+| Node OS | Debian 13 (trixie), systemd, cgroup v2 |
+| Database | PostgreSQL 18.6 from pinned PGDG packages |
+| First-party node binaries | Native Rust: `pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive`, `pgcf-wal-fetch` |
+| Cloudflare management | TypeScript API Worker, Durable Objects, Workflows and release signer |
+| Deployed Edge | TypeScript (`apps/edge`); Rust/Wasm (`apps/edge-rust`) is built/tested and not deployed |
+
+"Rust node image" describes its four first-party executables. PostgreSQL, systemd, cloudflared,
+Barman Cloud and other upstream packages retain their own implementations. The image requires
+no Node.js runtime; Node.js remains tooling for the CLI and operator scripts outside the image.
+Talos, Kubernetes, CloudNativePG and OpenEBS were retired by the October 17 architecture decision.
+The systemd slot pool was reinstated on October 20. Its Rust supervisor executes PostgreSQL
+after the agent binds the database's retained volume and socket directory.
+
+The image's [package recipe](infra/node-image/mkosi.conf),
+[slot unit](infra/node-image/mkosi.extra/usr/lib/systemd/system/pgcf-slot@.service) and
+[builder notes](infra/node-image/README.md) define this node stack. Use the latest dated entries
+in the [ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md) for actual
+per-node releases and operating health; a historical closeout is not a rolling deployment claim.
+
+## Capabilities
 
 - Create, resize, suspend, restore and delete databases through a versioned API.
 - Connect through Cloudflare: PostgreSQL over WebSocket. The VPS expose no database port.
@@ -34,8 +59,8 @@ states what runs where; it does not repeat measurements.
 | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | API Worker, DatabaseActor, NodeActor, Workflows | TypeScript on Cloudflare, deployed; each node links to its NodeActor over `/node/v1`                                                        |
 | Edge Worker                                     | TypeScript (`apps/edge`) is deployed; the Rust/Wasm target (`apps/edge-rust`) is built and tested by CI and not deployed                     |
-| Gateway                                         | Rust (`apps/native-gateway`) on every node beside the agent, reached through the node's Tunnel behind Cloudflare Access; runs on EU1        |
-| Node runtime                                    | The Debian image, the Rust node agent, the PostgreSQL units and the thin LVM volumes ([node image](infra/node-image/README.md), [agent](apps/node-agent/README.md)); EU1 runs it |
+| Gateway                                         | Rust (`apps/native-gateway`) on each node beside the agent, reached through that node's Tunnel behind Cloudflare Access |
+| Node runtime                                    | Debian 13 image, Rust node agent, sandboxed PostgreSQL slots and thin LVM volumes ([node image](infra/node-image/README.md), [agent](apps/node-agent/README.md)); see dated ULTRA entries for regional release verification |
 | Release signer                                  | TypeScript Worker (`apps/release-signer`): signs a release's manifest for CI, whose key is a Cloudflare secret; deployed, key provisioned 2026-10-19         |
 
 Placement follows the

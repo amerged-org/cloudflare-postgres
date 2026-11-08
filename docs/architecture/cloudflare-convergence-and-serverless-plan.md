@@ -79,6 +79,81 @@ completion times, not a backup-start deadline or a restore test. Both original s
 report backup, WAL archiving and disk health **`ok`**. The original
 `database_base_backup_stale` episode is **inactive**, and control cron is **`ok`** with no failing
 steps. No customer-data mutation or manual backup was used to obtain the result.
+# Publication review of remaining changes — 2026-11-08
+
+The remaining private-tooling ignore rule and append-only local credential-custody
+instructions are recorded alongside the sanitized operating snapshot and backup-alert
+diagnosis below. Customer-linked inventory attribution, database identifiers and the
+alert episode identifier were removed before publication. Mermaider 0.1.1, its gallery
+and font notices were already published; their newer source-backed versions are retained.
+No credential file or private evidence was read, staged or published. No live system
+or paid resource changed.
+
+Publication checks covered all 40 changed public files in the older checkout and the three
+remaining files on the current branch. Both Gitleaks scans returned zero findings; independent
+review found no public-safety blocker after anonymization. The complete canonical-plan privacy
+check returned zero findings, and `git diff --check` passed. Mermaider checked five diagrams
+with zero changed paths; existing placeholder and compacted-condition warnings remain scoped
+to source coverage, not deployed-resource claims.
+
+## Read-only base-backup alert diagnosis — 2026-11-08
+
+An operator-visible US `database_base_backup_stale` alert
+opened at **19:30:10.266 UTC**. Live API, D1 and R2 catalog reads confirmed that
+the first affected database last completed a base backup at **November 6 12:00:24.840 UTC**,
+and the second affected database at **October 30 09:55:36.244 UTC**. Both were ready/awake,
+with effective idle sleep **300 seconds**, and last woke at **November 7
+07:30:07.212 / 07:30:08.556 UTC**. The alert's 36-hour baseline is the latest
+backup, creation or wake, explaining this episode's exact firing time; it does
+not sum separate awake sessions.
+
+US1 reported release **`sha-f9faade99747`** converged. That release's
+`apps/node-agent/src/agent/power.rs` only starts a due backup while serving when
+the effective sleep delay is null or a previous backup deferral has expired.
+For a database with finite auto-sleep that never reaches idle sleep and has no
+previous deferral, the daily backup path is therefore skipped. This is a source-confirmed
+scheduling gap consistent with these live observations; runtime activity and
+backup-failure logs were not collected. Both databases report archiving `ok`;
+their catalog recovery upper bounds were **November 8 19:35:24.085 UTC / November 7
+07:35:09.074 UTC**, respectively. A null last-failure field does not establish
+that no jobs failed: native observations publish successful backup metadata.
+At this diagnostic checkpoint the scheduling fix and failing-first regression were prepared in
+[PR #54](https://github.com/amerged-org/cloudflare-postgres/pull/54), code commit
+`a55bedb5` and validation record `1916f13f`. All **59 power/lifecycle tests passed**
+against real PostgreSQL **18.6**, with zero failures or ignored tests; Rust formatting,
+Clippy (existing macOS-only warnings) and plan privacy checks passed. Hosted CI and
+the owner-authorized production rollout were still pending at that checkpoint; the later
+November 8 production-rollout record above closes them. No tenant SQL, wake,
+configuration change, deployment or resource purchase was performed.
+
+## Read-only operating snapshot — 2026-11-06
+
+At **05:56:55 UTC**, current management API inventory and read-only D1 telemetry showed **223 nondeleted databases: EU1 193 / US1 30**. EU1's 193 and US1's 25 were explicitly suspended and hibernated; US1's remaining five were ready/awake. One US database was created during this inspection, increasing the total from 222 to 223. Database names were not used to infer customer ownership; customer-specific inventory is omitted. Both nodes were ready, schedulable, placement-enabled and OS-converged, with six CPU cores and 12,548,050,944 visible RAM bytes each.
+
+The latest node observations at **05:56:14 UTC EU1 / 05:56:11 UTC US1** reported CPU busy **11 / 8 millicores** (0.183% / 0.133% of six cores), available RAM **11,837,747,200 / 11,712,983,040 bytes**, and physical database-pool use **19,627,245,568 / 4,741,529,600 bytes** out of **310,776,954,880 bytes per node** (6.316% / 1.526%). Both had zero starts, queued starts and archive-ready backlog. The US node sample preceded the fifth database's ready observation; database state and node samples are independently timestamped.
+
+For the **1,440 complete minutes from November 5 05:55 through November 6 05:54 UTC**, all minutes had samples (EU1 5,719 / US1 5,760 samples). Weighted CPU averages were **0.4403% / 0.2273%**, sampled CPU peaks **3.8000% / 7.5167%**, RAM averages **5.6197% / 6.5736%**, and sampled RAM peaks **5.7546% / 8.3117%**. Awake-database averages were **0 / 4.0575**, peaks **0 / 5**. Both had zero queued/starting peaks, capacity/start refusals and queue waits. Minute-end archive-ready backlog peaked at **0 / 1 file**, with the US file aged zero seconds at that observation; current backlog was zero. CPU includes steal and excludes I/O wait; RAM use is total minus MemAvailable. These operating observations do not establish maximum concurrency or disk-I/O latency. No tenant SQL, wakes, stress campaign, deployment, resource purchase or live-system mutation was performed.
+
+# Stack reference reconciliation — 2026-11-08
+
+README, PLAN, AGENTS and the infra entry point now state the node stack explicitly:
+Debian 13 (trixie), systemd, PostgreSQL 18.6, thin LVM and four native Rust first-party
+executables (`pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive`, `pgcf-wal-fetch`).
+PostgreSQL starts through the Rust slot supervisor after the agent binds the database's
+retained volume and socket. Talos, Kubernetes and CloudNativePG are retired; the systemd
+slot pool was reinstated on October 20.
+
+The Cloudflare API, Durable Objects, Workflows and deployed Edge remain TypeScript.
+Rust/Wasm Edge is built/tested and undeployed. "Rust node image" describes first-party
+node software, not the upstream database/OS packages or the entire control plane.
+The current image recipe and the recorded `acb21e26e064` / `f9faade99747` recipes agree
+on Debian trixie and PostgreSQL `18.6-1.pgdg13+2`. Later dated operating evidence governs
+per-node releases; this reference does not turn an earlier closeout into current health.
+No runtime code, live system, credential or acceptance gate changed.
+
+Validation: source pins and the Rust slot entrypoint verified, 48 local documentation links
+resolved, PLAN privacy check returned zero findings, and `git diff --check` passed. Independent
+review found no material discrepancy; the existing canonical ledger below remains unchanged.
 
 # General cold-storage Production activation — 2026-11-07
 
