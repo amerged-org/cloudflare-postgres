@@ -110,8 +110,9 @@ test("the Rust cache feeds verdicts only: a pull request restores it, only main 
   );
   assert.doesNotMatch(rust, /uses: actions\/cache@/);
   // The node binaries that `sign-release` signs and the Edge Worker bytes that are kept compile
-  // from nothing: no cache of compiled output reaches them.
+  // from nothing, and their packages install from the registry: no cache of compiled output or of
+  // the pnpm store (setup-node's `cache:` input) reaches them.
   for (const job of ["node-image", "edge-tests", "sign-release"]) {
-    assert.doesNotMatch(code(jobs[job]!), /actions\/cache/, job);
+    assert.doesNotMatch(code(jobs[job]!), /actions\/cache|^ *cache:/m, job);
   }
 });
