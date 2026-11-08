@@ -1516,8 +1516,9 @@ export const NodeSample = z
   .strictObject({
     observed_at: Timestamp,
     /**
-     * MemTotal and MemAvailable. A node is far below 1 TiB; the bound keeps the placement
-     * arithmetic of the rollups inside SQLite's 64-bit integers.
+     * MemTotal and MemAvailable. A node is far below 1 TiB; the bound keeps the arithmetic of one
+     * sample inside SQLite's 64-bit integers. Placement ranks on the memory placed, not on these
+     * readings, so a node that reports odd totals cannot buy placement with them.
      */
     memory: z.strictObject({
       total_bytes: Positive.max(2 ** 40),

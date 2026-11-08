@@ -85,7 +85,8 @@ describe("which node takes a new database", () => {
   it("skips the fullest node when the database would take it to 80 % and goes on to the next", () => {
     const nodes = [
       node({ id: id("a"), ram_peak_ppm: 500_000 }),
-      node({ id: id("c"), ram_peak_ppm: 780_000 }),
+      // More memory placed on it, so only the 80 % veto keeps it from winning.
+      node({ id: id("c"), ram_peak_ppm: 780_000, placed_memory_mib: 1024 }),
     ];
     expect(pick(nodes)).toBe(id("a"));
   });
