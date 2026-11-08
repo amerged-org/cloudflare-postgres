@@ -50,6 +50,24 @@ pub struct Node {
     legacy: Mutex<BTreeMap<u32, String>>,
 }
 
+/// Removes everything in a socket directory and keeps the directory with its mode and owner. A
+/// link is removed as a link, never followed; a directory that is gone holds nothing.
+fn empty_socket_directory(directory: &Path) -> io::Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        entries => entries?,
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// The first entry of a colon-separated database such as `/etc/passwd` or `/etc/group` whose first
 /// field is `name`: its fields.
 fn lookup(path: &str, name: &str) -> Option<Vec<String>> {
@@ -232,6 +250,39 @@ impl Node {
                 .map_err(|error| io::Error::other(error.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Ends the database's unit as `stop` does, whichever kind holds it.
+    async fn end_unit(&self, database: &str) -> Result<(), units::Error> {
+        if self.pool.stop(database).await? {
+            return Ok(());
+        }
+        // A unit of its own that an earlier agent started goes to sleep as it did; one that does
+        // not run is not asked, which would load it.
+        if self.units.state(database).await?.active.awake() {
+            let stopped = self.units.stop(database).await;
+            if stopped.is_ok() {
+                self.legacy
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|_, held| held != database);
+            }
+            return stopped;
+        }
+        Ok(())
+    }
+
+    /// Empties the database's socket directory, but only while no slot and no unit of its own
+    /// holds the database: a running PostgreSQL keeps its socket and lock file there.
+    async fn clear_socket_directory(&self, database: &str) -> Result<(), units::Error> {
+        if self.pool.slot_of(database).is_some() || self.units.holds_database(database).await? {
+            return Ok(());
+        }
+        let directory = self.layout.socket_directory(database);
+        tokio::task::spawn_blocking(move || empty_socket_directory(&directory))
+            .await
+            .map_err(|_| units::Error::Unexpected("the socket directory's cleanup panicked"))?
+            .map_err(units::Error::Io)
     }
 }
 
@@ -493,6 +544,7 @@ impl Machine for Node {
         Ok(states)
     }
     async fn bind(&self, database: &str, bind: &Bind) -> Result<Bound, units::Error> {
+        self.clear_socket_directory(database).await?;
         self.pool.bind(database, bind).await
     }
     async fn exec(&self, bound: &Bound) -> Result<Started, units::Error> {
@@ -515,21 +567,10 @@ impl Machine for Node {
         self.units.timeline(database, started).await
     }
     async fn stop(&self, database: &str) -> Result<(), units::Error> {
-        if self.pool.stop(database).await? {
-            return Ok(());
-        }
-        // A unit of its own that an earlier agent started goes to sleep as it did; one that does
-        // not run is not asked, which would load it.
-        if self.units.state(database).await?.active.awake() {
-            let stopped = self.units.stop(database).await;
-            if stopped.is_ok() {
-                self.legacy
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .retain(|_, held| held != database);
-            }
-            return stopped;
-        }
+        self.end_unit(database).await?;
+        // The unit has ended, so a failed cleanup must not turn the stop into the error that says
+        // PostgreSQL may still run; the next bind empties the directory again.
+        let _ = self.clear_socket_directory(database).await;
         Ok(())
     }
     async fn kill(&self, database: &str) -> Result<(), units::Error> {
@@ -890,6 +931,35 @@ mod tests {
         assert!(lookup(path_text, "20000").is_none() && lookup(path_text, "pgcf").is_none());
         assert!(lookup("/nonexistent/passwd", "root").is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// What an awake period leaves in a database's socket directory goes when the database is
+    /// bound or stopped. The directory stays with its mode and owner, and a link is removed as a
+    /// link, never followed to what lies outside the directory.
+    #[test]
+    fn a_socket_directory_is_emptied_without_following_a_link() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let root = std::env::temp_dir().join(format!("pgcf-socket-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let directory = root.join("run");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(directory.join("nested")).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::write(&outside, "kept").unwrap();
+        std::fs::write(directory.join("file"), "gone").unwrap();
+        std::fs::write(directory.join("nested").join("file"), "gone").unwrap();
+        symlink(&outside, directory.join("link")).unwrap();
+        symlink(&outside, directory.join("nested").join("link")).unwrap();
+        let before = std::fs::metadata(&directory).unwrap();
+
+        empty_socket_directory(&directory).unwrap();
+
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept");
+        let after = std::fs::metadata(&directory).unwrap();
+        assert_eq!(after.mode() & 0o777, 0o750);
+        assert_eq!(after.uid(), before.uid());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
