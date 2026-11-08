@@ -114,8 +114,13 @@ impl Layout {
     pub fn host_files(&self) -> PathBuf {
         crate::hostfiles::state_path(&self.agent())
     }
-    /// The scratch directory of the barman jobs' environment files.
+    /// The scratch directory of the barman jobs' environment files: on the runtime directory's
+    /// tmpfs, so that a credential never reaches the root disk (`service.rs` sweeps it at start).
     pub fn jobs(&self) -> PathBuf {
+        self.agent_run().join("jobs")
+    }
+    /// Where an agent before this one kept them, on the root disk: swept at start, never used.
+    pub fn legacy_jobs(&self) -> PathBuf {
         self.agent().join("jobs")
     }
 }
@@ -146,6 +151,10 @@ mod tests {
             layout.archive_socket(),
             PathBuf::from(crate::archive::protocol::SOCKET)
         );
+        // The jobs' environment files hold the credentials: they live on the runtime directory's
+        // tmpfs, never on the root disk, which an offline read of the disk would reach.
+        assert_eq!(layout.jobs(), PathBuf::from("/run/pgcf/agent/jobs"));
+        assert_eq!(layout.legacy_jobs(), PathBuf::from("/var/lib/pgcf/agent/jobs"));
         // Nothing of the agent's own is below a database's volume, which its user can rearrange.
         assert!(!layout.database_files("a").starts_with(layout.volume("a")));
     }
