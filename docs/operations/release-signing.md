@@ -189,7 +189,7 @@ no step prints one.
    that holds the control plane (the variables Wrangler reads; `pnpm install` has been run):
 
    ```sh
-   cd apps/release-signer && npx wrangler deploy
+   cd apps/release-signer && pnpm exec wrangler deploy
    ```
 
    The Worker is `pgcf-release-signer-dev`, reachable at its `workers.dev` address (Wrangler prints it;
@@ -219,7 +219,7 @@ no step prints one.
    secret was set, the error contains the public key to put there (it is no secret). If the API's answer
    to the secret never arrives, the error says that it is not known whether the Worker holds a new key,
    gives the public half, and leaves the file unchanged; the Worker held no secret before the command,
-   so delete the one it may hold with `npx wrangler secret delete RELEASE_SIGNING_KEY --name <worker>`
+   so delete the one it may hold with `cd apps/release-signer && pnpm exec wrangler secret delete RELEASE_SIGNING_KEY --name <worker>`
    and run the command again.
 
 3. **Commit the public key and set the variable.** Write the key into the API Worker's constant, commit
@@ -281,7 +281,7 @@ steps below switch the signer, the API and CI to the new text. Doing the steps b
 that has not taken the first release is the case that needs the hand replacement.
 
 1. Deploy the signer from a checkout of the branch tip that is about to be merged (`cd
-   apps/release-signer && npx wrangler deploy`). The signer bundles the manifest's contract
+   apps/release-signer && pnpm exec wrangler deploy`). The signer bundles the manifest's contract
    (`ReleaseManifestFields`), so the checkout has to hold the new one even where the signer's own files
    did not change; a checkout of the merge commit does as well. Until `main` carries the new CI, a
    push to `main` is signed by a signer that expects the new fields and is refused
@@ -316,7 +316,7 @@ not before.** One Worker holds one secret and a secret cannot be read back, so t
 the old signer: it is made in a second signer, and the cut-over is the repository variable.
 
 1. Deploy a second signer from the same code under another name, with the same variables:
-   `cd apps/release-signer && npx wrangler deploy --name pgcf-release-signer-next`.
+   `cd apps/release-signer && pnpm exec wrangler deploy --name pgcf-release-signer-next`.
 2. `node scripts/operations/release-signing.ts provision --rotate --worker pgcf-release-signer-next
    --token-env … --account-env …` makes the new key in memory, sets it as the second signer's secret
    and writes its public half to `release-signing.pub`; then `node
@@ -340,7 +340,7 @@ the old signer: it is made in a second signer, and the cut-over is the repositor
    key, and its agent trusts the new one.
 5. Point `RELEASE_SIGNER_URL` at the second signer (`gh variable set RELEASE_SIGNER_URL --body …`), set
    `name` in `apps/release-signer/wrangler.jsonc` to the second signer's name so that later deploys
-   update it, and delete the old Worker (`npx wrangler delete --name pgcf-release-signer-dev`), so that
+   update it, and delete the old Worker (`cd apps/release-signer && pnpm exec wrangler delete --name pgcf-release-signer-dev`), so that
    the old key can sign nothing more. Merge a commit to `main` (the change of `wrangler.jsonc` is one):
    its build is signed by the new key and is the first the fleet accepts under it. Wait for its
    `sign-release` job.
@@ -355,7 +355,7 @@ the old signer: it is made in a second signer, and the cut-over is the repositor
 
 A node that missed the transition (it was offline) still trusts the old key and refuses the releases
 of the new one: reinstall it, as for a lost node. There is no rotating in place: `provision` never
-replaces a secret. Deleting the signer's secret by hand (`npx wrangler secret delete
+replaces a secret. Deleting the signer's secret by hand (`cd apps/release-signer && pnpm exec wrangler secret delete
 RELEASE_SIGNING_KEY --name <worker>`) and provisioning again is a cut-over with no transition: the
 old key stops signing at once, and no running node accepts a release again until it is reinstalled,
 which is the loss case below.
@@ -369,7 +369,7 @@ key, no signature that a node accepts can be made any more: the nodes keep runni
 databases and keep their data, but no release can reach them again, and **every node has to be
 reinstalled** from an image built with a new key's public half. Deploy a signer, run
 `provision --rotate` against a Worker that holds no secret (a new Worker name, or after
-`npx wrangler secret delete RELEASE_SIGNING_KEY --name <worker>` for one whose secret is lost or
+`cd apps/release-signer && pnpm exec wrangler secret delete RELEASE_SIGNING_KEY --name <worker>` for one whose secret is lost or
 wrong; `provision` never replaces a secret itself), write the new public key into the API's constant
 (`generate-release-key.ts`) and commit both files, deploy the API of that commit before anything is
 registered (it verifies with the key it was built with), build and register the image, and reinstall
@@ -381,7 +381,7 @@ deploy a version of the signer Worker can read the key out of it and keep it, an
 code afterwards does not undo that. So apply this procedure not only when the account is under someone
 else's control but to any suspected misuse of Workers edit access: an API token with Workers Scripts:
 Edit that leaked, a member of the account who should not have had that access, an unexplained version
-of the signer Worker in its deployment history. Delete the secret first if you still can (`npx wrangler
+of the signer Worker in its deployment history. Delete the secret first if you still can (`cd apps/release-signer && pnpm exec wrangler
 secret delete RELEASE_SIGNING_KEY --name pgcf-release-signer-dev`) so that the old key signs nothing
 more through the Worker, and treat every release signed since the suspected misuse as untrusted: the
 holder of the key can also sign a transition release that carries their own key.

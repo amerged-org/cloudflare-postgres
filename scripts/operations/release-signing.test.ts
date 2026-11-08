@@ -346,7 +346,7 @@ test("an answer to the request that sets the secret that never arrives leaves th
         // The Worker held no secret before this command, so deleting what may be there loses no key.
         assert.match(
           error.message,
-          /npx wrangler secret delete RELEASE_SIGNING_KEY --name pgcf-release-signer-test/,
+          /cd apps\/release-signer && pnpm exec wrangler secret delete RELEASE_SIGNING_KEY --name pgcf-release-signer-test/,
         );
         assert.match(error.message, /[0-9a-f]{64}/);
         const sent = (JSON.parse(api.seen[1]!.body) as { text: string }).text;
@@ -509,5 +509,32 @@ test("the API base is https, or http on this machine", async () => {
       await assert.rejects(provision(options(apiBase, publicPath)), /API base/);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("every wrangler command the operator is told to run is pinned to the signer workspace with pnpm exec, never npx", async () => {
+  const texts = await Promise.all([
+    readFile(new URL("./release-signing.ts", import.meta.url), "utf8"),
+    readFile(
+      new URL("../../docs/operations/release-signing.md", import.meta.url),
+      "utf8",
+    ),
+  ]);
+  for (const text of texts) {
+    // The runbook wraps commands across lines, so the check compares on single spaces.
+    const flat = text.replace(/\s+/g, " ");
+    assert.doesNotMatch(flat, /npx wrangler/);
+    const commands = [
+      ...flat.matchAll(/wrangler (secret delete|delete|deploy)\b/g),
+    ];
+    assert.ok(commands.length > 0);
+    for (const command of commands) {
+      assert.ok(
+        flat
+          .slice(0, command.index)
+          .endsWith("cd apps/release-signer && pnpm exec "),
+        `not pinned to the signer workspace: ${command[0]}`,
+      );
+    }
   }
 });
