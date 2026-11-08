@@ -22,6 +22,16 @@ diagnostic history also returned zero findings. Main baseline `1640e54b` passed 
 including native tests, image boot and signing. This consolidation changes documentation and
 an ignore rule; it performs no deployment, node assignment, resource purchase or live data write.
 
+**Cleanup completed:** 65 local side branches (including the temporary consolidation branch)
+and four remote side branches were deleted only after their tips were reachable from main.
+The root checkout was fast-forwarded to main and is clean. Fifty-one redundant/temporary
+worktree registrations were retired, including 13 reviewed scratch-file edits; only the root
+worktree remains registered. Public tracked source was removed from the retired checkouts,
+while 45 directories containing ignored files were preserved at their original paths. No
+ignored credential or evidence file was opened or deleted. The root `.env.local` metadata was
+unchanged across the refresh. All original branch histories remain reachable through main;
+no retired Kubernetes runtime or diagnostic mutant was restored to the current source tree.
+
 # Operator shell credential custody — 2026-11-08
 
 The original operator credentials were found under the installation's ignored
