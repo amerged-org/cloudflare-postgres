@@ -439,3 +439,39 @@ it("answers a node's read through the handler the node router calls once it has 
   expect((await get("crd_" + "a".repeat(20))).status).toBe(404);
   expect((await get("not-an-id")).status).toBe(404);
 });
+
+it("gives a read-only credential one day and a read-write credential seven, renewing each after a third of its own lifetime", async () => {
+  const f = await lifecycle(),
+    row = await f.row(),
+    now = Date.parse("2026-10-18T10:00:00.000Z");
+  const scope = {
+    nodeId: f.node,
+    archivePath: row.archive_path,
+    access: "read_only" as const,
+  };
+  const reading = await ensureArchiveCredential(env.DB, scope, now);
+  expect(reading.expires_at).toBe(new Date(now + DAY).toISOString());
+  const writing = await ensureArchiveCredential(
+    env.DB,
+    { ...scope, access: "read_write" },
+    now,
+  );
+  expect(writing.expires_at).toBe(
+    new Date(now + ARCHIVE_CREDENTIAL_LIFETIME_SECONDS * 1000).toISOString(),
+  );
+  // Renewed after eight hours, a third of the day.
+  expect(
+    await ensureArchiveCredential(env.DB, scope, now + 7 * 3600_000),
+  ).toEqual(reading);
+  expect(
+    (await ensureArchiveCredential(env.DB, scope, now + 9 * 3600_000)).id,
+  ).not.toBe(reading.id);
+  // The credential the node reads ends with the day, not with the week.
+  const delivered = await deliverArchiveCredential(
+    keyedEnv(),
+    f.node,
+    reading.id,
+    now + 1000,
+  );
+  expect(claimsOf(delivered!).exp).toBe(Math.floor((now + DAY) / 1000));
+});
