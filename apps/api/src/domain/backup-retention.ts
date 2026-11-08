@@ -8,6 +8,7 @@ import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
 import { BACKUP_DATA, keysOf, walRangeArchived } from "./archive-chain.ts";
 import {
+  fencedAtSql,
   parseBackupInfo,
   readRestoreCatalog,
   type RestoreBackup,
@@ -121,10 +122,11 @@ async function findAnchor(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
+  notAfter?: string,
 ): Promise<RestoreBackup | null> {
   try {
     return (
-      (await readRestoreCatalog(bucket, prefix)).backups.find(
+      (await readRestoreCatalog(bucket, prefix, notAfter)).backups.find(
         (backup) => Date.parse(backup.end) <= cutoff,
       ) ?? null
     );
@@ -147,8 +149,9 @@ export async function retainBackups(
   prefix: string,
   cutoff: number,
   maxDeletes = DEFAULT_DELETES_PER_DATABASE,
+  notAfter?: string,
 ): Promise<RetentionResult> {
-  const anchor = await findAnchor(bucket, prefix, cutoff);
+  const anchor = await findAnchor(bucket, prefix, cutoff, notAfter);
   if (!anchor) return { backups: 0, objects: 0, complete: true };
   const descriptors: string[] = [],
     data: string[] = [];
@@ -193,6 +196,7 @@ interface DueRow {
   archive_path: string;
   storage_generation: number;
   backup_retention_days: number;
+  fenced_at: string | null;
 }
 export interface RetentionRun {
   checked: number;
@@ -217,11 +221,12 @@ export async function enforceBackupRetention(
   const at = new Date(now).toISOString();
   const due = (
     await env.DB.prepare(
-      `SELECT d.id,d.region_id,d.archive_path,d.storage_generation,s.backup_retention_days
+      `SELECT d.id,d.region_id,d.archive_path,d.storage_generation,s.backup_retention_days,${fencedAtSql("d.node_id")} AS fenced_at
       FROM databases d JOIN size_classes s ON s.id=d.size_class_id
       LEFT JOIN backup_retention_runs c ON c.database_id=d.id AND c.archive_path=d.archive_path
       LEFT JOIN database_recovery_points p ON p.database_id=d.id AND p.storage_generation=d.storage_generation
       WHERE d.node_id IS NOT NULL AND d.deleted_at IS NULL AND d.desired_state<>'deleted'
+      AND NOT EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=d.node_id AND l.powered_off_at IS NULL)
       AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase IN('proving','restoring','rolling_back'))
       AND NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id
         WHERE x.source_database_id=d.id AND x.verified_at IS NULL AND o.status IN('pending','running'))
@@ -241,6 +246,8 @@ export async function enforceBackupRetention(
         selected.bucket,
         validatedArchivePrefix(row, selected.bucketName),
         now - row.backup_retention_days * 86_400_000,
+        undefined,
+        row.fenced_at ?? undefined,
       );
       run.backups += result.backups;
       run.objects += result.objects;

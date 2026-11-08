@@ -206,7 +206,9 @@ A node holds no secret of the image. Its credentials come from the install and f
   base backup, a WAL archive and a restore read on the new key
   ([the bucket move](operator-installation.md#moving-to-another-archive-bucket), step 11): deleting it
   earlier ends the credentials the nodes hold, and archiving fails until they read new ones
-  (`database_archive_failing`).
+  (`database_archive_failing`). A fenced node's credentials stay valid until they expire, up to 7
+  days after the fence; deleting the old parent token ends them at once. Replacing the parent key is
+  the operator's planned step when compromise is suspected ([recovery](recovery.md#lost-node)).
 
 ## Provider and account credentials
 

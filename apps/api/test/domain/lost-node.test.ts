@@ -2,10 +2,12 @@
 import { env } from "cloudflare:workers";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
+import { cleanupRetainedArchives } from "../../src/domain/retained-archives.ts";
 import {
   cleanupFixtures,
   desiredPage,
   fixture,
+  refusal,
   report,
   request,
   verdicts,
@@ -84,4 +86,103 @@ it("keeps the warm Actor of a lost node's database closed and takes no report of
       .bind(id)
       .first("count"),
   ).toBe(0);
+});
+
+it("purges a database deleted on a lost node once its node is fenced and its archive has expired", async () => {
+  const f = await fixture();
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  const id = created.database.id;
+  expect(await verdicts(await report(f, id, 1))).toEqual(["accept"]);
+  const archivePath = await env.DB.prepare(
+    "SELECT archive_path FROM databases WHERE id=?",
+  )
+    .bind(id)
+    .first<{ archive_path: string }>();
+  const prefix =
+    archivePath!.archive_path.replace(`s3://${env.ARCHIVE_BUCKET_NAME}/`, "") +
+    "/database/";
+  expect(
+    (
+      await request(`/v1/nodes/${f.node}/mark-lost`, f.admin, "POST", {
+        expected_node_uid: f.nodeUid,
+        reason: "confirmed source node loss",
+      })
+    ).status,
+  ).toBe(200);
+  // The fence completes: the Tunnel is gone and the instance is powered off.
+  const fenced = new Date().toISOString();
+  await env.DB.prepare(
+    "UPDATE node_losses SET tunnel_deleted_at=?,power_off_requested_at=?,powered_off_at=? WHERE node_id=?",
+  )
+    .bind(fenced, fenced, fenced, f.node)
+    .run();
+  expect(
+    (await request(`/v1/databases/${id}`, f.integrator, "DELETE")).status,
+  ).toBe(202);
+  const expiry = await env.DB.prepare(
+    "SELECT expires_at FROM retained_archives WHERE source_database_id=?",
+  )
+    .bind(id)
+    .first<{ expires_at: string }>();
+  const now = Date.parse(expiry!.expires_at);
+  await env.ARCHIVE.put(`${prefix}base/20260101T000000/data.tar.gz`, "payload");
+  await env.ARCHIVE.put(
+    `${prefix}wals/0000000100000000/000000010000000000000001.gz`,
+    "wal",
+  );
+  expect(await cleanupRetainedArchives(env, now)).toEqual({
+    purged: 0,
+    objects: 2,
+  });
+  expect(await cleanupRetainedArchives(env, now)).toEqual({
+    purged: 1,
+    objects: 0,
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) count FROM retained_archives WHERE source_database_id=?",
+    )
+      .bind(id)
+      .first(),
+  ).toEqual({ count: 0 });
+  expect(
+    await env.DB.prepare("SELECT COUNT(*) count FROM roles WHERE database_id=?")
+      .bind(id)
+      .first(),
+  ).toEqual({ count: 0 });
+});
+
+it("refuses to restore from a lost node's database until the node is fenced", async () => {
+  const f = await fixture();
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  const id = created.database.id;
+  expect(await verdicts(await report(f, id, 1))).toEqual(["accept"]);
+  expect(
+    (
+      await request(`/v1/nodes/${f.node}/mark-lost`, f.admin, "POST", {
+        expected_node_uid: f.nodeUid,
+        reason: "confirmed source node loss",
+      })
+    ).status,
+  ).toBe(200);
+  const restore = () =>
+    request(`/v1/databases/${id}/restore`, f.integrator, "POST", {
+      name: "from-lost",
+      mode: "full",
+    });
+  // Lost but not fenced: the node can still write, so its archive is not read.
+  expect(await refusal(await restore())).toMatchObject({
+    status: 409,
+    reason: "source_unavailable",
+  });
+  const fenced = new Date().toISOString();
+  await env.DB.prepare(
+    "UPDATE node_losses SET tunnel_deleted_at=?,power_off_requested_at=?,powered_off_at=? WHERE node_id=?",
+  )
+    .bind(fenced, fenced, fenced, f.node)
+    .run();
+  // Fenced: the archive is read, and this one holds no recovery point.
+  expect(await refusal(await restore())).toMatchObject({
+    reason: "no_recovery_point",
+  });
 });

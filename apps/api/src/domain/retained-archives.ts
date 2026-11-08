@@ -2,6 +2,7 @@
 import type { Env } from "../env.ts";
 import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
+import { fencedAtSql } from "./restore-catalog.ts";
 interface ExpiredArchive {
   source_database_id: string;
   region_id: string;
@@ -33,6 +34,9 @@ export function retainedArchiveRestorable(
     retained.storage_generation === (source.storage_generation ?? 1)
   );
 }
+// A database is gone once it is deleted, or once its node is fenced: a deleted database on a lost
+// node is never reported by that node, so its archive would otherwise never be purged.
+const gone = `(d.observed_state='deleted' OR ${fencedAtSql("d.node_id")} IS NOT NULL)`;
 const idle = `NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.source_database_id=a.source_database_id AND x.verified_at IS NULL AND o.status IN('pending','running'))`;
 export async function cleanupRetainedArchives(
   env: Env,
@@ -45,7 +49,7 @@ export async function cleanupRetainedArchives(
   const named = `s3://${archiveBucket(env).bucketName}/`;
   const rows = await env.DB.prepare(
     `SELECT a.* FROM retained_archives a JOIN databases d ON d.id=a.source_database_id
-   WHERE a.expires_at<=? AND substr(a.archive_path,1,length(?))=? AND d.desired_state='deleted' AND d.observed_state='deleted' AND d.deleted_at=a.deleted_at AND d.archive_path=a.archive_path AND d.storage_generation=a.storage_generation AND ${idle} ORDER BY a.expires_at,a.source_database_id LIMIT 2`,
+   WHERE a.expires_at<=? AND substr(a.archive_path,1,length(?))=? AND d.desired_state='deleted' AND ${gone} AND d.deleted_at=a.deleted_at AND d.archive_path=a.archive_path AND d.storage_generation=a.storage_generation AND ${idle} ORDER BY a.expires_at,a.source_database_id LIMIT 2`,
   )
     .bind(timestamp, named, named)
     .all<ExpiredArchive>();
@@ -55,7 +59,7 @@ export async function cleanupRetainedArchives(
     const claim = row.cleanup_claim ?? crypto.randomUUID();
     const claimed = await env.DB.prepare(
       `UPDATE retained_archives AS a SET cleanup_claim=? WHERE source_database_id=? AND expires_at<=? AND cleanup_claim IS ? AND ${idle}
-    AND EXISTS(SELECT 1 FROM databases d WHERE d.id=a.source_database_id AND d.desired_state='deleted' AND d.observed_state='deleted' AND d.deleted_at=a.deleted_at AND d.archive_path=a.archive_path AND d.storage_generation=a.storage_generation)`,
+    AND EXISTS(SELECT 1 FROM databases d WHERE d.id=a.source_database_id AND d.desired_state='deleted' AND ${gone} AND d.deleted_at=a.deleted_at AND d.archive_path=a.archive_path AND d.storage_generation=a.storage_generation)`,
     )
       .bind(claim, row.source_database_id, timestamp, row.cleanup_claim)
       .run();
@@ -87,7 +91,7 @@ export async function cleanupRetainedArchives(
     const result = await env.DB.batch([
       env.DB.prepare(
         `DELETE FROM retained_archives AS a WHERE source_database_id=? AND cleanup_claim=? AND archive_path=? AND storage_generation=? AND expires_at<=? AND ${idle}
-      AND EXISTS(SELECT 1 FROM databases d WHERE d.id=a.source_database_id AND d.desired_state='deleted' AND d.observed_state='deleted' AND d.deleted_at=a.deleted_at AND d.archive_path=a.archive_path AND d.storage_generation=a.storage_generation)`,
+      AND EXISTS(SELECT 1 FROM databases d WHERE d.id=a.source_database_id AND d.desired_state='deleted' AND ${gone} AND d.deleted_at=a.deleted_at AND d.archive_path=a.archive_path AND d.storage_generation=a.storage_generation)`,
       ).bind(
         row.source_database_id,
         claim,
@@ -96,7 +100,7 @@ export async function cleanupRetainedArchives(
         timestamp,
       ),
       env.DB.prepare(
-        "DELETE FROM roles WHERE database_id=? AND changes()=1 AND EXISTS(SELECT 1 FROM databases d WHERE d.id=roles.database_id AND d.desired_state='deleted' AND d.observed_state='deleted')",
+        `DELETE FROM roles WHERE database_id=? AND changes()=1 AND EXISTS(SELECT 1 FROM databases d WHERE d.id=roles.database_id AND d.desired_state='deleted' AND ${gone})`,
       ).bind(row.source_database_id),
     ]);
     purged += result[0]!.meta.changes;

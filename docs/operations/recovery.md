@@ -171,6 +171,16 @@ database moves (plan 7.11, 9.4).
    records (`DELETE /zones/{zone}/dns_records/{record}`). Never delete a `pgcf-` record whose Tunnel
    is alive, and never a record by name pattern alone: the cleanup of 2026-10-22 deleted only a
    record whose target was one of the account's own deleted Tunnels.
+   **Suspected compromise.** A restore or backup-retention pass of a lost node's archive reads only
+   the objects uploaded up to the fence, and refuses a source on a lost node that is not yet fenced.
+   The R2 credentials a node was given stay valid for their 7 days after the fence, though: when
+   compromise of the node is suspected, the operator replaces the R2 parent key as a planned step,
+   with the owner's approval: create the new token (object read and write on the archive bucket),
+   set `R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`, deploy, then delete the old token.
+   Deleting it ends every credential the old key signed at once
+   ([credentials](credentials.md#provider-and-account-credentials)). Healthy nodes fail archiving
+   (`database_archive_failing`) until they read new credentials, and the bucket is shared by every
+   region, so the step affects them too.
 4. Only when the status is `fenced`, restore the affected databases onto healthy capacity with the
    separate-target restore procedure above. Each restore is a new database with a new ID; the
    integrator rebinds. The last archived commit is what comes back, not the last acknowledged one
@@ -191,7 +201,8 @@ database moves (plan 7.11, 9.4).
    acknowledges that loss with `POST /v1/nodes/{id}/reinstall-override` and a reason.
 7. The reinstall brings the node back empty: recover mode restores nothing, and each database
    is restored from R2 as a new database with the restore procedure above (a new ID; the
-   integrator rebinds).
+   integrator rebinds). A database deleted on a lost node is purged with its retained archive once
+   that archive expires, after the fence: its node never reports the deletion.
 
 **Measured (EU1).** Fence: within 30 s of `mark-lost` (2026-10-19). Reinstall: AddNode in recover
 mode reached `ready` after 231 s on 2026-10-19; the pull install alone took 196.5 s from the rescue
