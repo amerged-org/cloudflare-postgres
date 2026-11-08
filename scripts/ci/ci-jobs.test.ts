@@ -116,3 +116,21 @@ test("the Rust cache feeds verdicts only: a pull request restores it, only main 
     assert.doesNotMatch(code(jobs[job]!), /actions\/cache|^ *cache:/m, job);
   }
 });
+
+test("the scheduled advisories job audits the production npm packages and the Rust crates with a pinned cargo-audit", () => {
+  const lock = JSON.parse(
+    readFileSync(join(root, "infra/platform/versions.lock.json"), "utf8"),
+  ) as { nativeRuntime: { cargoAuditVersion: string } };
+  assert.match(lock.nativeRuntime.cargoAuditVersion, /^\d+\.\d+\.\d+$/);
+  const job = code(jobs["advisories"]!);
+  assert.match(job, /^ {8}run: pnpm audit --prod --audit-level=moderate$/m);
+  assert.match(
+    job,
+    /^ {10}PGCF_CARGO_AUDIT_VERSION=\$\(node -p 'require\("\.\/infra\/platform\/versions\.lock\.json"\)\.nativeRuntime\.cargoAuditVersion'\)$/m,
+  );
+  assert.match(
+    job,
+    /^ {10}cargo install cargo-audit --version "\$PGCF_CARGO_AUDIT_VERSION" --locked$/m,
+  );
+  assert.match(job, /^ {10}cargo audit$/m);
+});
