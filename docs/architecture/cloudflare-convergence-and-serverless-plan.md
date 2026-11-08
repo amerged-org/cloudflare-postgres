@@ -1404,7 +1404,7 @@ The API Worker holds a parent R2 key, new in Stage 0, and **signs temporary cred
 
 - **No delete rights on nodes.** Nodes never hold a delete right or the bucket-wide key. Retention runs in the Worker (section 7.7).
 - **Margin for outages.** The 7-day lifetime leaves days of margin for a Worker, link or renewal outage. If a credential does expire, archiving fails, databases stay awake and WAL grows. The renewal alert fires long before that.
-- **Overwrites stay possible.** A credential still allows overwriting objects inside its own generation's prefix. This is accepted, because that prefix belongs to that database and generation only.
+- **Overwrites stay possible.** A credential still allows overwriting objects inside its own generation's prefix. This is accepted, because that prefix belongs to that database and generation only. The restore catalog and a retention pass of a lost node's archive ignore objects uploaded after its fence (`node_losses.powered_off_at`), and a restore source on a lost node that is not yet fenced is refused with the retryable `not_ready`; the restoring node's `wal-fetch` still reads the live prefix, so deleting the old R2 parent token, which ends the credentials it signed including the 7-day lifetime after a fence, is the operator's step when compromise is suspected ([recovery](../operations/recovery.md#lost-node)).
 - **HeadBucket.** Barman needs HeadBucket only for `--test` and for `barman-cloud-check-wal-archive`, and we use neither. Stage 1 verified this: WAL archive, base backup, restore and WAL restore all ran with credentials that cannot call HeadBucket.
 
 ### 7.4 Who runs barman

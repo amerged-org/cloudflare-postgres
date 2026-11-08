@@ -92,10 +92,44 @@ export interface RestoreCatalog {
   newestWalAt: string | null;
 }
 
-/** Reads the bounded v1 catalog; an archive it cannot read completely is `archive_unusable`. */
+/**
+ * The instant a node was fenced (its instance powered off), as SQL over `node`; NULL while the node
+ * is not lost or not yet fenced. Every archive cutoff and retained-archive purge reads it this way.
+ */
+export const fencedAtSql = (node: string) =>
+  `(SELECT l.powered_off_at FROM node_losses l WHERE l.node_id=${node})`;
+
+/**
+ * The upload cutoff for reading the archive a node wrote: its fence time, or undefined when the node
+ * is not lost. A node that is lost but not yet fenced can still write, so its archive is refused until the
+ * fence completes (retryable, `not_ready`).
+ */
+export async function archiveCutoff(
+  db: D1Database,
+  nodeId: string | null,
+): Promise<string | undefined> {
+  if (nodeId === null) return undefined;
+  const loss = await db
+    .prepare("SELECT powered_off_at FROM node_losses WHERE node_id=?")
+    .bind(nodeId)
+    .first<{ powered_off_at: string | null }>();
+  if (loss && loss.powered_off_at === null)
+    throw new ApiError(
+      "conflict",
+      "The source node is lost and not yet fenced",
+      { reason: "not_ready" },
+    );
+  return loss?.powered_off_at ?? undefined;
+}
+
+/**
+ * Reads the bounded v1 catalog; an archive it cannot read completely is `archive_unusable`. With
+ * `notAfter` (a fence time), objects uploaded later are ignored: a fenced node can no longer write.
+ */
 export async function readRestoreCatalog(
   bucket: R2Bucket,
   prefix: string,
+  notAfter?: string,
 ): Promise<RestoreCatalog> {
   const objects = new Map<string, R2Object>(),
     cursors = new Set<string>();
@@ -111,6 +145,8 @@ export async function readRestoreCatalog(
         reason: "archive_unusable",
       });
     for (const o of result.objects) {
+      if (notAfter !== undefined && o.uploaded.getTime() > Date.parse(notAfter))
+        continue;
       if (
         !o.key.startsWith(prefix) ||
         objects.has(o.key) ||
@@ -199,8 +235,9 @@ export async function restoreBackup(
   bucket: R2Bucket,
   prefix: string,
   target?: string,
+  notAfter?: string,
 ): Promise<RestoreBackup> {
-  const { backups } = await readRestoreCatalog(bucket, prefix);
+  const { backups } = await readRestoreCatalog(bucket, prefix, notAfter);
   const selected = backups.find(
     (backup) => target === undefined || backup.end <= target,
   );

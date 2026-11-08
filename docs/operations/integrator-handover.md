@@ -1150,6 +1150,7 @@ adoption paths; it does not claim a fresh live interruption of the narrow DONE-b
 | `archive_unusable`   | the v1 catalog reads at most 16,000 objects and 64 base backups per database, and the listing was incomplete, invalid or beyond that bound |
 | `name_in_use`        | a live database of the project already has the target `name`; choose another                                                               |
 | `source_unavailable` | the source's class is disabled, its region record is gone or its credentials are unavailable                                               |
+| `not_ready`          | the source's node was declared lost and its fence has not completed yet; retry after the `Retry-After` seconds                             |
 | `region_unavailable` | the `region_id` of the request is not the source's own region (a restore stays in the source's region)                                     |
 | `generation_changed` | the source, its retained archive or the placement changed under the request; retry                                                         |
 
