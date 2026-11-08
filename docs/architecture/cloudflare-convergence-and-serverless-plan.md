@@ -1,6 +1,6 @@
 # Daily base-backup scheduling fix — 2026-11-08
 
-**Implemented; not deployed.** The US stale-base-backup alert exposed a scheduling gap:
+**Deployed; live backup recovery verified.** The US stale-base-backup alert exposed a scheduling gap:
 an auto-sleep database that stays busy never reaches the idle-sleep backup path, and the
 background path previously required either an always-warm policy or an earlier idle backup
 deferral. A ready database that remains awake now schedules its due daily backup regardless
@@ -15,10 +15,43 @@ afterward**. It also checks that fresh backups are retained and the database sta
 and running. The complete power/lifecycle suite passed **59 tests, zero failures and zero
 ignored tests** against the same PostgreSQL. Rust formatting, Clippy (with existing macOS-only
 warnings) and plan privacy checks passed. Independent source review found no correctness issue.
-The implementation is in [PR #54](https://github.com/amerged-org/cloudflare-postgres/pull/54).
-Deployment and real R2
-backup/alert recovery confirmation remain open; the existing customer-serving nodes require
-the owner's explicit production-write go. No credentials, API contracts or schema changed.
+The owner explicitly authorized the production rollout. [PR #54](https://github.com/amerged-org/cloudflare-postgres/pull/54)
+merged as **`7579a39581a9d0131ba31238bb6c862fb2fe7853`**; full main
+[CI run 42520348496](https://github.com/amerged-org/cloudflare-postgres/actions/runs/42520348496)
+passed, including the actual QEMU boot and release signing. All seven artifact checksums and
+the signature verified. Registered **`sha-7579a39581a9`**, spec SHA-256
+`4535d7f979a66b9008dd88fe20dda49ce58ba5f6f3e9c3b5386b08914360e112`;
+the agent is **28,978,392 bytes**, SHA-256
+`63f00d1e0b85caa632e7250e0a86f4d65a89cd155a1e6e34e80f02c8d3c71c55`.
+The gateway, archive clients, package lock, kernel and host-file pins match the previous release.
+
+Only the two native qualification arrays changed on the management Worker, adding this release
+while retaining every earlier ID. Version **`e9530aff-015b-4422-87f3-6e7a45d7e10d`** serves at
+100%; its runtime module remains byte-identical, SHA-256
+`fcc03d44207b1380f9128f03bebbe3d91d5b37c910f47325996e9a9f6eaaa254`.
+All **53 unselected bindings**, including **15 opaque secrets**, were inherited from the exact
+serving version. The complete 55-binding readback, runtime, migration tag **v8**, routes,
+domain, schedule and Worker settings matched; general cold archival stays enabled and its
+database allowlist stays absent. No API contracts, schema or runtime credentials changed.
+
+US assignment advanced **22→23 at 20:46:54.951 UTC**; EU advanced **19→20 at
+21:07:40.996 UTC**. Independent reads at **21:09 UTC**, followed by the final **21:11:02.144 UTC**
+check, confirmed both nodes ready, schedulable, placement-enabled, OS-converged and freshly
+converged on the registered release. Both original boot IDs and kernel
+**`6.12.113+deb13-amd64`** remained unchanged; no OS maintenance or VPS purchase occurred.
+
+The actual R2 catalogs contain new completed base backups for both original alert subjects:
+
+| Database | Backup | Completed at (UTC, 2026-11-08) |
+| --- | --- | --- |
+| `rt8dns41ry0eecsqelkf` | `20261108T204806` | **20:48:10.642** |
+| `mh0ee7q165tb5njjfn4l` | `20261108T210106` | **21:01:10.310** |
+
+Another due US database completed its ordinary backup at **20:48:22.880 UTC**. These are observed
+completion times, not a backup-start deadline or a restore test. Both original subjects now
+report backup, WAL archiving and disk health **`ok`**. The original
+`database_base_backup_stale` episode is **inactive**, and control cron is **`ok`** with no failing
+steps. No customer-data mutation or manual backup was used to obtain the result.
 
 # General cold-storage Production activation — 2026-11-07
 
