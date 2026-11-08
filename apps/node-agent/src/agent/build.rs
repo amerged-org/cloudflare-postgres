@@ -530,8 +530,8 @@ impl<M: Machine> Core<M> {
             .ok_or_else(|| build_failed!())
     }
 
-    /// The base backup that is due of a database that runs (plan 7.6): before an idle sleep, daily
-    /// for an always-warm database, and for one that was put off the longest while it is used. A
+    /// The base backup that is due of a database that runs (plan 7.6): before an idle sleep, or
+    /// daily while a database stays awake, whatever its configured idle time. A
     /// database is never woken for one. It is put off, and the database is not put to sleep
     /// without it (`Backup::PutOff`), in the first minute after any database on the node became
     /// ready and while a start is queued or in flight on the node, so that the first statements

@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Starting and stopping PostgreSQL (plan 4.6, 4.7, 5.9, 7.9, 7.10): a wake, the sleep with its
 //! proof, the recovery of a database that stopped without one, and the watches that start them.
-use super::{
-    Claim, Core, Db, Desired, Entry, Phase, View,
-    build::{Backup, put_off_for_the_longest},
-    now_ms,
-    report::uuid,
-};
+use super::{Claim, Core, Db, Desired, Entry, Phase, View, build::Backup, now_ms, report::uuid};
 use crate::{
     Error,
     admission::{AdmitError, EarlySleep, Request},
@@ -1409,7 +1404,8 @@ impl<M: Machine> Core<M> {
     }
 
     /// Puts to sleep the awake databases that nobody used for their idle time (plan 3.2), and
-    /// tells admission when each was last used, which early sleep picks from. The databases are
+    /// tells admission when each was last used, which early sleep picks from. Databases that stay
+    /// awake take their due base backups while serving. The databases are
     /// looked at `start_concurrency` at a time, and each sleep is the whole proof of plan 7.9
     /// (EU1, 2026-10-23: one at a time, a sleep takes 2 to 3 s, so after a storm the awake count
     /// drained at about 0.4 a second, and one sleep that waited for the archive held up all the
@@ -1426,7 +1422,7 @@ impl<M: Machine> Core<M> {
 
     /// One database's turn of the idle pass.
     async fn idle_check(self: &Arc<Self>, db: Arc<Db>) {
-        let (entry, since, backup, put_off) = {
+        let (entry, since, backup) = {
             let view = db.view();
             if view.phase != Phase::Ready {
                 return;
@@ -1435,52 +1431,47 @@ impl<M: Machine> Core<M> {
                 view.entry.clone(),
                 view.awake_since_ms,
                 view.state.as_ref().and_then(|state| state.backup.clone()),
-                view.backup_put_off_ms,
             )
         };
         let Some(entry) = entry else { return };
         if entry.cold_snapshot_pending {
             return;
         }
-        // An always-warm database takes its backup while it serves. So does one that was put
-        // off for the longest: the idle sleep that would take it does not come while the
-        // database is used.
-        if (entry.sleep_after_seconds.is_none() || put_off_for_the_longest(put_off, now_ms()))
-            && super::build::backup_due(backup.as_ref(), None, now_ms())
-        {
-            self.spawn_served_backup(&db);
-        }
         // Without the gateway there is no way to know that nobody uses the database.
-        let Some(activity) = self.gateway.activity(&db.id).await else {
-            return;
-        };
-        let now = now_ms();
-        let last = activity
-            .last_activity_ms
-            .unwrap_or(0)
-            .max(since.unwrap_or(now))
-            .min(now);
-        let age = Duration::from_millis(u64::try_from(now - last).unwrap_or(0));
-        self.admission
-            .activity(&db.id, tokio::time::Instant::now() - age);
-        let Some(idle) = entry.sleep_after_seconds else {
-            return;
-        };
-        let busy = activity.busy_connections > 0 || activity.pending_dials > 0;
-        if !busy && age >= Duration::from_secs(idle) && entry.desired == Desired::Running {
-            // Undelivered data events keep the database awake: the drain delivers them, and a later
-            // pass asks again. The sleep's proof stays the authority over the outbox.
-            if self.outbox_backlog(&db.id) {
+        if let Some(activity) = self.gateway.activity(&db.id).await {
+            let now = now_ms();
+            let last = activity
+                .last_activity_ms
+                .unwrap_or(0)
+                .max(since.unwrap_or(now))
+                .min(now);
+            let age = Duration::from_millis(u64::try_from(now - last).unwrap_or(0));
+            self.admission
+                .activity(&db.id, tokio::time::Instant::now() - age);
+            let busy = activity.busy_connections > 0 || activity.pending_dials > 0;
+            // Undelivered data events keep the database awake. The sleep's proof stays the
+            // authority over the outbox, and the idle sleep takes any due backup itself.
+            if let Some(idle) = entry.sleep_after_seconds
+                && !busy
+                && age >= Duration::from_secs(idle)
+                && entry.desired == Desired::Running
+                && !self.outbox_backlog(&db.id)
+            {
+                self.sleep(&db, Why::Idle).await;
                 return;
             }
-            self.sleep(&db, Why::Idle).await;
+        }
+        // Every database that stays awake needs its daily backup, including auto-sleep
+        // databases kept up by traffic, an outbox backlog or unavailable gateway activity.
+        // backup_if_due retains the node's quiet window, bounded deferral and retry delay.
+        if super::build::backup_due(backup.as_ref(), None, now_ms()) {
+            self.spawn_served_backup(&db);
         }
     }
 
-    /// The base backup of a database that stays up and serves (plan 7.6): the daily one of an
-    /// always-warm database, and the one of a database that was put off the longest, off the
-    /// idle pass. A flow that runs on the database now, a backup among them, puts it off to the
-    /// next pass.
+    /// The daily base backup of a database that stays up and serves (plan 7.6), off the idle
+    /// pass. A flow that runs on the database now, a backup among them, puts it off to the next
+    /// pass.
     fn spawn_served_backup(self: &Arc<Self>, db: &Arc<Db>) {
         let (core, db) = (self.clone(), db.clone());
         tokio::spawn(async move {
@@ -3446,6 +3437,52 @@ mod tests {
         .await;
         assert_eq!(db.phase(), Phase::Ready);
         assert!(rig.machine.running(&entry.id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_auto_sleep_database_that_stays_busy_takes_its_daily_backup_without_an_idle_attempt()
+    {
+        let Some(rig) = Rig::new("backup-busy").await else {
+            return;
+        };
+        let gateway = rig.connect_gateway().await;
+        let mut json = rig.entry_json();
+        json["sleep_after_seconds"] = json!(300);
+        let (entry, db) = rig.create_from(&json).await;
+        let first = db.state().unwrap().backup.unwrap();
+        db.view().awake_since_ms = Some(now_ms() - 2 * BACKUP_AFTER_WAKE_MS);
+        {
+            let mut sessions = gateway.sessions.lock().unwrap();
+            sessions.connections = 1;
+            sessions.busy_connections = 1;
+            sessions.last_activity_ms = Some(now_ms());
+        }
+        assert!(db.view().backup_put_off_ms.is_none());
+
+        // The database never idles: today's backup stays, but yesterday's must be replaced
+        // without a prior sleep attempt to start the backup deferral clock.
+        rig.core.idle_pass().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(db.state().unwrap().backup, Some(first.clone()));
+        age_backup(&rig, &db);
+        rig.core.idle_pass().await;
+        eventually(
+            10,
+            "the daily backup of a continuously busy database",
+            || {
+                db.state()
+                    .and_then(|state| state.backup)
+                    .is_some_and(|backup| backup.backup_id != first.backup_id)
+            },
+        )
+        .await;
+        assert_eq!(db.phase(), Phase::Ready);
+        assert!(rig.machine.running(&entry.id));
+
+        let second = db.state().unwrap().backup.unwrap();
+        rig.core.idle_pass().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(db.state().unwrap().backup, Some(second));
     }
 
     /// A start in flight on the node for another database, which the test ends when it likes: what
