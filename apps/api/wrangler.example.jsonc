@@ -3,8 +3,9 @@
   "name": "pgcf-api-dev",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-02",
-  // The daily infrastructure backup streams AES-256-GCM through node:crypto.
-  "compatibility_flags": ["nodejs_compat"],
+  // The daily infrastructure backup streams AES-256-GCM through node:crypto. global_fetch_strictly_public
+  // sends a fetch to a hostname of this Worker's own zone over the public path, as a tenant's webhook URL needs.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   // Every cold Durable Object, a DatabaseActor included, loads this whole bundle in an isolate of its own
   // before it answers: a smaller bundle answers sooner.
   "minify": true,

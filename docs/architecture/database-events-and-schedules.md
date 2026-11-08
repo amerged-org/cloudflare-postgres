@@ -97,7 +97,12 @@ Schedule alarm ─┘   schedules, event buffer,  └─> /sql through the Edge,
   tools cannot verify an HMAC signature, but they can check a header or keep a secret URL.
 - `POST /v1/webhooks/{id}/test` sends a sample event, because automation tools learn their field
   mapping from a first request.
-- URLs must be HTTPS. Loopback, link-local, metadata and private addresses are refused (SSRF).
+- URLs must be HTTPS, on port 443 or 8443, with no credentials or fragment, and a DNS name with at least
+  two labels. IP literals, `localhost`, and the reserved suffixes (`.local`, `.internal`, `.lan`, `.corp` and
+  the like) are refused when the URL is set. A DNS name is not resolved at that point, so a public name that
+  points at a private address is not refused by pgcf. Delivery fetches with `global_fetch_strictly_public`
+  (in the API Worker's `compatibility_flags`), so a hostname of the API Worker's own zone takes the public
+  path and not the zone's origin.
 
 ### 4.4 Platform events
 

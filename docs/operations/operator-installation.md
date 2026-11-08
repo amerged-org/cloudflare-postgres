@@ -14,7 +14,10 @@ Use a source commit that passed the common CI checks.
 
 Keep the private API configuration outside Git. It supplies D1, the one R2 archive binding,
 NodeActor/DatabaseActor/CronWatchdog/ActorWarmer Durable Objects and the AddNode and
-InfrastructureBackup Workflows. Start from `apps/api/wrangler.example.jsonc`; replace every placeholder. Import secret
+InfrastructureBackup Workflows. Start from `apps/api/wrangler.example.jsonc`; replace every placeholder. Keep
+`global_fetch_strictly_public` in its `compatibility_flags`, as the example does: without it a webhook URL on a
+hostname of the Worker's own zone is fetched at that zone's origin, past its Workers, WAF and Access. Add the
+flag to the private configuration before the next API deploy. Import secret
 values from private custody and preserve the existing ones on every redeploy. Export D1 before
 applying additive migrations and rehearse them against the export.
 
