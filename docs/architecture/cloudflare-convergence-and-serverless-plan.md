@@ -1,3 +1,21 @@
+# Daily base-backup scheduling fix — 2026-11-08
+
+**Implemented; not deployed.** The US stale-base-backup alert exposed a scheduling gap:
+an auto-sleep database that stays busy never reaches the idle-sleep backup path, and the
+background path previously required either an always-warm policy or an earlier idle backup
+deferral. A ready database that remains awake now schedules its due daily backup regardless
+of its configured idle time, including when gateway activity is unavailable or an outbox
+backlog prevents sleep. An eligible idle sleep still takes its backup synchronously before
+stopping. Existing per-database locks, shared job limits, the node quiet window, bounded
+deferral and retry delay remain in force. Sleeping databases are not woken for backups.
+
+The new continuously busy, 300-second auto-sleep regression ran against real PostgreSQL
+**18.6**: **one failure before the fix** (the due backup never advanced), then **one pass
+afterward**. It also checks that fresh backups are retained and the database stays ready
+and running. Independent source review found no correctness issue. Deployment and real R2
+backup/alert recovery confirmation remain open; the existing customer-serving nodes require
+the owner's explicit production-write go. No credentials, API contracts or schema changed.
+
 # General cold-storage Production activation — 2026-11-07
 
 **Released:** the owner-authorized policy is active for Free and Paid databases after strictly
@@ -2211,7 +2229,9 @@ Only after that would WAL-G or wal-rus be reconsidered.
 A base backup runs:
 1. at create (before ready), and after every restore, because a new timeline needs its own base backup;
 2. when the idle timer fires and a backup is due, before the database sleeps;
-3. daily, at a staggered time, for always-warm databases.
+3. daily while a database remains awake, including an auto-sleep database kept awake by traffic,
+   an outbox backlog or unavailable gateway activity. The existing node quiet window, bounded
+   deferral and retry delay apply; an eligible idle sleep still takes its due backup before stopping.
 
 "Due" means one of:
 - there is no DONE backup on the current timeline;

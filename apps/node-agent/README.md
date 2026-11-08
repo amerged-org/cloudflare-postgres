@@ -691,7 +691,9 @@ R2 and the segment is in the fsynced upload log. The agent never deletes in R2; 
 Worker. The concurrency and memory limits of the jobs come from the policy.
 
 A base backup is due when the newest of the database's timeline is a day old (plan 7.6). It is taken
-at the database's idle sleep, and daily for an always-warm database, never by waking one. It is put
+before an eligible idle sleep, or while serving if the database stays awake, including an
+auto-sleep database kept awake by traffic or an outbox backlog. Missing gateway activity prevents
+sleep but does not prevent a due backup. Sleeping databases are never woken for a backup. It is put
 off while a start is queued or in flight on the node, and in the first minute after any database on
 the node became ready (a wake, a build, the adoption of a unit that runs), so that the first
 statements of a cold database do not share the disk and the CPU with the backup of another one
@@ -701,7 +703,7 @@ whose idle sleep is put off is not put to sleep: nothing would wake it for the b
 stays up and the next idle pass (every five seconds) asks again. Ten minutes after the first
 put-off of an awake session (the wait after a failed backup) the backup is taken whatever the node
 does: at the idle sleep of a database that stays idle, and, for one that is used meanwhile and so
-never idles, while it serves, as the daily backup of an always-warm database is. So a database that
+never idles, while it serves. So a database that
 stays up has it within ten minutes and one idle pass of the first put-off. One case is not bounded:
 an early sleep, which a wake that waits for room orders and which picks the database unused
 longest, usually the one that was put off, takes no backup and ends the session with the wait; the
