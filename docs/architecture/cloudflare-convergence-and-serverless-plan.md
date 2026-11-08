@@ -12,7 +12,11 @@ deferral and retry delay remain in force. Sleeping databases are not woken for b
 The new continuously busy, 300-second auto-sleep regression ran against real PostgreSQL
 **18.6**: **one failure before the fix** (the due backup never advanced), then **one pass
 afterward**. It also checks that fresh backups are retained and the database stays ready
-and running. Independent source review found no correctness issue. Deployment and real R2
+and running. The complete power/lifecycle suite passed **59 tests, zero failures and zero
+ignored tests** against the same PostgreSQL. Rust formatting, Clippy (with existing macOS-only
+warnings) and plan privacy checks passed. Independent source review found no correctness issue.
+The implementation is in [PR #54](https://github.com/amerged-org/cloudflare-postgres/pull/54).
+Deployment and real R2
 backup/alert recovery confirmation remain open; the existing customer-serving nodes require
 the owner's explicit production-write go. No credentials, API contracts or schema changed.
 
