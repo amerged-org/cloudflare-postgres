@@ -921,7 +921,7 @@ At create, restore and move, a node is **eligible** when all of these hold:
 - the database's memory fits the node's maximum;
 - the node holds fewer volumes than the technical volume bound (1,000, 4.11).
 
-**Fill first** (owner rule). Among eligible nodes, the fullest wins: the node with the highest active-RAM peak that stays under 80 % after adding the new database. A new node gets databases only when the others are full.
+**Fill first** (owner rule). Among eligible nodes, the fullest wins: the node that holds the most memory of live databases the API placed on it (the sum of their memory from the API's own rows; the node's reports only decide eligibility, so a node cannot raise its rank by what it reports); ties go to the lower node ID. A new node gets databases only when the others are full.
 
 These definitions are plan defaults beyond the owner's rule, set in operator configuration:
 - **Active RAM** is the RAM in use on the node (MemTotal − MemAvailable) divided by MemTotal, which the link accepts up to 1 TiB. It is sampled every 15 s and averaged per 30 minutes. Under D3 (b), it is the sum of awake reservations divided by the awake budget instead.

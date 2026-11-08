@@ -61,6 +61,7 @@ function node(overrides: Partial<PlacementNode> = {}): PlacementNode {
     cpu_peak_ppm: 0,
     memory_available_bytes: NODE_BYTES,
     pending_memory_mib: 0,
+    placed_memory_mib: 0,
     pending_storage_mib: 0,
     ...overrides,
   };
@@ -72,9 +73,9 @@ const id = (letter: string) => `nod_${letter.repeat(20)}`;
 describe("which node takes a new database", () => {
   it("is the fullest node that stays under 80 % active RAM after the database", () => {
     const nodes = [
-      node({ id: id("a"), ram_peak_ppm: 500_000 }),
-      node({ id: id("b"), ram_peak_ppm: 300_000 }),
-      node({ id: id("c"), ram_peak_ppm: 700_000 }),
+      node({ id: id("a"), ram_peak_ppm: 500_000, placed_memory_mib: 512 }),
+      node({ id: id("b"), ram_peak_ppm: 300_000, placed_memory_mib: 256 }),
+      node({ id: id("c"), ram_peak_ppm: 700_000, placed_memory_mib: 2048 }),
     ];
     expect(pick(nodes)).toBe(id("c"));
     // Order of the list does not matter.
@@ -157,11 +158,32 @@ describe("which node takes a new database", () => {
     ).toBeNull();
   });
 
-  it("ranks by peak plus pending, so a node that just took several databases counts as fuller", () => {
+  it("ranks by the memory placed on each node, so a node that just took several databases counts as fuller", () => {
     expect(
       pick([
         node({ id: id("a"), ram_peak_ppm: 300_000 }),
-        node({ id: id("b"), ram_peak_ppm: 100_000, pending_memory_mib: 4096 }),
+        node({
+          id: id("b"),
+          ram_peak_ppm: 100_000,
+          pending_memory_mib: 4096,
+          placed_memory_mib: 4096,
+        }),
+      ]),
+    ).toBe(id("b"));
+  });
+
+  it("ranks by the memory placed on each node, so a node's own report cannot make it the fullest", () => {
+    // The forged node reports 79.9 % in use of a 1 TiB total and holds no database.
+    expect(
+      pick([
+        node({
+          id: id("a"),
+          memory_total_bytes: 2 ** 40,
+          memory_available_bytes: 2 ** 40,
+          ram_peak_ppm: 799_000,
+          placed_memory_mib: 0,
+        }),
+        node({ id: id("b"), ram_peak_ppm: 300_000, placed_memory_mib: 2048 }),
       ]),
     ).toBe(id("b"));
   });
@@ -768,7 +790,25 @@ describe("placement over real samples", () => {
     await seedSamples(quiet, recent({ ramPpm: 100_000 }));
     await seedSamples(busy, recent({ ramPpm: 600_000 }));
     await seedSamples(full, recent({ ramPpm: 790_000 }));
+    // The API placed a 2 GiB database on the busy node: the placed memory ranks the nodes.
+    await env.DB.prepare(
+      `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,archive_path,created_at,updated_at,placed_at,own_memory_mib)
+      VALUES(?,?,?,?,'placed',?,'running','ready',1,'s3://b/x',?,?,?,2048)`,
+    )
+      .bind(
+        "d" + crypto.randomUUID().replaceAll("-", "").slice(0, 19),
+        f.project,
+        f.region,
+        busy,
+        f.size,
+        new Date().toISOString(),
+        new Date().toISOString(),
+        // Before the newest sample, so the sample already includes it.
+        new Date(Date.now() - 3_600_000).toISOString(),
+      )
+      .run();
     const nodes = await placementNodes(env.DB, f.region);
+    expect(nodes.find((n) => n.id === busy)?.placed_memory_mib).toBe(2048);
     // 512 MiB are 5 % of the node: 79 % + 5 % crosses 80 %, 60 % + 5 % does not.
     expect(
       choosePlacement(nodes, {
