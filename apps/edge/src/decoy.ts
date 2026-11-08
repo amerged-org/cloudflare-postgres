@@ -82,16 +82,17 @@ export function decoyResponse(
     socket.removeEventListener("error", close);
     complete();
   };
-  const finish = (code?: string) => {
+  const finish = (code?: string, message?: string) => {
     if (closed) return;
     try {
       if (code)
         socket.send(
           encodeErrorResponse(
             code,
-            code === "28P01"
-              ? "password authentication failed"
-              : "connection rejected",
+            message ??
+              (code === "28P01"
+                ? "password authentication failed"
+                : "connection rejected"),
           ),
         );
       socket.close(1000, "connection refused");
@@ -170,9 +171,7 @@ export function decoyResponse(
             finish("28P01");
             break;
           }
-          socket.send(
-            authentication(10, "SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0"),
-          );
+          socket.send(authentication(10, "SCRAM-SHA-256\0\0"));
         }
         if (buffer.length < 5) break;
         const length = new DataView(
@@ -189,11 +188,22 @@ export function decoyResponse(
         buffer = buffer.slice(length + 1);
         if (phase === "first") {
           const end = body.indexOf(0);
+          if (end < 0) {
+            finish("28P01");
+            break;
+          }
+          // Non-fatal decoding: bytes that are not UTF-8 never equal the offered name.
           if (
-            end < 0 ||
-            utf8.decode(body.subarray(0, end)) !== "SCRAM-SHA-256" ||
-            body.length < end + 5
+            new TextDecoder().decode(body.subarray(0, end)) !== "SCRAM-SHA-256"
           ) {
+            // PostgreSQL refuses a mechanism it did not offer with this error.
+            finish(
+              "08P01",
+              "client selected an invalid SASL authentication mechanism",
+            );
+            break;
+          }
+          if (body.length < end + 5) {
             finish("28P01");
             break;
           }
