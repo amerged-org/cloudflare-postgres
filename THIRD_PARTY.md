@@ -184,7 +184,7 @@ part of any PGCF runtime.
 | [Neon storage engine, proxy](https://github.com/neondatabase/neon), [NeonVM](https://github.com/neondatabase/autoscaling) (Apache-2.0) | The public repository is effectively dormant. Its storage is a different architecture. NeonVM needs nested virtualization, which Contabo Cloud VPS lack. |
 | [Xata OSS](https://github.com/xataio/xata) (Apache-2.0)                                                                                | Requires Kubernetes, CloudNativePG and OpenEBS, the platform PGCF left; access runs through the Cloudflare edge and Tunnel.                              |
 | [PgBouncer](https://github.com/pgbouncer/pgbouncer) (ISC), [Supavisor](https://github.com/supabase/supavisor) (Apache-2.0)             | No server-side pooler in v1; reconsider with measured connection pressure.                                                                               |
-| Kubernetes, CloudNativePG, Talos Linux, OpenEBS, Cilium, Flux, cert-manager, containerd, Helm | Retired on 2026-10-17 with the Kubernetes runtime (branch `archive/kubernetes-runtime`); nothing of them ships and their notices were removed. |
+| Kubernetes, CloudNativePG, Talos Linux, OpenEBS, Cilium, Flux, cert-manager, containerd, Helm | Retired on 2026-10-17 with the Kubernetes runtime (Git history at `6761e7f0`); nothing of them ships and their notices were removed. |
 
 ## Rules
 

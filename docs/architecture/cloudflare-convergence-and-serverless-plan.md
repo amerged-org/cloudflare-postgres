@@ -1,3 +1,27 @@
+# Main and branch consolidation — 2026-11-08
+
+The owner requested one main branch and removal of resolved branches. The two outstanding
+documentation histories (runtime/credential-custody notes and the measured CI report) are
+merged without removing newer deployment receipts. All other branch implementations were
+already merged, patch-equivalent or superseded by the accepted runtime. Twenty-two original
+historical tips, including the retired Kubernetes fixture work and one detached diagnostic
+commit, are retained as merge ancestry with a verified unchanged source tree. Old branch
+names in the historical plan below are dated references: use commit `6761e7f0` directly for
+the former Kubernetes archive, which remains reachable through main history.
+
+The three dirty test worktrees contain superseded assertions, deliberately reverted verifier
+fixtures or diagnostic scratch code, not a missing product fix; obsolete test-wait experiments
+are retired rather than added to the accepted tests. The older root documentation differences
+were separately reconciled with the current published documents. Credential files and ignored
+private evidence are outside the publication and deletion scope.
+
+Before retaining the old history, 76 candidate commits affecting 286 public paths were checked
+for forbidden private paths and scanned with Gitleaks: zero findings. The additional detached
+diagnostic history also returned zero findings. Main baseline `1640e54b` passed full CI
+[42525948434](https://github.com/amerged-org/cloudflare-postgres/actions/runs/42525948434),
+including native tests, image boot and signing. This consolidation changes documentation and
+an ignore rule; it performs no deployment, node assignment, resource purchase or live data write.
+
 # Operator shell credential custody — 2026-11-08
 
 The original operator credentials were found under the installation's ignored

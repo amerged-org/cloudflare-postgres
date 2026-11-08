@@ -19,4 +19,5 @@ builder image, the Rust Edge Worker build tools and the CI toolchain (Node, Dock
 distribution and the Rust targets). CI and `scripts/ci/toolchain.mjs` read it.
 
 The Kubernetes runtime that once lived here (Talos, Flux, CloudNativePG, OpenEBS and the relay) was
-retired on 2026-10-17 and is kept on the `archive/kubernetes-runtime` branch.
+retired on 2026-10-17. Its source remains in Git history at commit `6761e7f0`; the obsolete
+archive branch was consolidated into main history.
