@@ -1,3 +1,30 @@
+# Operator shell credential custody — 2026-11-08
+
+The original operator credentials were found under the installation's ignored
+`.local/secrets/shell/` directory. The CA public fingerprint matched the live value,
+**`SHA256:jwQrEbpF0/jS57DJe3bcM6Y3bdVmlg4ZM/r6LlhHLU0`**, and the saved shell service-token
+Client ID matched the active `pgcf-shell-dev` identity. This is the October 19 shell token,
+separate from the November 6 shared-Edge rotation; its existing expiry is **2026-11-18
+19:48:52 UTC**. Correct existing authentication material was retained.
+
+Verified byte-identical custody copies now live in **`~/.ssh/`**, directory mode **0700**:
+`pgcf_shell_ca`, `pgcf_shell_ca.pub` and `pgcf_shell_access.env` are **0600**;
+`pgcf_shell_askpass.sh` is **0700**. The CA passphrase remains in macOS Keychain and its existing
+askpass helper successfully unlocked the CA. The installation's untracked `.env.local` received
+append-only path references (`PGCF_SHELL_CA_KEY`, `PGCF_SHELL_CA_PUBLIC_KEY_FILE`,
+`PGCF_SHELL_ACCESS_ENV_FILE`, `PGCF_SHELL_ASKPASS_FILE`, `PGCF_SHELL_KNOWN_HOSTS_FILE`) and protected
+credential custody entries. Original files and every pre-existing environment byte were preserved.
+
+A dedicated saved `~/.ssh/pgcf_shell_operator` client key and its certificate were also recorded
+in `.env.local` before use. The certificate is restricted to `pgcf-break-glass`, without
+forwarding permissions, and its verification lease was **21:24:57–21:40:57 UTC**; the certificate
+must be renewed for later sessions. Read-only SSH through Access and each node's Tunnel succeeded
+on **both live nodes**, matching root UID, expected hostname and current boot. Reading each
+running agent's executable independently confirmed SHA-256
+`63f00d1e0b85caa632e7250e0a86f4d65a89cd155a1e6e34e80f02c8d3c71c55`, with US PID **1551448** and
+EU PID **2186232**. The production CA, Access policies/tokens, gateway and database configuration
+were not changed by this custody recovery. No secret value belongs in this public record.
+
 # Daily base-backup scheduling fix — 2026-11-08
 
 **Deployed; live backup recovery verified.** The US stale-base-backup alert exposed a scheduling gap:
