@@ -372,6 +372,41 @@ test("operator consumption refuses missing evidence configuration before accessi
   });
 });
 
+test("a deny-all node firewall's empty allowlist is consumed as a truthful, complete allowlist", () => {
+  const value = input();
+  const config = parseProbeConfig(
+    JSON.stringify({ ...value, operator_allowlist: [] }),
+    now,
+  );
+  const pool = [`${host4(203, 0, 113, 0)}/24`];
+  const report = probeReport(config, pool, context, now);
+  report.results[0]!.before = {
+    state: "connected",
+    at: new Date(now).toISOString(),
+  };
+  report.results[0]!.target = {
+    state: "timed_out",
+    at: new Date(now + 1).toISOString(),
+  };
+  report.results[0]!.after = {
+    state: "connected",
+    at: new Date(now + 2).toISOString(),
+  };
+  report.finished_at = new Date(now + 3).toISOString();
+  assert.deepEqual(
+    assertExternalReport(
+      report,
+      config,
+      pool,
+      context,
+      [],
+      config.targets,
+      now + 5,
+    ),
+    [config.targets[0]],
+  );
+});
+
 test("only a fresh nonce-bound report with both TCP controls closes the IPv4 gap; IPv6 stays open", () => {
   const { config, pool, report } = fixture();
   assert.deepEqual(
