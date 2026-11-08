@@ -29,3 +29,6 @@ serde-wasm-bindgen = "=0.6.5"
 futures-channel = "=0.3.34"
 futures-util = "=0.3.34"
 web-sys = { version = "=0.3.106", features = ["AbortController", "AbortSignal", "BinaryType", "Crypto", "Event", "EventTarget", "Headers", "MessageEvent", "ReadableStream", "ReadableStreamDefaultReader", "Request", "RequestInit", "RequestRedirect", "Response", "ResponseInit", "WebSocket", "WorkerGlobalScope"] }
+
+[dev-dependencies]
+pgcf-test-postgres = { path = "../../packages/test-postgres" }

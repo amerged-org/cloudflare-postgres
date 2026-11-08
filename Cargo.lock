@@ -1288,6 +1288,7 @@ dependencies = [
  "hmac",
  "js-sys",
  "pgcf-native-protocol",
+ "pgcf-test-postgres",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
