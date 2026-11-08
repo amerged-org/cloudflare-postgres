@@ -97,7 +97,7 @@ Schedule alarm ─┘   schedules, event buffer,  └─> /sql through the Edge,
   tools cannot verify an HMAC signature, but they can check a header or keep a secret URL.
 - `POST /v1/webhooks/{id}/test` sends a sample event, because automation tools learn their field
   mapping from a first request.
-- URLs must be HTTPS. Loopback, link-local, metadata and private addresses are refused (SSRF).
+- URLs must be HTTPS. Literal IP addresses, localhost and reserved names are refused at create and at delivery (SSRF). A public name that resolves to a private address is not checked; it relies on Cloudflare's network having no route to private address space.
 
 ### 4.4 Platform events
 
@@ -345,7 +345,7 @@ Owned: `apps/api` (TriggerActor, subscriptions, delivery), `packages/contracts`,
 Depends on: none.
 Live acceptance: create a database and receive a signed `database.ready`; stop the receiver and see
 retries, then the dead letter and a replay; duplicates carry the same `id`; operation polling is no
-longer needed; SSRF targets are refused; a real n8n webhook and a real Make or Zapier catch hook
+longer needed; literal private, loopback and reserved targets are refused; a real n8n webhook and a real Make or Zapier catch hook
 receive the test event, and a static header reaches them.
 Done when: the handover's "no event stream or webhook" statement is replaced by the contract.
 

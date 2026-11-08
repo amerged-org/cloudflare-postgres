@@ -27,8 +27,9 @@ const RESERVED_SUFFIXES = [
 ];
 
 /**
- * Accepts only an https URL whose host is a DNS name. A public DNS name that resolves to a private
- * address is not detectable here; the delivery path has to decide that at connection time.
+ * Accepts only an https URL whose host is a DNS name. Literal IP addresses, localhost and reserved
+ * names are refused here, at create and at delivery. A public DNS name that resolves to a private
+ * address is not checked; it relies on Cloudflare's network having no route to private address space.
  */
 export function checkWebhookUrl(raw: string): WebhookUrlCheck {
   const refuse = (reason: WebhookUrlRefusal): WebhookUrlCheck => ({

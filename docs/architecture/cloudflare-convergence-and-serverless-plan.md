@@ -1158,12 +1158,12 @@ Changes:
 - **The gap today.** The Edge reaches a gateway with a plain fetch to a public HTTPS URL (`apps/edge/src/gateway.ts` L18-45). Anyone on the internet can reach that hostname through Cloudflare and so bypass the Edge's rate limiters and admission. Only the route token protects it.
 - **The fix:** each node's gateway hostname sits behind **Cloudflare Access**.
   - The Edge holds a service token. Access refuses requests without it.
-  - cloudflared checks the Access token again before forwarding.
   - The gateway still requires the route token.
   - One self-hosted application, `pgcf node gateways`, covers the wildcard `pgcf-node-*.<domain>` with one Service Auth policy that names the Edge's token and nothing else. A request without credentials gets 401, never a login page. `scripts/operations/setup-access.ts` makes and checks it and puts a rotated secret into the Edge Worker's secrets (`docs/operations/operator-installation.md`). The token lasts 8760h and rotation does not move that date: `--refresh-service-token` does, and the script warns 30 days before and refuses an expired token, because Access would then refuse the Edge at every gateway.
   - The shell's hostname is `pgcf-shell-<id>.<domain>`, a family of its own: Cloudflare does not say which of two overlapping wildcard applications wins, so the two wildcards must not overlap.
 - **Alternative:** a private Worker-to-Tunnel binding (Cloudflare's Workers VPC). If the account has it and it measures at least as fast, Lane E uses it instead, and the public hostname goes away.
 - **Check:** Stage 4 verifies that a direct request to the node hostname without Access credentials is refused at Cloudflare (`setup-access.ts --verify`: only 401 or 403 pass).
+- **Guards.** Cloudflare Access and the route token are the only guards on a public gateway hostname. cloudflared does not validate the Access token: the ingress sets no `originRequest.access`. So `setup-access.ts --verify` is a release checklist step, run by the operator after every change to the Access applications or the service token.
 
 ### 5.9 A cold wake, step by step
 
