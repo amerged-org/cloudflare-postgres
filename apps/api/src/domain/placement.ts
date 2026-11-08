@@ -3,7 +3,8 @@
 // Placement by measured activity (ULTRA plan 4.8). CPU must stay below 80 % of the highest
 // 30-minute average of the last three days. RAM uses the higher of that peak and the newest sample,
 // plus pending placements and the new database's full memory, and must also stay below 80 %.
-// Among the nodes that qualify the fullest wins, and a node is added only when none does. A node
+// Among the nodes that qualify the one holding the most memory the API placed on it wins: a node's
+// own report can veto a node, never raise its rank. A node is added only when none qualifies. A node
 // holding `MAX_VOLUMES_PER_NODE` volumes takes no more (plan 4.11). Cloudflare reads only what the
 // node reports: its newest sample (`nodes.last_sample_json`) and its per-minute rollups
 // (`node_minutes`); the node decides every start itself.
@@ -66,10 +67,12 @@ export interface PlacementNode {
   /** Highest 30-minute average of active RAM and of CPU load in the last three days. */
   ram_peak_ppm: number | null;
   cpu_peak_ppm: number | null;
-  /** Active RAM in the newest sample, in parts per million: what the 30-minute average has not caught up with. */
-  ram_now_ppm: number | null;
+  /** MemAvailable of the newest sample: the active RAM it shows is what the 30-minute average has not caught up with. */
+  memory_available_bytes: number | null;
   /** Memory of the databases placed after the node's newest sample: no sample includes them yet. */
   pending_memory_mib: number;
+  /** Memory of the live databases the API placed on the node; it ranks the nodes. */
+  placed_memory_mib: number;
   /** Storage of the databases whose volume the node may not have counted in `pool_nominal_bytes` yet. */
   pending_storage_mib: number;
 }
@@ -177,20 +180,27 @@ function memoryPpm(mib: number, total: number): bigint {
 }
 
 /**
- * How full a node is for placement: the higher of its RAM peak and newest sample, plus the memory
- * of databases placed since that sample. Null while the load is unknown; `projected` adds the new
- * database's `addedMib`.
+ * Whether a node's RAM stays under the limit once it holds the new database: the higher of its RAM
+ * peak and newest sample, plus the memory of databases placed since that sample and `addedMib`.
+ * Null while the load is unknown.
  */
 function load(
   node: PlacementNode,
   addedMib: number,
-): { current: bigint; projected: bigint } | null {
+): { projected: bigint } | null {
   if (node.ram_peak_ppm === null || node.memory_total_bytes === null)
     return null;
-  // The average lags behind a burst of starts: what the newest sample shows counts as well.
-  const peak = BigInt(Math.max(node.ram_peak_ppm, node.ram_now_ppm ?? 0));
+  // The newest sample's active RAM, in integers: the average lags behind a burst of starts, so
+  // what the newest sample shows counts as well.
+  const total = BigInt(node.memory_total_bytes);
+  const nowPpm =
+    node.memory_available_bytes === null
+      ? 0n
+      : ((total - BigInt(node.memory_available_bytes)) * PPM) / total;
+  // SQLite returns a real for a rollup that overflows 64 bits (only forged samples do); a ppm is whole.
+  const average = BigInt(Math.floor(node.ram_peak_ppm));
+  const peak = average > nowPpm ? average : nowPpm;
   return {
-    current: peak + memoryPpm(node.pending_memory_mib, node.memory_total_bytes),
     projected:
       peak +
       memoryPpm(node.pending_memory_mib + addedMib, node.memory_total_bytes),
@@ -200,8 +210,8 @@ function load(
 /**
  * The node a new database goes to: of the nodes that are online, open, with an open pool (below
  * the volume bound as well), below 80 % CPU and below 80 % active RAM after the database, the one
- * with the most load; ties go to the lower ID. Null when none qualifies and the database waits for
- * capacity.
+ * holding the most placed memory; ties go to the lower ID. Null when none qualifies and the
+ * database waits for capacity.
  */
 export function choosePlacement(
   nodes: readonly PlacementNode[],
@@ -209,7 +219,7 @@ export function choosePlacement(
   now = Date.now(),
 ): PlacementNode | null {
   const limit = BigInt(PLACEMENT_LIMIT_PPM);
-  let best: { node: PlacementNode; current: bigint } | null = null;
+  let best: PlacementNode | null = null;
   for (const node of nodes) {
     if (!nodeOnline(node, now) || !nodeOpen(node)) continue;
     if (
@@ -224,12 +234,12 @@ export function choosePlacement(
     if (figures === null || figures.projected >= limit) continue;
     if (
       best === null ||
-      figures.current > best.current ||
-      (figures.current === best.current && node.id < best.node.id)
+      node.placed_memory_mib > best.placed_memory_mib ||
+      (node.placed_memory_mib === best.placed_memory_mib && node.id < best.id)
     )
-      best = { node, current: figures.current };
+      best = node;
   }
-  return best?.node ?? null;
+  return best;
 }
 
 /** What a resize adds to the node its database stays on; a shrink adds nothing. */
@@ -344,10 +354,11 @@ export async function placementNodes(
         l.observed_at sampled_at,l.memory_total_bytes,l.cpu_cores,l.room,
         l.pool_data_total_bytes,l.pool_data_used_bytes,l.pool_metadata_total_bytes,l.pool_metadata_used_bytes,l.pool_nominal_bytes,l.volumes_total,
         p.ram_peak_ppm,p.cpu_peak_ppm,
-        CASE WHEN l.memory_total_bytes>0 AND l.memory_available_bytes IS NOT NULL
-          THEN (l.memory_total_bytes-l.memory_available_bytes)*1000000/l.memory_total_bytes END ram_now_ppm,
+        l.memory_available_bytes,
         COALESCE((SELECT SUM(r.memory_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
           WHERE d.node_id=n.id AND d.deleted_at IS NULL AND d.placed_at>COALESCE(l.observed_at,'')),0) pending_memory_mib,
+        COALESCE((SELECT SUM(r.memory_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
+          WHERE d.node_id=n.id AND d.deleted_at IS NULL),0) placed_memory_mib,
         ${pendingStorageSql("n", "l.observed_at")} pending_storage_mib
       FROM nodes n LEFT JOIN latest l ON l.node_id=n.id LEFT JOIN peaks p ON p.node_id=n.id
       WHERE n.region_id=? ORDER BY n.id`,

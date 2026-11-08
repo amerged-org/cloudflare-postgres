@@ -842,6 +842,7 @@ describe("what a node reports", () => {
     ).toBe(true);
     for (const broken of [
       { memory: { total_bytes: 1, available_bytes: 2 } },
+      { memory: { total_bytes: 2 ** 40 + 1, available_bytes: 0 } },
       { cpu: { cores: 6, busy_millicores: 6001 } },
       { pool: { ...sample.pool, data_used_bytes: 126 * 1024 ** 3 } },
       { awake: [id, id] },
@@ -869,8 +870,8 @@ describe("what a node reports", () => {
     const sample = {
       observed_at: now,
       memory: {
-        total_bytes: Number.MAX_SAFE_INTEGER,
-        available_bytes: Number.MAX_SAFE_INTEGER,
+        total_bytes: 2 ** 40,
+        available_bytes: 2 ** 40,
       },
       cpu: { cores: 1024, busy_millicores: 1_024_000 },
       pool: {

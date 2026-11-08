@@ -921,10 +921,10 @@ At create, restore and move, a node is **eligible** when all of these hold:
 - the database's memory fits the node's maximum;
 - the node holds fewer volumes than the technical volume bound (1,000, 4.11).
 
-**Fill first** (owner rule). Among eligible nodes, the fullest wins: the node with the highest active-RAM peak that stays under 80 % after adding the new database. A new node gets databases only when the others are full.
+**Fill first** (owner rule). Among eligible nodes, the fullest wins: the node that holds the most memory of live databases the API placed on it (the sum of their memory from the API's own rows; the node's reports only decide eligibility, so a node cannot raise its rank by what it reports); ties go to the lower node ID. A new node gets databases only when the others are full.
 
 These definitions are plan defaults beyond the owner's rule, set in operator configuration:
-- **Active RAM** is the RAM in use on the node (MemTotal − MemAvailable) divided by MemTotal. It is sampled every 15 s and averaged per 30 minutes. Under D3 (b), it is the sum of awake reservations divided by the awake budget instead.
+- **Active RAM** is the RAM in use on the node (MemTotal − MemAvailable) divided by MemTotal, which the link accepts up to 1 TiB. It is sampled every 15 s and averaged per 30 minutes. Under D3 (b), it is the sum of awake reservations divided by the awake budget instead.
 - **CPU load** is busy time divided by cores, averaged the same way.
 - **Peak window:** the highest 30-minute average of the last 3 days (owner decision 2026-10-23, 11.3; it was 7 days), or of the available history for a new node.
 - **New databases no sample includes yet** count at their full memory size until the node's next sample includes them, and the active RAM of the newest sample stands in for the peak when it is higher, because a 30-minute average lags behind a burst. This keeps a burst of creates from all landing on one node before the node's own figures move. The first form of this rule counted full memory until a 30-minute average existed; on EU1 it held every create after the eighth (1 GiB class, 12 GB node) for 30 minutes ("Waiting for verified regional capacity"), which a mostly cold, overbooked fleet cannot accept. The node's own admission (4.6) keeps awake memory inside its budget regardless.

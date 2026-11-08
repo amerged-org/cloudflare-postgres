@@ -627,7 +627,7 @@ pgcf -i -X POST "$PGCF_API/v1/databases" -H 'Content-Type: application/json' \
 
 What happens: the database record (generation 1) and the owner role `app` with a server-generated
 password are written; the
-placement step picks the fullest qualifying node. Its CPU peak (the highest 30-minute average of
+placement step picks the qualifying node holding the most placed memory. Its CPU peak (the highest 30-minute average of
 the last three days) must stay under 80 %, and the requested CPU must fit its physical cores.
 RAM uses the higher of its three-day peak and current sample, plus the full memory of databases
 placed since that sample and the requested database; the sum must stay under 80 %. Its thin pool is

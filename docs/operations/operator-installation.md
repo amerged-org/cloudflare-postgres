@@ -1451,8 +1451,8 @@ fails with `power_outbox`: its drain has rows it cannot deliver.
 Placement follows plan 4.8 and needs no policy. Its CPU peak (the highest 30-minute average of the
 last three days) must be below 80 %, and the requested CPU must fit its physical cores. RAM uses
 the higher of that three-day peak and the current sample, plus the full memory of databases placed
-since that sample and the requested database; this sum must also be below 80 %. The fullest
-qualifying node wins. Two more things close a node to new databases, and neither is
+since that sample and the requested database; this sum must also be below 80 %. The qualifying
+node holding the most placed memory wins. Two more things close a node to new databases, and neither is
 a policy field: its thin pool (data at 80 %, metadata at 50 %, or the sold storage at four times its
 data) and **1,000 thin volumes**, the largest count Stage 1 measured on EU1 and the constant
 `MAX_VOLUMES_PER_NODE` in `apps/api/src/domain/placement.ts`. The bound counts every volume the node
