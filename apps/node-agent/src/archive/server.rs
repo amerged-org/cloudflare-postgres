@@ -29,8 +29,9 @@ use tokio::{
 
 /// How long a client may take to send its line.
 const READ_BOUND: Duration = Duration::from_secs(2);
-/// Connections the archive socket holds at once, from all callers. A node holds 245 databases
-/// (diagnostics.rs), and each may have one call in flight, so every one of them still gets a share.
+/// Connections the archive socket holds at once, from all callers. Far above what a node needs (a
+/// call lasts a few seconds and about five are in flight at a time), and below the descriptors the
+/// agent's unit allows, so a burst from the databases cannot starve the agent of descriptors.
 const MAX_CONNECTIONS: usize = 256;
 /// Connections one uid holds at once. A database makes one archive call at a time (its `serial`
 /// lock), and PostgreSQL's archiver and recovery never ask in parallel, so two connections are
