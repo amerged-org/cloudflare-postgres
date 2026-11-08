@@ -296,6 +296,16 @@ it("selected SCRAM-PLUS without certificate binding is refused", async () => {
   ).toContain("Mclient selected an invalid SASL authentication mechanism\0");
   expect(connection.messages).toHaveLength(2);
 });
+it("a mechanism name behind a byte-order mark is not the offered one", async () => {
+  const connection = await unknown();
+  connection.socket.send(
+    encodeStartup({ database: connection.database, user: connection.user }),
+  );
+  await expect.poll(() => connection.messages.length).toBe(1);
+  connection.socket.send(first(undefined, "n,,", "\uFEFFSCRAM-SHA-256"));
+  await rejected(connection, "08P01");
+  expect(connection.messages).toHaveLength(2);
+});
 it("unsupported GS2 authorization identity is refused", async () => {
   const connection = await unknown();
   connection.socket.send(
