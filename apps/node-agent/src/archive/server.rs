@@ -28,6 +28,13 @@ use tokio::{
 
 /// How long a client may take to send its line.
 const READ_BOUND: Duration = Duration::from_secs(10);
+/// Connections the archive socket holds at once, from all callers. A node holds 245 databases
+/// (diagnostics.rs), and each may have one call in flight, so every one of them still gets a share.
+const MAX_CONNECTIONS: usize = 256;
+/// Connections one uid holds at once. A database makes one archive call at a time (its `serial`
+/// lock), and PostgreSQL's archiver and recovery never ask in parallel, so two connections are
+/// the most a legitimate uid needs; four leave room for a retry that starts before the last ends.
+const MAX_CONNECTIONS_PER_UID: usize = 4;
 /// How much of a failed job's stderr goes to the log.
 const LOGGED_STDERR: usize = 400;
 
@@ -700,6 +707,41 @@ mod tests {
             archive(DATABASE, "000000010000000000000002".into()).await,
             Reply::Ok
         );
+    }
+
+    #[tokio::test]
+    async fn a_uid_past_its_share_of_connections_is_closed_at_once_and_its_silent_client_frees_it() {
+        let node = Node::start("connection-share", AGENT_BOUND).await;
+        // Clients that send nothing hold the uid's whole share until they close.
+        let mut silent = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_UID {
+            silent.push(UnixStream::connect(&node.socket).await.unwrap());
+        }
+        // The next connection of that uid is closed at once: no answer, and no wait for the bound.
+        let mut refused = UnixStream::connect(&node.socket).await.unwrap();
+        let mut answer = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            refused.read_to_string(&mut answer),
+        )
+        .await
+        .expect("a refused connection is closed within a second")
+        .unwrap();
+        assert_eq!(answer, "");
+        // Once one silent client has gone, a well-formed request is answered.
+        silent.remove(0);
+        let answered = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let answer = node.ask("pgcf-archive/1 delete 000000010000000000000001\n").await;
+                if !answer.is_empty() {
+                    return answer;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the uid has its share back within a second");
+        assert_eq!(answered, "failed bad_request\n");
     }
 
     #[tokio::test]
