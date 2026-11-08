@@ -1420,6 +1420,8 @@ SQL and allows 16 local connections.
 - The StartupMessage must arrive within 10 s of the upgrade and is at most 10,000 bytes. A
   password pipelined with it is a PasswordMessage of at most 4,096 bytes; an empty, oversized or
   wrong one, an unknown role and an unknown database are all answered with the same `28P01`.
+- A login that does not complete within 10 s of the gateway's first write to PostgreSQL ends the
+  connection with `08006`.
 - The gateway logs in with a pipelined password (and over HTTP) only to a PostgreSQL that asks for
   SCRAM-SHA-256 with at most 16,384 iterations (PostgreSQL's default `scram_iterations` is
   4,096), or for no password; anything else answers `08006` and never receives the password.

@@ -43,6 +43,10 @@ type WebSocket = WebSocketStream<BudgetedStream>;
 pub const SESSION_MEMORY_BYTES: usize = 2 * MAX_FRAME_BYTES + 16 * 1024;
 /// The time a connection has to send its StartupMessage and have its writer dialled.
 pub const STARTUP_BOUND: Duration = Duration::from_secs(10);
+/// The time a connection may stay unauthenticated after its first write to PostgreSQL. PostgreSQL
+/// holds a backend slot while it waits for the login; a slow honest client needs two SCRAM round
+/// trips well inside this bound.
+pub const AUTHENTICATION_BOUND: Duration = Duration::from_secs(10);
 /// How long a held wake connection waits for its release, counted from its upgrade.
 pub const WAKE_BOUND: Duration = Duration::from_millis(wake::WAKE_BOUND_MS);
 /// The time one write of frontend bytes to PostgreSQL may take.
@@ -1704,6 +1708,10 @@ async fn relay(
     heartbeat.tick().await;
     let mut physical_timer = tokio::time::interval(Duration::from_millis(100));
     let database = id.split_once('/').expect("bound session identity").0;
+    // The relay is entered after the first upstream write, which the session's stages record.
+    let authentication = tokio::time::Instant::from_std(
+        stages.written.unwrap_or_else(Instant::now) + AUTHENTICATION_BOUND,
+    );
     update(gateway, id, activity, false, false);
     loop {
         if !gateway.permits(database, target).await {
@@ -1761,6 +1769,11 @@ async fn relay(
                     let _=timeout(Duration::from_millis(500),websocket.send(Message::Binary(error.into()))).await;
                 }
                 close(websocket,CloseCode::Restart,"gateway restarting").await;
+                break;
+            },
+            _=tokio::time::sleep_until(authentication),if !activity.authenticated()=>{
+                stages.outcome="authentication_timeout";
+                let _=send_error(websocket,"08006","database connection failed").await;
                 break;
             },
             _=actions.changed()=>{},

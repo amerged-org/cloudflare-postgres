@@ -135,6 +135,8 @@ fn entry(mode: Mode, generation: u64, operation: &str, writer: Option<&Writer>) 
 enum Double {
     /// A stand-in exchange the client completes itself: an `R 10` and an opaque `p` message.
     Opaque,
+    /// An `R 10` the client never answers: the double then only reads, and ends with the stream.
+    Silent,
     /// SCRAM-SHA-256 for this password, as PostgreSQL runs it.
     Scram(&'static str),
     /// SCRAM-SHA-256 for this password, with a server signature that is not the verifier's.
@@ -193,6 +195,13 @@ impl Double {
                 assert_eq!(&password, b"p\0\0\0\x0aopaque");
                 stream
                     .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                    .await
+                    .unwrap();
+                return true;
+            }
+            Double::Silent => {
+                stream
+                    .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 10])
                     .await
                     .unwrap();
                 return true;
@@ -1960,6 +1969,47 @@ async fn a_postgres_that_cannot_prove_the_verifier_is_never_trusted_with_the_ses
             .is_err(),
         "the pipelined query reached an unproven PostgreSQL"
     );
+    fixture.stop().await;
+}
+/// A client that sends its StartupMessage and never answers the SASL challenge holds PostgreSQL
+/// only for the authentication bound: the session ends with 08006 and both sides are closed.
+#[tokio::test]
+async fn a_client_that_never_logs_in_is_ended_at_the_authentication_bound() {
+    let mut fixture = Fixture::build(
+        |unit| vec![entry(Mode::Running, 1, &operation(), Some(unit))],
+        false,
+        Double::Silent,
+    )
+    .await;
+    let mut client = fixture.connect(1600).await;
+    let sent = std::time::Instant::now();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_message(&mut client).await,
+        [b'R', 0, 0, 0, 8, 0, 0, 0, 10]
+    );
+    let failure = timeout(Duration::from_secs(20), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data();
+    assert_eq!(failure[0], b'E');
+    assert!(String::from_utf8_lossy(&failure).contains("C08006"));
+    let waited = sent.elapsed();
+    assert!(
+        waited >= transport::AUTHENTICATION_BOUND
+            && waited < transport::AUTHENTICATION_BOUND + Duration::from_secs(5),
+        "ended after {waited:?}"
+    );
+    timeout(Duration::from_secs(2), fixture.ends.recv())
+        .await
+        .expect("the gateway ends PostgreSQL's stream")
+        .unwrap();
+    fixture.ended().await;
     fixture.stop().await;
 }
 #[tokio::test]
