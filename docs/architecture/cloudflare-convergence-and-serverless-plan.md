@@ -1,3 +1,24 @@
+# Stack reference reconciliation — 2026-11-08
+
+README, PLAN, AGENTS and the infra entry point now state the node stack explicitly:
+Debian 13 (trixie), systemd, PostgreSQL 18.6, thin LVM and four native Rust first-party
+executables (`pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive`, `pgcf-wal-fetch`).
+PostgreSQL starts through the Rust slot supervisor after the agent binds the database's
+retained volume and socket. Talos, Kubernetes and CloudNativePG are retired; the systemd
+slot pool was reinstated on October 20.
+
+The Cloudflare API, Durable Objects, Workflows and deployed Edge remain TypeScript.
+Rust/Wasm Edge is built/tested and undeployed. "Rust node image" describes first-party
+node software, not the upstream database/OS packages or the entire control plane.
+The current image recipe and the recorded `acb21e26e064` / `f9faade99747` recipes agree
+on Debian trixie and PostgreSQL `18.6-1.pgdg13+2`. Later dated operating evidence governs
+per-node releases; this reference does not turn an earlier closeout into current health.
+No runtime code, live system, credential or acceptance gate changed.
+
+Validation: source pins and the Rust slot entrypoint verified, 48 local documentation links
+resolved, PLAN privacy check returned zero findings, and `git diff --check` passed. Independent
+review found no material discrepancy; the existing canonical ledger below remains unchanged.
+
 # General cold-storage Production activation — 2026-11-07
 
 **Released:** the owner-authorized policy is active for Free and Paid databases after strictly
