@@ -124,6 +124,14 @@ test("the scheduled advisories job audits the production npm packages and the Ru
   assert.match(lock.nativeRuntime.cargoAuditVersion, /^\d+\.\d+\.\d+$/);
   const job = code(jobs["advisories"]!);
   assert.match(job, /^ {8}run: pnpm audit --prod --audit-level=moderate$/m);
+  // A red check must not hide the next one: every later step runs unless the job is cancelled.
+  const steps = job.split(/^ {6}- name: /m).slice(1);
+  const audits = steps.filter((step) =>
+    /pnpm audit|rustup toolchain install|cargo audit/.test(step),
+  );
+  assert.equal(audits.length, 3);
+  for (const step of audits)
+    assert.match(step, /^ {8}if: \$\{\{ !cancelled\(\) \}\}$/m);
   assert.match(
     job,
     /^ {10}PGCF_CARGO_AUDIT_VERSION=\$\(node -p 'require\("\.\/infra\/platform\/versions\.lock\.json"\)\.nativeRuntime\.cargoAuditVersion'\)$/m,

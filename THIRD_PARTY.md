@@ -81,6 +81,9 @@ SDK/wasm-bindgen host glue retains upstream licensing; the admission and decoy
 state machines are first-party Rust. No maintained TypeScript Edge wrapper is
 included in that artifact.
 
+The CI-only `cargo-audit` 0.22.2 tool (`Apache-2.0 OR MIT`) checks the locked crates against
+the RustSec advisory database in the scheduled advisories job; it is in no artifact.
+
 ## Node image
 
 The node image ([infra/node-image](infra/node-image/README.md)) redistributes unmodified Debian 13
