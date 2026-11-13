@@ -43,8 +43,13 @@ async function list(prefix: string): Promise<string[]> {
   return found.sort();
 }
 
-/** A database whose archive the tests fill as Barman lays it out. */
-async function archive(now = Date.now()) {
+/**
+ * A database whose archive the tests fill as Barman lays it out. Its clock runs ahead of the real one
+ * by a margin: the objects of a test are uploaded now, and a backup is an anchor only once R2 says it
+ * was uploaded by the window's start, so every window here starts after its uploads.
+ */
+const CLOCK_MARGIN = 30 * DAY;
+async function archive(now = Date.now() + CLOCK_MARGIN) {
   const f = await lifecycle(),
     row = await f.row();
   const root = row.archive_path.replace(`s3://${env.ARCHIVE_BUCKET_NAME}/`, "");
@@ -668,6 +673,20 @@ it("purges expired credentials in the same step, and fails the step after the ot
       .bind(again.id)
       .first(),
   ).toBeNull();
+});
+
+it("takes as the anchor only a backup that R2 says was uploaded by the window's start, so a descriptor written now cannot be one", async () => {
+  const a = await archive(Date.now());
+  const old = await a.backup(31, 30, 1, 3);
+  const recent = await a.backup(11, 10, 4, 6);
+  await a.segments(1, 8);
+  // Everything was uploaded just now, after the start of the window: no anchor, nothing deleted.
+  expect(await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY)).toEqual({
+    backups: 0,
+    objects: 0,
+    complete: true,
+  });
+  expect(bases(await a.names())).toEqual([old, recent].sort());
 });
 
 it("never takes a backup whose id names a time past the cutoff as the anchor, whatever its descriptor says", async () => {

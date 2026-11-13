@@ -7,11 +7,11 @@
  */
 const LIST_PAGES = 50;
 
-/** The keys under `prefix` in order, a page at a time; an archive too long to list is an error. */
-export async function* keysOf(
+/** The objects under `prefix` in order, a page at a time; an archive too long to list is an error. */
+export async function* objectsOf(
   bucket: R2Bucket,
   prefix: string,
-): AsyncGenerator<string> {
+): AsyncGenerator<R2Object> {
   let cursor: string | undefined;
   for (let page = 0; page < LIST_PAGES; page++) {
     const result = await bucket.list({
@@ -19,11 +19,19 @@ export async function* keysOf(
       limit: 1000,
       ...(cursor ? { cursor } : {}),
     });
-    for (const object of result.objects) yield object.key;
+    for (const object of result.objects) yield object;
     if (!result.truncated) return;
     cursor = result.cursor;
   }
   throw new Error("retention_listing_incomplete");
+}
+
+/** The keys under `prefix` in order, a page at a time; an archive too long to list is an error. */
+export async function* keysOf(
+  bucket: R2Bucket,
+  prefix: string,
+): AsyncGenerator<string> {
+  for await (const object of objectsOf(bucket, prefix)) yield object.key;
 }
 
 /** The data of a base backup: its tar files, compressed or not. */

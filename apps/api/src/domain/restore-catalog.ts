@@ -90,6 +90,11 @@ export interface RestoreCatalog {
   backups: RestoreBackup[];
   /** When the newest archived WAL segment was uploaded; null while there is none. */
   newestWalAt: string | null;
+  /**
+   * When the newest object of each base backup was uploaded, in milliseconds, as R2 records it. The
+   * node writes the descriptor and the data, but not this time.
+   */
+  uploaded: ReadonlyMap<string, number>;
 }
 
 /**
@@ -174,6 +179,15 @@ export async function readRestoreCatalog(
       "Archive listing exceeds the bounded recovery catalog",
       { reason: "archive_unusable" },
     );
+  const uploaded = new Map<string, number>();
+  for (const [key, object] of objects) {
+    const base = /^base\/([0-9]{8}T[0-9]{6})\//.exec(key.slice(prefix.length));
+    if (base)
+      uploaded.set(
+        base[1]!,
+        Math.max(uploaded.get(base[1]!) ?? 0, object.uploaded.getTime()),
+      );
+  }
   const walNames = new Set<string>();
   const walObjects = new Map<string, R2Object>();
   for (const key of objects.keys()) {
@@ -228,6 +242,7 @@ export async function readRestoreCatalog(
       newestWal === undefined
         ? null
         : walObjects.get(newestWal)!.uploaded.toISOString(),
+    uploaded,
   };
 }
 

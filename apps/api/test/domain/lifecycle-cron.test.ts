@@ -15,7 +15,9 @@ afterEach(async () => {
 it("carries the fence of a lost node on and applies the recovery windows, each in its own step", async () => {
   const f = await lifecycle(),
     row = await f.row(),
-    now = Date.now();
+    // The objects below are uploaded now, and a backup is an anchor only once R2 dates its upload
+    // before the window's start: the clock runs ahead of the uploads, so the windows start after them.
+    now = Date.now() + 30 * 86_400_000;
   const uid = (await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
     .bind(f.node)
     .first<string>("node_uid"))!;
