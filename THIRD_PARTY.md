@@ -83,6 +83,8 @@ included in that artifact.
 
 The CI-only `cargo-audit` 0.22.2 tool (`Apache-2.0 OR MIT`) checks the locked crates against
 the RustSec advisory database in the scheduled advisories job; it is in no artifact.
+The CI-only [gitleaks](https://github.com/gitleaks/gitleaks) scanner (`MIT`, image pinned by digest in
+`.github/workflows/ci.yml`) scans the checked-out source in the `static` job; it is in no artifact.
 
 ## Node image
 

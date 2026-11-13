@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# The source secret scan of CI (the `static` job). The default rules run unchanged; the only
+# exclusions are the directories that installs and builds write, which a checkout does not hold.
+title = "PGCF source secret scan"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Reproducible installed and built directories, and git's own metadata."
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)target/''',
+  '''(^|/)\.git/''',
+]

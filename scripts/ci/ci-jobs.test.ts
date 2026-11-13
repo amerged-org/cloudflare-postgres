@@ -117,6 +117,15 @@ test("the Rust cache feeds verdicts only: a pull request restores it, only main 
   }
 });
 
+test("the source is scanned for secrets in the static job by a digest-pinned gitleaks with the repository's rules", () => {
+  // The same image digest as the ohmyho repository; the rules are the repository's .gitleaks.toml.
+  const job = code(jobs["static"]!);
+  assert.match(job, /docker run --rm --network none/);
+  assert.match(job, /ghcr\.io\/gitleaks\/gitleaks@sha256:[0-9a-f]{64}/);
+  assert.match(job, /dir \/repo --config \/repo\/\.gitleaks\.toml/);
+  assert.equal(existsSync(join(root, ".gitleaks.toml")), true);
+});
+
 test("the scheduled advisories job audits the production npm packages and the Rust crates with a pinned cargo-audit", () => {
   const lock = JSON.parse(
     readFileSync(join(root, "infra/platform/versions.lock.json"), "utf8"),
