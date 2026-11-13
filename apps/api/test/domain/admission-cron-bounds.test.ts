@@ -160,8 +160,9 @@ it(
         second_usage_statements: second.usage.statements,
       }),
     );
-    expect.soft(firstCount.count()).toBeLessThanOrEqual(850);
-    expect.soft(secondCount.count()).toBeLessThanOrEqual(850);
+    // Raised from 850: the waves process the due archive (claim and check record, 7 statements) that main starved on a foreign bucket.
+    expect.soft(firstCount.count()).toBeLessThanOrEqual(860);
+    expect.soft(secondCount.count()).toBeLessThanOrEqual(860);
     expect(first.usage.statements).toBeLessThanOrEqual(
       USAGE_CRON_STATEMENT_LIMIT,
     );
