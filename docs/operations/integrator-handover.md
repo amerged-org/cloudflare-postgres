@@ -1761,8 +1761,8 @@ XS database and its SM resize, not a reservation of physical RAM against every o
 
 | Class | MemoryMax | MemoryHigh | CPU ceiling | Write bandwidth | Write IOPS | Swap | Read limits |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| XS | 256 MiB | 230 MiB | 0.25 CPU | 8 MB/s | 1,000 | 0 | uncapped |
-| SM | 1,024 MiB | 921 MiB | 0.5 CPU | 32 MB/s | 4,000 | 0 | uncapped |
+| XS | 256 MiB | 230 MiB | 0.25 CPU | 8 MB/s | 1,000 | 0 | 32 MB/s, 4,000 IOPS |
+| SM | 1,024 MiB | 921 MiB | 0.5 CPU | 32 MB/s | 4,000 | 0 | 128 MB/s, 16,000 IOPS |
 
 The SM resize, manual-suspend refusal and explicit resume passed, with the source's 100 markers
 and the witness's 337 full rows subsequently verified. These observations do not close pool-full,
@@ -1860,7 +1860,9 @@ readable by another.
   and grows before unproven crash recovery. It imposes no tenant project quota or hidden usable-space
   reserve, and does not promise arbitrary DELETE/VACUUM/TRUNCATE while no space is available.
 - **Write limits.** Each database's write bandwidth and IOPS are capped by its size, which bounds
-  how fast one tenant can fill the pool.
+  how fast one tenant can fill the pool. Its read bandwidth and IOPS are capped at four times those
+  write limits (`READ_FACTOR` in `apps/node-agent/src/units/limits.rs`), so one tenant cannot saturate
+  the node's shared disk with reads; the factor is not measured against cold wakes yet.
 - **Measured storage acceptance (Stage 5.5).** EU1 passed byte/inode exhaustion and 2-to-5-GiB
   growth, with exact 29/109 acknowledged writes. US1 reached physical pool full, new allocations
   failed, and deleting only its owned filler restored space. All 1,789 ledger acknowledgements

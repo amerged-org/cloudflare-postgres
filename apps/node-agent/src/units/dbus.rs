@@ -99,12 +99,14 @@ pub fn encode(property: &Property) -> (&'static str, Value<'static>) {
         | Property::TasksMax(value)
         | Property::CpuQuotaPerSecUsec(value) => Value::from(*value),
         // `a(st)`: the device and its limit.
-        Property::IoWriteBandwidthMax(device, value) | Property::IoWriteIopsMax(device, value) => {
-            Value::new(vec![(device.clone(), *value)])
-        }
-        Property::IoWriteBandwidthMaxNone | Property::IoWriteIopsMaxNone => {
-            Value::new(Vec::<(String, u64)>::new())
-        }
+        Property::IoWriteBandwidthMax(device, value)
+        | Property::IoWriteIopsMax(device, value)
+        | Property::IoReadBandwidthMax(device, value)
+        | Property::IoReadIopsMax(device, value) => Value::new(vec![(device.clone(), *value)]),
+        Property::IoWriteBandwidthMaxNone
+        | Property::IoWriteIopsMaxNone
+        | Property::IoReadBandwidthMaxNone
+        | Property::IoReadIopsMaxNone => Value::new(Vec::<(String, u64)>::new()),
     };
     (property.name(), value)
 }
@@ -129,6 +131,14 @@ mod tests {
         );
         assert_eq!(
             signature(Property::IoWriteIopsMax("/dev/x".into(), 1)),
+            "a(st)"
+        );
+        assert_eq!(
+            signature(Property::IoReadBandwidthMax("/dev/x".into(), 1)),
+            "a(st)"
+        );
+        assert_eq!(
+            signature(Property::IoReadIopsMax("/dev/x".into(), 1)),
             "a(st)"
         );
     }

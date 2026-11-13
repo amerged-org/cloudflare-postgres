@@ -1769,7 +1769,7 @@ Purchases still need the owner's costed go (section 9.7).
 
 - **Logical cap** (lowered from the plan default of 4 × the pool's data size on 2026-11-10, security review pgcf-compute-1). The sum of nominal volume sizes stays at or below 150 % of the pool's data size, enforced by placement and by the node agent. It bounds how much sold storage a full pool can hurt. On EU1's pool of about 289 GiB that is about 430 GiB, or about 430 databases of 1 GiB; the technical volume bound (1,000, 4.11) may bind first.
 - **Reserve.** It starts at 6 GiB: the old 2 GiB reserve plus the old 4 GiB slack, now inside the pool. Stage 5.5 measures the node's sustained write rate while filling the pool. If that rate × 10 s is larger, the reserve is raised to it. This way the agent's pool sample, taken every 5 s, always sees the reserve being used before the pool is full.
-- **Write limits.** Each database's write bandwidth and IOPS are capped by its size, starting at 16 MB/s and 1,000 IOPS for 256 MiB. Stage 5.5 sets the real values from the measured disk. This bounds how fast one tenant can fill the pool.
+- **Write limits.** Each database's write bandwidth and IOPS are capped by its size, starting at 16 MB/s and 1,000 IOPS for 256 MiB. Stage 5.5 sets the real values from the measured disk. This bounds how fast one tenant can fill the pool. Read bandwidth and IOPS are capped at four times the write limits of the same size (2026-11-10, security review pgcf-compute-2); that factor still awaits a cold-wake measurement.
 - **Full-pool recovery.** It is built into the agent in Stage 3, with a runbook in Stage 6. A full pool makes ext4 on the affected volumes abort its journal and remount read-only, so those databases stop.
   - Space comes back above the reserve through deleted or moved databases and trimmed volumes.
   - Then the agent stops each affected unit, unmounts it, runs `e2fsck -p`, mounts it again, and wakes the database through admission.
@@ -3513,7 +3513,7 @@ Key external references:
   - `MemoryMax` = memory, `MemoryHigh` = 90 %, `MemorySwapMax=0`, `TasksMax=64`;
   - `CPUWeight` by size (start cost: none in the Stage 1 rerun, at most 20 ms at p50 in the first session's sequential runs, 11.1);
   - `CPUQuota` set after ready, for a wake after `cpu_boost_ms` (4.4), and cleared (`CPUQuota=` infinity) when the unit stops: a set quota persists and throttles the next start (Stage 1); the unit file keeps `CPUWeight=100` until the agent applies the class's weight, and no quota;
-  - `IOWriteBandwidthMax` and `IOWriteIOPSMax` by size.
+  - `IOWriteBandwidthMax`, `IOWriteIOPSMax`, `IOReadBandwidthMax` and `IOReadIOPSMax` by size.
 - **OOM:** `OOMPolicy=continue`, `OOMScoreAdjust=-900`, `PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj`, `PG_OOM_ADJUST_VALUE=0` (*measured (lab)*: postmaster -900, children 0).
 - **Sandbox:**
   - network: `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;

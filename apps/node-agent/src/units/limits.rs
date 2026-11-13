@@ -34,6 +34,13 @@ pub enum Property {
     /// an earlier incarnation of the unit set. Setting one device's limit again does not.
     IoWriteBandwidthMaxNone,
     IoWriteIopsMaxNone,
+    /// Per device: bytes per second.
+    IoReadBandwidthMax(String, u64),
+    /// Per device: operations per second.
+    IoReadIopsMax(String, u64),
+    /// No read limit on any device, as `IoWriteBandwidthMaxNone`.
+    IoReadBandwidthMaxNone,
+    IoReadIopsMaxNone,
 }
 impl Property {
     /// The property's name on the unit's D-Bus interfaces.
@@ -45,6 +52,8 @@ impl Property {
             Self::TasksMax(_) => "TasksMax",
             Self::IoWriteBandwidthMax(..) | Self::IoWriteBandwidthMaxNone => "IOWriteBandwidthMax",
             Self::IoWriteIopsMax(..) | Self::IoWriteIopsMaxNone => "IOWriteIOPSMax",
+            Self::IoReadBandwidthMax(..) | Self::IoReadBandwidthMaxNone => "IOReadBandwidthMax",
+            Self::IoReadIopsMax(..) | Self::IoReadIopsMaxNone => "IOReadIOPSMax",
             Self::CpuQuotaPerSecUsec(_) => "CPUQuotaPerSecUSec",
         }
     }
@@ -57,23 +66,32 @@ pub struct Io {
     pub device: String,
     pub write_bytes_per_second: u64,
     pub write_iops: u64,
+    pub read_bytes_per_second: u64,
+    pub read_iops: u64,
 }
+/// The read limits are this many times the write limits of the same size. Reads are not measured
+/// against a cold wake yet; this bounds how much of the shared disk one database can take.
+const READ_FACTOR: u64 = 4;
 impl Io {
-    /// The limits of a database of `memory_mib`: those of a 256 MiB database times `memory_mib / 256`.
+    /// The limits of a database of `memory_mib`: those of a 256 MiB database times `memory_mib / 256`,
+    /// and the reads at `READ_FACTOR` times the writes.
     pub fn scaled(
         device: impl Into<String>,
         base_bytes_per_second: u64,
         base_iops: u64,
         memory_mib: u64,
     ) -> Self {
-        let scale = |base: u64| {
-            let scaled = u128::from(base) * u128::from(memory_mib) / u128::from(IO_BASE_MEMORY_MIB);
+        let scale = |base: u64, factor: u64| {
+            let scaled = u128::from(base) * u128::from(factor) * u128::from(memory_mib)
+                / u128::from(IO_BASE_MEMORY_MIB);
             u64::try_from(scaled).unwrap_or(u64::MAX)
         };
         Self {
             device: device.into(),
-            write_bytes_per_second: scale(base_bytes_per_second),
-            write_iops: scale(base_iops),
+            write_bytes_per_second: scale(base_bytes_per_second, 1),
+            write_iops: scale(base_iops, 1),
+            read_bytes_per_second: scale(base_bytes_per_second, READ_FACTOR),
+            read_iops: scale(base_iops, READ_FACTOR),
         }
     }
 }
@@ -105,6 +123,11 @@ impl Limits {
                 io.write_bytes_per_second,
             ));
             properties.push(Property::IoWriteIopsMax(io.device.clone(), io.write_iops));
+            properties.push(Property::IoReadBandwidthMax(
+                io.device.clone(),
+                io.read_bytes_per_second,
+            ));
+            properties.push(Property::IoReadIopsMax(io.device.clone(), io.read_iops));
         }
         properties
     }
@@ -123,6 +146,8 @@ pub fn idle() -> Vec<Property> {
         cpu_quota(None),
         Property::IoWriteBandwidthMaxNone,
         Property::IoWriteIopsMaxNone,
+        Property::IoReadBandwidthMaxNone,
+        Property::IoReadIopsMaxNone,
     ]
 }
 
@@ -192,7 +217,7 @@ mod tests {
             write_iops: 1000,
         };
         let with = limits(256, 1000, Some(io)).properties();
-        assert_eq!(with.len(), 6);
+        assert_eq!(with.len(), 8);
         assert_eq!(
             with[4],
             Property::IoWriteBandwidthMax("/dev/mapper/pgcf-lv".into(), 16_000_000)
@@ -200,6 +225,14 @@ mod tests {
         assert_eq!(
             with[5],
             Property::IoWriteIopsMax("/dev/mapper/pgcf-lv".into(), 1000)
+        );
+        assert_eq!(
+            with[6],
+            Property::IoReadBandwidthMax("/dev/mapper/pgcf-lv".into(), 64_000_000)
+        );
+        assert_eq!(
+            with[7],
+            Property::IoReadIopsMax("/dev/mapper/pgcf-lv".into(), 4000)
         );
     }
 
@@ -213,6 +246,11 @@ mod tests {
         assert_eq!(scaled(4096).write_bytes_per_second, 256_000_000);
         assert_eq!(scaled(4096).write_iops, 16_000);
         assert_eq!(scaled(256).device, "/dev/x");
+        // Reads are capped at four times the write rate of the same size, so a cold wake still
+        // reads at a useful rate while one tenant cannot saturate the disk with reads.
+        assert_eq!(scaled(256).read_bytes_per_second, 64_000_000);
+        assert_eq!(scaled(256).read_iops, 4000);
+        assert_eq!(scaled(1024).read_iops, 16_000);
         // A size between two steps rounds down; the product is exact in 128 bits.
         assert_eq!(scaled(300).write_iops, 1171);
         assert_eq!(
@@ -255,6 +293,8 @@ mod tests {
                 Property::CpuQuotaPerSecUsec(u64::MAX),
                 Property::IoWriteBandwidthMaxNone,
                 Property::IoWriteIopsMaxNone,
+                Property::IoReadBandwidthMaxNone,
+                Property::IoReadIopsMaxNone,
             ]
         );
     }
@@ -266,6 +306,8 @@ mod tests {
         for property in [
             Property::IoWriteBandwidthMaxNone,
             Property::IoWriteIopsMaxNone,
+            Property::IoReadBandwidthMaxNone,
+            Property::IoReadIopsMaxNone,
         ] {
             let (name, value) = dbus::encode(&property);
             assert_eq!(value.value_signature().to_string(), "a(st)");
@@ -279,6 +321,11 @@ mod tests {
             "IOWriteBandwidthMax"
         );
         assert_eq!(Property::IoWriteIopsMaxNone.name(), "IOWriteIOPSMax");
+        assert_eq!(
+            Property::IoReadBandwidthMaxNone.name(),
+            "IOReadBandwidthMax"
+        );
+        assert_eq!(Property::IoReadIopsMaxNone.name(), "IOReadIOPSMax");
     }
 
     #[test]
@@ -290,6 +337,8 @@ mod tests {
                 device: "/dev/x".into(),
                 write_bytes_per_second: 1,
                 write_iops: 1,
+                read_bytes_per_second: 1,
+                read_iops: 1,
             }),
         )
         .properties()
@@ -304,7 +353,9 @@ mod tests {
                 "CPUWeight",
                 "TasksMax",
                 "IOWriteBandwidthMax",
-                "IOWriteIOPSMax"
+                "IOWriteIOPSMax",
+                "IOReadBandwidthMax",
+                "IOReadIOPSMax"
             ]
         );
         assert_eq!(cpu_quota(None).name(), "CPUQuotaPerSecUSec");
