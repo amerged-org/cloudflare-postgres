@@ -6,7 +6,7 @@ import { recordBackupDigest } from "./archive-digests.ts";
 import { fencedAtSql, parseBackupInfo } from "./restore-catalog.ts";
 
 /** Archives one minute's pass works on, and descriptors it reads for each of them. */
-const ARCHIVES_PER_RUN = 2;
+const ARCHIVES_PER_RUN = 5;
 const DESCRIPTORS_PER_ARCHIVE = 64;
 const LISTING_PAGES = 16;
 const DESCRIPTOR_LIMIT = 65536;
