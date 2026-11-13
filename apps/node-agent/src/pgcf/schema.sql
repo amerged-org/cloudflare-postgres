@@ -1,4 +1,6 @@
--- pgcf-schema-revision: 1
+-- pgcf-schema-revision: 2
+-- (The revision covers baseline.sql too, which the agent applies before this file; revision 2 added
+-- it and left this file as it was.)
 -- The platform schema of a tenant database (plan database-events-and-schedules, 4.5). The agent
 -- runs this file as the cluster's superuser between BEGIN and COMMIT, with search_path set to
 -- pg_catalog, so every name is qualified.

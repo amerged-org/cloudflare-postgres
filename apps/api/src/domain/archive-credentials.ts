@@ -19,8 +19,15 @@ import { archiveEndpoint } from "./archive-bucket.ts";
  * read: it can only expire, which is why a lost node's rows stop being delivered at once.
  */
 export const ARCHIVE_CREDENTIAL_LIFETIME_SECONDS = 7 * 86_400;
-/** Renewed once a third of the lifetime has passed, so an outage has days of margin. */
-const RENEW_AFTER_MS = (ARCHIVE_CREDENTIAL_LIFETIME_SECONDS * 1000) / 3;
+/** A restore reads its source for its operation only: a day, which the page renews early. */
+const READ_ONLY_LIFETIME_SECONDS = 86_400;
+const lifetimeSeconds = (access: ArchiveAccess) =>
+  access === "read_only"
+    ? READ_ONLY_LIFETIME_SECONDS
+    : ARCHIVE_CREDENTIAL_LIFETIME_SECONDS;
+/** Renewed once a third of its own lifetime has passed, so an outage has the other two thirds as margin. */
+const renewedBefore = (access: ArchiveAccess, now: number) =>
+  iso(now - (lifetimeSeconds(access) * 1000) / 3);
 /** A row stays a day after it expired, so a late read is told "expired" and not "unknown". */
 const PURGE_AFTER_MS = 86_400_000;
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -103,7 +110,7 @@ export function archiveCredentialStatement(
       scope.archivePath,
       scope.access,
       iso(issuedAt),
-      iso(issuedAt + ARCHIVE_CREDENTIAL_LIFETIME_SECONDS * 1000),
+      iso(issuedAt + lifetimeSeconds(scope.access) * 1000),
       path.database,
       ...guardBindings(scope, path.region),
     );
@@ -138,7 +145,7 @@ export async function ensureArchiveCredential(
       scope.nodeId,
       scope.archivePath,
       scope.access,
-      iso(now - RENEW_AFTER_MS),
+      renewedBefore(scope.access, now),
       iso(now),
     )
     .first<ArchiveCredentialReference>();
@@ -148,7 +155,7 @@ export async function ensureArchiveCredential(
   if (inserted.meta.changes !== 1) throw refused();
   return {
     id,
-    expires_at: iso(now + ARCHIVE_CREDENTIAL_LIFETIME_SECONDS * 1000),
+    expires_at: iso(now + lifetimeSeconds(scope.access) * 1000),
   };
 }
 
@@ -175,7 +182,7 @@ export async function ensureArchiveCredentials(
   const fresh = await db
     .prepare(
       `SELECT id,archive_path,access,expires_at FROM archive_credentials
-      WHERE node_id=? AND archive_path IN(SELECT value FROM json_each(?)) AND issued_at>? AND expires_at>?
+      WHERE node_id=? AND archive_path IN(SELECT value FROM json_each(?)) AND issued_at>CASE access WHEN 'read_only' THEN ? ELSE ? END AND expires_at>?
       ORDER BY issued_at DESC,id DESC`,
     )
     .bind(
@@ -183,7 +190,8 @@ export async function ensureArchiveCredentials(
       JSON.stringify([
         ...new Set([...wanted.values()].map((s) => s.archivePath)),
       ]),
-      iso(now - RENEW_AFTER_MS),
+      renewedBefore("read_only", now),
+      renewedBefore("read_write", now),
       iso(now),
     )
     .all<{
@@ -197,8 +205,12 @@ export async function ensureArchiveCredentials(
     if (wanted.has(key) && !found.has(key))
       found.set(key, { id: row.id, expires_at: row.expires_at });
   }
-  const missing: { key: string; id: string; statement: D1PreparedStatement }[] =
-    [];
+  const missing: {
+    key: string;
+    id: string;
+    expires_at: string;
+    statement: D1PreparedStatement;
+  }[] = [];
   for (const [key, scope] of wanted) {
     if (found.has(key)) continue;
     const id = newArchiveCredentialId();
@@ -206,6 +218,7 @@ export async function ensureArchiveCredentials(
       missing.push({
         key,
         id,
+        expires_at: iso(now + lifetimeSeconds(scope.access) * 1000),
         statement: archiveCredentialStatement(
           db,
           { nodeId, ...scope },
@@ -222,10 +235,7 @@ export async function ensureArchiveCredentials(
       results = await db.batch(chunk.map((value) => value.statement));
     chunk.forEach((value, index) => {
       if (results[index]!.meta.changes === 1)
-        found.set(value.key, {
-          id: value.id,
-          expires_at: iso(now + ARCHIVE_CREDENTIAL_LIFETIME_SECONDS * 1000),
-        });
+        found.set(value.key, { id: value.id, expires_at: value.expires_at });
     });
   }
   return found;

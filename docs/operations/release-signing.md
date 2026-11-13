@@ -195,7 +195,7 @@ no step prints one.
    that holds the control plane (the variables Wrangler reads; `pnpm install` has been run):
 
    ```sh
-   cd apps/release-signer && npx wrangler deploy
+   cd apps/release-signer && pnpm exec wrangler deploy
    ```
 
    The Worker is `pgcf-release-signer-dev`, reachable at its `workers.dev` address (Wrangler prints it;
@@ -225,7 +225,7 @@ no step prints one.
    secret was set, the error contains the public key to put there (it is no secret). If the API's answer
    to the secret never arrives, the error says that it is not known whether the Worker holds a new key,
    gives the public half, and leaves the file unchanged; the Worker held no secret before the command,
-   so delete the one it may hold with `npx wrangler secret delete RELEASE_SIGNING_KEY --name <worker>`
+   so delete the one it may hold with `cd apps/release-signer && pnpm exec wrangler secret delete RELEASE_SIGNING_KEY --name <worker>`
    and run the command again.
 
 3. **Commit the public key and set the variable.** Write the key into the API Worker's constant, commit
@@ -287,7 +287,7 @@ steps below switch the signer, the API and CI to the new text. Doing the steps b
 that has not taken the first release is the case that needs the hand replacement.
 
 1. Deploy the signer from a checkout of the branch tip that is about to be merged (`cd
-   apps/release-signer && npx wrangler deploy`). The signer bundles the manifest's contract
+   apps/release-signer && pnpm exec wrangler deploy`). The signer bundles the manifest's contract
    (`ReleaseManifestFields`), so the checkout has to hold the new one even where the signer's own files
    did not change; a checkout of the merge commit does as well. Until `main` carries the new CI, a
    push to `main` is signed by a signer that expects the new fields and is refused

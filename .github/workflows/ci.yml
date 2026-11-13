@@ -14,7 +14,7 @@ on:
         type: boolean
         default: false
       advisories:
-        description: Run only the check that the node image package lock is current
+        description: Run only the scheduled advisory checks (node image package lock, npm and Rust audits)
         type: boolean
         default: false
 
@@ -205,7 +205,6 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
-          cache: pnpm
       - name: Validate the native CI toolchain
         run: node scripts/ci/toolchain.mjs check
       - name: Install dependencies
@@ -504,7 +503,6 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
-          cache: pnpm
       - name: Validate the native CI toolchain
         run: node scripts/ci/toolchain.mjs check
       - name: Install dependencies
@@ -672,3 +670,18 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Compare the package lock with today's Debian security, Debian updates and PGDG indexes
         run: node infra/node-image/node-image.ts advisories --work "$RUNNER_TEMP/pgcf-node-image"
+      # Each check runs whatever the others report, so one red result never hides another.
+      - name: Audit the production npm packages
+        if: ${{ !cancelled() }}
+        run: pnpm audit --prod --audit-level=moderate
+      - name: Set up the pinned Rust toolchain
+        if: ${{ !cancelled() }}
+        run: |
+          PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
+          rustup toolchain install "$PGCF_RUST_VERSION" --profile minimal
+      - name: Audit the Rust crates against RustSec with the pinned cargo-audit
+        if: ${{ !cancelled() }}
+        run: |
+          PGCF_CARGO_AUDIT_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.cargoAuditVersion')
+          cargo install cargo-audit --version "$PGCF_CARGO_AUDIT_VERSION" --locked
+          cargo audit

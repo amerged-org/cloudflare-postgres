@@ -97,7 +97,13 @@ Schedule alarm ─┘   schedules, event buffer,  └─> /sql through the Edge,
   tools cannot verify an HMAC signature, but they can check a header or keep a secret URL.
 - `POST /v1/webhooks/{id}/test` sends a sample event, because automation tools learn their field
   mapping from a first request.
-- URLs must be HTTPS. Loopback, link-local, metadata and private addresses are refused (SSRF).
+- URLs must be HTTPS, on port 443 or 8443, with no credentials or fragment, and a DNS name with at least
+  two labels. IP literals, `localhost`, and the reserved suffixes (`.local`, `.internal`, `.lan`, `.corp` and
+  the like) are refused when the URL is set and again at delivery (SSRF). A DNS name is not resolved by
+  pgcf, so a public name that points at a private address is not refused there. Delivery fetches with
+  `global_fetch_strictly_public` (in the API Worker's `compatibility_flags`), so the runtime refuses such a
+  destination at connection time, and a hostname of the API Worker's own zone takes the public path and not
+  the zone's origin.
 
 ### 4.4 Platform events
 
@@ -345,7 +351,7 @@ Owned: `apps/api` (TriggerActor, subscriptions, delivery), `packages/contracts`,
 Depends on: none.
 Live acceptance: create a database and receive a signed `database.ready`; stop the receiver and see
 retries, then the dead letter and a replay; duplicates carry the same `id`; operation polling is no
-longer needed; SSRF targets are refused; a real n8n webhook and a real Make or Zapier catch hook
+longer needed; literal private, loopback and reserved targets are refused; a real n8n webhook and a real Make or Zapier catch hook
 receive the test event, and a static header reaches them.
 Done when: the handover's "no event stream or webhook" statement is replaced by the contract.
 

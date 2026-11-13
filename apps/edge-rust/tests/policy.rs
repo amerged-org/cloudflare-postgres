@@ -369,7 +369,7 @@ fn decoy_refuses_plus_and_invalid_utf8_instead_of_authenticating() {
         b"SCRAM-SHA-256-PLUS",
     ));
     assert!(output.close);
-    assert_eq!(output.frames[0][0], b'E');
+    assert!(output.frames[0].windows(6).any(|v| v == b"C08P01"));
     let (hints, mut decoy) = fresh_decoy();
     decoy.push(&startup(&hints.database, &hints.user));
     assert!(decoy.push(&first_frame(&[0xff], b"SCRAM-SHA-256")).close);

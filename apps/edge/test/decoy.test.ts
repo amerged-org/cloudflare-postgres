@@ -77,7 +77,7 @@ async function unknown(
   sessions.push({ socket, ctx });
   return { database, user, socket, messages, closed: () => closed, ctx };
 }
-it("a valid unknown route offers the PostgreSQL TLS mechanism list after the real matching startup", async () => {
+it("a valid unknown route offers the SCRAM mechanism PostgreSQL offers on a Unix socket after the real matching startup", async () => {
   const connection = await unknown();
   connection.socket.send(
     encodeStartup({ database: connection.database, user: "app" }),
@@ -86,9 +86,7 @@ it("a valid unknown route offers the PostgreSQL TLS mechanism list after the rea
   const first = connection.messages[0]!;
   expect(first[0]).toBe(0x52);
   expect(new DataView(first.buffer).getUint32(5)).toBe(10);
-  expect(new TextDecoder().decode(first.subarray(9))).toBe(
-    "SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0",
-  );
+  expect(new TextDecoder().decode(first.subarray(9))).toBe("SCRAM-SHA-256\0\0");
 });
 
 const text = (value: string) => new TextEncoder().encode(value);
@@ -292,7 +290,20 @@ it("selected SCRAM-PLUS without certificate binding is refused", async () => {
   connection.socket.send(
     first(undefined, "p=tls-server-end-point,,", "SCRAM-SHA-256-PLUS"),
   );
-  await rejected(connection);
+  await rejected(connection, "08P01");
+  expect(
+    new TextDecoder().decode(connection.messages[1]!.subarray(5)),
+  ).toContain("Mclient selected an invalid SASL authentication mechanism\0");
+  expect(connection.messages).toHaveLength(2);
+});
+it("a mechanism name behind a byte-order mark is not the offered one", async () => {
+  const connection = await unknown();
+  connection.socket.send(
+    encodeStartup({ database: connection.database, user: connection.user }),
+  );
+  await expect.poll(() => connection.messages.length).toBe(1);
+  connection.socket.send(first(undefined, "n,,", "\uFEFFSCRAM-SHA-256"));
+  await rejected(connection, "08P01");
   expect(connection.messages).toHaveLength(2);
 });
 it("unsupported GS2 authorization identity is refused", async () => {
@@ -467,6 +478,6 @@ it("a pipelined message that is not a password gets the SCRAM offer", async () =
       password(text("a\0b\0")),
     ),
   );
-  await rejected(connection);
+  await rejected(connection, "08P01");
   expect(new DataView(connection.messages[0]!.buffer).getUint32(5)).toBe(10);
 });

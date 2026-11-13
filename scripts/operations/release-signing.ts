@@ -182,7 +182,7 @@ async function secretNames(
   const body: unknown = await response.json().catch(() => null);
   if (response.status === 404)
     throw new Error(
-      `the Worker ${options.worker} does not exist in this account: deploy it first (cd apps/release-signer && npx wrangler deploy)`,
+      `the Worker ${options.worker} does not exist in this account: deploy it first (cd apps/release-signer && pnpm exec wrangler deploy)`,
     );
   const result = (body as { success?: boolean; result?: unknown } | null)
     ?.result;
@@ -244,7 +244,7 @@ export async function provision(
   //    cannot be read back. Nothing lifts this refusal, --rotate included.
   if ((await secretNames(options, fetchImpl)).includes(RELEASE_SIGNING_SECRET))
     throw new Error(
-      `the Worker ${options.worker} already holds the secret ${RELEASE_SIGNING_SECRET}, which cannot be read back: this command never replaces it, because it may be the only copy of the key the nodes trust. Deploy another Worker under another name and pass it as --worker (docs/operations/release-signing.md), or, only if that key is lost, delete the secret first with: npx wrangler secret delete ${RELEASE_SIGNING_SECRET} --name ${options.worker}`,
+      `the Worker ${options.worker} already holds the secret ${RELEASE_SIGNING_SECRET}, which cannot be read back: this command never replaces it, because it may be the only copy of the key the nodes trust. Deploy another Worker under another name and pass it as --worker (docs/operations/release-signing.md), or, only if that key is lost, delete the secret first with: cd apps/release-signer && pnpm exec wrangler secret delete ${RELEASE_SIGNING_SECRET} --name ${options.worker}`,
     );
 
   // 3. The key exists only from here, in memory.
@@ -262,7 +262,7 @@ export async function provision(
     // The answer did not arrive: the API may or may not have set the secret. The Worker held none
     // before (step 2), so deleting what may be there loses no key anyone trusts.
     throw new Error(
-      `the Cloudflare API did not answer the request that sets the secret, so it is not known whether the Worker now holds a new key. The new key's public half is ${publicKey}; the file ${options.publicPath} is unchanged. The Worker held no secret before this command: delete the one it may hold with \`npx wrangler secret delete ${RELEASE_SIGNING_SECRET} --name ${options.worker}\` and run the command again`,
+      `the Cloudflare API did not answer the request that sets the secret, so it is not known whether the Worker now holds a new key. The new key's public half is ${publicKey}; the file ${options.publicPath} is unchanged. The Worker held no secret before this command: delete the one it may hold with \`cd apps/release-signer && pnpm exec wrangler secret delete ${RELEASE_SIGNING_SECRET} --name ${options.worker}\` and run the command again`,
     );
   }
   const body: unknown = await response.json().catch(() => null);

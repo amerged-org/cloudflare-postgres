@@ -357,6 +357,10 @@ impl<M: Machine> Service<M> {
         let table = Arc::new(Table::default());
         let credentials = Arc::new(Credentials::default());
         crate::link::file::create_private_directory(&layout.jobs())?;
+        crate::archive::job::remove_leftovers(&layout.jobs())?;
+        // An earlier agent left a crashed run's environment file on the root disk; it goes now,
+        // and a failure to remove it must not keep the agent from starting.
+        let _ = std::fs::remove_dir_all(layout.legacy_jobs());
         let jobs = Arc::new(Jobs::new(
             Runner::new(&layout.systemd_run, &layout.barman_bin, layout.jobs()),
             policy.backup.clone(),

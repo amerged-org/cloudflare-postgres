@@ -647,7 +647,7 @@ it("purges expired credentials in the same step, and fails the step after the ot
       .bind(reference.id)
       .first(),
   ).toBeNull();
-  // An archive in a bucket this Worker is not bound to: the windows cannot be applied.
+  // No archive bucket is bound to this Worker: the windows cannot be applied.
   const again = await ensureArchiveCredential(
     env.DB,
     {
@@ -659,7 +659,7 @@ it("purges expired credentials in the same step, and fails the step after the ot
   );
   await expect(
     runBackupRetention(
-      { ...env, ARCHIVE_BUCKET_NAME: "unbound-bucket" },
+      { ...env, ARCHIVE: undefined as unknown as typeof env.ARCHIVE },
       a.now + 7 * 3600_000,
     ),
   ).rejects.toThrow("backup_retention_failed");
@@ -668,4 +668,51 @@ it("purges expired credentials in the same step, and fails the step after the ot
       .bind(again.id)
       .first(),
   ).toBeNull();
+});
+
+it("never takes a backup whose id names a time past the cutoff as the anchor, whatever its descriptor says", async () => {
+  const a = await archive();
+  await a.backup(21, 20, 1, 3);
+  const recent = await a.backup(11, 10, 4, 6);
+  await a.segments(1, 8);
+  // A descriptor a node wrote under an id far past the window, ending before the window.
+  const forged = "99991231T235959";
+  await put(
+    `${a.prefix}base/${forged}/backup.info`,
+    `status=DONE\nbegin_time=${a.ago(20).toISOString()}\nend_time=${a.ago(8).toISOString()}\nbegin_wal=${wal(8)}\nend_wal=${wal(8)}\nxlog_segment_size=16777216\n`,
+  );
+  await put(`${a.prefix}base/${forged}/data.tar.gz`, "data");
+  await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY);
+  expect(bases(await a.names())).toContain(recent);
+});
+
+it("skips archives that name another bucket, and sends one that throws to the back for six hours, so that they hold no slot", async () => {
+  const now = Date.now();
+  const foreign = [await archive(now), await archive(now)],
+    broken = await archive(now),
+    good = await archive(now);
+  for (const a of foreign)
+    await env.DB.prepare(
+      "UPDATE databases SET archive_path=replace(archive_path,?,?) WHERE id=?",
+    )
+      .bind(`s3://${env.ARCHIVE_BUCKET_NAME}/`, "s3://another-bucket/", a.id)
+      .run();
+  // Its generation no longer matches its archive path, so the archive cannot be read.
+  await env.DB.exec(
+    `UPDATE databases SET storage_generation=2 WHERE id='${broken.id}'`,
+  );
+  // The good database was checked seven hours ago and is due; the others were never checked.
+  await env.DB.prepare(
+    "INSERT INTO backup_retention_runs(database_id,archive_path,checked_at) SELECT id,archive_path,? FROM databases WHERE id=?",
+  )
+    .bind(new Date(now - 7 * 3600_000).toISOString(), good.id)
+    .run();
+  expect(await enforceBackupRetention(env, now, 2)).toMatchObject({
+    checked: 2,
+    failed: 1,
+  });
+  // The broken archive was checked a minute ago, so it waits six hours.
+  expect(await enforceBackupRetention(env, now + 60_000, 2)).toMatchObject({
+    checked: 0,
+  });
 });

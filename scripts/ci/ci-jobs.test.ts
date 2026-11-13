@@ -110,8 +110,35 @@ test("the Rust cache feeds verdicts only: a pull request restores it, only main 
   );
   assert.doesNotMatch(rust, /uses: actions\/cache@/);
   // The node binaries that `sign-release` signs and the Edge Worker bytes that are kept compile
-  // from nothing: no cache of compiled output reaches them.
+  // from nothing, and their packages install from the registry: no cache of compiled output or of
+  // the pnpm store (setup-node's `cache:` input) reaches them.
   for (const job of ["node-image", "edge-tests", "sign-release"]) {
-    assert.doesNotMatch(code(jobs[job]!), /actions\/cache/, job);
+    assert.doesNotMatch(code(jobs[job]!), /actions\/cache|^ *cache:/m, job);
   }
+});
+
+test("the scheduled advisories job audits the production npm packages and the Rust crates with a pinned cargo-audit", () => {
+  const lock = JSON.parse(
+    readFileSync(join(root, "infra/platform/versions.lock.json"), "utf8"),
+  ) as { nativeRuntime: { cargoAuditVersion: string } };
+  assert.match(lock.nativeRuntime.cargoAuditVersion, /^\d+\.\d+\.\d+$/);
+  const job = code(jobs["advisories"]!);
+  assert.match(job, /^ {8}run: pnpm audit --prod --audit-level=moderate$/m);
+  // A red check must not hide the next one: every later step runs unless the job is cancelled.
+  const steps = job.split(/^ {6}- name: /m).slice(1);
+  const audits = steps.filter((step) =>
+    /pnpm audit|rustup toolchain install|cargo audit/.test(step),
+  );
+  assert.equal(audits.length, 3);
+  for (const step of audits)
+    assert.match(step, /^ {8}if: \$\{\{ !cancelled\(\) \}\}$/m);
+  assert.match(
+    job,
+    /^ {10}PGCF_CARGO_AUDIT_VERSION=\$\(node -p 'require\("\.\/infra\/platform\/versions\.lock\.json"\)\.nativeRuntime\.cargoAuditVersion'\)$/m,
+  );
+  assert.match(
+    job,
+    /^ {10}cargo install cargo-audit --version "\$PGCF_CARGO_AUDIT_VERSION" --locked$/m,
+  );
+  assert.match(job, /^ {10}cargo audit$/m);
 });

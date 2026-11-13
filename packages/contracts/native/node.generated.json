@@ -2903,7 +2903,7 @@
             "total_bytes": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 9007199254740991
+              "maximum": 1099511627776
             },
             "available_bytes": {
               "type": "integer",
@@ -3799,7 +3799,7 @@
                     "total_bytes": {
                       "type": "integer",
                       "minimum": 1,
-                      "maximum": 9007199254740991
+                      "maximum": 1099511627776
                     },
                     "available_bytes": {
                       "type": "integer",

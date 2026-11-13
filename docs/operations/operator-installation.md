@@ -14,7 +14,10 @@ Use a source commit that passed the common CI checks.
 
 Keep the private API configuration outside Git. It supplies D1, the one R2 archive binding,
 NodeActor/DatabaseActor/CronWatchdog/ActorWarmer Durable Objects and the AddNode and
-InfrastructureBackup Workflows. Start from `apps/api/wrangler.example.jsonc`; replace every placeholder. Import secret
+InfrastructureBackup Workflows. Start from `apps/api/wrangler.example.jsonc`; replace every placeholder. Keep
+`global_fetch_strictly_public` in its `compatibility_flags`, as the example does: without it a webhook URL on a
+hostname of the Worker's own zone is fetched at that zone's origin, past its Workers, WAF and Access. Add the
+flag to the private configuration before the next API deploy. Import secret
 values from private custody and preserve the existing ones on every redeploy. Export D1 before
 applying additive migrations and rehearse them against the export.
 
@@ -990,11 +993,28 @@ The deployed Edge Worker is the TypeScript `apps/edge`; the management API and D
 in TypeScript. Start the private deployment configuration from `apps/edge/wrangler.example.jsonc`
 and preserve the existing Worker name, hostname, DatabaseActor binding, rate-limit namespaces,
 gateway service bindings (if a region uses one) and `ROUTE_MASTER_KEYS` secret.
-The example also sets `minify: true`, a `BINDING_CONNECTION_RATE_LIMITER` rate limit with a
-namespace of its own for same-account Workers on a service binding (without it every such caller
-is refused with `53300` "connection admission unavailable"), and `DATABASE_ACTOR_LOCATION_HINT`,
+The example also sets `minify: true`, a `SOURCE_RATE_LIMITER` rate limit with a namespace of its
+own that counts every route of one source network (600 per 60 s, a product default to adjust;
+without it every public WebSocket connection and HTTP query is refused with `53300` "connection
+admission unavailable", so add the namespace before or with the deploy), a
+`BINDING_CONNECTION_RATE_LIMITER` rate limit with a namespace of its own for same-account Workers
+on a service binding (without it every such caller is refused with `53300` "connection admission
+unavailable"), and `DATABASE_ACTOR_LOCATION_HINT`,
 which must equal the API Worker's value; the hint places only DatabaseActor objects created after
 it is set.
+
+A PostgreSQL backend holds its slot from the StartupMessage until the login completes. Every
+database's configuration sets `authentication_timeout = 10s`, which the node agent writes at each
+start (a database that has not started since this release keeps PostgreSQL's default of one
+minute until its next start), and the gateway ends a connection that is not logged in 10 s after
+its first write to PostgreSQL, answering `08006`. A client that never logs in therefore holds a
+slot for at most about 10 s. The Edge's connection limiters still bound a reconnect flood: with
+the example values, the per-database limiter (`DATABASE_CONNECTION_RATE_LIMITER`, 120 per 60 s)
+and the per-database-role-network limiter (`CONNECTION_RATE_LIMITER`, 120 per 60 s) let about two
+such connections start per second, so about 20 unauthenticated slots can be held at once, which is
+the whole `max_connections` of an `xs` database. This release does not change the limiters; their
+configured values are the bound on such a flood, so set them for each installation with that in
+mind.
 
 A fresh Edge isolate parses and evaluates the whole bundle before it answers its first request, so
 the bundle holds no zod: it was 487.65 KiB (gzip 107.22 KiB) with it and is 25.48 KiB (gzip 9.63
@@ -1034,7 +1054,7 @@ protocol behavior. They do not replace live acceptance on the EU1 stack: a real 
 node's gateway, reached through its Tunnel.
 
 Start the replacement's private configuration from `apps/edge-rust/wrangler.example.jsonc`;
-it has the same bindings, variable and secret as the TypeScript example, and serves the same
+it has the same bindings, variable and secret as the TypeScript example except `SOURCE_RATE_LIMITER`, which only the TypeScript Edge counts, and serves the same
 routes (`/v2` WebSocket connections and `/sql` HTTP queries). The example intentionally has no
 custom build command: delivery uses the qualified artifact instead of compiling again. Do not
 activate the replacement until the selected bytes pass live database acceptance on the EU1
@@ -1434,8 +1454,8 @@ fails with `power_outbox`: its drain has rows it cannot deliver.
 Placement follows plan 4.8 and needs no policy. Its CPU peak (the highest 30-minute average of the
 last three days) must be below 80 %, and the requested CPU must fit its physical cores. RAM uses
 the higher of that three-day peak and the current sample, plus the full memory of databases placed
-since that sample and the requested database; this sum must also be below 80 %. The fullest
-qualifying node wins. Two more things close a node to new databases, and neither is
+since that sample and the requested database; this sum must also be below 80 %. The qualifying
+node holding the most placed memory wins. Two more things close a node to new databases, and neither is
 a policy field: its thin pool (data at 80 %, metadata at 50 %, or the sold storage at four times its
 data) and **1,000 thin volumes**, the largest count Stage 1 measured on EU1 and the constant
 `MAX_VOLUMES_PER_NODE` in `apps/api/src/domain/placement.ts`. The bound counts every volume the node

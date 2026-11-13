@@ -2099,6 +2099,14 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     [
+      "total-above-the-bound",
+      {
+        ...sample,
+        memory: { total_bytes: 2 ** 40 + 1, available_bytes: 0 },
+      },
+      false,
+    ],
+    [
       "busy-above-cores",
       { ...sample, cpu: { cores: 6, busy_millicores: 6001 } },
       false,

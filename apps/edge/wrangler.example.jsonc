@@ -28,6 +28,17 @@
     // SQL statements on an existing connection do not consume these buckets.
     // Counters are per Cloudflare location and eventually consistent.
     {
+      "name": "SOURCE_RATE_LIMITER",
+      "namespace_id": "<SOURCE_RATE_LIMIT_NAMESPACE_ID>",
+      // Per source network across all databases and roles, for WebSocket handshakes and HTTP
+      // queries alike; it is counted before any DatabaseActor is got or any body is read. The 600
+      // per 60 s is a product default: adjust it to the installation's traffic.
+      "simple": {
+        "limit": 600,
+        "period": 60,
+      },
+    },
+    {
       "name": "DATABASE_CONNECTION_RATE_LIMITER",
       "namespace_id": "<DATABASE_RATE_LIMIT_NAMESPACE_ID>",
       // Aggregate per database across all roles and source networks.

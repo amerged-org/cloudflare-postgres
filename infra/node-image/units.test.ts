@@ -263,6 +263,11 @@ test("the agent runs in a mount namespace of its own: its volumes never reach PI
   }
 });
 
+test("the agent may hold 65536 descriptors, so one uid's connections to the archive socket cannot exhaust its table", () => {
+  const unit = readFileSync(new URL("pgcf-agent.service", units), "utf8");
+  assert.deepEqual(assignments(unit, "LimitNOFILE"), ["65536"]);
+});
+
 test("a killed agent is started again within a quarter of a second, and a start that fails waits in the agent", () => {
   // The first wake after `kill -9` of the agent waits for the next process: systemd starts it after
   // RestartSec (1 s on EU1, 2026-10-23, of 46 s to the first served wake). The back-off of a start
