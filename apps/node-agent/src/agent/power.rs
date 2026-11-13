@@ -834,8 +834,8 @@ impl<M: Machine> Core<M> {
             return refuse(refusal.reason());
         }
         steps.insert("pg_control".into(), millis(began.elapsed()));
-        // The configuration of a database whose size or settings changed is written while its
-        // unit is stopped, which is the only time the agent may write below its mount point.
+        // The configuration is written at every start while its unit is stopped, which is the only
+        // time the agent may write below its mount point.
         let began = Instant::now();
         let refreshed = self.refresh_configuration(&db, &entry).await;
         steps.insert("config".into(), millis(began.elapsed()));
