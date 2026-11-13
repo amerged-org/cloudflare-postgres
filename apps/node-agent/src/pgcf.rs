@@ -1486,6 +1486,12 @@ mod tests {
         let session = events(&cluster).await;
         install(&session, &SETTINGS, false).await.unwrap();
         let reader = as_role(&cluster, "reader", 2).await;
+        // The baseline takes TEMPORARY from PUBLIC: the owner grants it to the role that writes.
+        as_role(&cluster, "app", 1)
+            .await
+            .batch_execute("GRANT TEMPORARY ON DATABASE tenant TO reader")
+            .await
+            .unwrap();
         reader
             .batch_execute(
                 "CREATE TEMP TABLE orders (id int, total int);
