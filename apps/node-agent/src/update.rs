@@ -385,9 +385,11 @@ impl Lock {
                 .as_array()?
                 .iter()
                 .map(|entry| {
+                    let name = entry["name"].as_str().filter(|name| is_package_name(name))?;
+                    let version = entry["version"].as_str().filter(|version| is_version(version))?;
                     Some(Package {
-                        name: entry["name"].as_str()?.to_string(),
-                        version: entry["version"].as_str()?.to_string(),
+                        name: name.to_string(),
+                        version: version.to_string(),
                         pinned: Pinned {
                             url: entry["url"].as_str()?.to_string(),
                             sha256: entry["sha256"].as_str()?.to_string(),
@@ -443,6 +445,15 @@ pub fn plan(lock: &Lock, installed: &BTreeMap<String, String>) -> Plan {
         reboot: files.iter().any(|package| needs_reboot(&package.name)),
         files,
     }
+}
+
+/// Whether `version` is a Debian version the lock may name, and one that is a part of a file name
+/// as it is: letters, digits and `. + ~ : -`, never a slash.
+pub fn is_version(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'~' | b':' | b'-'))
 }
 
 /// Whether `name` is a Debian package name as the image's lock states one
@@ -635,6 +646,25 @@ mod tests {
         assert_eq!(lock.packages[0].name, "adduser");
         assert_eq!(Lock::parse(b"{}"), None);
         assert_eq!(Lock::parse(b"not json"), None);
+    }
+
+    #[test]
+    fn a_lock_entry_whose_name_or_version_is_no_file_name_part_is_refused() {
+        // Each package becomes a file `<name>_<version>.deb` under the agent's directory, so a name
+        // or a version that could leave it (a slash, a dot-dot name) is no lock at all.
+        let entry = |name: &str, version: &str| {
+            format!(
+                r#"{{"debian":{{"snapshot":"20261016T000000Z"}},"extra":[],"packages":[{{"name":"{name}","version":"{version}","architecture":"all","url":"https://snapshot.example/a.deb","sha256":"{}","size":100}}]}}"#,
+                "2".repeat(64)
+            )
+        };
+        assert!(Lock::parse(entry("adduser", "3.152").as_bytes()).is_some());
+        assert!(Lock::parse(entry("adduser", "3.152+b1~deb13:1").as_bytes()).is_some());
+        assert_eq!(Lock::parse(entry("adduser", "1.0/../../x").as_bytes()), None);
+        assert_eq!(Lock::parse(entry("adduser", "").as_bytes()), None);
+        assert_eq!(Lock::parse(entry("../adduser", "3.152").as_bytes()), None);
+        assert_eq!(Lock::parse(entry("Adduser", "3.152").as_bytes()), None);
+        assert_eq!(Lock::parse(entry("a", "3.152").as_bytes()), None);
     }
 
     #[test]
