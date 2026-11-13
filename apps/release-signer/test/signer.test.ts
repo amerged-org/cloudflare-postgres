@@ -456,6 +456,18 @@ describe("who may ask", () => {
       403,
       "claim_runner_environment",
     ],
+    [
+      "a run outside the release environment",
+      { environment: undefined },
+      403,
+      "claim_environment",
+    ],
+    [
+      "a run of another environment",
+      { environment: "staging" },
+      403,
+      "claim_environment",
+    ],
     ["no commit", { sha: undefined }, 403, "claim_sha"],
     [
       "a commit that is not 40 hex digits",

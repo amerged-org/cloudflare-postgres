@@ -78,6 +78,7 @@ key still does not protect is under "What is and is not protected".
   | `event_name` | `push` (not a pull request, not a dispatch) | `claim_event_name` |
   | `job_workflow_ref` | `<repository>/<SIGNER_WORKFLOW>@<ref>` (`.github/workflows/ci.yml`) | `claim_job_workflow_ref` |
   | `runner_environment` | `github-hosted` | `claim_runner_environment` |
+  | `environment` | `release`, the protected environment of the `sign-release` job in `ci.yml` (its required reviewer who did not push, and its branch rule, are repository settings the owner keeps) | `claim_environment` |
   | `sha` | 40 hex digits, and the manifest's release id is `sha-<its first 12 digits>` | `claim_sha`, `release_not_of_commit` |
 
   The variables are in `apps/release-signer/wrangler.jsonc`, which holds no secret and no account id and
@@ -130,7 +131,7 @@ key still does not protect is under "What is and is not protected".
   dispatch-only `external_probe` (which attests its report and whose token says `workflow_dispatch`,
   which the signer refuses), or if a step could pass over the signing. A pull request, a run of another
   branch or a dispatched run, even with an edited `ci.yml`, gets no signature: its token names another
-  `ref`, `event_name` or `job_workflow_ref`, and the signer does not accept it.
+  `ref`, `event_name`, `job_workflow_ref` or `environment`, and the signer does not accept it.
 - **Registration.** `register-node-image.ts` reads `release.sig`, checks it against
   `apps/node-agent/release-signing.pub` of **its own checkout** and stops before it uploads anything if
   it does not verify, so that no release that every node would refuse is ever registered. That key must

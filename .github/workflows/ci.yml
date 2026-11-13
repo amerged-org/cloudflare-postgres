@@ -589,6 +589,10 @@ jobs:
   sign-release:
     needs: [check, node-image]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.fork
+    # The signer accepts only a run that names this environment in its token, so the owner's
+    # protection rules on `release` (a required reviewer who did not push, main only) stand between
+    # a push and a signature. The rules are a repository setting, not code.
+    environment: release
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:

@@ -4,6 +4,7 @@
 // and it uses WebCrypto only, so that the Worker's tests (workerd) and the scripts' tests (Node)
 // both run it.
 import { bytesToBase64url } from "@pgcf/contracts";
+import { RELEASE_ENVIRONMENT } from "../src/github-token.ts";
 
 export const ISSUER = "https://token.actions.githubusercontent.com";
 export const JWKS_URL = `${ISSUER}/.well-known/jwks`;
@@ -90,6 +91,7 @@ export function claims(
     event_name: "push",
     job_workflow_ref: `${POLICY_VARS.SIGNER_REPOSITORY}/${POLICY_VARS.SIGNER_WORKFLOW}@${POLICY_VARS.SIGNER_REF}`,
     runner_environment: "github-hosted",
+    environment: RELEASE_ENVIRONMENT,
     iat: seconds,
     nbf: seconds - 5,
     exp: seconds + 300,
