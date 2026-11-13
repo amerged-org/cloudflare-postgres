@@ -1229,7 +1229,7 @@ async fn run_session(
         let mut held = None;
         if let Some(password) = password {
             let login = tokio::select! {
-                login=timeout(STARTUP_BOUND,auth::login(&mut postgres,&password,None))=>login.map_err(|_|"startup_timeout").and_then(|login|login.map_err(|_|"postgres_error")),
+                login=timeout(STARTUP_BOUND,auth::login(&mut postgres,&claims.db,&password,None))=>login.map_err(|_|"startup_timeout").and_then(|login|login.map_err(|_|"postgres_error")),
                 _=stop.changed()=>Err("gateway_draining"),
                 _=interrupted(actions)=>Err("fenced"),
             };

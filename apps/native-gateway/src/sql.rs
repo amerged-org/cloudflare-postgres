@@ -901,7 +901,7 @@ async fn authenticate(
             Guard::Fenced => not_accepting("fenced"),
             Guard::Lost => failed(),
         })?;
-    let login = auth::login(&mut backend.postgres, password, known)
+    let login = auth::login(&mut backend.postgres, &backend.database, password, known)
         .await
         .map_err(|_| failed())?;
     let startup_error = |body: &[u8]| Refused {
