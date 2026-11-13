@@ -5,7 +5,12 @@ import testConfig from "../../wrangler.test.jsonc?raw";
 
 // Both files are JSONC: line comments and trailing commas. The pattern keeps string literals
 // (URLs contain "//") and drops comments and trailing commas outside them.
-const parseJsonc = (text: string): { compatibility_flags?: string[] } =>
+const parseJsonc = (
+  text: string,
+): {
+  compatibility_flags?: string[];
+  ratelimits?: { name: string; namespace_id: string; simple: unknown }[];
+} =>
   JSON.parse(
     text.replace(
       /("(?:\\.|[^"\\])*")|\/\/[^\n]*|,(\s*[}\]])/g,
@@ -23,4 +28,14 @@ it.each([
   expect(parseJsonc(text).compatibility_flags).toContain(
     "global_fetch_strictly_public",
   );
+});
+
+// The API limits each source address on its own namespace, before any key is read: the default is
+// 3000 requests a minute, and an operator puts the namespace id of the account in place of its placeholder.
+it("limits each source address in the example to 3000 requests a minute on the API's own namespace", () => {
+  expect(parseJsonc(exampleConfig).ratelimits).toContainEqual({
+    name: "API_RATE_LIMITER",
+    namespace_id: "<API_RATE_LIMIT_NAMESPACE_ID>",
+    simple: { limit: 3000, period: 60 },
+  });
 });

@@ -99,15 +99,18 @@
   // The API answers on its routes only, where the WAF rule of the installation and the limit below apply.
   "workers_dev": false,
   "preview_urls": false,
-  // The API's own limit per source network (CF-Connecting-IP), counted before a key is read, so that
-  // anonymous callers cannot reach D1 for free. 1200 requests per 60 s is a product default: adjust
-  // it to the installation's traffic, and allowlist the node addresses in the WAF rule if they are many.
+  // The API's own limit per source address (CF-Connecting-IP), counted before a key is read, so that
+  // anonymous callers cannot reach D1 for free. The default is 3000 requests per 60 s. A Workers rate
+  // limit binding takes its limit and namespace from this file, not from a variable: to change either,
+  // edit it and deploy. The namespace id (a rate limiting namespace of the account, created once) takes
+  // the place of <API_RATE_LIMIT_NAMESPACE_ID>; the deploy fails until it names one that exists. Raise
+  // the limit for an integrator whose traffic leaves from one address, or allowlist nodes in the WAF.
   "ratelimits": [
     {
       "name": "API_RATE_LIMITER",
       "namespace_id": "<API_RATE_LIMIT_NAMESPACE_ID>",
       "simple": {
-        "limit": 1200,
+        "limit": 3000,
         "period": 60,
       },
     },
