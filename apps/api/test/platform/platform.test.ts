@@ -161,7 +161,7 @@ describe("API platform on real Workers D1", () => {
     expect(await errorCode(retried)).toBe("unauthorized");
   });
 
-  it("rejects bootstrap of integrator keys and cannot bootstrap again after revocation", async () => {
+  it("makes integrator keys only for an existing project, and cannot bootstrap again after revocation", async () => {
     const invalid = await app().fetch(
       request("/v1/api-keys", env.BOOTSTRAP_TOKEN, "POST", {
         name: "wrong",
@@ -170,7 +170,7 @@ describe("API platform on real Workers D1", () => {
       }),
       env,
     );
-    expect(invalid.status).toBe(403);
+    expect(invalid.status).toBe(404);
     const admin = await bootstrap();
     expect(
       (
@@ -233,7 +233,7 @@ describe("API platform on real Workers D1", () => {
     const admin = await bootstrap();
     const own = await project(admin.key, "own");
     const other = await project(admin.key, "other");
-    const integrator = await createKey(admin.key, {
+    const integrator = await createKey(env.BOOTSTRAP_TOKEN, {
       scope: "integrator",
       project_id: own.id,
       name: "own",

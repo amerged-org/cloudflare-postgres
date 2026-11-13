@@ -10,14 +10,16 @@ messages, provider access tokens and certificates retain their security deadline
 ## API keys
 
 Using a working administrator key, call `POST /v1/api-keys` with an explicit `Idempotency-Key`.
-For a replacement administrator use `{"scope":"admin","name":"operator replacement"}`;
-integrator keys additionally require their existing `project_id`. Save the creation response
+For a replacement administrator use `{"scope":"admin","name":"operator replacement"}`. An integrator
+key is made with the owner credential (`BOOTSTRAP_TOKEN`), or by an integrator key of the same
+project; it requires the project's `project_id`. An administrator key never makes one. Save the creation response
 directly in private credential custody. The full key is returned once; replay does not reissue or
 silently replace it. Verify the replacement's scoped access, update the consumer, then revoke the
 old key with `DELETE /v1/api-keys/{id}`. Keep a working administrator throughout the change.
 
-`BOOTSTRAP_TOKEN` creates the first administrator key once and then answers `401`; it creates no
-integrator key and no second administrator.
+`BOOTSTRAP_TOKEN` creates the first administrator key once and then answers `401` for another
+administrator; it creates integrator keys for any existing project, with no idempotency record, so a
+retried request makes another key.
 
 **Scopes.** An operator holds keys of two scopes. `admin` changes anything: it buys servers, starts
 rollouts and maintenance, declares nodes lost and makes keys. `admin_read` reads what an
