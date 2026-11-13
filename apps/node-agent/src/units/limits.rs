@@ -215,6 +215,8 @@ mod tests {
             device: "/dev/mapper/pgcf-lv".into(),
             write_bytes_per_second: 16_000_000,
             write_iops: 1000,
+            read_bytes_per_second: 64_000_000,
+            read_iops: 4000,
         };
         let with = limits(256, 1000, Some(io)).properties();
         assert_eq!(with.len(), 8);
