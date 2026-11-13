@@ -8,6 +8,7 @@ import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
 import { deleteUnpinnedArchiveKeys } from "./archive-retention-claims.ts";
 import { retireColdSnapshots } from "./cold-snapshot-retention.ts";
+import { recordedDigests, verifyBackupDigest } from "./archive-digests.ts";
 import {
   BACKUP_DATA,
   keysOf,
@@ -92,6 +93,7 @@ async function boundedAnchor(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
+  recorded: ReadonlyMap<string, string>,
 ): Promise<RestoreBackup | null> {
   const described: string[] = [],
     withData = new Set<string>(),
@@ -110,7 +112,11 @@ async function boundedAnchor(
   for (const id of described.sort().reverse()) {
     // A backup that began a day after the cutoff did not end before it, whatever the node's clock.
     if (idMs(id) > cutoff + 86_400_000) continue;
+    // Only a backup whose digest the Worker recorded is trusted; one that changed refuses the archive.
+    const expected = recorded.get(id);
+    if (expected === undefined) continue;
     if (reads++ === ANCHOR_READS) break;
+    await verifyBackupDigest(bucket, prefix, id, expected);
     const info = await bucket.get(`${prefix}base/${id}/backup.info`);
     const backup =
       info && info.size <= 65536
@@ -136,10 +142,16 @@ async function findAnchor(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
-  notAfter?: string,
+  notAfter: string | undefined,
+  recorded: ReadonlyMap<string, string>,
 ): Promise<RestoreBackup | null> {
   try {
-    const catalog = await readRestoreCatalog(bucket, prefix, notAfter);
+    const catalog = await readRestoreCatalog(
+      bucket,
+      prefix,
+      notAfter,
+      recorded,
+    );
     return (
       catalog.backups.find(
         (backup) =>
@@ -153,7 +165,7 @@ async function findAnchor(
       error instanceof ApiError && error.details?.reason === "archive_unusable"
     ))
       throw error;
-    return boundedAnchor(bucket, prefix, cutoff);
+    return boundedAnchor(bucket, prefix, cutoff, recorded);
   }
 }
 
@@ -166,8 +178,9 @@ export async function retainBackups(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
-  maxDeletes = DEFAULT_DELETES_PER_DATABASE,
-  notAfter?: string,
+  maxDeletes: number,
+  notAfter: string | undefined,
+  recorded: ReadonlyMap<string, string>,
 ): Promise<RetentionResult> {
   const plan = await retentionPlan(
     bucket,
@@ -175,6 +188,7 @@ export async function retainBackups(
     cutoff,
     maxDeletes,
     notAfter,
+    recorded,
   );
   await deleteKeys(bucket, plan.descriptors);
   await deleteKeys(bucket, plan.data);
@@ -185,10 +199,11 @@ async function retentionPlan(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
-  maxDeletes = DEFAULT_DELETES_PER_DATABASE,
-  notAfter?: string,
+  maxDeletes: number,
+  notAfter: string | undefined,
+  recorded: ReadonlyMap<string, string>,
 ): Promise<{ descriptors: string[]; data: string[]; result: RetentionResult }> {
-  const anchor = await findAnchor(bucket, prefix, cutoff, notAfter);
+  const anchor = await findAnchor(bucket, prefix, cutoff, notAfter, recorded);
   if (!anchor)
     return {
       descriptors: [],
@@ -298,7 +313,8 @@ export async function enforceBackupRetention(
     run.checked++;
     try {
       const selected = archiveBucket(env),
-        prefix = validatedArchivePrefix(row, selected.bucketName);
+        prefix = validatedArchivePrefix(row, selected.bucketName),
+        recorded = await recordedDigests(env.DB, row.archive_path);
       const deletion = await deleteUnpinnedArchiveKeys(
         env,
         selected.bucket,
@@ -309,8 +325,9 @@ export async function enforceBackupRetention(
             selected.bucket,
             prefix,
             now - row.backup_retention_days * 86_400_000,
-            undefined,
+            DEFAULT_DELETES_PER_DATABASE,
             row.fenced_at ?? undefined,
+            recorded,
           );
           return {
             keys: [...plan.descriptors, ...plan.data],

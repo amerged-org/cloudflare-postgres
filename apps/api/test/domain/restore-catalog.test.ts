@@ -2,6 +2,10 @@
 import { env } from "cloudflare:workers";
 import { expect, it } from "vitest";
 import {
+  recordBackupDigest,
+  recordedDigests,
+} from "../../src/domain/archive-digests.ts";
+import {
   parseBackupInfo,
   readRestoreCatalog,
 } from "../../src/domain/restore-catalog.ts";
@@ -23,6 +27,19 @@ it("ignores what a node uploaded after its fence when the catalog is read up to 
   await put(`base/${legit}/data.tar.gz`, "data");
   for (let n = 1; n <= 3; n++)
     await put(`wals/${wal(n).slice(0, 16)}/${wal(n)}`, "wal");
+  // The Worker records the digest of the backup it was told about, before the fence.
+  await recordBackupDigest(
+    env.ARCHIVE,
+    env.DB,
+    `s3://${env.ARCHIVE_BUCKET_NAME}/${prefix}`,
+    prefix,
+    legit,
+    Date.now(),
+  );
+  const recorded = await recordedDigests(
+    env.DB,
+    `s3://${env.ARCHIVE_BUCKET_NAME}/${prefix}`,
+  );
   const fenced = new Date().toISOString();
   await new Promise((resolve) => setTimeout(resolve, 20));
   // A compromised node keeps writing: a newer backup that ends later, junk descriptors past the
@@ -40,7 +57,12 @@ it("ignores what a node uploaded after its fence when the catalog is read up to 
     );
   await put(`wals/${wal(9).slice(0, 16)}/${wal(9)}`, "wal");
 
-  const catalog = await readRestoreCatalog(env.ARCHIVE, prefix, fenced);
+  const catalog = await readRestoreCatalog(
+    env.ARCHIVE,
+    prefix,
+    fenced,
+    recorded,
+  );
   expect(catalog.backups.map((backup) => backup.id)).toEqual([legit]);
   expect(catalog.newestWalAt).not.toBeNull();
   expect(Date.parse(catalog.newestWalAt!)).toBeLessThanOrEqual(
@@ -57,4 +79,48 @@ it("reads actual Barman backup.info without a serialized backup ID", () => {
   const text = `status=DONE\nbegin_time=${time}\nend_time=${time}\nbegin_wal=${wal}\nend_wal=${wal}\nxlog_segment_size=16777216\n`;
   expect(parseBackupInfo(text, id)).not.toBeNull();
   expect(parseBackupInfo(text + "status=DONE\n", id)).toBeNull();
+});
+
+it("trusts a backup only while its objects match the digest the Worker recorded, and refuses one that changed", async () => {
+  const prefix = `catalog-digest/${crypto.randomUUID()}/`;
+  const archivePath = `s3://${env.ARCHIVE_BUCKET_NAME}/${prefix}`;
+  const wal = (segment: number) =>
+    `00000001${"0".repeat(8)}${segment.toString(16).toUpperCase().padStart(8, "0")}`;
+  const put = (key: string, body: string) =>
+    env.ARCHIVE.put(`${prefix}${key}`, body);
+  const id = "20260101T000000";
+  await put(
+    `base/${id}/backup.info`,
+    `status=DONE\nbegin_time=2026-01-01T00:00:00Z\nend_time=2026-01-01T00:01:00Z\nbegin_wal=${wal(1)}\nend_wal=${wal(3)}\nxlog_segment_size=16777216\n`,
+  );
+  await put(`base/${id}/data.tar.gz`, "data");
+  for (let n = 1; n <= 3; n++)
+    await put(`wals/${wal(n).slice(0, 16)}/${wal(n)}`, "wal");
+  // Not recorded by the Worker: the backup is not trusted, whatever its descriptor says.
+  expect(
+    (await readRestoreCatalog(env.ARCHIVE, prefix, undefined, new Map()))
+      .backups,
+  ).toEqual([]);
+  await recordBackupDigest(
+    env.ARCHIVE,
+    env.DB,
+    archivePath,
+    prefix,
+    id,
+    Date.now(),
+  );
+  const recorded = await recordedDigests(env.DB, archivePath);
+  expect(
+    (
+      await readRestoreCatalog(env.ARCHIVE, prefix, undefined, recorded)
+    ).backups.map((backup) => backup.id),
+  ).toEqual([id]);
+  // The data changed after the digest was recorded: the catalog refuses the archive.
+  await put(`base/${id}/data.tar.gz`, "changed");
+  await expect(
+    readRestoreCatalog(env.ARCHIVE, prefix, undefined, recorded),
+  ).rejects.toMatchObject({ details: { reason: "archive_digest_mismatch" } });
+  await env.ARCHIVE.delete(
+    (await env.ARCHIVE.list({ prefix })).objects.map((o) => o.key),
+  );
 });

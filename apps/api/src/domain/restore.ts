@@ -36,6 +36,7 @@ import { publishForAnswer } from "./admission-mutations.ts";
 import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
 import { archiveCutoff, restoreBackup } from "./restore-catalog.ts";
+import { recordedDigests } from "./archive-digests.ts";
 import { retainedArchiveRestorable } from "./retained-archives.ts";
 interface Retained {
   roles_json: string;
@@ -202,6 +203,7 @@ export async function restoreDatabase(
         prefix,
         body.mode === "pitr" ? body.target_time : undefined,
         fencedAt,
+        await recordedDigests(c.env.DB, archiveSource.archive_path),
       );
       const stored = retained
         ? (JSON.parse(retained.roles_json) as SourceRole[])

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { reportedBackup } from "./fixtures.ts";
 import { expect } from "vitest";
 import {
   ArchiveVerificationResult,
@@ -112,6 +113,7 @@ export async function sleeping(
     `status=DONE\nbegin_time=${backupAt}\nend_time=${backupAt}\nbegin_wal=000000010000000000000001\nend_wal=000000010000000000000001\nxlog_segment_size=16777216\n`,
   );
   for (const key of [data, first, last]) await put(key);
+  await reportedBackup(before.archive_path, backup.backup_id);
   return {
     ...f,
     configured,

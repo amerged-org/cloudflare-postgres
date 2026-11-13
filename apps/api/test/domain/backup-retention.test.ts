@@ -9,6 +9,10 @@ import {
   runBackupRetention,
 } from "../../src/domain/backup-retention.ts";
 import { ensureArchiveCredential } from "../../src/domain/archive-credentials.ts";
+import {
+  recordBackupDigest,
+  recordedDigests,
+} from "../../src/domain/archive-digests.ts";
 import { readRestoreCatalog } from "../../src/domain/restore-catalog.ts";
 import { applyLifecycleObservations } from "../../src/domain/lifecycle-observations.ts";
 import {
@@ -71,6 +75,15 @@ async function archive(now = Date.now() + CLOCK_MARGIN) {
     );
     await put(`${prefix}base/${id}/data.tar.gz`, "data");
     await put(`${prefix}base/${id}/data_1.tar.gz`, "data");
+    // The Worker records the digest of a backup when a node reports it done.
+    await recordBackupDigest(
+      env.ARCHIVE,
+      env.DB,
+      row.archive_path,
+      prefix,
+      id,
+      now,
+    );
     return id;
   };
   const segments = async (from: number, to: number, timeline = 1) => {
@@ -81,7 +94,8 @@ async function archive(now = Date.now() + CLOCK_MARGIN) {
   };
   const names = async () =>
     (await list(prefix)).map((key) => key.slice(prefix.length));
-  return { ...f, prefix, root, now, backup, segments, names, ago };
+  const recorded = () => recordedDigests(env.DB, row.archive_path);
+  return { ...f, prefix, root, now, backup, segments, names, ago, recorded };
 }
 const wals = (names: string[]) =>
   names
@@ -103,7 +117,14 @@ it("keeps what the recovery window needs: the newest backup at or before its sta
   const history = "wals/00000002.history";
   const other = `${a.root.replace(/\/g1-/, "/g2-")}/database/base/${b1}/backup.info`;
   await put(other, "another generation");
-  const result = await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY);
+  const result = await retainBackups(
+    env.ARCHIVE,
+    a.prefix,
+    a.now - 7 * DAY,
+    2000,
+    undefined,
+    await a.recorded(),
+  );
   expect(result).toEqual({ backups: 1, objects: 3 + 3, complete: true });
   const names = await a.names();
   expect(bases(names)).toEqual([b2, b3].sort());
@@ -128,7 +149,14 @@ it("deletes the compressed backup labels and partial segments that lie before th
     [7, ".partial.gz"],
   ] as const)
     await put(extra(n, suffix));
-  await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY);
+  await retainBackups(
+    env.ARCHIVE,
+    a.prefix,
+    a.now - 7 * DAY,
+    2000,
+    undefined,
+    await a.recorded(),
+  );
   const names = await a.names();
   expect(names.filter((n) => /backup\.gz$|partial/.test(n))).toEqual(
     [
@@ -143,7 +171,14 @@ it("never deletes the newest DONE backup, however old", async () => {
   await a.backup(40, 39, 1, 2);
   const newest = await a.backup(30, 29, 3, 4);
   await a.segments(1, 6);
-  const result = await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY);
+  const result = await retainBackups(
+    env.ARCHIVE,
+    a.prefix,
+    a.now - 7 * DAY,
+    2000,
+    undefined,
+    await a.recorded(),
+  );
   expect(result.backups).toBe(1);
   const names = await a.names();
   expect(bases(names)).toEqual([newest]);
@@ -156,7 +191,16 @@ it("deletes nothing while every backup is inside the window or none is complete"
   await a.backup(2, 1, 3, 4);
   await a.segments(1, 5);
   const before = await a.names();
-  expect(await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY)).toEqual({
+  expect(
+    await retainBackups(
+      env.ARCHIVE,
+      a.prefix,
+      a.now - 7 * DAY,
+      2000,
+      undefined,
+      await a.recorded(),
+    ),
+  ).toEqual({
     backups: 0,
     objects: 0,
     complete: true,
@@ -168,7 +212,16 @@ it("deletes nothing while every backup is inside the window or none is complete"
   await b.segments(1, 1);
   await b.segments(3, 5);
   const gap = await b.names();
-  expect(await retainBackups(env.ARCHIVE, b.prefix, b.now - 7 * DAY)).toEqual({
+  expect(
+    await retainBackups(
+      env.ARCHIVE,
+      b.prefix,
+      b.now - 7 * DAY,
+      2000,
+      undefined,
+      await b.recorded(),
+    ),
+  ).toEqual({
     backups: 0,
     objects: 0,
     complete: true,
@@ -182,7 +235,14 @@ it("removes unfinished backups older than the anchor and leaves a newer one that
   await a.backup(20, 19, 3, 4);
   const running = await a.backup(0.01, 0.005, 9, 10, "STARTED");
   await a.segments(3, 12);
-  await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY);
+  await retainBackups(
+    env.ARCHIVE,
+    a.prefix,
+    a.now - 7 * DAY,
+    2000,
+    undefined,
+    await a.recorded(),
+  );
   const names = await a.names();
   expect(bases(names)).not.toContain(failed);
   expect(bases(names)).toContain(running);
@@ -199,10 +259,25 @@ it("follows the timeline: the segments of older timelines go, those of the ancho
     `status=DONE\nbegin_time=${begin.toISOString()}\nend_time=${a.ago(10).toISOString()}\nbegin_wal=${wal(5, 2)}\nend_wal=${wal(6, 2)}\nxlog_segment_size=16777216\n`,
   );
   await put(`${a.prefix}base/${id}/data.tar.gz`);
+  await recordBackupDigest(
+    env.ARCHIVE,
+    env.DB,
+    (await a.row()).archive_path,
+    a.prefix,
+    id,
+    a.now,
+  );
   await put(`${a.prefix}wals/00000002.history`, "history");
   await a.segments(1, 8, 1);
   await a.segments(4, 8, 2);
-  await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY);
+  await retainBackups(
+    env.ARCHIVE,
+    a.prefix,
+    a.now - 7 * DAY,
+    2000,
+    undefined,
+    await a.recorded(),
+  );
   const names = await a.names();
   expect(wals(names)).toEqual([5, 6, 7, 8].map((n) => wal(n, 2)));
   expect(names).toContain("wals/00000002.history");
@@ -216,7 +291,16 @@ it("leaves an archive alone when WAL of a later timeline makes its backups unusa
   await a.segments(1, 8, 1);
   await a.segments(7, 8, 2);
   const before = await a.names();
-  expect(await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY)).toEqual({
+  expect(
+    await retainBackups(
+      env.ARCHIVE,
+      a.prefix,
+      a.now - 7 * DAY,
+      2000,
+      undefined,
+      await a.recorded(),
+    ),
+  ).toEqual({
     backups: 0,
     objects: 0,
     complete: true,
@@ -241,7 +325,14 @@ it("deletes the descriptor of a backup before its data, in bounded calls", async
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
-  await retainBackups(recording, a.prefix, a.now - 7 * DAY);
+  await retainBackups(
+    recording,
+    a.prefix,
+    a.now - 7 * DAY,
+    2000,
+    undefined,
+    await a.recorded(),
+  );
   expect(calls.flat()).toHaveLength(6);
   expect(calls[0]).toEqual([`${a.prefix}base/${old}/backup.info`]);
   expect(calls.every((call) => call.length <= 1000)).toBe(true);
@@ -252,10 +343,24 @@ it("stops at the limit it was given and reports that more remains", async () => 
   await a.backup(21, 20, 1, 3);
   await a.backup(11, 10, 4, 6);
   await a.segments(1, 12);
-  const first = await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY, 2);
+  const first = await retainBackups(
+    env.ARCHIVE,
+    a.prefix,
+    a.now - 7 * DAY,
+    2,
+    undefined,
+    await a.recorded(),
+  );
   expect(first).toEqual({ backups: 1, objects: 2, complete: false });
   // The descriptor went first, so the old backup is already out of the catalog.
-  const second = await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY);
+  const second = await retainBackups(
+    env.ARCHIVE,
+    a.prefix,
+    a.now - 7 * DAY,
+    2000,
+    undefined,
+    await a.recorded(),
+  );
   expect(second.complete).toBe(true);
   const names = await a.names();
   expect(bases(names)).toHaveLength(1);
@@ -381,9 +486,9 @@ it("trims an archive that is beyond the bounds of the restore catalog instead of
   for (let i = 0; i < 65; i++)
     ids.push(await a.backup(65 - i, 65 - i - 0.01, 2 * i + 1, 2 * i + 2));
   await a.segments(1, 131);
-  await expect(readRestoreCatalog(env.ARCHIVE, a.prefix)).rejects.toMatchObject(
-    { details: { reason: "archive_unusable" } },
-  );
+  await expect(
+    readRestoreCatalog(env.ARCHIVE, a.prefix, undefined, await a.recorded()),
+  ).rejects.toMatchObject({ details: { reason: "archive_unusable" } });
   const run = await enforceBackupRetention(env, a.now);
   expect(run).toMatchObject({ checked: 1, backups: 57, failed: 0 });
   const names = await a.names();
@@ -394,7 +499,14 @@ it("trims an archive that is beyond the bounds of the restore catalog instead of
   );
   // The archive is within the catalog's bounds again.
   expect(
-    (await readRestoreCatalog(env.ARCHIVE, a.prefix)).backups,
+    (
+      await readRestoreCatalog(
+        env.ARCHIVE,
+        a.prefix,
+        undefined,
+        await a.recorded(),
+      )
+    ).backups,
   ).toHaveLength(8);
 });
 
@@ -404,7 +516,16 @@ it("deletes nothing from an oversized archive whose newest old backups cannot be
     await a.backup(65 - i, 65 - i - 0.01, 2 * i + 1, 2 * i + 2);
   // Not one segment is archived: no backup has its WAL.
   const before = await a.names();
-  expect(await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY)).toEqual({
+  expect(
+    await retainBackups(
+      env.ARCHIVE,
+      a.prefix,
+      a.now - 7 * DAY,
+      2000,
+      undefined,
+      await a.recorded(),
+    ),
+  ).toEqual({
     backups: 0,
     objects: 0,
     complete: true,
@@ -675,13 +796,42 @@ it("purges expired credentials in the same step, and fails the step after the ot
   ).toBeNull();
 });
 
+it("deletes nothing from an archive whose recorded backup changed after the Worker recorded it, and refuses", async () => {
+  const a = await archive();
+  const old = await a.backup(21, 20, 1, 3);
+  const recent = await a.backup(11, 10, 4, 6);
+  await a.segments(1, 8);
+  // The data of the recent backup is rewritten after its digest was recorded.
+  await put(`${a.prefix}base/${recent}/data.tar.gz`, "rewritten");
+  await expect(
+    retainBackups(
+      env.ARCHIVE,
+      a.prefix,
+      a.now - 7 * DAY,
+      2000,
+      undefined,
+      await a.recorded(),
+    ),
+  ).rejects.toMatchObject({ details: { reason: "archive_digest_mismatch" } });
+  expect(bases(await a.names())).toEqual([old, recent].sort());
+});
+
 it("takes as the anchor only a backup that R2 says was uploaded by the window's start, so a descriptor written now cannot be one", async () => {
   const a = await archive(Date.now());
   const old = await a.backup(31, 30, 1, 3);
   const recent = await a.backup(11, 10, 4, 6);
   await a.segments(1, 8);
   // Everything was uploaded just now, after the start of the window: no anchor, nothing deleted.
-  expect(await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY)).toEqual({
+  expect(
+    await retainBackups(
+      env.ARCHIVE,
+      a.prefix,
+      a.now - 7 * DAY,
+      2000,
+      undefined,
+      await a.recorded(),
+    ),
+  ).toEqual({
     backups: 0,
     objects: 0,
     complete: true,
@@ -701,7 +851,14 @@ it("never takes a backup whose id names a time past the cutoff as the anchor, wh
     `status=DONE\nbegin_time=${a.ago(20).toISOString()}\nend_time=${a.ago(8).toISOString()}\nbegin_wal=${wal(8)}\nend_wal=${wal(8)}\nxlog_segment_size=16777216\n`,
   );
   await put(`${a.prefix}base/${forged}/data.tar.gz`, "data");
-  await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY);
+  await retainBackups(
+    env.ARCHIVE,
+    a.prefix,
+    a.now - 7 * DAY,
+    2000,
+    undefined,
+    await a.recorded(),
+  );
   expect(bases(await a.names())).toContain(recent);
 });
 

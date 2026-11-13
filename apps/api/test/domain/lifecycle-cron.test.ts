@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, expect, it } from "vitest";
 import { runCron } from "../../src/cron.ts";
 import { CRON_STEPS } from "../../src/domain/cron-health.ts";
+import { recordBackupDigest } from "../../src/domain/archive-digests.ts";
 import { declareNodeLost } from "../../src/domain/node-loss.ts";
 import { cleanup, lifecycle } from "./lifecycle-fixture.ts";
 
@@ -46,6 +47,15 @@ it("carries the fence of a lost node on and applies the recovery windows, each i
     await env.ARCHIVE.put(
       `${prefix}base/${id}/backup.info`,
       `status=DONE\nbegin_time=${start.toISOString()}\nend_time=${new Date(now - to * 86_400_000).toISOString()}\nbegin_wal=${wal(begin)}\nend_wal=${wal(end)}\nxlog_segment_size=16777216\n`,
+    );
+    // The Worker records the digest of each backup when the node reports it done.
+    await recordBackupDigest(
+      env.ARCHIVE,
+      env.DB,
+      row.archive_path,
+      prefix,
+      id,
+      now,
     );
     return id;
   };

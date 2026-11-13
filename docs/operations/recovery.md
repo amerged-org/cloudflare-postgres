@@ -278,8 +278,10 @@ database moves (plan 7.11, 9.4).
    **Suspected compromise.** When the restore catalog of a lost node's archive is read, the objects that
    node uploaded after its fence are ignored, so the base backup and the WAL range a restore starts from
    are the ones written before it. A restore or replacement from a source on a lost node that is not yet
-   fenced is refused with the retryable `not_ready`, and a retention pass skips such a node. The
-   restoring node's own `wal-fetch` still reads the live archive prefix, though, and the R2 credentials
+   fenced is refused with the retryable `not_ready`, and a retention pass skips such a node. A backup
+   is trusted only while its objects still match the digest the Worker recorded when the node first reported
+   it done; a backup it never recorded is not restored from, and a recorded backup that changed refuses the
+   archive (`archive_digest_mismatch`). The restoring node's own `wal-fetch` still reads the live archive prefix, though, and the R2 credentials
    the node was given stay valid for their 7 days after the fence. When compromise of the node is
    suspected, the operator therefore replaces the R2 parent key as a planned step, with the owner's
    approval, by the procedure of [the node credentials](credentials.md#node-credentials): delete the old

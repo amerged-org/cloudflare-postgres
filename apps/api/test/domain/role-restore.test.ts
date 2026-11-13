@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { reportedBackup } from "./fixtures.ts";
 import {
   ROLE_LIMIT,
   ROLE_MEMBER_OF_MAX,
@@ -60,6 +61,7 @@ async function source() {
     keys.push(name);
     await env.ARCHIVE.put(name, value);
   }
+  await reportedBackup(archive!.archive_path, backupId);
   const until = new Date(Date.now() + 86_400_000).toISOString();
   for (const body of [
     { name: "reader" },

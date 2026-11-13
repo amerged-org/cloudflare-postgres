@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { reportedBackup } from "./fixtures.ts";
 import { afterEach, expect, it } from "vitest";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
@@ -48,6 +49,7 @@ async function database() {
       `status=DONE\nbegin_time=${begin.toISOString()}\nend_time=${end.toISOString()}\nbegin_wal=${wal(beginSegment)}\nend_wal=${wal(endSegment)}\nxlog_segment_size=16777216\n`,
     );
     await put(`${prefix}base/${id}/data.tar.gz`, "payload");
+    await reportedBackup(row!.archive_path, id);
     return id;
   };
   const segment = (n: number, extension = "gz") =>

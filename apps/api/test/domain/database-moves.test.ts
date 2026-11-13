@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { reportedBackup } from "./fixtures.ts";
 import {
   ArchiveCredential,
   DatabaseOrigin,
@@ -70,6 +71,7 @@ async function archive(f: { row: () => Promise<{ archive_path: string }> }) {
     segment = (n: string) =>
       `${prefix}wals/0000000100000000/0000000100000000000000${n}.gz`;
   for (const key of [info, data, segment("01"), segment("02")]) await put(key);
+  await reportedBackup((await f.row()).archive_path, BACKUP.backup_id);
   return { info, data, last: segment("02"), put };
 }
 async function ready() {

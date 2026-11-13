@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { ApiError } from "../api-error.ts";
+import {
+  backupDigest,
+  digestMismatch,
+  type ArchivedObject,
+} from "./archive-digests.ts";
 const WAL = /^[0-9A-F]{24}$/;
 const BACKUP = /^[0-9]{8}T[0-9]{6}$/;
 const CATALOG_PAGE_LIMIT = 16,
@@ -130,13 +135,18 @@ export async function archiveCutoff(
 /**
  * Reads the bounded v1 catalog; an archive it cannot read completely is `archive_unusable`. With
  * `notAfter` (a fence time), objects uploaded later are ignored: a fenced node can no longer write.
+ * A backup is trusted only when the Worker recorded its digest (`recorded`) and its objects still match
+ * it; one that does not match refuses the whole archive (`archive_digest_mismatch`), and one that was
+ * never recorded is left out. The digest reads every object under the backup, uploaded after the fence or not.
  */
 export async function readRestoreCatalog(
   bucket: R2Bucket,
   prefix: string,
-  notAfter?: string,
+  notAfter: string | undefined,
+  recorded: ReadonlyMap<string, string>,
 ): Promise<RestoreCatalog> {
   const objects = new Map<string, R2Object>(),
+    everything: R2Object[] = [],
     cursors = new Set<string>();
   let cursor: string | undefined;
   for (let page = 0; page < CATALOG_PAGE_LIMIT; page++) {
@@ -150,6 +160,7 @@ export async function readRestoreCatalog(
         reason: "archive_unusable",
       });
     for (const o of result.objects) {
+      if (o.key.startsWith(`${prefix}base/`)) everything.push(o);
       if (notAfter !== undefined && o.uploaded.getTime() > Date.parse(notAfter))
         continue;
       if (
@@ -188,6 +199,25 @@ export async function readRestoreCatalog(
         Math.max(uploaded.get(base[1]!) ?? 0, object.uploaded.getTime()),
       );
   }
+  const byBackup = new Map<string, ArchivedObject[]>();
+  for (const o of everything) {
+    const id = /^base\/([0-9]{8}T[0-9]{6})\//.exec(
+      o.key.slice(prefix.length),
+    )?.[1];
+    if (id === undefined) continue;
+    byBackup.set(id, [
+      ...(byBackup.get(id) ?? []),
+      { key: o.key, size: o.size, etag: o.etag },
+    ]);
+  }
+  // A backup whose descriptor is gone is being deleted (the descriptor goes first): it has nothing to verify.
+  for (const [id, listed] of byBackup)
+    if (
+      recorded.has(id) &&
+      listed.some((o) => o.key === `${prefix}base/${id}/backup.info`) &&
+      (await backupDigest(listed)) !== recorded.get(id)
+    )
+      throw digestMismatch();
   const walNames = new Set<string>();
   const walObjects = new Map<string, R2Object>();
   for (const key of objects.keys()) {
@@ -213,6 +243,7 @@ export async function readRestoreCatalog(
       key.slice(prefix.length),
     );
     if (!match) continue;
+    if (!recorded.has(match[1]!)) continue;
     if (++metadataCount > 64)
       throw new ApiError(
         "conflict",
@@ -249,10 +280,16 @@ export async function readRestoreCatalog(
 export async function restoreBackup(
   bucket: R2Bucket,
   prefix: string,
-  target?: string,
-  notAfter?: string,
+  target: string | undefined,
+  notAfter: string | undefined,
+  recorded: ReadonlyMap<string, string>,
 ): Promise<RestoreBackup> {
-  const { backups } = await readRestoreCatalog(bucket, prefix, notAfter);
+  const { backups } = await readRestoreCatalog(
+    bucket,
+    prefix,
+    notAfter,
+    recorded,
+  );
   const selected = backups.find(
     (backup) => target === undefined || backup.end <= target,
   );

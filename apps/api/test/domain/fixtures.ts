@@ -29,12 +29,32 @@ import {
 } from "@pgcf/contracts";
 import { expect } from "vitest";
 import { createApp } from "../../src/app.ts";
+import { recordBackupDigest } from "../../src/domain/archive-digests.ts";
 import type { Env } from "../../src/env.ts";
 import { signRelease } from "../release-key.ts";
 import { reportStatements } from "./node-samples.ts";
 
 /** The origin the Worker under test names in the URLs of a release and in an installer's userData. */
 export const API_ORIGIN = "https://api.example.org";
+
+/**
+ * A node reports a backup done once its objects are in the archive: the Worker records its digest then.
+ * The archive is the database's own (`/database/` under its archive path).
+ */
+export async function reportedBackup(
+  archivePath: string,
+  backupId: string,
+): Promise<void> {
+  const prefix = `${archivePath.replace(`s3://${env.ARCHIVE_BUCKET_NAME}/`, "")}/database/`;
+  await recordBackupDigest(
+    env.ARCHIVE,
+    env.DB,
+    archivePath,
+    prefix,
+    backupId,
+    Date.now(),
+  );
+}
 const fixtures: {
   projects: string[];
   regions: string[];
