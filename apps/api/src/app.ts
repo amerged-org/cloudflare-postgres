@@ -32,6 +32,7 @@ import { registerLifecycle } from "./routes/lifecycle.ts";
 import { registerInfrastructureBackups } from "./routes/infrastructure-backups.ts";
 import { registerAuditEvents } from "./routes/audit-events.ts";
 import { recordAuditOutcome } from "./middleware/audit.ts";
+import { limitRequests } from "./middleware/rate-limit.ts";
 import { NodeStateError } from "./domain/node-state.ts";
 
 export type ApiApp = OpenAPIHono<ApiEnv>;
@@ -276,6 +277,7 @@ export function createApp(): ApiApp {
     }
   });
 
+  app.use("*", limitRequests);
   app.use("*", async (c, next) => {
     c.header("Cache-Control", "no-store");
     c.header("X-Content-Type-Options", "nosniff");

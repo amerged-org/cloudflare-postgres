@@ -96,6 +96,22 @@
     // jurisdiction (the binding's "jurisdiction": "eu") is served only at the ".eu." host.
     "ARCHIVE_ENDPOINT_URL": "https://<CLOUDFLARE_ACCOUNT_ID>.eu.r2.cloudflarestorage.com",
   },
+  // The API answers on its routes only, where the WAF rule of the installation and the limit below apply.
+  "workers_dev": false,
+  "preview_urls": false,
+  // The API's own limit per source network (CF-Connecting-IP), counted before a key is read, so that
+  // anonymous callers cannot reach D1 for free. 1200 requests per 60 s is a product default: adjust
+  // it to the installation's traffic, and allowlist the node addresses in the WAF rule if they are many.
+  "ratelimits": [
+    {
+      "name": "API_RATE_LIMITER",
+      "namespace_id": "<API_RATE_LIMIT_NAMESPACE_ID>",
+      "simple": {
+        "limit": 1200,
+        "period": 60,
+      },
+    },
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "NODE_ACTOR", "class_name": "NodeActor" },

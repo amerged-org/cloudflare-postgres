@@ -32,6 +32,17 @@
     // another test. The tests of the keep-warm arm it with an interval of their own.
     "DATABASE_ACTOR_WARM_INTERVAL_MS": "0",
   },
+  // High here: the suite's requests share one test address, and the limit is exercised with a limiter of its own.
+  "ratelimits": [
+    {
+      "name": "API_RATE_LIMITER",
+      "namespace_id": "7",
+      "simple": {
+        "limit": 100000,
+        "period": 60,
+      },
+    },
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "NODE_ACTOR", "class_name": "NodeActor" },
