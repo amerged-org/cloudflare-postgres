@@ -38,6 +38,9 @@
 Description=PGCF slot %i
 Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
 StartLimitIntervalSec=0
+# The database's own log budget (pgcf-pg@.service): the supervisor's unit logs what the postmaster does.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=1000
 
 [Service]
 Type=notify
