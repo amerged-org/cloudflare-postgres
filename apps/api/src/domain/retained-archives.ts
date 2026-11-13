@@ -40,11 +40,28 @@ export function retainedArchiveRestorable(
 const gone = `(d.observed_state='deleted' OR ${fencedAtSql("d.node_id")} IS NOT NULL)`;
 const idle = `NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.source_database_id=a.source_database_id AND x.verified_at IS NULL AND o.status IN('pending','running'))
   AND NOT EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.archive_path=a.archive_path AND pin.released_at IS NULL)`;
+/**
+ * How long after its expiry an archive of a database deleted on a lost node may still be there before
+ * its delete operation says so. The purge removes it in the next runs; the operation is closed once it is gone.
+ */
+const PURGE_GRACE_MS = 3_600_000;
+
 export async function cleanupRetainedArchives(
   env: Env,
   now = Date.now(),
 ): Promise<{ purged: number; objects: number }> {
   const timestamp = new Date(now).toISOString();
+  // A delete on a lost node is never reported by the node, so its operation waits for this purge. One
+  // whose archive is still there past the grace is shown as failed, so an operator sees the purge is stuck.
+  await env.DB.prepare(
+    `UPDATE operations SET status='failed',error_code='archive_purge_incomplete',
+      error_message='The archive of this database, deleted on a lost node, is still not purged an hour after it expired',updated_at=?,completed_at=?
+    WHERE kind='database.delete' AND status IN('pending','running')
+      AND database_id IN(SELECT a.source_database_id FROM retained_archives a WHERE a.expires_at<?)
+      AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.desired_state='deleted' AND ${gone})`,
+  )
+    .bind(timestamp, timestamp, new Date(now - PURGE_GRACE_MS).toISOString())
+    .run();
   // An archive that names another bucket is out of this Worker's reach: its objects cannot be
   // listed or deleted here, so it is never selected, which would otherwise fill the batch of two
   // and fail every run before the archives after it.
@@ -110,6 +127,17 @@ export async function cleanupRetainedArchives(
       env.DB.prepare(
         `DELETE FROM roles WHERE database_id=? AND changes()=1 AND EXISTS(SELECT 1 FROM databases d WHERE d.id=roles.database_id AND d.desired_state='deleted' AND ${gone})`,
       ).bind(row.source_database_id),
+      // Once no archive of the database is retained, its delete is complete, whatever the node reported.
+      env.DB.prepare(
+        `UPDATE operations SET status='succeeded',completed_at=?,updated_at=?,error_code=NULL,error_message=NULL
+        WHERE kind='database.delete' AND database_id=? AND (status IN('pending','running') OR (status='failed' AND error_code='archive_purge_incomplete'))
+          AND NOT EXISTS(SELECT 1 FROM retained_archives a WHERE a.source_database_id=?)`,
+      ).bind(
+        timestamp,
+        timestamp,
+        row.source_database_id,
+        row.source_database_id,
+      ),
     ]);
     purged += result[0]!.meta.changes;
   }
