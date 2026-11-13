@@ -190,6 +190,42 @@ describe("who mints integrator keys", () => {
     expect(admin.status).toBe(403);
     expect(await code(admin)).toBe("forbidden");
   });
+
+  it("refuses a read-only or an integrator key any administrator key, and keeps the table as it was", async () => {
+    const f = await fixture();
+    const reader = await mint(f.admin, { scope: "admin_read" });
+    const integrator = await mint(env.BOOTSTRAP_TOKEN, {
+      scope: "integrator",
+      project_id: f.project,
+    });
+    const before = await count("api_keys");
+    for (const key of [reader.key, integrator.key])
+      for (const scope of ["admin", "admin_read"] as const) {
+        const response = await request("/v1/api-keys", key, "POST", {
+          name: "acct-key",
+          scope,
+        });
+        expect(response.status, `${scope}`).toBe(403);
+        expect(await code(response)).toBe("forbidden");
+      }
+    expect(await count("api_keys")).toBe(before);
+  });
+
+  it("lets an administrator key make both administrator scopes, and the owner credential make integrator keys", async () => {
+    const f = await fixture();
+    for (const scope of ["admin", "admin_read"] as const)
+      expect((await mint(f.admin, { scope })).api_key).toMatchObject({
+        scope,
+      });
+    expect(
+      (
+        await mint(env.BOOTSTRAP_TOKEN, {
+          scope: "integrator",
+          project_id: f.project,
+        })
+      ).api_key,
+    ).toMatchObject({ scope: "integrator", project_id: f.project });
+  });
 });
 
 describe("key expiry", () => {

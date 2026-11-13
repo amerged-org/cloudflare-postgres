@@ -136,6 +136,7 @@ export async function createApiKey(
     );
   }
   const auth = await getAuth(c);
+  if (auth.scope !== "integrator") await requireScope(c, "admin");
   assertMayMint(auth, body);
   return withIdempotency(c, {
     replay: async () => refuseCredentialReplay(),
