@@ -906,6 +906,68 @@ it("backfills a deleted database's archive even when some of its backups are alr
   ).toBe(1);
 });
 
+/** A descriptor that reads as DONE for a backup of the archive, with its data, and not recorded. */
+const doneBackup = async (prefix: string, i: number) => {
+  const id = `20250101T${String(i).padStart(6, "0")}`;
+  await put(
+    `${prefix}base/${id}/backup.info`,
+    `status=DONE\nbegin_time=2025-01-01T00:00:00Z\nend_time=2025-01-01T00:01:00Z\nbegin_wal=${wal(1)}\nend_wal=${wal(2)}\nxlog_segment_size=16777216\n`,
+  );
+  await put(`${prefix}base/${id}/data.tar.gz`);
+  return id;
+};
+
+it("skips descriptors that are not DONE without counting them against the bound, so a backup behind them is still recorded", async () => {
+  const a = await archive();
+  for (let i = 0; i < 70; i++)
+    await put(
+      `${a.prefix}base/${`20240101T${String(i).padStart(6, "0")}`}/backup.info`,
+      "status=FAILED\n",
+    );
+  const done = await doneBackup(a.prefix, 0);
+  await backfillBackupDigests(env, a.now);
+  expect((await a.recorded()).recorded.has(done)).toBe(true);
+});
+
+it("marks an archive done after twenty passes even while some of its backups cannot be recorded", async () => {
+  const a = await archive();
+  const row = await a.row();
+  // The node was fenced before these backups were written, so none of them can be recorded.
+  const fenced = new Date(Date.now() - 3_600_000).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO node_losses(node_id,region_id,declared_at,reason,tunnel_deleted_at,power_off_requested_at,powered_off_at)
+     VALUES(?,?,?,?,?,?,?)`,
+  )
+    .bind(
+      a.node,
+      a.region,
+      new Date(Date.now() - 2 * 3_600_000).toISOString(),
+      "fenced for the test",
+      fenced,
+      fenced,
+      fenced,
+    )
+    .run();
+  const deleted = new Date(a.now).toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE databases SET desired_state='deleted', deleted_at=? WHERE id=?",
+    ).bind(deleted, row.id),
+    env.DB.prepare(
+      `INSERT INTO retained_archives(source_database_id,project_id,region_id,archive_path,storage_generation,roles_json,deleted_at,expires_at)
+       SELECT id,project_id,region_id,archive_path,storage_generation,'[]',?,? FROM databases WHERE id=?`,
+    ).bind(deleted, new Date(a.now + 30 * DAY).toISOString(), row.id),
+  ]);
+  // More than one bound's worth of backups: each pass reaches the bound and stops short of the rest.
+  for (let i = 0; i < 65; i++) await doneBackup(a.prefix, i);
+  for (let pass = 1; pass < 20; pass++) {
+    await backfillBackupDigests(env, a.now);
+    expect((await a.recorded()).enforced, `pass ${pass}`).toBe(false);
+  }
+  await backfillBackupDigests(env, a.now);
+  expect((await a.recorded()).enforced).toBe(true);
+}, 120_000);
+
 it("does not refuse an archive that has no recorded backup and no backfill yet", async () => {
   const a = await archive();
   const row = await a.row();

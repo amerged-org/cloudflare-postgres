@@ -8,6 +8,8 @@ import { fencedAtSql, parseBackupInfo } from "./restore-catalog.ts";
 /** Archives one minute's pass works on, and descriptors it reads for each of them. */
 const ARCHIVES_PER_RUN = 5;
 const DESCRIPTORS_PER_ARCHIVE = 64;
+/** The passes an archive gets before it is marked done even though some of its backups were not recorded. */
+const MAX_PASSES = 20;
 const LISTING_PAGES = 16;
 const DESCRIPTOR_LIMIT = 65536;
 
@@ -24,9 +26,10 @@ interface Candidate {
  * Records the digests of the backups an archive kept from before digests were recorded, so that they
  * stay restorable once the archive is enforced. Candidates are the archives of databases on nodes that
  * are neither lost nor fenced, and the retained archives, whether or not some of their backups are
- * already recorded. An archive is
- * marked done once every backup in it has been looked at, and a marked archive is never looked at again:
- * later backups of a live archive are recorded by the nodes' reports. Each run is bounded.
+ * already recorded. An archive is marked done once every backup in it has been looked at, or after
+ * `MAX_PASSES` passes; a done archive is never looked at again, since later backups of a live archive are
+ * recorded by the nodes' reports. An archive whose passes all failed leaves the candidates after
+ * `MAX_PASSES`, so that it does not hold a slot of every run. Each run is bounded.
  */
 export async function backfillBackupDigests(
   env: Env,
@@ -46,10 +49,11 @@ export async function backfillBackupDigests(
         FROM retained_archives a JOIN databases d ON d.id=a.source_database_id
       ) c
       WHERE substr(c.archive_path,1,length(?))=?
-        AND NOT EXISTS(SELECT 1 FROM archive_digest_backfill b WHERE b.archive_path=c.archive_path)
+        AND NOT EXISTS(SELECT 1 FROM archive_digest_backfill b WHERE b.archive_path=c.archive_path
+          AND (b.done_at IS NOT NULL OR b.passes>=?))
       ORDER BY c.archive_path LIMIT ?`,
     )
-      .bind(named, named, ARCHIVES_PER_RUN)
+      .bind(named, named, MAX_PASSES, ARCHIVES_PER_RUN)
       .all<Candidate>()
   ).results;
   let archives = 0,
@@ -57,20 +61,35 @@ export async function backfillBackupDigests(
   for (const row of candidates) {
     try {
       const prefix = validatedArchivePrefix(row, selected.bucketName);
+      const ids = await listBackupIds(selected.bucket, prefix).catch(
+        async (error: unknown) => {
+          // A pass that fails still counts, so that a listing that keeps failing reaches the bound.
+          await countPass(env.DB, row.archive_path, null);
+          throw error;
+        },
+      );
+      // No backup to look at: the one pass finishes the archive.
+      if (ids.length === 0) {
+        await countPass(env.DB, row.archive_path, new Date(now).toISOString());
+        archives++;
+        continue;
+      }
+      const passes = await countPass(env.DB, row.archive_path, null);
       const pass = await backfillArchive(
         env,
         selected.bucket,
         prefix,
         row,
+        ids,
         now,
       );
       backups += pass.recorded;
-      if (!pass.complete) continue;
+      if (!pass.complete && passes < MAX_PASSES) continue;
       archives++;
       await env.DB.prepare(
-        "INSERT OR IGNORE INTO archive_digest_backfill(archive_path,done_at) VALUES(?,?)",
+        "UPDATE archive_digest_backfill SET done_at=? WHERE archive_path=?",
       )
-        .bind(row.archive_path, new Date(now).toISOString())
+        .bind(new Date(now).toISOString(), row.archive_path)
         .run();
     } catch (error) {
       console.error(
@@ -89,14 +108,29 @@ export async function backfillBackupDigests(
   return { archives, backups };
 }
 
-/** One pass over an archive's backups: complete when every backup has been looked at. */
-async function backfillArchive(
-  env: Env,
+/** Counts one pass over an archive, and marks it done when `doneAt` is given; returns the passes so far. */
+async function countPass(
+  db: D1Database,
+  archivePath: string,
+  doneAt: string | null,
+): Promise<number> {
+  const counted = await db
+    .prepare(
+      `INSERT INTO archive_digest_backfill(archive_path,passes,done_at) VALUES(?,1,?)
+       ON CONFLICT(archive_path) DO UPDATE SET passes=passes+1,done_at=COALESCE(excluded.done_at,done_at)
+       RETURNING passes`,
+    )
+    .bind(archivePath, doneAt)
+    .first<{ passes: number }>();
+  if (counted === null) throw new Error("backfill_pass_not_counted");
+  return counted.passes;
+}
+
+/** Every backup of the archive, by id, from every page of its listing. */
+async function listBackupIds(
   bucket: R2Bucket,
   prefix: string,
-  row: Candidate,
-  now: number,
-): Promise<{ complete: boolean; recorded: number }> {
+): Promise<string[]> {
   const ids: string[] = [];
   let cursor: string | undefined;
   for (let page = 0; ; page++) {
@@ -117,8 +151,18 @@ async function backfillArchive(
     if (!listed.cursor) throw new Error("backup_listing_incomplete");
     cursor = listed.cursor;
   }
-  // Nothing to look at: no backup of the archive, so no digest to read back.
-  if (ids.length === 0) return { complete: true, recorded: 0 };
+  return ids;
+}
+
+/** One pass over an archive's backups: complete when every backup has been looked at. */
+async function backfillArchive(
+  env: Env,
+  bucket: R2Bucket,
+  prefix: string,
+  row: Candidate,
+  ids: readonly string[],
+  now: number,
+): Promise<{ complete: boolean; recorded: number }> {
   const have = new Set(
     (
       await env.DB.prepare(
@@ -132,12 +176,12 @@ async function backfillArchive(
     recorded = 0;
   for (const id of ids) {
     if (have.has(id)) continue;
-    if (reads === DESCRIPTORS_PER_ARCHIVE) return { complete: false, recorded };
-    reads++;
     const info = await bucket.get(`${prefix}base/${id}/backup.info`);
     if (!info || info.size > DESCRIPTOR_LIMIT) continue;
-    // Only a descriptor that reads as DONE is a backup; anything else is left unrecorded.
+    // Only a descriptor that reads as DONE is a backup. Any other is skipped and does not count against the bound.
     if (parseBackupInfo(await info.text(), id) === null) continue;
+    if (reads === DESCRIPTORS_PER_ARCHIVE) return { complete: false, recorded };
+    reads++;
     if (
       await recordBackupDigest(
         bucket,

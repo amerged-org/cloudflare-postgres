@@ -126,7 +126,7 @@ export async function recordedDigests(
   const rows = await db
     .prepare(
       `SELECT backup_id,digest FROM archive_backup_digests WHERE archive_path=?1
-       UNION ALL SELECT NULL,NULL FROM archive_digest_backfill WHERE archive_path=?1`,
+       UNION ALL SELECT NULL,NULL FROM archive_digest_backfill WHERE archive_path=?1 AND done_at IS NOT NULL`,
     )
     .bind(archivePath)
     .all<{ backup_id: string | null; digest: string | null }>();
