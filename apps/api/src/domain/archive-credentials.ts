@@ -19,8 +19,11 @@ import { archiveEndpoint } from "./archive-bucket.ts";
  * read: it can only expire, which is why a lost node's rows stop being delivered at once.
  */
 export const ARCHIVE_CREDENTIAL_LIFETIME_SECONDS = 7 * 86_400;
-/** A restore reads its source for its operation only: a day, which the page renews early. */
-const READ_ONLY_LIFETIME_SECONDS = 86_400;
+/**
+ * A read of a source lasts an hour: a restore or a move reads its source only while it runs, and the
+ * page renews the credential early. Delivery also needs that operation to be open (`source_open`).
+ */
+const READ_ONLY_LIFETIME_SECONDS = 3_600;
 const lifetimeSeconds = (access: ArchiveAccess) =>
   access === "read_only"
     ? READ_ONLY_LIFETIME_SECONDS
@@ -253,6 +256,8 @@ interface DeliveryRow {
   lost: number;
   /** The node is the target of a move that restores onto this path now. */
   staged: number;
+  /** A restore, a move or a replacement that reads this path on this node is open now. */
+  source_open: number;
 }
 
 /**
@@ -273,6 +278,10 @@ export async function deliverArchiveCredential(
     `SELECT c.id,c.node_id,c.archive_path,c.access,c.expires_at,
       d.node_id database_node_id,d.archive_path database_archive_path,CASE WHEN ${sourceWritableSql} THEN 1 ELSE 0 END source_writable,
       CASE WHEN n.lost_at IS NOT NULL OR EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=n.id) THEN 1 ELSE 0 END lost,
+      CASE WHEN EXISTS(SELECT 1 FROM database_moves m WHERE m.status='restoring' AND m.target_node_id=c.node_id AND m.source_archive_path=c.archive_path)
+        OR EXISTS(SELECT 1 FROM database_replacements p WHERE p.node_id=c.node_id AND p.source_archive_path=c.archive_path AND p.phase IN('restoring','rolling_back'))
+        OR EXISTS(SELECT 1 FROM database_restores x JOIN databases t ON t.id=x.target_database_id JOIN operations o ON o.id=x.operation_id
+          WHERE t.node_id=c.node_id AND x.source_archive_path=c.archive_path AND x.verified_at IS NULL AND o.status<>'failed') THEN 1 ELSE 0 END source_open,
       CASE WHEN EXISTS(SELECT 1 FROM database_moves m WHERE m.database_id=c.database_id AND m.status='restoring'
         AND m.target_node_id=c.node_id AND m.target_archive_path=c.archive_path)
         OR EXISTS(SELECT 1 FROM database_replacements p WHERE p.database_id=c.database_id AND p.node_id=c.node_id
@@ -289,6 +298,7 @@ export async function deliverArchiveCredential(
     !row ||
     now >= Date.parse(row.expires_at) ||
     row.lost === 1 ||
+    (row.access === "read_only" && row.source_open !== 1) ||
     (row.access === "read_write" &&
       row.staged === 0 &&
       (row.source_writable !== 1 ||

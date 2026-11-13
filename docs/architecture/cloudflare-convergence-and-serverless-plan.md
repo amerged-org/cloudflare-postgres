@@ -2354,7 +2354,7 @@ The API Worker holds a parent R2 key, new in Stage 0, and **signs temporary cred
 | Purpose | Scope | Lifetime |
 | --- | --- | --- |
 | WAL and base backups of one database generation | Prefix `<region>/<db>/g<gen>-<op>/`; actions Get, Head, Put, ListObjectsV2 and multipart; **no DeleteObject(s)** | 7 days (plan default; R2 accepts it, Stage 1). Renewed after at most a third of the lifetime; an alert fires when less than 25 % is left |
-| Restore source | Read-only on the source prefix | 24 hours (plan default); renewed after 8 hours. A write credential keeps 7 days |
+| Restore source | Read-only on the source prefix | 1 hour; renewed after 20 minutes, and delivered only while the restore or move that reads it runs on the node. A write credential keeps 7 days |
 
 - **No delete rights on nodes.** Nodes never hold a delete right or the bucket-wide key. Retention runs in the Worker (section 7.7).
 - **Margin for outages.** The 7-day lifetime leaves days of margin for a Worker, link or renewal outage. If a credential does expire, archiving fails, databases stay awake and WAL grows. The renewal alert fires long before that.

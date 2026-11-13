@@ -31,6 +31,7 @@ import {
 
 afterEach(cleanup);
 const DAY = 86_400_000;
+const HOUR = 3_600_000;
 const claimsOf = (credential: ArchiveCredential) => {
   const jwt = atob(credential.session_token).slice(4);
   return JSON.parse(
@@ -159,7 +160,13 @@ it("names the one bucket's EU endpoint for a database in us-dev, which has no en
     sub: ACCOUNT_ID,
     aud: `${ACCOUNT_ID}.eu.r2.cloudflarestorage.com`,
   });
-  // The same endpoint for the region of the eu- node.
+  // The same endpoint for the region of the eu- node, read while a restore onto it runs.
+  await openRestoreFrom(
+    f.id,
+    f.node,
+    before.archive_path,
+    new Date(now).toISOString(),
+  );
   const eu = await ensureArchiveCredential(
     env.DB,
     { nodeId: f.node, archivePath: before.archive_path, access: "read_only" },
@@ -194,6 +201,32 @@ it("is unavailable while the endpoint of the archive bucket is missing or names 
       ),
     ).rejects.toThrow("archive_credentials_unavailable");
 });
+
+/**
+ * A restore onto `node` from `source` is open: the one operation that lets the node read that source
+ * read-only. `database` is the one being moved, so its node is the source node of the move.
+ */
+async function openRestoreFrom(
+  database: string,
+  node: string,
+  source: string,
+  at: string,
+) {
+  await env.DB.prepare(
+    `INSERT INTO database_moves(operation,database_id,project_id,region_id,source_node_id,target_node_id,source_storage_generation,source_archive_path,status,target_generation,target_storage_generation,target_archive_path,backup_id,proven_sleep_json,created_at,updated_at)
+    SELECT ?,d.id,d.project_id,d.region_id,d.node_id,?,1,?,'restoring',2,2,?,'20261018T093000','{}',?,? FROM databases d WHERE d.id=?`,
+  )
+    .bind(
+      "op_" + "m".repeat(20),
+      node,
+      source,
+      source.replace(/\/g1-op_[a-z0-9]{20}$/, "/g2-op_" + "m".repeat(20)),
+      at,
+      at,
+      database,
+    )
+    .run();
+}
 
 it("reads only for the node it was issued to, until it expires", async () => {
   const f = await lifecycle(),
@@ -232,6 +265,7 @@ it("gives a read-write credential only to the node that serves the generation, a
     { nodeId: f.other, archivePath: oldPath, access: "read_only" },
     now,
   );
+  await openRestoreFrom(f.id, f.other, oldPath, new Date(now).toISOString());
   // The database moves on: its next storage generation lives on the other node.
   const next = oldPath.replace(
     /\/g1-op_[a-z0-9]{20}$/,
@@ -318,6 +352,52 @@ it("lets the target of a restoring move write its staged path while the source s
   expect(
     await deliverArchiveCredential(keyedEnv(), f.other, reference.id, now),
   ).toBeNull();
+});
+
+it("delivers a read-only credential of a source to the node of a restore that reads it, until the restore is verified or fails", async () => {
+  const f = await lifecycle(),
+    row = await f.row(),
+    now = Date.parse("2026-10-18T10:00:00.000Z"),
+    at = new Date(now).toISOString();
+  // The restoring database is served by the other node, and restores from its own archive path.
+  await env.DB.prepare("UPDATE databases SET node_id=? WHERE id=?")
+    .bind(f.other, f.id)
+    .run();
+  const operation = "op_" + "r".repeat(20);
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,'database.restore','running',project_id,id,1,?,? FROM databases WHERE id=?",
+    ).bind(operation, at, at, f.id),
+    env.DB.prepare(
+      "INSERT INTO database_restores(target_database_id,operation_id,source_database_id,source_archive_path,source_storage_generation,backup_id,created_at) VALUES(?,?,?,?,1,?,?)",
+    ).bind(f.id, operation, f.id, row.archive_path, "20261017T110000", at),
+  ]);
+  const reference = await ensureArchiveCredential(
+    env.DB,
+    { nodeId: f.other, archivePath: row.archive_path, access: "read_only" },
+    now,
+  );
+  const deliver = () =>
+    deliverArchiveCredential(keyedEnv(), f.other, reference.id, now);
+  expect(await deliver()).toMatchObject({
+    access: "read_only",
+    path: row.archive_path,
+  });
+  await env.DB.prepare(
+    "UPDATE operations SET status='failed',error_code='no_recovery_point',error_message='The recovery paused',completed_at=? WHERE id=?",
+  )
+    .bind(at, operation)
+    .run();
+  expect(await deliver()).toBeNull();
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE operations SET status='succeeded',error_code=NULL,error_message=NULL,completed_at=? WHERE id=?",
+    ).bind(at, operation),
+    env.DB.prepare(
+      "UPDATE database_restores SET verified_at=? WHERE target_database_id=?",
+    ).bind(at, f.id),
+  ]);
+  expect(await deliver()).toBeNull();
 });
 
 it("issues and delivers nothing to a lost or fenced node", async () => {
@@ -440,7 +520,7 @@ it("answers a node's read through the handler the node router calls once it has 
   expect((await get("not-an-id")).status).toBe(404);
 });
 
-it("gives a read-only credential one day and a read-write credential seven, renewing each after a third of its own lifetime", async () => {
+it("gives a read-only credential one hour and a read-write credential seven days, renewing each after a third of its own lifetime", async () => {
   const f = await lifecycle(),
     row = await f.row(),
     now = Date.parse("2026-10-18T10:00:00.000Z");
@@ -450,7 +530,7 @@ it("gives a read-only credential one day and a read-write credential seven, rene
     access: "read_only" as const,
   };
   const reading = await ensureArchiveCredential(env.DB, scope, now);
-  expect(reading.expires_at).toBe(new Date(now + DAY).toISOString());
+  expect(reading.expires_at).toBe(new Date(now + HOUR).toISOString());
   const writing = await ensureArchiveCredential(
     env.DB,
     { ...scope, access: "read_write" },
@@ -459,19 +539,42 @@ it("gives a read-only credential one day and a read-write credential seven, rene
   expect(writing.expires_at).toBe(
     new Date(now + ARCHIVE_CREDENTIAL_LIFETIME_SECONDS * 1000).toISOString(),
   );
-  // Renewed after eight hours, a third of the day.
+  // Renewed after twenty minutes, a third of the hour.
   expect(
-    await ensureArchiveCredential(env.DB, scope, now + 7 * 3600_000),
+    await ensureArchiveCredential(env.DB, scope, now + 19 * 60_000),
   ).toEqual(reading);
   expect(
-    (await ensureArchiveCredential(env.DB, scope, now + 9 * 3600_000)).id,
+    (await ensureArchiveCredential(env.DB, scope, now + 21 * 60_000)).id,
   ).not.toBe(reading.id);
-  // The credential the node reads ends with the day, not with the week.
-  const delivered = await deliverArchiveCredential(
-    keyedEnv(),
-    f.node,
-    reading.id,
-    now + 1000,
+});
+
+it("delivers a read-only credential of a source only to the node a restore from that source runs on, and only while the restore is open", async () => {
+  const f = await lifecycle(),
+    row = await f.row(),
+    now = Date.parse("2026-10-18T10:00:00.000Z"),
+    at = new Date(now).toISOString();
+  const reference = await ensureArchiveCredential(
+    env.DB,
+    { nodeId: f.other, archivePath: row.archive_path, access: "read_only" },
+    now,
   );
-  expect(claimsOf(delivered!).exp).toBe(Math.floor((now + DAY) / 1000));
+  const deliver = (node: string) =>
+    deliverArchiveCredential(keyedEnv(), node, reference.id, now);
+  // No restore runs from the source: nothing is delivered to the node that holds the credential.
+  expect(await deliver(f.other)).toBeNull();
+  await openRestoreFrom(f.id, f.other, row.archive_path, at);
+  expect(await deliver(f.other)).toMatchObject({
+    access: "read_only",
+    path: row.archive_path,
+  });
+  expect(claimsOf((await deliver(f.other))!).exp).toBe(
+    Math.floor((now + HOUR) / 1000),
+  );
+  // The move ends: the source is no longer read, even by the node that held the credential.
+  await env.DB.prepare(
+    "UPDATE database_moves SET status='failed',failure='build_failed',completed_at=?,updated_at=? WHERE database_id=?",
+  )
+    .bind(at, at, f.id)
+    .run();
+  expect(await deliver(f.other)).toBeNull();
 });
