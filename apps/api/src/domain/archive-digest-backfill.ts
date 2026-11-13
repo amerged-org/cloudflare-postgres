@@ -23,7 +23,8 @@ interface Candidate {
 /**
  * Records the digests of the backups an archive kept from before digests were recorded, so that they
  * stay restorable once the archive is enforced. Candidates are the archives of databases on nodes that
- * are neither lost nor fenced, and the retained archives that have no recorded digest. An archive is
+ * are neither lost nor fenced, and the retained archives, whether or not some of their backups are
+ * already recorded. An archive is
  * marked done once every backup in it has been looked at, and a marked archive is never looked at again:
  * later backups of a live archive are recorded by the nodes' reports. Each run is bounded.
  */
@@ -43,7 +44,6 @@ export async function backfillBackupDigests(
         UNION ALL
         SELECT a.source_database_id,a.region_id,a.archive_path,a.storage_generation,${fencedAtSql("d.node_id")}
         FROM retained_archives a JOIN databases d ON d.id=a.source_database_id
-        WHERE NOT EXISTS(SELECT 1 FROM archive_backup_digests g WHERE g.archive_path=a.archive_path)
       ) c
       WHERE substr(c.archive_path,1,length(?))=?
         AND NOT EXISTS(SELECT 1 FROM archive_digest_backfill b WHERE b.archive_path=c.archive_path)

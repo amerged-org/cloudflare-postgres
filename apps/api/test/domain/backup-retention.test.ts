@@ -874,6 +874,38 @@ it("backfills the digests of backups an archive kept from before digests were re
   expect(await restorable()).toEqual([fresh]);
 });
 
+it("backfills a deleted database's archive even when some of its backups are already recorded", async () => {
+  const a = await archive();
+  const row = await a.row();
+  const old = await a.backup(31, 30, 1, 3);
+  await a.backup(11, 10, 4, 6);
+  await a.segments(1, 6);
+  await env.DB.prepare(
+    "DELETE FROM archive_backup_digests WHERE archive_path=? AND backup_id=?",
+  )
+    .bind(row.archive_path, old)
+    .run();
+  // The database is deleted: its archive is retained, not live.
+  const deleted = new Date(a.now).toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE databases SET desired_state='deleted', deleted_at=? WHERE id=?",
+    ).bind(deleted, row.id),
+    env.DB.prepare(
+      `INSERT INTO retained_archives(source_database_id,project_id,region_id,archive_path,storage_generation,roles_json,deleted_at,expires_at)
+       SELECT id,project_id,region_id,archive_path,storage_generation,'[]',?,? FROM databases WHERE id=?`,
+    ).bind(deleted, new Date(a.now + 30 * DAY).toISOString(), row.id),
+  ]);
+  await backfillBackupDigests(env, a.now);
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM archive_backup_digests WHERE archive_path=? AND backup_id=?",
+    )
+      .bind(row.archive_path, old)
+      .first<number>("n"),
+  ).toBe(1);
+});
+
 it("does not refuse an archive that has no recorded backup and no backfill yet", async () => {
   const a = await archive();
   const row = await a.row();
