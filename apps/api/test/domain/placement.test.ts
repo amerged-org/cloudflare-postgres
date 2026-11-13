@@ -258,23 +258,23 @@ describe("which node takes a new database", () => {
     ).toBeNull();
   });
 
-  it("keeps the sold storage within four times the pool's data", () => {
+  it("keeps the sold storage within 150 % of the pool's data", () => {
     const pool = (nominal: number) =>
       node({ pool_data_total_bytes: 100 * GIB, pool_nominal_bytes: nominal });
-    // 400 GiB is the logical cap; the database brings 5 GiB.
-    expect(pick([pool(395 * GIB)])).not.toBeNull();
-    expect(pick([pool(395 * GIB + 1)])).toBeNull();
-    expect(pick([pool(400 * GIB)])).toBeNull();
+    // 150 GiB is the logical cap; the database brings 5 GiB.
+    expect(pick([pool(145 * GIB)])).not.toBeNull();
+    expect(pick([pool(145 * GIB + 1)])).toBeNull();
+    expect(pick([pool(150 * GIB)])).toBeNull();
   });
 
   it("counts the storage of databases the node has not finished against the same cap", () => {
     const pool = (pending: number) =>
       node({
         pool_data_total_bytes: 100 * GIB,
-        pool_nominal_bytes: 390 * GIB,
+        pool_nominal_bytes: 140 * GIB,
         pending_storage_mib: pending * 1024,
       });
-    // The cap is 400 GiB; 390 GiB are reported, the database brings 5 GiB.
+    // The cap is 150 GiB; 140 GiB are reported, the database brings 5 GiB.
     expect(pick([pool(5)])).not.toBeNull();
     expect(pick([pool(6)])).toBeNull();
     expect(pick([pool(10)])).toBeNull();
@@ -284,13 +284,13 @@ describe("which node takes a new database", () => {
     const mib = 1024 ** 2;
     const pool = node({
       pool_data_total_bytes: 100 * GIB,
-      pool_nominal_bytes: 398 * GIB,
+      pool_nominal_bytes: 148 * GIB,
       pending_storage_mib: 1024 + 500,
     });
     expect(pick([pool], { ...SMALL, storage_mib: 524 })).not.toBeNull();
     expect(pick([pool], { ...SMALL, storage_mib: 528 })).toBeNull();
     expect(
-      pick([{ ...pool, pool_nominal_bytes: 398 * GIB + mib }], {
+      pick([{ ...pool, pool_nominal_bytes: 148 * GIB + mib }], {
         ...SMALL,
         storage_mib: 524,
       }),
@@ -310,7 +310,7 @@ describe("which node takes a new database", () => {
 
 /**
  * What closes a node's pool for new databases (plan 4.3, 4.8): 80 % of its data, 50 % of its
- * metadata, the sold storage at four times its data (the cap) and 1,000 volumes. While the pool
+ * metadata, the sold storage at 150 % of its data (the cap) and 1,000 volumes. While the pool
  * has room, only the cap stops a resize that grows storage, whatever else has closed the node: a
  * resize creates no volume and takes no real space (handover 2.5). A pool with no room (the agent
  * reports `room: false` below the free-data reserve or at 75 % of the metadata) stops it too.
@@ -397,11 +397,11 @@ describe("which node takes the storage growth of a database it holds (plan 3.5)"
         pool_data_used_bytes: 80 * GIB,
         pool_nominal_bytes: nominal * GIB,
       });
-    expect(growthFits(full(399), GROW, NOW)).toBe(true);
-    expect(growthFits(full(399), { ...GROW, storage_mib: 2048 }, NOW)).toBe(
+    expect(growthFits(full(149), GROW, NOW)).toBe(true);
+    expect(growthFits(full(149), { ...GROW, storage_mib: 2048 }, NOW)).toBe(
       false,
     );
-    expect(growthFits(full(400), GROW, NOW)).toBe(false);
+    expect(growthFits(full(150), GROW, NOW)).toBe(false);
   });
 });
 
@@ -761,7 +761,7 @@ describe("placement over real samples", () => {
 
   it("stops a burst of creates at the logical cap before the node has reported any of them", async () => {
     const f = await fixture(0);
-    // 30 GiB of pool data give a cap of 120 GiB; 115 GiB are sold when the node last reported.
+    // 30 GiB of pool data give a cap of 45 GiB; 40 GiB are sold when the node last reported.
     await seedSamples(
       f.node,
       steady(Date.now(), 40, {
@@ -769,7 +769,7 @@ describe("placement over real samples", () => {
           ...OPEN_POOL,
           dataTotal: 30 * GIB,
           dataUsed: 0,
-          nominal: 115 * GIB,
+          nominal: 40 * GIB,
         },
       }),
     );

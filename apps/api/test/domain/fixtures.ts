@@ -592,7 +592,7 @@ export function nodeSample(
       data_used_bytes: 40 * 1024 ** 3,
       metadata_total_bytes: 1024 ** 3,
       metadata_used_bytes: 1024 ** 2,
-      nominal_bytes: 300 * 1024 ** 3,
+      nominal_bytes: 150 * 1024 ** 3,
     },
     room: true,
     volumes: { total: 3, mounted: 3 },

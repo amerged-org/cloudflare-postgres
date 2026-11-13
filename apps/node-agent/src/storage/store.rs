@@ -670,7 +670,7 @@ impl<R: CommandRunner> Storage<R> {
             .collect())
     }
 
-    /// The logical cap of plan 4.3: nominal sizes stay at or below a multiple of the pool.
+    /// The logical cap of plan 4.3: nominal sizes stay at or below a percentage of the pool.
     fn within_cap(
         &self,
         sample: &PoolSample,
@@ -685,7 +685,8 @@ impl<R: CommandRunner> Storage<R> {
             + adding_bytes;
         let cap_bytes = sample
             .data_total_bytes
-            .saturating_mul(self.config.logical_cap_factor);
+            .saturating_mul(self.config.logical_cap_percent)
+            / 100;
         if nominal_bytes > cap_bytes {
             return Err(Error::LogicalCap {
                 nominal_bytes,

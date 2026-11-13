@@ -70,7 +70,7 @@ RAM uses the higher of its three-day peak and current sample, plus pending place
 new database's full memory; that sum must also be below 80 %. The requested CPU must fit the
 node's physical cores. Among the nodes that qualify, the one holding the most memory placed on it wins. A node that placement has
 closed (pool data at 80 %, pool metadata at 50 %, the sold storage
-at four times the pool's data, or 1,000 volumes) takes none. Each start is admitted by the node
+at 150 % of the pool's data, or 1,000 volumes) takes none. Each start is admitted by the node
 itself, from its own free RAM and pool. No lease expiry, stale sample or missing observation stops
 a running database: besides its own idle sleep and the node's early sleep, only explicit orders
 (suspend, delete, move, maintenance) do. A database that no node can host is accepted and waits as "Waiting for verified regional
@@ -255,8 +255,8 @@ room or without a sample (`thin_storage_blocked`), a database deleted more than 
 its node has not finished removing (`database_delete_incomplete`), a node that keeps refusing wakes for awake
 capacity (`regional_node_capacity_refusals`), a region that
 placement has closed (`regional_node_pool_closed`: the smallest size class on offer fits no node,
-for pool data at 80 %, pool metadata at 50 %, the sold storage plus that class past four times
-the pool's data, 1,000 volumes, or RAM or CPU at 80 %; a full node beside a node that takes the
+for pool data at 80 %, pool metadata at 50 %, the sold storage plus that class past 150 %
+of the pool's data, 1,000 volumes, or RAM or CPU at 80 %; a full node beside a node that takes the
 class is no episode), a database volume at 80 % or 90 % of its space or
 inodes (`database_volume_warning`, `database_volume_critical`), an enrollment token that was presented again or too late
 (`node_enrollment_refused`) and a node that rebooted without a maintenance order

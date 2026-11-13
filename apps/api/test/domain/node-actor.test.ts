@@ -578,7 +578,7 @@ describe("the samples of a node", () => {
       cpu_cores: 6,
       room: 1,
       pool_data_total_bytes: 125 * 1024 ** 3,
-      pool_nominal_bytes: 300 * 1024 ** 3,
+      pool_nominal_bytes: 150 * 1024 ** 3,
       // 3 GiB of 12 in use, 1200 of 6000 millicores busy: a node with less than 30 minutes of
       // history has one average over all of it.
       ram_peak_ppm: 250_000,

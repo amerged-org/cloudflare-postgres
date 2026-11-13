@@ -19,8 +19,11 @@ export const PLACEMENT_LIMIT_PPM = 800_000;
 /** The thin pool is closed for placement from these shares of its data and metadata (plan 4.3). */
 const POOL_DATA_CLOSED_PPM = 800_000;
 const POOL_METADATA_CLOSED_PPM = 500_000;
-/** The sold storage of a node stays within this many times its pool's data (plan 4.3). */
-const LOGICAL_CAP_FACTOR = 4;
+/**
+ * The sold storage of a node stays within this share of its pool's data: 150 %, so a node never
+ * promises more than half as much again as its thin pool holds (plan 4.3).
+ */
+export const LOGICAL_CAP_PERCENT = 150n;
 /**
  * The technical volume bound (plan 4.8, 4.11): from this many thin volumes a node is closed for
  * create, restore and move, and counts as full for the purchase signal. It is the largest count
@@ -156,7 +159,7 @@ export function poolState(
     return "unavailable";
   if (pool.room !== 1) return "no_room";
   const dataTotal = BigInt(pool.pool_data_total_bytes),
-    cap = dataTotal * BigInt(LOGICAL_CAP_FACTOR),
+    cap = (dataTotal * LOGICAL_CAP_PERCENT) / 100n,
     sold =
       BigInt(pool.pool_nominal_bytes) + BigInt(pool.pending_storage_mib) * MIB;
   if (sold >= cap || sold + BigInt(needMib) * MIB > cap) return "cap";

@@ -355,14 +355,14 @@ it("refuses a target that is not open for placement or has no room for the secon
     code: "conflict",
     details: { reason: "node_capacity" },
   });
-  // Nominal capacity also applies: 398 GiB of the 400 the target pool may sell are sold,
+  // Nominal capacity also applies: 148 GiB of the 150 the target pool may sell are sold,
   // and the database brings 5 more.
   const sold = await addNode(f.region);
   await seedSamples(sold, [
     {
       at: Date.now(),
       totalBytes: 8192 * MIB,
-      pool: { ...OPEN_POOL, nominal: 398 * GIB },
+      pool: { ...OPEN_POOL, nominal: 148 * GIB },
     },
   ]);
   await expect(start(f, sold)).rejects.toMatchObject({

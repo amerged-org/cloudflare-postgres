@@ -455,7 +455,7 @@ creates its database with the source's resources.
 
 The API refuses a class whose memory exceeds the region's per-database maximum (`400`; 4,096 MiB
 unless the operator sets another). It does **not** refuse a class that no node can host, for
-example a volume size that would take a node's sold storage past four times its pool, or a CPU
+example a volume size that would take a node's sold storage past 150 % of its pool, or a CPU
 size above the node's cores: creates of such a class are accepted and then wait unplaced. Ask the
 operator which classes are placeable.
 
@@ -631,7 +631,7 @@ placement step picks the qualifying node holding the most placed memory. Its CPU
 the last three days) must stay under 80 %, and the requested CPU must fit its physical cores.
 RAM uses the higher of its three-day peak and current sample, plus the full memory of databases
 placed since that sample and the requested database; the sum must stay under 80 %. Its thin pool is
-open (data below 80 %, metadata below 50 %, sold storage within four times its data), and the node
+open (data below 80 %, metadata below 50 %, sold storage within 150 % of its data), and the node
 holds fewer than 1,000 volumes. The node then creates the volume
 and the cluster, applies the roles, starts PostgreSQL through its own admission and takes the first
 base backup; WAL archiving starts with the first start. The database is ready only when that backup
@@ -936,7 +936,7 @@ its memory and CPU are admitted by its node then, while its storage growth must 
   grows must fit the node now, else `503 capacity_exhausted` ("Current node has insufficient
   memory, CPU or storage"): the node has no observation from the last 180 s, its active RAM would
   reach 80 % with the extra memory, its CPU would exceed the node's cores, or, for extra storage,
-  the node reports no thin pool or no room in it, or its sold storage would pass four times its
+  the node reports no thin pool or no room in it, or its sold storage would pass 150 % of its
   pool. A smaller or equal size needs no room. A hibernated database waits for its next wake only for
   memory and CPU; growth of its storage is sold from now on and is refused with the same `503` on
   the same storage test.
@@ -1829,9 +1829,9 @@ other classes are not converted into unmeasured regional passes.
 Every database lives on its own thin LVM volume of its node's one thin pool. The volume's size is
 the database's nominal volume size (`storage_mib`, or the equivalent legacy `storage_gib`), real space is taken only as the database writes (an empty database
 used 68.6 MiB when it was ready on EU1, 2026-10-17, "Stage 1 Block 2: create and sleep costs"), and the pool does not grow. Sold sizes do not reserve
-space: the sizes of the volumes on a node may add up to more than its disk, within a cap of four
-times the pool's physical data area. Report physical pool bytes, nominal allocated volume bytes
-and the sold-storage admission cap separately; the four-times cap is not additional disk or a
+space: the sizes of the volumes on a node may add up to more than its disk, within a cap of 150 %
+of the pool's physical data area. Report physical pool bytes, nominal allocated volume bytes
+and the sold-storage admission cap separately; the 150 % cap is not additional disk or a
 measured workload envelope. Chunks are zeroed before reuse, so space freed by one database is never
 readable by another.
 
@@ -1884,7 +1884,7 @@ What bounds a node, with the kind of each value as in the header.
 | Node size | 6 vCPU, 12 GB RAM (11,967 MiB visible on EU1) and a thin pool of about 289 GiB | measured: US1 reported 11,966 MiB, 6,000 millicores and 289 GiB (2026-10-22, "US1 installed into `us-dev` from the image") |
 | Placement RAM and CPU limits | Below 80 %: CPU uses the highest 30-minute average of the last 3 days; RAM uses max(three-day peak, current sample) plus pending placements and the new database's full memory. Requested CPU must fit physical cores | decided: the owner's rule of 2026-10-17 and its window of 3 days on 2026-10-23 (plan 11.3, "2026-10-17" and "2026-10-23"); see [2.1](#21-create) |
 | Pool closed for placement at | 80 % of its data or 50 % of its metadata | decided: the 80 % is the owner's number, the 50 % a plan default (plan 4.3) |
-| Sold storage per node | at most 4 times the pool's data (about 1,150 GiB on EU1) | decided: plan default, operator-configurable (plan 11.4, "Logical cap of 4 × pool, operator-configurable") |
+| Sold storage per node | at most 150 % of the pool's data (about 430 GiB on EU1) | decided 2026-11-10 in the security review (pgcf-compute-1), lowered from the plan default of 4 × pool (plan 11.4): one constant in `apps/api/src/domain/placement.ts` (`LOGICAL_CAP_PERCENT`) and `logical_cap_percent` in the node agent's storage configuration |
 | Volumes per node | 1,000 | measured on 2026-10-17: the largest count tested, `lvcreate` p50 about 270 ms at 1,000 volumes ("Stage 1 Block 1: LVM at scale"); placement closes a node at 1,000 volumes (built 2026-10-20 and in the API deployed on 2026-10-22: "Placement closes a node at 1,000 volumes, and the capacity cron reserves no order while purchases are off"; "Release of main `69d2b245` live on EU1"). It is a technical bound, raised only after a measurement at a higher count, not a sales limit |
 | Volumes carried so far | up to 301 on EU1 (2026-10-19 and 2026-10-20), 167 on 2026-10-23 | measured: a count carried, not a cap ("Placement closes a node at 1,000 volumes, and the capacity cron reserves no order while purchases are off"; "Live acceptance on the slot-pool release, part 1") |
 | Starts at once | 8 on EU1 | node policy, set 2026-10-20 ("Stage 5.6 wake storm, first measurement") |
@@ -2309,7 +2309,7 @@ of the row of the plan's
 | Security reboots | Within 7 days of a Debian security advisory that fixes the kernel, in an announced window (default Tuesday 02:00 to 04:00 UTC), one node at a time; every other reboot also needs the owner's go | decided 2026-10-19 (D10); window: plan default D15 | plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
 | IDs after restore, move and node loss | `/restore` creates a new ID; `/restore-in-place` retains ID and cached credentials. The four original SQL/API and native restore paths passed on both regions, including original-data recovery after a failed target. Move keeps ID; node-loss restoration uses new IDs. Bounded G9 queue/restart and US pool/R2-hard-cut acceptance passed; the owner accepted the cold-latency exception on October 26 | provider paths measured 2026-10-25; move/node-loss identity follows the existing decisions | Dated ULTRA update; plan 11.4 and D4 | [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) |
 | Losing a node | About 2.2 to 3.4 h for EU1's 167 databases and 23.4 GB if every restore succeeds: fence 30 s, reinstall 174 to 197 s, restores about 2.2 to 3.3 h. **7 of the 8 sample restores succeeded; the total assumes the `archive_unusable` defect is fixed** (failed-build/timeout fixes are deployed and bounded G9 queue/restart acceptance passed October 25; this extrapolation is not a measured full-node recovery bound) | extrapolated 2026-10-23 from a sample of restores; fence and reinstall measured 2026-10-19 and 2026-10-22; the full drill has not been run | "Live acceptance on the slot-pool release, part 1"; "G9: what is left after the 2026-10-19 loss and reinstall"; "US1 installed into `us-dev` from the image" | [7.3](#73-recovery-time), [7.4](#74-eu1-lost) |
-| Capacity caps | Placement requires CPU's three-day peak and projected RAM below 80 % (RAM includes the higher of peak and current sample, pending placements and the new class); pool closed at 80 % data or 50 % metadata; sold storage at most 4 times the pool; 1,000 volumes; 8 starts at once on EU1; a storm of 40 wakes answered in at most 5.8 s (HTTP) and 7.1 s (WebSocket) with none refused | historical figures are not universal capacity guarantees. Required EU density/proof recovery, US 241-target population and regional storage/fault acceptance are accepted in the October 25–26 ULTRA ledger; post-cleanup free pool snapshot: EU1 271.292 GiB / US1 286.259 GiB, closed minute 10:40 UTC on October 26; both current placement previews idle | "Stage 1 Block 1: LVM at scale"; "Stage 5.6 wake storm, first measurement" | [4.4](#44-capacity-caps) |
+| Capacity caps | Placement requires CPU's three-day peak and projected RAM below 80 % (RAM includes the higher of peak and current sample, pending placements and the new class); pool closed at 80 % data or 50 % metadata; sold storage at most 150 % of the pool (lowered from 4 times on 2026-11-10); 1,000 volumes; 8 starts at once on EU1; a storm of 40 wakes answered in at most 5.8 s (HTTP) and 7.1 s (WebSocket) with none refused | historical figures are not universal capacity guarantees. Required EU density/proof recovery, US 241-target population and regional storage/fault acceptance are accepted in the October 25–26 ULTRA ledger; post-cleanup free pool snapshot: EU1 271.292 GiB / US1 286.259 GiB, closed minute 10:40 UTC on October 26; both current placement previews idle | "Stage 1 Block 1: LVM at scale"; "Stage 5.6 wake storm, first measurement" | [4.4](#44-capacity-caps) |
 | Reserved role names | `postgres`, `pgcf_backup`, `public`, `none` and every name starting with `pg_` are refused (`400`); `streaming_replica`, `cnpg_*` and `pgcf_maintenance` are ordinary names | decided (W2-C/W2-C2), included in deployed baseline B with migration `0085`; the exercised regional role/connection receipts passed on October 25 and are reused; no new role-testing gate is added | Dated ULTRA baseline; `packages/contracts/src/ids-core.ts`; served OpenAPI `RoleName` | [2.3](#23-roles-connection-uri-and-passwords) |
 | Regions and the archive bucket | Two regions, `eu-dev` (EU1) and `us-dev` (US1), and one R2 archive bucket in the EU jurisdiction for both | measured 2026-10-22 and 2026-10-23 | "US1 installed into `us-dev` from the image"; "US1 database acceptance in `us-dev`"; "G8 one archive bucket: the cutover on Dev, steps 1 to 11" | [1.2](#12-regions) |
 | Placement window | 3 days (deployed in baseline B) | decided 2026-10-23 (O6, plan 11.3) | "Placement is closed for 3 days after a burst" (plan 11.2); plan 11.3 | [2.1](#21-create) |
