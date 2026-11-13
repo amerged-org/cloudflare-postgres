@@ -12,6 +12,7 @@ import {
   digestMismatch,
   recordedDigests,
   verifyBackupDigest,
+  type ArchiveDigests,
 } from "./archive-digests.ts";
 import { backfillBackupDigests } from "./archive-digest-backfill.ts";
 import {
@@ -98,7 +99,7 @@ async function boundedAnchor(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
-  recorded: ReadonlyMap<string, string> | null,
+  recorded: ArchiveDigests,
 ): Promise<RestoreBackup | null> {
   const described: string[] = [],
     withData = new Set<string>(),
@@ -119,8 +120,8 @@ async function boundedAnchor(
     if (idMs(id) > cutoff + 86_400_000) continue;
     // Once the archive is enforced, only a backup whose digest the Worker recorded is trusted; one that
     // changed fails the pass.
-    const expected = recorded?.get(id);
-    if (recorded !== null && expected === undefined) continue;
+    const expected = recorded.recorded.get(id);
+    if (recorded.enforced && expected === undefined) continue;
     if (reads++ === ANCHOR_READS) break;
     if (expected !== undefined)
       await verifyBackupDigest(bucket, prefix, id, expected);
@@ -150,7 +151,7 @@ async function findAnchor(
   prefix: string,
   cutoff: number,
   notAfter: string | undefined,
-  recorded: ReadonlyMap<string, string> | null,
+  recorded: ArchiveDigests,
 ): Promise<RestoreBackup | null> {
   try {
     const catalog = await readRestoreCatalog(
@@ -189,7 +190,7 @@ export async function retainBackups(
   cutoff: number,
   maxDeletes: number,
   notAfter: string | undefined,
-  recorded: ReadonlyMap<string, string> | null,
+  recorded: ArchiveDigests,
 ): Promise<RetentionResult> {
   const plan = await retentionPlan(
     bucket,
@@ -210,7 +211,7 @@ async function retentionPlan(
   cutoff: number,
   maxDeletes: number,
   notAfter: string | undefined,
-  recorded: ReadonlyMap<string, string> | null,
+  recorded: ArchiveDigests,
 ): Promise<{ descriptors: string[]; data: string[]; result: RetentionResult }> {
   const anchor = await findAnchor(bucket, prefix, cutoff, notAfter, recorded);
   if (!anchor)

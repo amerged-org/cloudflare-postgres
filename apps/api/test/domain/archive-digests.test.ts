@@ -40,7 +40,7 @@ it("records the digest of a backup of any size, from every page of its listing",
       Date.now(),
     ),
   ).toBe(true);
-  const recorded = (await recordedDigests(env.DB, archivePath))!;
+  const recorded = (await recordedDigests(env.DB, archivePath)).recorded;
   // The recorded digest covers all 1201 objects: a verification over every page passes, and a
   // change to the last object of the last page is refused.
   await verifyBackupDigest(env.ARCHIVE, prefix, id, recorded.get(id)!);
@@ -73,5 +73,5 @@ it("does not record a backup that an object was uploaded to after the fence time
       fenced,
     ),
   ).toBe(false);
-  expect(await recordedDigests(env.DB, archivePath)).toBeNull();
+  expect((await recordedDigests(env.DB, archivePath)).recorded.size).toBe(0);
 });

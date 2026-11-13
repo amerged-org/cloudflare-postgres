@@ -854,8 +854,8 @@ it("backfills the digests of backups an archive kept from before digests were re
         await a.recorded(),
       )
     ).backups.map((backup) => backup.id);
-  // The recorded backup enforces the archive, so the old one is not offered yet.
-  expect(await restorable()).toEqual([fresh]);
+  // Before the backfill has looked at the archive it is not enforced: the old backup is still offered.
+  expect(await restorable()).toEqual([fresh, old]);
   await backfillBackupDigests(env, a.now);
   expect(await restorable()).toEqual([fresh, old]);
   expect(
@@ -865,8 +865,13 @@ it("backfills the digests of backups an archive kept from before digests were re
       .bind(row.archive_path)
       .first<number>("n"),
   ).toBe(1);
-  await backfillBackupDigests(env, a.now);
-  expect(await restorable()).toEqual([fresh, old]);
+  // Once the backfill has marked the archive, it is enforced: an old backup without a record is not offered.
+  await env.DB.prepare(
+    "DELETE FROM archive_backup_digests WHERE archive_path=? AND backup_id=?",
+  )
+    .bind(row.archive_path, old)
+    .run();
+  expect(await restorable()).toEqual([fresh]);
 });
 
 it("does not refuse an archive that has no recorded backup and no backfill yet", async () => {
@@ -879,7 +884,7 @@ it("does not refuse an archive that has no recorded backup and no backfill yet",
   )
     .bind(row.archive_path)
     .run();
-  expect(await a.recorded()).toBeNull();
+  expect((await a.recorded()).enforced).toBe(false);
   expect(
     (
       await readRestoreCatalog(

@@ -99,8 +99,12 @@ it("trusts a backup only while its objects match the digest the Worker recorded,
     await put(`wals/${wal(n).slice(0, 16)}/${wal(n)}`, "wal");
   // Not recorded by the Worker: the backup is not trusted, whatever its descriptor says.
   expect(
-    (await readRestoreCatalog(env.ARCHIVE, prefix, undefined, new Map()))
-      .backups,
+    (
+      await readRestoreCatalog(env.ARCHIVE, prefix, undefined, {
+        recorded: new Map(),
+        enforced: true,
+      })
+    ).backups,
   ).toEqual([]);
   await recordBackupDigest(
     env.ARCHIVE,

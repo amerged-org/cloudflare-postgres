@@ -8,9 +8,9 @@ import { ApiError } from "../api-error.ts";
  * it: that backup is left out of recovery and retention refuses to delete anything from the archive.
  * The digest covers each object under the backup's prefix by its key, size and R2 etag.
  *
- * An archive is enforced once one of its backups is recorded or its backfill is marked done. Until
- * then its backups are trusted as they were before digests existed; once enforced, a backup that the
- * Worker never recorded is not trusted at all.
+ * An archive is enforced only once its backfill is marked done: until then its backups that were never
+ * recorded are trusted as they were before digests existed, so that none is dropped before the backfill
+ * has looked at the archive. A recorded backup that no longer matches is left out at any time.
  */
 export interface ArchivedObject {
   key: string;
@@ -111,15 +111,18 @@ export async function verifyBackupDigest(
     throw digestMismatch();
 }
 
-/**
- * The digests recorded for one archive, by backup id; null while the archive is not enforced (no backup
- * of it is recorded and its backfill is not done), so that its backups are trusted as before.
- */
+/** The digests recorded for one archive, by backup id, and whether the archive is enforced. */
+export interface ArchiveDigests {
+  recorded: ReadonlyMap<string, string>;
+  /** True once the backfill has marked the archive: a backup that was never recorded is then not trusted. */
+  enforced: boolean;
+}
+
 export async function recordedDigests(
   db: D1Database,
   archivePath: string,
-): Promise<ReadonlyMap<string, string> | null> {
-  // One statement: a row with no backup id is the backfill's marker, which enforces the archive too.
+): Promise<ArchiveDigests> {
+  // One statement: a row with no backup id is the backfill's marker.
   const rows = await db
     .prepare(
       `SELECT backup_id,digest FROM archive_backup_digests WHERE archive_path=?1
@@ -127,14 +130,13 @@ export async function recordedDigests(
     )
     .bind(archivePath)
     .all<{ backup_id: string | null; digest: string | null }>();
-  if (rows.results.length === 0) return null;
-  return new Map(
-    rows.results.flatMap((row) =>
-      row.backup_id === null || row.digest === null
-        ? []
-        : [[row.backup_id, row.digest] as const],
-    ),
-  );
+  const recorded = new Map<string, string>();
+  let enforced = false;
+  for (const row of rows.results) {
+    if (row.backup_id === null || row.digest === null) enforced = true;
+    else recorded.set(row.backup_id, row.digest);
+  }
+  return { recorded, enforced };
 }
 
 /** Refuses a recovery or a retention pass over a recorded backup that no longer matches what was recorded. */

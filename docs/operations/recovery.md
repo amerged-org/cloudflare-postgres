@@ -280,8 +280,8 @@ database moves (plan 7.11, 9.4).
    are the ones written before it. A restore or replacement from a source on a lost node that is not yet
    fenced is refused with the retryable `not_ready`, and a retention pass skips such a node. A backup
    is trusted only while its objects still match the digest the Worker recorded when the node first reported
-   it done, or the one-time backfill recorded for an archive written before digests existed. Once an archive
-   is enforced, a backup never recorded is not restored from; a recorded backup that changed is left out, and
+   it done, or the one-time backfill recorded for an archive written before digests existed. Only once the
+   backfill has marked an archive is a backup never recorded not restored from; a recorded backup that changed is left out, and
    the restore refuses the archive (`archive_digest_mismatch`) only when no trusted backup remains, while
    retention deletes nothing from it. The restoring node's own `wal-fetch` still reads the live archive prefix, though, and the R2 credentials
    the node was given stay valid for their 7 days after the fence. When compromise of the node is
