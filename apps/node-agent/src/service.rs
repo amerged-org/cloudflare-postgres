@@ -3425,6 +3425,13 @@ mod tests {
         use sha2::{Digest, Sha256};
         crate::update::hex(&Sha256::digest(bytes))
     }
+    /// A lock entry of a package the cloud serves as a file: the node downloads it and checks it
+    /// against the entry's digest and size, so a maintenance test needs the bytes behind it.
+    fn served(cloud: &Cloud, name: &str, version: &str) -> serde_json::Value {
+        let bytes = format!("{name} {version}").into_bytes();
+        let url = cloud.serve_file(&format!("/files/{name}_{version}.deb"), bytes.clone());
+        json!({"name": name, "version": version, "architecture": "amd64", "url": url, "size": bytes.len(), "sha256": digest(&bytes)})
+    }
     /// The files the node runs, in `bin/<id>/`, and the `current` link to them.
     fn runs(machine: &crate::machine::local::Local, id: &str, files: &[(&str, &[u8])]) {
         let bin = machine.layout().state.join("bin");
@@ -5162,7 +5169,7 @@ mod tests {
         let lock = json!({
             "packages": [
                 {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
-                {"name": "linux-image-6.12.99-amd64", "version": "6.12.99-1", "architecture": "amd64", "url": "https://snapshot.example/k.deb", "size": 10, "sha256": "c".repeat(64)},
+                served(&cloud, "linux-image-6.12.99-amd64", "6.12.99-1"),
             ],
             "extra": [],
         })
@@ -5331,7 +5338,7 @@ mod tests {
         let lock = json!({
             "packages": [
                 {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
-                {"name": "linux-image-6.12.113+deb13-amd64", "version": "6.12.113-1", "architecture": "amd64", "url": "https://snapshot.example/k.deb", "size": 10, "sha256": "c".repeat(64)},
+                served(&cloud, "linux-image-6.12.113+deb13-amd64", "6.12.113-1"),
             ],
             "extra": [],
         })
@@ -5429,8 +5436,8 @@ mod tests {
         let cloud = Cloud::start().await;
         let lock = json!({
             "packages": [
-                {"name": "bash", "version": "5.3", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
-                {"name": "linux-image-6.12.113+deb13-amd64", "version": "6.12.113-1", "architecture": "amd64", "url": "https://snapshot.example/k.deb", "size": 10, "sha256": "c".repeat(64)},
+                served(&cloud, "bash", "5.3"),
+                served(&cloud, "linux-image-6.12.113+deb13-amd64", "6.12.113-1"),
             ],
             "extra": [],
         })
