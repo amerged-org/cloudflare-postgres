@@ -100,6 +100,8 @@ export interface RestoreCatalog {
    * node writes the descriptor and the data, but not this time.
    */
   uploaded: ReadonlyMap<string, number>;
+  /** The recorded backups whose objects no longer match their digest: left out of `backups`, never deleted. */
+  mismatched: string[];
 }
 
 /**
@@ -135,15 +137,16 @@ export async function archiveCutoff(
 /**
  * Reads the bounded v1 catalog; an archive it cannot read completely is `archive_unusable`. With
  * `notAfter` (a fence time), objects uploaded later are ignored: a fenced node can no longer write.
- * A backup is trusted only when the Worker recorded its digest (`recorded`) and its objects still match
- * it; one that does not match refuses the whole archive (`archive_digest_mismatch`), and one that was
- * never recorded is left out. The digest reads every object under the backup, uploaded after the fence or not.
+ * With `recorded` (the digests of the archive, see `recordedDigests`; null while it is not enforced),
+ * a backup is trusted only when its digest was recorded and its objects still match it. One that was
+ * never recorded is left out; one that changed is left out and listed in `mismatched`, and the others
+ * are still offered. The digest reads every object under the backup, uploaded after the fence or not.
  */
 export async function readRestoreCatalog(
   bucket: R2Bucket,
   prefix: string,
   notAfter: string | undefined,
-  recorded: ReadonlyMap<string, string>,
+  recorded: ReadonlyMap<string, string> | null,
 ): Promise<RestoreCatalog> {
   const objects = new Map<string, R2Object>(),
     everything: R2Object[] = [],
@@ -211,13 +214,15 @@ export async function readRestoreCatalog(
     ]);
   }
   // A backup whose descriptor is gone is being deleted (the descriptor goes first): it has nothing to verify.
-  for (const [id, listed] of byBackup)
-    if (
-      recorded.has(id) &&
-      listed.some((o) => o.key === `${prefix}base/${id}/backup.info`) &&
-      (await backupDigest(listed)) !== recorded.get(id)
-    )
-      throw digestMismatch();
+  const mismatched = new Set<string>();
+  if (recorded !== null)
+    for (const [id, listed] of byBackup)
+      if (
+        recorded.has(id) &&
+        listed.some((o) => o.key === `${prefix}base/${id}/backup.info`) &&
+        (await backupDigest(listed)) !== recorded.get(id)
+      )
+        mismatched.add(id);
   const walNames = new Set<string>();
   const walObjects = new Map<string, R2Object>();
   for (const key of objects.keys()) {
@@ -243,7 +248,8 @@ export async function readRestoreCatalog(
       key.slice(prefix.length),
     );
     if (!match) continue;
-    if (!recorded.has(match[1]!)) continue;
+    if (recorded !== null && !recorded.has(match[1]!)) continue;
+    if (mismatched.has(match[1]!)) continue;
     if (++metadataCount > 64)
       throw new ApiError(
         "conflict",
@@ -274,6 +280,7 @@ export async function readRestoreCatalog(
         ? null
         : walObjects.get(newestWal)!.uploaded.toISOString(),
     uploaded,
+    mismatched: [...mismatched].sort(),
   };
 }
 
@@ -282,9 +289,9 @@ export async function restoreBackup(
   prefix: string,
   target: string | undefined,
   notAfter: string | undefined,
-  recorded: ReadonlyMap<string, string>,
+  recorded: ReadonlyMap<string, string> | null,
 ): Promise<RestoreBackup> {
-  const { backups } = await readRestoreCatalog(
+  const { backups, mismatched } = await readRestoreCatalog(
     bucket,
     prefix,
     notAfter,
@@ -293,11 +300,14 @@ export async function restoreBackup(
   const selected = backups.find(
     (backup) => target === undefined || backup.end <= target,
   );
-  if (!selected)
+  if (!selected) {
+    // Refused as changed only when no trusted backup is left to restore from.
+    if (backups.length === 0 && mismatched.length > 0) throw digestMismatch();
     throw new ApiError(
       "conflict",
       "No complete base backup and required WAL are available for the requested recovery",
       { reason: "no_recovery_point" },
     );
+  }
   return selected;
 }

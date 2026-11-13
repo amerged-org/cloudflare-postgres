@@ -127,6 +127,13 @@ export async function cleanupRetainedArchives(
       env.DB.prepare(
         `DELETE FROM roles WHERE database_id=? AND changes()=1 AND EXISTS(SELECT 1 FROM databases d WHERE d.id=roles.database_id AND d.desired_state='deleted' AND ${gone})`,
       ).bind(row.source_database_id),
+      // The digests and the backfill marker of the archive go with it: nothing of it is trusted any more.
+      env.DB.prepare(
+        `DELETE FROM archive_backup_digests WHERE archive_path=? AND NOT EXISTS(SELECT 1 FROM retained_archives a WHERE a.archive_path=archive_backup_digests.archive_path)`,
+      ).bind(row.archive_path),
+      env.DB.prepare(
+        `DELETE FROM archive_digest_backfill WHERE archive_path=? AND NOT EXISTS(SELECT 1 FROM retained_archives a WHERE a.archive_path=archive_digest_backfill.archive_path)`,
+      ).bind(row.archive_path),
       // Once no archive of the database is retained, its delete is complete, whatever the node reported.
       env.DB.prepare(
         `UPDATE operations SET status='succeeded',completed_at=?,updated_at=?,error_code=NULL,error_message=NULL

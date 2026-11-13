@@ -8,7 +8,12 @@ import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
 import { deleteUnpinnedArchiveKeys } from "./archive-retention-claims.ts";
 import { retireColdSnapshots } from "./cold-snapshot-retention.ts";
-import { recordedDigests, verifyBackupDigest } from "./archive-digests.ts";
+import {
+  digestMismatch,
+  recordedDigests,
+  verifyBackupDigest,
+} from "./archive-digests.ts";
+import { backfillBackupDigests } from "./archive-digest-backfill.ts";
 import {
   BACKUP_DATA,
   keysOf,
@@ -93,7 +98,7 @@ async function boundedAnchor(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
-  recorded: ReadonlyMap<string, string>,
+  recorded: ReadonlyMap<string, string> | null,
 ): Promise<RestoreBackup | null> {
   const described: string[] = [],
     withData = new Set<string>(),
@@ -112,11 +117,13 @@ async function boundedAnchor(
   for (const id of described.sort().reverse()) {
     // A backup that began a day after the cutoff did not end before it, whatever the node's clock.
     if (idMs(id) > cutoff + 86_400_000) continue;
-    // Only a backup whose digest the Worker recorded is trusted; one that changed refuses the archive.
-    const expected = recorded.get(id);
-    if (expected === undefined) continue;
+    // Once the archive is enforced, only a backup whose digest the Worker recorded is trusted; one that
+    // changed fails the pass.
+    const expected = recorded?.get(id);
+    if (recorded !== null && expected === undefined) continue;
     if (reads++ === ANCHOR_READS) break;
-    await verifyBackupDigest(bucket, prefix, id, expected);
+    if (expected !== undefined)
+      await verifyBackupDigest(bucket, prefix, id, expected);
     const info = await bucket.get(`${prefix}base/${id}/backup.info`);
     const backup =
       info && info.size <= 65536
@@ -143,7 +150,7 @@ async function findAnchor(
   prefix: string,
   cutoff: number,
   notAfter: string | undefined,
-  recorded: ReadonlyMap<string, string>,
+  recorded: ReadonlyMap<string, string> | null,
 ): Promise<RestoreBackup | null> {
   try {
     const catalog = await readRestoreCatalog(
@@ -152,6 +159,8 @@ async function findAnchor(
       notAfter,
       recorded,
     );
+    // Retention deletes nothing while a recorded backup no longer matches: the pass fails instead.
+    if (catalog.mismatched.length > 0) throw digestMismatch();
     return (
       catalog.backups.find(
         (backup) =>
@@ -180,7 +189,7 @@ export async function retainBackups(
   cutoff: number,
   maxDeletes: number,
   notAfter: string | undefined,
-  recorded: ReadonlyMap<string, string>,
+  recorded: ReadonlyMap<string, string> | null,
 ): Promise<RetentionResult> {
   const plan = await retentionPlan(
     bucket,
@@ -201,7 +210,7 @@ async function retentionPlan(
   cutoff: number,
   maxDeletes: number,
   notAfter: string | undefined,
-  recorded: ReadonlyMap<string, string>,
+  recorded: ReadonlyMap<string, string> | null,
 ): Promise<{ descriptors: string[]; data: string[]; result: RetentionResult }> {
   const anchor = await findAnchor(bucket, prefix, cutoff, notAfter, recorded);
   if (!anchor)
@@ -552,6 +561,9 @@ export async function expireColdStorageArchives(
 export async function runBackupRetention(env: Env, now: number): Promise<void> {
   let failed = 0;
   for (const part of [
+    // Before the enforcement: an archive written before digests were recorded is enforced only once its
+    // backups are recorded here or it is marked done.
+    async () => (await backfillBackupDigests(env, now), 0),
     async () => (await enforceBackupRetention(env, now)).failed,
     async () => (await expireSupersededArchives(env, now), 0),
     async () => (await expireColdStorageArchives(env, now), 0),

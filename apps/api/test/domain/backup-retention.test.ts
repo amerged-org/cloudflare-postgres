@@ -8,6 +8,7 @@ import {
   retainBackups,
   runBackupRetention,
 } from "../../src/domain/backup-retention.ts";
+import { backfillBackupDigests } from "../../src/domain/archive-digest-backfill.ts";
 import { ensureArchiveCredential } from "../../src/domain/archive-credentials.ts";
 import {
   recordBackupDigest,
@@ -814,6 +815,81 @@ it("deletes nothing from an archive whose recorded backup changed after the Work
     ),
   ).rejects.toMatchObject({ details: { reason: "archive_digest_mismatch" } });
   expect(bases(await a.names())).toEqual([old, recent].sort());
+});
+
+it("leaves every archive alone in the retention pass while one of its recorded backups no longer matches", async () => {
+  const a = await archive();
+  const old = await a.backup(21, 20, 1, 3);
+  await a.backup(11, 10, 4, 6);
+  await a.backup(6, 5, 7, 9);
+  await a.segments(1, 12);
+  await put(`${a.prefix}base/${old}/data.tar.gz`, "rewritten");
+  const before = await a.names();
+  expect(await enforceBackupRetention(env, a.now)).toMatchObject({
+    checked: 1,
+    backups: 0,
+    failed: 1,
+  });
+  expect(await a.names()).toEqual(before);
+});
+
+it("backfills the digests of backups an archive kept from before digests were recorded, so they stay restorable", async () => {
+  const a = await archive();
+  const row = await a.row();
+  const old = await a.backup(31, 30, 1, 3),
+    fresh = await a.backup(11, 10, 4, 6);
+  await a.segments(1, 6);
+  // Written before digests existed: the old backup has no record.
+  await env.DB.prepare(
+    "DELETE FROM archive_backup_digests WHERE archive_path=? AND backup_id=?",
+  )
+    .bind(row.archive_path, old)
+    .run();
+  const restorable = async () =>
+    (
+      await readRestoreCatalog(
+        env.ARCHIVE,
+        a.prefix,
+        undefined,
+        await a.recorded(),
+      )
+    ).backups.map((backup) => backup.id);
+  // The recorded backup enforces the archive, so the old one is not offered yet.
+  expect(await restorable()).toEqual([fresh]);
+  await backfillBackupDigests(env, a.now);
+  expect(await restorable()).toEqual([fresh, old]);
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM archive_digest_backfill WHERE archive_path=?",
+    )
+      .bind(row.archive_path)
+      .first<number>("n"),
+  ).toBe(1);
+  await backfillBackupDigests(env, a.now);
+  expect(await restorable()).toEqual([fresh, old]);
+});
+
+it("does not refuse an archive that has no recorded backup and no backfill yet", async () => {
+  const a = await archive();
+  const row = await a.row();
+  const old = await a.backup(21, 20, 1, 3);
+  await a.segments(1, 6);
+  await env.DB.prepare(
+    "DELETE FROM archive_backup_digests WHERE archive_path=?",
+  )
+    .bind(row.archive_path)
+    .run();
+  expect(await a.recorded()).toBeNull();
+  expect(
+    (
+      await readRestoreCatalog(
+        env.ARCHIVE,
+        a.prefix,
+        undefined,
+        await a.recorded(),
+      )
+    ).backups.map((backup) => backup.id),
+  ).toEqual([old]);
 });
 
 it("takes as the anchor only a backup that R2 says was uploaded by the window's start, so a descriptor written now cannot be one", async () => {

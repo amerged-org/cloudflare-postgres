@@ -130,6 +130,20 @@ it("purges a database deleted on a lost node once its node is fenced and its arc
     `${prefix}wals/0000000100000000/000000010000000000000001.gz`,
     "wal",
   );
+  // The archive's recorded digests and backfill marker go with the archive.
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO archive_backup_digests(archive_path,backup_id,digest,recorded_at) VALUES(?,?,?,?)",
+    ).bind(
+      archivePath!.archive_path,
+      "20260101T000000",
+      "0".repeat(64),
+      fenced,
+    ),
+    env.DB.prepare(
+      "INSERT INTO archive_digest_backfill(archive_path,done_at) VALUES(?,?)",
+    ).bind(archivePath!.archive_path, fenced),
+  ]);
   expect(await cleanupRetainedArchives(env, now)).toEqual({
     purged: 0,
     objects: 2,
@@ -150,6 +164,13 @@ it("purges a database deleted on a lost node once its node is fenced and its arc
       .bind(id)
       .first(),
   ).toEqual({ count: 0 });
+  expect(
+    await env.DB.prepare(
+      "SELECT (SELECT COUNT(*) FROM archive_backup_digests WHERE archive_path=?) AS digests, (SELECT COUNT(*) FROM archive_digest_backfill WHERE archive_path=?) AS backfills",
+    )
+      .bind(archivePath!.archive_path, archivePath!.archive_path)
+      .first(),
+  ).toEqual({ digests: 0, backfills: 0 });
   // The node never reports the deletion, so the purge closes the delete operation.
   expect(
     await env.DB.prepare(

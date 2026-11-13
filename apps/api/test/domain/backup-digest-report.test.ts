@@ -9,8 +9,9 @@ it("records the digest of a backup the node reports done, from the archive as it
   const f = await lifecycle(),
     row = await f.row();
   const prefix = `${row.archive_path.replace(`s3://${env.ARCHIVE_BUCKET_NAME}/`, "")}/database/`;
-  // The first report came before the backup was in the archive: nothing is recorded yet.
-  expect(await recordedDigests(env.DB, row.archive_path)).toEqual(new Map());
+  // The first report came before the backup was in the archive: nothing is recorded yet, so the
+  // archive is not enforced.
+  expect(await recordedDigests(env.DB, row.archive_path)).toBeNull();
   await env.ARCHIVE.put(
     `${prefix}base/${BACKUP.backup_id}/backup.info`,
     "status=DONE\nbegin_time=2026-10-18T09:00:00Z\nend_time=2026-10-18T09:30:00Z\nbegin_wal=000000010000000000000001\nend_wal=000000010000000000000002\nxlog_segment_size=16777216\n",
@@ -23,8 +24,8 @@ it("records the digest of a backup the node reports done, from the archive as it
   expect(
     (await nodeReport(f, f.id, 1, "ready", { backup: BACKUP })).status,
   ).toBe(200);
-  expect([...(await recordedDigests(env.DB, row.archive_path)).keys()]).toEqual(
-    [BACKUP.backup_id],
-  );
+  expect([
+    ...(await recordedDigests(env.DB, row.archive_path))!.keys(),
+  ]).toEqual([BACKUP.backup_id]);
   await cleanup();
 });

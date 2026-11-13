@@ -8,6 +8,7 @@ import {
 import {
   parseBackupInfo,
   readRestoreCatalog,
+  restoreBackup,
 } from "../../src/domain/restore-catalog.ts";
 
 it("ignores what a node uploaded after its fence when the catalog is read up to that time", async () => {
@@ -115,10 +116,80 @@ it("trusts a backup only while its objects match the digest the Worker recorded,
       await readRestoreCatalog(env.ARCHIVE, prefix, undefined, recorded)
     ).backups.map((backup) => backup.id),
   ).toEqual([id]);
-  // The data changed after the digest was recorded: the catalog refuses the archive.
+  // The data changed after the digest was recorded: the backup is left out, and with no trusted backup
+  // left the restore refuses the archive.
   await put(`base/${id}/data.tar.gz`, "changed");
+  expect(
+    await readRestoreCatalog(env.ARCHIVE, prefix, undefined, recorded),
+  ).toMatchObject({ backups: [], mismatched: [id] });
   await expect(
-    readRestoreCatalog(env.ARCHIVE, prefix, undefined, recorded),
+    restoreBackup(env.ARCHIVE, prefix, undefined, undefined, recorded),
+  ).rejects.toMatchObject({ details: { reason: "archive_digest_mismatch" } });
+  await env.ARCHIVE.delete(
+    (await env.ARCHIVE.list({ prefix })).objects.map((o) => o.key),
+  );
+});
+
+it("drops only the backup whose objects changed, and refuses the archive only when no trusted backup remains", async () => {
+  const prefix = `catalog-drop/${crypto.randomUUID()}/`;
+  const archivePath = `s3://${env.ARCHIVE_BUCKET_NAME}/${prefix}`;
+  const wal = (segment: number) =>
+    `00000001${"0".repeat(8)}${segment.toString(16).toUpperCase().padStart(8, "0")}`;
+  const put = (key: string, body: string) =>
+    env.ARCHIVE.put(`${prefix}${key}`, body);
+  const older = "20260101T000000",
+    newer = "20260102T000000";
+  const complete = (id: string, day: string, begin: number, end: number) =>
+    Promise.all([
+      put(
+        `base/${id}/backup.info`,
+        `status=DONE\nbegin_time=${day}T00:00:00Z\nend_time=${day}T00:01:00Z\nbegin_wal=${wal(begin)}\nend_wal=${wal(end)}\nxlog_segment_size=16777216\n`,
+      ),
+      put(`base/${id}/data.tar.gz`, `data of ${id}`),
+    ]);
+  await complete(older, "2026-01-01", 1, 3);
+  await complete(newer, "2026-01-02", 4, 6);
+  for (let n = 1; n <= 6; n++)
+    await put(`wals/${wal(n).slice(0, 16)}/${wal(n)}`, "wal");
+  await recordBackupDigest(
+    env.ARCHIVE,
+    env.DB,
+    archivePath,
+    prefix,
+    older,
+    Date.now(),
+  );
+  await recordBackupDigest(
+    env.ARCHIVE,
+    env.DB,
+    archivePath,
+    prefix,
+    newer,
+    Date.now(),
+  );
+  const recorded = await recordedDigests(env.DB, archivePath);
+  await put(`base/${newer}/data.tar.gz`, "changed");
+  // The newer backup no longer matches: the older one is still offered, and is what a restore takes.
+  const catalog = await readRestoreCatalog(
+    env.ARCHIVE,
+    prefix,
+    undefined,
+    recorded,
+  );
+  expect(catalog.backups.map((backup) => backup.id)).toEqual([older]);
+  expect(catalog.mismatched).toEqual([newer]);
+  expect(
+    (await restoreBackup(env.ARCHIVE, prefix, undefined, undefined, recorded))
+      .id,
+  ).toBe(older);
+  // Nothing is deleted: the changed backup is still in the archive.
+  expect(
+    await env.ARCHIVE.get(`${prefix}base/${newer}/backup.info`),
+  ).not.toBeNull();
+  // Both changed: no trusted backup remains, so the restore refuses the archive.
+  await put(`base/${older}/data.tar.gz`, "changed too");
+  await expect(
+    restoreBackup(env.ARCHIVE, prefix, undefined, undefined, recorded),
   ).rejects.toMatchObject({ details: { reason: "archive_digest_mismatch" } });
   await env.ARCHIVE.delete(
     (await env.ARCHIVE.list({ prefix })).objects.map((o) => o.key),
