@@ -1622,7 +1622,36 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     });
   });
 
-  it("both limiters and admitWake are called before any of them resolves", async () => {
+  it("counts the limiters before the Actor is asked to wake, so a refused connect wakes nothing", async () => {
+    const limited = {
+      limit: vi.fn(async () => ({ success: false })),
+    } as unknown as RateLimit;
+    const admitWake = vi.fn(
+      (
+        id: string,
+        user: string,
+        options: { deadline: number; waiterId: string },
+      ) =>
+        testEnv.DATABASE_ACTOR.get(
+          testEnv.DATABASE_ACTOR.idFromName(id),
+        ).admitWake(id, user, options),
+    );
+    const connection = await open({
+      bindings: {
+        ...testEnv,
+        DATABASE_CONNECTION_RATE_LIMITER: limited,
+        DATABASE_ACTOR: {
+          idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+          get: () => ({ admitWake, cancelWakeWaiter: async () => false }),
+        },
+      },
+    });
+    expect(await errorCode(connection)).toBe("53300");
+    expect(limited.limit).toHaveBeenCalledTimes(1);
+    expect(admitWake).not.toHaveBeenCalled();
+  });
+
+  it("holds the Actor's wake until both limiters have counted the connect", async () => {
     const called: string[] = [];
     let release!: () => void;
     const held = new Promise<void>((resolve) => {
@@ -1660,10 +1689,10 @@ describe("native edge admission with real Workers D1 and route-token modules", (
         },
       },
     });
-    await expect.poll(() => called.length).toBe(3);
-    expect(new Set(called)).toEqual(
-      new Set(["connection", "database", "actor"]),
-    );
+    await expect.poll(() => called.length).toBe(2);
+    // The Actor is asked only once both limiters have counted the connect.
+    expect(new Set(called)).toEqual(new Set(["connection", "database"]));
+    expect(admitWake).not.toHaveBeenCalled();
     release();
     const connection = await pending;
     connection.socket.send(encodeStartup({ user: "app", database }));
@@ -1905,35 +1934,6 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       },
     });
     expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).route).toBe("v6");
-  });
-
-  it("a refused limiter answers 53300 even when the actor admitted", async () => {
-    const admitWake = vi.fn(
-      (
-        id: string,
-        user: string,
-        options: { deadline: number; waiterId: string },
-      ) =>
-        testEnv.DATABASE_ACTOR.get(
-          testEnv.DATABASE_ACTOR.idFromName(id),
-        ).admitWake(id, user, options),
-    );
-    const connection = await open({
-      bindings: {
-        ...testEnv,
-        DATABASE_CONNECTION_RATE_LIMITER: {
-          limit: async () => ({ success: false }),
-        } as unknown as RateLimit,
-        DATABASE_ACTOR: {
-          idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
-          get: () => ({ admitWake, cancelWakeWaiter: async () => false }),
-        },
-      },
-    });
-    expect(await errorCode(connection)).toBe("53300");
-    expect(admitWake).toHaveBeenCalledTimes(1);
-    expect((await admitWake.mock.results[0]!.value).ok).toBe(true);
-    expect(await stats()).toHaveLength(0);
   });
 
   it("returns a generic PostgreSQL error for gateway failure without replaying", async () => {

@@ -3,10 +3,10 @@
  * The admission every database request takes, a WebSocket connection (`index.ts`) and an HTTP
  * query (`sql.ts`) alike: the Edge limiters and the DatabaseActor's admission, and an admitted
  * request is signed its route to the node's gateway. Both count the source network first
- * (`limitSource`), before any Actor is got. A WebSocket upgrade then runs the per-database and
- * per-role limiters and the Actor's admission together; an HTTP query counts in the limiters first
- * (`limitRoute`), before its body is read, and takes the Actor's admission after the body is
- * understood.
+ * (`limitSource`), before any Actor is got. Then the limiters count the request (`limitRoute`) and
+ * only an admitted request reaches the Actor's admission, which may wake the database: a WebSocket
+ * upgrade counts there before its admission, an HTTP query counts before its body is read and takes
+ * the Actor's admission after the body is understood.
  */
 import {
   parseRouteKeyring,
@@ -25,9 +25,9 @@ export interface Hints {
 /** Milliseconds of each admission stage that ran, logged with the admission. */
 export interface AdmissionTimings {
   /**
-   * The limiters: the source limiter first and alone, then the others in parallel with the Actor's
-   * admission for a WebSocket upgrade, and ahead of the body, before the Actor's admission begins,
-   * for an HTTP query. The stage is the longest of its limiters' waits, not their sum.
+   * The limiters: the source limiter first and alone, then the others in parallel with each other,
+   * for both kinds of request, before the Actor's admission begins (and, for an HTTP query, ahead
+   * of the body). The stage is the longest of its limiters' waits, not their sum.
    */
   limiters_ms?: number;
   admit_ms?: number;
@@ -224,10 +224,11 @@ export async function admitRoute(
       throw new AdmissionFailure("08006", "connection admission interrupted");
   };
   check();
-  // A request that `limitRoute` counted has passed the source limiter already.
-  if (!counted) await limitSource(request, env, timings);
+  // A request that `limitRoute` counted has passed the limiters already; any other request is
+  // counted here, and only once the limiters admit it does the Actor run, so a refused connect
+  // never wakes a database.
+  if (!counted) await limitRoute(request, env, hints, timings, scope);
   check();
-  const limits = counted ? [] : routeLimits(request, env, hints, scope);
   const actor = databaseActor(env, hints.database);
   const cancel = () =>
     ctx.waitUntil(
@@ -236,43 +237,31 @@ export async function admitRoute(
         .catch(() => false),
     );
   signal.addEventListener("abort", cancel, { once: true });
-  // Unless `limitRoute` has counted the request, the per-database and per-role limiters and the
-  // Actor's admission run together: none of them waits for another, only for the source limiter
-  // above. The per-database bucket therefore also counts connects that admission refuses.
   const started = Date.now();
-  let admission: PromiseSettledResult<DatabaseWakeAdmission>;
-  let outcomes: PromiseSettledResult<RateLimitOutcome>[];
+  let admitted: DatabaseWakeAdmission;
   try {
     check();
-    [admission, ...outcomes] = await Promise.allSettled([
-      actor
-        .admitWake(hints.database, hints.user, { deadline, waiterId: cid })
-        .catch((reason: unknown) => {
-          // A 12 s live stall returned 08006 without a matching Actor log. Keep the RPC's
-          // diagnostic flags, not its message/name/cause/stack, so the next probe can distinguish
-          // that failure from an Actor that ran and returned a refusal.
-          const flags =
-            typeof reason === "object" && reason !== null
-              ? (reason as Record<string, unknown>)
-              : {};
-          timings.admit_error = "rpc_exception";
-          timings.admit_retryable = flags.retryable === true;
-          timings.admit_overloaded = flags.overloaded === true;
-          timings.admit_remote = flags.remote === true;
-          throw reason;
-        })
-        .finally(() => {
-          timings.admit_ms = Date.now() - started;
-        }),
-      ...countLimits(limits, timings, started),
-    ]);
+    admitted = await actor
+      .admitWake(hints.database, hints.user, { deadline, waiterId: cid })
+      .catch((reason: unknown) => {
+        // A 12 s live stall returned 08006 without a matching Actor log. Keep the RPC's
+        // diagnostic flags, not its message/name/cause/stack, so the next probe can distinguish
+        // that failure from an Actor that ran and returned a refusal.
+        const flags =
+          typeof reason === "object" && reason !== null
+            ? (reason as Record<string, unknown>)
+            : {};
+        timings.admit_error = "rpc_exception";
+        timings.admit_retryable = flags.retryable === true;
+        timings.admit_overloaded = flags.overloaded === true;
+        timings.admit_remote = flags.remote === true;
+        throw reason;
+      });
   } finally {
+    timings.admit_ms = Date.now() - started;
     signal.removeEventListener("abort", cancel);
   }
   check();
-  refuseLimited(limits, outcomes);
-  if (admission.status === "rejected") throw admission.reason;
-  const admitted = admission.value;
   if (!admitted.ok) {
     switch (admitted.sqlstate) {
       case "3D000":
