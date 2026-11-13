@@ -20,7 +20,7 @@ use tokio::sync::Notify;
 /// The revision of what `install` applies: `schema.sql` and `baseline.sql`, each of which carries
 /// it as its first line. A database whose record holds an earlier one is installed again at its
 /// next refresh, which is how a change to either file reaches the databases that exist.
-pub const SCHEMA_REVISION: u32 = 2;
+pub const SCHEMA_REVISION: u32 = 3;
 /// The role that owns the platform schema and its objects.
 pub const PLATFORM_ROLE: &str = "pgcf-events";
 /// The channel `pgcf.emit` notifies after each row, so the drain wakes up.
@@ -624,6 +624,16 @@ mod tests {
             .unwrap_err();
         assert_eq!(state(&error), "42501");
 
+        // A login that holds SELECT only makes no temporary table: the database's TEMPORARY is the
+        // owner's, and the owner's own login keeps it.
+        let error = reader
+            .batch_execute("CREATE TEMP TABLE scratch (a int)")
+            .await
+            .expect_err("a temporary table of a reader");
+        assert_eq!(state(&error), "42501");
+        app.batch_execute("CREATE TEMP TABLE scratch (a int)")
+            .await
+            .unwrap();
         // The owner makes large objects as before and grants the function onward, and only that.
         for sql in LARGE_OBJECT_CREATORS {
             app.batch_execute(sql).await.unwrap();

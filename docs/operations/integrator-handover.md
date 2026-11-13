@@ -789,12 +789,15 @@ the platform schema `pgcf`.
   queue `max_notify_queue_pages` caps at 8 GB by default and which a session that listens and holds a
   transaction open can fill (156 MB for 20,000 notifications were measured; the files go when the
   session ends).
-- **Disk writes that remain.** Two more paths let a `SELECT`-only login write to the volume, and this
-  baseline closes neither. (a) `temp_file_limit` is unset (the default, -1), so a query can spill sort
+- **Temporary tables (revision 3).** The baseline also takes `TEMPORARY` on the database from `PUBLIC`
+  and keeps it with `app`, so a role that creates a temporary table gets `42501` from the moment its
+  database is hardened. `app` gives it back with `GRANT TEMPORARY ON DATABASE <db> TO <role>` for each
+  role that writes. Until that grant a writing role's temporary tables fail, so grant it before the
+  release reaches the database.
+- **Disk writes that remain.** One more path lets a `SELECT`-only login write to the volume, and this
+  baseline does not close it: `temp_file_limit` is unset (the default, -1), so a query can spill sort
   and hash files to disk until it ends, bounded only by a `statement_timeout` (a role can change its
-  own) and the volume. (b) Temporary tables are not counted by `temp_file_limit`: they are closed per
-  role by revoking `TEMPORARY` on the database, which the baseline does not do and the integrator
-  does. What would close (a): `ALTER DATABASE <db> SET temp_file_limit = '<size>'`, run by the
+  own) and the volume. What would close it: `ALTER DATABASE <db> SET temp_file_limit = '<size>'`, run by the
   superuser (a superuser-only setting, so tenants cannot change it), with a value the node agent
   derives from the volume size. What would close `pg_notify`: `max_notify_queue_pages` in
   `apps/node-agent/src/settings.rs` (a cluster setting, which needs a restart). Neither is built here,

@@ -1,4 +1,4 @@
--- pgcf-schema-revision: 2
+-- pgcf-schema-revision: 3
 -- The hardening baseline of a tenant database. The agent runs this file as the cluster's superuser
 -- at every install of the platform schema, before it looks at the schema: it holds whoever owns the
 -- name pgcf. It is one batch, so it is atomic, and running it again changes nothing. The names are
@@ -12,9 +12,13 @@
 --   * the two forms of pg_logical_emit_message write a WAL record. A login that holds SELECT only
 --     could write 1,000,000,000 bytes with one call (measured), as often as it likes, to the
 --     volume and to the archive.
--- The privileges on a function of pg_catalog are kept in the catalog of each database, so only a
--- superuser can take them away and each database must be changed on its own. The function names
--- and their argument types are the same on PostgreSQL 17 and 18 (checked on 17.7 and 18.6).
+-- The third takes TEMPORARY on the database from PUBLIC. A login that holds SELECT only could
+-- otherwise fill the volume with temporary tables, which temp_file_limit does not count. The owner
+-- keeps it, with the grant option, so the integrator grants it to each role that writes.
+-- The privileges on a function of pg_catalog and on the database are kept in the catalog of each
+-- database, so only a superuser can take them away and each database must be changed on its own.
+-- The function names and their argument types are the same on PostgreSQL 17 and 18 (checked on 17.7
+-- and 18.6).
 --
 -- Reviewed and left, because each is refused, needs something that exists, or is bounded by a
 -- setting: lo_import and lo_export are the superuser's already, lo_put, lowrite, lo_truncate and
@@ -30,6 +34,12 @@
 -- which connects as the owner, can grant them to the runtime roles that need them. The owner can
 -- therefore also grant them to PUBLIC again, by design: the REVOKE below runs as the superuser and
 -- removes only the entries of PUBLIC that the function's owner granted, not one the database
--- owner made. TEMPORARY is not touched: the integrator decides it per role.
+-- owner made.
 REVOKE EXECUTE ON FUNCTION pg_catalog.lo_create(pg_catalog.oid), pg_catalog.lo_creat(pg_catalog.int4), pg_catalog.lo_from_bytea(pg_catalog.oid, pg_catalog.bytea), pg_catalog.pg_logical_emit_message(pg_catalog.bool, pg_catalog.text, pg_catalog.text, pg_catalog.bool), pg_catalog.pg_logical_emit_message(pg_catalog.bool, pg_catalog.text, pg_catalog.bytea, pg_catalog.bool) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(pg_catalog.oid), pg_catalog.lo_creat(pg_catalog.int4), pg_catalog.lo_from_bytea(pg_catalog.oid, pg_catalog.bytea), pg_catalog.pg_logical_emit_message(pg_catalog.bool, pg_catalog.text, pg_catalog.text, pg_catalog.bool), pg_catalog.pg_logical_emit_message(pg_catalog.bool, pg_catalog.text, pg_catalog.bytea, pg_catalog.bool) TO "app" WITH GRANT OPTION;
+DO $baseline$
+BEGIN
+  EXECUTE pg_catalog.format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', pg_catalog.current_database());
+  EXECUTE pg_catalog.format('GRANT TEMPORARY ON DATABASE %I TO "app" WITH GRANT OPTION', pg_catalog.current_database());
+END
+$baseline$;
