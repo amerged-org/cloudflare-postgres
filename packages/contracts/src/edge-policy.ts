@@ -28,11 +28,16 @@ export const ACCESS_CLIENT_ID_HEADER = "CF-Access-Client-Id";
 export const ACCESS_CLIENT_SECRET_HEADER = "CF-Access-Client-Secret";
 /** The `config_error` an Edge logs when it has one of the token's two secrets and not the other. */
 export const ACCESS_SECRETS_INCOMPLETE = "access_secrets_incomplete";
+/**
+ * The `config_error` an Edge logs for a public gateway when it has neither of the token's secrets:
+ * it fails closed rather than reaching the gateway without Access.
+ */
+export const ACCESS_SECRETS_MISSING = "access_secrets_missing";
 
 /**
  * What an Edge does with its two Access secrets: `send` both when both are set, `none` when
- * neither is (an installation without Access), and `incomplete` for one alone, which is a
- * configuration error that refuses the connection. An empty value is not set.
+ * neither is, and `incomplete` for one alone. A public gateway refuses both `none` and `incomplete`
+ * (a configuration error). An empty value is not set.
  */
 export function accessTokenState(
   id: unknown,

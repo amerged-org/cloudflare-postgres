@@ -1165,6 +1165,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     await updateRegion("gateway_binding = NULL");
     const callerRoute = crypto.randomUUID();
     const connection = await open({
+      bindings: withAccess,
       headers: {
         Authorization: `Bearer ${crypto.randomUUID()}`,
         Cookie: `session=${crypto.randomUUID()}`,
@@ -1969,7 +1970,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
   it("refuses gateway redirects without leaking a token to the redirect target", async () => {
     await setGatewayMode("redirect");
     await updateRegion("gateway_binding = NULL");
-    const connection = await open();
+    const connection = await open({ bindings: withAccess });
     expect(await errorCode(connection)).toBe("08006");
     const observations = await stats();
     expect(observations).toHaveLength(1);
@@ -2020,19 +2021,19 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       expectNoValue(written());
     });
 
-    it("presents nothing without the secrets, whatever the caller sends", async () => {
+    it("refuses a public gateway without the secrets before sending anything, whatever the caller sends", async () => {
       await updateRegion("gateway_binding = NULL");
       const connection = await open({ headers: callerHeaders });
-      const startup = encodeStartup({ user: "app", database });
-      connection.socket.send(startup);
-      await expect
-        .poll(async () => (await stats())[0]?.bytes)
-        .toEqual([...startup]);
-      const { headers } = (await stats())[0]!;
-      expect(
-        Object.keys(headers).filter((h) => h.startsWith("cf-access")),
-      ).toEqual([]);
-      expect(lastLog().config_error).toBeUndefined();
+      expect(await errorCode(connection)).toBe("08006");
+      await waitOnExecutionContext(connection.ctx);
+      expect(await stats()).toHaveLength(0);
+      expect(lastLog()).toMatchObject({
+        event: "conn_admission",
+        outcome: "08006",
+        config_error: "access_secrets_missing",
+      });
+      expect(lastLog().gateway_status).toBeUndefined();
+      expectNoValue(written());
     });
 
     it("presents nothing over a service binding, which does not go through Access", async () => {
@@ -2192,7 +2193,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
 
   it("routes the global fetch fallback to a real test gateway Worker", async () => {
     await updateRegion("gateway_binding = NULL");
-    const connection = await open();
+    const connection = await open({ bindings: withAccess });
     const startup = encodeStartup({ user: "app", database });
     connection.socket.send(startup);
     await expect

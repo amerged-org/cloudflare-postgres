@@ -832,15 +832,33 @@ describe("HTTP SQL behind Cloudflare Access", () => {
     expect(text).not.toContain(accessSecret);
   });
 
-  it("presents nothing without the secrets, whatever the caller sends, and nothing over a service binding", async () => {
+  it("refuses a public gateway without the secrets before sending anything, whatever the caller sends", async () => {
     const caller = {
       ...neonHeaders(),
       "CF-Access-Client-Id": "caller-id",
       "CF-Access-Client-Secret": "caller-secret",
     };
-    expect(
-      (await post(admitting(open()), { query: "select 1" }, caller)).status,
-    ).toBe(200);
+    const response = await post(
+      admitting(open()),
+      { query: "select 1" },
+      caller,
+    );
+    expect(await refusal(response.clone())).toBe("08006");
+    expect(await forwarded()).toHaveLength(0);
+    expect(lastLog()).toMatchObject({
+      event: "sql_admission",
+      outcome: "08006",
+      config_error: "access_secrets_missing",
+    });
+    expect(lastLog().gateway_status).toBeUndefined();
+  });
+
+  it("presents nothing over a service binding, whatever the secrets", async () => {
+    const caller = {
+      ...neonHeaders(),
+      "CF-Access-Client-Id": "caller-id",
+      "CF-Access-Client-Secret": "caller-secret",
+    };
     expect(
       (await post(admitting(awake(), both), { query: "select 1" }, caller))
         .status,
@@ -856,7 +874,7 @@ describe("HTTP SQL behind Cloudflare Access", () => {
       ).status,
     ).toBe(200);
     const requests = await forwarded();
-    expect(requests).toHaveLength(3);
+    expect(requests).toHaveLength(2);
     for (const request of requests) expect(accessHeaders(request)).toEqual([]);
   });
 

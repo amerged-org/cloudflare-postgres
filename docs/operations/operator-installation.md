@@ -1029,10 +1029,11 @@ Two optional Worker secrets, `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET`, are 
 Access service token that the Edge presents (headers `CF-Access-Client-Id` and
 `CF-Access-Client-Secret`) to a gateway on a public hostname, once Access guards it; the Access
 application's policy for the gateway hostnames must use the Service Auth action for this token.
-Set them as secrets (`wrangler secret put` or the API), never as variables. Set both or neither:
-without them the Edge sends nothing and an installation without Access works as before, and one
-alone refuses every connection and HTTP query to a public gateway with `08006` before anything is
-sent, and logs `config_error: "access_secrets_incomplete"` (never a value). A gateway on a service
+Set them as secrets (`wrangler secret put` or the API), never as variables. Set both: a public
+gateway is reached only with them. Without them the Edge refuses every connection and HTTP query to
+a public gateway with `08006` before anything is sent, and logs `config_error:
+"access_secrets_missing"`; one alone does the same with `config_error: "access_secrets_incomplete"`
+(never a value). A gateway on a service
 binding does not go through Access and never receives the token. An Access refusal (401, 403, or
 a redirect to the login page, which the Edge does not follow) shows in the log as the
 `gateway_status` of the refused connection. The token expires after the duration chosen when it

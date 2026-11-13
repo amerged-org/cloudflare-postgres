@@ -3,6 +3,7 @@ import {
   ACCESS_CLIENT_ID_HEADER,
   ACCESS_CLIENT_SECRET_HEADER,
   ACCESS_SECRETS_INCOMPLETE,
+  ACCESS_SECRETS_MISSING,
   REFUSAL_BYTES,
   accessTokenState,
   refusalCode,
@@ -62,8 +63,9 @@ export class GatewayConfigError extends Error {
 
 /**
  * The headers that present the Edge's Access service token to a gateway on the public network.
- * None for a gateway on a service binding, which does not go through Access, and none without the
- * token's secrets; one secret alone is a configuration error.
+ * None for a gateway on a service binding, which does not go through Access. A public gateway
+ * needs both secrets: without them, or with one alone, the Edge refuses before sending anything,
+ * so a gateway is never reached past an Access check the Edge cannot present.
  */
 export function accessHeaders(
   region: GatewayRegion,
@@ -80,7 +82,7 @@ export function accessHeaders(
     case "incomplete":
       throw new GatewayConfigError(ACCESS_SECRETS_INCOMPLETE);
     default:
-      return {};
+      throw new GatewayConfigError(ACCESS_SECRETS_MISSING);
   }
 }
 

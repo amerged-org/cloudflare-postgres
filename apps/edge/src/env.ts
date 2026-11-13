@@ -28,7 +28,8 @@ export interface Env {
   readonly ROUTE_MASTER_KEYS: string;
   /**
    * The Cloudflare Access service token that the Edge presents to a gateway on the public network:
-   * both secrets or neither. A gateway on a service binding does not go through Access.
+   * both secrets, which a public gateway requires. A gateway on a service binding does not go
+   * through Access.
    */
   readonly ACCESS_CLIENT_ID?: string;
   readonly ACCESS_CLIENT_SECRET?: string;
