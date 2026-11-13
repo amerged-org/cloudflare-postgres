@@ -1583,10 +1583,12 @@ impl<M: Machine> Service<M> {
             .await
             .map_err(|_| "packages_not_read")?;
         let plan = update::plan(&lock, &installed);
-        if !(plan.versions.is_empty() && plan.files.is_empty()) {
+        if !plan.files.is_empty() {
+            // Every package comes from its lock's file, checked against the lock's digest and size
+            // by the link before apt sees it.
             let mut files = Vec::new();
             for package in &plan.files {
-                let path = work.join(format!("{}.deb", package.name));
+                let path = work.join(format!("{}_{}.deb", package.name, package.version));
                 self.link
                     .fetch(
                         &package.pinned.url,
@@ -1599,7 +1601,7 @@ impl<M: Machine> Service<M> {
                 files.push(path);
             }
             self.machine
-                .install_packages(&release.debian_snapshot, &plan.versions, &files)
+                .install_packages(&release.debian_snapshot, &files)
                 .await
                 .map_err(|_| "packages_not_installed")?;
             // Nothing that can fail comes between the install of a kernel and its boot: the order
@@ -5026,10 +5028,12 @@ mod tests {
         let cloud = Cloud::start().await;
         let deb = b"cloudflared 2026.10.1".to_vec();
         let url = cloud.serve_file("/files/cloudflared.deb", deb.clone());
+        let pg = b"postgresql 18.7".to_vec();
+        let pg_url = cloud.serve_file("/files/postgresql-18.deb", pg.clone());
         let lock = json!({
             "packages": [
                 {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
-                {"name": "postgresql-18", "version": "18.7-1", "architecture": "amd64", "url": "https://snapshot.example/pg.deb", "size": 10, "sha256": "b".repeat(64)},
+                {"name": "postgresql-18", "version": "18.7-1", "architecture": "amd64", "url": pg_url, "size": pg.len(), "sha256": digest(&pg)},
                 {"name": "cloudflared", "version": "2026.10.1", "architecture": "amd64", "url": url, "size": deb.len(), "sha256": digest(&deb)},
             ],
             "extra": [
@@ -5054,14 +5058,13 @@ mod tests {
                 .any(|order| order["operation"] == operation && order["status"] == "done")
         })
         .await;
-        // The pinned versions are installed from the release's snapshot, the extra package as the
-        // file it downloaded (a real lock lists it among its packages too), and the node is checked
-        // afterwards. No reboot: no kernel changed.
+        // Each package that differs is installed from the file its lock pinned, checked against the
+        // lock's digest, and the node is checked afterwards. No reboot: no kernel changed.
         let calls = machine.calls();
         let at = |what: &str| calls.iter().position(|call| call.starts_with(what));
         assert!(
             calls.contains(
-                &"install 20261016T000000Z postgresql-18=18.7-1 cloudflared=2026.10.1 + cloudflared.deb"
+                &"install 20261016T000000Z + postgresql-18_18.7-1.deb cloudflared_2026.10.1.deb"
                     .to_string()
             ),
             "{calls:?}"
@@ -5241,10 +5244,12 @@ mod tests {
         ]);
         let cloud = Cloud::start().await;
         let package = |name: &str, version: &str| json!({"name": name, "version": version, "architecture": "amd64", "url": format!("https://snapshot.example/{name}.deb"), "size": 10, "sha256": "a".repeat(64)});
+        let pg = b"postgresql 18.7".to_vec();
+        let pg_url = cloud.serve_file("/files/postgresql-18.deb", pg.clone());
         let lock = json!({
             "packages": [
                 package("bash", "5.2"),
-                package("postgresql-18", "18.7-1"),
+                json!({"name": "postgresql-18", "version": "18.7-1", "architecture": "amd64", "url": pg_url, "size": pg.len(), "sha256": digest(&pg)}),
                 package("linux-image-6.12.111+deb13-amd64", "6.12.111-1"),
             ],
             "extra": [],

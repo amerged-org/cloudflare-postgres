@@ -711,7 +711,6 @@ impl Machine for Node {
     async fn install_packages(
         &self,
         snapshot: &str,
-        versions: &[String],
         files: &[std::path::PathBuf],
     ) -> io::Result<()> {
         // The node's apt sources name the snapshot of the image; the release names another.
@@ -741,10 +740,12 @@ impl Machine for Node {
         };
         apt(vec!["update".into()]).await?;
         // The conffiles of the image (nftables) are kept as they are; versions are exact, so a
-        // package may also go down; recommendations are not installed.
+        // package may also go down; recommendations are not installed. `--no-download` keeps apt
+        // to the files the lock verified: a dependency that they do not supply is not fetched.
         let mut install: Vec<String> = [
             "install",
             "--yes",
+            "--no-download",
             "--no-install-recommends",
             "--allow-downgrades",
             "-o",
@@ -752,7 +753,6 @@ impl Machine for Node {
         ]
         .map(String::from)
         .into();
-        install.extend(versions.iter().cloned());
         install.extend(files.iter().map(|file| file.to_string_lossy().into_owned()));
         apt(install).await
     }
