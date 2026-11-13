@@ -21,13 +21,13 @@ Description=PGCF database %i
 Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
 # A start without the agent's link fails, not silently skips and not on an empty directory.
 AssertPathExists=/run/pgcf/dev/%i
+
+[Service]
+Type=notify
 # One budget per unit, so one database's log lines (a loop of RAISE WARNING, say) cannot evict the
 # node's journal or the operator's lines: journald's default is 10,000 per 30 s for each service.
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=1000
-
-[Service]
-Type=notify
 NotifyAccess=main
 User=pgcf-%i
 Group=pgcf-%i

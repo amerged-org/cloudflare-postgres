@@ -298,9 +298,16 @@ test("the three oneshots that MountImages= pulls into every start are masked: a 
 
 eachDatabaseUnit("a database's log lines are rate limited for its own unit: one database's warnings cannot evict the node's journal", (unit) => {
   // journald keeps one budget per service; a loop of RAISE WARNING with large text fills the shared
-  // journal in minutes at the default of 10,000 lines per 30 s, and evicts the operator's lines.
-  assert.deepEqual(assignments(unit, "LogRateLimitIntervalSec"), ["30s"]);
-  assert.deepEqual(assignments(unit, "LogRateLimitBurst"), ["1000"]);
+  // journal in minutes at the default of 10,000 lines per 30 s, and evicts the operator's lines. The
+  // rate limit is a [Service] setting; in [Unit] systemd would not apply it.
+  const limits = directives(unit).filter((directive) => directive.key.includes("LogRateLimit"));
+  assert.deepEqual(
+    limits.map(({ section, key, value }) => ({ section, key, value })),
+    [
+      { section: "Service", key: "Service.LogRateLimitIntervalSec", value: "30s" },
+      { section: "Service", key: "Service.LogRateLimitBurst", value: "1000" },
+    ],
+  );
 });
 
 eachDatabaseUnit("a database's private /dev/shm cannot run code, hold setuid files or hold device nodes", (unit) => {
