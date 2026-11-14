@@ -805,7 +805,7 @@ mod tests {
             panic!("not authenticated with a verifier");
         };
         assert_eq!(answer, ready);
-        let expected = Salted::derive(&password(b"pencil"), salt, 4096)
+        let expected = Salted::derive("db", &password(b"pencil"), salt, 4096)
             .await
             .unwrap();
         assert!(verifier.same(&expected.verifier()));
