@@ -945,17 +945,28 @@ fn probes(
                 id += 1;
                 probes.spawn(async move {
                     let began = Instant::now();
-                    let outcome = match timeout(
-                        Duration::from_secs(25),
-                        connect_async(upgrade_request(port, &route)),
-                    )
-                    .await
-                    {
-                        Ok(result) => match answered(result) {
-                            Ok(_) => Ok(began.elapsed()),
-                            Err((status, body)) => Err(format!("status {status}: {body}")),
-                        },
-                        Err(_) => Err("no answer in 25 s".into()),
+                    // A database admits eight sessions that have not logged in; the probes that
+                    // queued in the socket during the restart arrive together, and the ones past
+                    // the limit are told to retry (429), as a client does within its budget.
+                    // Their wait includes the retries.
+                    let outcome = loop {
+                        let attempt = timeout(
+                            Duration::from_secs(25).saturating_sub(began.elapsed()),
+                            connect_async(upgrade_request(port, &route)),
+                        )
+                        .await;
+                        match attempt {
+                            Ok(result) => match answered(result) {
+                                Ok(_) => break Ok(began.elapsed()),
+                                Err((429, _)) => {
+                                    tokio::time::sleep(Duration::from_millis(20)).await
+                                }
+                                Err((status, body)) => {
+                                    break Err(format!("status {status}: {body}"));
+                                }
+                            },
+                            Err(_) => break Err("no answer in 25 s".into()),
+                        }
                     };
                     (after, outcome)
                 });
