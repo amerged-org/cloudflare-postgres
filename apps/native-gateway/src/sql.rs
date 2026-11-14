@@ -416,7 +416,20 @@ async fn handle(
     }
     let route = attempt!(admitted_route(&head, gateway));
     stages.database = Some(route.database().to_string());
+    // The request holds its memory from the body on, against its database's budget, until it has
+    // run: a cold request that waits for a wake holds it too.
+    let mut memory = gateway.memory.lease(route.database());
     let body = attempt!(read_body(socket, head).await);
+    if !memory.grow(request_memory(body.len())) {
+        return (
+            Err(refused(
+                "memory_capacity",
+                "53300",
+                "gateway has no memory for the request",
+            )),
+            None,
+        );
+    }
     drop(permit);
     let request = attempt!(parse(&body));
     let request_bytes = body.len();
@@ -481,6 +494,12 @@ async fn handle(
             (Err(refusal), None)
         }
     }
+}
+
+/// The memory a request holds from its body on: the body, the statements parsed from it and the
+/// pipeline they become, which together take about three times the body.
+fn request_memory(body: usize) -> usize {
+    body.saturating_mul(3)
 }
 
 /// What a request presents: a v6 route that names the unit it runs on, or a v5 wake ticket that
@@ -1500,5 +1519,16 @@ mod tests {
             error_fields(&body),
             json!({"severity":"ERROR","code":"23505","message":"duplicate key","detail":"Key (id)=(1) already exists.","constraint":"items_pkey"})
         );
+    }
+
+    #[test]
+    fn a_request_holds_three_times_its_body_from_its_database_budget() {
+        assert_eq!(request_memory(MAX_REQUEST_BYTES), 12 << 20);
+        let budget = crate::budget::MemoryBudget::new(64 << 20, 32 << 20, 0, 0);
+        let mut lease = budget.lease("db");
+        assert!(lease.grow(request_memory(MAX_REQUEST_BYTES)));
+        assert_eq!(budget.database_used("db"), 12 << 20);
+        // A second request of the same size would take the database past its share of the budget.
+        assert!(!lease.grow(request_memory(MAX_REQUEST_BYTES) * 2));
     }
 }
