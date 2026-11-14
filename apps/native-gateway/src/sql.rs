@@ -426,17 +426,7 @@ async fn handle(
     // The request holds its memory from the body on, against its database's budget, until it has
     // run: a cold request that waits for a wake holds it too.
     let mut memory = gateway.memory.lease(route.database());
-    let body = attempt!(read_body(socket, head).await);
-    if !memory.grow(request_memory(body.len())) {
-        return (
-            Err(refused(
-                "memory_capacity",
-                "53300",
-                "gateway has no memory for the request",
-            )),
-            None,
-        );
-    }
+    let body = attempt!(read_body(socket, head, &mut memory).await);
     drop(permit);
     let request = attempt!(parse(&body));
     let request_bytes = body.len();
@@ -503,6 +493,15 @@ async fn handle(
     }
 }
 
+/// The refusal of a request the gateway has no memory for: before anything was sent.
+fn memory_refused() -> Refused {
+    refused(
+        "memory_capacity",
+        "53300",
+        "gateway has no memory for the request",
+    )
+}
+
 /// The memory a request holds from its body on: the body, the statements parsed from it and the
 /// pipeline they become, which together take about three times the body.
 fn request_memory(body: usize) -> usize {
@@ -562,7 +561,11 @@ fn admitted_route(head: &HttpHead, gateway: &Gateway) -> Result<Presented, Refus
     Ok(presented)
 }
 /// The request body, by Content-Length or chunked. Every buffer that held it is zeroized.
-async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Zeroizing<Vec<u8>>, Refused> {
+async fn read_body(
+    socket: &mut TcpStream,
+    head: HttpHead,
+    memory: &mut Lease,
+) -> Result<Zeroizing<Vec<u8>>, Refused> {
     let HttpHead {
         headers,
         prefix,
@@ -613,6 +616,9 @@ async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Zeroizing<V
                     if &raw[start + size..start + size + 2] != b"\r\n" {
                         return Err(invalid("invalid request"));
                     }
+                    if !memory.grow(request_memory(size)) {
+                        return Err(memory_refused());
+                    }
                     body.extend_from_slice(&raw[start..start + size]);
                     offset = start + size + 2;
                 }
@@ -635,6 +641,10 @@ async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Zeroizing<V
     }
     if prefix.len() - end > length {
         return Err(invalid("invalid request"));
+    }
+    // Leased before the buffer exists: a body the database has no memory for is refused as sent.
+    if !memory.grow(request_memory(length)) {
+        return Err(memory_refused());
     }
     // Sized once: a reallocation would leave an unwiped copy behind.
     let mut body = Zeroizing::new(Vec::with_capacity(length));
@@ -1581,5 +1591,26 @@ mod tests {
             cancel_packet(&[0, 0, 0, 7, 0, 0, 0, 9]),
             [0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 0, 7, 0, 0, 0, 9]
         );
+    }
+
+    #[tokio::test]
+    async fn a_body_the_database_has_no_memory_for_is_refused_before_it_is_read() {
+        let budget = crate::budget::MemoryBudget::new(64 << 20, 1 << 20, 0, 0);
+        let mut memory = budget.lease("db");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (_client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let (mut socket, _) = accepted.unwrap();
+        let head = HttpHead {
+            method: "POST".into(),
+            path: "/sql".into(),
+            headers: vec![("content-length".into(), (1 << 20).to_string())],
+            prefix: Vec::new(),
+            end: 0,
+        };
+        // The client sends no body: the refusal comes before the reader waits for one.
+        let answer = read_body(&mut socket, head, &mut memory).await.unwrap_err();
+        assert_eq!(answer.outcome, "memory_capacity");
+        assert_eq!(budget.database_used("db"), 0);
     }
 }
