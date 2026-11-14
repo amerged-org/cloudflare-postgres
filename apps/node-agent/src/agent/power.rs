@@ -2722,14 +2722,12 @@ mod tests {
         let (entry, db) = rig.create().await;
         assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
 
-        // The next postmaster ends with a FATAL, after the wake stopped waiting for it.
-        let auto = rig
-            .machine
-            .layout()
-            .data(&entry.id)
-            .join("postgresql.auto.conf");
-        let original = std::fs::read_to_string(&auto).unwrap();
-        std::fs::write(&auto, format!("{original}shared_buffers = 'none'\n")).unwrap();
+        // The next postmaster ends with a FATAL, after the wake stopped waiting for it: the data
+        // directory names a PostgreSQL version this server is not. The agent writes the
+        // configuration files again at every start, so only a file outside them stays broken.
+        let version = rig.machine.layout().data(&entry.id).join("PG_VERSION");
+        let original = std::fs::read_to_string(&version).unwrap();
+        std::fs::write(&version, "99\n").unwrap();
         rig.machine.delay_next_start(Duration::from_millis(1500));
         let result = rig
             .core
@@ -2747,7 +2745,7 @@ mod tests {
         })
         .await;
         assert!(!rig.machine.running(&entry.id));
-        std::fs::write(&auto, original).unwrap();
+        std::fs::write(&version, original).unwrap();
         // The next start is slower than the first wake's budget, as a real one is on a loaded
         // host (CI, 2026-10-22: 302 ms): the budget belongs to the wake, not to the node.
         rig.machine.delay_next_start(Duration::from_millis(600));

@@ -2044,7 +2044,6 @@ mod tests {
     async fn a_restores_configuration_is_persisted_before_its_first_cold_wake() {
         use crate::agent::power::{Slept, Why};
         use pgcf_native_protocol::wake::Outcome;
-        use std::os::unix::fs::MetadataExt;
 
         let Some(rig) = Rig::new("restore-config").await else {
             return;
@@ -2085,22 +2084,21 @@ mod tests {
             Some(&hash)
         );
         let data_path = rig.machine.layout().data(&entry.id);
-        let held: Vec<_> = configuration
-            .iter()
-            .map(|(name, content)| {
-                let path = data_path.join(name);
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), *content);
-                // Hold the old inode open so a needless unlink/rewrite cannot reuse it.
-                (path.clone(), std::fs::File::open(path).unwrap())
-            })
-            .collect();
+        for (name, content) in &configuration {
+            assert_eq!(
+                std::fs::read_to_string(data_path.join(name)).unwrap(),
+                *content
+            );
+        }
         assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
         let woke = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(woke.outcome, Outcome::Started, "{woke:?}");
-        for (path, file) in held {
-            let before = file.metadata().unwrap();
-            let after = std::fs::metadata(path).unwrap();
-            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        // Every start writes the files again, so they match the configuration after the wake too.
+        for (name, content) in &configuration {
+            assert_eq!(
+                std::fs::read_to_string(data_path.join(name)).unwrap(),
+                *content
+            );
         }
         let data = postgres::connect(
             &rig.machine.layout().socket_directory(&entry.id),
