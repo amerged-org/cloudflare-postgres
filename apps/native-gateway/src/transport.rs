@@ -64,6 +64,8 @@ pub struct Config {
     pub reserve_memory: usize,
     /// What every database may hold before it competes for the shared part.
     pub guaranteed_memory: usize,
+    /// How long one HTTP SQL request's statements may run before the gateway cancels them.
+    pub statement_bound: Duration,
 }
 pub(crate) struct Admission {
     pub(crate) replay: ReplayCache,
@@ -1860,6 +1862,7 @@ mod tests {
             database_memory: 96 << 20,
             reserve_memory: 96 << 20,
             guaranteed_memory: 3 << 20,
+            statement_bound: crate::sql::STATEMENT_BOUND,
         }))
     }
     fn route(route_revision: u64) -> Route {

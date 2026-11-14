@@ -199,6 +199,7 @@ impl Node {
             database_memory: 96 * 1024 * 1024,
             reserve_memory: 96 * 1024 * 1024,
             guaranteed_memory: 3 * 1024 * 1024,
+            statement_bound: pgcf_native_gateway::sql::STATEMENT_BOUND,
         }));
         let (stop, receiver) = watch::channel(false);
         let channel = tokio::spawn(local::synchronize(

@@ -63,6 +63,10 @@ pub const LIFETIME: Duration = Duration::from_secs(60);
 const POOLED_PER_ROLE: usize = 4;
 /// The time a request has to send its body.
 const BODY_BOUND: Duration = Duration::from_secs(10);
+/// The most a request's statements may run before the gateway cancels them. It is longer than the
+/// thirty seconds of a schedule's run, so PostgreSQL's own statement timeout normally answers
+/// first; a schedule's statements cannot lengthen it.
+pub const STATEMENT_BOUND: Duration = Duration::from_secs(35);
 
 /// A refusal in the driver's error format, answered with HTTP 400, and its log outcome.
 #[derive(Debug)]
@@ -418,10 +422,6 @@ async fn handle(
         return (Err(invalid("HTTP SQL requires POST")), None);
     }
     let route = attempt!(admitted_route(&head, gateway));
-    let exp = match &route {
-        Presented::Admitted(claims) => claims.exp,
-        Presented::Wake(ticket) => ticket.exp,
-    };
     stages.database = Some(route.database().to_string());
     // The request holds its memory from the body on, against its database's budget, until it has
     // run: a cold request that waits for a wake holds it too.
@@ -479,14 +479,7 @@ async fn handle(
     drop(password);
     let started = Instant::now();
     stages.sent = true;
-    let executed = execute(
-        gateway,
-        &mut backend,
-        &statements,
-        transaction.as_ref(),
-        statement_deadline(exp),
-    )
-    .await;
+    let executed = execute(gateway, &mut backend, &statements, transaction.as_ref()).await;
     stages.query = Some(started.elapsed());
     match executed {
         Ok((Ok(answer), status)) if answer.results == statements.len() => {
@@ -1213,17 +1206,6 @@ fn statement(out: &mut Vec<u8>, query: &str, params: &[Option<String>], describe
     }
     message(out, b'E', &[0, 0, 0, 0, 0]);
 }
-/// The instant a request's statements must end by: the expiry of the route it was admitted under,
-/// which the Edge signs for thirty seconds. A schedule's own statements cannot move it, as they can
-/// PostgreSQL's statement_timeout.
-fn statement_deadline(exp: u64) -> tokio::time::Instant {
-    tokio::time::Instant::now() + remaining(exp, http::now())
-}
-
-fn remaining(exp: u64, now: u64) -> Duration {
-    Duration::from_secs(exp.saturating_sub(now))
-}
-
 /// The CancelRequest that names a session's backend: its length, the cancel code and its key.
 fn cancel_packet(key: &[u8; 8]) -> [u8; 16] {
     let mut packet = [0u8; 16];
@@ -1250,8 +1232,9 @@ async fn execute(
     backend: &mut Backend,
     statements: &[Statement],
     transaction: Option<&Transaction>,
-    deadline: tokio::time::Instant,
 ) -> Result<(Result<Answer, Vec<u8>>, u8), Refused> {
+    // Taken here, so that no statement of the request can set a longer bound than the gateway's.
+    let deadline = tokio::time::Instant::now() + gateway.config.statement_bound;
     let mut pipeline = Vec::new();
     if let Some(transaction) = transaction {
         statement(&mut pipeline, &begin(transaction), &[], false);
@@ -1590,9 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn a_statement_ends_by_its_route_expiry_and_cancels_with_its_backend_key() {
-        assert_eq!(remaining(130, 100), Duration::from_secs(30));
-        assert_eq!(remaining(100, 130), Duration::ZERO);
+    fn the_cancel_request_names_the_backend_by_its_key() {
         assert_eq!(
             cancel_packet(&[0, 0, 0, 7, 0, 0, 0, 9]),
             [0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 0, 7, 0, 0, 0, 9]

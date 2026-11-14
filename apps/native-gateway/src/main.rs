@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use pgcf_native_gateway::{
-    activation, budget, local,
+    activation, budget, local, sql,
     transport::{self, Config, Gateway},
 };
 use pgcf_native_protocol::{agent, constant, route::Keyring, valid_pattern};
@@ -69,6 +69,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         database_memory,
         reserve_memory,
         guaranteed_memory,
+        statement_bound: sql::STATEMENT_BOUND,
     });
     let (stop, receiver) = watch::channel(false);
     // On a node: the agent's table over its local channel, PostgreSQL on Unix sockets, and only

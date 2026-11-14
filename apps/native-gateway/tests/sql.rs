@@ -536,6 +536,7 @@ impl Fixture {
             database_memory: memory[1],
             reserve_memory: memory[2],
             guaranteed_memory: memory[3],
+            statement_bound: pgcf_native_gateway::sql::STATEMENT_BOUND,
         }));
         gateway
             .table

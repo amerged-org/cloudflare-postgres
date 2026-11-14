@@ -245,6 +245,7 @@ impl Node {
             database_memory: 96 * 1024 * 1024,
             reserve_memory: 96 * 1024 * 1024,
             guaranteed_memory: 3 * 1024 * 1024,
+            statement_bound: pgcf_native_gateway::sql::STATEMENT_BOUND,
         }));
         let (stop, receiver) = watch::channel(false);
         let channel = tokio::spawn(local::synchronize(
@@ -769,6 +770,7 @@ async fn connections_beyond_the_handshake_limit_wait_in_the_socket_and_are_not_r
         database_memory: 96 * 1024 * 1024,
         reserve_memory: 96 * 1024 * 1024,
         guaranteed_memory: 3 * 1024 * 1024,
+            statement_bound: pgcf_native_gateway::sql::STATEMENT_BOUND,
     }));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

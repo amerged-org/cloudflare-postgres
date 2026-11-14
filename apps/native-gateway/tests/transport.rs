@@ -416,6 +416,7 @@ impl Fixture {
             database_memory: 96 * 1024 * 1024,
             reserve_memory: 96 * 1024 * 1024,
             guaranteed_memory: 3 * 1024 * 1024,
+            statement_bound: pgcf_native_gateway::sql::STATEMENT_BOUND,
         }));
         gateway.table.write().await.replace(table(&unit));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
