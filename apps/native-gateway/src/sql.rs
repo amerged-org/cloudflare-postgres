@@ -839,7 +839,9 @@ async fn open(
     let capacity = || refused("admission_denied", "53300", "too many connections");
     let memory = transport::session_memory(gateway, database).ok_or_else(capacity)?;
     let wire = WireBudget::new(gateway.memory.lease(database));
-    let unauthenticated = gateway.begin_authentication(database).map_err(|_| capacity())?;
+    let unauthenticated = gateway
+        .begin_authentication(database)
+        .map_err(|_| capacity())?;
     let (lease, actions) = gateway
         .reserve(claims, wire, target, false)
         .map_err(|_| capacity())?;

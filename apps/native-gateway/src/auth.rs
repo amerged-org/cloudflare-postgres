@@ -264,7 +264,14 @@ pub async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     ring::rand::SystemRandom::new()
         .fill(&mut random)
         .map_err(|_| "random source unavailable")?;
-    login_with(postgres, database, password, &STANDARD.encode(random), known).await
+    login_with(
+        postgres,
+        database,
+        password,
+        &STANDARD.encode(random),
+        known,
+    )
+    .await
 }
 
 async fn login_with<S: AsyncRead + AsyncWrite + Unpin>(
@@ -631,9 +638,14 @@ mod tests {
                     gap.fetch_max(now - tick.swap(now, SeqCst), SeqCst);
                 }
             });
-            Salted::derive("db", &password(b"pencil"), b"salt".to_vec(), MAXIMUM_ITERATIONS)
-                .await
-                .unwrap();
+            Salted::derive(
+                "db",
+                &password(b"pencil"),
+                b"salt".to_vec(),
+                MAXIMUM_ITERATIONS,
+            )
+            .await
+            .unwrap();
             let elapsed = started.elapsed().as_micros() as u64;
             ticker.abort();
             let widest = widest.load(SeqCst).max(elapsed - last.load(SeqCst));
@@ -838,9 +850,14 @@ mod tests {
     async fn a_database_whose_share_stays_busy_is_refused_instead_of_queued() {
         let _held = share_of("share-test-busy").acquire_owned().await.unwrap();
         assert!(
-            Salted::derive("share-test-busy", &password(b"pencil"), b"salt".to_vec(), 4096)
-                .await
-                .is_err()
+            Salted::derive(
+                "share-test-busy",
+                &password(b"pencil"),
+                b"salt".to_vec(),
+                4096
+            )
+            .await
+            .is_err()
         );
     }
 }

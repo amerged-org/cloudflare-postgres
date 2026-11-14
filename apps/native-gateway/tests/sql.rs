@@ -1406,8 +1406,16 @@ async fn a_statement_past_its_bound_is_cancelled_and_answered_as_unknown() {
             &body(PASSWORD, &[("stall", json!(["163840"]))], None),
         )
         .await;
-    assert_eq!((status, &answer["code"]), (400, &json!("08007")), "{answer}");
-    assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+    assert_eq!(
+        (status, &answer["code"]),
+        (400, &json!("08007")),
+        "{answer}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
     assert_eq!(fixture.journal.count("stalled"), 1);
     // The double's startup gave process 1 and secret 2; the cancel names that backend.
     timeout(Duration::from_secs(5), async {
@@ -1443,7 +1451,11 @@ async fn a_database_refuses_a_session_beyond_its_unauthenticated_limit_before_it
     let (status, answer) = fixture
         .sql(&route(9), &body(PASSWORD, &[("select", json!([]))], None))
         .await;
-    assert_eq!((status, &answer["code"]), (400, &json!("53300")), "{answer}");
+    assert_eq!(
+        (status, &answer["code"]),
+        (400, &json!("53300")),
+        "{answer}"
+    );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 8);
     fixture.gate.send(true).unwrap();
     for task in held {

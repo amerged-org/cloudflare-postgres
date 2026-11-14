@@ -385,8 +385,12 @@ impl Lock {
                 .as_array()?
                 .iter()
                 .map(|entry| {
-                    let name = entry["name"].as_str().filter(|name| is_package_name(name))?;
-                    let version = entry["version"].as_str().filter(|version| is_version(version))?;
+                    let name = entry["name"]
+                        .as_str()
+                        .filter(|name| is_package_name(name))?;
+                    let version = entry["version"]
+                        .as_str()
+                        .filter(|version| is_version(version))?;
                     Some(Package {
                         name: name.to_string(),
                         version: version.to_string(),
@@ -660,7 +664,10 @@ mod tests {
         };
         assert!(Lock::parse(entry("adduser", "3.152").as_bytes()).is_some());
         assert!(Lock::parse(entry("adduser", "3.152+b1~deb13:1").as_bytes()).is_some());
-        assert_eq!(Lock::parse(entry("adduser", "1.0/../../x").as_bytes()), None);
+        assert_eq!(
+            Lock::parse(entry("adduser", "1.0/../../x").as_bytes()),
+            None
+        );
         assert_eq!(Lock::parse(entry("adduser", "").as_bytes()), None);
         assert_eq!(Lock::parse(entry("../adduser", "3.152").as_bytes()), None);
         assert_eq!(Lock::parse(entry("Adduser", "3.152").as_bytes()), None);
@@ -700,7 +707,10 @@ mod tests {
         // A kernel the node does not have yet: its package is new, and the node reboots.
         let without = installed(&[("bash", "5.2"), ("postgresql-18", "18.7-1")]);
         let planned = plan(&lock(), &without);
-        assert_eq!(names(&planned), ["linux-image-6.12.99-amd64", "cloudflared"]);
+        assert_eq!(
+            names(&planned),
+            ["linux-image-6.12.99-amd64", "cloudflared"]
+        );
         assert!(planned.reboot);
         // A package that both lists name is one file, not two.
         let both = Lock {
