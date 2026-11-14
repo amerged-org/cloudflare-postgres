@@ -287,7 +287,7 @@ async fn postgres_session(
     let mut startup = vec![0; length - 4];
     stream.read_exact(&mut startup).await?;
     // A CancelRequest comes on a connection of its own; it names the backend by process and secret.
-    if &startup[..4] == &80_877_102u32.to_be_bytes() {
+    if startup[..4] == 80_877_102u32.to_be_bytes() {
         let key: Vec<String> = startup[4..]
             .chunks(4)
             .map(|word| u32::from_be_bytes(word.try_into().unwrap()).to_string())
