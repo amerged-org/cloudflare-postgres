@@ -1219,6 +1219,8 @@ fn cancel_packet(key: &[u8; 8]) -> [u8; 16] {
 /// Asks PostgreSQL to cancel the statement a session runs, over a connection of its own. The
 /// caller ends the session: a stream that was cut off has lost its place in the protocol.
 async fn cancel(target: &Writer, key: Option<[u8; 8]>) {
+    // No key means the startup gave a BackendKeyData that is not eight bytes, which `authenticate`
+    // does not keep: the session cannot be named, so only its end is sent.
     let Some(key) = key else { return };
     if let Ok(Ok(mut stream)) = timeout(Duration::from_millis(500), local::dial(target)).await {
         let _ = stream.write_all(&cancel_packet(&key)).await;
