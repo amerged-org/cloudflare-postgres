@@ -44,7 +44,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UnixStream},
     sync::{OwnedSemaphorePermit, oneshot, watch},
-    time::timeout,
+    time::{timeout, timeout_at},
 };
 use zeroize::Zeroizing;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -281,6 +281,9 @@ struct Backend {
     generation: u64,
     /// What PostgreSQL proved; none when it asked for no password, and then it is not pooled.
     verifier: Option<Verifier>,
+    /// The session's BackendKeyData (process id and secret key), which names it to a cancel
+    /// request; none until its startup gave one.
+    key: Option<[u8; 8]>,
     authenticated: Instant,
     /// The memory the session holds while it exists.
     _memory: Lease,
@@ -415,6 +418,10 @@ async fn handle(
         return (Err(invalid("HTTP SQL requires POST")), None);
     }
     let route = attempt!(admitted_route(&head, gateway));
+    let exp = match &route {
+        Presented::Admitted(claims) => claims.exp,
+        Presented::Wake(ticket) => ticket.exp,
+    };
     stages.database = Some(route.database().to_string());
     // The request holds its memory from the body on, against its database's budget, until it has
     // run: a cold request that waits for a wake holds it too.
@@ -472,7 +479,14 @@ async fn handle(
     drop(password);
     let started = Instant::now();
     stages.sent = true;
-    let executed = execute(gateway, &mut backend, &statements, transaction.as_ref()).await;
+    let executed = execute(
+        gateway,
+        &mut backend,
+        &statements,
+        transaction.as_ref(),
+        statement_deadline(exp),
+    )
+    .await;
     stages.query = Some(started.elapsed());
     match executed {
         Ok((Ok(answer), status)) if answer.results == statements.len() => {
@@ -855,6 +869,7 @@ async fn open(
         user: claims.user.clone(),
         generation: claims.generation,
         verifier: None,
+        key: None,
         authenticated: Instant::now(),
         _memory: memory,
     };
@@ -945,7 +960,8 @@ async fn authenticate(
         match tag {
             b'E' => return Err(startup_error(body)),
             b'Z' if rest.is_empty() => return Ok(verifier),
-            b'R' | b'S' | b'K' | b'N' => {}
+            b'K' => backend.key = <[u8; 8]>::try_from(body).ok(),
+            b'R' | b'S' | b'N' => {}
             _ => return Err(protocol()),
         }
     }
@@ -1197,6 +1213,35 @@ fn statement(out: &mut Vec<u8>, query: &str, params: &[Option<String>], describe
     }
     message(out, b'E', &[0, 0, 0, 0, 0]);
 }
+/// The instant a request's statements must end by: the expiry of the route it was admitted under,
+/// which the Edge signs for thirty seconds. A schedule's own statements cannot move it, as they can
+/// PostgreSQL's statement_timeout.
+fn statement_deadline(exp: u64) -> tokio::time::Instant {
+    tokio::time::Instant::now() + remaining(exp, http::now())
+}
+
+fn remaining(exp: u64, now: u64) -> Duration {
+    Duration::from_secs(exp.saturating_sub(now))
+}
+
+/// The CancelRequest that names a session's backend: its length, the cancel code and its key.
+fn cancel_packet(key: &[u8; 8]) -> [u8; 16] {
+    let mut packet = [0u8; 16];
+    packet[..4].copy_from_slice(&16u32.to_be_bytes());
+    packet[4..8].copy_from_slice(&80_877_102u32.to_be_bytes());
+    packet[8..].copy_from_slice(key);
+    packet
+}
+
+/// Asks PostgreSQL to cancel the statement a session runs, over a connection of its own. The
+/// caller ends the session: a stream that was cut off has lost its place in the protocol.
+async fn cancel(target: &Writer, key: Option<[u8; 8]>) {
+    let Some(key) = key else { return };
+    if let Ok(Ok(mut stream)) = timeout(Duration::from_millis(500), local::dial(target)).await {
+        let _ = stream.write_all(&cancel_packet(&key)).await;
+    }
+}
+
 /// Runs the request as one pipeline ending in one Sync: a batch between BEGIN and COMMIT. The
 /// answer is the results or PostgreSQL's error, with the transaction status after the Sync; a
 /// refusal means the session cannot be used again.
@@ -1205,6 +1250,7 @@ async fn execute(
     backend: &mut Backend,
     statements: &[Statement],
     transaction: Option<&Transaction>,
+    deadline: tokio::time::Instant,
 ) -> Result<(Result<Answer, Vec<u8>>, u8), Refused> {
     let mut pipeline = Vec::new();
     if let Some(transaction) = transaction {
@@ -1227,10 +1273,21 @@ async fn execute(
         transaction.is_some(),
     )?;
     let Backend {
-        postgres, actions, ..
+        postgres,
+        actions,
+        lease,
+        key,
+        ..
     } = backend;
+    let key = *key;
     tokio::select! {
-        result = results(postgres, answer) => result,
+        result = timeout_at(deadline, results(postgres, answer)) => match result {
+            Ok(result) => result,
+            Err(_) => {
+                cancel(&lease.target, key).await;
+                Err(unknown("statement_deadline"))
+            }
+        },
         _ = retired(actions) => Err(unknown("database_retired")),
     }
 }
@@ -1530,5 +1587,15 @@ mod tests {
         assert_eq!(budget.database_used("db"), 12 << 20);
         // A second request of the same size would take the database past its share of the budget.
         assert!(!lease.grow(request_memory(MAX_REQUEST_BYTES) * 2));
+    }
+
+    #[test]
+    fn a_statement_ends_by_its_route_expiry_and_cancels_with_its_backend_key() {
+        assert_eq!(remaining(130, 100), Duration::from_secs(30));
+        assert_eq!(remaining(100, 130), Duration::ZERO);
+        assert_eq!(
+            cancel_packet(&[0, 0, 0, 7, 0, 0, 0, 9]),
+            [0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 0, 7, 0, 0, 0, 9]
+        );
     }
 }
