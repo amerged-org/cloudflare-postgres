@@ -779,7 +779,8 @@ async fn checkout(
             None => return Checkout::Missed(None),
         }
     };
-    let Ok(salted) = Salted::derive(password, newest.salt, newest.iterations).await else {
+    let derivation = Salted::derive(&claims.db, password, newest.salt, newest.iterations);
+    let Ok(salted) = derivation.await else {
         return Checkout::Missed(None);
     };
     let derived = salted.verifier();
