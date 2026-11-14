@@ -9,6 +9,18 @@
       "database_name": "pgcf-edge-test",
     },
   ],
+  // The API handler that takes the nodes' reports in these tests records the digest of a reported
+  // backup from the archive bucket, so the suite binds one.
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE",
+      "bucket_name": "pgcf-edge-test",
+      "jurisdiction": "eu",
+    },
+  ],
+  "vars": {
+    "ARCHIVE_BUCKET_NAME": "pgcf-edge-test",
+  },
   "durable_objects": {
     "bindings": [
       { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
