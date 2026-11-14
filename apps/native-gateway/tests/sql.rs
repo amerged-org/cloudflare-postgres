@@ -286,6 +286,15 @@ async fn postgres_session(
     let length = stream.read_u32().await? as usize;
     let mut startup = vec![0; length - 4];
     stream.read_exact(&mut startup).await?;
+    // A CancelRequest comes on a connection of its own; it names the backend by process and secret.
+    if &startup[..4] == &80_877_102u32.to_be_bytes() {
+        let key: Vec<String> = startup[4..]
+            .chunks(4)
+            .map(|word| u32::from_be_bytes(word.try_into().unwrap()).to_string())
+            .collect();
+        journal.push(format!("cancel:{}", key.join(":")));
+        return Ok(());
+    }
     assert_eq!(&startup[..4], &196608u32.to_be_bytes());
     let parameters = strings(&startup[4..]);
     let pairs: Vec<String> = parameters
@@ -515,6 +524,10 @@ impl Fixture {
     }
     /// The gateway's byte budgets: the total, one database's, the reserve and the guaranteed share.
     async fn sized(mode: Mode, memory: [usize; 4]) -> Self {
+        Self::bounded(mode, memory, pgcf_native_gateway::sql::STATEMENT_BOUND).await
+    }
+    /// As `sized`, with the statement bound of the gateway given.
+    async fn bounded(mode: Mode, memory: [usize; 4], statement_bound: Duration) -> Self {
         let directory = Directory::new("sql");
         let socket = directory.path().join(".s.PGSQL.5432");
         let upstream = UnixListener::bind(&socket).unwrap();
@@ -536,7 +549,7 @@ impl Fixture {
             database_memory: memory[1],
             reserve_memory: memory[2],
             guaranteed_memory: memory[3],
-            statement_bound: pgcf_native_gateway::sql::STATEMENT_BOUND,
+            statement_bound,
         }));
         gateway
             .table
@@ -1375,5 +1388,34 @@ async fn a_cleartext_challenge_gets_no_password_and_a_trusting_session_is_not_po
     fixture.idle(0).await;
     assert_eq!(fixture.sql(&route(24), &request).await.0, 200);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_statement_past_its_bound_is_cancelled_and_answered_as_unknown() {
+    // The bound is one second: the stalled statement is cancelled long before its stall would end.
+    let fixture = Fixture::bounded(
+        Mode::Running,
+        [192 << 20, 96 << 20, 96 << 20, 3 << 20],
+        Duration::from_secs(1),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let (status, answer) = fixture
+        .sql(
+            &route(1),
+            &body(PASSWORD, &[("stall", json!(["163840"]))], None),
+        )
+        .await;
+    assert_eq!((status, &answer["code"]), (400, &json!("08007")), "{answer}");
+    assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+    assert_eq!(fixture.journal.count("stalled"), 1);
+    // The double's startup gave process 1 and secret 2; the cancel names that backend.
+    timeout(Duration::from_secs(5), async {
+        while fixture.journal.count("cancel:1:2") == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the statement was not cancelled");
     fixture.stop().await;
 }
