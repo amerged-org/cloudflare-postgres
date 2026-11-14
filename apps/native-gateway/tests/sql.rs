@@ -1419,3 +1419,35 @@ async fn a_statement_past_its_bound_is_cancelled_and_answered_as_unknown() {
     .expect("the statement was not cancelled");
     fixture.stop().await;
 }
+#[tokio::test]
+async fn a_database_refuses_a_session_beyond_its_unauthenticated_limit_before_it_dials() {
+    let fixture = Fixture::new().await;
+    // While the gate is closed the double answers no StartupMessage: these sessions stay
+    // unauthenticated and hold their count.
+    fixture.gate.send(false).unwrap();
+    let request = body(PASSWORD, &[("select", json!([]))], None).to_string();
+    let mut held = Vec::new();
+    for id in 1..=8 {
+        let (port, route, request) = (fixture.port, route(id), request.clone());
+        held.push(tokio::spawn(async move {
+            post(port, &route, request.as_bytes()).await
+        }));
+    }
+    timeout(Duration::from_secs(5), async {
+        while fixture.calls.load(Ordering::SeqCst) < 8 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the sessions did not dial");
+    let (status, answer) = fixture
+        .sql(&route(9), &body(PASSWORD, &[("select", json!([]))], None))
+        .await;
+    assert_eq!((status, &answer["code"]), (400, &json!("53300")), "{answer}");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 8);
+    fixture.gate.send(true).unwrap();
+    for task in held {
+        assert_eq!(task.await.unwrap().0, 200);
+    }
+    fixture.stop().await;
+}

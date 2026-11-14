@@ -71,6 +71,8 @@ pub(crate) struct Admission {
     pub(crate) replay: ReplayCache,
     counts: HashMap<String, usize>,
     total: usize,
+    /// The sessions of each database that have not authenticated yet.
+    unauthenticated: HashMap<String, usize>,
 }
 impl Default for Admission {
     fn default() -> Self {
@@ -78,6 +80,29 @@ impl Default for Admission {
             replay: ReplayCache::new(50_000),
             counts: HashMap::new(),
             total: 0,
+            unauthenticated: HashMap::new(),
+        }
+    }
+}
+/// The most sessions of one database that may be connected and not yet authenticated. Each one
+/// holds one of PostgreSQL's connection slots before it proves a password, so the bound keeps
+/// connections that never log in from taking every slot of the database.
+pub(crate) const UNAUTHENTICATED_LIMIT: usize = 8;
+/// One session of a database that has not authenticated yet, counted until it is dropped.
+pub(crate) struct Unauthenticated {
+    gateway: Arc<Gateway>,
+    database: String,
+}
+impl Drop for Unauthenticated {
+    fn drop(&mut self) {
+        let mut admission = self.gateway.admission.lock().unwrap();
+        let count = admission
+            .unauthenticated
+            .get_mut(&self.database)
+            .expect("an unauthenticated session is counted");
+        *count -= 1;
+        if *count == 0 {
+            admission.unauthenticated.remove(&self.database);
         }
     }
 }
@@ -129,6 +154,26 @@ impl Gateway {
             admission: Mutex::new(Admission::default()),
         })
     }
+    /// Counts one more session of `database` that has not authenticated, or refuses it when the
+    /// database has [`UNAUTHENTICATED_LIMIT`] of them.
+    pub(crate) fn begin_authentication(
+        self: &Arc<Self>,
+        database: &str,
+    ) -> Result<Unauthenticated, &'static str> {
+        let mut admission = self.admission.lock().unwrap();
+        let count = admission
+            .unauthenticated
+            .entry(database.to_owned())
+            .or_default();
+        if *count >= UNAUTHENTICATED_LIMIT {
+            return Err("too many unauthenticated sessions");
+        }
+        *count += 1;
+        Ok(Unauthenticated {
+            gateway: self.clone(),
+            database: database.to_owned(),
+        })
+    }
     /// Reserves the session of an admitted route. `replay` is false only for a held wake
     /// connection, whose route was checked against the replay cache when it was held.
     pub(crate) fn reserve(
@@ -174,6 +219,7 @@ impl Gateway {
                 id,
                 target: target.clone(),
                 wire,
+                unauthenticated: Mutex::new(None),
             },
             actions,
         ))
@@ -418,6 +464,19 @@ pub(crate) struct SessionLease {
     pub(crate) id: String,
     pub(crate) target: Writer,
     wire: WireBudget,
+    /// Counted while the session has not authenticated; released by `authenticated`.
+    unauthenticated: Mutex<Option<Unauthenticated>>,
+}
+impl SessionLease {
+    /// Holds the count of an unauthenticated session until it authenticates.
+    pub(crate) fn hold_unauthenticated(&self, counted: Unauthenticated) {
+        *self.unauthenticated.lock().unwrap() = Some(counted);
+    }
+    /// Releases the count: the session has authenticated, or it was dropped.
+    pub(crate) fn authenticated(&self) {
+        let released = self.unauthenticated.lock().unwrap().take();
+        drop(released);
+    }
 }
 impl Drop for SessionLease {
     fn drop(&mut self) {
@@ -736,6 +795,18 @@ pub async fn serve_socket(
         return memory_refused(&mut socket, &gateway, &claims.db).await;
     };
     let wire = WireBudget::new(gateway.memory.lease(&claims.db));
+    let unauthenticated = match gateway.begin_authentication(&claims.db) {
+        Ok(counted) => counted,
+        Err(_) => {
+            stages.outcome = "admission_denied";
+            return http::reply(
+                &mut socket,
+                429,
+                serde_json::json!({"error":"admission_denied"}),
+            )
+            .await;
+        }
+    };
     let (session, mut actions) = match gateway.reserve(&claims, wire.clone(), &target, true) {
         Ok(value) => value,
         Err(status) => {
@@ -748,6 +819,7 @@ pub async fn serve_socket(
             .await;
         }
     };
+    session.hold_unauthenticated(unauthenticated);
     // The route names the database, the user and the unit, so nothing the StartupMessage says
     // changes where PostgreSQL is dialled: the dial overlaps the client's own round trips to it
     // (the upgrade, the answer to SSLRequest, the StartupMessage). Not a byte is sent before the
@@ -1118,6 +1190,14 @@ async fn serve_held(
             return Ok(());
         }
     };
+    let unauthenticated = match gateway.begin_authentication(&claims.db) {
+        Ok(counted) => counted,
+        Err(_) => {
+            stages.outcome = "admission_denied";
+            let _ = send_error(&mut websocket, "53300", "too many connections").await;
+            return Ok(());
+        }
+    };
     let (session, mut actions) = match gateway.reserve(&claims, wire.clone(), &target, false) {
         Ok(value) => value,
         Err(_) => {
@@ -1126,6 +1206,7 @@ async fn serve_held(
             return Ok(());
         }
     };
+    session.hold_unauthenticated(unauthenticated);
     {
         // The session is measured from its reservation; what the client sent while held is its.
         let mut metrics = gateway.measurements.lock().unwrap();
@@ -1262,6 +1343,9 @@ async fn run_session(
                     metrics.authenticate(id);
                 }
                 metrics.egress(id, answer.len());
+            }
+            if activity.authenticated() {
+                session.authenticated();
             }
             update(gateway, id, &activity, true, false);
             send_client(websocket, Message::Binary(answer.into()), stages).await?;
@@ -1801,6 +1885,7 @@ async fn relay(
             result=postgres.read(&mut read)=>{
                 let length=result.inspect_err(|_|stages.outcome="postgres_error")?;if length==0{stages.outcome="postgres_closed";break;}activity.observe_backend(&read[..length]);
                 {let mut metrics=gateway.measurements.lock().unwrap();if activity.authenticated(){metrics.authenticate(id);}metrics.egress(id,length);}
+                if activity.authenticated(){session.authenticated();}
                 update(gateway,id,activity,true,false);send_client(websocket,Message::Binary(read[..length].to_vec().into()),stages).await?;
                 stages.first_backend.get_or_insert_with(Instant::now);
             }
@@ -1875,6 +1960,21 @@ mod tests {
             route_revision,
             instance: INSTANCE.into(),
         }
+    }
+
+    #[test]
+    fn a_database_holds_eight_unauthenticated_sessions_and_releases_one_per_guard() {
+        let gateway = gateway();
+        let mut held: Vec<Unauthenticated> = (0..UNAUTHENTICATED_LIMIT)
+            .map(|_| gateway.begin_authentication(DATABASE).unwrap())
+            .collect();
+        assert!(gateway.begin_authentication(DATABASE).is_err());
+        // Another database's sessions are counted apart.
+        assert!(gateway.begin_authentication("bbbbbbbbbbbbbbbbbbbb").is_ok());
+        drop(held.pop());
+        assert!(gateway.begin_authentication(DATABASE).is_ok());
+        drop(held);
+        assert!(gateway.admission.lock().unwrap().unauthenticated.is_empty());
     }
 
     fn ticket(route_revision: u64) -> WakeClaims {
