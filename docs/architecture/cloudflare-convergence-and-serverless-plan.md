@@ -1,3 +1,37 @@
+# Security hardening release — 2026-11-15
+
+**Deployed to both live nodes; canary accepted on US1 before EU1.** [PR #57](https://github.com/amerged-org/cloudflare-postgres/pull/57)
+merged as **`d6a2152015e5bd870324b81253a213ddab3253c8`**; the full main CI run passed, including the
+actual QEMU boot and release signing. All seven artifact checksums and the signature verified. Registered
+**`sha-d6a2152015e5`**, spec SHA-256 `e29963a3e11e990574b2761992ec36a7d2da56cefff06e44d3148c4c4f2633ac`.
+The package lock is byte-identical to the previous release (SHA-256
+`3e9377ab3fd9602a5a84c56971239bd435413040345f37462c46e7a19e52cf8b`), so no OS maintenance, reboot or VPS
+purchase occurred. The owner authorized the rollout and its costs.
+
+Order of events (UTC, 2026-11-15): a D1 export was taken first; migrations **0099** and **0100** were applied
+(both add tables only); the management Worker was deployed with a per-source request limit and the global-fetch
+flag, inheriting every secret, variable, binding and schedule of the serving version; the Edge Worker was
+deployed with its per-source limit (both Access secrets confirmed present); the release was registered; both
+native qualification arrays gained the new ID while keeping every earlier one; US assignment advanced
+**23→24 at 07:16:59** and EU **20→21 at 07:28:36**. Both nodes converged in under 20 seconds with unchanged
+boot IDs and kernel. The release signer was redeployed and accepts the `release` environment claim; its key
+is unchanged. The `release` environment now holds a branch rule for `main` only and no required reviewer.
+
+Canary acceptance (small throw-away databases, deleted afterwards): SQL through the public hostname worked on
+both regions; a writing role without the temporary-table grant received `42501`, the owner role did not; the
+WAL-message function was refused for a non-owner role; an HTTP statement of 40 seconds ended at
+**35.4 s** (US) and **35.1 s** (EU) and the database kept serving; a first request after sleep took
+**518 ms**; a database restored from the digest-checked base backup contained the pre-backup state. Under
+sustained load from one address the management API answered **13,565 of 47,261** requests with `429`
+(`rate_limited`) while `/healthz` and the node path stayed served; a short burst of 9,000 requests in 20 s was
+not refused, because the platform's counters are per location and eventually consistent. The digest backfill
+had marked its archives done within one run (47 archives, 96 digest rows). Purchases and autoscale stayed off
+in both regions; sold storage (EU 284 GiB, US 56 GiB of 289 GiB each) stayed under the new 150 % cap.
+
+Not measured: a 9-way parallel unauthenticated burst on one database (wrong-password requests all returned the
+authentication error and were not refused), and the effect of the new read-IO caps beyond one cold wake.
+Rollback stays the reassignment of `sha-7579a39581a9` per region.
+
 # Main and branch consolidation — 2026-11-08
 
 The owner requested one main branch and removal of resolved branches. The two outstanding
